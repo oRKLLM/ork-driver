@@ -9,9 +9,12 @@ kernel module — it is a small userspace library that talks to the kernel drive
 ships with your board. The regcmd ISA was reverse-engineered from scratch; the result is an
 open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a real LLM.
 
-> Status: **RK3588 validated on hardware** (Radxa ROCK 5B). RK3576 shares the same driver and
-> ISA — the code path works, but its tuning parameters are inherited and need on-device
-> validation (the library prints a warning until then). See [SoC support](#soc-support).
+> Status: **RK3588 validated on hardware** (Radxa ROCK 5B). On Qwen3-1.7B w8a8 it does **decode
+> ~11 tok/s (~96% of the closed `librkllmrt`)** and prefill ~94 tok/s — multi-core and the full-K
+> int8 decode layout are chosen automatically (no tuning flags); per-channel int8 quant is
+> validated (~0.5% error). RK3576 shares the driver/ISA — the path works but its tuning params are
+> inherited and need on-device validation (the library warns until then). int4/`w4a16` is the next
+> target. See [ROADMAP.md](ROADMAP.md) and [SoC support](#soc-support).
 
 ## What it does
 
