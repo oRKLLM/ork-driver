@@ -27,10 +27,14 @@ enum { DT_F16=0, DT_I8=1 };
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
+struct ork_pw { struct ork_npu *c; int id; };   /* persistent NPU-pool worker arg */
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int core_budget;
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE];
-    size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc; };
+    size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
+    /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
+    pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
+    pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop; };
 struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; struct buf *Bf; };
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
@@ -102,6 +106,7 @@ ork_npu *ork_npu_init(void){
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores;
+    pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,4096,0x403); c->task=bcreate(fd,4096,0x40b); c->Af=bcreate(fd,(size_t)4*32768*2,0x403);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -109,6 +114,8 @@ ork_npu *ork_npu_init(void){
     return c;
 }
 void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
+    if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
+        for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
     free(c->cres); if(fd>=0)close(fd); free(c); }
@@ -251,6 +258,24 @@ static void *mcworker(void *vp){
     }
     return NULL;
 }
+/* persistent worker pool: spawned once, each pinned to driving NPU core `id`. Signalled per matmul
+ * (gen bump) — workers with id<nc run mcworker for that job, the rest sleep. Replaces per-matmul
+ * pthread_create/join (the spawn cost matters at ~200 matmuls/decode-token). */
+static void *npu_pool_worker(void *vp){
+    struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
+    for(;;){
+        pthread_mutex_lock(&c->pmu);
+        while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
+        if(c->pstop){ pthread_mutex_unlock(&c->pmu); return NULL; }
+        mygen=c->pgen; int nc=c->pjob_nc; struct mcw *args=c->pjob; pthread_mutex_unlock(&c->pmu);
+        if(id<nc){ mcworker(&args[id]);
+            pthread_mutex_lock(&c->pmu); if(++c->pdone==nc-1) pthread_cond_signal(&c->pdn); pthread_mutex_unlock(&c->pmu); }
+    }
+}
+static void npu_pool_ensure(ork_npu *c){
+    if(c->pool_n) return; c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
+    for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,npu_pool_worker,&c->pwa[i]); }
+}
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
@@ -261,12 +286,13 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(mc_ensure(c,nc)) return -1;
     size_t need=(size_t)M*w->N*4;
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;} memset(c->cres,0,need);
-    struct mcw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE]; int rc=0;
+    struct mcw args[ORK_MAXCORE]; int rc=0;
     for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0};
-    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,mcworker,&args[i]);
+    npu_pool_ensure(c);
+    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
     mcworker(&args[0]);                                   /* core 0 on the calling thread */
-    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
-    for(int i=0;i<nc;i++) if(args[i].rc) rc=-1;
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    for(int i=0;i<nc;i++){ if(args[i].rc) rc=-1; }
     if(rc) return -1;
     memcpy(C,c->cres,need); return 0;
 }

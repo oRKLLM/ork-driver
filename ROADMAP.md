@@ -22,6 +22,10 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 - **Per-channel int8 quant** — the correct fp32→int8→matmul→dequant pattern (per-output-channel
   weight + per-row activation scales) validated end-to-end vs fp32 (`examples/quant.c`, ~0.5% RMS
   error). The pattern a real engine follows; the bench keeps a dummy scale for pure throughput.
+- **Persistent NPU worker pool** — the multi-core path no longer does per-matmul
+  `pthread_create`/`join`; workers are spawned once and signalled per matmul. Decode unchanged
+  (~11 tok/s — it's **bandwidth-bound near librkllmrt, not spawn-bound**), prefill slightly up;
+  the value is lower overhead + cleaner scaling under many small matmuls.
 - **Calibration tools** — `ksubmit_probe` (K ceiling), `slice_probe`, `attn_cost`, `telemetry_sample.sh`.
 
 ## Remaining (highest leverage first)
@@ -40,10 +44,7 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    stack usable and properly benchmarkable.
 3. **SoC validation** — RK3576 params are inherited from RK3588 (`validated=0`): needs an on-board
    run + tune, then `validated=1`. RK3562/RK3568 not added (see `docs/ADDING_AN_SOC.md`).
-4. **NPU-side persistent thread pool** — the multi-core path still does per-matmul
-   `pthread_create`/`join`; a persistent pool (like the CPU one) would cut that overhead and push
-   multi-core past 1.69×.
-5. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
+4. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
    scheduling, not an ork-driver change. See the [Heterogeneous Serving wiki](https://github.com/oRKLLM/ork-driver/wiki/Heterogeneous-Serving-and-Scheduling).
 
 Low value (measured): **CPU/NPU op overlap** (decode is 97% NPU; prefill ops already threaded);
