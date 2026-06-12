@@ -1,0 +1,13 @@
+# build artifacts
+test_matmul
+layer
+decode
+model
+llama2
+*.o
+*.a
+# test models (downloaded, large)
+*.bin
+!regcmd_*.h
+# editor
+.DS_Store
