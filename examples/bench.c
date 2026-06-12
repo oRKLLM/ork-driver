@@ -10,6 +10,9 @@
 #include <stdint.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
 #include "ork_npu.h"
 typedef ork_f16 f16;
 /* Qwen3-1.7B config (for apples-to-apples vs librkllmrt's Qwen3-1.7B w8a8). NPU dims: K%32, N%16. */
@@ -26,6 +29,20 @@ typedef ork_f16 f16;
 
 static int g_i8=0;          /* 0 = fp16 weights, 1 = int8/w8a8 */
 static double g_mm=0;       /* accumulated time inside ork_mm_run* (NPU + library) */
+static double g_att=0;      /* accumulated time in the (CPU) attention block */
+/* big.LITTLE: attention threads must run on the PERFORMANCE cores (A55 stragglers gate the join).
+ * Detect the big cores (highest cpufreq max) once; pin attention there, oversubscribed 2x (hides
+ * KV-cache read latency). RK3588: cpu4-7 A76 @2.3GHz vs cpu0-3 A55 @1.8GHz. */
+static int g_big[16], g_nbig=0;
+static void att_init(void){
+    if(g_nbig) return;
+    int nc=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nc>16)nc=16; long mx=0,f[16]={0};
+    for(int c=0;c<nc;c++){char p[96];snprintf(p,sizeof p,"/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq",c);
+        FILE*fp=fopen(p,"r"); if(fp){if(fscanf(fp,"%ld",&f[c])!=1)f[c]=0;fclose(fp);} if(f[c]>mx)mx=f[c];}
+    for(int c=0;c<nc;c++) if(mx>0 && f[c]*10>=mx*9) g_big[g_nbig++]=c;  /* within 90% of top = a perf core (A76 clusters differ slightly: 2304 vs 2352 MHz) */
+    if(!g_nbig){ for(int c=0;c<nc&&c<16;c++)g_big[g_nbig++]=c; }   /* fallback: all cores */
+}
+static int att_threads(void){ att_init(); const char*e=getenv("ORK_ATT_THREADS"); int v=e?atoi(e):2*g_nbig; if(v<1)v=1; return v; }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static void rmsnorm(float*o,const float*x,const float*w,int n){float ss=0;for(int i=0;i<n;i++)ss+=x[i]*x[i];float s=1.0f/sqrtf(ss/n+EPS);for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];}
 static void rope(float*x,int seq,int nh,int hd,int p0){for(int t=0;t<seq;t++)for(int h=0;h<nh;h++){float*v=x+((size_t)t*nh+h)*hd;for(int i=0;i<hd/2;i++){float fr=powf(10000.0f,-2.0f*i/hd),an=(p0+t)*fr,c=cosf(an),s=sinf(an);float a=v[i],b=v[i+hd/2];v[i]=a*c-b*s;v[i+hd/2]=a*s+b*c;}}}
@@ -50,17 +67,36 @@ static void mm(ork_npu*ctx,ork_w*w,int K,int N,int M,const float*Af,float*C){
     f16*A=malloc((size_t)M*K*2);for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af[i];
     double t=now(); ork_mm_run(ctx,w,M,A,C); g_mm+=now()-t; free(A);
 }
+/* Attention is the prefill bottleneck (O(M^2 * heads * HD), and it's ~65-72% of prefill time on
+ * the CPU). The NPU is idle during it, so parallelize across heads (independent; each writes its
+ * own att columns) over the CPU cores. */
+#define ATT_THREADS 16
+struct attw { const float *q,*Kc,*Vc; float *att; int M,p0,grp,h0,h1,core; };
+static void *attworker(void *vp){
+    struct attw *a=vp; float scale=1.0f/sqrtf((float)HD);
+    if(a->core>=0){ cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(a->core,&cs); sched_setaffinity(0,sizeof cs,&cs); }
+    for(int hh=a->h0;hh<a->h1;hh++){int kvh=hh/a->grp;
+        for(int t=0;t<a->M;t++){int L2=a->p0+t+1; float sc[MAXSEQ];
+            for(int j=0;j<L2;j++){float dt=0;for(int e=0;e<HD;e++)dt+=a->q[((size_t)t*NH+hh)*HD+e]*a->Kc[(size_t)j*KVD+kvh*HD+e];sc[j]=dt*scale;}
+            softmax(sc,L2);
+            for(int e=0;e<HD;e++){float ac=0;for(int j=0;j<L2;j++)ac+=sc[j]*a->Vc[(size_t)j*KVD+kvh*HD+e];a->att[((size_t)t*NH+hh)*HD+e]=ac;}}}
+    return NULL;
+}
 static void layer(ork_npu*ctx,Layer*L,int M,int p0,float*x,float*Kc,float*Vc){
-    int grp=NH/NKV; float scale=1.0f/sqrtf((float)HD);
+    int grp=NH/NKV; float scale=1.0f/sqrtf((float)HD); (void)scale;
     float*xn=malloc((size_t)M*H*4),*q=malloc((size_t)M*QD*4),*k=malloc((size_t)M*KVD*4),*v=malloc((size_t)M*KVD*4),*att=malloc((size_t)M*QD*4),*o=malloc((size_t)M*H*4),*hn=malloc((size_t)M*H*4),*g=malloc((size_t)M*FFN*4),*u=malloc((size_t)M*FFN*4),*a=malloc((size_t)M*FFN*4),*d=malloc((size_t)M*H*4);
     for(int t=0;t<M;t++)rmsnorm(xn+(size_t)t*H,x+(size_t)t*H,L->n1,H);
     mm(ctx,L->Wq,H,QD,M,xn,q);mm(ctx,L->Wk,H,KVD,M,xn,k);mm(ctx,L->Wv,H,KVD,M,xn,v);
     rope(q,M,NH,HD,p0);rope(k,M,NKV,HD,p0);
     for(int t=0;t<M;t++){memcpy(Kc+(size_t)(p0+t)*KVD,k+(size_t)t*KVD,KVD*4);memcpy(Vc+(size_t)(p0+t)*KVD,v+(size_t)t*KVD,KVD*4);}
-    for(int hh=0;hh<NH;hh++){int kvh=hh/grp;for(int t=0;t<M;t++){int L2=p0+t+1;float sc[MAXSEQ];
-        for(int j=0;j<L2;j++){float dt=0;for(int e=0;e<HD;e++)dt+=q[((size_t)t*NH+hh)*HD+e]*Kc[(size_t)j*KVD+kvh*HD+e];sc[j]=dt*scale;}
-        softmax(sc,L2);
-        for(int e=0;e<HD;e++){float ac=0;for(int j=0;j<L2;j++)ac+=sc[j]*Vc[(size_t)j*KVD+kvh*HD+e];att[((size_t)t*NH+hh)*HD+e]=ac;}}}
+    double _ta=now();
+    int nth=att_threads(); if(nth>NH)nth=NH; if(nth>ATT_THREADS)nth=ATT_THREADS;
+    pthread_t th[ATT_THREADS]; struct attw aw[ATT_THREADS];   /* pin each to a big (perf) core */
+    for(int i=0;i<nth;i++) aw[i]=(struct attw){q,Kc,Vc,att,M,p0,grp,i*NH/nth,(i+1)*NH/nth, g_big[i%g_nbig]};
+    for(int i=1;i<nth;i++) pthread_create(&th[i],NULL,attworker,&aw[i]);
+    attworker(&aw[0]);
+    for(int i=1;i<nth;i++) pthread_join(th[i],NULL);
+    g_att+=now()-_ta;
     mm(ctx,L->Wo,QD,H,M,att,o);
     for(size_t i=0;i<(size_t)M*H;i++)x[i]+=o[i];
     for(int t=0;t<M;t++)rmsnorm(hn+(size_t)t*H,x+(size_t)t*H,L->n2,H);
@@ -97,10 +133,13 @@ int main(int argc,char**argv){
         g_mm/TDEC*1e3, g_mm/dt*100, (dt-g_mm)/TDEC*1e3, (dt-g_mm)/dt*100);
     for(size_t i=0;i<(size_t)TPRE*H;i++){s=s*1103515245+12345;x[i]=(((int)((s>>16)%17))-8)*0.05f;}
     memset(Kc,0,(size_t)NL*MAXSEQ*KVD*4);memset(Vc,0,(size_t)NL*MAXSEQ*KVD*4);
+    g_mm=0; g_att=0;                       /* measure prefill: NPU(matmul) vs attention vs other */
     t0=now();
     for(int l=0;l<NL;l++)layer(ctx,&Ls[l],TPRE,0,x,Kc+(size_t)l*MAXSEQ*KVD,Vc+(size_t)l*MAXSEQ*KVD);
     double pt=now()-t0;
-    printf("PREFILL: %d tok in %.2fs = %.1f tok/s\n",TPRE,pt,TPRE/pt);
+    printf("PREFILL: %d tok in %.2fs = %.1f tok/s  (%d att-threads)\n",TPRE,pt,TPRE/pt,att_threads());
+    printf("         NPU matmul: %.0f ms (%.0f%%);  attention: %.0f ms (%.0f%%);  other CPU (norm/rope/silu/malloc): %.0f ms (%.0f%%)\n",
+        g_mm*1e3, g_mm/pt*100, g_att*1e3, g_att/pt*100, (pt-g_mm-g_att)*1e3, (pt-g_mm-g_att)/pt*100);
     ork_npu_free(ctx);
     return 0;
 }
