@@ -19,6 +19,9 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
   int8 & K≤10752 & multi-core & **it fits the IOMMU** (`bcreate`-success guard — abandons it and
   falls back to K-split otherwise, never crashes). Policy via `ork_npu_set_core_budget(ctx,n)`;
   `ORK_NPU_MC`/`ORK_FULLK_DEC` are now debug overrides. Decode 11 tok/s & prefill ~94 with zero env.
+- **Per-channel int8 quant** — the correct fp32→int8→matmul→dequant pattern (per-output-channel
+  weight + per-row activation scales) validated end-to-end vs fp32 (`examples/quant.c`, ~0.5% RMS
+  error). The pattern a real engine follows; the bench keeps a dummy scale for pure throughput.
 - **Calibration tools** — `ksubmit_probe` (K ceiling), `slice_probe`, `attn_cost`, `telemetry_sample.sh`.
 
 ## Remaining (highest leverage first)
@@ -35,14 +38,12 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 2. **llama.cpp-rockchip integration** — wire `libork_npu.a` in as the matmul backend so it runs real
    models via `llama-cli`/`llama-bench` with a tokenizer, not just the standalone examples. Makes the
    stack usable and properly benchmarkable.
-3. **Real per-channel int8 quant** — the bench uses a dummy per-tensor scale (timing only). Needed
-   for *correct* output in real serving (correctness, not speed).
-4. **SoC validation** — RK3576 params are inherited from RK3588 (`validated=0`): needs an on-board
+3. **SoC validation** — RK3576 params are inherited from RK3588 (`validated=0`): needs an on-board
    run + tune, then `validated=1`. RK3562/RK3568 not added (see `docs/ADDING_AN_SOC.md`).
-5. **NPU-side persistent thread pool** — the multi-core path still does per-matmul
+4. **NPU-side persistent thread pool** — the multi-core path still does per-matmul
    `pthread_create`/`join`; a persistent pool (like the CPU one) would cut that overhead and push
    multi-core past 1.69×.
-6. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
+5. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
    scheduling, not an ork-driver change. See the [Heterogeneous Serving wiki](https://github.com/oRKLLM/ork-driver/wiki/Heterogeneous-Serving-and-Scheduling).
 
 Low value (measured): **CPU/NPU op overlap** (decode is 97% NPU; prefill ops already threaded);

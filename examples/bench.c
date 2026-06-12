@@ -97,9 +97,11 @@ struct qctx{const float*src;int8_t*dst;};
 static void quant_pf(int lo,int hi,void*vp){struct qctx*c=vp;for(int i=lo;i<hi;i++){int q=(int)lrintf(c->src[i]*8.0f);c->dst[i]=(int8_t)(q<-127?-127:q>127?127:q);}}
 struct dqctx{const int32_t*src;float*dst;};
 static void dequant_pf(int lo,int hi,void*vp){struct dqctx*c=vp;for(int i=lo;i<hi;i++)c->dst[i]=c->src[i]*(1.0f/8.0f);}
-/* C[M,N] = A[M,K] x packed weights. fp16: cast A->fp16. int8: quantize A->int8, run, dequant
- * (dummy per-tensor scale — bench measures matmul throughput, not numerics). The fp32<->int8
- * round-trip is the bench's; a real engine keeps activations int8 on-device. Pooled here. */
+/* C[M,N] = A[M,K] x packed weights. fp16: cast A->fp16. int8: quantize A->int8, run, dequant.
+ * NOTE: dummy per-tensor scale here — this benchmark measures matmul THROUGHPUT, not numerics.
+ * The correct, validated per-channel quant pattern (per-output-channel weight + per-row activation
+ * scales, ~0.5% RMS error) is in examples/quant.c. A real engine also keeps activations int8
+ * on-device instead of this fp32<->int8 round-trip. Quant/dequant pooled across the perf cores. */
 static void mm(ork_npu*ctx,ork_w*w,int K,int N,int M,const float*Af,float*C){
     if(g_i8){ int8_t*A=malloc((size_t)M*K);int32_t*Ci=malloc((size_t)M*N*4);
         struct qctx qc={Af,A}; pfor(M>=8,(int)((size_t)M*K),quant_pf,&qc);
