@@ -15,13 +15,16 @@
 #include <stdint.h>
 #include <sys/ioctl.h>
 
-/* Self-contained kernel types (avoid a hard dep on linux/types.h). */
+/* Self-contained kernel types (avoid a hard dep on linux/types.h). Use the kernel's exact
+ * underlying types (asm-generic/int-ll64.h) so that if another header (e.g. pulled transitively
+ * by <pthread.h>) also defines __u64/__s64, it is an identical — and therefore legal — typedef
+ * redefinition, not a `unsigned long` vs `unsigned long long` conflict. Same sizes either way. */
 #ifndef __rknpu_kernel_types
 #define __rknpu_kernel_types
-typedef uint32_t __u32;
-typedef int32_t  __s32;
-typedef uint64_t __u64;
-typedef int64_t  __s64;
+typedef unsigned int       __u32;
+typedef int                __s32;
+typedef unsigned long long __u64;
+typedef long long          __s64;
 #endif
 
 /* ---- Minimal DRM ioctl encoding (from <drm/drm.h>) ---- */

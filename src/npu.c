@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <pthread.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -23,9 +24,13 @@
 #include "soc.h"
 typedef ork_f16 f16;
 enum { DT_F16=0, DT_I8=1 };
+#define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; };
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt;
+    /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
+    struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE];
+    size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc; };
 struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; };   /* Bb[ns*Sk + ks], K-split x N-split */
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
@@ -96,6 +101,7 @@ ork_npu *ork_npu_init(void){
 }
 void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);
+    for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
     free(c->cres); if(fd>=0)close(fd); free(c); }
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
 int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
@@ -145,7 +151,86 @@ static int submit1(ork_npu *c){
         bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
+/* ---- multi-core (ORK_NPU_MC=<n>): use n cores (capped at soc->cores). Split each N-slice's
+ * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
+ * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
+ * so this is dynamic, not hardwired to a chip's core total. ---- */
+static int mc(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NPU_MC"); v=e?atoi(e):0; if(v<0)v=0;} return v; }
+static int mc_ensure(ork_npu *c,int nc){
+    int fd=c->fd;
+    for(int i=0;i<nc;i++){
+        if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
+        c->mrc[i]=bcreate(fd,4096,0x403); c->mtk[i]=bcreate(fd,4096,0x40b); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403);
+        if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) return -1;
+        struct rknpu_task t;memset(&t,0,sizeof t);t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->mrc[i].dma;
+        memcpy(c->mtk[i].cpu,&t,sizeof t); bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    return 0;
+}
+struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; };
+static void *mcworker(void *vp){
+    struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
+    int K=a->w->K, N=a->w->N, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
+    int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    ork_w *w=a->w; const void *A=a->A; struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*CC=&c->mcc[i];
+    a->rc=0;
+    size_t maxout=0;                       /* size this core's output buffer (rows x its columns) */
+    for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz; if(cols<=0)continue;
+        for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);int R=RB/Kp;if(R<1)R=1;int chunk=sd?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;int rows=chunk<M?chunk:M;size_t o=(size_t)rows*cols*4;if(o>maxout)maxout=o;}}
+    if(maxout==0) return NULL;             /* this core got no tiles (tiny N) */
+    if(c->mccsz[i]<maxout){bdestroy(fd,CC);*CC=bcreate(fd,maxout,0x403);c->mccsz[i]=maxout;c->mwarm[i]=0;if(!CC->cpu){a->rc=-1;return NULL;}}
+    for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
+        int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz;
+        for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0),R=RB/Kp;if(R<1)R=1;int chunk=sched?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;
+            struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)t0*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
+            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                if(dt==DT_F16){f16*ad=AF->cpu;const f16*Af=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j];}
+                else{int8_t*ad=AF->cpu;const int8_t*Ai=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j];}
+                bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                uint32_t rc[REGCMD_N];
+                if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+                int reps=c->mwarm[i]?1:2;
+                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=last?6000:1000;
+                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;return NULL;}continue;}
+                    bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);}
+                c->mwarm[i]=1;
+                if(dt==DT_F16){float  *cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
+                else{int32_t*cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
+            }
+        }
+    }
+    return NULL;
+}
+static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
+    int dt=w->dtype, fd=c->fd;
+    /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
+    if(nc>c->soc->cores) nc=c->soc->cores;
+    if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
+    if(nc<1) nc=1;
+    if(dt!=c->last_dt){ if(dt==DT_I8) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=dt; }
+    if(mc_ensure(c,nc)) return -1;
+    size_t need=(size_t)M*w->N*4;
+    if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;} memset(c->cres,0,need);
+    struct mcw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE]; int rc=0;
+    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0};
+    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,mcworker,&args[i]);
+    mcworker(&args[0]);                                   /* core 0 on the calling thread */
+    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<nc;i++) if(args[i].rc) rc=-1;
+    if(rc) return -1;
+    memcpy(C,c->cres,need); return 0;
+}
+
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
+    int nc=mc();                                          /* requested core count (0/1 = single) */
+    if(nc>1 && c->soc->cores>1) return run_multicore(c,w,M,A,C,nc);
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
