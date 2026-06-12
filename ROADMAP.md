@@ -33,12 +33,23 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 1. **int4 / `w4a16` path** — the big one. Hardware-native (RK3588 CNA has int4 weight modes;
    Rockchip exposes `w4a16`/`w4a8` + QINT8/INT4 mixing). Not yet RE'd (we have fp16 + int8). Worth
    it for two reasons: (a) 4-bit is the format real models ship in; (b) decode is weight-read-bound,
-   so half the bytes ≈ **~2× decode**. **Approach:** capture librknnrt doing a `w4a16` matmul with
-   `tools/regcmd_capture`, diff vs the int8 regcmd, decode the 4-bit weight packing + the CNA
-   bit-width regs (same method that cracked int8). **Prerequisite:** a `w4a16` `.rkllm` (or a
-   librknnrt int4 probe) on the board — none present today (only w8a8). Mixed int4/int8 is then
-   per-op dtype selection (not within a matmul). q3 is *not* a native mode (int4/int8/fp16 only);
-   "q4.5" ≈ `w4a16` (int4 + per-group fp16 scales).
+   so half the bytes ≈ **~2× decode**. *regcmd is independent of librknnrt — we use it only to RE
+   the int4 weight packing + the CNA bit-width reg + how per-group/channel fp16 scales are applied,
+   then ork_mm_* emits the int4 regcmd itself.* Mixed int4/int8 is then per-op dtype selection (not
+   within a matmul); q3 is *not* a native mode (int4/int8/fp16 only); "q4.5" ≈ `w4a16` (int4 +
+   per-group fp16 scales).
+   **Status (in progress):** capture toolchain set up — librknnrt 2.3.2 + `rknn_matmul_api.h` on the
+   board, `tools/int4_capture.c` (rknn_matmul int4 probe), `regcmd_capture` shim. **Pipeline
+   validated end-to-end on int8** (captured the int8 `rknn_matmul` regcmd). **Blocker:** librknnrt
+   2.3.2's `rknn_matmul` rejects *all* int4 types on RK3588 ("unsupported … in this platform"; only
+   int8 works). So the int4 reference must come from **librkllmrt running a `w4a16` `.rkllm`** (the
+   LLM runtime does int4) captured under the same shim. A `Qwen3-1.7B …rk3576-w4a16` model was tried
+   but librkllmrt **rejects it on the rk3588 board** (`target_platform does not match` → init fails).
+   So the runnable reference must be **(a)** an **rk3588 w4a16** `.rkllm` on this board, or **(b)** a
+   capture on an **actual rk3576 board** (NanoPi M5) — the int4 weight packing/bit-width reg transfer
+   across the RK35xx family, only the scheduler params (which we have for rk3588) differ. Once
+   captured: diff vs `REGCMD_I8` → `synth_i4` + `ork_mm_pack_i4`/`ork_mm_run_i4`, validate like
+   `examples/quant.c`. Capture pipeline proven on int8 (`tools/int4_capture.c` + `regcmd_capture`).
 2. **llama.cpp-rockchip integration** — wire `libork_npu.a` in as the matmul backend so it runs real
    models via `llama-cli`/`llama-bench` with a tokenizer, not just the standalone examples. Makes the
    stack usable and properly benchmarkable.
