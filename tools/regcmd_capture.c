@@ -39,6 +39,11 @@ static void init(void) {
 static struct ent *by_handle(uint32_t h) { for (int i=0;i<nent;i++) if (tab[i].handle==h) return &tab[i]; return NULL; }
 static struct ent *by_off(uint64_t o)    { for (int i=0;i<nent;i++) if (tab[i].off==o)    return &tab[i]; return NULL; }
 static struct ent *by_dma(uint64_t d)    { for (int i=0;i<nent;i++) if (tab[i].dma==d)    return &tab[i]; return NULL; }
+/* range lookup: find the buffer CONTAINING d (task regcmds live at offsets into one regcmd buffer,
+ * so exact-base by_dma misses task[1..3]); returns the entry and sets *off to the byte offset. */
+static struct ent *by_dma_range(uint64_t d, uint64_t *off) {
+    for (int i=0;i<nent;i++) if (d>=tab[i].dma && d<tab[i].dma+tab[i].size) { *off=d-tab[i].dma; return &tab[i]; }
+    return NULL; }
 
 static void record_map(off_t off, void *p) {
     struct ent *e = by_off((uint64_t)off);
@@ -116,10 +121,10 @@ int ioctl(int fd, unsigned long request, ...) {
                 fprintf(stderr, "  task[%u]: flags=0x%x op_idx=%u enable=0x%x int_mask=0x%x regcfg_amount=%u regcfg_offset=%u regcmd_addr=0x%llx\n",
                     i, t[i].flags, t[i].op_idx, t[i].enable_mask, t[i].int_mask,
                     t[i].regcfg_amount, t[i].regcfg_offset, (unsigned long long)t[i].regcmd_addr);
-                struct ent *re = by_dma(t[i].regcmd_addr);
+                uint64_t roff=0; struct ent *re = by_dma_range(t[i].regcmd_addr, &roff);
                 /* regcfg_amount = number of 64-bit (value,target) register writes */
                 int rcwords = (int)t[i].regcfg_amount * 2 + 16;
-                if (re && re->cpu) hexwords("regcmd", (uint32_t *)re->cpu, rcwords);
+                if (re && re->cpu) hexwords("regcmd", (uint32_t *)((char*)re->cpu + roff), rcwords);
                 else fprintf(stderr, "  (regcmd buffer for dma=0x%llx not mapped)\n", (unsigned long long)t[i].regcmd_addr);
             }
         } else {

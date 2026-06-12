@@ -30,6 +30,21 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 
 ## Remaining (highest leverage first)
 
+0. **int4 W4A4 matmul — DONE ✅ (2026-06-12), public API.** ork-driver does a real int4×int4→int32
+   matmul on the NPU via its own regcmd (maxerr=0 vs CPU), independent of librknnrt — the first open
+   *regcmd* int4 on RK3588. `ork_mm_pack_i4`/`ork_mm_run_i4` are callable like the fp16/int8 paths
+   (`examples/i4.c`, in `make test`): N-tile at 64, K-split at the 10752 ceiling (== int8) with int32
+   accumulate, M-tile by row — validated across M-tiling, N-tiling (N=256), and K-split (K=12288).
+   The quant path (fp32→int4→NPU→dequant `C_real=aScale[m]*bScale[n]*C`) gives ~10% RMS (W4A4 is
+   4-bit on both operands — coarse; this is why Hadamard helps, and why w4a16 below is more accurate).
+   How: captured librknnrt type-10 W4A4 (`tools/int4_capture.c`, `B_layout=NATIVE`) → `src/regcmd_i4.h`
+   → `synth_i4`; native tile layouts documented in `rknn_matmul_api.h` (A `(K/32,M,32)`,
+   B `(N/64,K/32,64,32)`, C `(N/8,M,8)`); the runtime's "12 tasks" = 4-task M-tiling × 3 subcores,
+   each an M=1 GEMM. **Remaining:** **w4a16** (fp16×int4 — the `.rkllm` format, more accurate) by
+   swapping the activation regs to fp16 (REGCMD) over this validated int4 weight path; optional int4
+   multi-core (reuse the int8 multi-core path), N>64 single-submit (parameterize the int4 N-output
+   regs), llama.cpp wiring.
+
 1. **int4 / `w4a16` path** — the big one. Hardware-native (RK3588 CNA has int4 weight modes;
    Rockchip exposes `w4a16`/`w4a8` + QINT8/INT4 mixing). Not yet RE'd (we have fp16 + int8). Worth
    it for two reasons: (a) 4-bit is the format real models ship in; (b) decode is weight-read-bound,
@@ -38,18 +53,45 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    then ork_mm_* emits the int4 regcmd itself.* Mixed int4/int8 is then per-op dtype selection (not
    within a matmul); q3 is *not* a native mode (int4/int8/fp16 only); "q4.5" ≈ `w4a16` (int4 +
    per-group fp16 scales).
-   **Status (in progress):** capture toolchain set up — librknnrt 2.3.2 + `rknn_matmul_api.h` on the
-   board, `tools/int4_capture.c` (rknn_matmul int4 probe), `regcmd_capture` shim. **Pipeline
-   validated end-to-end on int8** (captured the int8 `rknn_matmul` regcmd). **Blocker:** librknnrt
-   2.3.2's `rknn_matmul` rejects *all* int4 types on RK3588 ("unsupported … in this platform"; only
-   int8 works). So the int4 reference must come from **librkllmrt running a `w4a16` `.rkllm`** (the
-   LLM runtime does int4) captured under the same shim. A `Qwen3-1.7B …rk3576-w4a16` model was tried
-   but librkllmrt **rejects it on the rk3588 board** (`target_platform does not match` → init fails).
-   So the runnable reference must be **(a)** an **rk3588 w4a16** `.rkllm` on this board, or **(b)** a
-   capture on an **actual rk3576 board** (NanoPi M5) — the int4 weight packing/bit-width reg transfer
-   across the RK35xx family, only the scheduler params (which we have for rk3588) differ. Once
-   captured: diff vs `REGCMD_I8` → `synth_i4` + `ork_mm_pack_i4`/`ork_mm_run_i4`, validate like
-   `examples/quant.c`. Capture pipeline proven on int8 (`tools/int4_capture.c` + `regcmd_capture`).
+   **Status (2026-06-12) — capture abandoned as unnecessary; deriving from the fp16↔int8 delta.**
+   *No runnable int4 reference is reachable on this board, and it turns out we don't need one.*
+   librknnrt 2.3.2's `rknn_matmul` rejects *all* int4 types on RK3588 (int8-only); the runtime does
+   not officially expose int4 here. The w4a16 `.rkllm` reference is a catch-22: a `…rk3576-w4a16`
+   model is platform-rejected, and the `…rk3588-w4a16-grq` model **segfaults on load** under
+   v1.1.0–v1.1.4 (loader older than the model's toolkit format) yet is **platform-rejected** by
+   v1.2.0–v1.2.3 (stricter target_platform check). No runtime version both accepts *and* loads it.
+   **But the NPU silicon supports int4** — so ork-driver emits the int4 regcmd directly, bypassing the
+   runtime's gate (the entire point of the project). We don't need a capture; we **derive** the format
+   from the fp16↔int8 register delta (both already RE'd) and **validate against a CPU reference**
+   (like `examples/quant.c`), since we control both sides.
+   **Derived plan (from the `REGCMD`/`REGCMD_I8` diff):** the precision axis (fp↔int) is encoded in
+   `0x100c` (CNA), `0x3010` (DPU), `0x4010`/`0x40c0` (PPU), and a per-port float-bit (`…ffff` vs
+   `…fffe` on `0x1070`/`0x1110`/`0x4020`); fp16 sets "float" bits that int8 clears. **w4a16 is mixed —
+   int4 weights × fp16 activations** — so its regcmd is a *hybrid*: activation/feature regs take the
+   **fp16** template values (16-bit activations), weight regs take new int4 values, byte-linear-halved
+   from int8: `0x1030=K*N/2`, `0x1034=K/2`, `0x1044=ceil(K/128)`, `0x107c=K/32`, rows budget
+   `4*cbuf/K`. Three unknowns the 2-point delta can't give: **(a)** the int8↔int4 weight-bit-width
+   subfield (likely a low field of `0x100c`, which reads `0x0000` for int8), **(b)** the int4 nibble
+   packing order within the `[16][32]` weight tile, **(c)** per-group fp16 scale application. Resolve
+   by **bounded sweep against a CPU reference**: factor out (c) by baking a single global scale into
+   the reference, then sweep (a)+(b) (a few values each) until NPU output matches — no librkllmrt
+   needed. Then `synth_i4` + `ork_mm_pack_i4`/`ork_mm_run_i4`, validate end-to-end like
+   `examples/quant.c`; per-group scales added after the plain-int4 matmul validates.
+   **Sweep result (2026-06-12, `tools/i4_probe.c` + `synth_i4`/`ork_npu_probe_i4`):** built the
+   harness and swept **both bases (fp16, int8) x 18 `0x100c` candidates x 4 nibble layouts** vs a CPU
+   reference. **No match, no near-miss (<50 err).** fp16-base runs but computes wrong (the fp16 weight
+   datapath doesn't decode packed nibbles); int8-base mostly runs once the output/M-scheduler regs are
+   correctly N-parameterized (built on `synth_i8`, not a bare template — that cut wedges 72->20) but is
+   still wrong. **Conclusion: the int4 enable is a *coordinated multi-block* config (CNA bit-width +
+   DPU/PPU precision + the right nibble tile geometry + likely the per-group-scale path), not a single
+   `0x100c` field — too large a space to brute-force blind.** The 2-point fp16<->int8 delta pins the
+   weight-size scaling (solid) and the structure, but cannot converge the int4 enable without a real
+   reference. **Realistic unblock: capture on the NanoPi M5 (rk3576, 10.6.0.14)** where librkllmrt
+   *does* run int4 (an rk3576 w4a16 `.rkllm` under the proven `regcmd_capture` shim); the int4 weight
+   packing + CNA bit-width regs transfer across RK35xx (only scheduler params differ, and we have those
+   for rk3588). `i4_probe` (with the `base`/`i4mode`/`layout`/override knobs) is then the validator.
+   Safety note: the sweep ran 72->20 consecutive wedges serially with no crash — per-call
+   `RKNPU_ACT_RESET` + serial submits is safe; only *concurrent* wedging storms the queue.
 2. **llama.cpp-rockchip integration** — wire `libork_npu.a` in as the matmul backend so it runs real
    models via `llama-cli`/`llama-bench` with a tokenizer, not just the standalone examples. Makes the
    stack usable and properly benchmarkable.

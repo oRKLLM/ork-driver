@@ -20,10 +20,11 @@
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
+#include "regcmd_i4.h"
 #include "ork_npu.h"
 #include "soc.h"
 typedef ork_f16 f16;
-enum { DT_F16=0, DT_I8=1 };
+enum { DT_F16=0, DT_I8=1, DT_I4=2 };
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
@@ -97,6 +98,30 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
 }
+/* w4a16 (int4 weight x fp16 activation -> fp32) — DERIVED from the fp16<->int8 regcmd delta, NOT
+ * captured (the runtime won't expose int4 on this board; the NPU silicon does, so we emit it).
+ * w4a16 is MIXED precision, so the regcmd is a HYBRID: the activation/feature/output path is fp16
+ * (base = REGCMD, the fp16 template — 16-bit activations, fp32 output, the fp16 0x1070 float-bit),
+ * while the WEIGHT path is int4 = the int8 weight-size regs HALVED (0.5 B/elem vs int8's 1):
+ *   0x1030=K*N/2 (weight bytes), 0x1034=K/2 (row bytes), 0x1044=ceil(K/128) (half int8's /64),
+ *   0x107c=K/32 (half int8's /16).
+ * The one register the 2-point fp16/int8 delta CANNOT give — the int8<->int4 weight-bit-width
+ * subfield — is `i4mode`, swept from the caller (candidate values for 0x100c, which reads 0x0000
+ * for int8 → has room for a 4-bit code). Small dims only (feature/output template defaults hold). */
+/* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
+ * the base (the real hardware program, not a guess), overriding only the K/N/address-dependent regs.
+ * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) and M-scheduler stay as captured
+ * (M=4, the capture's M — caller must use M=4 until the M-schedule is parameterized). See ROADMAP. */
+static void synth_i4(uint32_t*rc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+    memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
+    setr(rc,REGCMD_I4_N,0x201,0x1024,((K-1)<<16)|K);       /* K range (element count) */
+    setr(rc,REGCMD_I4_N,0x201,0x1030,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
+    setr(rc,REGCMD_I4_N,0x201,0x1034,K/2);                 /* weight row bytes */
+    setr(rc,REGCMD_I4_N,0x201,0x1044,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
+    setr(rc,REGCMD_I4_N,0x201,0x1088,K);
+    setr(rc,REGCMD_I4_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I4_N,0x801,0x3018,N-1);
+    setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
+}
 
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
@@ -162,6 +187,70 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
+
+/* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----
+ * Tiling: N split into 64-wide tiles (the captured regcmd's N width), K split at the 10752 single-
+ * submit ceiling (same as int8) with host-side int32 accumulate, M done one row per submit (the
+ * captured program's M-tiling). C is int32 (holds the K-accumulated int sum; caller applies scales:
+ * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]). DOCUMENTED native layouts (RK3588/3576). */
+#define ORK_I4_KS 10752       /* int4 single-submit K ceiling (validated == int8's) */
+#define ORK_I4_NT 64          /* int4 N-tile width (captured regcmd is N=64; N%64) */
+/* one 64-col N-tile x Kp-row slice of B[K][N] at (k0,n0) -> native (Kp/32,64,32) int4 (2/byte) */
+static void tile_i4_Bslice(uint8_t*dst,const int8_t*B,int K,int N,int k0,int Kp,int n0){
+    int KT=Kp/32; memset(dst,0,(size_t)Kp*ORK_I4_NT/2);
+    for(int kt=0;kt<KT;kt++)for(int nl=0;nl<ORK_I4_NT;nl++)for(int kk=0;kk<32;kk++){
+        size_t idx=((size_t)kt*ORK_I4_NT+nl)*32+kk;
+        dst[idx/2]|= (uint8_t)(B[(size_t)(k0+kt*32+kk)*N+(n0+nl)]&0xf) << ((idx&1)?4:0);
+    }
+}
+/* a Kp-slice of one A row -> native (Kp/32,1,32) int4 */
+static void tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
+    int KT=Kp/32; memset(dst,0,(size_t)Kp/2);
+    for(int kt=0;kt<KT;kt++)for(int kk=0;kk<32;kk++){
+        size_t idx=(size_t)kt*32+kk;
+        dst[idx/2]|= (uint8_t)(Arow[k0+kt*32+kk]&0xf) << ((idx&1)?4:0);
+    }
+}
+ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
+    if(K%32||N%ORK_I4_NT) return NULL;
+    int KS=ORK_I4_KS, Sk=(K+KS-1)/KS, Sn=N/ORK_I4_NT;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    for(int ns=0;ns<Sn;ns++)for(int ks=0;ks<Sk;ks++){
+        int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*ORK_I4_NT;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*ORK_I4_NT/2,0x403);
+        if(!b->cpu){ ork_w_free(w); return NULL; }
+        tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0);
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+    }
+    return w;
+}
+int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+    if(!w||w->dtype!=DT_I4) return -1;
+    int fd=c->fd,K=w->K,N=w->N,KS=ORK_I4_KS;
+    struct buf O=bcreate(fd,(size_t)ORK_I4_NT*2,0x403); if(!O.cpu) return -2;   /* one N-tile int16 */
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    for(int m=0;m<M;m++){ const int8_t*Arow=A+(size_t)m*K;
+        for(int ns=0;ns<w->Sn;ns++){
+            int32_t acc[ORK_I4_NT]; for(int i=0;i<ORK_I4_NT;i++)acc[i]=0;
+            for(int ks=0;ks<w->Sk;ks++){
+                int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+                tile_i4_Aslice(c->Af.cpu,Arow,k0,Kp); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+                act(fd,RKNPU_ACT_RESET,0);
+                uint32_t rc[REGCMD_I4_N];
+                synth_i4(rc,Kp,ORK_I4_NT,(uint32_t)c->Af.dma,(uint32_t)w->Bb[(size_t)ns*w->Sk+ks].dma,(uint32_t)O.dma);
+                memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+                int ok=-1; for(int rep=0;rep<2;rep++){ sub.timeout=2000;
+                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+                    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+                if(ok){ bdestroy(fd,&O); return -1; }
+                int16_t*o=O.cpu; for(int nt=0;nt<ORK_I4_NT/8;nt++)for(int nl=0;nl<8;nl++) acc[nt*8+nl]+=o[nt*8+nl];
+            }
+            for(int i=0;i<ORK_I4_NT;i++) C[(size_t)m*N + ns*ORK_I4_NT + i]=acc[i];
+        }
+    }
+    bdestroy(fd,&O); return 0;
+}
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
  * int8 uses 2x the rows budget, K-slice 1024, and effective-K/2 schedule (see synth_i8). */
@@ -395,6 +484,65 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     for(int rep=0;rep<2;rep++){ sub.timeout=2000;
         if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* RE: probe W4A4 (int4 A x int4 B -> int16 C) using the captured REGCMD_I4 (M=4, the capture's M).
+ * A[M*K], B[K*N] hold int4 values as int8 in [-8,7]. `blayout`/`alayout` select candidate native
+ * tile packings (2 int4/byte); the regcmd is correct (captured) so a layout combo that matches the
+ * CPU reference reveals the native tile order. C[M*N] int16 = sum_k A[m][k]*B[k][n]. `nov`/`ovr_*`
+ * patch extra CNA regs from the tool. Returns 0 ok, -1 wedge/abort, -2 bad dims. Single task[0]
+ * submit — if the 12-task W4A4 program needs the other tasks (A-quant/reorder), this is wrong and a
+ * multi-task path is needed (see ROADMAP). Layouts: 0=K-contig lo/hi, 1=K-contig hi/lo, 2=N-lane. */
+#define ORK_I4_M 1   /* the captured W4A4 program M-tiles: each task is one M=1 GEMM (task[0] here) */
+/* RK3588/3576 int4 native layouts (DOCUMENTED in rknn_matmul_api.h, not guessed):
+ *   A: (K/32, M, 32)        elem[kt][m][kk] = A[m][kt*32+kk]
+ *   B: (N/64, K/32, 64, 32) elem[nt][kt][nl][kk] = B[kt*32+kk][nt*64+nl]   (B row-major [K][N])
+ * 2 int4 packed per byte; `nib` toggles which of the two consecutive elements is the high nibble. */
+static void tile_i4_A(uint8_t*dst,const int8_t*A,int M,int K,int nib){
+    int KT=K/32; memset(dst,0,(size_t)M*K/2);
+    for(int kt=0;kt<KT;kt++)for(int m=0;m<M;m++)for(int kk=0;kk<32;kk++){
+        size_t idx=((size_t)kt*M+m)*32+kk; uint8_t v=(uint8_t)(A[(size_t)m*K+kt*32+kk]&0xf);
+        dst[idx/2]|= ((idx&1)^nib)?(v<<4):v;
+    }
+}
+static void tile_i4_B(uint8_t*dst,const int8_t*B,int K,int N,int nib){
+    int KT=K/32,NT=N/64; memset(dst,0,(size_t)K*N/2);
+    for(int nt=0;nt<NT;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<64;nl++)for(int kk=0;kk<32;kk++){
+        size_t idx=(((size_t)nt*KT+kt)*64+nl)*32+kk;
+        uint8_t v=(uint8_t)(B[(size_t)(kt*32+kk)*N + (nt*64+nl)]&0xf);
+        dst[idx/2]|= ((idx&1)^nib)?(v<<4):v;
+    }
+}
+int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
+                     const uint32_t *ovr_reg,const uint32_t *ovr_val,
+                     const int8_t *A,const int8_t *B,int16_t *C){
+    int fd=c->fd;
+    if(K%32||N%64||N>c->soc->nmax) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N/2,0x403); if(!W.cpu) return -2;        /* B int4: half bytes */
+    tile_i4_B(W.cpu,B,K,N,nibB);
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*2,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
+    /* M-tiling: the captured W4A4 program runs M=1 per task; we replicate it per row. Each row's A is
+     * its own native (K/32,1,32) block (contiguous K/2 bytes); each row's C is (N/8,1,8) = N int16. */
+    uint8_t*ad=c->Af.cpu;
+    for(int m=0;m<M;m++) tile_i4_A(ad+(size_t)m*(K/2), A+(size_t)m*K, 1, K, nibA);
+    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=0;
+    for(int m=0;m<M && ok==0;m++){
+        act(fd,RKNPU_ACT_RESET,0);
+        uint32_t rc[REGCMD_I4_N];
+        synth_i4(rc,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
+        for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
+        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        sub.timeout=500; ok=-1;
+        for(int rep=0;rep<2;rep++){ if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+            bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+        if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
+            for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) C[(size_t)m*N + nt*8+nl] = cr[nt*8+nl]; }
+    }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }

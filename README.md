@@ -12,9 +12,11 @@ open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a rea
 > Status: **RK3588 validated on hardware** (Radxa ROCK 5B). On Qwen3-1.7B w8a8 it does **decode
 > ~11 tok/s (~96% of the closed `librkllmrt`)** and prefill ~94 tok/s — multi-core and the full-K
 > int8 decode layout are chosen automatically (no tuning flags); per-channel int8 quant is
-> validated (~0.5% error). RK3576 shares the driver/ISA — the path works but its tuning params are
-> inherited and need on-device validation (the library warns until then). int4/`w4a16` is the next
-> target. See [ROADMAP.md](ROADMAP.md) and [SoC support](#soc-support).
+> validated (~0.5% error). **int4 (W4A4) matmul is validated too** (`ork_mm_pack_i4`/`ork_mm_run_i4`,
+> the first open *regcmd*-based int4 on RK3588 — maxerr=0 vs CPU, with K-split/N-tiling/M-tiling);
+> `w4a16` (fp16 activations) is next. RK3576 shares the driver/ISA — the path works but its tuning
+> params are inherited and need on-device validation (the library warns until then). See
+> [ROADMAP.md](ROADMAP.md) and [SoC support](#soc-support).
 
 ## What it does
 

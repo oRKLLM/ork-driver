@@ -37,12 +37,16 @@ void         ork_npu_set_core_budget(ork_npu *ctx, int n);
  * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
 ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */
 ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int8/w8a8 weights */
+ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 void         ork_w_free(ork_w *w);
 
 /* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
- *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32. */
+ *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32.
+ *   int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 (raw sum; apply scales:
+ *                C_real[m][n] = aScale[m]*bScale[n]*C[m][n]). */
 int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float   *C);
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
 
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8
  * submit at (K,N) (N <= SoC N-cap, K%32, N%32) on its own buffers. Returns 0 if the submit
@@ -57,5 +61,15 @@ int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A
 int          ork_npu_probe_slice_f16(ork_npu *ctx, int Kfull, int N, int Kp, int nov,
                                      const uint32_t *ovr_reg, const uint32_t *ovr_val,
                                      const ork_f16 *A, const ork_f16 *B, float *C);
+
+/* RE/calibration only: probe W4A4 (int4 A x int4 B -> int16 C) using the captured RK3588 regcmd
+ * (REGCMD_I4, M=4) and the DOCUMENTED native tile layouts (A:(K/32,M,32) B:(N/64,K/32,64,32)
+ * C:(N/8,M,8)). A is [4*K], B is [K*N] row-major, int4 values stored as int8 in [-8,7]. `nibB`/`nibA`
+ * (0/1) toggle the 2-int4-per-byte nibble order (the one detail the docs don't pin). C is [4*N]
+ * int16 (de-tiled). `nov`/`ovr_*` patch extra CNA (0x0201) regs. Returns 0/ok, -1 wedged/abort,
+ * -2 bad dims (K%32, N%64). See tools/i4_probe.c. */
+int          ork_npu_probe_i4(ork_npu *ctx, int M, int K, int N, int nibB, int nibA, int nov,
+                              const uint32_t *ovr_reg, const uint32_t *ovr_val,
+                              const signed char *A, const signed char *B, short *C);
 
 #endif

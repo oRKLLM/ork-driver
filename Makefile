@@ -6,7 +6,7 @@ AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant layer decode model llama2 bench
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench
 
 all: $(EXAMPLES)
 
@@ -35,6 +35,11 @@ ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 
 # RE probe: hunt the weight stride register for in-place K-slicing of a full-K buffer.
 slice_probe: tools/slice_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# RE probe: derive the w4a16 (int4 weight x fp16 activation) regcmd by sweeping vs a CPU reference
+# (the runtime won't expose int4 on this board; the NPU does it — we emit the regcmd directly).
+i4_probe: tools/i4_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 # install the public header + both libs (override PREFIX=/path as needed)
