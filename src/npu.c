@@ -273,7 +273,8 @@ static void *npu_pool_worker(void *vp){
     }
 }
 static void npu_pool_ensure(ork_npu *c){
-    if(c->pool_n) return; c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
+    if(c->pool_n) return;
+    c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
     for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,npu_pool_worker,&c->pwa[i]); }
 }
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
