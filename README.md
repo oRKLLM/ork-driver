@@ -120,6 +120,12 @@ scheduler, then handles the practical limits (contraction-dim and output-width c
 state) so callers just see `C = A·B`. The full reverse-engineering record lives in the
 [ork-driver wiki](https://github.com/oRKLLM/ork-driver/wiki) (start with the [regcmd ISA Reference](https://github.com/oRKLLM/ork-driver/wiki/regcmd-ISA-Reference)).
 
+## Status & roadmap
+
+What's done (fp16/int8 matmul, multi-core, decode ≈ closed runtime, prefill flash attention) and
+what's left (int4/`w4a16`, llama.cpp integration, auto-tuner, more SoCs) — with the closed
+dead-ends — is tracked in **[ROADMAP.md](ROADMAP.md)**.
+
 ## Credits & scope
 
 Independent, community project — **not affiliated with or endorsed by Rockchip**. "Rockchip",
