@@ -59,3 +59,6 @@ clean:
 	rm -f $(EXAMPLES) rkllm_bench libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
 .PHONY: all lib install test clean
+
+attn_cost: tools/attn_cost.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

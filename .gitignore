@@ -17,3 +17,5 @@ ksubmit_probe
 .DS_Store
 
 slice_probe
+
+attn_cost
