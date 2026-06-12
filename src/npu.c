@@ -127,10 +127,16 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w); }   /* device buf
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
  * int8 uses 2x the rows budget, K-slice 1024, and effective-K/2 schedule (see synth_i8). */
-/* one matmul submit with cold-start warmup; regcmd must already be staged in c->regcmd. */
+/* one matmul submit with cold-start warmup; regcmd must already be staged in c->regcmd.
+ * core_mask=1<<core selects a single NPU core (0x1/0x2/0x4 = core 0/1/2 — exactly what librkllmrt
+ * round-robins). ALL THREE subcore_task[] must be populated even for a single core: leaving the
+ * non-target entries zero NULL-derefs rknpu_job_subcore_commit (the earlier kernel Oops). */
 static int submit1(ork_npu *c){
     int fd=c->fd;
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
+    sub.core_mask=1u<<tc;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
