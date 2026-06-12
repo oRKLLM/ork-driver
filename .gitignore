@@ -6,6 +6,7 @@ model
 llama2
 bench
 rkllm_bench
+ksubmit_probe
 *.o
 *.a
 *.so

@@ -28,6 +28,11 @@ libork_npu.so: $(CORE)                   # shared — dynamic link / FFI from Py
 rkllm_bench: tools/rkllm_bench.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+# RE/calibration probe: sweeps K to find this SoC's single-submit K-tile ceiling (int8).
+# Not in `all`/`test` — it intentionally wedges the NPU past the cap (recoverable).
+ksubmit_probe: tools/ksubmit_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include

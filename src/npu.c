@@ -174,3 +174,31 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
 }
 int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){ if(w->dtype!=DT_F16)return -1; return run(c,w,M,A,C); }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){ if(w->dtype!=DT_I8) return -1; return run(c,w,M,A,C); }
+
+/* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
+ * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
+ * weights. Returns 0 if the submit completed (C[N] int32 valid), -1 if it wedged (K over the
+ * per-op K-tile cap; recoverable — the next call's RKNPU_ACT_RESET clears it), -2 on bad dims. */
+int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
+    uint32_t rc[REGCMD_I8_N];
+    synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ sub.timeout=1500;   /* rep0 warmup (cold buffer stale), rep1 real */
+        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
