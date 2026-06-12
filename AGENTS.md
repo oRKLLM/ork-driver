@@ -23,12 +23,14 @@ See [`README.md`](README.md) for the user-facing overview and API.
 
 ### Language
 
-- The **driver is C** (C11, no dependencies beyond libc + the kernel DRM uABI). Keep it that
-  way — no C++, no third-party libraries in `src/`.
-- **Tooling, tests, and CI are Node.js / JavaScript** (e.g. `test/regression.mjs`). **Never
-  reach for Python.** If you need a script, write it as a `.mjs` or inline `node -e`. The only
-  sanctioned exception anywhere in the oRKLLM ecosystem is `rkllm-toolkit` model conversion,
-  which does not apply here.
+- **ork-driver is C end-to-end** — the library (`src/`), the examples, and the tests are all
+  C11 (no dependencies beyond libc + the kernel DRM uABI; no C++, no third-party libs in `src/`).
+  The build/test runner is the `Makefile` (`make`, `make test`). Keep it this way.
+- **The examples ARE the test suite** — each self-validates against a CPU reference and exits
+  0/nonzero; `make test` runs them. Don't add a separate test framework or a non-C harness.
+- **No Python, and no Node/JavaScript** — the regression runner was deliberately moved from a
+  Node script to `make test` so the whole repo is one language. If some incidental scripting is
+  ever truly unavoidable, prefer a tiny C program or a Makefile target over another runtime.
 - Match the surrounding code's terse, single-purpose style (the kernels are dense by design).
 
 ### Git hygiene
@@ -64,22 +66,24 @@ This keeps the docs reflecting reality so the next agent doesn't reverse-enginee
 ## 3. Build, test, and the board
 
 The library and examples **build and run on a Rockchip board** (they need `/dev/dri/cardN` and
-the `rknpu` DRM driver). Development happens on a workstation; build/test is driven over SSH.
+the `rknpu` DRM driver). Build on the board (or cross-compile); from a workstation, sync the
+source over and run there.
 
 ```sh
-make                              # on the board: library + examples
-node test/regression.mjs          # from the workstation: sync → build → run on BOARD
-BOARD=user@host node test/regression.mjs llama2   # filter to one example
+make                  # on the board: library + examples
+make test             # on the board: build + run every example, asserting each exits 0
+make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
+# from a workstation: rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'
 ```
 
-- The default board is the validated RK3588 (set `BOARD=user@host`).
-- The NPU is **single-stream**: the regression harness runs serially with a settle delay, and a
-  wedged submit can stall the next — keep that in mind when adding tests.
+- The validated board is RK3588.
+- The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can
+  stall the next — keep that in mind when adding tests.
 - A `.bin` test model (e.g. `stories15M`) is needed only for the `llama2` example; it is
-  git-ignored and the regression harness skips that test gracefully when absent.
-- **Every example self-validates against a CPU reference** (NPU output must match within fp16
-  tolerance, and NaN/inf or dead output must fail). When you fix a hardware-behavior bug, add a
-  shape/case to `test/regression.mjs` that would have caught it.
+  git-ignored and `make test` skips that test gracefully when `MODEL` is absent.
+- **The examples ARE the tests** — each self-validates against a CPU reference (NPU output must
+  match within fp16 tolerance; NaN/inf or dead output must fail). When you fix a hardware-behavior
+  bug, add a shape/config case to the relevant example so `make test` would have caught it.
 
 ---
 
@@ -92,8 +96,8 @@ src/soc.{h,c}          runtime device-tree SoC detection + caps registry
 src/soc/<chip>.c       one file per SoC: core count, CBUF budget, output-width cap, K-slice
 src/rknpu_ioctl.h      open DRM uABI of the upstream rknpu kernel driver
 src/regcmd_*.h         captured regcmd templates (our RE; no proprietary content)
-examples/              test_matmul · layer · decode · model · llama2 (each validates vs CPU)
-test/regression.mjs    builds + runs all examples on a board
+examples/              test_matmul · layer · decode · model · llama2 — the test suite (each
+                       self-validates vs CPU; MHA/GQA/arbitrary-head_dim covered). `make test` runs them.
 tools/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs)
 docs/ADDING_AN_SOC.md   how to add/validate a SoC (RE narrative + scratch live on the wiki)
 ```

@@ -29,7 +29,19 @@ install: libork_npu.a libork_npu.so
 	install -m644 libork_npu.a libork_npu.so $(DESTDIR)$(PREFIX)/lib/
 	install -m644 include/ork_npu.h $(DESTDIR)$(PREFIX)/include/
 
+# --- tests: the examples ARE the tests (each self-validates vs a CPU reference and exits
+# 0/nonzero). Run them on the board; a wall timeout catches an NPU hang. The llama2 test
+# needs a model and is skipped when absent. ---
+MODEL ?= stories15M.bin
+test: $(EXAMPLES)
+	@fail=0; \
+	for t in "test_matmul" "layer" "decode" "model 1" "model 12"; do \
+	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
+	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
+	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
+	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+
 clean:
 	rm -f $(EXAMPLES) libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
-.PHONY: all lib install clean
+.PHONY: all lib install test clean

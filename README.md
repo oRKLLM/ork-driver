@@ -97,14 +97,18 @@ Adding or validating a SoC is one file + a regression run — see
 
 ## Tests
 
-`test/regression.mjs` builds the library + examples on a board and runs them (each asserts a
-CPU-validated result; a wall timeout catches NPU hangs). Requires NPU hardware, no proprietary
-deps.
+The examples **are** the test suite — each self-validates its NPU result against a CPU
+reference (and the matmul/layer/decode/model examples sweep MHA, GQA, non-power-of-2 K,
+N-tiling, and decode). `make test` builds and runs them on the board, asserting each exits 0;
+a wall timeout catches NPU hangs. Requires NPU hardware, no proprietary deps.
 
 ```sh
-BOARD=user@host node test/regression.mjs          # full suite
-BOARD=user@host node test/regression.mjs llama2   # filter
+make test                  # build + run all examples; "ALL TESTS PASSED" on success
+make test MODEL=/path/to/stories15M.bin   # also run the real-model llama2 test (skipped if absent)
 ```
+
+From a workstation, sync the source to the board and run it there, e.g.
+`rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'`.
 
 ## How it works
 
