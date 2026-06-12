@@ -149,12 +149,14 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             if(dt==DT_F16) synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.timeout=6000;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            /* cold-start: the first submit after a fresh output buffer / dtype switch yields
-             * stale data or wedges once, then the NPU recovers — so run a throwaway warmup
-             * submit first and TOLERATE its failure; only the final (real) submit must succeed. */
-            int reps=c->warmed?1:3;   /* >=1 throwaway warmup that may wedge + 1 that primes, then the real submit */
-            for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1);
+            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+            /* cold-start: the first submit on a fresh output buffer returns stale data, and the
+             * first int8 submit on a context *wedges* once (the int8 NPU mode is stateful) — then
+             * the NPU recovers. So run throwaway warmup submits first and TOLERATE failure; give
+             * them a short timeout so a wedge aborts in ~1s, not the full 6s. Only the final
+             * (real) submit must succeed, with the full timeout. */
+            int reps=c->warmed?1:3;   /* throwaway warmup(s) that may wedge/stale, then the real submit */
+            for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=last?6000:1000;
                 if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ if(last){perror("SUBMIT");return -1;} continue; }
                 bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
             c->warmed=1;

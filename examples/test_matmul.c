@@ -39,8 +39,12 @@ static int check_i8(ork_npu*ctx,int M,int K,int N){
     ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
 }
 int main(void){
-    ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
     int fail=0;
+    /* fp16 and int8 in SEPARATE contexts: a model is one precision, and switching regcmd mode
+     * (fp16<->int8) on a live context wedges the first submit in the new mode for ~6s (the NPU
+     * mode is stateful — see the wiki). Each precision gets a fresh context here, which also
+     * mirrors real usage. (ork_mm_run_i8 on fp16 weights still safely returns an error.) */
+    ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
     fail|=check(ctx,128,512,128);
     fail|=check(ctx,256,4096,512);
     fail|=check(ctx,512,8192,128);
@@ -48,13 +52,14 @@ int main(void){
     fail|=check(ctx,32,2048,256);
     fail|=check(ctx,8,512,16384);     /* N-tiling: N>8192 (NPU output-width cap) */
     fail|=check(ctx,1,288,32000);     /* LM-head shape: non-pow2 K + N tiled into 4 slices */
-    /* int8/w8a8 */
-    fail|=check_i8(ctx,128,512,128);
-    fail|=check_i8(ctx,256,4096,512);
-    fail|=check_i8(ctx,64,11008,32);  /* non-power-of-2 K (768 remainder fallback) */
-    fail|=check_i8(ctx,1,8192,512);   /* decode */
-    fail|=check_i8(ctx,8,1280,64);    /* 256 remainder slice */
     ork_npu_free(ctx);
+    ork_npu*c8=ork_npu_init(); if(!c8){printf("init failed (NPU?)\n");return 1;}
+    fail|=check_i8(c8,128,512,128);
+    fail|=check_i8(c8,256,4096,512);
+    fail|=check_i8(c8,64,11008,32);   /* non-power-of-2 K (768 remainder fallback) */
+    fail|=check_i8(c8,1,8192,512);    /* decode */
+    fail|=check_i8(c8,8,1280,64);     /* 256 remainder slice */
+    ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
 }
