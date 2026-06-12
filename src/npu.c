@@ -26,9 +26,7 @@ enum { DT_F16=0, DT_I8=1 };
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; };
-struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; struct buf *Bf; };
-/* Bb[ns*Sk + ks] = K-split x N-split (prefill, M>1). Bf[ns] = full-K per N-slice (decode, M=1:
- * one submit per N-slice, no K-split/accumulate — far fewer submits). ~2x weight memory. */
+struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; };   /* Bb[ns*Sk + ks], K-split x N-split */
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
@@ -121,23 +119,11 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
                 bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
         }
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
-    /* full-K layout: one buffer per N-slice covering all K (for the M=1 decode single-submit). */
-    int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf));
-    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-        struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403);
-        if(dt==DT_F16){ f16*bb=b->cpu; const f16*Bf=B;
-            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
-                bb[nt*KTf*16*32+kt*16*32+nl*32+kk]=Bf[(size_t)(kt*32+kk)*N+(n0+nt*16+nl)];
-        } else { int8_t*bb=b->cpu; const int8_t*Bi=B;
-            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
-                bb[nt*KTf*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
-        }
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w); }   /* device buffers freed at ctx teardown */
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
  * int8 uses 2x the rows budget, K-slice 1024, and effective-K/2 schedule (see synth_i8). */
@@ -166,26 +152,6 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t maxout=0; for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);int R=RB/Kp;if(R<1)R=1;
         int chunk=sd?4*R:((RB/2)/Kp); if(chunk<1)chunk=1; int rows=chunk<M?chunk:M; int nc=N<NMAX?N:NMAX; size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;}
     if(c->ccsz<maxout){bdestroy(fd,&c->Cc);c->Cc=bcreate(fd,maxout,0x403);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu)return -1;}
-    /* DECODE fast path: M=1, full K in ONE submit per N-slice — no K-split, no accumulation.
-     * Cuts the decode submit count (decode is per-submit-overhead-bound, not memory-bound).
-     * Only for K the M=1 single-submit scheduler handles: K<=8192 (validated; larger K, e.g.
-     * 11008, wedge the submit — those fall back to the K-split path below). */
-    if(M==1 && K<=8192){
-        /* 0x1010=0x20 (from synth, mc=1), 0x1040=0xb1; activation copied once, reused per N-slice. */
-        if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int j=0;j<K;j++) ad[j]=Af[j]; }
-        else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int j=0;j<K;j++) ad[j]=Ai[j]; }
-        bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            uint32_t rc[REGCMD_N];
-            if(dt==DT_F16) synth   (rc,1,K,Nc,(uint32_t)c->Af.dma,(uint32_t)w->Bf[ns].dma,(uint32_t)c->Cc.dma,1,CBUF);
-            else           synth_i8(rc,1,K,Nc,(uint32_t)c->Af.dma,(uint32_t)w->Bf[ns].dma,(uint32_t)c->Cc.dma,1,CBUF);
-            setr(rc,REGCMD_N,0x201,0x1040,0xb1);   /* M=1 single-tile schedule, valid for any K */
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            if(submit1(c)) return -1;
-            if(dt==DT_F16){ float  *cc=c->Cc.cpu,*cr=c->cres; for(int n=0;n<Nc;n++) cr[n0+n]=cc[n]; }
-            else { int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int n=0;n<Nc;n++) cr[n0+n]=cc[n]; }
-        }
-    } else
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
         int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0), R=RB/Kp; if(R<1)R=1; int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
