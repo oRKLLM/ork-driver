@@ -52,6 +52,7 @@ int main(void){
     fail|=check(ctx,32,2048,256);
     fail|=check(ctx,8,512,16384);     /* N-tiling: N>8192 (NPU output-width cap) */
     fail|=check(ctx,1,288,32000);     /* LM-head shape: non-pow2 K + N tiled into 4 slices */
+    fail|=check(ctx,4,6144,2048);     /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     ork_npu_free(ctx);
     ork_npu*c8=ork_npu_init(); if(!c8){printf("init failed (NPU?)\n");return 1;}
     fail|=check_i8(c8,128,512,128);
@@ -59,6 +60,7 @@ int main(void){
     fail|=check_i8(c8,64,11008,32);   /* non-power-of-2 K (768 remainder fallback) */
     fail|=check_i8(c8,1,8192,512);    /* decode */
     fail|=check_i8(c8,8,1280,64);     /* 256 remainder slice */
+    fail|=check_i8(c8,4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
