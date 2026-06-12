@@ -43,10 +43,44 @@ static void att_init(void){
     if(!g_nbig){ for(int c=0;c<nc&&c<16;c++)g_big[g_nbig++]=c; }   /* fallback: all cores */
 }
 static int att_threads(void){ att_init(); const char*e=getenv("ORK_ATT_THREADS"); int v=e?atoi(e):2*g_nbig; if(v<1)v=1; return v; }
+
+/* Persistent thread pool pinned to the perf cores. Per-op pthread_create/join drowns in spawn
+ * overhead (the regression we saw), so spawn workers ONCE and dispatch parallel-for jobs to them.
+ * Used for every parallelizable CPU op (attention, quant/dequant, silu, rmsnorm). */
+typedef void (*pf_fn)(int lo,int hi,void *ctx);
+static pthread_t P_th[16]; static int P_nth=0;
+static pthread_mutex_t P_mu=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t P_go=PTHREAD_COND_INITIALIZER, P_dn=PTHREAD_COND_INITIALIZER;
+static pf_fn P_fn; static void *P_ctx; static int P_total, P_gen=0, P_done=0, P_stop=0;
+static void p_chunk(int id,int nth,int total,int*lo,int*hi){*lo=(int)((long)id*total/nth);*hi=(int)((long)(id+1)*total/nth);}
+static void *p_worker(void *arg){
+    int id=(int)(long)arg; cpu_set_t cs;CPU_ZERO(&cs);CPU_SET(g_big[id%g_nbig],&cs);sched_setaffinity(0,sizeof cs,&cs);
+    int mygen=0;
+    for(;;){
+        pthread_mutex_lock(&P_mu);
+        while(P_gen==mygen && !P_stop) pthread_cond_wait(&P_go,&P_mu);
+        if(P_stop){pthread_mutex_unlock(&P_mu);return NULL;}
+        mygen=P_gen; pf_fn fn=P_fn; void*ctx=P_ctx; int total=P_total,nth=P_nth;
+        pthread_mutex_unlock(&P_mu);
+        int lo,hi; p_chunk(id,nth,total,&lo,&hi); if(hi>lo) fn(lo,hi,ctx);
+        pthread_mutex_lock(&P_mu); if(++P_done==nth-1) pthread_cond_signal(&P_dn); pthread_mutex_unlock(&P_mu);
+    }
+}
+static void pool_init(void){ att_init(); P_nth=att_threads(); if(P_nth>16)P_nth=16; if(P_nth<1)P_nth=1;
+    for(int i=1;i<P_nth;i++) pthread_create(&P_th[i],NULL,p_worker,(void*)(long)i); }
+/* run fn over [0,total) split across the pool; main runs chunk 0, workers the rest, then barrier */
+static void parallel_for(int total,pf_fn fn,void*ctx){
+    if(P_nth<=1||total<=0){ if(total>0)fn(0,total,ctx); return; }
+    pthread_mutex_lock(&P_mu); P_fn=fn;P_ctx=ctx;P_total=total;P_done=0;P_gen++; pthread_cond_broadcast(&P_go); pthread_mutex_unlock(&P_mu);
+    int lo,hi; p_chunk(0,P_nth,total,&lo,&hi); if(hi>lo) fn(lo,hi,ctx);
+    pthread_mutex_lock(&P_mu); while(P_done<P_nth-1) pthread_cond_wait(&P_dn,&P_mu); pthread_mutex_unlock(&P_mu);
+}
+/* pool only for prefill-sized work (big=M>=8). Decode (M=1) runs inline — 450 tiny pool barriers
+ * per token would regress decode. */
+static void pfor(int big,int total,pf_fn fn,void*ctx){ if(big&&P_nth>1)parallel_for(total,fn,ctx); else if(total>0)fn(0,total,ctx); }
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static void rmsnorm(float*o,const float*x,const float*w,int n){float ss=0;for(int i=0;i<n;i++)ss+=x[i]*x[i];float s=1.0f/sqrtf(ss/n+EPS);for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];}
 static void rope(float*x,int seq,int nh,int hd,int p0){for(int t=0;t<seq;t++)for(int h=0;h<nh;h++){float*v=x+((size_t)t*nh+h)*hd;for(int i=0;i<hd/2;i++){float fr=powf(10000.0f,-2.0f*i/hd),an=(p0+t)*fr,c=cosf(an),s=sinf(an);float a=v[i],b=v[i+hd/2];v[i]=a*c-b*s;v[i+hd/2]=a*s+b*c;}}}
-static void softmax(float*x,int n){float m=x[0];for(int i=1;i<n;i++)if(x[i]>m)m=x[i];float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];}for(int i=0;i<n;i++)x[i]/=s;}
 static float silu(float x){return x/(1.0f+expf(-x));}
 
 typedef struct { ork_w*Wq,*Wk,*Wv,*Wo,*Wg,*Wu,*Wd; float n1[H],n2[H]; } Layer;
@@ -56,31 +90,39 @@ static ork_w* mkw(ork_npu*ctx,int K,int N){
     for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;B[i]=(f16)((((int)((s>>16)%9))-4)*sc);} ork_w*w=ork_mm_pack(ctx,K,N,B);free(B);return w;}
 static void mkl(ork_npu*ctx,Layer*L){for(int i=0;i<H;i++){L->n1[i]=1.0f;L->n2[i]=1.0f;}
     L->Wq=mkw(ctx,H,QD);L->Wk=mkw(ctx,H,KVD);L->Wv=mkw(ctx,H,KVD);L->Wo=mkw(ctx,QD,H);L->Wg=mkw(ctx,H,FFN);L->Wu=mkw(ctx,H,FFN);L->Wd=mkw(ctx,FFN,H);}
+/* pooled CPU ops (#1: cut the prefill "other-CPU" — quant/dequant/silu — across the perf cores) */
+struct siluctx{const float*g,*u;float*a;};
+static void silu_pf(int lo,int hi,void*vp){struct siluctx*c=vp;for(int i=lo;i<hi;i++)c->a[i]=silu(c->g[i])*c->u[i];}
+struct qctx{const float*src;int8_t*dst;};
+static void quant_pf(int lo,int hi,void*vp){struct qctx*c=vp;for(int i=lo;i<hi;i++){int q=(int)lrintf(c->src[i]*8.0f);c->dst[i]=(int8_t)(q<-127?-127:q>127?127:q);}}
+struct dqctx{const int32_t*src;float*dst;};
+static void dequant_pf(int lo,int hi,void*vp){struct dqctx*c=vp;for(int i=lo;i<hi;i++)c->dst[i]=c->src[i]*(1.0f/8.0f);}
 /* C[M,N] = A[M,K] x packed weights. fp16: cast A->fp16. int8: quantize A->int8, run, dequant
- * (dummy per-tensor scale — bench measures matmul throughput, not numerics). */
+ * (dummy per-tensor scale — bench measures matmul throughput, not numerics). The fp32<->int8
+ * round-trip is the bench's; a real engine keeps activations int8 on-device. Pooled here. */
 static void mm(ork_npu*ctx,ork_w*w,int K,int N,int M,const float*Af,float*C){
     if(g_i8){ int8_t*A=malloc((size_t)M*K);int32_t*Ci=malloc((size_t)M*N*4);
-        for(size_t i=0;i<(size_t)M*K;i++){int q=(int)lrintf(Af[i]*8.0f);A[i]=(int8_t)(q<-127?-127:q>127?127:q);}
+        struct qctx qc={Af,A}; pfor(M>=8,(int)((size_t)M*K),quant_pf,&qc);
         double t=now(); ork_mm_run_i8(ctx,w,M,A,Ci); g_mm+=now()-t;
-        for(size_t i=0;i<(size_t)M*N;i++)C[i]=Ci[i]*(1.0f/8.0f);
+        struct dqctx dc={Ci,C}; pfor(M>=8,(int)((size_t)M*N),dequant_pf,&dc);
         free(A);free(Ci); return; }
     f16*A=malloc((size_t)M*K*2);for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af[i];
     double t=now(); ork_mm_run(ctx,w,M,A,C); g_mm+=now()-t; free(A);
 }
-/* Attention is the prefill bottleneck (O(M^2 * heads * HD), and it's ~65-72% of prefill time on
- * the CPU). The NPU is idle during it, so parallelize across heads (independent; each writes its
- * own att columns) over the CPU cores. */
-#define ATT_THREADS 16
-struct attw { const float *q,*Kc,*Vc; float *att; int M,p0,grp,h0,h1,core; };
-static void *attworker(void *vp){
-    struct attw *a=vp; float scale=1.0f/sqrtf((float)HD);
-    if(a->core>=0){ cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(a->core,&cs); sched_setaffinity(0,sizeof cs,&cs); }
-    for(int hh=a->h0;hh<a->h1;hh++){int kvh=hh/a->grp;
-        for(int t=0;t<a->M;t++){int L2=a->p0+t+1; float sc[MAXSEQ];
-            for(int j=0;j<L2;j++){float dt=0;for(int e=0;e<HD;e++)dt+=a->q[((size_t)t*NH+hh)*HD+e]*a->Kc[(size_t)j*KVD+kvh*HD+e];sc[j]=dt*scale;}
-            softmax(sc,L2);
-            for(int e=0;e<HD;e++){float ac=0;for(int j=0;j<L2;j++)ac+=sc[j]*a->Vc[(size_t)j*KVD+kvh*HD+e];a->att[((size_t)t*NH+hh)*HD+e]=ac;}}}
-    return NULL;
+/* Attention is the prefill bottleneck (O(M^2 * heads * HD), ~65-72% of prefill CPU). Flash-style:
+ * online softmax in a SINGLE pass over keys, O(HD) running state (no sc[L2] buffer, one read of
+ * K/V each). Parallel over heads via the pool (independent; each head writes its own att cols).
+ * Causal (j<=t). */
+struct attctx { const float *q,*Kc,*Vc; float *att; int M,p0,grp; };
+static void att_pf(int lo,int hi,void *vp){
+    struct attctx *c=vp; float scale=1.0f/sqrtf((float)HD);
+    for(int hh=lo;hh<hi;hh++){int kvh=hh/c->grp;
+        for(int t=0;t<c->M;t++){int L2=c->p0+t+1; const float*qp=c->q+((size_t)t*NH+hh)*HD;
+            float m=-1e30f,l=0,acc[HD]; for(int e=0;e<HD;e++)acc[e]=0;
+            for(int j=0;j<L2;j++){const float*kp=c->Kc+(size_t)j*KVD+kvh*HD; float s=0;for(int e=0;e<HD;e++)s+=qp[e]*kp[e]; s*=scale;
+                float nm=s>m?s:m, cc=expf(m-nm), p=expf(s-nm); l=l*cc+p;
+                const float*vp2=c->Vc+(size_t)j*KVD+kvh*HD; for(int e=0;e<HD;e++)acc[e]=acc[e]*cc+p*vp2[e]; m=nm; }
+            float inv=l>0?1.0f/l:0,*ap=c->att+((size_t)t*NH+hh)*HD; for(int e=0;e<HD;e++)ap[e]=acc[e]*inv; }}
 }
 static void layer(ork_npu*ctx,Layer*L,int M,int p0,float*x,float*Kc,float*Vc){
     int grp=NH/NKV; float scale=1.0f/sqrtf((float)HD); (void)scale;
@@ -90,18 +132,13 @@ static void layer(ork_npu*ctx,Layer*L,int M,int p0,float*x,float*Kc,float*Vc){
     rope(q,M,NH,HD,p0);rope(k,M,NKV,HD,p0);
     for(int t=0;t<M;t++){memcpy(Kc+(size_t)(p0+t)*KVD,k+(size_t)t*KVD,KVD*4);memcpy(Vc+(size_t)(p0+t)*KVD,v+(size_t)t*KVD,KVD*4);}
     double _ta=now();
-    int nth=att_threads(); if(nth>NH)nth=NH; if(nth>ATT_THREADS)nth=ATT_THREADS;
-    pthread_t th[ATT_THREADS]; struct attw aw[ATT_THREADS];   /* pin each to a big (perf) core */
-    for(int i=0;i<nth;i++) aw[i]=(struct attw){q,Kc,Vc,att,M,p0,grp,i*NH/nth,(i+1)*NH/nth, g_big[i%g_nbig]};
-    for(int i=1;i<nth;i++) pthread_create(&th[i],NULL,attworker,&aw[i]);
-    attworker(&aw[0]);
-    for(int i=1;i<nth;i++) pthread_join(th[i],NULL);
+    struct attctx ac={q,Kc,Vc,att,M,p0,grp}; pfor(M>=8,NH,att_pf,&ac);
     g_att+=now()-_ta;
     mm(ctx,L->Wo,QD,H,M,att,o);
     for(size_t i=0;i<(size_t)M*H;i++)x[i]+=o[i];
     for(int t=0;t<M;t++)rmsnorm(hn+(size_t)t*H,x+(size_t)t*H,L->n2,H);
     mm(ctx,L->Wg,H,FFN,M,hn,g);mm(ctx,L->Wu,H,FFN,M,hn,u);
-    for(size_t i=0;i<(size_t)M*FFN;i++)a[i]=silu(g[i])*u[i];
+    struct siluctx sc2={g,u,a}; pfor(M>=8,(int)((size_t)M*FFN),silu_pf,&sc2);
     mm(ctx,L->Wd,FFN,H,M,a,d);
     for(size_t i=0;i<(size_t)M*H;i++)x[i]+=d[i];
     free(xn);free(q);free(k);free(v);free(att);free(o);free(hn);free(g);free(u);free(a);free(d);
@@ -110,6 +147,7 @@ int main(int argc,char**argv){
     int NL=argc>1?atoi(argv[1]):24, TDEC=argc>2?atoi(argv[2]):32, TPRE=argc>3?atoi(argv[3]):64;
     if(argc>4 && (argv[4][0]=='i'||argv[4][0]=='I')) g_i8=1;
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
+    pool_init();                           /* persistent CPU pool on the perf cores */
     int wsz=g_i8?1:2;
     double wmb=((double)NL*(2.0*H*QD+2.0*H*KVD+(double)H*FFN*3)+(double)H*VOCAB)*wsz/1e6;
     printf("bench: %s  H=%d NL=%d NH=%d NKV=%d HD=%d FFN=%d vocab=%d  dtype=%s (~%.0f MB weights)\n",
