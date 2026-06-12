@@ -31,7 +31,11 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE];
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc; };
-struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; };   /* Bb[ns*Sk + ks], K-split x N-split */
+struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; struct buf *Bf; };
+/* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
+ * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
+ * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
+static int fdec(void){ static int v=-1; if(v<0)v=getenv("ORK_FULLK_DEC")?1:0; return v; }
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
@@ -125,11 +129,18 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
                 bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
         }
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    /* optional full-K layout for the multi-core decode single-submit (int8, K<=10752). */
+    if(fdec() && dt==DT_I8 && K<=10752){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf));
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403); int8_t*bb=b->cpu; const int8_t*Bi=B;
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=Bi[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
+            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
  * int8 uses 2x the rows budget, K-slice 1024, and effective-K/2 schedule (see synth_i8). */
@@ -180,6 +191,25 @@ static void *mcworker(void *vp){
         for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);int R=RB/Kp;if(R<1)R=1;int chunk=sd?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;int rows=chunk<M?chunk:M;size_t o=(size_t)rows*cols*4;if(o>maxout)maxout=o;}}
     if(maxout==0) return NULL;             /* this core got no tiles (tiny N) */
     if(c->mccsz[i]<maxout){bdestroy(fd,CC);*CC=bcreate(fd,maxout,0x403);c->mccsz[i]=maxout;c->mwarm[i]=0;if(!CC->cpu){a->rc=-1;return NULL;}}
+    if(M==1 && w->Bf){   /* int8 DECODE fast path: ONE full-K submit per N-slice (no K-split) */
+        int8_t*ad=AF->cpu; const int8_t*Ai=A; for(int j=0;j<K;j++)ad[j]=Ai[j]; bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
+            int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
+            uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
+            setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
+            memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+            sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+            int reps=c->mwarm[i]?1:2;
+            for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=last?6000:1000;
+                if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;return NULL;}continue;}
+                bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);}
+            c->mwarm[i]=1;
+            int32_t*cc=CC->cpu,*cr=a->cres; for(int col=0;col<Ncore;col++)cr[n0+coff+col]=cc[col];
+        }
+        return NULL;
+    }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
         int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
         int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz;
