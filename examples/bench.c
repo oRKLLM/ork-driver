@@ -25,6 +25,7 @@ typedef ork_f16 f16;
 #define EPS 1e-5f
 
 static int g_i8=0;          /* 0 = fp16 weights, 1 = int8/w8a8 */
+static double g_mm=0;       /* accumulated time inside ork_mm_run* (NPU + library) */
 static double now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec/1e9;}
 static void rmsnorm(float*o,const float*x,const float*w,int n){float ss=0;for(int i=0;i<n;i++)ss+=x[i]*x[i];float s=1.0f/sqrtf(ss/n+EPS);for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];}
 static void rope(float*x,int seq,int nh,int hd,int p0){for(int t=0;t<seq;t++)for(int h=0;h<nh;h++){float*v=x+((size_t)t*nh+h)*hd;for(int i=0;i<hd/2;i++){float fr=powf(10000.0f,-2.0f*i/hd),an=(p0+t)*fr,c=cosf(an),s=sinf(an);float a=v[i],b=v[i+hd/2];v[i]=a*c-b*s;v[i+hd/2]=a*s+b*c;}}}
@@ -43,10 +44,11 @@ static void mkl(ork_npu*ctx,Layer*L){for(int i=0;i<H;i++){L->n1[i]=1.0f;L->n2[i]
 static void mm(ork_npu*ctx,ork_w*w,int K,int N,int M,const float*Af,float*C){
     if(g_i8){ int8_t*A=malloc((size_t)M*K);int32_t*Ci=malloc((size_t)M*N*4);
         for(size_t i=0;i<(size_t)M*K;i++){int q=(int)lrintf(Af[i]*8.0f);A[i]=(int8_t)(q<-127?-127:q>127?127:q);}
-        ork_mm_run_i8(ctx,w,M,A,Ci);
+        double t=now(); ork_mm_run_i8(ctx,w,M,A,Ci); g_mm+=now()-t;
         for(size_t i=0;i<(size_t)M*N;i++)C[i]=Ci[i]*(1.0f/8.0f);
         free(A);free(Ci); return; }
-    f16*A=malloc((size_t)M*K*2);for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af[i];ork_mm_run(ctx,w,M,A,C);free(A);
+    f16*A=malloc((size_t)M*K*2);for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af[i];
+    double t=now(); ork_mm_run(ctx,w,M,A,C); g_mm+=now()-t; free(A);
 }
 static void layer(ork_npu*ctx,Layer*L,int M,int p0,float*x,float*Kc,float*Vc){
     int grp=NH/NKV; float scale=1.0f/sqrtf((float)HD);
@@ -91,6 +93,8 @@ int main(int argc,char**argv){
         rmsnorm(fn,t1,Ls[0].n1,H); mm(ctx,Wlm,H,VOCAB,1,fn,logits); }
     double dt=now()-t0;
     printf("DECODE : %d tok in %.2fs = %.2f tok/s  (%.1f ms/tok)\n",TDEC,dt,TDEC/dt,dt/TDEC*1e3);
+    printf("         of which ork_mm_run (NPU+lib): %.1f ms/tok (%.0f%%);  rest (quant/ops/alloc on CPU): %.1f ms/tok (%.0f%%)\n",
+        g_mm/TDEC*1e3, g_mm/dt*100, (dt-g_mm)/TDEC*1e3, (dt-g_mm)/dt*100);
     for(size_t i=0;i<(size_t)TPRE*H;i++){s=s*1103515245+12345;x[i]=(((int)((s>>16)%17))-8)*0.05f;}
     memset(Kc,0,(size_t)NL*MAXSEQ*KVD*4);memset(Vc,0,(size_t)NL*MAXSEQ*KVD*4);
     t0=now();
