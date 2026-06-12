@@ -12,13 +12,13 @@
 #include <time.h>
 #include "ork_npu.h"
 typedef ork_f16 f16;
-/* ~1.5B-class config (Qwen-ish). NPU dims: K%32, N%16 (int8 N%32). */
+/* Qwen3-1.7B config (for apples-to-apples vs librkllmrt's Qwen3-1.7B w8a8). NPU dims: K%32, N%16. */
 #define H 2048
 #define NH 16
-#define NKV 2
+#define NKV 8
 #define HD 128
-#define FFN 5632
-#define VOCAB 32000
+#define FFN 6144
+#define VOCAB 151936
 #define QD (NH*HD)
 #define KVD (NKV*HD)
 #define MAXSEQ 256
