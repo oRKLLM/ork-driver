@@ -45,4 +45,12 @@ int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int3
  * cap; recoverable), -2 on bad dims. See tools/ksubmit_probe.c. */
 int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 
+/* RE/calibration only: probe in-place K-slicing of a full-K weight buffer. Packs B[Kfull,N] fp16
+ * full-K, runs one M=1 submit over k in [0,Kp), with up to `nov` regcmd overrides (block 0x0201)
+ * to hunt the per-N-tile weight stride register. C[N] should equal the Kp-partial sum if slicing
+ * works. Returns 0/ok, -1 wedged, -2 bad dims. See tools/slice_probe.c. */
+int          ork_npu_probe_slice_f16(ork_npu *ctx, int Kfull, int N, int Kp, int nov,
+                                     const uint32_t *ovr_reg, const uint32_t *ovr_val,
+                                     const ork_f16 *A, const ork_f16 *B, float *C);
+
 #endif

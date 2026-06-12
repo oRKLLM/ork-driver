@@ -33,6 +33,10 @@ rkllm_bench: tools/rkllm_bench.c
 ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE probe: hunt the weight stride register for in-place K-slicing of a full-K buffer.
+slice_probe: tools/slice_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include

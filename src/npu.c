@@ -202,3 +202,35 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
+
+/* RE: probe in-place K-slicing of a FULL-K weight buffer (for a single-layout decode+prefill).
+ * Packs B[Kfull,N] fp16 in full-K tile layout, then runs ONE M=1 submit over k in [0,Kp) reading
+ * from that buffer — i.e. the op processes Kp passes but the weights are laid out for Kfull. With
+ * no override the per-N-tile stride is Kp's (N-tile 0 correct, 1+ wrong); pass reg/val overrides
+ * (e.g. 0x1044, 0x1034, 0x1030 set to their full-K values) to hunt the stride register that makes
+ * all N-tiles correct. C[N] = sum_{k<Kp} A[k]*B[k][n] if slicing is right. nov<=4. Returns 0/ok. */
+int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
+                            const uint32_t *ovr_reg,const uint32_t *ovr_val,
+                            const f16 *A,const f16 *B,float *C){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(Kfull%32||Kp%32||N%16||N>c->soc->nmax||Kp>Kfull) return -2;
+    struct buf W=bcreate(fd,(size_t)Kfull*N*2,0x403); if(!W.cpu) return -2;
+    int NN=N/16,KTf=Kfull/32; f16*bb=W.cpu;     /* full-K fp16 layout [Ntile][KTfull][16][32] */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KTf*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t rc[REGCMD_N];
+    synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    setr(rc,REGCMD_N,0x201,0x1040,0xb1);
+    for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ sub.timeout=2000;
+        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}

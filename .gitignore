@@ -15,3 +15,5 @@ ksubmit_probe
 !regcmd_*.h
 # editor
 .DS_Store
+
+slice_probe
