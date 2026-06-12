@@ -23,6 +23,11 @@ libork_npu.so: $(CORE)                   # shared — dynamic link / FFI from Py
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# comparison tool: benchmark the closed librkllmrt (dlopen'd at runtime, no build dep).
+# Not in `all`/`test` — it needs a .rkllm model + the runtime present on the board.
+rkllm_bench: tools/rkllm_bench.c
+	$(CC) $(CFLAGS) -o $@ $< -ldl
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
@@ -42,6 +47,6 @@ test: $(EXAMPLES)
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
 clean:
-	rm -f $(EXAMPLES) libork_npu.a libork_npu.so src/*.o src/soc/*.o
+	rm -f $(EXAMPLES) rkllm_bench libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
 .PHONY: all lib install test clean

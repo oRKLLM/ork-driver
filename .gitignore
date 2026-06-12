@@ -4,8 +4,11 @@ layer
 decode
 model
 llama2
+bench
+rkllm_bench
 *.o
 *.a
+*.so
 # test models (downloaded, large)
 *.bin
 !regcmd_*.h
