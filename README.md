@@ -98,8 +98,8 @@ value)` triples across the CNA/DPU/PPU/PC blocks), placed in a DMA buffer, and r
 `RKNPU_SUBMIT` on the card node. The library reverse-engineers the weight tile layout
 (`[Ntile][Ktile][16][32]`), the feature/output addressing, and the NPU's internal M-tiling
 scheduler, then handles the practical limits (contraction-dim and output-width caps, cold-start
-state) so callers just see `C = A·B`. The full reverse-engineering log lives in the
-[oRKLLM wiki](https://github.com/oRKLLM/oRKLLM/wiki).
+state) so callers just see `C = A·B`. The full reverse-engineering record lives in the
+[ork-driver wiki](https://github.com/oRKLLM/ork-driver/wiki) (start with the [regcmd ISA Reference](https://github.com/oRKLLM/ork-driver/wiki/regcmd-ISA-Reference)).
 
 ## Credits & scope
 

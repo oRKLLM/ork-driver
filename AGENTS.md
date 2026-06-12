@@ -4,7 +4,7 @@
 register-command (regcmd) programs and submits them to the in-tree `rknpu` DRM kernel driver
 via ioctls on `/dev/dri/cardN` — no `librknnrt`, no kernel module. It is the open NPU runtime
 spun out of [oRKLLM](https://github.com/oRKLLM/oRKLLM); the reverse-engineering record lives in
-[`docs/REVERSE-ENGINEERING.md`](docs/REVERSE-ENGINEERING.md).
+the [ork-driver wiki](https://github.com/oRKLLM/ork-driver/wiki).
 
 See [`README.md`](README.md) for the user-facing overview and API.
 
@@ -54,7 +54,8 @@ Before committing, check whether the change needs doc updates:
   header doc-comment).
 - New SoC, or a change to the SoC abstraction → update `docs/ADDING_AN_SOC.md` and `src/soc/`.
 - A non-obvious hardware/RE finding (a new register meaning, a limit, a workaround) → record it
-  in `docs/REVERSE-ENGINEERING.md`, not in code comments alone.
+  on the [wiki](https://github.com/oRKLLM/ork-driver/wiki) (ISA Reference / RE Roadmap), not in
+  code comments alone.
 
 This keeps the docs reflecting reality so the next agent doesn't reverse-engineer what changed.
 
@@ -94,7 +95,7 @@ src/regcmd_*.h         captured regcmd templates (our RE; no proprietary content
 examples/              test_matmul · layer · decode · model · llama2 (each validates vs CPU)
 test/regression.mjs    builds + runs all examples on a board
 tools/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs)
-docs/                  REVERSE-ENGINEERING.md · FEASIBILITY-LOG.md · ADDING_AN_SOC.md
+docs/ADDING_AN_SOC.md   how to add/validate a SoC (RE narrative + scratch live on the wiki)
 ```
 
 ### Multi-SoC: data, not branches
