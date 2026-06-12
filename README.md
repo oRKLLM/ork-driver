@@ -42,11 +42,26 @@ sudo ./test_matmul   # fp16 matmul validation vs CPU (incl. non-power-of-2 K, N-
 sudo ./model 12      # 12-layer transformer body, NPU vs CPU reference
 ```
 
-Embed in another project:
+## Integrating into another project
+
+ork-driver is **built from source** — it compiles for the board's ARM64 + kernel DRM uABI, so
+you build it on the target (or cross-compile for `aarch64`), not download a generic binary. It
+has **no external dependencies** (just libc + the kernel headers already in the repo). Build a
+library and link the C ABI in `include/ork_npu.h`:
 
 ```sh
-make libork_npu.a    # static lib + include/ork_npu.h
+make lib          # produces libork_npu.a (static) and libork_npu.so (shared)
+make install      # → $(PREFIX)/lib/{libork_npu.a,libork_npu.so} + $(PREFIX)/include/ork_npu.h
 ```
+
+- **C / C++ (e.g. the llama.cpp-rockchip backend):** statically link `libork_npu.a` (no runtime
+  `.so` dependency) — `cc your.c -lork_npu` after `make install`, or drop the `src/*.c` straight
+  into your build. The header is the entire contract: `ork_npu_init` / `ork_mm_pack[_i8]` /
+  `ork_mm_run[_i8]`.
+- **Other languages (Python / Node / Rust):** link `libork_npu.so` and FFI against the same C
+  ABI (`dlopen` / `ctypes` / `node-ffi` / `bindgen`).
+
+Cross-compile example: `make lib CC=aarch64-linux-gnu-gcc`.
 
 ## Examples (each self-validates against a CPU reference)
 
