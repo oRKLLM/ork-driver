@@ -40,10 +40,19 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    How: captured librknnrt type-10 W4A4 (`tools/int4_capture.c`, `B_layout=NATIVE`) → `src/regcmd_i4.h`
    → `synth_i4`; native tile layouts documented in `rknn_matmul_api.h` (A `(K/32,M,32)`,
    B `(N/64,K/32,64,32)`, C `(N/8,M,8)`); the runtime's "12 tasks" = 4-task M-tiling × 3 subcores,
-   each an M=1 GEMM. **Remaining:** **w4a16** (fp16×int4 — the `.rkllm` format, more accurate) by
-   swapping the activation regs to fp16 (REGCMD) over this validated int4 weight path; optional int4
-   multi-core (reuse the int8 multi-core path), N>64 single-submit (parameterize the int4 N-output
-   regs), llama.cpp wiring.
+   each an M=1 GEMM. **Remaining:** int4 multi-core (reuse the int8 multi-core path), N>64
+   single-submit (parameterize the int4 N-output regs), real per-group scales, llama.cpp wiring.
+
+   **w4a16 (fused fp16×int4) is a HARDWARE dead-end on RK3588.** The NPU MAC only multiplies MATCHING
+   precisions: the only supported rknn_matmul types are 1 (f16×f16), 2/3/9 (int8×int8), 10 (int4×int4)
+   — every mixed type (5 f16×i8, 7=w4a16 f16×i4, 8, 11 i8×i4, 12, 15) returns "unsupported matmul dtype
+   in this platform", a silicon limit not a packaging choice. Proven directly: a fully-derived fp16×int4
+   regcmd (correct fp32-output group, `0x100c=0x20000160`, fp16 activation regs) runs but reads the
+   fp16 activations as integers → garbage, because there is no fp16×int4 MAC mode to enable. So w4a16
+   models run EITHER by dequantizing int4 weights → fp16 once and running f16×f16 (saves disk/load but
+   no decode-bandwidth win — weights stream as fp16), OR via the W4A4 path above (int4×int4, 2× decode,
+   needs activation quant + a Hadamard rotation for accuracy). W4A4 is thus the correct/only native
+   low-bit matmul on RK3588. (The non-functional fp16×int4 synth probe was reverted; RE record stands here.)
 
 1. **int4 / `w4a16` path** — the big one. Hardware-native (RK3588 CNA has int4 weight modes;
    Rockchip exposes `w4a16`/`w4a8` + QINT8/INT4 mixing). Not yet RE'd (we have fp16 + int8). Worth
