@@ -28,6 +28,11 @@ const char  *ork_npu_soc(const ork_npu *ctx);    /* "rk3588", "rk3576", ... */
 int          ork_npu_cores(const ork_npu *ctx);  /* NPU core count */
 int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params are HW-validated */
 
+/* Policy: cap how many NPU cores the auto-tuner may use per matmul (n<=0 → all SoC cores, the
+ * default). Multi-core + the full-K int8 decode layout are chosen automatically per matmul; this
+ * just bounds them (e.g. reserve cores for another workload). ORK_NPU_MC env overrides if set. */
+void         ork_npu_set_core_budget(ork_npu *ctx, int n);
+
 /* Pack + upload B[K,N] (row-major) into NPU-resident tile layout; reuse across runs.
  * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
 ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */

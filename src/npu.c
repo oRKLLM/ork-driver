@@ -27,7 +27,7 @@ enum { DT_F16=0, DT_I8=1 };
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt;
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int core_budget;
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE];
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc; };
@@ -35,7 +35,12 @@ struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; struct buf *Bf; };
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
-static int fdec(void){ static int v=-1; if(v<0)v=getenv("ORK_FULLK_DEC")?1:0; return v; }
+/* Auto-tuner policy. Multi-core + full-K decode are now the library's DEFAULT per-matmul choice
+ * (no env needed); the engine sets a core budget via ork_npu_set_core_budget, and env vars only
+ * override: ORK_NPU_MC caps cores, ORK_FULLK_DEC=0 disables the full-K decode layout. */
+static int env_mc(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_NPU_MC"); v=e?atoi(e):-1;} return v; }  /* -1 = unset */
+static int fdec(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_FULLK_DEC"); v=(e&&atoi(e)==0)?0:1;} return v; } /* default ON; =0 disables */
+static int budget(ork_npu*c){ int b=env_mc(); if(b<0)b=c->core_budget; if(b>c->soc->cores)b=c->soc->cores; if(b<1)b=1; return b; } /* effective max cores */
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
@@ -96,7 +101,7 @@ ork_npu *ork_npu_init(void){
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores;
     c->regcmd=bcreate(fd,4096,0x403); c->task=bcreate(fd,4096,0x40b); c->Af=bcreate(fd,(size_t)4*32768*2,0x403);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -110,6 +115,9 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
 int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
 int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
+/* policy: cap the cores the auto-tuner may use for a matmul (n<=0 → all soc cores). The library
+ * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
+void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
@@ -129,13 +137,19 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
                 bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
         }
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
-    /* optional full-K layout for the multi-core decode single-submit (int8, K<=10752). */
-    if(fdec() && dt==DT_I8 && K<=10752){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf));
-        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403); int8_t*bb=b->cpu; const int8_t*Bi=B;
+    /* AUTO full-K decode layout (int8, K<=10752, multi-core enabled): lets the multi-core decode do
+     * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
+     * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
+     * K-split path (correct, just slower). No crash, no ceiling guess. */
+    if(fdec() && dt==DT_I8 && K<=10752 && budget(c)>1){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403);
+            if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
+            int8_t*bb=b->cpu; const int8_t*Bi=B;
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
                 bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=Bi[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
-            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
@@ -166,7 +180,6 @@ static int submit1(ork_npu *c){
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
  * so this is dynamic, not hardwired to a chip's core total. ---- */
-static int mc(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NPU_MC"); v=e?atoi(e):0; if(v<0)v=0;} return v; }
 static int mc_ensure(ork_npu *c,int nc){
     int fd=c->fd;
     for(int i=0;i<nc;i++){
@@ -259,8 +272,11 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 }
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
-    int nc=mc();                                          /* requested core count (0/1 = single) */
-    if(nc>1 && c->soc->cores>1) return run_multicore(c,w,M,A,C,nc);
+    /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
+     * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
+    int b=budget(c), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
+    int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
+    if(nc>1) return run_multicore(c,w,M,A,C,nc);
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never

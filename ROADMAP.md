@@ -14,6 +14,11 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 - **Multi-core NPU** (`ORK_NPU_MC=n`) — N-split across cores, clamped to `soc->cores`; **decode 1.69×**.
 - **Per-core full-K single-submit decode** (`ORK_FULLK_DEC`) — decode **~11 tok/s ≈ 96% of librkllmrt**.
 - **Prefill CPU path** — flash-style attention + persistent thread pool pinned to the perf cores; **~1.6×**.
+- **Auto-tuner** — multi-core + full-K int8 decode are now the **default per-matmul choice** (no env
+  needed): cores chosen per matmul (≤ budget, ≥2 N-tiles/core), full-K decode auto-built when
+  int8 & K≤10752 & multi-core & **it fits the IOMMU** (`bcreate`-success guard — abandons it and
+  falls back to K-split otherwise, never crashes). Policy via `ork_npu_set_core_budget(ctx,n)`;
+  `ORK_NPU_MC`/`ORK_FULLK_DEC` are now debug overrides. Decode 11 tok/s & prefill ~94 with zero env.
 - **Calibration tools** — `ksubmit_probe` (K ceiling), `slice_probe`, `attn_cost`, `telemetry_sample.sh`.
 
 ## Remaining (highest leverage first)
@@ -30,19 +35,14 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 2. **llama.cpp-rockchip integration** — wire `libork_npu.a` in as the matmul backend so it runs real
    models via `llama-cli`/`llama-bench` with a tokenizer, not just the standalone examples. Makes the
    stack usable and properly benchmarkable.
-3. **Auto-tuner (productionize the env flags)** — fold `ORK_NPU_MC` / `ORK_FULLK_DEC` into the
-   library's internal per-matmul choice: core count from N-tile count; full-K single-submit when
-   `M small && K≤10752 && int8 && fits-IOVA`; else K-split. Add an **IOVA-fits guard** (the dual
-   layout doubles weight memory and overflows the IOMMU on big/fp16 models). Mechanism in the
-   library, policy (core budget / latency-vs-throughput) from the caller.
-4. **Real per-channel int8 quant** — the bench uses a dummy per-tensor scale (timing only). Needed
+3. **Real per-channel int8 quant** — the bench uses a dummy per-tensor scale (timing only). Needed
    for *correct* output in real serving (correctness, not speed).
-5. **SoC validation** — RK3576 params are inherited from RK3588 (`validated=0`): needs an on-board
+4. **SoC validation** — RK3576 params are inherited from RK3588 (`validated=0`): needs an on-board
    run + tune, then `validated=1`. RK3562/RK3568 not added (see `docs/ADDING_AN_SOC.md`).
-6. **NPU-side persistent thread pool** — the multi-core path still does per-matmul
+5. **NPU-side persistent thread pool** — the multi-core path still does per-matmul
    `pthread_create`/`join`; a persistent pool (like the CPU one) would cut that overhead and push
    multi-core past 1.69×.
-7. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
+6. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
    scheduling, not an ork-driver change. See the [Heterogeneous Serving wiki](https://github.com/oRKLLM/ork-driver/wiki/Heterogeneous-Serving-and-Scheduling).
 
 Low value (measured): **CPU/NPU op overlap** (decode is 97% NPU; prefill ops already threaded);
