@@ -130,7 +130,10 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w); }   /* device buf
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
-    if(dt!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=dt; }  /* fp16<->int8 switches the regcmd mode — force a fresh output buffer + re-warm */
+    /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
+     * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
+     * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
+    if(dt!=c->last_dt){ if(dt==DT_I8) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=dt; }
     size_t need=(size_t)M*N*4;                         /* output is fp32 or int32 (both 4 bytes) */
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;}
     memset(c->cres,0,need);
@@ -150,12 +153,11 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            /* cold-start: the first submit on a fresh output buffer returns stale data, and the
-             * first int8 submit on a context *wedges* once (the int8 NPU mode is stateful) — then
-             * the NPU recovers. So run throwaway warmup submits first and TOLERATE failure; give
-             * them a short timeout so a wedge aborts in ~1s, not the full 6s. Only the final
-             * (real) submit must succeed, with the full timeout. */
-            int reps=c->warmed?1:3;   /* throwaway warmup(s) that may wedge/stale, then the real submit */
+            /* cold-start: the first submit on a fresh output buffer returns stale data (the NPU
+             * is primed against wedging by the RKNPU_ACT_RESET at init / dtype switch, so no
+             * timeout). Run one throwaway warmup submit, then the real one. A short timeout on
+             * the warmup is belt-and-suspenders against an unexpected wedge (aborts in ~1s). */
+            int reps=c->warmed?1:2;
             for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=last?6000:1000;
                 if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ if(last){perror("SUBMIT");return -1;} continue; }
                 bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
