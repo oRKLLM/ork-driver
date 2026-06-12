@@ -6,7 +6,7 @@ AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul layer decode model llama2
+EXAMPLES := test_matmul layer decode model llama2 bench
 
 all: $(EXAMPLES)
 
