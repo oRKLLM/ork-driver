@@ -118,5 +118,7 @@ RK3588 is hardware-validated; RK3576 shares the code path with inherited (untest
   driver. Be precise about that in docs and messages.
 - Independent, community project — **not affiliated with or endorsed by Rockchip**. "Rockchip",
   "RK3576", "RK3588", "RKNN" are trademarks of Rockchip.
-- The library is currently **fp16**. An int8/w8a8 path exists in oRKLLM's history and can be
-  ported in; keep the public API stable when doing so.
+- Both **fp16** (`ork_mm_pack`/`run`, fp16 A·B → fp32 C) and **int8/w8a8** (`ork_mm_pack_i8`/
+  `run_i8`, int8 A·B → int32 C) are supported. Keep the public API stable when extending.
+  Note: mixing both dtypes on one context works, but switching modes triggers a one-time NPU
+  re-warm (the regcmd mode is stateful) — see `run()` in `src/npu.c`.

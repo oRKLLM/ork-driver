@@ -28,12 +28,15 @@ const char  *ork_npu_soc(const ork_npu *ctx);    /* "rk3588", "rk3576", ... */
 int          ork_npu_cores(const ork_npu *ctx);  /* NPU core count */
 int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params are HW-validated */
 
-/* Pack + upload B[K,N] (row-major fp16) into NPU-resident tile layout; reuse across runs.
- * Requires K%32==0 and N%16==0. Returns NULL on bad dims. */
-ork_w       *ork_mm_pack(ork_npu *ctx, int K, int N, const ork_f16 *B);
+/* Pack + upload B[K,N] (row-major) into NPU-resident tile layout; reuse across runs.
+ * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
+ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */
+ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int8/w8a8 weights */
 void         ork_w_free(ork_w *w);
 
-/* C[M,N] (fp32, row-major) = A[M,K] (fp16, row-major) x packed weights. Returns 0 on ok. */
-int          ork_mm_run(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float *C);
+/* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
+ *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32. */
+int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float   *C);
+int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
 
 #endif

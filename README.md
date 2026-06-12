@@ -7,7 +7,7 @@ programs and submitting them to the in-tree `rknpu` DRM kernel driver via ioctls
 `/dev/dri/cardN`. It does **not** use Rockchip's proprietary `librknnrt`, and it is **not** a
 kernel module — it is a small userspace library that talks to the kernel driver that already
 ships with your board. The regcmd ISA was reverse-engineered from scratch; the result is an
-open, dependency-free fp16 matmul primitive fast enough to run a real LLM.
+open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a real LLM.
 
 > Status: **RK3588 validated on hardware** (Radxa ROCK 5B). RK3576 shares the same driver and
 > ISA — the code path works, but its tuning parameters are inherited and need on-device
