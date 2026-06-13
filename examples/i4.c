@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <math.h>
 #include "ork_npu.h"
 static double ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3+t.tv_nsec/1e6; }
 
@@ -25,6 +26,37 @@ static int test(ork_npu*c,int M,int K,int N){
            maxe==0?"OK":"FAIL",(K+10751)/10752,(N+8191)/8192);
     free(A);free(B);free(C); return maxe!=0;
 }
+/* per-group W4A4: fp32 -> int4 (per-group scales along K) -> NPU dequant -> RMS vs fp32 */
+static int gtest(ork_npu*c,int M,int K,int N,int G){
+    int Sk=K/G;
+    float*Af=malloc((size_t)M*K*4),*Bf=malloc((size_t)K*N*4);
+    float*aS=malloc((size_t)M*Sk*4),*bS=malloc((size_t)Sk*N*4),*C=malloc((size_t)M*N*4);
+    signed char*Ai=malloc((size_t)M*K),*Bi=malloc((size_t)K*N);
+    unsigned sd=7+M+K+N+G;
+    for(size_t i=0;i<(size_t)M*K;i++){sd=sd*1103515245+12345;Af[i]=((int)(sd>>9)%2001-1000)/1000.0f;}
+    for(size_t i=0;i<(size_t)K*N;i++){sd=sd*1103515245+12345;Bf[i]=((int)(sd>>9)%2001-1000)/1000.0f;}
+    for(int m=0;m<M;m++)for(int g=0;g<Sk;g++){ float mx=1e-9f; for(int j=0;j<G;j++){float a=Af[m*K+g*G+j];if(a<0)a=-a;if(a>mx)mx=a;}
+        aS[m*Sk+g]=mx/7; for(int j=0;j<G;j++){int q=(int)(Af[m*K+g*G+j]/aS[m*Sk+g]+(Af[m*K+g*G+j]>=0?.5f:-.5f));if(q>7)q=7;if(q<-8)q=-8;Ai[m*K+g*G+j]=(signed char)q;} }
+    for(int g=0;g<Sk;g++)for(int n=0;n<N;n++){ float mx=1e-9f; for(int j=0;j<G;j++){float b=Bf[(g*G+j)*N+n];if(b<0)b=-b;if(b>mx)mx=b;}
+        bS[g*N+n]=mx/7; for(int j=0;j<G;j++){int q=(int)(Bf[(g*G+j)*N+n]/bS[g*N+n]+(Bf[(g*G+j)*N+n]>=0?.5f:-.5f));if(q>7)q=7;if(q<-8)q=-8;Bi[(g*G+j)*N+n]=(signed char)q;} }
+    ork_w*w=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
+    if(!w){printf("  grouped M=%d K=%d N=%d G=%d: pack failed\n",M,K,N,G);return 1;}
+    int rc=ork_mm_run_i4_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
+    if(rc){printf("  grouped M=%d K=%d N=%d G=%d: run rc=%d\n",M,K,N,G,rc);return 1;}
+    double maxe=0,se=0,sr=0;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){
+        double exact=0,f32=0;                          /* exact = same int4 vals + per-group dequant */
+        for(int g=0;g<Sk;g++){ long p=0; for(int j=0;j<G;j++)p+=(long)Ai[m*K+g*G+j]*Bi[(g*G+j)*N+n];
+            exact+=(double)aS[m*Sk+g]*bS[g*N+n]*p; }
+        for(int k=0;k<K;k++)f32+=(double)Af[m*K+k]*Bf[k*N+n];
+        double e=C[m*N+n]-exact; if(e<0)e=-e; if(e>maxe)maxe=e;   /* NPU vs exact dequant: mechanism */
+        double q=C[m*N+n]-f32; se+=q*q; sr+=f32*f32;              /* vs fp32: the quant error */
+    }
+    int ok=maxe<0.05;                                  /* mechanism must be exact (fp32 rounding only) */
+    printf("  grouped M=%-2d K=%-5d N=%-4d G=%-3d: dequant maxerr=%.4f %s | quant RMS vs fp32 %.1f%% (Sk=%d)\n",
+           M,K,N,G,maxe,ok?"EXACT":"WRONG",100.0*sqrt(se/sr),Sk);
+    free(Af);free(Bf);free(aS);free(bS);free(C);free(Ai);free(Bi); return !ok;
+}
 int main(void){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed (NPU?)\n");return 1;}
     printf("W4A4 public API (ork_mm_pack_i4/ork_mm_run_i4) vs CPU int4 reference:\n");
@@ -34,10 +66,17 @@ int main(void){
     fail|=test(c,2,256,64);       /* K within one slice           */
     fail|=test(c,1,12288,64);     /* K-split (>10752) + accumulate */
     fail|=test(c,3,2048,256);     /* M + N tiling, mid K          */
+    printf("per-group W4A4 (fp32 -> int4 group-quant -> NPU dequant) vs fp32:\n");
+    fail|=gtest(c,1,2048,256,128);    /* decode, group_size 128 (16 groups) */
+    fail|=gtest(c,1,4096,512,128);    /* more groups + N-tiling                */
+    fail|=gtest(c,4,2048,128,64);     /* M-tiling + finer groups                */
     printf("%s\n", fail?"SOME TESTS FAILED":"ALL W4A4 API TESTS PASSED");
 
     if(getenv("ORK_I4_BENCH")){   /* decode-shape throughput: M=1, time R runs (set ORK_NPU_MC to compare) */
-        int K=2048,N=2048,R=100; signed char*A=malloc(K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)N*4);
+        int K=2048,N=2048,R=100;
+        if(getenv("ORK_BENCH_K")) K=atoi(getenv("ORK_BENCH_K"));
+        if(getenv("ORK_BENCH_N")) N=atoi(getenv("ORK_BENCH_N"));
+        signed char*A=malloc(K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)N*4);
         for(int i=0;i<K;i++) A[i]=(i%15)-7;
         for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int)(i%15)-7;
         ork_w*w=ork_mm_pack_i4(c,K,N,B);

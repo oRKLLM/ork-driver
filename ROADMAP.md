@@ -48,8 +48,15 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    wide submit per K-slice (~nc·Sk·Sn submits/matmul, not Sn·64-tiles). This fixed a hard board-hang
    (the old 64-tile multi-core fired ~32 submits/matmul with no wedge recovery → kernel hang at decode
    scale) and is ~860× faster single-core (the old per-64-tile serial did RESET+2×2000ms-reps/tile).
-   M=1 K=2048 N=2048 decode: **0.19 ms/matmul (~5200/s), stable over sustained runs.**
-   **Remaining:** real per-group scales, bigger multi-core gains on large-N (LM head / FFN), llama.cpp wiring.
+   M=1 K=2048 N=2048 decode: **0.19 ms/matmul (~5200/s), stable over sustained runs.** Multi-core
+   scales to **~2.3× on 3 cores at real shapes** (N=8192 2.28×, FFN N=11008 2.28×, N=16384 2.38×).
+   **Per-group scales — DONE:** `ork_mm_pack_i4_grouped(…,G)` + `ork_mm_run_i4_grouped(…,aScale,bScale,Cf)`
+   K-slice at group boundaries and dequantize each group's int partial in fp32 (the int MAC can't
+   scale mid-K-sum) — `C[m][n]=Σ_g aScale[m][g]·bScale[g][n]·Σ_{k∈g}A·B`. Validated EXACT (maxerr=0
+   vs reference dequant) across multi-group (Sk=32), multi-core, N-tiling; ~9.5% RMS vs fp32 is
+   W4A4's floor (int4 activations dominate — per-group helps weights, not the activation 4-bit cap).
+   Cost: K/G submits/core (larger G = fewer submits, coarser scale).
+   **Remaining:** llama.cpp wiring (run a real model end-to-end with a tokenizer).
 
    **w4a16 (fused fp16×int4) is a HARDWARE dead-end on RK3588.** The NPU MAC only multiplies MATCHING
    precisions: the only supported rknn_matmul types are 1 (f16×f16), 2/3/9 (int8×int8), 10 (int4×int4)

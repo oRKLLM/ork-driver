@@ -36,7 +36,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop; };
-struct ork_w   { int K, N, Sk, Sn, dtype; struct buf *Bb; struct buf *Bf; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; };
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
@@ -217,6 +217,22 @@ ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403);
         if(!b->cpu){ ork_w_free(w); return NULL; }
         tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0,Nc);
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+    }
+    return w;
+}
+/* grouped pack: K split into groups of G (each its own resident slice) for per-group scales. G%32,
+ * K%G, G<=10752. Sk = K/G groups; run_i4_grouped scales each group's partial before accumulating. */
+ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
+    if(K%32||N%64||G%32||K%G||G>ORK_I4_KS) return NULL;
+    int NMAX=c->soc->nmax, Sk=K/G, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;w->gsize=G;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
+        int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403);
+        if(!b->cpu){ ork_w_free(w); return NULL; }
+        tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
     }
     return w;
@@ -416,6 +432,61 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     for(int i=0;i<nc;i++) args[i]=(struct i4mcw){c,i,nc,M,w,A,C,0};
     for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker,&args[i]);
     i4_mcworker(&args[0]);                                /* core 0 on the calling thread */
+    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
+    return 0;
+}
+
+/* ---- grouped W4A4 (per-group scales): each K-group is its own wide submit (the int MAC can't scale
+ * mid-K-sum), scaled aScale[m][g]*bScale[g][n] into an fp32 accumulator. Same column-split as above;
+ * cost is K/G submits/core (more than per-channel — larger G trades accuracy for fewer submits). ---- */
+struct i4gw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; const float *aS,*bS; float *Cf; int rc; };
+static void *i4_mcworker_g(void *vp){
+    struct i4gw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
+    ork_w *w=a->w; int K=w->K,N=w->N,G=w->gsize,NMAX=c->soc->nmax,Sk=w->Sk;
+    struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*O=&c->mcc[i]; a->rc=0;
+    float *acc=malloc((size_t)NMAX*4); if(!acc){a->rc=-1;return NULL;}
+    for(int ns=0;ns<w->Sn;ns++){
+        int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NB=Nc/64;
+        int b0=(int)((long)i*NB/nc),b1=(int)((long)(i+1)*NB/nc); if(b1<=b0)continue;
+        int ci0=b0*64,Ncore=(b1-b0)*64;
+        for(int m=0;m<M;m++){ const int8_t*Arow=a->A+(size_t)m*K;
+            for(int z=0;z<Ncore;z++)acc[z]=0;
+            for(int g=0;g<Sk;g++){
+                tile_i4_Aslice(AF->cpu,Arow,g*G,G); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                uint64_t wbase=w->Bb[(size_t)ns*Sk+g].dma+(uint64_t)b0*G*32;
+                uint32_t rc[REGCMD_I4_N]; synth_i4(rc,G,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+                int reps=c->mwarm[i]?1:2;
+                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=last?6000:1000;
+                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                    bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
+                c->mwarm[i]=1;
+                int16_t*o=O->cpu; float as=a->aS[(size_t)m*Sk+g];
+                for(int col=0;col<Ncore;col++) acc[col]+= as * a->bS[(size_t)g*N + n0+ci0+col] * (float)o[col];
+            }
+            for(int z=0;z<Ncore;z++) a->Cf[(size_t)m*N + n0+ci0+z]=acc[z];
+        }
+    }
+    free(acc); return NULL;
+}
+int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
+    if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
+    int fd=c->fd, NB=w->N/64, nc=budget(c);
+    if(nc>NB)nc=NB;
+    if(nc>c->soc->cores)nc=c->soc->cores;
+    if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    if(nc<1)nc=1;
+    if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
+    if(mc_ensure(c,nc)) return -1;
+    size_t osz=(size_t)c->soc->nmax*2;
+    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu)return -2; } }
+    struct i4gw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
+    for(int i=0;i<nc;i++) args[i]=(struct i4gw){c,i,nc,M,w,A,aScale,bScale,C,0};
+    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker_g,&args[i]);
+    i4_mcworker_g(&args[0]);
     for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
     for(int i=0;i<nc;i++) if(args[i].rc) return -1;
     return 0;
