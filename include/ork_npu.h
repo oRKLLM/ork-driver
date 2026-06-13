@@ -61,6 +61,13 @@ int          ork_mm_run_i4_grouped(ork_npu *ctx, ork_w *w, int M, const int8_t *
  * copy = cres->C memcpy. Any pointer may be NULL. Pins integration overhead vs the NPU itself. */
 void         ork_npu_run_timing(double *setup, double *submit, double *copy, long *n);
 
+/* Profiling (ORK_MCPROF diagnostic): per-core phase times (us) inside the multi-core prefill (M>1)
+ * path — copy (activation host-copy + bsync), submit (regcmd + ioctl + result bsync), acc (host
+ * accumulate), and the submit count. Pins why large-M multi-core barely scales. Call _reset before
+ * the timed region. core in [0, cores). */
+void         ork_npu_mc_reset(void);
+void         ork_npu_mc_timing(int core, double *copy, double *submit, double *acc, long *n);
+
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8
  * submit at (K,N) (N <= SoC N-cap, K%32, N%32) on its own buffers. Returns 0 if the submit
  * completed (C[N] int32 valid — validate vs CPU), -1 if it wedged (K exceeds the per-op K-tile

@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <sched.h>
 #include <time.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
@@ -281,6 +282,15 @@ static int mc_ensure(ork_npu *c,int nc){
     }
     return 0;
 }
+static double ork_now_us(void);   /* fwd (defined below) */
+/* ORK_MCPROF diagnostic: per-core phase timing inside mcworker's prefill (M>1) path —
+ * copy (activation tile host-copy + bsync), submit (regcmd + ioctl + result bsync), acc
+ * (host accumulate). Pins why large-M multi-core barely scales. Read via ork_npu_mc_timing. */
+#define MCPROF_MAX 8
+static double g_mc_copy[MCPROF_MAX], g_mc_sub[MCPROF_MAX], g_mc_acc[MCPROF_MAX]; static long g_mc_n[MCPROF_MAX];
+void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub[i]=g_mc_acc[i]=0;g_mc_n[i]=0;} }
+void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
+    if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; };
 static void *mcworker(void *vp){
     struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
@@ -320,9 +330,11 @@ static void *mcworker(void *vp){
             int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0),R=RB/Kp;if(R<1)R=1;int chunk=sched?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;
             struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)t0*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
             for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                double _tc0=ork_now_us();
                 if(dt==DT_F16){f16*ad=AF->cpu;const f16*Af=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j];}
                 else{int8_t*ad=AF->cpu;const int8_t*Ai=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j];}
                 bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
                 uint32_t rc[REGCMD_N];
                 if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
                 else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
@@ -334,8 +346,10 @@ static void *mcworker(void *vp){
                     if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;return NULL;}continue;}
                     bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);}
                 c->mwarm[i]=1;
+                double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
                 if(dt==DT_F16){float  *cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
                 else{int32_t*cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
+                g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
             }
         }
     }
@@ -344,8 +358,22 @@ static void *mcworker(void *vp){
 /* persistent worker pool: spawned once, each pinned to driving NPU core `id`. Signalled per matmul
  * (gen bump) — workers with id<nc run mcworker for that job, the rest sleep. Replaces per-matmul
  * pthread_create/join (the spawn cost matters at ~200 matmuls/decode-token). */
+/* Pin the calling thread to a big CPU core. On RK3576 (4×A72+4×A53) and RK3588 (4×A76+4×A55)
+ * the big cluster is the HIGH-numbered CPUs, so map NPU-driver thread `id` -> CPU (ncpu-1-id):
+ * distinct big cores, no contention. Without this the scheduler parks the pool workers on the
+ * little cores, making them ~2x slower than the (lucky big-core) calling thread and collapsing
+ * multi-core prefill scaling to ~1.1x. ORK_NO_AFFINITY=1 disables (e.g. odd topologies). */
+static void pin_big_core(int id){
+    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
+    if(off) return;
+    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return;
+    int cpu=(int)ncpu-1-id; if(cpu<0) cpu=0;
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
+    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+}
 static void *npu_pool_worker(void *vp){
     struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
+    pin_big_core(id);                          /* keep this worker off the little cores */
     for(;;){
         pthread_mutex_lock(&c->pmu);
         while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
@@ -357,6 +385,7 @@ static void *npu_pool_worker(void *vp){
 }
 static void npu_pool_ensure(ork_npu *c){
     if(c->pool_n) return;
+    pin_big_core(0);                           /* calling thread drives NPU core 0 — keep it big too */
     c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
     for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,npu_pool_worker,&c->pwa[i]); }
 }
@@ -401,6 +430,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 struct i4mcw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; int32_t *C; int rc; };
 static void *i4_mcworker(void *vp){
     struct i4mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
+    pin_big_core(i);                           /* core 0 = calling thread, 1.. = spawned workers */
     ork_w *w=a->w; int K=w->K, N=w->N, KS=ORK_I4_KS, NMAX=c->soc->nmax;
     struct buf *RC=&c->mrc[i], *AF=&c->maf[i], *O=&c->mcc[i]; a->rc=0;
     int32_t *acc=malloc((size_t)NMAX*4); if(!acc){a->rc=-1;return NULL;}
@@ -455,6 +485,7 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
 struct i4gw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; const float *aS,*bS; float *Cf; int rc; };
 static void *i4_mcworker_g(void *vp){
     struct i4gw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
+    pin_big_core(i);                           /* core 0 = calling thread, 1.. = spawned workers */
     ork_w *w=a->w; int K=w->K,N=w->N,G=w->gsize,NMAX=c->soc->nmax,Sk=w->Sk;
     struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*O=&c->mcc[i]; a->rc=0;
     float *acc=malloc((size_t)NMAX*4); if(!acc){a->rc=-1;return NULL;}
@@ -510,6 +541,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     int b=budget(c), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
     if(nc>1) return run_multicore(c,w,M,A,C,nc);
+    pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never

@@ -57,6 +57,10 @@ RKNN_DIR ?= /tmp/rknn
 rknn_vs_ork: tools/rknn_vs_ork.c $(CORE)
 	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< $(CORE) -L$(RKNN_DIR) -lrknnrt -lm
 
+# diagnostic: why does large-M (prefill) multi-core barely scale? per-core copy/submit/acc split.
+mc_prof: tools/mc_prof.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
