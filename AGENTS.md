@@ -126,3 +126,39 @@ RK3588 is hardware-validated; RK3576 shares the code path with inherited (untest
   `run_i8`, int8 A·B → int32 C) are supported. Keep the public API stable when extending.
   Note: mixing both dtypes on one context works, but switching modes triggers a one-time NPU
   re-warm (the regcmd mode is stateful) — see `run()` in `src/npu.c`.
+
+---
+
+## 6. Benchmarking & performance (MANDATORY procedure)
+
+The open stack is `ork-driver → ggml-ork → llama.cpp` (the [`oRKLLM/llama.cpp-rockchip`](https://github.com/oRKLLM/llama.cpp-rockchip) fork vendors this repo as a submodule and adds the `ggml-ork` backend). Full history + every experiment: the **[Optimization Roadmap](https://github.com/oRKLLM/ork-driver/wiki/Optimization-Roadmap)**, **[Experiment Log](https://github.com/oRKLLM/ork-driver/wiki/Experiment-Log)**, and **[Benchmark Standards](https://github.com/oRKLLM/ork-driver/wiki/Benchmark-Standards-and-Methodology)** wiki pages.
+
+### Before stating ANY performance number — run the standardized benchmark
+1. **Same model on both runtimes.** ggml-ork: a GGUF (Q8_0). Closed baseline: the matching `.rkllm` for librkllmrt (full-model) or the RKNN matmul API (per-matmul). Never compare across model sizes or paths.
+2. **Use `llama-bench`, NOT short `llama-cli` prompts** (warmup + repetition; short prompts + the lazy weight-pack produce false prefill numbers). For matmul-level work use `tools/rknn_vs_ork` / `tools/mc_prof`.
+3. **Verify governors at max BEFORE timing:** DDR `/sys/class/devfreq/dmc/governor`=performance@2112MHz, CPU A76 `cpu4..7` performance@2.4GHz. A parked DDR governor ~halves decode.
+4. **Run with `-t <big-core-count>` (4 on RK3588), not `-t 8`** — the little A55 cores drag the threadpool barrier and contend with the NPU-driver threads. This alone is the difference between losing to and beating librkllmrt.
+5. Report BOTH prefill and decode, ≥2 reps, and state model / path / warm-vs-cold.
+6. **Validate any matmul-path change against the CPU reference** (`make quant`, RMS unchanged) — `mc_prof`/`rknn_vs_ork` use dummy data and do NOT check correctness.
+
+Reference (Qwen3-1.7B-w8a8, RK3588 board `10.3.0.236`, `-t 4`, warm): librkllmrt **184 prefill / 11.71 decode** tok/s; open stack **178 (97%) / 12.8 (109%, beats it)**.
+
+### Env knobs (set on the `llama-bench`/`mc_prof`/`quant` command)
+| var | effect |
+|---|---|
+| `ORK_NPU_MC=<n>` | cap NPU cores per matmul (overrides the auto-tuner / `set_core_budget`) |
+| `ORK_FULLK_PREFILL=0` | disable full-K prefill (default on; one submit/M-tile over full K for power-of-2 K) |
+| `ORK_FULLK_DEC=0` | disable the full-K decode `Bf` layout |
+| `ORK_FUSE=1` | QKV/gate-up fusion (off — measured neutral) |
+| `ORK_NO_AFFINITY=1` | don't pin NPU-driver threads to big cores (default: pin) |
+| `ORK_ZC_OUT=1` | output zero-copy (off — **buggy**, single-tile ~90% wrong, needs regcmd debug) |
+| `ORK_PROFILE=1` | per-section timing (quant / NPU run / dequant; decode vs prefill; run_multicore phases) — printed by ggml-ork on free |
+| `ORK_QUANT=4` | int4 W4A4 instead of int8 (experimental, incoherent) |
+
+### Diagnostic tools (board only; not in `all`/`test`)
+- `make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters] [a]` — per-matmul ork vs the closed RKNN matmul API (same int8 (M,K,N)); `a` arg = the AC-layout probe.
+- `make mc_prof && sudo ./mc_prof [M] [K] [N] [iters]` — per-core copy/submit/accumulate breakdown; `ORK_TEST_DMA=1` puts A in a zero-copy DMA buffer.
+- `make batch_probe && sudo ./batch_probe [ntask]` — multi-task-per-submit probe (it times out; the kernel rejects `task_number>1`).
+
+### Zero-copy DMA (`ork_dma_alloc`/`ork_dma_free`)
+NPU-coherent CPU-mapped buffers; a matmul whose A/C live in one has the regcmd read/write it in place (no host memcpy). **Input zero-copy (A): validated correct, default on, −17% on the full-K prefill matmul.** **Output zero-copy (C): buggy, off** — see the knob table. Realizing it end-to-end needs a ggml-ork DMA buffer type so activations land in a DMA buffer (the open Stage-2 item).
