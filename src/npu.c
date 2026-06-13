@@ -624,12 +624,14 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous). */
-        /* input zero-copy: validated correct (regcmd reads A in place). Output zero-copy: the regcmd's
-         * result address isn't fully redirected by 0x4020 alone (single-tile ~90% wrong) — a 2nd output
-         * address register needs RE, so it stays opt-in (ORK_ZC_OUT) until fixed. */
-        struct buf *abuf=dma_find(c,A);
+        struct buf *abuf=dma_find(c,A);   /* INPUT zero-copy: validated correct, default on */
+        /* OUTPUT zero-copy: still WRONG even with a fresh-buffer re-warm (the single-tile ~90%-wrong /
+         * 4-tile-~5%-wrong symptom persists) — the regcmd's result write isn't landing where 0x4020
+         * points for a non-Cc buffer. Needs regcmd-level debugging (dump where the result lands).
+         * Opt-in (ORK_ZC_OUT) + off by default until fixed. */
         struct buf *cbuf=(w->Sn==1 && getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
         if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
+        if(cbuf) c->warmed=0;             /* re-warm the fresh output buffer (necessary but not sufficient) */
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
             for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
