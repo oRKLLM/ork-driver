@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
+#include <time.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -559,6 +560,46 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
+}
+
+static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
+/* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`
+ * identical small int8 matmuls (single core) as (a) ntask separate task_number=1 ioctls vs (b) ONE
+ * ioctl with task_number=ntask. Returns 0/ok, -1 wedge, -2 bad dims (K%32, N%32, 1<=ntask<=32).
+ * FINDING (2026-06-13): the batched path (b) TIMES OUT (`task counter: 0x0` — NPU dispatches no tasks;
+ * kernel soft-resets + recovers). The naive task[]/subcore config doesn't drive multi-task execution.
+ * AND it's moot for cross-matmul batching: the closed runtime's captured 12-task submit is ONE
+ * matmul's program (4 sub-tasks × 3 subcores), NOT multiple matmuls batched — so librkllmrt also does
+ * ~1 submit/matmul and pays the same per-matmul submit floor (~11 tok/s on 1.7B, which ork-driver
+ * matched). The floor is inherent; cross-matmul task-batching is not the reference's mechanism nor
+ * the lever. See tools/batch_probe.c. */
+int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,double*us_batched){
+    int fd=c->fd,CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||ntask<1||ntask>32) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403); if(!W.cpu) return -2;
+    memset(W.cpu,1,(size_t)K*N); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; memset(ad,1,K); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task*t=c->task.cpu;                 /* task[] array: ntask tasks, same regcmd */
+    for(int i=0;i<ntask;i++){memset(&t[i],0,sizeof t[i]);t[i].enable_mask=0xd;t[i].int_mask=0x300;t[i].int_clear=0x1ffff;t[i].regcfg_amount=108;t[i].regcmd_addr=c->regcmd.dma;}
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    /* single-core: set only subcore_task[0] (like probe_single_i8); leave [1]/[2] zero */
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=3000;
+    sub.task_number=1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
+    double t0=ork_now_us();                          /* (a) ntask separate ioctls */
+    for(int i=0;i<ntask;i++){ sub.task_number=1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
+    *us_unbatched=ork_now_us()-t0;
+    sub.task_number=ntask; sub.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)ntask};
+    t0=ork_now_us();                                 /* (b) one ioctl, ntask tasks */
+    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    *us_batched=ork_now_us()-t0;
+    bdestroy(fd,&W);bdestroy(fd,&O); return 0;
 }
 
 /* RE: probe in-place K-slicing of a FULL-K weight buffer (for a single-layout decode+prefill).

@@ -62,6 +62,12 @@ int          ork_mm_run_i4_grouped(ork_npu *ctx, ork_w *w, int M, const int8_t *
  * cap; recoverable), -2 on bad dims. See tools/ksubmit_probe.c. */
 int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 
+/* RE/calibration only: does batching tasks per RKNPU_SUBMIT amortize the per-submit round-trip
+ * floor? Runs `ntask` identical small int8 matmuls as ntask separate ioctls vs one ioctl with
+ * task_number=ntask, writing the two total wall times (us). Returns 0/ok, -1 wedged, -2 bad dims.
+ * See tools/batch_probe.c. */
+int          ork_npu_probe_batch(ork_npu *ctx, int ntask, int K, int N, double *us_unbatched, double *us_batched);
+
 /* RE/calibration only: probe in-place K-slicing of a full-K weight buffer. Packs B[Kfull,N] fp16
  * full-K, runs one M=1 submit over k in [0,Kp), with up to `nov` regcmd overrides (block 0x0201)
  * to hunt the per-N-tile weight stride register. C[N] should equal the Kp-partial sum if slicing

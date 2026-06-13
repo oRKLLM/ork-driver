@@ -46,6 +46,10 @@ i4_probe: tools/i4_probe.c $(CORE)
 gguf_q4k: tools/gguf_q4k.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
+batch_probe: tools/batch_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
