@@ -20,15 +20,21 @@ static double bench_ork(int M,int K,int N,int iters,int cores){
   int32_t* C=malloc((size_t)M*N*4);
   ork_w* w=ork_mm_pack_i8(c,K,N,B); if(!w)return -1;
   if(ork_mm_run_i8(c,w,M,A,C))return -1;
+  ork_npu_mc_reset();
   double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,C);
   double us=(now_us()-t0)/iters;
+  if(getenv("ORK_MCPROF") && cores>1 && M>1){            /* per-core balance check (prefill path) */
+    for(int i=0;i<cores;i++){ double cp,su,ac; long n; ork_npu_mc_timing(i,&cp,&su,&ac,&n);
+      if(n) fprintf(stderr,"      [%dx%dx%d c%d] submits=%ld copy=%.1f submit=%.1f acc=%.1f us/submit\n",
+                    M,K,N,i,n,cp/n,su/n,ac/n); }
+  }
   ork_w_free(w); ork_npu_free(c); free(A);free(B);free(C); return us;
 }
 
-static double bench_rknn(int M,int K,int N,int iters){
+static double bench_rknn_ac(int M,int K,int N,int iters,int ac_layout){
   rknn_matmul_ctx ctx; rknn_matmul_info info; rknn_matmul_io_attr io;
   memset(&info,0,sizeof info); memset(&io,0,sizeof io);
-  info.M=M; info.K=K; info.N=N; info.type=RKNN_INT8_MM_INT8_TO_INT32;
+  info.M=M; info.K=K; info.N=N; info.type=RKNN_INT8_MM_INT8_TO_INT32; info.AC_layout=ac_layout;
   int ret=rknn_matmul_create(&ctx,&info,&io); if(ret<0)return -1;
   rknn_tensor_mem* Am=rknn_create_mem(ctx, io.A.size);
   rknn_tensor_mem* Bm=rknn_create_mem(ctx, io.B.size);
@@ -43,9 +49,18 @@ static double bench_rknn(int M,int K,int N,int iters){
   rknn_destroy_mem(ctx,Am); rknn_destroy_mem(ctx,Bm); rknn_destroy_mem(ctx,Cm);
   rknn_matmul_destroy(ctx); return us;
 }
+static double bench_rknn(int M,int K,int N,int iters){ return bench_rknn_ac(M,K,N,iters,0); }
 
 int main(int argc,char**argv){
   int iters=argc>1?atoi(argv[1]):200;
+  /* 1c-i probe: does RKNN's native A layout (AC_layout=1) actually beat normal A (0) on this HW? */
+  if(argc>2 && argv[2][0]=='a'){
+    int M=512,K=2048,N=2048;
+    printf("RKNN A-layout probe (%dx%dx%d int8, %d iters):\n",M,K,N,iters);
+    double n0=bench_rknn_ac(M,K,N,iters,0), n1=bench_rknn_ac(M,K,N,iters,1);
+    printf("  normal A (AC_layout=0): %.1f us\n  native A (AC_layout=1): %.1f us   -> native/normal %.2f\n",n0,n1,n1>0?n1/n0:0);
+    return 0;
+  }
   int shapes[][3]={{1,2048,2048},{1,2048,6144},{1,6144,2048},{1,2048,1536},{512,2048,2048}};
   printf("int8 matmul, %d warm iters. us/matmul (lower=faster):\n",iters);
   printf("  %-16s %10s %10s %10s %12s\n","M x K x N","ork-1core","ork-3core","rknn-1core","ork1/rknn");
