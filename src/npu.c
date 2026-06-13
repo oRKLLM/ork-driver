@@ -370,6 +370,11 @@ static void pin_big_core(int id){
     int cpu=(int)ncpu-1-id; if(cpu<0) cpu=0;
     cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
     pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+    /* NOTE: this pins only the dedicated NPU-driver threads to their own big core. We deliberately do
+     * NOT restrict the whole process / CPU threadpool to the big cluster: doing so at init was measured
+     * to oversubscribe and CRATER decode at -t 8 (9.3 -> 2.3 tok/s) while not helping -t 4. The big-core
+     * win for the CPU side comes from running with -t = big-core-count (e.g. -t 4 on RK3588), which is a
+     * user/serving choice, not something to force here. See the Thread-Count wiki experiment. */
 }
 static void *npu_pool_worker(void *vp){
     struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
