@@ -47,6 +47,12 @@ int main(void){
     fail|=check(ctx,16,4096,512);
     fail|=check(ctx,8,6144,256);
     fail|=check(ctx,1,2048,2048);   /* decode (M=1) */
+    /* Tier 1c-ii: single-core full-K prefill path (set ORK_FULLK_PREFILL=1 to exercise it). K<=10752. */
+    ork_npu_set_core_budget(ctx,1);
+    printf("  -- single-core (budget=1; full-K prefill if ORK_FULLK_PREFILL=1) --\n");
+    fail|=check(ctx,512,2048,2048);
+    fail|=check(ctx,128,2048,2048);
+    fail|=check(ctx,64,4096,512);
     ork_npu_free(ctx);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail;

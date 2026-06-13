@@ -47,6 +47,11 @@ struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf;
  * override: ORK_NPU_MC caps cores, ORK_FULLK_DEC=0 disables the full-K decode layout. */
 static int env_mc(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_NPU_MC"); v=e?atoi(e):-1;} return v; }  /* -1 = unset */
 static int fdec(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_FULLK_DEC"); v=(e&&atoi(e)==0)?0:1;} return v; } /* default ON; =0 disables */
+/* Tier 1c-ii: use the full-K layout (Bf) for PREFILL (M>1) too — one submit per M-tile over full K
+ * (M-scheduler), no K-split host accumulate. Default ON for power-of-2 K<=10752 (validated vs the CPU
+ * reference in examples/quant: correct + ~1.8x single-core / +14% end-to-end prefill); non-power-of-2
+ * K (e.g. 6144) falls back to the K-split path. ORK_FULLK_PREFILL=0 disables. */
+static int fullk_pf(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_FULLK_PREFILL"); v=(e&&atoi(e)==0)?0:1;} return v; }
 static int budget(ork_npu*c){ int b=env_mc(); if(b<0)b=c->core_budget; if(b>c->soc->cores)b=c->soc->cores; if(b<1)b=1; return b; } /* effective max cores */
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
@@ -171,7 +176,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
      * K-split path (correct, just slower). No crash, no ceiling guess. */
-    if(fdec() && dt==DT_I8 && K<=10752 && budget(c)>1){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(fdec() && dt==DT_I8 && K<=10752 && (budget(c)>1 || fullk_pf())){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
@@ -320,6 +325,32 @@ static void *mcworker(void *vp){
                 bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);}
             c->mwarm[i]=1;
             int32_t*cc=CC->cpu,*cr=a->cres; for(int col=0;col<Ncore;col++)cr[n0+coff+col]=cc[col];
+        }
+        return NULL;
+    }
+    if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* Tier 1c-ii: full-K PREFILL (power-of-2 K only) — one submit/M-tile over full K, no K-split accumulate */
+        int Kp=K, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
+        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
+            int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
+            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                double _tc0=ork_now_us();
+                int8_t*ad=AF->cpu; const int8_t*Ai=A; for(int r=0;r<mco;r++)for(int j=0;j<K;j++)ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
+                bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
+                uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
+                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+                int reps=c->mwarm[i]?1:2;
+                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=last?6000:1000;
+                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;return NULL;}continue;}
+                    bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);}
+                c->mwarm[i]=1;
+                double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
+                int32_t*cc=CC->cpu,*cr=a->cres; for(int r=0;r<mco;r++)for(int n=0;n<Ncore;n++)cr[(size_t)(m0+r)*N+(n0+coff+n)]=cc[(size_t)r*Ncore+n];
+                g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
+            }
         }
         return NULL;
     }
@@ -559,6 +590,28 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t maxout=0; for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);int R=RB/Kp;if(R<1)R=1;
         int chunk=sd?4*R:((RB/2)/Kp); if(chunk<1)chunk=1; int rows=chunk<M?chunk:M; int nc=N<NMAX?N:NMAX; size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;}
     if(c->ccsz<maxout){bdestroy(fd,&c->Cc);c->Cc=bcreate(fd,maxout,0x403);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu)return -1;}
+    /* Tier 1c-ii: full-K prefill — one submit per M-tile over the FULL K (Bf layout), M-scheduler on,
+     * result written directly (no K-split, no host accumulate). Saves the second K-slice's accumulate +
+     * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
+    if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
+        int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
+        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
+            for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+                double _tc0=ork_now_us();
+                int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
+                bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+                double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
+                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,sched,CBUF);
+                memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+                if(submit1(c)) return -1;
+                double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
+                int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+                g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
+            }
+        }
+        memcpy(C,c->cres,need); return 0;
+    }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
         int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0), R=RB/Kp; if(R<1)R=1; int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
