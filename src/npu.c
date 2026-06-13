@@ -601,16 +601,17 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
+            static int nohc=-1; if(nohc<0) nohc=getenv("ORK_NOHOSTCOPY")?1:0;  /* sim: skip host copy+writeout to bound the zero-copy ceiling (timing only, garbage output) */
             for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
                 double _tc0=ork_now_us();
-                int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
-                bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+                if(!nohc){ int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j]; }
+                bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);   /* real zero-copy still bsyncs (coherency); only the gather memcpy is skipped */
                 double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
                 uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,sched,CBUF);
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(submit1(c)) return -1;
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
-                int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+                if(!nohc){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
                 g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
             }
         }
