@@ -25,8 +25,10 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     int cores=ork_npu_cores(c);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    int8_t*A=malloc((size_t)M*K); memset(A,1,(size_t)M*K);
+    int dma=getenv("ORK_TEST_DMA")!=NULL;   /* allocate A in a zero-copy DMA buffer to exercise the no-gather path */
+    int8_t*A=dma?ork_dma_alloc(c,(size_t)M*K):malloc((size_t)M*K); if(A)memset(A,1,(size_t)M*K);
     int32_t*C=malloc((size_t)M*N*4);
+    if(dma) printf("[A in zero-copy DMA buffer]\n");
     ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
     printf("int8 matmul %dx%dx%d, %d warm iters. us/matmul:\n",M,K,N,iters);
 
@@ -48,5 +50,5 @@ int main(int argc,char**argv){
         printf("    core %d: submits=%ld  copy=%.0f  submit=%.0f  acc=%.0f  | per-submit: copy=%.1f submit=%.1f acc=%.1f\n",
                i, n, cp, su, ac, n?cp/n:0, n?su/n:0, n?ac/n:0);
     }
-    ork_w_free(w); ork_npu_free(c); free(A);free(B);free(C); return 0;
+    ork_w_free(w); if(!dma)free(A); ork_npu_free(c); free(B);free(C); return 0;   /* dma A freed by ork_npu_free */
 }

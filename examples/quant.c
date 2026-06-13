@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdint.h>
+#include <string.h>
 #include "ork_npu.h"
 static unsigned sd=1; static float frand(void){sd=sd*1103515245+12345;return ((int)((sd>>9)&0x3fff)-8192)/16384.0f;} /* ~[-0.5,0.5] */
 static int8_t q8(float x){int q=(int)lrintf(x);return (int8_t)(q<-127?-127:q>127?127:q);}
@@ -30,14 +31,21 @@ static int check(ork_npu*ctx,int M,int K,int N){
     for(int m=0;m<M;m++){float mx=0;for(int k=0;k<K;k++){float a=fabsf(A[(size_t)m*K+k]);if(a>mx)mx=a;}
         as[m]=mx>0?mx/127.0f:1.0f; for(int k=0;k<K;k++)Aq[(size_t)m*K+k]=q8(A[(size_t)m*K+k]/as[m]);}
     ork_w*w=ork_mm_pack_i8(ctx,K,N,Bq); if(!w){printf("pack failed\n");return 1;}
-    int32_t*Ci=malloc((size_t)M*N*4); if(ork_mm_run_i8(ctx,w,M,Aq,Ci)){printf("run failed\n");return 1;}
+    /* ORK_TEST_DMA: put the activation + output in zero-copy DMA buffers so ork_mm_run_i8 takes the
+     * no-host-copy path — validates that path against the same fp32 reference. */
+    int dma=getenv("ORK_TEST_DMA")!=NULL; int8_t*Aqd=Aq; int32_t*Ci;
+    if(dma){ Aqd=ork_dma_alloc(ctx,(size_t)M*K); if(Aqd)memcpy(Aqd,Aq,(size_t)M*K); else Aqd=Aq;
+             Ci=ork_dma_alloc(ctx,(size_t)M*N*4); if(!Ci)Ci=malloc((size_t)M*N*4); }
+    else Ci=malloc((size_t)M*N*4);
+    if(ork_mm_run_i8(ctx,w,M,Aqd,Ci)){printf("run failed\n");return 1;}
     double num=0,den=0,mx=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){double c=(double)Ci[(size_t)m*N+n]*as[m]*ws[n],r=Cf[(size_t)m*N+n];
         double e=c-r; num+=e*e; den+=r*r; if(fabs(e)>mx)mx=fabs(e);}
     double rms=den>0?sqrt(num/den):0;
     int ok=rms<0.03;   /* int8 per-channel: RMS rel err ~<1%; 3% is a generous pass bar */
     printf("  %s MKN=%d,%d,%d  RMS rel err=%.3f%%  max abs err=%.4f\n",ok?"ok  ":"WRONG",M,K,N,rms*100,mx);
-    ork_w_free(w); free(A);free(B);free(Cf);free(ws);free(Bq);free(as);free(Aq);free(Ci);
+    ork_w_free(w); free(A);free(B);free(Cf);free(ws);free(Bq);free(as);free(Aq);
+    if(dma){ if(Aqd!=Aq)ork_dma_free(ctx,Aqd); ork_dma_free(ctx,Ci); } else free(Ci);
     return ok?0:1;
 }
 int main(void){

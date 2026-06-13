@@ -37,7 +37,10 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
-    pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop; };
+    pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
+    /* zero-copy registry: caller-allocated NPU-coherent DMA buffers (ork_dma_alloc). When a matmul's
+     * A/C live in one of these, the regcmd points at them directly — no host gather/writeout memcpy. */
+    struct buf dma_tab[64]; int dma_n; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; };
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
@@ -146,7 +149,27 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
+    for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
     free(c->cres); if(fd>=0)close(fd); free(c); }
+
+/* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
+ * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_mm_run_i8 detects
+ * residency automatically (no API change); the caller just allocates A/C here. ---- */
+void *ork_dma_alloc(ork_npu *c, size_t size){
+    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
+    struct buf b=bcreate(c->fd,size,0x403); if(!b.cpu) return NULL;
+    c->dma_tab[c->dma_n++]=b; return b.cpu;
+}
+void ork_dma_free(ork_npu *c, void *ptr){
+    if(!c||!ptr) return;
+    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; return; }
+}
+/* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
+static struct buf *dma_find(ork_npu *c, const void *p){
+    for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
+        if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
+    return NULL;
+}
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
 int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
 int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
@@ -599,22 +622,33 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
     if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
+        /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
+         * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous). */
+        /* input zero-copy: validated correct (regcmd reads A in place). Output zero-copy: the regcmd's
+         * result address isn't fully redirected by 0x4020 alone (single-tile ~90% wrong) — a 2nd output
+         * address register needs RE, so it stays opt-in (ORK_ZC_OUT) until fixed. */
+        struct buf *abuf=dma_find(c,A);
+        struct buf *cbuf=(w->Sn==1 && getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
+        if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
-            static int nohc=-1; if(nohc<0) nohc=getenv("ORK_NOHOSTCOPY")?1:0;  /* sim: skip host copy+writeout to bound the zero-copy ceiling (timing only, garbage output) */
             for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
                 double _tc0=ork_now_us();
-                if(!nohc){ int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j]; }
-                bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);   /* real zero-copy still bsyncs (coherency); only the gather memcpy is skipped */
+                uint32_t adma;
+                if(abuf){ adma=(uint32_t)(abuf->dma + ((const char*)A-(const char*)abuf->cpu) + (size_t)m0*K); }
+                else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
+                       bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); adma=(uint32_t)c->Af.dma; }
                 double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
-                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,sched,CBUF);
+                uint32_t cdma=cbuf?(uint32_t)(cbuf->dma + ((const char*)C-(const char*)cbuf->cpu) + (size_t)m0*N*4):(uint32_t)c->Cc.dma;
+                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF);
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(submit1(c)) return -1;
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
-                if(!nohc){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
+                if(!cbuf){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
                 g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
             }
         }
+        if(cbuf){ bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE); return 0; }   /* result already in C's DMA buffer */
         memcpy(C,c->cres,need); return 0;
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;

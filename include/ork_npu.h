@@ -33,6 +33,13 @@ int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params ar
  * just bounds them (e.g. reserve cores for another workload). ORK_NPU_MC env overrides if set. */
 void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 
+/* Zero-copy DMA buffers (NPU-coherent, CPU-mapped). Allocate the activation A and/or output C here
+ * and the matmul reads/writes them in place — no host gather/writeout memcpy (the ~33% prefill
+ * residual vs the closed runtime). ork_mm_run detects residency automatically; pass the returned
+ * pointer as A/C exactly as a malloc'd one. NULL on failure or table-full (fall back to malloc). */
+void        *ork_dma_alloc(ork_npu *ctx, size_t size);
+void         ork_dma_free (ork_npu *ctx, void *ptr);
+
 /* Pack + upload B[K,N] (row-major) into NPU-resident tile layout; reuse across runs.
  * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
 ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */
