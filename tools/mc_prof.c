@@ -31,8 +31,12 @@ int main(int argc,char**argv){
     printf("int8 matmul %dx%dx%d, %d warm iters. us/matmul:\n",M,K,N,iters);
 
     ork_npu_set_core_budget(c,1);
+    ork_npu_mc_reset();
     double t1=run(c,w,M,K,A,C,iters);
     printf("  1-core: %.1f us/matmul\n", t1);
+    { double cp,su,ac; long n; ork_npu_mc_timing(0,&cp,&su,&ac,&n);
+      if(n) printf("    1-core phases over %d iters: submits=%ld  copy=%.0f (%.1f/sub)  submit=%.0f (%.1f/sub)  acc=%.0f (%.1f/sub)\n",
+                   iters,n,cp,cp/n,su,su/n,ac,ac/n); }
 
     ork_npu_set_core_budget(c,cores);
     ork_npu_mc_reset();
