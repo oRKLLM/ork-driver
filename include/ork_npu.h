@@ -56,6 +56,11 @@ int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int3
 int          ork_mm_run_i4_grouped(ork_npu *ctx, ork_w *w, int M, const int8_t *A,
                                    const float *aScale, const float *bScale, float *C);
 
+/* Profiling: read accumulated run_multicore phase times (us) and call count since process start.
+ * setup = pre-dispatch checks + mc_ensure + cres memset; submit = pool dispatch + workers + NPU;
+ * copy = cres->C memcpy. Any pointer may be NULL. Pins integration overhead vs the NPU itself. */
+void         ork_npu_run_timing(double *setup, double *submit, double *copy, long *n);
+
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8
  * submit at (K,N) (N <= SoC N-cap, K%32, N%32) on its own buffers. Returns 0 if the submit
  * completed (C[N] int32 valid — validate vs CPU), -1 if it wedged (K exceeds the per-op K-tile

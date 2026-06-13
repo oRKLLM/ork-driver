@@ -360,8 +360,14 @@ static void npu_pool_ensure(ork_npu *c){
     c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
     for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,npu_pool_worker,&c->pwa[i]); }
 }
+static double ork_now_us(void);   /* defined below */
+/* run_multicore phase timing (ORK_RT): setup (checks+mc_ensure+cres memset), submit (pool dispatch
+ * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
+static double g_rt_setup=0, g_rt_submit=0, g_rt_copy=0; static long g_rt_n=0;
+void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n){ if(setup)*setup=g_rt_setup; if(submit)*submit=g_rt_submit; if(copy)*copy=g_rt_copy; if(n)*n=g_rt_n; }
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
+    const double ts=ork_now_us();
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
@@ -373,12 +379,17 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     struct mcw args[ORK_MAXCORE]; int rc=0;
     for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0};
     npu_pool_ensure(c);
+    const double t1=ork_now_us();
     pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
     mcworker(&args[0]);                                   /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     for(int i=0;i<nc;i++){ if(args[i].rc) rc=-1; }
     if(rc) return -1;
-    memcpy(C,c->cres,need); return 0;
+    const double t2=ork_now_us();
+    memcpy(C,c->cres,need);
+    const double t3=ork_now_us();
+    g_rt_setup+=t1-ts; g_rt_submit+=t2-t1; g_rt_copy+=t3-t2; g_rt_n++;
+    return 0;
 }
 
 /* ---- int4 (W4A4) multi-core: WIDE submits with COLUMN-split. Each core owns a contiguous range
