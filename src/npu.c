@@ -98,20 +98,11 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
 }
-/* w4a16 (int4 weight x fp16 activation -> fp32) — DERIVED from the fp16<->int8 regcmd delta, NOT
- * captured (the runtime won't expose int4 on this board; the NPU silicon does, so we emit it).
- * w4a16 is MIXED precision, so the regcmd is a HYBRID: the activation/feature/output path is fp16
- * (base = REGCMD, the fp16 template — 16-bit activations, fp32 output, the fp16 0x1070 float-bit),
- * while the WEIGHT path is int4 = the int8 weight-size regs HALVED (0.5 B/elem vs int8's 1):
- *   0x1030=K*N/2 (weight bytes), 0x1034=K/2 (row bytes), 0x1044=ceil(K/128) (half int8's /64),
- *   0x107c=K/32 (half int8's /16).
- * The one register the 2-point fp16/int8 delta CANNOT give — the int8<->int4 weight-bit-width
- * subfield — is `i4mode`, swept from the caller (candidate values for 0x100c, which reads 0x0000
- * for int8 → has room for a 4-bit code). Small dims only (feature/output template defaults hold). */
 /* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
  * the base (the real hardware program, not a guess), overriding only the K/N/address-dependent regs.
- * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) and M-scheduler stay as captured
- * (M=4, the capture's M — caller must use M=4 until the M-schedule is parameterized). See ROADMAP. */
+ * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) stay as captured; K, N (≤nmax),
+ * and the A/B/C addresses are parameterized. The captured program is M=1 (each task of the closed
+ * runtime's M-tiling), so callers M-tile by looping rows. See ROADMAP. */
 static void synth_i4(uint32_t*rc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     setr(rc,REGCMD_I4_N,0x201,0x1024,((K-1)<<16)|K);       /* K range (element count) */
@@ -120,6 +111,11 @@ static void synth_i4(uint32_t*rc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC
     setr(rc,REGCMD_I4_N,0x201,0x1044,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
     setr(rc,REGCMD_I4_N,0x201,0x1088,K);
     setr(rc,REGCMD_I4_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I4_N,0x801,0x3018,N-1);
+    /* N-output-stride regs, parameterized for wide-N single-submit (verified vs N=64 & N=128
+     * captures: 0x403c=(N-1)dup, 0x4058=N-1, 0x3018=N-1 above). 0x40c0/0x4050 are CONSTANT across N
+     * (0x80/0x7fe — left at REGCMD_I4); M-count regs 0x4034/0x4038 stay 0 (M=1). */
+    setr(rc,REGCMD_I4_N,0x1001,0x403c,((N-1)<<16)|(N-1));
+    setr(rc,REGCMD_I4_N,0x1001,0x4058,N-1);
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
 }
 
@@ -194,13 +190,13 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   
  * captured program's M-tiling). C is int32 (holds the K-accumulated int sum; caller applies scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]). DOCUMENTED native layouts (RK3588/3576). */
 #define ORK_I4_KS 10752       /* int4 single-submit K ceiling (validated == int8's) */
-#define ORK_I4_NT 64          /* int4 N-tile width (captured regcmd is N=64; N%64) */
-/* one 64-col N-tile x Kp-row slice of B[K][N] at (k0,n0) -> native (Kp/32,64,32) int4 (2/byte) */
-static void tile_i4_Bslice(uint8_t*dst,const int8_t*B,int K,int N,int k0,int Kp,int n0){
-    int KT=Kp/32; memset(dst,0,(size_t)Kp*ORK_I4_NT/2);
-    for(int kt=0;kt<KT;kt++)for(int nl=0;nl<ORK_I4_NT;nl++)for(int kk=0;kk<32;kk++){
-        size_t idx=((size_t)kt*ORK_I4_NT+nl)*32+kk;
-        dst[idx/2]|= (uint8_t)(B[(size_t)(k0+kt*32+kk)*N+(n0+nl)]&0xf) << ((idx&1)?4:0);
+/* an Nc-wide x Kp-row slice of B[K][N] at (k0,n0) -> native (Nc/64,Kp/32,64,32) int4 (2/byte).
+ * Nc%64; validated single-submit up to N=8192 (SoC nmax). */
+static void tile_i4_Bslice(uint8_t*dst,const int8_t*B,int K,int N,int k0,int Kp,int n0,int Nc){
+    int KT=Kp/32, NB=Nc/64; memset(dst,0,(size_t)Kp*Nc/2);
+    for(int nb=0;nb<NB;nb++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<64;nl++)for(int kk=0;kk<32;kk++){
+        size_t idx=(((size_t)nb*KT+kt)*64+nl)*32+kk;
+        dst[idx/2]|= (uint8_t)(B[(size_t)(k0+kt*32+kk)*N+(n0+nb*64+nl)]&0xf) << ((idx&1)?4:0);
     }
 }
 /* a Kp-slice of one A row -> native (Kp/32,1,32) int4 */
@@ -212,44 +208,25 @@ static void tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
     }
 }
 ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
-    if(K%32||N%ORK_I4_NT) return NULL;
-    int KS=ORK_I4_KS, Sk=(K+KS-1)/KS, Sn=N/ORK_I4_NT;
+    if(K%32||N%64) return NULL;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;  /* wide N-slices ≤ nmax */
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++)for(int ks=0;ks<Sk;ks++){
-        int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*ORK_I4_NT;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*ORK_I4_NT/2,0x403);
+        int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403);
         if(!b->cpu){ ork_w_free(w); return NULL; }
-        tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0);
+        tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0,Nc);
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
     }
     return w;
 }
+static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* defined below */
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;
-    int fd=c->fd,K=w->K,N=w->N,KS=ORK_I4_KS;
-    struct buf O=bcreate(fd,(size_t)ORK_I4_NT*2,0x403); if(!O.cpu) return -2;   /* one N-tile int16 */
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    for(int m=0;m<M;m++){ const int8_t*Arow=A+(size_t)m*K;
-        for(int ns=0;ns<w->Sn;ns++){
-            int32_t acc[ORK_I4_NT]; for(int i=0;i<ORK_I4_NT;i++)acc[i]=0;
-            for(int ks=0;ks<w->Sk;ks++){
-                int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-                tile_i4_Aslice(c->Af.cpu,Arow,k0,Kp); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-                act(fd,RKNPU_ACT_RESET,0);
-                uint32_t rc[REGCMD_I4_N];
-                synth_i4(rc,Kp,ORK_I4_NT,(uint32_t)c->Af.dma,(uint32_t)w->Bb[(size_t)ns*w->Sk+ks].dma,(uint32_t)O.dma);
-                memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-                int ok=-1; for(int rep=0;rep<2;rep++){ sub.timeout=2000;
-                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
-                    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
-                if(ok){ bdestroy(fd,&O); return -1; }
-                int16_t*o=O.cpu; for(int nt=0;nt<ORK_I4_NT/8;nt++)for(int nl=0;nl<8;nl++) acc[nt*8+nl]+=o[nt*8+nl];
-            }
-            for(int i=0;i<ORK_I4_NT;i++) C[(size_t)m*N + ns*ORK_I4_NT + i]=acc[i];
-        }
-    }
-    bdestroy(fd,&O); return 0;
+    int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
+    int nc=budget(c); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
+    return run_i4_mc(c,w,M,A,C,nc);
 }
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
@@ -385,6 +362,63 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     for(int i=0;i<nc;i++){ if(args[i].rc) rc=-1; }
     if(rc) return -1;
     memcpy(C,c->cres,need); return 0;
+}
+
+/* ---- int4 (W4A4) multi-core: WIDE submits with COLUMN-split. Each core owns a contiguous range
+ * of 64-wide N-blocks within each N-slice and computes them in ONE wide submit per K-slice (not one
+ * per 64-tile) — so a decode matmul is ~nc·Sk·Sn submits, not Sn·64-tiles. Per-core buffers,
+ * core_mask=1<<i, all subcore_task[] populated, NO per-submit RESET (the dtype-switch RESET is done
+ * once in run_i4_mc; concurrent RESET / a submit-storm is the documented board-hang). nc==1 = serial
+ * (one core, whole width). Writes disjoint columns of C, no lock. ---- */
+struct i4mcw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; int32_t *C; int rc; };
+static void *i4_mcworker(void *vp){
+    struct i4mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
+    ork_w *w=a->w; int K=w->K, N=w->N, KS=ORK_I4_KS, NMAX=c->soc->nmax;
+    struct buf *RC=&c->mrc[i], *AF=&c->maf[i], *O=&c->mcc[i]; a->rc=0;
+    int32_t *acc=malloc((size_t)NMAX*4); if(!acc){a->rc=-1;return NULL;}
+    for(int ns=0;ns<w->Sn;ns++){
+        int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NB=Nc/64;
+        int b0=(int)((long)i*NB/nc), b1=(int)((long)(i+1)*NB/nc); if(b1<=b0) continue;
+        int ci0=b0*64, Ncore=(b1-b0)*64;
+        for(int m=0;m<M;m++){ const int8_t*Arow=a->A+(size_t)m*K;
+            for(int z=0;z<Ncore;z++)acc[z]=0;
+            for(int ks=0;ks<w->Sk;ks++){
+                int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+                tile_i4_Aslice(AF->cpu,Arow,k0,Kp); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
+                uint32_t rc[REGCMD_I4_N];
+                synth_i4(rc,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+                int reps=c->mwarm[i]?1:2;
+                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=last?6000:1000;
+                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                    bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
+                c->mwarm[i]=1;
+                int16_t*o=O->cpu; for(int nt=0;nt<Ncore/8;nt++)for(int nl=0;nl<8;nl++) acc[nt*8+nl]+=o[nt*8+nl];
+            }
+            for(int z=0;z<Ncore;z++) a->C[(size_t)m*N + n0+ci0+z]=acc[z];
+        }
+    }
+    free(acc); return NULL;
+}
+static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc){
+    int fd=c->fd;
+    if(nc>c->soc->cores)nc=c->soc->cores;
+    if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    if(nc<1)nc=1;
+    if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
+    if(mc_ensure(c,nc)) return -1;
+    size_t osz=(size_t)c->soc->nmax*2;        /* per-core output: up to a full N-slice of int16 */
+    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu)return -2; } }
+    struct i4mcw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
+    for(int i=0;i<nc;i++) args[i]=(struct i4mcw){c,i,nc,M,w,A,C,0};
+    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker,&args[i]);
+    i4_mcworker(&args[0]);                                /* core 0 on the calling thread */
+    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
+    return 0;
 }
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){

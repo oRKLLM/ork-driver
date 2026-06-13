@@ -16,7 +16,9 @@
 int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed (NPU?)\n");return 1;}
     int M=4,K=64,N=64;                             /* M-tiling: each row is one M=1 task */
-    if(getenv("ORK_M"))M=atoi(getenv("ORK_M")); if(getenv("ORK_K"))K=atoi(getenv("ORK_K")); if(getenv("ORK_N"))N=atoi(getenv("ORK_N"));
+    if(getenv("ORK_M")) M=atoi(getenv("ORK_M"));
+    if(getenv("ORK_K")) K=atoi(getenv("ORK_K"));
+    if(getenv("ORK_N")) N=atoi(getenv("ORK_N"));
     signed char*A=malloc((size_t)M*K);             /* int4 A [M][K] */
     signed char*B=malloc((size_t)K*N);             /* int4 B [K][N] row-major */
     short*C=malloc((size_t)M*N*2);

@@ -40,8 +40,16 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    How: captured librknnrt type-10 W4A4 (`tools/int4_capture.c`, `B_layout=NATIVE`) → `src/regcmd_i4.h`
    → `synth_i4`; native tile layouts documented in `rknn_matmul_api.h` (A `(K/32,M,32)`,
    B `(N/64,K/32,64,32)`, C `(N/8,M,8)`); the runtime's "12 tasks" = 4-task M-tiling × 3 subcores,
-   each an M=1 GEMM. **Remaining:** int4 multi-core (reuse the int8 multi-core path), N>64
-   single-submit (parameterize the int4 N-output regs), real per-group scales, llama.cpp wiring.
+   each an M=1 GEMM. **int4 multi-core + wide-N single-submit — DONE (2026-06-12).** `synth_i4` is
+   parameterized for arbitrary N up to nmax=8192 (single-submit validated to N=8192; N-dependent
+   output regs are just `0x403c`/`0x4058`/`0x3018`=`N-1` + the `0x1030`/`0x1038` size regs — `0x40c0`
+   /`0x4050` are constant across N). `ork_mm_pack_i4`/`ork_mm_run_i4` now pack wide N-slices (≤nmax)
+   and run a COLUMN-SPLIT multi-core path: each core owns a contiguous 64-block range and fires ONE
+   wide submit per K-slice (~nc·Sk·Sn submits/matmul, not Sn·64-tiles). This fixed a hard board-hang
+   (the old 64-tile multi-core fired ~32 submits/matmul with no wedge recovery → kernel hang at decode
+   scale) and is ~860× faster single-core (the old per-64-tile serial did RESET+2×2000ms-reps/tile).
+   M=1 K=2048 N=2048 decode: **0.19 ms/matmul (~5200/s), stable over sustained runs.**
+   **Remaining:** real per-group scales, bigger multi-core gains on large-N (LM head / FFN), llama.cpp wiring.
 
    **w4a16 (fused fp16×int4) is a HARDWARE dead-end on RK3588.** The NPU MAC only multiplies MATCHING
    precisions: the only supported rknn_matmul types are 1 (f16×f16), 2/3/9 (int8×int8), 10 (int4×int4)
