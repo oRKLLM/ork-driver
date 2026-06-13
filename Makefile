@@ -42,6 +42,10 @@ slice_probe: tools/slice_probe.c $(CORE)
 i4_probe: tools/i4_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# load a real GGUF Q4_K model, dequant a weight, run it on the NPU (requantized to int8/W8A8).
+gguf_q4k: tools/gguf_q4k.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
