@@ -48,6 +48,14 @@ static void test(ork_npu*ctx,int M,int K,int N){
         /* also: is row 0 alone correct under row-major? (tells us M=1 part works, M>1 is the layout Q) */
         long b0=0; for(int n=0;n<N;n++) if(raw[n]!=ref[n]) b0++;
         printf("   row0 row-major: %s (%ld/%d)\n", b0==0?"ok":"no", b0, N);
+        /* exhaustive: for each output row m, is its N-vector present ANYWHERE in raw (any start offset,
+         * contiguous)? If rows 1..M-1 are nowhere, the hardware simply didn't compute them. */
+        for(int m=1;m<M;m++){ long found=-1;
+            for(size_t off=0; off+N<=(size_t)M*N; off++){ int ok=1;
+                for(int n=0;n<N&&ok;n++) if(raw[off+n]!=ref[(size_t)m*N+n]) ok=0;
+                if(ok){found=(long)off;break;} }
+            if(found>=0) printf("   row%d contiguous: FOUND @ %ld\n", m, found);
+            else         printf("   row%d contiguous: NOT computed (nowhere in output)\n", m); }
         printf("   raw[0..7]= "); for(int i=0;i<8&&i<M*N;i++)printf("%d ",raw[i]); printf(" | ref[0..7]= ");
         for(int i=0;i<8&&i<M*N;i++)printf("%d ",ref[i]); printf("\n");
     }

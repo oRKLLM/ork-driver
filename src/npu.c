@@ -126,11 +126,22 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
      * (0x80/0x7fe — left at REGCMD_I4). */
     setr(rc,REGCMD_I4_N,0x1001,0x403c,((N-1)<<16)|(N-1));
     setr(rc,REGCMD_I4_N,0x1001,0x4058,N-1);
-    /* M-count regs. The captured program is M=4, so its M-scheduler regs (0x1010=0x20, 0x1040=0xb1,
-     * 0x4034=0, 0x4038=0) are left VERBATIM — they already encode multi-M. int8's output-side M-regs
-     * (0x4034=mc-1, 0x4038=(N/4-1)) do NOT apply to int4 (they corrupt even row 0). `mc` is reserved
-     * for when the multi-M encoding/limit is pinned; for now mc only documents the intended row count. */
-    (void)mc;
+    /* Multi-M scheduler (mc>1) — PROVEN INERT for int4 (kept runnable for re-test on future
+     * kernels/SoCs; see tools/i4_multim_probe.c + ROADMAP Tier 4b). Applying int8's full multi-M
+     * register set (M-count = mc, output M-stride = mc-1, CNA row-count 0x1010, schedule 0x1040,
+     * 0x4038 = (N/4-1)) to the int4 program does NOT make it compute rows >0: with per-row A, row 0 is
+     * bit-exact and rows 1..M-1 are computed NOWHERE in the output. The int4 datapath is structurally
+     * single-row on this NPU (the closed runtime tiled int4 M across 12 tasks, and task_number>1
+     * kernel-hangs this board). So int4 is 1-submit/row; this block stays for the record but is unused
+     * by production (all callers pass mc=1). */
+    if(mc>1){
+        setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc);setr(rc,REGCMD_I4_N,0x201,0x102c,mc);
+        setr(rc,REGCMD_I4_N,0x1001,0x4034,mc-1);setr(rc,REGCMD_I4_N,0x1001,0x405c,(mc-1)<<16);setr(rc,REGCMD_I4_N,0x801,0x3014,(mc-1)<<16);
+        setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
+        setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc+1));
+        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc/64; if(mg<1)mg=1;
+        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v);
+    }
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
 }
 
