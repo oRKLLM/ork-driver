@@ -623,15 +623,15 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
-         * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous). */
+         * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
+         * Opt-in (ORK_ZC_OUT) + off by default. */
         struct buf *abuf=dma_find(c,A);   /* INPUT zero-copy: validated correct, default on */
-        /* OUTPUT zero-copy: still WRONG even with a fresh-buffer re-warm (the single-tile ~90%-wrong /
-         * 4-tile-~5%-wrong symptom persists) — the regcmd's result write isn't landing where 0x4020
-         * points for a non-Cc buffer. Needs regcmd-level debugging (dump where the result lands).
-         * Opt-in (ORK_ZC_OUT) + off by default until fixed. */
         struct buf *cbuf=(w->Sn==1 && getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
         if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
-        if(cbuf) c->warmed=0;             /* re-warm the fresh output buffer (necessary but not sufficient) */
+        if(cbuf) {
+            bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean dirty CPU cache lines so they don't evict over NPU output */
+            c->warmed=0;             /* re-warm the fresh output buffer (necessary but not sufficient) */
+        }
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
             for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
@@ -646,6 +646,11 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(submit1(c)) return -1;
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
+                
+                /* For output zero copy, the NPU writes directly to the user-provided C buffer.
+                 * We MUST invalidate the CPU cache here so the host reads the fresh NPU output instead of stale cache lines. */
+                if(cbuf) bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
+                
                 if(!cbuf){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
                 g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
             }
