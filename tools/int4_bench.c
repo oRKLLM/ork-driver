@@ -36,12 +36,18 @@ static double pc_i4(ork_npu*ctx,int M,int K,int N,int iters,double*ms){
     for(int m=0;m<M;m++){float mx=1e-9f;for(int k=0;k<K;k++){float a=fabsf(A[(size_t)m*K+k]);if(a>mx)mx=a;}
         as[m]=mx/7.0f; for(int k=0;k<K;k++)Aq[(size_t)m*K+k]=qc(A[(size_t)m*K+k]/as[m],7);}
     ork_w*w=ork_mm_pack_i4(ctx,K,N,Bq); if(!w){printf("pack_i4 failed\n");exit(1);}
-    int32_t*Ci=malloc((size_t)M*N*4);
-    if(ork_mm_run_i4(ctx,w,M,Aq,Ci)){printf("run_i4 failed\n");exit(1);}        /* warm */
-    double t0=now(); for(int it=0;it<iters;it++) ork_mm_run_i4(ctx,w,M,Aq,Ci); *ms=(now()-t0)/iters;
+    /* ORK_TEST_DMA: put A + C in ork_dma_alloc buffers to exercise the int4 zero-copy CHAINING path
+     * (coherency bsync of DMA-resident A/C in run_i4_mc). Result must stay correct, not garbage. */
+    int dma=getenv("ORK_TEST_DMA")!=NULL; int8_t*Aqd=Aq; int32_t*Ci;
+    if(dma){ Aqd=ork_dma_alloc(ctx,(size_t)M*K); if(Aqd)memcpy(Aqd,Aq,(size_t)M*K); else Aqd=Aq;
+             Ci=ork_dma_alloc(ctx,(size_t)M*N*4); if(!Ci)Ci=malloc((size_t)M*N*4); }
+    else Ci=malloc((size_t)M*N*4);
+    if(ork_mm_run_i4(ctx,w,M,Aqd,Ci)){printf("run_i4 failed\n");exit(1);}        /* warm */
+    double t0=now(); for(int it=0;it<iters;it++) ork_mm_run_i4(ctx,w,M,Aqd,Ci); *ms=(now()-t0)/iters;
     double num=0,den=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){double c=(double)Ci[(size_t)m*N+n]*as[m]*ws[n],r=Cf[(size_t)m*N+n];num+=(c-r)*(c-r);den+=r*r;}
-    ork_w_free(w); free(A);free(B);free(Cf);free(ws);free(Bq);free(as);free(Aq);free(Ci);
+    ork_w_free(w); free(A);free(B);free(Cf);free(ws);free(Bq);free(as);free(Aq);
+    if(dma){ if(Aqd!=Aq)ork_dma_free(ctx,Aqd); ork_dma_free(ctx,Ci); } else free(Ci);
     return den>0?sqrt(num/den):0;
 }
 /* grouped int4 timing (same shapes, group G) — just the warm per-call ms (correctness is in Int4-W4A4). */

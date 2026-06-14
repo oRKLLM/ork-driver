@@ -549,12 +549,23 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*2;        /* per-core output: up to a full N-slice of int16 */
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu)return -2; } }
+    /* Zero-copy chaining (the portable half of the int8 zero-copy design — perf-neutral, correctness
+     * for DMA pipelines). int4 can't read/write the caller's A/C *directly* (A needs the nibble re-tile,
+     * the int16 hardware output needs widening to the int32 C), so the internal AF/O scratch is
+     * mandatory. But when A/C are ork_dma_alloc buffers, int4 must still observe coherency so it
+     * composes with up/downstream NPU ops: invalidate a DMA-resident A once before the CPU re-tiles it
+     * (see NPU-produced input), and flush a DMA-resident C once after the CPU writes it (downstream NPU
+     * sees the output). dirty-line eviction otherwise corrupts a chained op — the same hazard the int8
+     * output zero-copy fix addressed. */
+    struct buf *abuf=dma_find(c,A), *cbuf=dma_find(c,C);
+    if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_FROM_DEVICE);   /* CPU re-tile must see an NPU-produced A */
     struct i4mcw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
     for(int i=0;i<nc;i++) args[i]=(struct i4mcw){c,i,nc,M,w,A,C,0};
     for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker,&args[i]);
     i4_mcworker(&args[0]);                                /* core 0 on the calling thread */
     for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
     for(int i=0;i<nc;i++) if(args[i].rc) return -1;
+    if(cbuf) bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);     /* flush host-written C for a downstream NPU op */
     return 0;
 }
 
