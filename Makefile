@@ -61,6 +61,10 @@ hadamard_real: tools/hadamard_real.c
 int4_bench: tools/int4_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Tier 4b RE: probe whether the int4 regcmd does multi-M in one submit + brute-force the output layout.
+i4_multim_probe: tools/i4_multim_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

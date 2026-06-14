@@ -94,14 +94,16 @@ int main(int argc,char**argv){
         uint64_t nl; const char*nm=rstr(&nl); uint32_t nd=ru32(); uint64_t d[4]={1,1,1,1};
         for(uint32_t j=0;j<nd&&j<4;j++) d[j]=ru64();
         uint32_t ty=ru32(); uint64_t o=ru64();
-        /* want a Q4_K 2D tensor whose K (ne0) is a power of 2 for the plain Hadamard */
-        if(!found && ty==12 && nd==2 && d[0]>=512 && (d[0]&(d[0]-1))==0 && d[1]>=64){
+        /* want any Q4_K 2D tensor with enough columns; K is truncated to a power of 2 below */
+        if(!found && ty==12 && nd==2 && d[0]>=512 && d[1]>=64){
             found=1; off=o; ne0=d[0]; ne1=d[1]; int c=nl<255?nl:255; memcpy(tname,nm,c); tname[c]=0;
         }
     }
-    if(!found){printf("no Q4_K 2D tensor with power-of-2 ne0 found\n");return 1;}
+    if(!found){printf("no usable Q4_K 2D tensor found\n");return 1;}
     size_t data0=(GP+align-1)/align*align;
-    int K=ne0, N=(int)ne1; if(N>Nreq)N=Nreq;
+    /* plain Hadamard needs power-of-2 K — use the largest power-of-2 slice of the real channels */
+    int K=1; while((uint64_t)(K<<1)<=ne0) K<<=1;
+    int N=(int)ne1; if(N>Nreq)N=Nreq;
     printf("real weight '%s' Q4_K [K=%d N=%d], M=%d G=%d outliers x%.0f\n",tname,K,N,M,Gp,oscale);
 
     /* dequant Q4_K -> fp32 weights wf[ne1][ne0] (row n, col k) */

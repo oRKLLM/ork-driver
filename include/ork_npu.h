@@ -105,4 +105,11 @@ int          ork_npu_probe_i4(ork_npu *ctx, int M, int K, int N, int nibB, int n
                               const uint32_t *ovr_reg, const uint32_t *ovr_val,
                               const signed char *A, const signed char *B, short *C);
 
+/* RE/calibration only (Tier 4b): ONE multi-M int4 submit with the M-count regs set to M (synth_i4
+ * mc=M). A:(K/32,M,32), B:(N/64,K/32,64,32) native. Copies the RAW int16 output (M*N, NO de-tile) to
+ * `raw` so the caller can deduce the multi-M C layout vs a CPU reference. 0/ok, -1 wedged, -2 dims.
+ * See tools/i4_multim_probe.c. */
+int          ork_npu_probe_i4_mm(ork_npu *ctx, int M, int K, int N,
+                                 const signed char *A, const signed char *B, short *raw);
+
 #endif

@@ -113,7 +113,7 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
  * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) stay as captured; K, N (≤nmax),
  * and the A/B/C addresses are parameterized. The captured program is M=1 (each task of the closed
  * runtime's M-tiling), so callers M-tile by looping rows. See ROADMAP. */
-static void synth_i4(uint32_t*rc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     setr(rc,REGCMD_I4_N,0x201,0x1024,((K-1)<<16)|K);       /* K range (element count) */
     setr(rc,REGCMD_I4_N,0x201,0x1030,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
@@ -123,9 +123,14 @@ static void synth_i4(uint32_t*rc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC
     setr(rc,REGCMD_I4_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I4_N,0x801,0x3018,N-1);
     /* N-output-stride regs, parameterized for wide-N single-submit (verified vs N=64 & N=128
      * captures: 0x403c=(N-1)dup, 0x4058=N-1, 0x3018=N-1 above). 0x40c0/0x4050 are CONSTANT across N
-     * (0x80/0x7fe — left at REGCMD_I4); M-count regs 0x4034/0x4038 stay 0 (M=1). */
+     * (0x80/0x7fe — left at REGCMD_I4). */
     setr(rc,REGCMD_I4_N,0x1001,0x403c,((N-1)<<16)|(N-1));
     setr(rc,REGCMD_I4_N,0x1001,0x4058,N-1);
+    /* M-count regs. The captured program is M=4, so its M-scheduler regs (0x1010=0x20, 0x1040=0xb1,
+     * 0x4034=0, 0x4038=0) are left VERBATIM — they already encode multi-M. int8's output-side M-regs
+     * (0x4034=mc-1, 0x4038=(N/4-1)) do NOT apply to int4 (they corrupt even row 0). `mc` is reserved
+     * for when the multi-M encoding/limit is pinned; for now mc only documents the intended row count. */
+    (void)mc;
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
 }
 
@@ -508,7 +513,7 @@ static void *i4_mcworker(void *vp){
                 tile_i4_Aslice(AF->cpu,Arow,k0,Kp); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
                 uint32_t rc[REGCMD_I4_N];
-                synth_i4(rc,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                synth_i4(rc,1,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
                 sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
@@ -561,7 +566,7 @@ static void *i4_mcworker_g(void *vp){
             for(int g=0;g<Sk;g++){
                 tile_i4_Aslice(AF->cpu,Arow,g*G,G); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 uint64_t wbase=w->Bb[(size_t)ns*Sk+g].dma+(uint64_t)b0*G*32;
-                uint32_t rc[REGCMD_I4_N]; synth_i4(rc,G,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                uint32_t rc[REGCMD_I4_N]; synth_i4(rc,1,G,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
                 sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
@@ -831,7 +836,7 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
     for(int m=0;m<M && ok==0;m++){
         act(fd,RKNPU_ACT_RESET,0);
         uint32_t rc[REGCMD_I4_N];
-        synth_i4(rc,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
+        synth_i4(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
         for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         sub.timeout=500; ok=-1;
@@ -840,6 +845,37 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
             for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) C[(size_t)m*N + nt*8+nl] = cr[nt*8+nl]; }
     }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* RE/calibration: ONE multi-M int4 submit (mc=M) — the M-scheduler experiment for Tier 4b. A is laid
+ * (K/32,M,32) native; B native (N/64,K/32,64,32); the regcmd's M-count regs are set to M (synth_i4
+ * mc=M). Copies the RAW int16 output buffer (M*N int16, NO de-tile) to raw so the caller can deduce
+ * the multi-M C layout against a CPU reference. Returns 0 if the submit completed, -1 wedged, -2 dims.
+ * Single N-slice (N<=nmax), single core. See tools/i4_multim_probe.c. */
+int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int16_t *raw){
+    int fd=c->fd;
+    if(K%32||N%64||N>c->soc->nmax||M<1) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N/2,0x403); if(!W.cpu) return -2;
+    tile_i4_B(W.cpu,B,K,N,0);
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*2,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    /* A layout selector via ORK_I4_ALAY: 0=(K/32,M,32) interleaved, 1=per-row contiguous (K/32,1,32)
+     * x M (what the captured M=1 program reads). Lets the probe tell whether the program is single-row. */
+    { int alay=getenv("ORK_I4_ALAY")?atoi(getenv("ORK_I4_ALAY")):0;
+      if(alay) for(int m=0;m<M;m++) tile_i4_A((uint8_t*)c->Af.cpu+(size_t)m*(K/2),A+(size_t)m*K,1,K,0);
+      else tile_i4_A(c->Af.cpu,A,M,K,0); }
+    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I4_N];
+    synth_i4(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ sub.timeout=500; if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    if(ok==0) memcpy(raw,O.cpu,(size_t)M*N*2);
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
