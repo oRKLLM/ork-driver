@@ -56,6 +56,11 @@ hadamard_int4: tools/hadamard_int4.c
 hadamard_real: tools/hadamard_real.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+# Tier 4b: time PER-CHANNEL int4 (full-K single submit) vs grouped int4 (K/G submits) vs int8 —
+# does per-channel int4 reach int8 speed (kill the grouped submit explosion)? Needs the NPU.
+int4_bench: tools/int4_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
