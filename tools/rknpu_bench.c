@@ -1,13 +1,13 @@
-/* tools/rkllm_bench.c — benchmark Rockchip's closed `librkllmrt` on a .rkllm model, for an
+/* tools/rknpu_bench.c — benchmark Rockchip's closed `librkllmrt` on a .rkllm model, for an
  * apples-to-apples comparison against ork-driver's own bench (examples/bench.c). It dlopen's
  * librkllmrt at RUNTIME (no build dependency) and reads the runtime's own perf stats, so the
  * library is found on the board, not shipped here. Contains NO Rockchip code — the RKLLM ABI
  * structs are reverse-engineered (same status as the regcmd headers). Like tools/regcmd_capture.c,
  * it needs the proprietary runtime present at run time only; it is not part of the ork-driver build.
  *
- *   make rkllm_bench   # or: gcc -O2 -o rkllm_bench tools/rkllm_bench.c -ldl
- *   sudo ./rkllm_bench <librkllmrt.so> <model.rkllm> [new_tokens]
- * e.g. ./rkllm_bench /var/lib/orkllm/runtimes/librkllmrt-aarch64-v1.2.3.so Qwen3-1.7B-w8a8.rkllm 128
+ *   make rknpu_bench   # or: gcc -O2 -o rknpu_bench tools/rknpu_bench.c -ldl
+ *   sudo ./rknpu_bench <librkllmrt.so> <model.rkllm> [new_tokens]
+ * e.g. ./rknpu_bench /var/lib/orkllm/runtimes/librkllmrt-aarch64-v1.2.3.so Qwen3-1.7B-w8a8.rkllm 128
  * Prints librkllmrt's prefill/decode tok/s; compare with `make bench` at the model's config. */
 #define _GNU_SOURCE
 #include <stdio.h>

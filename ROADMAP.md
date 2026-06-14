@@ -10,7 +10,7 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 - **fp16 + int8/w8a8 matmul** — `ork_mm_pack[_i8]` / `ork_mm_run[_i8]`, K-split × N-tiling, validated vs CPU.
 - **Real model end-to-end** — `stories15M` (NPU matmul + CPU ops), logits match CPU fp16.
 - **GQA / arbitrary head_dim** — examples generalized (Qwen3 16/8 GQA).
-- **tok/s benchmark vs `librkllmrt`** — same-state, Qwen3-1.7B w8a8 (`examples/bench.c`, `tools/rkllm_bench.c`).
+- **tok/s benchmark vs `librkllmrt`** — same-state, Qwen3-1.7B w8a8 (`examples/bench.c`, `tools/rknpu_bench.c`).
 - **Multi-core NPU** (`ORK_NPU_MC=n`) — N-split across cores, clamped to `soc->cores`; **decode 1.69×**.
 - **Per-core full-K single-submit decode** (`ORK_FULLK_DEC`) — decode **~11 tok/s ≈ 96% of librkllmrt**.
 - **Prefill CPU path** — flash-style attention + persistent thread pool pinned to the perf cores; **~1.6×**.

@@ -1,7 +1,7 @@
 /* tools/int4_capture.c — drive librknnrt's rknn_matmul so the regcmd_capture shim can dump a real
  * INT4 regcmd, the reference for adding an int4 path to ork_mm_*. RE-time only: needs Rockchip's
  * librknnrt + rknn_matmul_api.h/rknn_api.h (download separately — not in this repo, same status as
- * rkllm_bench). Values are dummy; we want the register program + the int4 weight tile layout.
+ * rknpu_bench). Values are dummy; we want the register program + the int4 weight tile layout.
  *
  *   cc -O2 -I<rknn_include> int4_capture.c -L<rknn_lib> -l:librknnrt.so -o int4cap
  *   ./int4cap                                  # SWEEP: find a type-10 (int4xint4) param combo that creates
