@@ -51,6 +51,11 @@ gguf_q4k: tools/gguf_q4k.c $(CORE)
 hadamard_int4: tools/hadamard_int4.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+# Tier 4a on a REAL weight tensor: dequant a Q4_K weight from a GGUF and run the same int4/Hadamard
+# error comparison on real model weights (random data is worst-case for quant — this removes that).
+hadamard_real: tools/hadamard_real.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
