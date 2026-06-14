@@ -85,7 +85,7 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
     setr(rc,REGCMD_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_N,0x801,0x3018,N-1);
     if(sched){
         int R=cbuf/K; if(R<1)R=1; int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_N,0x201,0x1010,16*rows);
-        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc/64; if(mg<1)mg=1;
+        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see synth_i8 (65..127-row tile needs the next K-schedule) */
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_N,0x201,0x1070,aA);setr(rc,REGCMD_N,0x201,0x1110,aB);setr(rc,REGCMD_N,0x1001,0x4020,aC);
@@ -103,7 +103,11 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
     if(sched){
         int R=(2*cbuf)/K; if(R<1)R=1; int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
-        int keff=K/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc/64; if(mg<1)mg=1;
+        /* 0x1040 = K-reduction schedule, selected per 64-row group. MUST be ceil(mc/64): a tile of
+         * 65..127 rows spills past the first 64-row group, so it needs the NEXT schedule (the one a
+         * full 128-row tile uses), not the <=64 schedule. floor(mc/64) gave 65..127-row tiles the
+         * <=64 schedule -> rows 64..mc-1 computed against the wrong K-partition (the prefill bug). */
+        int keff=K/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=(mc+63)/64; if(mg<1)mg=1;
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I8_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);

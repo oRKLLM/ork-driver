@@ -65,6 +65,10 @@ int4_bench: tools/int4_bench.c $(CORE)
 i4_multim_probe: tools/i4_multim_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# find the int8 prefill correctness bug: exact int8 matmul vs CPU ref across real model shapes/M/cores.
+prefill_check: tools/prefill_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
