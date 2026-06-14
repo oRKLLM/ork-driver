@@ -905,3 +905,5 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
+
+const char *ork_npu_version(void){ return ORK_NPU_VERSION; }

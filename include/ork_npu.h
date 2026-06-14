@@ -19,6 +19,10 @@ typedef _Float16 ork_f16;
 typedef struct ork_npu ork_npu;     /* device context (one per process) */
 typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 
+/* Library version — matches the git tag on the ork-driver repo. */
+#define ORK_NPU_VERSION "0.2.0"
+const char  *ork_npu_version(void);  /* returns ORK_NPU_VERSION */
+
 /* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
 ork_npu     *ork_npu_init(void);
 void         ork_npu_free(ork_npu *ctx);
