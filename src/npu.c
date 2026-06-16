@@ -288,6 +288,14 @@ ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
     }
     return w;
 }
+
+ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
+    /* The core fallback: it takes int4-range values ([-8,7]) unpacked in int8_t containers,
+     * but physically packs them into the highly optimized int8 resident weight layout.
+     * This simply defers to ork_mm_pack_i8, yielding maximum int8 silicon execution speed
+     * while the caller (e.g. ggml-ork) maintains the 50% footprint reduction on disk. */
+    return ork_mm_pack_i8(c, K, N, B);
+}
 static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* defined below */
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;

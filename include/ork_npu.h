@@ -52,6 +52,13 @@ ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* 
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */
 ork_w       *ork_mm_pack_i4_grouped(ork_npu *ctx, int K, int N, const int8_t *B, int G);
+
+/* int4-Stored / int8-Computed Fallback (Tier 4 Memory Optimization): takes unpacked int4 weights 
+ * ([-8,7] in int8 containers) and packs them into an int8 resident weight buffer. This runs on 
+ * the highly optimized int8 physical hardware path, yielding maximum silicon speed.
+ * Returns an int8 dtype ork_w (run with ork_mm_run_i8). */
+ork_w       *ork_mm_pack_i4_to_i8(ork_npu *ctx, int K, int N, const int8_t *B);
+
 void         ork_w_free(ork_w *w);
 
 /* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
