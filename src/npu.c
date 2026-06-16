@@ -445,10 +445,12 @@ static void *mcworker(void *vp){
 static void pin_big_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
     if(off) return;
+#if defined(__linux__)
     long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return;
     int cpu=(int)ncpu-1-id; if(cpu<0) cpu=0;
     cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
     pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+#endif
     /* NOTE: this pins only the dedicated NPU-driver threads to their own big core. We deliberately do
      * NOT restrict the whole process / CPU threadpool to the big cluster: doing so at init was measured
      * to oversubscribe and CRATER decode at -t 8 (9.3 -> 2.3 tok/s) while not helping -t 4. The big-core
