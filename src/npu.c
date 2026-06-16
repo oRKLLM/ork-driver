@@ -1135,3 +1135,164 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
 }
 
 const char *ork_npu_version(void){ return ORK_NPU_VERSION; }
+
+int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if (!c) return -1;
+    if (S < 1 || S > 64) return -2;
+    if (!tasks) return -2;
+
+    int fd = c->fd, CBUF = c->soc->cbuf_elems;
+    
+    // 1. Validate all tasks
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w) return -2;
+        if (w->dtype != DT_I8) return -2;
+        if (tasks[i].M <= 0) return -2;
+        if (w->K % 32 || w->N % 32) return -2;
+        if (w->Sn != 1 || w->Sk != 1) return -2; // chain expects single-slice weights (K<=10752, N<=nmax)
+    }
+
+    // 2. State transition reset for int8 mode
+    if (c->last_dt != DT_I8) {
+        act(fd, RKNPU_ACT_RESET, 0);
+        c->warmed = 0;
+        c->last_dt = DT_I8;
+        c->ccsz = 0; // invalidate Cc size
+    }
+
+    // 3. Resolve buffers and cache coherency
+    struct buf tmp_A[64];
+    struct buf tmp_C[64];
+    memset(tmp_A, 0, sizeof(tmp_A));
+    memset(tmp_C, 0, sizeof(tmp_C));
+
+    uint32_t act_dma[64];
+    uint32_t out_dma[64];
+    struct buf *cbufs[64];
+    memset(cbufs, 0, sizeof(cbufs));
+
+    int ok = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        int M = tasks[i].M;
+        int K = w->K;
+        int N = w->N;
+
+        // Resolve input activations buffer
+        struct buf *abuf = dma_find(c, tasks[i].A);
+        if (abuf) {
+            bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);
+            act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
+        } else {
+            tmp_A[i] = bcreate(fd, (size_t)M * K, 0x403);
+            if (!tmp_A[i].cpu) { ok = -1; goto cleanup; }
+            memcpy(tmp_A[i].cpu, tasks[i].A, (size_t)M * K);
+            bsync(fd, &tmp_A[i], RKNPU_MEM_SYNC_TO_DEVICE);
+            act_dma[i] = (uint32_t)tmp_A[i].dma;
+        }
+
+        // Resolve output buffer
+        struct buf *cbuf = dma_find(c, tasks[i].C);
+        if (cbuf) {
+            bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+            out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
+            cbufs[i] = cbuf;
+        } else {
+            tmp_C[i] = bcreate(fd, (size_t)M * N * 4, 0x403);
+            if (!tmp_C[i].cpu) { ok = -1; goto cleanup; }
+            bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_TO_DEVICE);
+            out_dma[i] = (uint32_t)tmp_C[i].dma;
+        }
+    }
+
+    // 4. Synthesize REGCMD blocks and link the chain
+    uint32_t rc[REGCMD_I8_N];
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        int M = tasks[i].M;
+        int K = w->K;
+        int N = w->N;
+
+        synth_i8(rc, M, K, N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i], 1, CBUF);
+
+        // Chain the sequencer: indices 216-219 represent next block DMA link
+        if (i < S - 1) {
+            uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I8_N * 4;
+            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037 << 16);
+            rc[219] = (0x0101 << 16) | (0);
+        } else {
+            rc[216] = 0;
+            rc[217] = 0;
+            rc[218] = 0x00000014;
+            rc[219] = 0x01010000;
+        }
+        memcpy((char*)c->regcmd.cpu + i * REGCMD_I8_N * 4, rc, sizeof(rc));
+    }
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+
+    // 5. Populate and prepare rknpu_task structures
+    struct rknpu_task *t = c->task.cpu;
+    memset(t, 0, S * sizeof(struct rknpu_task));
+    for (int i = 0; i < S; i++) {
+        t[i].enable_mask = 0xd;
+        t[i].int_mask = 0x300;
+        t[i].int_clear = 0x1ffff;
+        t[i].regcfg_amount = 108;
+        t[i].regcmd_addr = c->regcmd.dma + i * REGCMD_I8_N * 4;
+    }
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+
+    // 6. Submit the chained tasks to the NPU
+    static int tc = -2;
+    if (tc == -2) {
+        const char *e = getenv("ORK_NPU_TESTCORE");
+        tc = e ? atoi(e) : 0;
+        if (tc < 0 || tc > 2) tc = 0;
+    }
+    struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
+    sub.flags = 0x5;
+    sub.task_number = S;
+    sub.task_obj_addr = c->task.obj;
+    sub.core_mask = 1u << tc;
+    sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
+
+    int reps = c->warmed ? 1 : 2;
+    int submit_ok = 0;
+    for (int rep = 0; rep < reps; rep++) {
+        int last = (rep == reps - 1);
+        sub.timeout = last ? 2000 : 500;
+        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) {
+            if (last) {
+                perror("SUBMIT chained");
+                submit_ok = -1;
+            }
+            continue;
+        }
+        submit_ok = 0;
+    }
+    c->warmed = 1;
+
+    // 7. Sync memory back and copy results
+    for (int i = 0; i < S; i++) {
+        if (cbufs[i]) {
+            bsync(fd, cbufs[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        } else {
+            bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            if (submit_ok == 0) {
+                memcpy(tasks[i].C, tmp_C[i].cpu, (size_t)tasks[i].M * tasks[i].w->N * 4);
+            }
+        }
+    }
+    ok = submit_ok;
+
+cleanup:
+    for (int i = 0; i < S; i++) {
+        bdestroy(fd, &tmp_A[i]);
+        bdestroy(fd, &tmp_C[i]);
+    }
+    return ok;
+}

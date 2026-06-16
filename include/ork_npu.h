@@ -123,4 +123,14 @@ int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int
 /* RE/calibration only: benchmark S chained matmuls vs S separate submits using pre-allocated memory */
 int          ork_npu_benchmark_chain(ork_npu *ctx, int S, int K, int N, int iters);
 
+/* Mixture of Experts (MoE) / Chained matmuls API */
+typedef struct {
+    ork_w *w;
+    int M;
+    const int8_t *A;
+    int32_t *C;
+} ork_mm_task_i8;
+
+int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+
 #endif

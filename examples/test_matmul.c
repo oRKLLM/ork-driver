@@ -38,6 +38,75 @@ static int check_i8(ork_npu*ctx,int M,int K,int N){
     printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad);
     ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
 }
+static int check_chain_i8(ork_npu*ctx) {
+    int S = 4;
+    int Ms[] = {1, 2, 4, 3};
+    int K = 256;
+    int N = 64;
+    
+    int8_t *A[4] = {NULL};
+    int8_t *B[4] = {NULL};
+    int32_t *C[4] = {NULL};
+    ork_w *w[4] = {NULL};
+    ork_mm_task_i8 tasks[4];
+
+    for (int i = 0; i < S; i++) {
+        if (i == 0) {
+            A[i] = ork_dma_alloc(ctx, (size_t)Ms[i] * K);
+            C[i] = ork_dma_alloc(ctx, (size_t)Ms[i] * N * 4);
+        } else {
+            A[i] = malloc((size_t)Ms[i] * K);
+            C[i] = malloc((size_t)Ms[i] * N * 4);
+        }
+        B[i] = malloc((size_t)K * N);
+        
+        for (size_t j = 0; j < (size_t)Ms[i] * K; j++) A[i][j] = (int8_t)(rnd() - 1);
+        for (size_t j = 0; j < (size_t)K * N; j++) B[i][j] = (int8_t)(rnd() - 1);
+        
+        w[i] = ork_mm_pack_i8(ctx, K, N, B[i]);
+        if (!w[i]) { printf("pack_chain_i8 failed %d\n", i); return 1; }
+        
+        tasks[i].w = w[i];
+        tasks[i].M = Ms[i];
+        tasks[i].A = A[i];
+        tasks[i].C = C[i];
+    }
+    
+    int bad = 0;
+    if (ork_mm_run_chain_i8(ctx, S, tasks)) {
+        printf("run_chain_i8 failed\n");
+        bad = 1;
+    } else {
+        for (int i = 0; i < S; i++) {
+            int m = Ms[i];
+            for (int r = 0; r < m; r++) {
+                for (int n = 0; n < N; n++) {
+                    int32_t ref = 0;
+                    for (int k = 0; k < K; k++) {
+                        ref += (int)A[i][(size_t)r * K + k] * (int)B[i][(size_t)k * N + n];
+                    }
+                    if (C[i][(size_t)r * N + n] != ref) bad++;
+                }
+            }
+        }
+    }
+
+    printf("  %s chained S=%d (varying M, independent matmuls) mism=%d\n", bad ? "WRONG" : "ok  ", S, bad);
+
+    for (int i = 0; i < S; i++) {
+        if (w[i]) ork_w_free(w[i]);
+        if (i == 0) {
+            ork_dma_free(ctx, A[i]);
+            ork_dma_free(ctx, C[i]);
+        } else {
+            free(A[i]);
+            free(C[i]);
+        }
+        free(B[i]);
+    }
+    return bad ? 1 : 0;
+}
+
 int main(void){
     int fail=0;
     /* fp16 and int8 in SEPARATE contexts: a model is one precision, and switching regcmd mode
@@ -61,6 +130,7 @@ int main(void){
     fail|=check_i8(c8,1,8192,512);    /* decode */
     fail|=check_i8(c8,8,1280,64);     /* 256 remainder slice */
     fail|=check_i8(c8,4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
+    fail|=check_chain_i8(c8);         /* verify chained matmuls / MoE API */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
