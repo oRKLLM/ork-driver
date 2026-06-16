@@ -19,6 +19,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
+#include <math.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -1445,4 +1446,13 @@ cleanup:
         bdestroy(fd, &tmp_C[i]);
     }
     return ok;
+}
+
+/* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
+void ork_fwht_norm(float *v, int n){
+    for(int len=1; len<n; len<<=1)
+        for(int i=0;i<n;i+=len<<1)
+            for(int j=i;j<i+len;j++){ float a=v[j], b=v[j+len]; v[j]=a+b; v[j+len]=a-b; }
+    float s=1.0f/sqrtf((float)n);
+    for(int i=0;i<n;i++) v[i]*=s;
 }

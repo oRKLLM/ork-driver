@@ -36,28 +36,23 @@ static float silu(float x){return x/(1.0f+expf(-x));}
 static void softmax(float*x,int n){float m=x[0];for(int i=1;i<n;i++)if(x[i]>m)m=x[i];
     float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++)x[i]/=s;}
 
-/* Hadamard */
-static void fwht_norm(float *v, int n){
-    for(int len=1; len<n; len<<=1)
-        for(int i=0;i<n;i+=len<<1)
-            for(int j=i;j<i+len;j++){ float a=v[j], b=v[j+len]; v[j]=a+b; v[j+len]=a-b; }
-    float s=1.0f/sqrtf((float)n);
-    for(int i=0;i<n;i++) v[i]*=s;
-}
 
 /* pack W4A4 Hadamard */
 static ork_w* pack_i4_hadamard(ork_npu* ctx, const float* w_raw, int OUT, int IN, int K_pad, int N_pad, int G, float** out_bS) {
+    int use_hadamard = getenv("NO_HADAMARD") ? 0 : 1;
     float* Bf = calloc((size_t)K_pad * N_pad, sizeof(float));
     for(int n=0; n<OUT; n++) {
         for(int k=0; k<IN; k++) Bf[k*N_pad + n] = w_raw[n*IN + k];
     }
-    float* col = malloc(K_pad * sizeof(float));
-    for(int n=0; n<N_pad; n++) {
-        for(int k=0; k<K_pad; k++) col[k] = Bf[k*N_pad + n];
-        fwht_norm(col, K_pad);
-        for(int k=0; k<K_pad; k++) Bf[k*N_pad + n] = col[k];
+    if (use_hadamard) {
+        float* col = malloc(K_pad * sizeof(float));
+        for(int n=0; n<N_pad; n++) {
+            for(int k=0; k<K_pad; k++) col[k] = Bf[k*N_pad + n];
+            ork_fwht_norm(col, K_pad);
+            for(int k=0; k<K_pad; k++) Bf[k*N_pad + n] = col[k];
+        }
+        free(col);
     }
-    free(col);
 
     int Sk = K_pad / G;
     signed char* Bi = malloc((size_t)K_pad * N_pad);
@@ -88,11 +83,12 @@ static ork_w* pack_i4_hadamard(ork_npu* ctx, const float* w_raw, int OUT, int IN
 
 /* Run I4 Hadamard or CPU fp32 */
 static void mv(ork_npu* ctx, ork_w* W, const float* bS, const float* wraw, int OUT, int IN, int K_pad, int N_pad, int G, const float* x, float* C, int useNPU) {
+    int use_hadamard = getenv("NO_HADAMARD") ? 0 : 1;
     if(useNPU) {
         float* x_pad = calloc(K_pad, sizeof(float));
         for(int k=0; k<IN; k++) x_pad[k] = x[k];
         
-        fwht_norm(x_pad, K_pad);
+        if (use_hadamard) ork_fwht_norm(x_pad, K_pad);
 
         int Sk = K_pad / G;
         signed char* Ai = malloc(K_pad);
