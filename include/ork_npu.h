@@ -131,6 +131,14 @@ typedef struct {
     int32_t *C;
 } ork_mm_task_i8;
 
+typedef struct {
+    ork_w *w;
+    int M;
+    const int8_t *A;
+    int32_t *C;
+} ork_mm_task_i4;
+
 int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 
 #endif

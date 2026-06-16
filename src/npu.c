@@ -158,7 +158,7 @@ ork_npu *ork_npu_init(void){
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
-    c->regcmd=bcreate(fd,65536,0x403); c->task=bcreate(fd,8192,0x40b); c->Af=bcreate(fd,(size_t)4*32768*2,0x403);
+    c->regcmd=bcreate(fd,524288,0x403); c->task=bcreate(fd,65536,0x40b); c->Af=bcreate(fd,(size_t)4*32768*2,0x403);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
@@ -1291,6 +1291,156 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
 
 cleanup:
     for (int i = 0; i < S; i++) {
+        bdestroy(fd, &tmp_A[i]);
+        bdestroy(fd, &tmp_C[i]);
+    }
+    return ok;
+}
+
+int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+    if (!c) return -1;
+    if (S < 1 || S > 512) return -2;
+    if (!tasks) return -2;
+
+    int fd = c->fd;
+
+    // 1. Validate all tasks and count total single-row tasks needed
+    int total_M = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w) return -2;
+        if (w->dtype != DT_I4) return -2;
+        if (tasks[i].M <= 0) return -2;
+        if (w->K % 32 || w->N % 64) return -2;
+        if (w->Sn != 1 || w->Sk != 1) return -2; // chain expects single-slice weights (K<=10752, N<=nmax)
+        total_M += tasks[i].M;
+    }
+    if (total_M > 512) return -2;
+
+    // 2. State transition reset for int4 mode
+    if (c->last_dt != DT_I4) {
+        act(fd, RKNPU_ACT_RESET, 0);
+        c->warmed = 0;
+        c->last_dt = DT_I4;
+        c->ccsz = 0;
+    }
+
+    // 3. Resolve buffers and tile input A
+    struct buf tmp_A[512];
+    struct buf tmp_C[512];
+    memset(tmp_A, 0, sizeof(tmp_A));
+    memset(tmp_C, 0, sizeof(tmp_C));
+
+    uint32_t act_dma[512];
+    uint32_t out_dma[512];
+
+    int ok = 0;
+    int t_idx = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        int M = tasks[i].M;
+        int K = w->K;
+        int N = w->N;
+        for (int m = 0; m < M; m++) {
+            tmp_A[t_idx] = bcreate(fd, (size_t)K, 0x403);
+            if (!tmp_A[t_idx].cpu) { ok = -1; goto cleanup; }
+            tile_i4_Aslice(tmp_A[t_idx].cpu, tasks[i].A + m * K, 0, K);
+            bsync(fd, &tmp_A[t_idx], RKNPU_MEM_SYNC_TO_DEVICE);
+            act_dma[t_idx] = (uint32_t)tmp_A[t_idx].dma;
+
+            tmp_C[t_idx] = bcreate(fd, (size_t)N * 2, 0x403);
+            if (!tmp_C[t_idx].cpu) { ok = -1; goto cleanup; }
+            bsync(fd, &tmp_C[t_idx], RKNPU_MEM_SYNC_TO_DEVICE);
+            out_dma[t_idx] = (uint32_t)tmp_C[t_idx].dma;
+            t_idx++;
+        }
+    }
+
+    // 4. Synthesize REGCMD blocks and link the chain
+    uint32_t rc[REGCMD_I4_N];
+    t_idx = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        int M = tasks[i].M;
+        int K = w->K;
+        int N = w->N;
+        for (int m = 0; m < M; m++) {
+            synth_i4(rc, 1, K, N, act_dma[t_idx], (uint32_t)w->Bb[0].dma, out_dma[t_idx]);
+
+            if (t_idx < total_M - 1) {
+                uint64_t next_dma = c->regcmd.dma + (t_idx + 1) * REGCMD_I4_N * 4;
+                rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+                rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037 << 16);
+                rc[219] = (0x0101 << 16) | (0);
+            } else {
+                rc[216] = 0;
+                rc[217] = 0;
+                rc[218] = 0x00000014;
+                rc[219] = 0x01010000;
+            }
+            memcpy((char*)c->regcmd.cpu + t_idx * REGCMD_I4_N * 4, rc, sizeof(rc));
+            t_idx++;
+        }
+    }
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+
+    // 5. Populate and prepare rknpu_task structures
+    struct rknpu_task *t = c->task.cpu;
+    memset(t, 0, total_M * sizeof(struct rknpu_task));
+    for (int i = 0; i < total_M; i++) {
+        t[i].enable_mask = 0xd;
+        t[i].int_mask = 0x300;
+        t[i].int_clear = 0x1ffff;
+        t[i].regcfg_amount = 116; // REGCMD_I4_N / 2
+        t[i].regcmd_addr = c->regcmd.dma + i * REGCMD_I4_N * 4;
+    }
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+
+    // 6. Submit the chained tasks to the NPU
+    static int tc = -2;
+    if (tc == -2) {
+        const char *e = getenv("ORK_NPU_TESTCORE");
+        tc = e ? atoi(e) : 0;
+        if (tc < 0 || tc > 2) tc = 0;
+    }
+    struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
+    sub.flags = 0x5;
+    sub.task_number = total_M;
+    sub.task_obj_addr = c->task.obj;
+    sub.core_mask = 1u << tc;
+    sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+
+    int reps = c->warmed ? 1 : 2;
+    for (int rep = 0; rep < reps; rep++) {
+        int last = (rep == reps - 1);
+        sub.timeout = last ? 6000 : 1000;
+        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) {
+            if (last) { ok = -1; goto cleanup; }
+            continue;
+        }
+        for (int i = 0; i < total_M; i++) {
+            bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        }
+    }
+    c->warmed = 1;
+
+    // 7. Accumulate outputs
+    t_idx = 0;
+    for (int i = 0; i < S; i++) {
+        int M = tasks[i].M;
+        int N = tasks[i].w->N;
+        for (int m = 0; m < M; m++) {
+            int16_t *o = tmp_C[t_idx].cpu;
+            int32_t *c_dst = tasks[i].C + m * N;
+            for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) c_dst[nt*8+nl] = o[nt*8+nl];
+            t_idx++;
+        }
+    }
+
+cleanup:
+    for (int i = 0; i < total_M; i++) {
         bdestroy(fd, &tmp_A[i]);
         bdestroy(fd, &tmp_C[i]);
     }
