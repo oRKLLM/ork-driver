@@ -47,16 +47,10 @@ struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf;
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
 /* Auto-tuner policy. Multi-core + full-K decode are now the library's DEFAULT per-matmul choice
- * (no env needed); the engine sets a core budget via ork_npu_set_core_budget, and env vars only
- * override: ORK_NPU_MC caps cores, ORK_FULLK_DEC=0 disables the full-K decode layout. */
-static int env_mc(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_NPU_MC"); v=e?atoi(e):-1;} return v; }  /* -1 = unset */
-static int fdec(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_FULLK_DEC"); v=(e&&atoi(e)==0)?0:1;} return v; } /* default ON; =0 disables */
-/* Tier 1c-ii: use the full-K layout (Bf) for PREFILL (M>1) too — one submit per M-tile over full K
- * (M-scheduler), no K-split host accumulate. Default ON for power-of-2 K<=10752 (validated vs the CPU
- * reference in examples/quant: correct + ~1.8x single-core / +14% end-to-end prefill); non-power-of-2
- * K (e.g. 6144) falls back to the K-split path. ORK_FULLK_PREFILL=0 disables. */
-static int fullk_pf(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_FULLK_PREFILL"); v=(e&&atoi(e)==0)?0:1;} return v; }
-static int budget(ork_npu*c){ int b=env_mc(); if(b<0)b=c->core_budget; if(b>c->soc->cores)b=c->soc->cores; if(b<1)b=1; return b; } /* effective max cores */
+ * (no env needed); the engine sets a core budget via ork_npu_set_core_budget.
+ * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
+ * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
+static int budget(ork_npu*c){ int b=c->core_budget; if(b>c->soc->cores)b=c->soc->cores; if(b<1)b=1; return b; } /* effective max cores */
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
@@ -216,11 +210,11 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
                 bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
         }
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
-    /* AUTO full-K decode layout (int8, K<=10752, multi-core enabled): lets the multi-core decode do
+    /* AUTO full-K decode layout (int8, K<=10752): lets the multi-core decode do
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
      * K-split path (correct, just slower). No crash, no ceiling guess. */
-    if(fdec() && dt==DT_I8 && K<=10752 && (budget(c)>1 || fullk_pf())){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(dt==DT_I8 && K<=10752){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
@@ -384,7 +378,7 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* Tier 1c-ii: full-K PREFILL (power-of-2 K only) — one submit/M-tile over full K, no K-split accumulate */
+    if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){   /* Tier 1c-ii: full-K PREFILL (power-of-2 K only) — one submit/M-tile over full K, no K-split accumulate */
         int Kp=K, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
@@ -662,7 +656,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* Tier 1c-ii: full-K prefill — one submit per M-tile over the FULL K (Bf layout), M-scheduler on,
      * result written directly (no K-split, no host accumulate). Saves the second K-slice's accumulate +
      * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
-    if(dt==DT_I8 && M>1 && w->Bf && fullk_pf() && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
+    if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; int chunk=4*R; if(chunk<1)chunk=1;
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).

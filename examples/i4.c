@@ -72,7 +72,7 @@ int main(void){
     fail|=gtest(c,4,2048,128,64);     /* M-tiling + finer groups                */
     printf("%s\n", fail?"SOME TESTS FAILED":"ALL W4A4 API TESTS PASSED");
 
-    if(getenv("ORK_I4_BENCH")){   /* decode-shape throughput: M=1, time R runs (set ORK_NPU_MC to compare) */
+    if(getenv("ORK_I4_BENCH")){   /* decode-shape throughput: M=1, time R runs */
         int K=2048,N=2048,R=100;
         if(getenv("ORK_BENCH_K")) K=atoi(getenv("ORK_BENCH_K"));
         if(getenv("ORK_BENCH_N")) N=atoi(getenv("ORK_BENCH_N"));
@@ -82,8 +82,7 @@ int main(void){
         ork_w*w=ork_mm_pack_i4(c,K,N,B);
         if(w){ ork_mm_run_i4(c,w,1,A,C); ork_mm_run_i4(c,w,1,A,C);   /* warm */
             double t0=ms(); for(int r=0;r<R;r++) ork_mm_run_i4(c,w,1,A,C); double dt=(ms()-t0)/R;
-            const char*mc=getenv("ORK_NPU_MC");
-            printf("decode bench M=1 K=%d N=%d: %.3f ms/matmul (%.0f matmul/s)  cores=%s\n",K,N,dt,1000.0/dt,mc?mc:"auto");
+            printf("decode bench M=1 K=%d N=%d: %.3f ms/matmul (%.0f matmul/s)  cores=auto\n",K,N,dt,1000.0/dt);
             ork_w_free(w); }
         free(A);free(B);free(C);
     }

@@ -71,8 +71,7 @@ Cross-compile example: `make lib CC=aarch64-linux-gnu-gcc`.
 **Tuning is automatic.** The library picks the parallelization per matmul — multi-core N-split
 across the NPU cores, and a full-K single-submit int8 decode layout when it fits the IOMMU — so a
 caller just packs and runs. To bound it (e.g. reserve cores for another workload) call
-`ork_npu_set_core_budget(ctx, n)`. Env overrides for debugging: `ORK_NPU_MC=<n>` caps cores,
-`ORK_FULLK_DEC=0` disables the full-K decode layout.
+`ork_npu_set_core_budget(ctx, n)`.
 
 ## Examples (each self-validates against a CPU reference)
 

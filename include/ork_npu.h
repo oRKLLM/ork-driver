@@ -34,7 +34,7 @@ int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params ar
 
 /* Policy: cap how many NPU cores the auto-tuner may use per matmul (n<=0 → all SoC cores, the
  * default). Multi-core + the full-K int8 decode layout are chosen automatically per matmul; this
- * just bounds them (e.g. reserve cores for another workload). ORK_NPU_MC env overrides if set. */
+ * just bounds them (e.g. reserve cores for another workload). */
 void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 
 /* Zero-copy DMA buffers (NPU-coherent, CPU-mapped). Allocate the activation A and/or output C here

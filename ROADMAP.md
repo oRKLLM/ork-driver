@@ -17,8 +17,8 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
 - **Auto-tuner** — multi-core + full-K int8 decode are now the **default per-matmul choice** (no env
   needed): cores chosen per matmul (≤ budget, ≥2 N-tiles/core), full-K decode auto-built when
   int8 & K≤10752 & multi-core & **it fits the IOMMU** (`bcreate`-success guard — abandons it and
-  falls back to K-split otherwise, never crashes). Policy via `ork_npu_set_core_budget(ctx,n)`;
-  `ORK_NPU_MC`/`ORK_FULLK_DEC` are now debug overrides. Decode 11 tok/s & prefill ~94 with zero env.
+  falls back to K-split otherwise, never crashes). Policy via `ork_npu_set_core_budget(ctx,n)`.
+  Decode 11 tok/s & prefill ~94 with zero env.
 - **Per-channel int8 quant** — the correct fp32→int8→matmul→dequant pattern (per-output-channel
   weight + per-row activation scales) validated end-to-end vs fp32 (`examples/quant.c`, ~0.5% RMS
   error). The pattern a real engine follows; the bench keeps a dummy scale for pure throughput.

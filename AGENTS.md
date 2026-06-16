@@ -146,9 +146,6 @@ Reference (Qwen3-1.7B-w8a8, RK3588 board `10.3.0.236`, `-t 4`, warm): librkllmrt
 ### Env knobs (set on the `llama-bench`/`mc_prof`/`quant` command)
 | var | effect |
 |---|---|
-| `ORK_NPU_MC=<n>` | cap NPU cores per matmul (overrides the auto-tuner / `set_core_budget`) |
-| `ORK_FULLK_PREFILL=0` | disable full-K prefill (default on; one submit/M-tile over full K for power-of-2 K) |
-| `ORK_FULLK_DEC=0` | disable the full-K decode `Bf` layout |
 | `ORK_FUSE=1` | QKV/gate-up fusion (off — measured neutral) |
 | `ORK_NO_AFFINITY=1` | don't pin NPU-driver threads to big cores (default: pin) |
 | `ORK_ZC_OUT=1` | output zero-copy (off — **buggy**, single-tile ~90% wrong, needs regcmd debug) |
