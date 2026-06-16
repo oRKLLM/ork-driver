@@ -116,4 +116,11 @@ int          ork_npu_probe_i4(ork_npu *ctx, int M, int K, int N, int nibB, int n
 int          ork_npu_probe_i4_mm(ork_npu *ctx, int M, int K, int N,
                                  const signed char *A, const signed char *B, short *raw);
 
+/* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
+int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,
+                                    const int8_t *B, int32_t *C);
+
+/* RE/calibration only: benchmark S chained matmuls vs S separate submits using pre-allocated memory */
+int          ork_npu_benchmark_chain(ork_npu *ctx, int S, int K, int N, int iters);
+
 #endif
