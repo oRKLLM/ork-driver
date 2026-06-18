@@ -77,13 +77,13 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 ```
 
 - The validated board is RK3588.
-- The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can
-  stall the next — keep that in mind when adding tests.
+- The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can stall the next — keep that in mind when adding tests. If the board becomes completely wedged, it can be power-cycled via the Home Assistant MCP by toggling the `rock5b` smart plug.
 - A `.bin` test model (e.g. `stories15M`) is needed only for the `llama2` example; it is
   git-ignored and `make test` skips that test gracefully when `MODEL` is absent.
 - **The examples ARE the tests** — each self-validates against a CPU reference (NPU output must
   match within fp16 tolerance; NaN/inf or dead output must fail). When you fix a hardware-behavior
   bug, add a shape/config case to the relevant example so `make test` would have caught it.
+- **No macOS Binary Transfers:** Never push or copy local macOS binaries (from arm64/x86_64 Mac workstation builds) to the target SBC. Only source files should be synchronized (e.g., via git or targeted rsync) and then built natively on the board.
 
 ---
 
