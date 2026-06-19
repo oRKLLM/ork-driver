@@ -9,33 +9,39 @@ typedef ork_f16 f16;
 static unsigned sd=12345; static int rnd(){sd=sd*1103515245+12345;return (sd>>16)%4;}
 
 static int check(ork_npu*ctx,int M,int K,int N){
+    printf("FP16 check start: M=%d, K=%d, N=%d\n", M, K, N); fflush(stdout);
     f16*A=malloc((size_t)M*K*2),*B=malloc((size_t)K*N*2); float*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)rnd();
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(f16)rnd();
+    printf("  Packing...\n"); fflush(stdout);
     ork_w*w=ork_mm_pack(ctx,K,N,B);
     if(!w){printf("pack failed %d,%d\n",K,N);return 1;}
     int bad=0;
     /* run the SAME resident weights for several M (decode then prefill), validate each */
     int Ms[]={1,1,4,M}; for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
+        printf("  Running run (t=%d, m=%d)...\n", t, m); fflush(stdout);
         if(ork_mm_run(ctx,w,m,A,C)){printf("run failed\n");return 1;}
         for(int i=0;i<m;i++)for(int n=0;n<N;n++){float ref=0;for(int k=0;k<K;k++)ref+=(float)A[(size_t)i*K+k]*(float)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;}
     }
-    printf("  %s MKN=%d,%d,%d (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad);
+    printf("  %s MKN=%d,%d,%d (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
     ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
 }
 /* int8/w8a8: A,B int8 -> C int32 (exact integer reference). K%32, N%32. */
 static int check_i8(ork_npu*ctx,int M,int K,int N){
+    printf("Int8 check start: M=%d, K=%d, N=%d\n", M, K, N); fflush(stdout);
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
+    printf("  Packing...\n"); fflush(stdout);
     ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
     if(!w){printf("pack_i8 failed %d,%d\n",K,N);return 1;}
     int bad=0; int Ms[]={1,1,4,M};
     for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
+        printf("  Running run_i8 (t=%d, m=%d)...\n", t, m); fflush(stdout);
         if(ork_mm_run_i8(ctx,w,m,A,C)){printf("run_i8 failed\n");return 1;}
         for(int i=0;i<m;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;}
     }
-    printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad);
+    printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
     ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
 }
 static int check_chain_i8(ork_npu*ctx) {
@@ -107,6 +113,38 @@ static int check_chain_i8(ork_npu*ctx) {
     return bad ? 1 : 0;
 }
 
+static int test_overlap_guards(ork_npu *ctx) {
+    printf("Testing memory overlap safety guards...\n");
+    int M = 1, K = 32, N = 32;
+    int8_t *B = malloc((size_t)K * N);
+    for (int i = 0; i < K * N; i++) B[i] = 1;
+    ork_w *w = ork_mm_pack_i8(ctx, K, N, B);
+    if (!w) {
+        printf("  test_overlap_guards failed: pack_i8 failed\n");
+        free(B);
+        return 1;
+    }
+
+    size_t size = 256;
+    int8_t *shared = malloc(size);
+    int8_t *A = shared;
+    int32_t *C = (int32_t *)(shared + 16); // 16 bytes offset, overlapping under K=32
+
+    int ret = ork_mm_run_i8(ctx, w, M, A, C);
+    int bad = 0;
+    if (ret != -1) {
+        printf("  test_overlap_guards failed: run_i8 did not reject overlapping buffers! (ret=%d)\n", ret);
+        bad = 1;
+    } else {
+        printf("  test_overlap_guards passed: run_i8 correctly rejected overlapping buffers.\n");
+    }
+
+    ork_w_free(w);
+    free(B);
+    free(shared);
+    return bad;
+}
+
 int main(void){
     int fail=0;
     /* fp16 and int8 in SEPARATE contexts: a model is one precision, and switching regcmd mode
@@ -114,6 +152,7 @@ int main(void){
      * mode is stateful — see the wiki). Each precision gets a fresh context here, which also
      * mirrors real usage. (ork_mm_run_i8 on fp16 weights still safely returns an error.) */
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
+    ork_npu_set_core_budget(ctx, 3);
     fail|=check(ctx,128,512,128);
     fail|=check(ctx,256,4096,512);
     fail|=check(ctx,512,8192,128);
@@ -124,6 +163,7 @@ int main(void){
     fail|=check(ctx,4,6144,2048);     /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     ork_npu_free(ctx);
     ork_npu*c8=ork_npu_init(); if(!c8){printf("init failed (NPU?)\n");return 1;}
+    ork_npu_set_core_budget(c8, 3);
     fail|=check_i8(c8,128,512,128);
     fail|=check_i8(c8,256,4096,512);
     fail|=check_i8(c8,64,11008,32);   /* non-power-of-2 K (768 remainder fallback) */
@@ -131,6 +171,7 @@ int main(void){
     fail|=check_i8(c8,8,1280,64);     /* 256 remainder slice */
     fail|=check_i8(c8,4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     fail|=check_chain_i8(c8);         /* verify chained matmuls / MoE API */
+    fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
