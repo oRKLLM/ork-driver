@@ -123,6 +123,10 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    run + tune, then `validated=1`. RK3562/RK3568 not added (see `docs/ADDING_AN_SOC.md`).
 4. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
    scheduling, not an ork-driver change. See the [Heterogeneous Serving wiki](https://github.com/oRKLLM/ork-driver/wiki/Heterogeneous-Serving-and-Scheduling).
+5. **Robustness & Defensive Guards (Anti-Wedge Security)** — Implement userspace-level sanitization to protect the SoC from hardware-level deadlocks or IOMMU page faults caused by faulty inputs or corrupt application states:
+   * **Memory-overlap checks**: Validate that input matrix $A$ and output matrix $C$ do not overlap or alias in memory to avoid concurrent hardware read-write cache collisions.
+   * **REGCMD sanity assertions**: Scan register commands (e.g., verifying `adma` and `cdma` configurations) immediately before submission to ensure target address ranges are well-formed and strictly bounded.
+   * **Self-healing auto-recovery**: Update `submit1` to proactively invoke `RKNPU_ACT_RESET` on a hard submission failure or timeout, clearing state registers so subsequent evaluations are not locked out.
 
 Low value (measured): **CPU/NPU op overlap** (decode is 97% NPU; prefill ops already threaded);
 **decode's last ~4%** to librkllmrt (run-to-run noise / thread+DMA overhead).
