@@ -123,10 +123,20 @@ what's left is engineering. Empirical detail and the reasoning behind each item 
    run + tune, then `validated=1`. RK3562/RK3568 not added (see `docs/ADDING_AN_SOC.md`).
 4. **Chunked prefill** — the only remaining long-prefill lever (O(M²) attention). Engine-level
    scheduling, not an ork-driver change. See the [Heterogeneous Serving wiki](https://github.com/oRKLLM/ork-driver/wiki/Heterogeneous-Serving-and-Scheduling).
-5. **Robustness & Defensive Guards (Anti-Wedge Security)** — Implement userspace-level sanitization to protect the SoC from hardware-level deadlocks or IOMMU page faults caused by faulty inputs or corrupt application states:
-   * **Memory-overlap checks**: Validate that input matrix $A$ and output matrix $C$ do not overlap or alias in memory to avoid concurrent hardware read-write cache collisions.
-   * **REGCMD sanity assertions**: Scan register commands (e.g., verifying `adma` and `cdma` configurations) immediately before submission to ensure target address ranges are well-formed and strictly bounded.
-   * **Self-healing auto-recovery**: Update `submit1` to proactively invoke `RKNPU_ACT_RESET` on a hard submission failure or timeout, clearing state registers so subsequent evaluations are not locked out.
+5. **Robustness & Defensive Guards (Anti-Wedge Security)** — Prevent malformed inputs and invalid states from causing hardware-level deadlocks or IOMMU page faults that freeze `/dev/dri/cardN` and require physical SoC power cycles:
+   * **Proposal I: Memory-Overlap Checks (Implemented & Active ✅)**:
+     - *Rationale*: If the input matrix $A$ and the output matrix $C$ overlap or alias in memory, high-frequency concurrent read-write cache operations on the same physical lines put the DPU/PPU hardware into recursive loops, freezing the NPU cores.
+     - *Mechanism*: A fast CPU-side pre-submit check `check_overlap` validates that the interval $[A, A + \text{size}_A)$ does not intersect with $[C, C + \text{size}_C)$ on all FP16, INT8, and INT4 core execution loops, intercepting and cleanly returning `-1` before commands are generated.
+   * **Proposal II: REGCMD Sanity Assertions (Implemented & Active ✅)**:
+     - *Rationale*: Wild, NULL, or misaligned pointers written to NPU DMA registers trigger instant physical kernel-level IOMMU Page Faults, wedging the DRM driver queue.
+     - *Mechanism*: Prior to copying synthesized regcmds to NPU-accessible memory, the register configurations are scanned to verify the key address registers:
+       - `0x1070` (`adma` - Activation DMA address, block `0x201`)
+       - `0x1110` (`bdma` - Weight DMA address, block `0x201`)
+       - `0x4020` (`cdma` - Output DMA address, block `0x1001`)
+     - *Checks*: Ensure they are non-zero, strictly 16-byte aligned (hardware requirement), and lie within a registered valid buffer context (allocated physical contexts, resident weight tables, temporary/chaining descriptors, or zero-copy tables).
+   * **Proposal III: Self-Healing Auto-Recovery (Implemented & Active ✅)**:
+     - *Rationale*: Even with perfect validation, transient hardware stalls or uncalibrated parameters can freeze the queue. Subsequent submissions must not be locked out.
+     - *Mechanism*: Intercept submitting timeouts and proactively issue an `RKNPU_ACT_RESET` ioctl call to clear the core's state registers, purge blocked hardware pipelines, and cleanly fail the calling thread, restoring the card automatically.
 
 Low value (measured): **CPU/NPU op overlap** (decode is 97% NPU; prefill ops already threaded);
 **decode's last ~4%** to librkllmrt (run-to-run noise / thread+DMA overhead).

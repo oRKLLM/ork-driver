@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <time.h>
 #include <math.h>
+#include <errno.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -52,6 +53,68 @@ static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, u
     }
     return 0;
 }
+static int is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const struct buf *extra, int extra_n) {
+    if (addr == 0) return 0;
+    if (c->regcmd.cpu && addr >= c->regcmd.dma && addr < c->regcmd.dma + c->regcmd.size) return 1;
+    if (c->task.cpu && addr >= c->task.dma && addr < c->task.dma + c->task.size) return 1;
+    if (c->Af.cpu && addr >= c->Af.dma && addr < c->Af.dma + c->Af.size) return 1;
+    if (c->Cc.cpu && addr >= c->Cc.dma && addr < c->Cc.dma + c->Cc.size) return 1;
+    for (int i = 0; i < ORK_MAXCORE; i++) {
+        if (c->mrc[i].cpu && addr >= c->mrc[i].dma && addr < c->mrc[i].dma + c->mrc[i].size) return 1;
+        if (c->mtk[i].cpu && addr >= c->mtk[i].dma && addr < c->mtk[i].dma + c->mtk[i].size) return 1;
+        if (c->maf[i].cpu && addr >= c->maf[i].dma && addr < c->maf[i].dma + c->maf[i].size) return 1;
+        if (c->mcc[i].cpu && addr >= c->mcc[i].dma && addr < c->mcc[i].dma + c->mcc[i].size) return 1;
+    }
+    if (c->mtk_all.cpu && addr >= c->mtk_all.dma && addr < c->mtk_all.dma + c->mtk_all.size) return 1;
+    for (int i = 0; i < c->dma_n; i++) {
+        if (c->dma_tab[i].cpu && addr >= c->dma_tab[i].dma && addr < c->dma_tab[i].dma + c->dma_tab[i].size) return 1;
+    }
+    if (w) {
+        if (w->Bb) {
+            int num_weights = w->Sn * w->Sk;
+            for (int i = 0; i < num_weights; i++) {
+                if (w->Bb[i].cpu && addr >= w->Bb[i].dma && addr < w->Bb[i].dma + w->Bb[i].size) return 1;
+            }
+        }
+        if (w->Bf) {
+            for (int i = 0; i < w->Sn; i++) {
+                if (w->Bf[i].cpu && addr >= w->Bf[i].dma && addr < w->Bf[i].dma + w->Bf[i].size) return 1;
+            }
+        }
+    }
+    if (extra && extra_n > 0) {
+        for (int i = 0; i < extra_n; i++) {
+            if (extra[i].cpu && addr >= extra[i].dma && addr < extra[i].dma + extra[i].size) return 1;
+        }
+    }
+    return 0;
+}
+static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
+    for (int k = 0; k + 1 < n; k += 2) {
+        uint32_t offset = rc[k] & 0xffff;
+        uint32_t block_id = rc[k+1] >> 16;
+        uint32_t val = (rc[k] >> 16) | ((rc[k+1] & 0xffff) << 16);
+        const char *reg_name = NULL;
+        if (offset == 0x1070 && block_id == 0x201) reg_name = "adma";
+        else if (offset == 0x1110 && block_id == 0x201) reg_name = "bdma";
+        else if (offset == 0x4020 && block_id == 0x1001) reg_name = "cdma";
+        if (reg_name) {
+            if (val == 0) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s is NULL (0x00000000).\n", op, reg_name);
+                return -1;
+            }
+            if ((val & 15) != 0) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s address 0x%08x is not 16-byte aligned.\n", op, reg_name, val);
+                return -1;
+            }
+            if (!is_valid_dma_addr(c, val, w, extra, extra_n)) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s address 0x%08x is wild/unallocated (outside all valid buffers).\n", op, reg_name, val);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
@@ -75,6 +138,15 @@ static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->s
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); b->cpu=0; }
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
+static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
+    int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
+    if (rc < 0) {
+        fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d). Triggering self-healing reset...\n", rc, errno);
+        struct rknpu_action a = { .flags = RKNPU_ACT_RESET, .value = 0 };
+        ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+    }
+    return rc;
+}
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
 static void setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
@@ -337,7 +409,7 @@ static int submit1(ork_npu *c){
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=60000;
-        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ if(last){perror("SUBMIT");return -1;} continue; }
+        if(rknpu_submit_ioctl(fd,&sub)){ if(last){perror("SUBMIT");return -1;} continue; }
         bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
@@ -389,7 +461,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
         sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=60000;
-        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ if(last){ a->rc=-1; return; } }
+        if(rknpu_submit_ioctl(fd,&sub)){ if(last){ a->rc=-1; return; } }
         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     c->mwarm[i]=1;
@@ -406,7 +478,7 @@ static void *mcworker(void *vp){
         int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz;
         int active = (cols > 0);
         int eff_cols = active ? cols : nt_sz;
-        for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);int R=RB/Kp;if(R<1)R=1;int chunk=sd?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;int rows=chunk<M?chunk:M;size_t o=(size_t)rows*eff_cols*4;if(o>maxout)maxout=o;}
+        for(int k0=0;k0<K;k0+=KS){int Kp=(K-k0<KS)?(K-k0):KS;int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);int R=RB/Kp;if(R<1)R=1;int chunk=sd?4*R:((RB/2)/Kp);if(chunk<1)chunk=1;int rows=chunk<M?chunk:M;size_t o=(size_t)rows*eff_cols*4;if(o>maxout)maxout=o;}
     }
     if(c->mccsz[i]<maxout){
         fprintf(stderr, "[ork] ERROR: mccsz[%d]=%zu < maxout=%zu, buffer not pre-allocated!\n", i, c->mccsz[i], maxout);
@@ -422,6 +494,7 @@ static void *mcworker(void *vp){
                 int Ncore = nt_sz;
                 uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF);
                 setr(rc,REGCMD_N,0x201,0x1040,0xb1);
+                if (validate_regcmd("mcworker_dec_inactive", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
             } else {
@@ -429,6 +502,7 @@ static void *mcworker(void *vp){
                 double _tp0=ork_now_us();   /* Tier 2a teardown: copy=regcmd-prep, submit=ioctl+result-sync, acc=writeout */
                 uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
                 setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
+                if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 double _ti0=ork_now_us(); g_mc_copy[i]+=_ti0-_tp0;
                 unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
@@ -451,6 +525,7 @@ static void *mcworker(void *vp){
                 if(!active){
                     int Ncore = nt_sz;
                     uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF);
+                    if (validate_regcmd("mcworker_pref_inactive", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                     memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
                 } else {
@@ -460,6 +535,7 @@ static void *mcworker(void *vp){
                     bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                     double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
                     uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
+                    if (validate_regcmd("mcworker_pref_active", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                     memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
                     double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
@@ -476,7 +552,7 @@ static void *mcworker(void *vp){
         int Ncore = active ? (t1-t0)*nt_sz : nt_sz;
         int coff = active ? t0*nt_sz : 0;
         for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0),R=RB/Kp;if(R<1)R=1;
+            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048),R=RB/Kp;if(R<1)R=1;
             int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
             int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
@@ -486,6 +562,7 @@ static void *mcworker(void *vp){
                     uint32_t rc[REGCMD_N];
                     if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
                     else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                    if (validate_regcmd("mcworker_loop_inactive", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                     memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
                 } else {
@@ -497,6 +574,7 @@ static void *mcworker(void *vp){
                     uint32_t rc[REGCMD_N];
                     if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
                     else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                    if (validate_regcmd("mcworker_loop_active", c, rc, REGCMD_N, w, NULL, 0)) { a->rc = -1; return NULL; }
                     memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
                     double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
@@ -576,7 +654,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             int eff_cols = active ? cols : nt_sz;
             for(int k0=0;k0<K;k0+=KS){
                 int Kp=(K-k0<KS)?(K-k0):KS;
-                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);
+                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
                 int R=RB/Kp; if(R<1)R=1;
                 int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
                 int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
@@ -663,12 +741,13 @@ static void *i4_mcworker(void *vp){
                 uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
                 uint32_t rc[REGCMD_I4_N];
                 synth_i4(rc,1,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
                 sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
                 int reps=c->mwarm[i]?1:2;
                 for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
-                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                    if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
                     bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
                 c->mwarm[i]=1;
                 int16_t*o=O->cpu; for(int nt=0;nt<Ncore/8;nt++)for(int nl=0;nl<8;nl++) acc[nt*8+nl]+=o[nt*8+nl];
@@ -707,9 +786,6 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     return 0;
 }
 
-/* ---- grouped W4A4 (per-group scales): each K-group is its own wide submit (the int MAC can't scale
- * mid-K-sum), scaled aScale[m][g]*bScale[g][n] into an fp32 accumulator. Same column-split as above;
- * cost is K/G submits/core (more than per-channel — larger G trades accuracy for fewer submits). ---- */
 struct i4gw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; const float *aS,*bS; float *Cf; int rc; };
 static void *i4_mcworker_g(void *vp){
     struct i4gw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
@@ -727,12 +803,13 @@ static void *i4_mcworker_g(void *vp){
                 tile_i4_Aslice(AF->cpu,Arow,g*G,G); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 uint64_t wbase=w->Bb[(size_t)ns*Sk+g].dma+(uint64_t)b0*G*32;
                 uint32_t rc[REGCMD_I4_N]; synth_i4(rc,1,G,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                if (validate_regcmd("i4_mcworker_g", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
                 memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                 struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
                 sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
                 int reps=c->mwarm[i]?1:2;
                 for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
-                    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                    if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
                     bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
                 c->mwarm[i]=1;
                 int16_t*o=O->cpu; float as=a->aS[(size_t)m*Sk+g];
@@ -783,7 +860,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t maxout=0, maxaf=0;
     for(int k0=0;k0<K;k0+=KS){
         int Kp=(K-k0<KS)?(K-k0):KS;
-        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0);
+        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
         int R=RB/Kp; if(R<1)R=1;
         int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
         int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
@@ -840,6 +917,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
                 uint32_t cdma=cbuf?(uint32_t)(cbuf->dma + ((const char*)C-(const char*)cbuf->cpu) + (size_t)m0*N*4):(uint32_t)c->Cc.dma;
                 uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF);
+                if (validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(submit1(c)) return -1;
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
@@ -868,6 +946,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
             if(dt==DT_F16) synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
+            if (validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             if(submit1(c)) return -1;
             double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
@@ -908,11 +987,13 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     uint32_t rc[REGCMD_I8_N];
     synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
     setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;   /* rep0 warmup (cold buffer stale), rep1 real */
-        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
@@ -939,6 +1020,8 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
     setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     for (int i = 0; i < ntask; i++) {
         memcpy((char*)c->regcmd.cpu + i * sizeof(rc), rc, sizeof(rc));
     }
@@ -949,14 +1032,14 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
+    if(rknpu_submit_ioctl(fd,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
     for(int i=0;i<ntask;i++){ sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(rknpu_submit_ioctl(fd,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
     *us_unbatched=ork_now_us()-t0;
     sub.task_number=ntask; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)ntask};
     t0=ork_now_us();                                 /* (b) one ioctl, ntask tasks */
-    if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(rknpu_submit_ioctl(fd,&sub)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     *us_batched=ork_now_us()-t0;
     bdestroy(fd,&W);bdestroy(fd,&O); return 0;
 }
@@ -983,11 +1066,13 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
     setr(rc,REGCMD_N,0x201,0x1040,0xb1);
     for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_slice_f16", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;
-        if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
@@ -1041,9 +1126,11 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
         uint32_t rc[REGCMD_I4_N];
         synth_i4(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
         for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
+        struct buf extra[2] = {W, O};
+        if (validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         sub.timeout=60000; ok=-1;
-        for(int rep=0;rep<2;rep++){ if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+        for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
             bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
             for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) C[(size_t)m*N + nt*8+nl] = cr[nt*8+nl]; }
@@ -1073,10 +1160,12 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I4_N];
     synth_i4(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(ioctl(fd,DRM_IOCTL_RKNPU_SUBMIT,&sub)){ ok=-1; continue; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)M*N*2);
     bdestroy(fd,&W);bdestroy(fd,&O);
@@ -1108,6 +1197,8 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
         synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF);
         setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
+        struct buf extra[2] = {W, O};
+        if (validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
         
         if (i < S - 1) {
             uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I8_N * 4;
@@ -1147,7 +1238,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     int ok = -1;
     for (int rep = 0; rep < 2; rep++) {
         sub.timeout = 60000;
-        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) { ok = -1; continue; }
+        if (rknpu_submit_ioctl(fd, &sub)) { ok = -1; continue; }
         bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         for (int i = 0; i < S; i++) {
             memcpy(C + i * N, (char*)O.cpu + i * 4096, (size_t)N * 4);
@@ -1247,7 +1338,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
     sub.timeout = 60000;
-    if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) {
+    if (rknpu_submit_ioctl(fd, &sub)) {
         perror("Warmup failed");
     }
     bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -1267,7 +1358,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
             sub_s.fence_fd = -1;
             sub_s.subcore_task[0] = sub_s.subcore_task[1] = sub_s.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
             sub_s.timeout = 60000;
-            if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub_s)) {
+            if (rknpu_submit_ioctl(fd, &sub_s)) {
                 perror("Separate submit failed");
                 break;
             }
@@ -1286,7 +1377,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         sub_c.fence_fd = -1;
         sub_c.subcore_task[0] = sub_c.subcore_task[1] = sub_c.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
         sub_c.timeout = 60000;
-        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub_c)) {
+        if (rknpu_submit_ioctl(fd, &sub_c)) {
             perror("Chained submit failed");
             break;
         }
@@ -1382,6 +1473,12 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
 
     // 4. Synthesize REGCMD blocks and link the chain
+    struct buf extra[2048];
+    int extra_n = 0;
+    for (int j = 0; j < S; j++) {
+        if (tmp_A[j].cpu) extra[extra_n++] = tmp_A[j];
+        if (tmp_C[j].cpu) extra[extra_n++] = tmp_C[j];
+    }
     uint32_t rc[REGCMD_I8_N];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -1390,6 +1487,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         int N = w->N;
 
         synth_i8(rc, M, K, N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i], 1, CBUF);
+        if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
         if (i < S - 1) {
             uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I8_N * 4;
@@ -1439,7 +1537,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = 60000;
-        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) {
+        if (rknpu_submit_ioctl(fd, &sub)) {
             if (last) {
                 perror("SUBMIT chained");
                 submit_ok = -1;
@@ -1532,6 +1630,12 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     }
 
     // 4. Synthesize REGCMD blocks and link the chain
+    struct buf extra[2048];
+    int extra_n = 0;
+    for (int j = 0; j < total_M; j++) {
+        if (tmp_A[j].cpu) extra[extra_n++] = tmp_A[j];
+        if (tmp_C[j].cpu) extra[extra_n++] = tmp_C[j];
+    }
     uint32_t rc[REGCMD_I4_N];
     t_idx = 0;
     for (int i = 0; i < S; i++) {
@@ -1541,6 +1645,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         int N = w->N;
         for (int m = 0; m < M; m++) {
             synth_i4(rc, 1, K, N, act_dma[t_idx], (uint32_t)w->Bb[0].dma, out_dma[t_idx]);
+            if (validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
             if (t_idx < total_M - 1) {
                 uint64_t next_dma = c->regcmd.dma + (t_idx + 1) * REGCMD_I4_N * 4;
@@ -1591,7 +1696,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = 60000;
-        if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) {
+        if (rknpu_submit_ioctl(fd, &sub)) {
             if (last) { ok = -1; goto cleanup; }
             continue;
         }
