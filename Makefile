@@ -6,7 +6,7 @@ AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts
 
 all: $(EXAMPLES)
 
@@ -63,6 +63,10 @@ int4_bench: tools/int4_bench.c $(CORE)
 
 # Tier 4b RE: probe whether the int4 regcmd does multi-M in one submit + brute-force the output layout.
 i4_multim_probe: tools/i4_multim_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# Tier 4b RE: exhaustive register fuzzer for undocumented int4 multi-M row execution.
+i4_multim_fuzz: tools/i4_multim_fuzz.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 # find the int8 prefill correctness bug: exact int8 matmul vs CPU ref across real model shapes/M/cores.
