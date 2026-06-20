@@ -100,7 +100,7 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES)
 	@fail=0; \
-	for t in "test_matmul" "quant" "layer" "decode" "model 1" "model 12"; do \
+	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
