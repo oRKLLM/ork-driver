@@ -66,10 +66,12 @@ int main(void){
     fail|=test(c,2,256,64);       /* K within one slice           */
     fail|=test(c,1,12288,64);     /* K-split (>10752) + accumulate */
     fail|=test(c,3,2048,256);     /* M + N tiling, mid K          */
+    fail|=test(c,8,512,256);      /* regression: prefill M=8 multi-core */
     printf("per-group W4A4 (fp32 -> int4 group-quant -> NPU dequant) vs fp32:\n");
     fail|=gtest(c,1,2048,256,128);    /* decode, group_size 128 (16 groups) */
     fail|=gtest(c,1,4096,512,128);    /* more groups + N-tiling                */
     fail|=gtest(c,4,2048,128,64);     /* M-tiling + finer groups                */
+    fail|=gtest(c,8,1024,256,64);     /* regression: grouped prefill M=8 multi-core */
     printf("%s\n", fail?"SOME TESTS FAILED":"ALL W4A4 API TESTS PASSED");
 
     if(getenv("ORK_I4_BENCH")){   /* decode-shape throughput: M=1, time R runs */
