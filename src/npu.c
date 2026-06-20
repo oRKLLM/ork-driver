@@ -215,11 +215,12 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
      * kernel-hangs this board). So int4 is 1-submit/row; this block stays for the record but is unused
      * by production (all callers pass mc=1). */
     if(mc>1){
-        setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc);setr(rc,REGCMD_I4_N,0x201,0x102c,mc);
-        setr(rc,REGCMD_I4_N,0x1001,0x4034,mc-1);setr(rc,REGCMD_I4_N,0x1001,0x405c,(mc-1)<<16);setr(rc,REGCMD_I4_N,0x801,0x3014,(mc-1)<<16);
+        int mc_phys = 2 * mc;
+        setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x102c,mc_phys);
+        setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);setr(rc,REGCMD_I4_N,0x1001,0x405c,0);setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);
         setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-        setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc+1));
-        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc/64; if(mg<1)mg=1;
+        setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc_phys+1));
+        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc_phys/64; if(mg<1)mg=1;
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v);
     }
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
@@ -336,6 +337,14 @@ static void tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
     for(int kt=0;kt<KT;kt++)for(int kk=0;kk<32;kk++){
         size_t idx=(size_t)kt*32+kk;
         dst[idx/2]|= (uint8_t)(Arow[k0+kt*32+kk]&0xf) << ((idx&1)?4:0);
+    }
+}
+/* a Kp-slice of M activation rows -> native (Kp/32,M,32) interleaved int4 */
+static void tile_i4_Aslice_mm(uint8_t*dst,const int8_t*A,int M,int K,int k0,int Kp){
+    int KT=Kp/32; memset(dst,0,(size_t)M*Kp/2);
+    for(int kt=0;kt<KT;kt++)for(int m=0;m<M;m++)for(int kk=0;kk<32;kk++){
+        size_t idx=((size_t)kt*M+m)*32+kk; uint8_t v=(uint8_t)(A[(size_t)m*K+k0+kt*32+kk]&0xf);
+        dst[idx/2]|= (idx&1)?(v<<4):v;
     }
 }
 ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
@@ -728,31 +737,55 @@ static void *i4_mcworker(void *vp){
     pin_big_core(i);                           /* core 0 = calling thread, 1.. = spawned workers */
     ork_w *w=a->w; int K=w->K, N=w->N, KS=ORK_I4_KS, NMAX=c->soc->nmax;
     struct buf *RC=&c->mrc[i], *AF=&c->maf[i], *O=&c->mcc[i]; a->rc=0;
-    int32_t *acc=malloc((size_t)NMAX*4); if(!acc){a->rc=-1;return NULL;}
+    int32_t *acc=malloc((size_t)M*NMAX*4); if(!acc){a->rc=-1;return NULL;}
     for(int ns=0;ns<w->Sn;ns++){
         int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NB=Nc/64;
         int b0=(int)((long)i*NB/nc), b1=(int)((long)(i+1)*NB/nc); if(b1<=b0) continue;
         int ci0=b0*64, Ncore=(b1-b0)*64;
-        for(int m=0;m<M;m++){ const int8_t*Arow=a->A+(size_t)m*K;
-            for(int z=0;z<Ncore;z++)acc[z]=0;
-            for(int ks=0;ks<w->Sk;ks++){
-                int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-                tile_i4_Aslice(AF->cpu,Arow,k0,Kp); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
-                uint32_t rc[REGCMD_I4_N];
-                synth_i4(rc,1,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
-                if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
-                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
-                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-                int reps=c->mwarm[i]?1:2;
-                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
-                    if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
-                    bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
-                c->mwarm[i]=1;
-                int16_t*o=O->cpu; for(int nt=0;nt<Ncore/8;nt++)for(int nl=0;nl<8;nl++) acc[nt*8+nl]+=o[nt*8+nl];
+        memset(acc, 0, (size_t)M*Ncore*4);
+        for(int ks=0;ks<w->Sk;ks++){
+            int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+            if(M>1) {
+                tile_i4_Aslice_mm(AF->cpu,a->A,M,K,k0,Kp);
+            } else {
+                tile_i4_Aslice(AF->cpu,a->A,k0,Kp);
             }
-            for(int z=0;z<Ncore;z++) a->C[(size_t)m*N + n0+ci0+z]=acc[z];
+            bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+            uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
+            uint32_t rc[REGCMD_I4_N];
+            synth_i4(rc,M,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+            if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
+            memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+            sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+            int reps=c->mwarm[i]?1:2;
+            for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
+                if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
+            c->mwarm[i]=1;
+            int16_t*o=O->cpu;
+            if(M>1) {
+                int mc_phys = 2 * M;
+                for(int m=0;m<M;m++){
+                    for(int nt=0;nt<Ncore/8;nt++){
+                        for(int nl=0;nl<8;nl++){
+                            size_t o_idx = ((size_t)nt * mc_phys + 2 * m) * 8 + nl;
+                            acc[m*Ncore + nt*8+nl] += o[o_idx];
+                        }
+                    }
+                }
+            } else {
+                for(int nt=0;nt<Ncore/8;nt++){
+                    for(int nl=0;nl<8;nl++){
+                        acc[nt*8+nl] += o[nt*8+nl];
+                    }
+                }
+            }
+        }
+        for(int m=0;m<M;m++){
+            for(int z=0;z<Ncore;z++){
+                a->C[(size_t)m*N + n0+ci0+z] = acc[m*Ncore + z];
+            }
         }
     }
     free(acc); return NULL;
@@ -764,8 +797,11 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(nc<1)nc=1;
     if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
-    size_t osz=(size_t)c->soc->nmax*2;        /* per-core output: up to a full N-slice of int16 */
+    size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
+    size_t asz=(size_t)M*ORK_I4_KS/2;
+    if(asz < (size_t)4*32768*2) asz=(size_t)4*32768*2;
+    for(int i=0;i<nc;i++){ if(c->maf[i].size<asz){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,asz,0x403); if(!c->maf[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation maf[%d] (size=%zu)\n", i, asz);return -2;} } }
     /* Zero-copy chaining (the portable half of the int8 zero-copy design — perf-neutral, correctness
      * for DMA pipelines). int4 can't read/write the caller's A/C *directly* (A needs the nibble re-tile,
      * the int16 hardware output needs widening to the int32 C), so the internal AF/O scratch is
