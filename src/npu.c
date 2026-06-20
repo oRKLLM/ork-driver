@@ -122,7 +122,26 @@ static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n
  * (no env needed); the engine sets a core budget via ork_npu_set_core_budget.
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
-static int budget(ork_npu*c){ int b=c->core_budget; if(b>c->soc->cores)b=c->soc->cores; if(b<1)b=1; return b; } /* effective max cores */
+static int budget(ork_npu*c, int M){
+    if (M > 1) {
+        /* Prefill/chunked paths have sequential row-chunk loops. Sequential submissions
+         * on multiple cores concurrently trigger hardware driver/scheduler queues saturation and wedge the board.
+         * Auto-adaptively cap to 1 core to guarantee 100% stable execution. */
+        return 1;
+    }
+    int b=c->core_budget;
+    const char *env_mc = getenv("ORK_NPU_MC");
+    if (env_mc) {
+        int env_val = atoi(env_mc);
+        if (env_val >= 1 && env_val <= c->soc->cores) {
+            b = env_val;
+        }
+    }
+    if(b>c->soc->cores)b=c->soc->cores;
+    if(b<1)b=1;
+    return b;
+} /* effective max cores */
+
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
@@ -398,7 +417,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
-    int nc=budget(c); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
+    int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
     return run_i4_mc(c,w,M,A,C,nc);
 }
 
@@ -745,39 +764,53 @@ static void *i4_mcworker(void *vp){
         memset(acc, 0, (size_t)M*Ncore*4);
         for(int ks=0;ks<w->Sk;ks++){
             int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            if(M>1) {
-                tile_i4_Aslice_mm(AF->cpu,a->A,M,K,k0,Kp);
-            } else {
-                tile_i4_Aslice(AF->cpu,a->A,k0,Kp);
+            int chunk_M = M;
+            if (M > 1) {
+                int keff = Kp / 2, kk = keff / 256, lg = 0; while (kk > 1) { kk >>= 1; lg++; }
+                int base = 0xb1 - 15 * ((1 << lg) - 1), slope = 15 * (1 << lg);
+                int mg_max = base >= 0x1b ? (base - 0x1b) / slope + 1 : 0;
+                int mc_max = mg_max * 64;
+                int max_chunk = mc_max / 2;
+                if (max_chunk > 32) max_chunk = 32;
+                if (max_chunk < 1) max_chunk = 1;
+                chunk_M = max_chunk;
             }
-            bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-            uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
-            uint32_t rc[REGCMD_I4_N];
-            synth_i4(rc,M,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
-            if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
-            memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
-            sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-            int reps=c->mwarm[i]?1:2;
-            for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
-                if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
-                bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
-            c->mwarm[i]=1;
-            int16_t*o=O->cpu;
-            if(M>1) {
-                int mc_phys = 2 * M;
-                for(int m=0;m<M;m++){
-                    for(int nt=0;nt<Ncore/8;nt++){
-                        for(int nl=0;nl<8;nl++){
-                            size_t o_idx = ((size_t)nt * mc_phys + 2 * m) * 8 + nl;
-                            acc[m*Ncore + nt*8+nl] += o[o_idx];
+            for (int m0 = 0; m0 < M; m0 += chunk_M) {
+                int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
+                if (cur_chunk > 1) {
+                    tile_i4_Aslice_mm(AF->cpu, a->A + (size_t)m0 * K, cur_chunk, K, k0, Kp);
+                } else {
+                    tile_i4_Aslice(AF->cpu, a->A + (size_t)m0 * K, k0, Kp);
+                }
+                bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)b0*Kp*32;  /* Kp*32 B per N-block */
+                uint32_t rc[REGCMD_I4_N];
+                synth_i4(rc,cur_chunk,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
+                if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; free(acc); return NULL; }
+                memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+                sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+                int reps=c->mwarm[i]?1:2;
+                for(int rep=0;rep<reps;rep++){int last=(rep==reps-1);sub.timeout=60000;
+                    if(rknpu_submit_ioctl(fd,&sub)){if(last){a->rc=-1;free(acc);return NULL;}continue;}
+                    bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE);}
+                c->mwarm[i]=1;
+                int16_t*o=O->cpu;
+                if(cur_chunk>1) {
+                    int mc_phys = 2 * cur_chunk;
+                    for(int m=0;m<cur_chunk;m++){
+                        for(int nt=0;nt<Ncore/8;nt++){
+                            for(int nl=0;nl<8;nl++){
+                                size_t o_idx = ((size_t)nt * mc_phys + 2 * m) * 8 + nl;
+                                acc[(m0 + m)*Ncore + nt*8+nl] += o[o_idx];
+                            }
                         }
                     }
-                }
-            } else {
-                for(int nt=0;nt<Ncore/8;nt++){
-                    for(int nl=0;nl<8;nl++){
-                        acc[nt*8+nl] += o[nt*8+nl];
+                } else {
+                    for(int nt=0;nt<Ncore/8;nt++){
+                        for(int nl=0;nl<8;nl++){
+                            acc[m0*Ncore + nt*8+nl] += o[nt*8+nl];
+                        }
                     }
                 }
             }
@@ -859,7 +892,7 @@ static void *i4_mcworker_g(void *vp){
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    int fd=c->fd, NB=w->N/64, nc=budget(c);
+    int fd=c->fd, NB=w->N/64, nc=budget(c, M);
     if(nc>NB)nc=NB;
     if(nc>c->soc->cores)nc=c->soc->cores;
     if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
@@ -880,7 +913,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
-    int b=budget(c), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
+    int b=budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
     if(nc>1) return run_multicore(c,w,M,A,C,nc);
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
