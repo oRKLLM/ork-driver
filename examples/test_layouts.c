@@ -75,17 +75,18 @@ static void synth_i4_custom(uint32_t*rc, int mc, int K, int N, uint32_t aA, uint
     setr(rc, REGCMD_I4_N, 0x1001, 0x4058, N-1);
     
     if (mc > 1) {
-        if (mask & (1 << 0)) setr(rc, REGCMD_I4_N, 0x201, 0x1020, 0x10000|mc);
-        if (mask & (1 << 1)) setr(rc, REGCMD_I4_N, 0x201, 0x1084, 0x10000|mc);
-        if (mask & (1 << 2)) setr(rc, REGCMD_I4_N, 0x201, 0x102c, mc);
-        if (mask & (1 << 3)) setr(rc, REGCMD_I4_N, 0x1001, 0x4034, mc-1);
-        if (mask & (1 << 4)) setr(rc, REGCMD_I4_N, 0x1001, 0x405c, (mc-1)<<16);
-        if (mask & (1 << 5)) setr(rc, REGCMD_I4_N, 0x801, 0x3014, (mc-1)<<16);
+        int mc_phys = 2 * mc;
+        if (mask & (1 << 0)) setr(rc, REGCMD_I4_N, 0x201, 0x1020, 0x10000|mc_phys);
+        if (mask & (1 << 1)) setr(rc, REGCMD_I4_N, 0x201, 0x1084, 0x10000|mc_phys);
+        if (mask & (1 << 2)) setr(rc, REGCMD_I4_N, 0x201, 0x102c, mc_phys);
+        if (mask & (1 << 3)) setr(rc, REGCMD_I4_N, 0x1001, 0x4034, mc_phys-1);
+        if (mask & (1 << 4)) setr(rc, REGCMD_I4_N, 0x1001, 0x405c, (mc_phys-1)<<16);
+        if (mask & (1 << 5)) setr(rc, REGCMD_I4_N, 0x801, 0x3014, (mc_phys-1)<<16);
         if (mask & (1 << 6)) setr(rc, REGCMD_I4_N, 0x1001, 0x4038, (((N/4)-1)<<16)|((N/4)-1));
-        if (mask & (1 << 7)) setr(rc, REGCMD_I4_N, 0x201, 0x1010, 16*(mc+1));
+        if (mask & (1 << 7)) setr(rc, REGCMD_I4_N, 0x201, 0x1010, 16*(mc_phys+1));
         if (mask & (1 << 8)) {
             int kk=K/256, lg=0; while(kk>1){kk>>=1; lg++;}
-            int base=0xb1-15*((1<<lg)-1), slope=15*(1<<lg), mg=mc/64; if(mg<1)mg=1;
+            int base=0xb1-15*((1<<lg)-1), slope=15*(1<<lg), mg=mc_phys/64; if(mg<1)mg=1;
             int v=base-slope*(mg-1); if(v<0x1b)v=0x1b;
             setr(rc, REGCMD_I4_N, 0x201, 0x1040, v);
         }
@@ -135,7 +136,7 @@ int main(void) {
     if (!ctx) { printf("init failed\n"); return 1; }
     
     int fd = ctx->fd;
-    int M = 32, K = 64, N = 64;
+    int M = 16, K = 64, N = 64;
     int8_t *A = malloc((size_t)M * K);
     int8_t *B = malloc((size_t)K * N);
     int32_t *ref = malloc((size_t)M * N * 4);

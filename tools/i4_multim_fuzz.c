@@ -218,6 +218,49 @@ int main(void) {
     
     for(int m=0;m<M;m++) tile_i4_A((uint8_t*)ctx->Af.cpu+(size_t)m*(K/2),A+(size_t)m*K,1,K,0);
     bsync(fd,&ctx->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+
+    int16_t *baseline_out = malloc((size_t)M * N * 2);
+    if (!baseline_out) { printf("baseline_out malloc failed\n"); return 1; }
+    
+    int16_t *out_cpu_base = (int16_t*)O.cpu;
+    for (size_t i = 0; i < (size_t)M*N; i++) out_cpu_base[i] = 0x7aaa;
+    bsync(fd, &O, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, &O, RKNPU_MEM_SYNC_TO_DEVICE);
+    
+    uint32_t rc_base[REGCMD_I4_N];
+    synth_i4(rc_base, M, K, N, (uint32_t)ctx->Af.dma, (uint32_t)W.dma, (uint32_t)O.dma);
+    
+    act(fd, RKNPU_ACT_RESET, 0);
+    memcpy(ctx->regcmd.cpu, rc_base, sizeof rc_base);
+    bsync(fd, &ctx->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    
+    struct rknpu_submit sub_base;
+    memset(&sub_base, 0, sizeof sub_base);
+    sub_base.flags = 0x5;
+    sub_base.task_number = 1;
+    sub_base.task_obj_addr = ctx->task.obj;
+    sub_base.core_mask = RKNPU_CORE0_MASK;
+    sub_base.fence_fd = -1;
+    sub_base.subcore_task[0] = (struct rknpu_subcore_task){0, 1};
+    sub_base.timeout = 2000;
+    
+    int ok_base = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub_base);
+    if (ok_base < 0) {
+        printf("Baseline run failed! rc=%d, errno=%d\n", ok_base, errno);
+        free(baseline_out);
+        bdestroy(fd, &W); bdestroy(fd, &O);
+        free(A); free(B); free(ref);
+        ork_npu_free(ctx);
+        return 1;
+    }
+    bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
+    memcpy(baseline_out, out_cpu_base, (size_t)M * N * 2);
+    
+    printf("[fuzzer] Baseline run completed successfully. First 8 elements of each row:\n");
+    for (int m = 0; m < M; m++) {
+        printf("  Row%d: ", m);
+        for (int i = 0; i < 8; i++) printf("%04x ", (uint16_t)baseline_out[m*N + i]);
+        printf("\n");
+    }
     
     uint32_t fvals[] = { 3, 4, 0x10003, 0x00030003 };
     int n_fvals = sizeof(fvals)/sizeof(fvals[0]);
@@ -312,17 +355,17 @@ int main(void) {
                 } else {
                     bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
                     
-                    int computed_rows = 0;
-                    for (int i = N; i < M*N; i++) {
-                        if (out_cpu[i] != 0x7aaa) {
-                            computed_rows = 1;
+                    int output_changed = 0;
+                    for (int i = 0; i < M*N; i++) {
+                        if (out_cpu[i] != baseline_out[i]) {
+                            output_changed = 1;
                             break;
                         }
                     }
                     
-                    if (computed_rows) {
+                    if (output_changed) {
                         hit_count++;
-                        printf("HIT! Output changed in rows 1-3!\n");
+                        printf("HIT! Output changed compared to baseline!\n");
                         printf("   [HIT] Register block=%x offset=%x val=%x caused output modification!\n", b, o, val);
                         for (int m = 0; m < M; m++) {
                             printf("   Row%d: ", m);
@@ -353,6 +396,7 @@ int main(void) {
     
     printf("[fuzzer] Finished! Total runs: %d, Hits: %d\n", total_runs, hit_count);
     
+    free(baseline_out);
     bdestroy(fd, &W); bdestroy(fd, &O);
     free(A); free(B); free(ref);
     ork_npu_free(ctx);
