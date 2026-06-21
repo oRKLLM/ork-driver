@@ -242,8 +242,8 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
     setr(rc,REGCMD_N,0x1001,0x403c,((N-1)<<16)|(N-1));setr(rc,REGCMD_N,0x1001,0x4058,N-1);setr(rc,REGCMD_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
     setr(rc,REGCMD_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_N,0x801,0x3018,N-1);
     if(sched){
-        int R=cbuf/K; if(R<1)R=1; int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_N,0x201,0x1010,16*rows);
-        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see synth_i8 (65..127-row tile needs the next K-schedule) */
+        int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_N,0x201,0x1010,16*rows);
+        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see synth_i8 (65..127-row tile needs the next K-schedule) */
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_N,0x201,0x1070,aA);setr(rc,REGCMD_N,0x201,0x1110,aB);setr(rc,REGCMD_N,0x1001,0x4020,aC);
@@ -261,12 +261,12 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I8_N,0x1001,0x403c,((s-1)<<16)|(N-1));setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/4)-1)<<16)|((N/4)-1));
     setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
     if(sched){
-        int R=(2*cbuf)/K; if(R<1)R=1; int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
+        int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
         /* 0x1040 = K-reduction schedule, selected per 64-row group. MUST be ceil(mc/64): a tile of
          * 65..127 rows spills past the first 64-row group, so it needs the NEXT schedule (the one a
          * full 128-row tile uses), not the <=64 schedule. floor(mc/64) gave 65..127-row tiles the
          * <=64 schedule -> rows 64..mc-1 computed against the wrong K-partition (the prefill bug). */
-        int keff=K/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=(mc+63)/64; if(mg<1)mg=1;
+        double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I8_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
@@ -303,7 +303,7 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
         setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);setr(rc,REGCMD_I4_N,0x1001,0x405c,0);setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);
         setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
         setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc_phys+1));
-        int kk=K/256,lg=0; while(kk>1){kk>>=1;lg++;} int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg),mg=mc_phys/64; if(mg<1)mg=1;
+        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=mc_phys/64; if(mg<1)mg=1;
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v);
     }
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
@@ -363,7 +363,7 @@ void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
-    int KS=dt?1024:c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
+    int KS=dt ? 1024 : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
@@ -600,7 +600,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
 static void *mcworker(void *vp){
     struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
     int K=a->w->K, N=a->w->N, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     ork_w *w=a->w; const void *A=a->A; struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*CC=&c->mcc[i];
     size_t maxout = a->maxout;
     if(c->mccsz[i]<maxout){
@@ -648,10 +648,9 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){   /* Tier 1c-ii: full-K PREFILL (power-of-2 K only) — one submit/M-tile over full K, no K-split accumulate */
-        int Kp=K, R=RB/Kp; if(R<1)R=1;
-        int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-        int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
+        int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
@@ -699,9 +698,8 @@ static void *mcworker(void *vp){
         int Ncore = active ? (t1-t0)*nt_sz : nt_sz;
         int coff = active ? t0*nt_sz : 0;
         for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048),R=RB/Kp;if(R<1)R=1;
-            int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-            int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+            double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
             struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)(active?t0:0)*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
             for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
@@ -870,7 +868,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
     int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     size_t core_maxout[ORK_MAXCORE] = {0};
     for(int i=0;i<nc;i++){
         size_t maxout=0, maxaf=0;
@@ -881,19 +879,17 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             for(int k0=0;k0<K;k0+=KS){
                 int Kp=(K-k0<KS)?(K-k0):KS;
                 int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
-                int R=RB/Kp; if(R<1)R=1;
-                int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-                int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+                int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+                double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
                 int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
                 int rows=chunk<M?chunk:M;
                 size_t o=(size_t)rows*eff_cols*4; if(o>maxout)maxout=o;
                 size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
             }
         }
-        if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){
-            int Kp=K, R=RB/Kp; if(R<1)R=1;
-            int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-            int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+        if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+            int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+            double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
             int rows=chunk<M?chunk:M;
             size_t sz=(size_t)rows*Kp*1;
@@ -968,12 +964,14 @@ static void *i4_mcworker(void *vp){
         if(acc) memset(acc, 0, (size_t)M*Ncore*4);
         for(int ks=0;ks<w->Sk;ks++){
             int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int chunk_M = 1;
+            int chunk_M = 16;
             for (int m0 = 0; m0 < M; m0 += chunk_M) {
                 int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
                 if (!c->mc_error) {
                     if (cur_chunk > 1) {
-                        tile_i4_Aslice_mm(AF->cpu, a->A + (size_t)m0 * K, cur_chunk, K, k0, Kp);
+                        for (int m = 0; m < cur_chunk; m++) {
+                            tile_i4_Aslice((uint8_t*)AF->cpu + (size_t)m * (Kp / 2), a->A + (size_t)(m0 + m) * K, k0, Kp);
+                        }
                     } else {
                         tile_i4_Aslice(AF->cpu, a->A + (size_t)m0 * K, k0, Kp);
                     }
@@ -1019,13 +1017,10 @@ static void *i4_mcworker(void *vp){
                 if (active && acc) {
                     int16_t*o=O->cpu;
                     if(cur_chunk>1) {
-                        int mc_phys = 2 * cur_chunk;
                         for(int m=0;m<cur_chunk;m++){
-                            for(int nt=0;nt<Ncore/8;nt++){
-                                for(int nl=0;nl<8;nl++){
-                                    size_t o_idx = ((size_t)nt * mc_phys + 2 * m) * 8 + nl;
-                                    acc[(m0 + m)*Ncore + nt*8+nl] += o[o_idx];
-                                }
+                            for(int col=0;col<Ncore;col++){
+                                size_t o_idx = (size_t)2 * m * Ncore + col;
+                                acc[(m0 + m)*Ncore + col] += o[o_idx];
                             }
                         }
                     } else {
@@ -1262,7 +1257,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(nc>1) return run_multicore(c,w,M,A,C,nc);
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt?1024:c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
+    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
@@ -1274,19 +1269,17 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     for(int k0=0;k0<K;k0+=KS){
         int Kp=(K-k0<KS)?(K-k0):KS;
         int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
-        int R=RB/Kp; if(R<1)R=1;
-        int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-        int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+        int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
         int rows=chunk<M?chunk:M;
         int nc=N<NMAX?N:NMAX;
         size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;
         size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){
-        int Kp=K, R=RB/Kp; if(R<1)R=1;
-        int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-        int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+        int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
         int rows=chunk<M?chunk:M;
         size_t sz=(size_t)rows*Kp*1;
@@ -1304,10 +1297,9 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* Tier 1c-ii: full-K prefill — one submit per M-tile over the FULL K (Bf layout), M-scheduler on,
      * result written directly (no K-split, no host accumulate). Saves the second K-slice's accumulate +
      * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
-    if(dt==DT_I8 && M>1 && w->Bf && (K&(K-1))==0){   /* power-of-2 K only: the M-scheduler is invalid for non-pow2 Kp (e.g. K=6144) */
-        int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1;
-        int keff=Kp/2,kk=keff/256,lg=0; while(kk>1){kk>>=1;lg++;}
-        int base=0xb1-15*((1<<lg)-1),slope=15*(1<<lg), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
+        int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
@@ -1363,7 +1355,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0), R=RB/Kp; if(R<1)R=1; int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
+        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             double _tc0=ork_now_us();
