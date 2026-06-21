@@ -27,6 +27,9 @@
 #include "regcmd_i4.h"
 #include "ork_npu.h"
 #include "soc.h"
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 typedef ork_f16 f16;
 enum { DT_F16=0, DT_I8=1, DT_I4=2 };
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
@@ -346,11 +349,26 @@ static void tile_i4_Bslice(uint8_t*dst,const int8_t*B,int K,int N,int k0,int Kp,
 }
 /* a Kp-slice of one A row -> native (Kp/32,1,32) int4 */
 static void tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int col = 0;
+    int8x16_t vmask = vdupq_n_s8(0x0f);
+    for (; col <= Kp - 16; col += 16) {
+        int8x16_t v = vld1q_s8(&Arow[k0 + col]);
+        int8x16_t vmasked = vandq_s8(v, vmask);
+        int8x16x2_t tuzp = vuzpq_s8(vmasked, vmasked);
+        uint8x8_t veven_low = vreinterpret_u8_s8(vget_low_s8(tuzp.val[0]));
+        uint8x8_t vodd_low  = vreinterpret_u8_s8(vget_low_s8(tuzp.val[1]));
+        uint8x8_t vodd_shifted = vshl_n_u8(vodd_low, 4);
+        uint8x8_t vcombined = vorr_u8(veven_low, vodd_shifted);
+        vst1_u8(&dst[col / 2], vcombined);
+    }
+#else
     int KT=Kp/32; memset(dst,0,(size_t)Kp/2);
     for(int kt=0;kt<KT;kt++)for(int kk=0;kk<32;kk++){
         size_t idx=(size_t)kt*32+kk;
         dst[idx/2]|= (uint8_t)(Arow[k0+kt*32+kk]&0xf) << ((idx&1)?4:0);
     }
+#endif
 }
 /* a Kp-slice of M activation rows -> native (Kp/32,M,32) interleaved int4 */
 static void tile_i4_Aslice_mm(uint8_t*dst,const int8_t*A,int M,int K,int k0,int Kp){
@@ -647,8 +665,74 @@ static void *mcworker(void *vp){
                         memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                         unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
                         double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
-                        if(dt==DT_F16){float  *cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
-                        else{int32_t*cc=CC->cpu,*cr=a->cres;for(int r=0;r<mco;r++)for(int col=0;col<Ncore;col++)cr[(size_t)(m0+r)*N+(n0+coff+col)]+=cc[(size_t)r*Ncore+col];}
+                        if(dt==DT_F16){
+                            float  *cc=CC->cpu,*cr=a->cres;
+                            for(int r=0;r<mco;r++) {
+                                size_t cr_row_offset = (size_t)(m0+r)*N + (n0+coff);
+                                size_t cc_row_offset = (size_t)r*Ncore;
+                                int col = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                                for (; col <= Ncore - 16; col += 16) {
+                                    float32x4_t vcc0 = vld1q_f32(&cc[cc_row_offset + col]);
+                                    float32x4_t vcc1 = vld1q_f32(&cc[cc_row_offset + col + 4]);
+                                    float32x4_t vcc2 = vld1q_f32(&cc[cc_row_offset + col + 8]);
+                                    float32x4_t vcc3 = vld1q_f32(&cc[cc_row_offset + col + 12]);
+
+                                    float32x4_t vcr0 = vld1q_f32(&cr[cr_row_offset + col]);
+                                    float32x4_t vcr1 = vld1q_f32(&cr[cr_row_offset + col + 4]);
+                                    float32x4_t vcr2 = vld1q_f32(&cr[cr_row_offset + col + 8]);
+                                    float32x4_t vcr3 = vld1q_f32(&cr[cr_row_offset + col + 12]);
+
+                                    vcr0 = vaddq_f32(vcr0, vcc0);
+                                    vcr1 = vaddq_f32(vcr1, vcc1);
+                                    vcr2 = vaddq_f32(vcr2, vcc2);
+                                    vcr3 = vaddq_f32(vcr3, vcc3);
+
+                                    vst1q_f32(&cr[cr_row_offset + col], vcr0);
+                                    vst1q_f32(&cr[cr_row_offset + col + 4], vcr1);
+                                    vst1q_f32(&cr[cr_row_offset + col + 8], vcr2);
+                                    vst1q_f32(&cr[cr_row_offset + col + 12], vcr3);
+                                }
+#endif
+                                for (; col < Ncore; col++) {
+                                    cr[cr_row_offset + col] += cc[cc_row_offset + col];
+                                }
+                            }
+                        }
+                        else{
+                            int32_t*cc=CC->cpu,*cr=a->cres;
+                            for(int r=0;r<mco;r++) {
+                                size_t cr_row_offset = (size_t)(m0+r)*N + (n0+coff);
+                                size_t cc_row_offset = (size_t)r*Ncore;
+                                int col = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                                for (; col <= Ncore - 16; col += 16) {
+                                    int32x4_t vcc0 = vld1q_s32(&cc[cc_row_offset + col]);
+                                    int32x4_t vcc1 = vld1q_s32(&cc[cc_row_offset + col + 4]);
+                                    int32x4_t vcc2 = vld1q_s32(&cc[cc_row_offset + col + 8]);
+                                    int32x4_t vcc3 = vld1q_s32(&cc[cc_row_offset + col + 12]);
+
+                                    int32x4_t vcr0 = vld1q_s32(&cr[cr_row_offset + col]);
+                                    int32x4_t vcr1 = vld1q_s32(&cr[cr_row_offset + col + 4]);
+                                    int32x4_t vcr2 = vld1q_s32(&cr[cr_row_offset + col + 8]);
+                                    int32x4_t vcr3 = vld1q_s32(&cr[cr_row_offset + col + 12]);
+
+                                    vcr0 = vaddq_s32(vcr0, vcc0);
+                                    vcr1 = vaddq_s32(vcr1, vcc1);
+                                    vcr2 = vaddq_s32(vcr2, vcc2);
+                                    vcr3 = vaddq_s32(vcr3, vcc3);
+
+                                    vst1q_s32(&cr[cr_row_offset + col], vcr0);
+                                    vst1q_s32(&cr[cr_row_offset + col + 4], vcr1);
+                                    vst1q_s32(&cr[cr_row_offset + col + 8], vcr2);
+                                    vst1q_s32(&cr[cr_row_offset + col + 12], vcr3);
+                                }
+#endif
+                                for (; col < Ncore; col++) {
+                                    cr[cr_row_offset + col] += cc[cc_row_offset + col];
+                                }
+                            }
+                        }
                         g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
                     } else {
                         unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
@@ -876,11 +960,38 @@ static void *i4_mcworker(void *vp){
                             }
                         }
                     } else {
+                        int32_t*acc_ptr = &acc[m0 * Ncore];
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                        int col = 0;
+                        for (; col <= Ncore - 16; col += 16) {
+                            int32x4_t vacc0 = vld1q_s32(&acc_ptr[col]);
+                            int32x4_t vacc1 = vld1q_s32(&acc_ptr[col + 4]);
+                            int32x4_t vacc2 = vld1q_s32(&acc_ptr[col + 8]);
+                            int32x4_t vacc3 = vld1q_s32(&acc_ptr[col + 12]);
+
+                            int16x8_t vo16_0 = vld1q_s16(&o[col]);
+                            int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
+
+                            vacc0 = vaddw_s16(vacc0, vget_low_s16(vo16_0));
+                            vacc1 = vaddw_high_s16(vacc1, vo16_0);
+                            vacc2 = vaddw_s16(vacc2, vget_low_s16(vo16_1));
+                            vacc3 = vaddw_high_s16(vacc3, vo16_1);
+
+                            vst1q_s32(&acc_ptr[col], vacc0);
+                            vst1q_s32(&acc_ptr[col + 4], vacc1);
+                            vst1q_s32(&acc_ptr[col + 8], vacc2);
+                            vst1q_s32(&acc_ptr[col + 12], vacc3);
+                        }
+                        for (; col < Ncore; col++) {
+                            acc_ptr[col] += o[col];
+                        }
+#else
                         for(int nt=0;nt<Ncore/8;nt++){
                             for(int nl=0;nl<8;nl++){
-                                acc[m0*Ncore + nt*8+nl] += o[nt*8+nl];
+                                acc_ptr[nt*8+nl] += o[nt*8+nl];
                             }
                         }
+#endif
                     }
                 }
             }
@@ -989,7 +1100,55 @@ static void *i4_mcworker_g(void *vp){
                 c->mwarm[i]=1;
                 if (active && acc) {
                     int16_t*o=O->cpu; float as=a->aS[(size_t)m*Sk+g];
-                    for(int col=0;col<Ncore;col++) acc[col]+= as * a->bS[(size_t)g*N + n0+ci0+col] * (float)o[col];
+                    const float *bS_ptr = a->bS + (size_t)g*N + n0+ci0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                    float32x4_t vas = vdupq_n_f32(as);
+                    int col = 0;
+                    for (; col <= Ncore - 16; col += 16) {
+                        int16x8_t vo16_0 = vld1q_s16(&o[col]);
+                        int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
+
+                        int32x4_t vo32_0_low  = vmovl_s16(vget_low_s16(vo16_0));
+                        int32x4_t vo32_0_high = vmovl_s16(vget_high_s16(vo16_0));
+                        float32x4_t vo_f_0_low  = vcvtq_f32_s32(vo32_0_low);
+                        float32x4_t vo_f_0_high = vcvtq_f32_s32(vo32_0_high);
+
+                        int32x4_t vo32_1_low  = vmovl_s16(vget_low_s16(vo16_1));
+                        int32x4_t vo32_1_high = vmovl_s16(vget_high_s16(vo16_1));
+                        float32x4_t vo_f_1_low  = vcvtq_f32_s32(vo32_1_low);
+                        float32x4_t vo_f_1_high = vcvtq_f32_s32(vo32_1_high);
+
+                        float32x4_t vbS_0_low  = vld1q_f32(&bS_ptr[col]);
+                        float32x4_t vbS_0_high = vld1q_f32(&bS_ptr[col + 4]);
+                        float32x4_t vbS_1_low  = vld1q_f32(&bS_ptr[col + 8]);
+                        float32x4_t vbS_1_high = vld1q_f32(&bS_ptr[col + 12]);
+
+                        float32x4_t vacc_0_low  = vld1q_f32(&acc[col]);
+                        float32x4_t vacc_0_high = vld1q_f32(&acc[col + 4]);
+                        float32x4_t vacc_1_low  = vld1q_f32(&acc[col + 8]);
+                        float32x4_t vacc_1_high = vld1q_f32(&acc[col + 12]);
+
+                        float32x4_t vprod_0_low  = vmulq_f32(vbS_0_low,  vo_f_0_low);
+                        float32x4_t vprod_0_high = vmulq_f32(vbS_0_high, vo_f_0_high);
+                        float32x4_t vprod_1_low  = vmulq_f32(vbS_1_low,  vo_f_1_low);
+                        float32x4_t vprod_1_high = vmulq_f32(vbS_1_high, vo_f_1_high);
+
+                        vacc_0_low  = vmlaq_f32(vacc_0_low,  vprod_0_low,  vas);
+                        vacc_0_high = vmlaq_f32(vacc_0_high, vprod_0_high, vas);
+                        vacc_1_low  = vmlaq_f32(vacc_1_low,  vprod_1_low,  vas);
+                        vacc_1_high = vmlaq_f32(vacc_1_high, vprod_1_high, vas);
+
+                        vst1q_f32(&acc[col],      vacc_0_low);
+                        vst1q_f32(&acc[col + 4],  vacc_0_high);
+                        vst1q_f32(&acc[col + 8],  vacc_1_low);
+                        vst1q_f32(&acc[col + 12], vacc_1_high);
+                    }
+                    for (; col < Ncore; col++) {
+                        acc[col] += as * bS_ptr[col] * (float)o[col];
+                    }
+#else
+                    for(int col=0;col<Ncore;col++) acc[col]+= as * bS_ptr[col] * (float)o[col];
+#endif
                 }
             }
             if (active && acc) {
