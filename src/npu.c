@@ -154,7 +154,73 @@ static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->s
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); b->cpu=0; }
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
+
+static struct ork_npu *g_npu_ctx = NULL;
+
+static void trace_submit(struct rknpu_submit *sub) {
+    if (!getenv("ORK_TRACE")) return;
+    fprintf(stderr, "[ork-trace] === SUBMIT flags=0x%x timeout=%u task_number=%u core=0x%x ===\n",
+            sub->flags, sub->timeout, sub->task_number, sub->core_mask);
+    
+    if (!g_npu_ctx) return;
+    
+    void *task_cpu = NULL;
+    if (g_npu_ctx->task.obj == sub->task_obj_addr) {
+        task_cpu = g_npu_ctx->task.cpu;
+    } else if (g_npu_ctx->mtk_all.obj == sub->task_obj_addr) {
+        task_cpu = g_npu_ctx->mtk_all.cpu;
+    } else {
+        for (int i = 0; i < ORK_MAXCORE; i++) {
+            if (g_npu_ctx->mtk[i].obj == sub->task_obj_addr) {
+                task_cpu = g_npu_ctx->mtk[i].cpu;
+                break;
+            }
+        }
+    }
+    
+    if (!task_cpu) {
+        fprintf(stderr, "  (task buffer not found/mapped)\n");
+        return;
+    }
+    
+    struct rknpu_task *tasks = (struct rknpu_task *)task_cpu;
+    for (uint32_t i = 0; i < sub->task_number; i++) {
+        struct rknpu_task *t = &tasks[i];
+        fprintf(stderr, "  task[%u]: flags=0x%x op_idx=%u enable=0x%x int_mask=0x%x regcfg_amount=%u regcmd_addr=0x%llx\n",
+                i, t->flags, t->op_idx, t->enable_mask, t->int_mask, t->regcfg_amount, (unsigned long long)t->regcmd_addr);
+        
+        void *regcmd_cpu = NULL;
+        uint64_t dma_base = 0;
+        if (t->regcmd_addr >= g_npu_ctx->regcmd.dma && t->regcmd_addr < g_npu_ctx->regcmd.dma + g_npu_ctx->regcmd.size) {
+            regcmd_cpu = g_npu_ctx->regcmd.cpu;
+            dma_base = g_npu_ctx->regcmd.dma;
+        } else {
+            for (int j = 0; j < ORK_MAXCORE; j++) {
+                if (t->regcmd_addr >= g_npu_ctx->mrc[j].dma && t->regcmd_addr < g_npu_ctx->mrc[j].dma + g_npu_ctx->mrc[j].size) {
+                    regcmd_cpu = g_npu_ctx->mrc[j].cpu;
+                    dma_base = g_npu_ctx->mrc[j].dma;
+                    break;
+                }
+            }
+        }
+        
+        if (regcmd_cpu) {
+            uint64_t offset = t->regcmd_addr - dma_base;
+            uint32_t *rc = (uint32_t *)((char *)regcmd_cpu + offset);
+            int n_words = (int)t->regcfg_amount * 2 + 16;
+            fprintf(stderr, "  --- regcmd (%d u32 words) ---\n", n_words);
+            for (int k = 0; k < n_words; k += 4) {
+                fprintf(stderr, "  [%03d] %08x %08x %08x %08x\n", k,
+                        rc[k], (k+1 < n_words)?rc[k+1]:0, (k+2 < n_words)?rc[k+2]:0, (k+3 < n_words)?rc[k+3]:0);
+            }
+        } else {
+            fprintf(stderr, "  (regcmd buffer not found for dma=0x%llx)\n", (unsigned long long)t->regcmd_addr);
+        }
+    }
+}
+
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
+    trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d). Triggering self-healing reset...\n", rc, errno);
@@ -185,13 +251,14 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
 /* int8/w8a8: A,B int8 -> C int32. Differs from fp16: weight amount/stride (no x2), K-passes
  * ceil(K/64), 0x107c=K/16, rows-budget 2x (int8 packs 2x rows/CBUF), and the 0x1040 schedule
  * uses effective K = K/2. cbuf is the fp16 budget; int8 rows = 2*cbuf/K. */
-static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
+static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
     memcpy(rc,REGCMD_I8,REGCMD_I8_N*4);
     setr(rc,REGCMD_I8_N,0x201,0x1024,((K-1)<<16)|K);setr(rc,REGCMD_I8_N,0x201,0x1030,K*N);setr(rc,REGCMD_I8_N,0x201,0x1034,K);
     setr(rc,REGCMD_I8_N,0x201,0x1044,(K+63)/64);setr(rc,REGCMD_I8_N,0x201,0x1088,K);setr(rc,REGCMD_I8_N,0x201,0x107c,K/16);
     setr(rc,REGCMD_I8_N,0x201,0x1020,0x10000|mc);setr(rc,REGCMD_I8_N,0x201,0x1084,0x10000|mc);setr(rc,REGCMD_I8_N,0x201,0x102c,mc);
     setr(rc,REGCMD_I8_N,0x1001,0x4034,mc-1);setr(rc,REGCMD_I8_N,0x1001,0x405c,(mc-1)<<16);setr(rc,REGCMD_I8_N,0x801,0x3014,(mc-1)<<16);
-    setr(rc,REGCMD_I8_N,0x1001,0x403c,((N-1)<<16)|(N-1));setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);setr(rc,REGCMD_I8_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
+    int s=stride>0?stride:N;
+    setr(rc,REGCMD_I8_N,0x1001,0x403c,((s-1)<<16)|(N-1));setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/4)-1)<<16)|((N/4)-1));
     setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
     if(sched){
         int R=(2*cbuf)/K; if(R<1)R=1; int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
@@ -255,9 +322,11 @@ ork_npu *ork_npu_init(void){
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
+    g_npu_ctx = c;
     return c;
 }
 void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
+    if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);
@@ -548,7 +617,7 @@ static void *mcworker(void *vp){
             int active = (t1 > t0);
             if(!active){
                 int Ncore = nt_sz;
-                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF);
+                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
                 setr(rc,REGCMD_N,0x201,0x1040,0xb1);
                 if (validate_regcmd("mcworker_dec_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
                     a->rc = -1; c->mc_error = 1;
@@ -560,7 +629,7 @@ static void *mcworker(void *vp){
             } else {
                 int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
                 double _tp0=ork_now_us();   /* Tier 2a teardown: copy=regcmd-prep, submit=ioctl+result-sync, acc=writeout */
-                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
+                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF,0);
                 setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
                 if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) {
                     a->rc = -1; c->mc_error = 1;
@@ -590,7 +659,7 @@ static void *mcworker(void *vp){
             for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
                 if(!active){
                     int Ncore = nt_sz;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF);
+                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
                     if (validate_regcmd("mcworker_pref_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -606,7 +675,7 @@ static void *mcworker(void *vp){
                         bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                     }
                     double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF);
+                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF,0);
                     if (validate_regcmd("mcworker_pref_active", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -639,7 +708,7 @@ static void *mcworker(void *vp){
                 if(!active){
                     uint32_t rc[REGCMD_N];
                     if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
-                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF,0);
                     if (validate_regcmd("mcworker_loop_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -657,7 +726,7 @@ static void *mcworker(void *vp){
                     double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
                     uint32_t rc[REGCMD_N];
                     if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
-                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
+                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF,0);
                     if (validate_regcmd("mcworker_loop_active", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -1244,7 +1313,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
          * Opt-in (ORK_ZC_OUT) + off by default. */
         struct buf *abuf=dma_find(c,A);   /* INPUT zero-copy: validated correct, default on */
-        struct buf *cbuf=(w->Sn==1 && getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
+        struct buf *cbuf=(getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
         if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
         if(cbuf) {
             bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean dirty CPU cache lines so they don't evict over NPU output */
@@ -1260,7 +1329,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                        bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); adma=(uint32_t)c->Af.dma; }
                 double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
                 uint32_t cdma=cbuf?(uint32_t)(cbuf->dma + ((const char*)C-(const char*)cbuf->cpu) + (size_t)m0*N*4):(uint32_t)c->Cc.dma;
-                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF);
+                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF,cbuf?N:Nc);
                 if (validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(submit1(c)) return -1;
@@ -1274,7 +1343,22 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
             }
         }
-        if(cbuf){ bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE); return 0; }   /* result already in C's DMA buffer */
+        if(cbuf){
+            bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
+            if(w->Sn>1){
+                int32_t *C_ptr = (int32_t*)C;
+                for (int r = M - 1; r >= 1; r--) {
+                    for (int ns = w->Sn - 1; ns >= 0; ns--) {
+                        int n0 = ns * NMAX;
+                        int Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                        int start_idx = n0 + Nc + (r - 1) * N;
+                        int dest_idx = r * N + n0;
+                        memmove(C_ptr + dest_idx, C_ptr + start_idx, (size_t)Nc * 4);
+                    }
+                }
+            }
+            return 0;
+        }   /* result already in C's DMA buffer */
         memcpy(C,c->cres,need); return 0;
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -1289,7 +1373,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
             if(dt==DT_F16) synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
-            else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
+            else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
             if (validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             if(submit1(c)) return -1;
@@ -1329,7 +1413,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
@@ -1362,7 +1446,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
     int8_t*ad=c->Af.cpu; memset(ad,1,K); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
@@ -1539,7 +1623,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(c->Af.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF);
+        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
         setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
         struct buf extra[2] = {W, O};
         if (validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
@@ -1625,7 +1709,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF);
+        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
         setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
         
         if (i < S - 1) {
@@ -1644,7 +1728,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF);
+        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
         setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
         rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;
         memcpy((char*)regs_sep.cpu + i * REGCMD_I8_N * 4, rc, sizeof(rc));
@@ -1830,7 +1914,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         int K = w->K;
         int N = w->N;
 
-        synth_i8(rc, M, K, N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i], 1, CBUF);
+        synth_i8(rc, M, K, N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i], 1, CBUF, 0);
         if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
         if (i < S - 1) {
