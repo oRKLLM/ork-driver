@@ -126,6 +126,7 @@ static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
 static int budget(ork_npu*c, int M){
+    if (M == 1) return 1;
     int b=c->core_budget;
     const char *env_mc = getenv("ORK_NPU_MC");
     if (env_mc) {
