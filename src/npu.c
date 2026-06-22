@@ -340,12 +340,12 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
  * residency automatically (no API change); the caller just allocates A/C here. ---- */
 void *ork_dma_alloc(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bcreate(c->fd,size,0x403); if(!b.cpu) return NULL;
+    struct buf b=bcreate(c->fd,size,0x401); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_free(ork_npu *c, void *ptr){
     if(!c||!ptr) return;
-    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; return; }
+    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; memset(&c->dma_tab[c->dma_n], 0, sizeof(struct buf)); return; }
 }
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
 static struct buf *dma_find(ork_npu *c, const void *p){
