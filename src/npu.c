@@ -500,11 +500,6 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
-    static int logged = 0;
-    if (!logged) {
-        fprintf(stderr, "[ork] ork_mm_run_i4: M=%d, N=%d, K=%d, nc=%d, NB=%d\n", M, w->N, w->K, nc, NB);
-        logged = 1;
-    }
     return run_i4_mc(c,w,M,A,C,nc);
 }
 
@@ -1863,12 +1858,13 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
 
     // 2. State transition reset for int8 mode
-    if (c->last_dt != DT_I8) {
-        act(fd, RKNPU_ACT_RESET, 0);
-        c->warmed = 0;
-        c->last_dt = DT_I8;
-        c->ccsz = 0; // invalidate Cc size
-    }
+    // We must ALWAYS reset the NPU before chained execution, because previous
+    // single-submit (non-chained) int8 runs leave the NPU in a state that corrupts
+    // the first chained task's output if reps=1.
+    act(fd, RKNPU_ACT_RESET, 0);
+    c->warmed = 0;
+    c->last_dt = DT_I8;
+    c->ccsz = 0; // invalidate Cc size
 
     // 3. Resolve buffers and cache coherency
     struct buf tmp_A[1024];
