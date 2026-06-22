@@ -543,7 +543,7 @@ static int mc_ensure(ork_npu *c,int nc){
     }
     for(int i=0;i<nc;i++){
         if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
-        c->mrc[i]=bcreate(fd,4096,0x403); c->mtk[i]=bcreate(fd,4096,0x40b); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403);
+        c->mrc[i]=bcreate(fd,65536,0x403); c->mtk[i]=bcreate(fd,65536,0x40b); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403);
         if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
             return -1;
@@ -649,10 +649,10 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
+    if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
             int active = (t1 > t0);
@@ -888,10 +888,10 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
             }
         }
-        if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+        if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
             int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
             double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-            int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
+            int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
             int rows=chunk<M?chunk:M;
             size_t sz=(size_t)rows*Kp*1;
             if(sz>maxaf)maxaf=sz;
@@ -979,13 +979,35 @@ static void *i4_mcworker(void *vp){
                     bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 }
                 uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)(active?b0:0)*Kp*32;  /* Kp*32 B per N-block */
-                uint32_t rc[REGCMD_I4_N];
-                synth_i4(rc,cur_chunk,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
-                if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) {
-                    a->rc = -1; c->mc_error = 1;
+                struct rknpu_task *tk_arr = c->mtk[i].cpu;
+                memset(tk_arr, 0, cur_chunk * sizeof(struct rknpu_task));
+                for(int m=0; m<cur_chunk; m++) {
+                    uint32_t rc[REGCMD_I4_N];
+                    uint32_t aA = (uint32_t)AF->dma + m * (Kp / 2);
+                    uint32_t aC = (uint32_t)O->dma + m * (Ncore * 2);
+                    synth_i4(rc, 1, Kp, Ncore, aA, (uint32_t)wbase, aC);
+                    if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) {
+                        a->rc = -1; c->mc_error = 1;
+                    }
+                    if (m < cur_chunk - 1) {
+                        uint64_t next_dma = c->mrc[i].dma + (m + 1) * REGCMD_I4_N * 4;
+                        rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+                        rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037 << 16);
+                        rc[219] = (0x0101 << 16) | (0);
+                    } else {
+                        rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;
+                    }
+                    memcpy((char*)RC->cpu + m * REGCMD_I4_N * 4, rc, sizeof(rc));
+                    tk_arr[m].enable_mask = 0xd;
+                    tk_arr[m].int_mask = 0x300;
+                    tk_arr[m].int_clear = 0x1ffff;
+                    tk_arr[m].regcfg_amount = 116;
+                    tk_arr[m].regcmd_addr = c->mrc[i].dma + m * REGCMD_I4_N * 4;
                 }
                 if (!c->mc_error) {
-                    memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                    bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
+                    bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
                 }
                 int reps=c->mwarm[i]?1:2;
                 if (c->mc_error) {
@@ -996,11 +1018,11 @@ static void *i4_mcworker(void *vp){
                 struct rknpu_submit sub;
                 memset(&sub, 0, sizeof sub);
                 sub.flags = 0x5;
-                sub.task_number = 1;
+                sub.task_number = cur_chunk;
                 sub.task_obj_addr = c->mtk[i].obj;
                 sub.fence_fd = -1;
                 sub.core_mask = 1u << i;
-                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, cur_chunk};
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
                     sub.timeout = 60000;
@@ -1020,7 +1042,7 @@ static void *i4_mcworker(void *vp){
                     if(cur_chunk>1) {
                         for(int m=0;m<cur_chunk;m++){
                             for(int col=0;col<Ncore;col++){
-                                size_t o_idx = (size_t)2 * m * Ncore + col;
+                                size_t o_idx = (size_t)m * Ncore + col;
                                 acc[(m0 + m)*Ncore + col] += o[o_idx];
                             }
                         }
@@ -1278,10 +1300,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;
         size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+    if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
         int rows=chunk<M?chunk:M;
         size_t sz=(size_t)rows*Kp*1;
         if(sz>maxaf)maxaf=sz;
@@ -1298,10 +1320,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* Tier 1c-ii: full-K prefill — one submit per M-tile over the FULL K (Bf layout), M-scheduler on,
      * result written directly (no K-split, no host accumulate). Saves the second K-slice's accumulate +
      * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
+    if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
          * Opt-in (ORK_ZC_OUT) + off by default. */
