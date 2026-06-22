@@ -6,7 +6,7 @@ AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed
 
 all: $(EXAMPLES)
 
@@ -100,7 +100,7 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES)
 	@fail=0; \
-	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12"; do \
+	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
