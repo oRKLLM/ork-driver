@@ -648,17 +648,18 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
+    if(dt==DT_I8 && M>1 && w->Bf && (K==1024||K==512)){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
+        int chunk = 1; if(chunk > M) chunk = M;
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
             int active = (t1 > t0);
             for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
                 if(!active){
                     int Ncore = nt_sz;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
+                    int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
+                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,sched,CBUF,0);
                     if (validate_regcmd("mcworker_pref_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -674,7 +675,8 @@ static void *mcworker(void *vp){
                         bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                     }
                     double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF,0);
+                    int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
+                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF,0);
                     if (validate_regcmd("mcworker_pref_active", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -887,7 +889,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
             }
         }
-        if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+        if(dt==DT_I8 && M>1 && w->Bf && (K==1024||K==512)){
             int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
             double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
@@ -964,7 +966,7 @@ static void *i4_mcworker(void *vp){
         if(acc) memset(acc, 0, (size_t)M*Ncore*4);
         for(int ks=0;ks<w->Sk;ks++){
             int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int chunk_M = 16;
+            int chunk_M = 1;
             for (int m0 = 0; m0 < M; m0 += chunk_M) {
                 int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
                 if (!c->mc_error) {
@@ -1277,7 +1279,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;
         size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
     }
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){
+    if(dt==DT_I8 && M>1 && w->Bf && (K==1024||K==512)){
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
@@ -1297,7 +1299,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* Tier 1c-ii: full-K prefill — one submit per M-tile over the FULL K (Bf layout), M-scheduler on,
      * result written directly (no K-split, no host accumulate). Saves the second K-slice's accumulate +
      * result cache-sync. Gated (M-scheduler at Kp=K unvalidated) — verify with examples/quant. */
-    if(dt==DT_I8 && M>1 && w->Bf && K<=4096){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
+    if(dt==DT_I8 && M>1 && w->Bf && (K==1024||K==512)){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk < 4*R) chunk = 4*R; if(chunk > M) chunk = M;
