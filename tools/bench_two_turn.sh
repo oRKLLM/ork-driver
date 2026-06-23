@@ -3,11 +3,56 @@ set -e
 
 sudo systemctl stop orkllm || true
 
-# Set maximum performance governors
-echo "performance" | sudo tee /sys/class/devfreq/dmc/governor || true
-for i in 4 5 6 7; do
-    echo "performance" | sudo tee /sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor || true
-done
+# --- Guaranteed performance-governor pinning ----------------------------------
+# A benchmark on a parked DDR governor reads ~half the real decode (stopping
+# orkllm above releases its perf pin), so we pin DDR + the big cores, then VERIFY
+# by reading the values back and ABORT if any isn't 'performance' — a non-pinned
+# run must never be mistaken for a valid number. Originals are restored on exit.
+DMC_GOV=/sys/class/devfreq/dmc/governor
+BIG_CORES="4 5 6 7"            # RK3588 A76 cluster; -t 4 runs here
+ORIG_DMC_GOV=""
+declare -A ORIG_CPU_GOV
+
+pin_and_verify_governors() {
+    echo "== Pinning CPU/DDR governors to performance =="
+    ORIG_DMC_GOV=$(cat "$DMC_GOV" 2>/dev/null || true)
+    local c g
+    for c in $BIG_CORES; do
+        ORIG_CPU_GOV[$c]=$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true)
+    done
+
+    echo performance | sudo tee "$DMC_GOV" >/dev/null
+    for c in $BIG_CORES; do
+        echo performance | sudo tee /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor >/dev/null
+    done
+    sleep 1
+
+    local fail=0
+    local dmc; dmc=$(cat "$DMC_GOV" 2>/dev/null || true)
+    [ "$dmc" = "performance" ] || { echo "ERROR: DDR (dmc) governor is '$dmc', expected 'performance'." >&2; fail=1; }
+    local dmc_freq; dmc_freq=$(cat /sys/class/devfreq/dmc/cur_freq 2>/dev/null || true)
+    echo "  dmc: governor=$dmc cur_freq=$dmc_freq"
+    [ "$dmc_freq" = "2112000000" ] || echo "  WARNING: dmc cur_freq is not 2112000000 (RK3588 max) — decode may be DDR-bound." >&2
+    for c in $BIG_CORES; do
+        g=$(cat /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor 2>/dev/null || true)
+        [ "$g" = "performance" ] || { echo "ERROR: cpu$c governor is '$g', expected 'performance'." >&2; fail=1; }
+    done
+    if [ "$fail" -ne 0 ]; then
+        echo "ERROR: governor pinning failed verification — refusing to benchmark a non-pinned machine." >&2
+        exit 1
+    fi
+    echo "  verified: dmc + cpu[$BIG_CORES] pinned to performance"
+}
+
+restore_governors() {
+    local c
+    [ -n "$ORIG_DMC_GOV" ] && { echo "$ORIG_DMC_GOV" | sudo tee "$DMC_GOV" >/dev/null 2>&1 || true; }
+    for c in $BIG_CORES; do
+        [ -n "${ORIG_CPU_GOV[$c]:-}" ] && { echo "${ORIG_CPU_GOV[$c]}" | sudo tee /sys/devices/system/cpu/cpu$c/cpufreq/scaling_governor >/dev/null 2>&1 || true; }
+    done
+}
+
+pin_and_verify_governors
 
 # Configuration
 SERVER_BIN="${LLAMA_SERVER_BIN:-./llama-server}"
@@ -33,7 +78,7 @@ start_server() {
         echo "Starting server with model: $model"
     fi
 
-    ORK_VERBOSE=1 $SERVER_BIN -m "$model" -c 2048 -t 4 --port $PORT $extra_args > server.log 2>&1 &
+    $SERVER_BIN -m "$model" -c 2048 -t 4 --port $PORT $extra_args > server.log 2>&1 &
     SERVER_PID=$!
 
     # Wait for health
@@ -53,7 +98,8 @@ start_server() {
     kill $SERVER_PID
     exit 1
 }
-trap stop_server EXIT
+cleanup() { stop_server; restore_governors; }
+trap cleanup EXIT
 
 stop_server() {
     if [ -n "$SERVER_PID" ]; then

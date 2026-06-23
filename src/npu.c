@@ -310,10 +310,26 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
 }
 
+/* Read-only sanity check: the benchmark methodology requires the DDR (dmc) governor at 'performance'
+ * — a parked governor ~halves decode. We only WARN (never write; that needs root), so any caller
+ * (llama-bench, the examples) notices a misconfigured box. Silence with ORK_NO_GOV_WARN=1. */
+static void warn_if_governor_parked(void){
+    if(getenv("ORK_NO_GOV_WARN")) return;
+    FILE*f=fopen("/sys/class/devfreq/dmc/governor","r"); if(!f) return;
+    char g[64]={0};
+    if(fgets(g,sizeof g,f)){ g[strcspn(g,"\n")]=0;
+        if(strcmp(g,"performance")!=0)
+            fprintf(stderr,"[ork] WARNING: DDR (dmc) governor is '%s', not 'performance' — decode may be ~half speed. "
+                           "Pin it: echo performance | sudo tee /sys/class/devfreq/dmc/governor  (ORK_NO_GOV_WARN=1 to silence)\n",g);
+    }
+    fclose(f);
+}
+
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
+    warn_if_governor_parked();
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
