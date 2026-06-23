@@ -430,6 +430,28 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
+
+/* Re-tile int8 B[K,N] into an EXISTING ork_w's resident buffers (same K,N), reusing the DMA
+ * allocations — NO bcreate/bdestroy. For pooling reused weights (e.g. MoE experts) so the NPU IOMMU
+ * isn't churned/fragmented by per-weight alloc+free. Returns 0 ok, -1 bad arg, -2 shape mismatch. */
+int ork_mm_repack_i8(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
+    if(!w || w->dtype!=DT_I8 || !w->Bb) return -1;
+    if(w->K!=K || w->N!=N) return -2;                  /* must match the slot's allocated shape */
+    int KS=1024, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1; int8_t*bb=b->cpu;
+        for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+            bb[nt*KT*32*32+kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    if(w->Bf && K<=10752){ int KTf=K/32;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*b=&w->Bf[ns]; if(!b->cpu) continue; int8_t*bb=b->cpu;
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
+            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return 0;
+}
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----

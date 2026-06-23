@@ -48,6 +48,9 @@ void         ork_dma_free (ork_npu *ctx, void *ptr);
  * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
 ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */
 ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int8/w8a8 weights */
+/* re-tile int8 B into an existing same-shape ork_w (reuses its DMA; no alloc/free) — for pooling
+ * reused weights (MoE experts) without churning/fragmenting the NPU IOMMU. 0 ok / -1 / -2 mismatch. */
+int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t *B);
 ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */
