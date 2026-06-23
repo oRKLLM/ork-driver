@@ -1846,6 +1846,11 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
 
+    /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
+     * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
+     * allocs per-call scratch, so it must only be used to batch S>1 independent matmuls. */
+    if (S == 1) return ork_mm_run_i8(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     
     // 1. Validate all tasks
@@ -2018,6 +2023,10 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
+
+    /* Single matmul: use the optimized run_i4 path (multi-core column-split) rather than the
+     * single-core chain path. Chaining only pays off when batching S>1 independent matmuls. */
+    if (S == 1) return ork_mm_run_i4(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     int fd = c->fd;
     for (int i = 0; i < S; i++) {
