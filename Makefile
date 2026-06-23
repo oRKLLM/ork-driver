@@ -6,7 +6,7 @@ AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4
 
 all: $(EXAMPLES)
 
@@ -100,11 +100,15 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES)
 	@fail=0; \
-	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed"; do \
+	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+
+bench-llama:
+	@echo "== Running two-turn conversation integration benchmark via llama-server =="
+	@LLAMA_SERVER_BIN=$(HOME)/llama.cpp/build/bin/llama-server tools/bench_two_turn.sh
 
 clean:
 	rm -f $(EXAMPLES) rknpu_bench libork_npu.a libork_npu.so src/*.o src/soc/*.o
@@ -113,3 +117,5 @@ clean:
 
 attn_cost: tools/attn_cost.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_chain_i4: examples/test_chain_i4.c src/npu.c src/soc.c $(SOC_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ -Iinclude -lm

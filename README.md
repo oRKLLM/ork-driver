@@ -82,6 +82,7 @@ caller just packs and runs. To bound it (e.g. reserve cores for another workload
 | `decode` | incremental token decode with a KV cache (M=1 projections) |
 | `model` | N stacked decoder layers (a transformer body) |
 | `llama2` | a **real trained model** end-to-end — Karpathy's `stories15M` — greedy generation; NPU logits match CPU-fp16 to ~0.01 |
+| `test_chain_i4` | isolated hardware validation of chained int4 (W4A4) tasks |
 
 `llama2` needs `stories15M.bin` (Karpathy's [tinyllamas](https://huggingface.co/karpathy/tinyllamas)):
 ```sh
@@ -115,6 +116,7 @@ a wall timeout catches NPU hangs. Requires NPU hardware, no proprietary deps.
 ```sh
 make test                  # build + run all examples; "ALL TESTS PASSED" on success
 make test MODEL=/path/to/stories15M.bin   # also run the real-model llama2 test (skipped if absent)
+make bench-llama           # run the integration benchmark script tools/bench_two_turn.sh
 ```
 
 From a workstation, sync the source to the board and run it there, e.g.

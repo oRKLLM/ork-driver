@@ -1861,10 +1861,12 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     // We must ALWAYS reset the NPU before chained execution, because previous
     // single-submit (non-chained) int8 runs leave the NPU in a state that corrupts
     // the first chained task's output if reps=1.
-    act(fd, RKNPU_ACT_RESET, 0);
-    c->warmed = 0;
-    c->last_dt = DT_I8;
-    c->ccsz = 0; // invalidate Cc size
+    if (c->last_dt != 3 /* DT_I8_CHAIN */) {
+        act(fd, RKNPU_ACT_RESET, 0);
+        c->warmed = 0;
+        c->last_dt = 3; // DT_I8_CHAIN
+        c->ccsz = 0; // invalidate Cc size
+    }
 
     // 3. Resolve buffers and cache coherency
     struct buf tmp_A[1024];
@@ -2009,7 +2011,132 @@ cleanup:
 }
 
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
-    return -2; // NOT SUPPORTED: task_number > 1 for int4 hangs the board
+    if (!c) return -1;
+    if (S < 1 || S > 1024) return -2;
+    if (!tasks) return -2;
+
+    int fd = c->fd;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I4) return -2;
+        if (tasks[i].M != 1) return -2;
+        if (w->Sn != 1 || w->Sk != 1) return -2;
+        if (check_overlap("ork_mm_run_chain_i4", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
+    }
+
+    if (c->last_dt != 4 /* DT_I4_CHAIN */) {
+        act(fd, RKNPU_ACT_RESET, 0);
+        c->warmed = 0;
+        c->last_dt = 4;
+        c->ccsz = 0;
+    }
+
+    int ok = 0;
+    int max_K = 0, max_N = 0;
+    for (int i = 0; i < S; i++) {
+        if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
+        if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
+        struct buf *abuf = dma_find(c, tasks[i].A);
+        if (abuf) bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+
+    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403);
+    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403);
+    if (!chain_A.cpu || !chain_C.cpu) {
+        if (chain_A.cpu) bdestroy(fd, &chain_A);
+        if (chain_C.cpu) bdestroy(fd, &chain_C);
+        return -1;
+    }
+
+    uint32_t act_dma[1024];
+    uint32_t out_dma[1024];
+
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        uint8_t *A_dst = (uint8_t*)chain_A.cpu + (size_t)i * max_K;
+        tile_i4_Aslice(A_dst, tasks[i].A, 0, w->K);
+        act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
+        out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
+    }
+    bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
+
+    struct buf extra[2] = {chain_A, chain_C};
+    uint32_t rc[REGCMD_I4_N];
+
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        if (validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
+
+        if (i < S - 1) {
+            uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
+            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037 << 16);
+            rc[219] = (0x0101 << 16) | (0);
+        } else {
+            rc[216] = 0;
+            rc[217] = 0;
+            rc[218] = 0x00000014;
+            rc[219] = 0x01010000;
+        }
+        memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
+    }
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+
+    struct rknpu_task *t = c->task.cpu;
+    memset(t, 0, sizeof(*t));
+    t->enable_mask = 0xd;
+    t->int_mask = 0x300;
+    t->int_clear = 0x1ffff;
+    t->regcfg_amount = 116;
+    t->regcmd_addr = c->regcmd.dma;
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+
+    static int tc = -2; 
+    if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
+    
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
+    sub.core_mask = 1u << tc;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+
+    if (!c->warmed) { submit(fd, &sub); c->warmed = 1; }
+    if (submit(fd, &sub)) { ok = -1; goto cleanup; }
+
+    bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+    for (int i = 0; i < S; i++) {
+        int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
+        int32_t *C = tasks[i].C;
+        int N = tasks[i].w->N;
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        int col = 0;
+        for (; col <= N - 16; col += 16) {
+            int16x8_t vo16_0 = vld1q_s16(&o[col]);
+            int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
+            vst1q_s32(&C[col], vmovl_s16(vget_low_s16(vo16_0)));
+            vst1q_s32(&C[col + 4], vmovl_s16(vget_high_s16(vo16_0)));
+            vst1q_s32(&C[col + 8], vmovl_s16(vget_low_s16(vo16_1)));
+            vst1q_s32(&C[col + 12], vmovl_s16(vget_high_s16(vo16_1)));
+        }
+        for (; col < N; col++) {
+            C[col] = o[col];
+        }
+#else
+        for (int col = 0; col < N; col++) {
+            C[col] = o[col];
+        }
+#endif
+
+        struct buf *cbuf = dma_find(c, tasks[i].C);
+        if (cbuf) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+    }
+
+cleanup:
+    bdestroy(fd, &chain_A);
+    bdestroy(fd, &chain_C);
+    return ok;
 }
 
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
