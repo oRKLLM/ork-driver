@@ -117,5 +117,3 @@ clean:
 
 attn_cost: tools/attn_cost.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
-test_chain_i4: examples/test_chain_i4.c src/npu.c src/soc.c $(SOC_OBJ)
-	$(CC) $(CFLAGS) -o $@ $^ -Iinclude -lm

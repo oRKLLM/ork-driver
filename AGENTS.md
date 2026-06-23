@@ -61,6 +61,17 @@ Before committing, check whether the change needs doc updates:
 
 This keeps the docs reflecting reality so the next agent doesn't reverse-engineer what changed.
 
+### WIP recovery doc for long debugging sessions
+
+During any multi-step debugging or hardware-RE session (anything that spans many board runs or
+risks getting disconnected), maintain a single WIP recovery document (e.g. `CHAIN_DEBUG_WIP.md` in
+the repo root) and **update it at least every 15 minutes of active work**, plus whenever a finding
+materially changes the picture. It must always capture: the current hypothesis, what's been proven
+or ruled out, the exact state of the working tree (what's restored/edited/committed), the next
+concrete steps, and any board-ops gotchas. The goal is that a fresh agent (or you, after a
+disconnect) can resume from the document alone without re-deriving the investigation. These docs are
+scratch — delete or fold them into the wiki once the work lands; don't commit stale ones.
+
 ---
 
 ## 3. Build, test, and the board
@@ -143,6 +154,9 @@ The open stack is `ork-driver → ggml-ork → llama.cpp` (the [`oRKLLM/llama.cp
 
 Reference (Qwen3-1.7B-w8a8, RK3588 board `10.3.0.236`, `-t 4`, warm): librkllmrt **184 prefill / 11.71 decode** tok/s; open stack **178 (97%) / 12.8 (109%, beats it)**.
 
+### Managing Baseline Thresholds
+When committing new performance optimizations to `ork-driver` or `ggml-ork`, you MUST run the integration benchmark script (`tools/bench_two_turn.sh` via `make bench-llama`) on the Rockchip SBC to ensure there is no significant degradation (e.g., M-scheduling bugs or KV-cache penalties). 
+If your optimizations successfully increase the performance baselines above the current documented numbers, you must explicitly update the threshold constants in the test scripts (e.g., `BASELINE_DECODE` in `tools/bench_two_turn.sh`) to the new, higher values before merging. Do not allow baselines to stagnate or decay.
 ### Env knobs (set on the `llama-bench`/`mc_prof`/`quant` command)
 | var | effect |
 |---|---|

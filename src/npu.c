@@ -1936,28 +1936,29 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
         if (i < S - 1) {
-            // RE DISCOVERY: Writing 0x000f to CORE_CTRL starts the MAC array AND instructs the
-            // command parser to WAIT for the MAC array to finish before executing the next instruction.
-            // This allows us to concatenate multiple matmuls into a single regcmd buffer!
-            // We OVERWRITE the default 0x000d start command (at the end of the template) with 0x000f.
-            rc[214] = 0x000f0008; rc[215] = 0x00810000;
+            // PC-chaining (mirrors the validated i4 path): patch the chain-control tail so this task
+            // jumps to the next regcmd instead of raising the completion interrupt. The final task
+            // keeps the template default (rc[216..219] = 0,0,0x14,0x01010000 = raise interrupt).
+            uint64_t next_dma = c->regcmd.dma + (size_t)(i + 1) * REGCMD_I8_N * 4;
+            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037 << 16);
+            rc[219] = (0x0101 << 16) | (0);
         }
         memcpy((char*)c->regcmd.cpu + i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
-    // Prepare ONE rknpu_task that spans the concatenated regcmd
+    // One rknpu_task per chained regcmd (PC-chained), mirroring the validated i4 path.
     struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, S * sizeof(struct rknpu_task));
-    
-    t[0].flags = 0;
-    t[0].op_idx = 0;
-    t[0].enable_mask = 0xd;
-    t[0].int_mask = 0x300;
-    t[0].int_clear = 0x1ffff;
-    // Total pairs: exactly 108 pairs per task, concatenated.
-    t[0].regcfg_amount = S * 108;
-    t[0].regcmd_addr = c->regcmd.dma;
+    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
+    for (int i = 0; i < S; i++) {
+        t[i].enable_mask = 0xd;
+        t[i].int_mask = 0x300;
+        t[i].int_clear = 0x1ffff;
+        t[i].regcfg_amount = 108;
+        t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I8_N * 4;
+    }
 
     bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
 
@@ -1970,11 +1971,11 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     sub.flags = 0x5;
-    sub.task_number = 1; // Concatenated task
+    sub.task_number = S;
     sub.task_obj_addr = c->task.obj;
-    sub.core_mask = RKNPU_CORE0_MASK;
+    sub.core_mask = 1u << tc;
     sub.fence_fd = -1;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
 
     int reps = c->warmed ? 1 : 2;
     int submit_ok = 0;
@@ -2087,25 +2088,37 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
+    /* Mirror the validated i4_mcworker multi-task path exactly: one rknpu_task per chained regcmd,
+     * task_number=S, subcore={0,S}, and the same reps/submit discipline (rknpu_submit_ioctl with a
+     * cold-buffer warmup rep + bsync(C) between reps). The kernel programs first_task+last_task and
+     * the HW PC-chain (rc[216..219]) walks the middle; it waits until the HW task counter reaches S. */
     struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, sizeof(*t));
-    t->enable_mask = 0xd;
-    t->int_mask = 0x300;
-    t->int_clear = 0x1ffff;
-    t->regcfg_amount = 116;
-    t->regcmd_addr = c->regcmd.dma;
+    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
+    for (int i = 0; i < S; i++) {
+        t[i].enable_mask = 0xd;
+        t[i].int_mask = 0x300;
+        t[i].int_clear = 0x1ffff;
+        t[i].regcfg_amount = 116;
+        t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4;
+    }
     bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
 
-    static int tc = -2; 
+    static int tc = -2;
     if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
-    
-    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
-    sub.core_mask = 1u << tc;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
 
-    if (!c->warmed) { ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub); c->warmed = 1; }
-    if (ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, &sub)) { ok = -1; goto cleanup; }
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = 0x5; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
+    sub.core_mask = 1u << tc;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
+
+    int reps = c->warmed ? 1 : 2;
+    for (int rep = 0; rep < reps; rep++) {
+        int last = (rep == reps - 1);
+        sub.timeout = 60000;
+        if (rknpu_submit_ioctl(fd, &sub)) { if (last) { ok = -1; goto cleanup; } continue; }
+        bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    c->warmed = 1;
 
     bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     for (int i = 0; i < S; i++) {

@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
+sudo systemctl stop orkllm || true
+
+# Set maximum performance governors
+echo "performance" | sudo tee /sys/class/devfreq/dmc/governor || true
+for i in 4 5 6 7; do
+    echo "performance" | sudo tee /sys/devices/system/cpu/cpu$i/cpufreq/scaling_governor || true
+done
+
 # Configuration
 SERVER_BIN="${LLAMA_SERVER_BIN:-./llama-server}"
-PORT=8080
+PORT=8085
 HOST="127.0.0.1"
 URL="http://$HOST:$PORT"
 QWEN_1_7B="/var/lib/orkllm/models/Qwen3-1.7B-GGUF/Qwen3-1.7B-UD-Q8_K_XL.gguf"
@@ -25,13 +33,15 @@ start_server() {
         echo "Starting server with model: $model"
     fi
 
-    $SERVER_BIN -m "$model" -c 2048 -t 4 --port $PORT $extra_args > server.log 2>&1 &
+    ORK_VERBOSE=1 $SERVER_BIN -m "$model" -c 2048 -t 4 --port $PORT $extra_args > server.log 2>&1 &
     SERVER_PID=$!
 
     # Wait for health
     local i=0
     while [ $i -lt 60 ]; do
-        if curl -s "$URL/health" | grep -q '"status": "ok"'; then
+        local health_out=$(curl -s "$URL/health" || true)
+        echo "Health out: $health_out"
+        if echo "$health_out" | grep -q '"status".*"ok"'; then
             echo "Server is healthy."
             return 0
         fi
@@ -43,14 +53,16 @@ start_server() {
     kill $SERVER_PID
     exit 1
 }
+trap stop_server EXIT
 
 stop_server() {
     if [ -n "$SERVER_PID" ]; then
-        kill $SERVER_PID
+        kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
+        SERVER_PID=""
+        sleep 3 # Wait for port to be freed
     fi
 }
-
 run_turn() {
     local prompt="$1"
     local response=$(curl -s -X POST "$URL/completion" \
@@ -64,12 +76,12 @@ extract_timing() {
     local response="$1"
     local field="$2"
     # Basic extraction using grep and sed to avoid requiring jq if unavailable
-    echo "$response" | grep -o "\"$field\": [0-9.]*" | cut -d':' -f2 | tr -d ' '
+    echo "$response" | tr -d '\000' | grep -o "\"$field\": *[0-9.]*" | cut -d':' -f2 | tr -d ' '
 }
 
 extract_content() {
     local response="$1"
-    echo "$response" | grep -o '"content": "[^"]*"' | sed 's/"content": "//' | sed 's/"$//'
+    echo "$response" | tr -d '\000' | grep -o '"content": "[^"]*"' | sed 's/"content": "//' | sed 's/"$//'
 }
 
 run_benchmark() {
@@ -83,6 +95,8 @@ run_benchmark() {
     local prefill1=$(extract_timing "$res1" "prompt_per_second")
     local decode1=$(extract_timing "$res1" "predicted_per_second")
     local content=$(extract_content "$res1")
+    
+    echo "Response 1: $res1"
     
     if [ -z "$decode1" ]; then
         echo "Failed to get timings for Turn 1"

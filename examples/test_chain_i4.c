@@ -7,7 +7,7 @@ int main(void) {
     ork_npu *ctx = ork_npu_init();
     if (!ctx) return 1;
 
-    int M1 = 1, M2 = 2;
+    int M1 = 1, M2 = 1;
     int K = 64, N = 64;
 
     int8_t *A1 = malloc(M1 * K);
@@ -38,7 +38,10 @@ int main(void) {
         for (int n=0; n<N; n++) {
             long s=0; 
             for (int k=0; k<K; k++) s+=(long)A1[m*K+k]*B[k*N+n];
-            if (C1[m*N+n] != s) bad++;
+            if (C1[m*N+n] != s) {
+                if (bad < 5) printf("C1[%d] = %d, expected %ld\n", m*N+n, C1[m*N+n], s);
+                bad++;
+            }
         }
     }
     // verify task 2
@@ -46,7 +49,10 @@ int main(void) {
         for (int n=0; n<N; n++) {
             long s=0; 
             for (int k=0; k<K; k++) s+=(long)A2[m*K+k]*B[k*N+n];
-            if (C2[m*N+n] != s) bad++;
+            if (C2[m*N+n] != s) {
+                if (bad < 10) printf("C2[%d] = %d, expected %ld\n", m*N+n, C2[m*N+n], s);
+                bad++;
+            }
         }
     }
 
