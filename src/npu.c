@@ -1939,15 +1939,10 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             // RE DISCOVERY: Writing 0x000f to CORE_CTRL starts the MAC array AND instructs the
             // command parser to WAIT for the MAC array to finish before executing the next instruction.
             // This allows us to concatenate multiple matmuls into a single regcmd buffer!
-            // We write it at the end of this task's block (word 216).
-            rc[216] = 0x000f0008; rc[217] = 0x00810000;
-            // Pad to make it exactly 110 pairs (220 words) for intermediate tasks.
-            rc[218] = 0; rc[219] = 0;
-            memcpy((char*)c->regcmd.cpu + i * 220 * 4, rc, 220 * 4);
-        } else {
-            // For the final task, we do NOT append CORE_CTRL because the kernel driver will write it for us!
-            memcpy((char*)c->regcmd.cpu + i * 220 * 4, rc, REGCMD_I8_N * 4);
+            // We OVERWRITE the default 0x000d start command (at the end of the template) with 0x000f.
+            rc[214] = 0x000f0008; rc[215] = 0x00810000;
         }
+        memcpy((char*)c->regcmd.cpu + i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
@@ -1960,9 +1955,8 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     t[0].enable_mask = 0xd;
     t[0].int_mask = 0x300;
     t[0].int_clear = 0x1ffff;
-    // Total pairs: 110 pairs per intermediate task (including the 0x000f CORE_CTRL write),
-    // and 108 pairs for the final task (which relies on the kernel driver's CORE_CTRL write).
-    t[0].regcfg_amount = (S - 1) * 110 + 108;
+    // Total pairs: exactly 108 pairs per task, concatenated.
+    t[0].regcfg_amount = S * 108;
     t[0].regcmd_addr = c->regcmd.dma;
 
     bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
