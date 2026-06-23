@@ -32,6 +32,13 @@
 #endif
 typedef ork_f16 f16;
 enum { DT_F16=0, DT_I8=1, DT_I4=2 };
+
+/* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
+ * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
+static double ork_now_us(void);
+static int    g_ork_prof = 0;
+static long   g_prof_i8_calls = 0, g_prof_i4_calls = 0;
+static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
@@ -330,6 +337,7 @@ ork_npu *ork_npu_init(void){
     if(!soc){fprintf(stderr,"[ork] unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();
+    g_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
@@ -343,6 +351,12 @@ ork_npu *ork_npu_init(void){
     return c;
 }
 void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
+    if(g_ork_prof){
+        if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
+                                    g_prof_i8_calls, g_prof_i8_us/1e3, g_prof_i8_us/g_prof_i8_calls);
+        if(g_prof_i4_calls) fprintf(stderr,"[ork PROFILE] run_i4: %ld calls, %.1f ms total, %.0f us/call\n",
+                                    g_prof_i4_calls, g_prof_i4_us/1e3, g_prof_i4_us/g_prof_i4_calls);
+    }
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
@@ -516,7 +530,8 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
-    return run_i4_mc(c,w,M,A,C,nc);
+    if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
+    double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
@@ -1420,7 +1435,8 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w->dtype!=DT_I8) return -1;
     if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    return run(c,w,M,A,C);
+    if(!g_ork_prof) return run(c,w,M,A,C);
+    double t0=ork_now_us(); int r=run(c,w,M,A,C); g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; return r;
 }
 
 /* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
