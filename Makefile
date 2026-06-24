@@ -96,6 +96,10 @@ chain_bench: tools/chain_bench.c $(CORE)
 pack_f32_probe: tools/pack_f32_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: Tier 4a per-group Hadamard for W4A4, validated end-to-end ON THE NPU (plain vs rotated RMS)
+hadamard_i4_npu: tools/hadamard_i4_npu.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
