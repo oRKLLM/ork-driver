@@ -162,7 +162,7 @@ If your optimizations successfully increase the performance baselines above the 
 |---|---|
 | `ORK_FUSE=1` | QKV/gate-up fusion (off — measured neutral) |
 | `ORK_NO_AFFINITY=1` | don't pin NPU-driver threads to big cores (default: pin) |
-| `ORK_ZC_OUT=1` | output zero-copy (off — **buggy**, single-tile ~90% wrong, needs regcmd debug) |
+| `ORK_ZC_OUT=1` | output zero-copy (off by default — **correct** at the matmul level since the DMA cache-coherency fix `3fad74a` (+ Sn>1 `033a45b`), but ~0 end-to-end gain, so opt-in; **not safe under concurrent multi-core** — the coherency bsyncs aren't serialized across cores) |
 | `ORK_PROFILE=1` | per-section timing (quant / NPU run / dequant; decode vs prefill; run_multicore phases) — printed by ggml-ork on free |
 | `ORK_QUANT=4` | int4 W4A4 instead of int8 (experimental, incoherent) |
 
@@ -172,4 +172,4 @@ If your optimizations successfully increase the performance baselines above the 
 - `make batch_probe && sudo ./batch_probe [ntask]` — multi-task-per-submit probe (it times out; the kernel rejects `task_number>1`).
 
 ### Zero-copy DMA (`ork_dma_alloc`/`ork_dma_free`)
-NPU-coherent CPU-mapped buffers; a matmul whose A/C live in one has the regcmd read/write it in place (no host memcpy). **Input zero-copy (A): validated correct, default on, −17% on the full-K prefill matmul.** **Output zero-copy (C): buggy, off** — see the knob table. Realizing it end-to-end needs a ggml-ork DMA buffer type so activations land in a DMA buffer (the open Stage-2 item).
+NPU-coherent CPU-mapped buffers; a matmul whose A/C live in one has the regcmd read/write it in place (no host memcpy). **Input zero-copy (A): validated correct, default on, −17% on the full-K prefill matmul.** **Output zero-copy (C): correct but off by default** — the original corruption was a DMA cache-coherency bug (CPU dirty/stale lines racing the NPU's writes), fixed in `3fad74a` (bsync clean-before + invalidate-after; Sn>1 strided in `033a45b`) and validated at the matmul level. It stays opt-in (`ORK_ZC_OUT`) because it measured **~0 end-to-end gain** (writeout saved is negligible vs prefill), not because it's wrong. Caveat: **unsafe under concurrent multi-core** (the per-core bsyncs don't serialize with the NPU writes — `run_chain_i8` multi-core falls back to single-core for DMA-buffer tasks). Realizing input zero-copy end-to-end still needs a ggml-ork DMA buffer type (the open Stage-2 item).
