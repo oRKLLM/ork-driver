@@ -1,0 +1,59 @@
+# Guaranteed semver bump: every push to main auto-increments ORK_NPU_VERSION in include/ork_npu.h so
+# every build is uniquely identifiable (ork_npu_version() returns it; the ggml-ork backend prints it).
+# Bump level from the pushed commit message: "#major" / "#minor", else PATCH. The bump commit is pushed
+# with the default GITHUB_TOKEN (which by design does NOT re-trigger workflows) AND carries "[skip ci]",
+# so it can never loop. A matching git tag vX.Y.Z is created as the authoritative version anchor.
+name: version-bump
+
+on:
+  push:
+    branches: [main]
+
+# never run twice for the same ref at once (avoids racing bumps)
+concurrency:
+  group: version-bump-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # belt-and-suspenders: skip the bot's own bump commit (GITHUB_TOKEN already prevents re-trigger)
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump ORK_NPU_VERSION
+        run: |
+          set -euo pipefail
+          HDR=include/ork_npu.h
+          CUR=$(grep -E '#define[[:space:]]+ORK_NPU_VERSION' "$HDR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ -n "$CUR" ] || { echo "could not parse ORK_NPU_VERSION from $HDR"; exit 1; }
+          IFS=. read -r MAJOR MINOR PATCH <<< "$CUR"
+
+          MSG=$(git log -1 --pretty=%B)
+          case "$MSG" in
+            *'#major'*) MAJOR=$((MAJOR+1)); MINOR=0; PATCH=0 ;;
+            *'#minor'*) MINOR=$((MINOR+1)); PATCH=0 ;;
+            *)          PATCH=$((PATCH+1)) ;;
+          esac
+          NEW="$MAJOR.$MINOR.$PATCH"
+          echo "ORK_NPU_VERSION: $CUR -> $NEW"
+
+          sed -i -E "s/(#define[[:space:]]+ORK_NPU_VERSION[[:space:]]+\")[0-9]+\.[0-9]+\.[0-9]+/\1$NEW/" "$HDR"
+          grep -E '#define[[:space:]]+ORK_NPU_VERSION' "$HDR"
+
+          if git diff --quiet -- "$HDR"; then echo "no version change; nothing to do"; exit 0; fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$HDR"
+          git commit -m "chore: bump ORK_NPU_VERSION to $NEW [skip ci]"
+          git tag "v$NEW"
+          git push origin HEAD:main
+          git push origin "v$NEW"

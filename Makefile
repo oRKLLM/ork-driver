@@ -4,6 +4,13 @@
 CC      ?= cc
 AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
+
+# Stamp the build with a short git hash WHEN git + a repo are present (workstation builds). On the
+# board (no git) this is empty and ork_npu_version() returns the bare semver — no failure either way.
+GIT_HASH := $(shell git rev-parse --short=7 HEAD 2>/dev/null)
+ifneq ($(GIT_HASH),)
+CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
+endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4

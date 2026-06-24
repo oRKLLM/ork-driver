@@ -19,9 +19,11 @@ typedef _Float16 ork_f16;
 typedef struct ork_npu ork_npu;     /* device context (one per process) */
 typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 
-/* Library version — matches the git tag on the ork-driver repo. */
-#define ORK_NPU_VERSION "0.2.0"
-const char  *ork_npu_version(void);  /* returns ORK_NPU_VERSION */
+/* Library version (semver). The build may also inject a short git hash via -DORK_GIT_HASH (the
+ * Makefile does this when built where git is available); ork_npu_version() then returns
+ * "MAJOR.MINOR.PATCH+g<hash>", else just the semver. Bump MINOR on backward-compatible API adds. */
+#define ORK_NPU_VERSION "0.3.0"
+const char  *ork_npu_version(void);  /* e.g. "0.3.0" or "0.3.0+g1a2b3c4" */
 
 /* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
 ork_npu     *ork_npu_init(void);

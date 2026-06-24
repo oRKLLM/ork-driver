@@ -1974,7 +1974,13 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     bdestroy(fd, &task_chain); bdestroy(fd, &task_sep);
     return 0;
 }
-const char *ork_npu_version(void){ return ORK_NPU_VERSION; }
+const char *ork_npu_version(void){
+#ifdef ORK_GIT_HASH
+    static char v[64]; snprintf(v, sizeof v, "%s+g%s", ORK_NPU_VERSION, ORK_GIT_HASH); return v;
+#else
+    return ORK_NPU_VERSION;   /* no git at build time (e.g. native board build) → semver only */
+#endif
+}
 
 /* Max M rows a single full-K int8 submit handles at this K (mirrors run()'s M>1 Bf tiling, npu.c
  * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
