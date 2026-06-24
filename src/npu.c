@@ -2169,8 +2169,9 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
                     // allocated (a fresh output buffer returns stale on its first write). NOT c->warmed —
                     // that tracks the chain/single path, whose buffers are different from the stream's.
     if (c->last_dt != 3) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 3; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
-    int ncore = c->soc->cores; if (ncore > ORK_MAXCORE) ncore = ORK_MAXCORE;
-    int nc = ncore < S ? ncore : S;
+    // Core count is caller-configurable up to the SoC max: budget() honors ork_npu_set_core_budget()
+    // and the ORK_NPU_MC env (both capped to soc->cores). Capped to S (no more cores than tasks).
+    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
         if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403); if (!c->maf[i].cpu) return -1; cold = 1; }
