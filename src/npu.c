@@ -1907,6 +1907,29 @@ static int chain_fullk_mcap_i8(ork_npu *c, int K) {
     return chunk;
 }
 
+/* One core's slice of a fanned-out chain: submit programs [its mtk range] on core `core` as an
+ * independent single-core PC-chain. Mirrors run_multicore's per-core submit (core_mask=1<<core, own
+ * task object), so it's the validated multi-core mechanism — NOT the single-submit core_mask=0x7 path
+ * (which hard-wedges the NPU). Programs live in the shared c->regcmd (read-only); the per-core task
+ * object c->mtk[core] lists this core's tasks pointing into c->regcmd. */
+struct chain_cw { ork_npu *c; int core; int ntask; int rc; };
+static void *chain_core_worker(void *vp) {
+    struct chain_cw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core;
+    pin_big_core(i);
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = 0x5; sub.task_number = a->ntask; sub.task_obj_addr = c->mtk[i].obj;
+    sub.core_mask = 1u << i; sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)a->ntask};
+    int reps = c->mwarm[i] ? 1 : 2;   /* cold core: warmup rep (stale buffer), then real */
+    a->rc = 0;
+    for (int rep = 0; rep < reps; rep++) {
+        sub.timeout = 60000;
+        if (rknpu_submit_ioctl(fd, &sub)) { if (rep == reps - 1) a->rc = -1; continue; }
+    }
+    c->mwarm[i] = 1;
+    return NULL;
+}
+
 int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
@@ -1957,7 +1980,8 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     struct buf *cbufs[1024];
     memset(cbufs, 0, sizeof(cbufs));
 
-    int ok = 0;
+    int ok = 0, any_dma = 0;   // any task using a zero-copy DMA buffer -> stay single-core (ZC+multicore
+                               // hits the known output cache-coherency bug; not the fan-out target case)
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         int M = tasks[i].M;
@@ -1967,6 +1991,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve input activations buffer
         struct buf *abuf = dma_find(c, tasks[i].A);
         if (abuf) {
+            any_dma = 1;
             bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);
             act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
         } else {
@@ -1980,6 +2005,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve output buffer
         struct buf *cbuf = dma_find(c, tasks[i].C);
         if (cbuf) {
+            any_dma = 1;
             bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
@@ -2010,6 +2036,16 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     if (P > 1024) { ok = -2; goto cleanup; }   // too many M-tiles for the chain regcmd/task buffers
 
+    // Cross-core fan-out (ORK_CHAIN_MC): split the P programs into nc contiguous ranges, one per NPU
+    // core, and submit each range as an independent single-core PC-chain CONCURRENTLY (the validated
+    // run_multicore mechanism — NOT one core_mask=0x7 submit, which hard-wedges). ~nc x on the chain.
+    // Default single-core; the win is for repack-free batched matmuls (dense / EAGLE-3 verification).
+    int ncore = c->soc->cores; if (ncore > 3) ncore = 3;
+    int nc = (getenv("ORK_CHAIN_MC") && P >= 2 && ncore >= 2 && !any_dma) ? (ncore < P ? ncore : P) : 1;
+    int coff[3] = {0,0,0}, ccnt[3] = {0,0,0};
+    { int base = P / nc, rem = P % nc, o = 0;
+      for (int i = 0; i < nc; i++) { ccnt[i] = base + (i < rem ? 1 : 0); coff[i] = o; o += ccnt[i]; } }
+
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -2028,10 +2064,14 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
                      bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
             if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
-            if (p < P - 1) {
+            // Link p -> p+1 UNLESS p+1 starts a new core range (each core's range is its own self-
+            // contained chain whose last program raises the interrupt). Single-core: link all but last.
+            int link = (p < P - 1);
+            for (int cc = 1; cc < nc; cc++) if (p + 1 == coff[cc]) link = 0;
+            if (link) {
                 // PC-chaining (mirrors the validated i4 path): patch the chain-control tail so this
                 // program jumps to the next regcmd instead of raising the completion interrupt. The
-                // final program keeps the template default (rc[216..219] = ...0x14,0x01010000 = raise).
+                // range-final program keeps the template default (rc[216..219] = ...0x14,0x01010000 = raise).
                 uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
                 rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
                 rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
@@ -2043,49 +2083,55 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
-    // One rknpu_task per chained regcmd program (P total, PC-chained).
-    struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
-    for (int p = 0; p < P; p++) {
-        t[p].enable_mask = 0xd;
-        t[p].int_mask = 0x300;
-        t[p].int_clear = 0x1ffff;
-        t[p].regcfg_amount = 108;
-        t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
-    }
-
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-
-    // 6. Submit the chained tasks to the NPU
-    static int tc = -2;
-    if (tc == -2) {
-        const char *e = getenv("ORK_NPU_TESTCORE");
-        tc = e ? atoi(e) : 0;
-        if (tc < 0 || tc > 2) tc = 0;
-    }
-    struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
-    sub.flags = 0x5;
-    sub.task_number = P;
-    sub.task_obj_addr = c->task.obj;
-    sub.core_mask = 1u << tc;
-    sub.fence_fd = -1;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, P};
-
-    int reps = c->warmed ? 1 : 2;
     int submit_ok = 0;
-    for (int rep = 0; rep < reps; rep++) {
-        int last = (rep == reps - 1);
-        sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) {
-            if (last) {
-                perror("SUBMIT chained");
-                submit_ok = -1;
+    if (nc > 1) {
+        // CROSS-CORE: nc independent single-core PC-chains, submitted concurrently (one thread/core).
+        // Each core's task object c->mtk[i] lists its ccnt[i] programs (pointing into the shared,
+        // read-only c->regcmd). Mirrors run_multicore's per-core submit — the validated multi-core path.
+        if (mc_ensure(c, nc)) { ok = -1; goto cleanup; }
+        for (int i = 0; i < nc; i++) {
+            struct rknpu_task *mt = (struct rknpu_task *) c->mtk[i].cpu;
+            memset(mt, 0, (size_t)ccnt[i] * sizeof(struct rknpu_task));
+            for (int j = 0; j < ccnt[i]; j++) {
+                mt[j].enable_mask = 0xd; mt[j].int_mask = 0x300; mt[j].int_clear = 0x1ffff;
+                mt[j].regcfg_amount = 108;
+                mt[j].regcmd_addr = c->regcmd.dma + (size_t)(coff[i] + j) * REGCMD_I8_N * 4;
             }
-            continue;
+            bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+            c->mwarm[i] = 0;   // force a warmup rep on each core for this chain (cold buffer)
         }
-        submit_ok = 0;
+        struct chain_cw cw[3]; pthread_t th[3];
+        for (int i = 0; i < nc; i++) cw[i] = (struct chain_cw){c, i, ccnt[i], 0};
+        for (int i = 1; i < nc; i++) pthread_create(&th[i], NULL, chain_core_worker, &cw[i]);
+        chain_core_worker(&cw[0]);
+        for (int i = 1; i < nc; i++) pthread_join(th[i], NULL);
+        for (int i = 0; i < nc; i++) if (cw[i].rc) submit_ok = -1;
+        c->warmed = 1;
+    } else {
+        // SINGLE-CORE: one rknpu_task per program (P total, PC-chained), one submit.
+        struct rknpu_task *t = c->task.cpu;
+        memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
+        for (int p = 0; p < P; p++) {
+            t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
+            t[p].regcfg_amount = 108;
+            t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
+        }
+        bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        static int tc = -2;
+        if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
+        struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
+        sub.flags = 0x5; sub.task_number = P; sub.task_obj_addr = c->task.obj;
+        sub.core_mask = 1u << tc; sub.fence_fd = -1;
+        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
+        int reps = c->warmed ? 1 : 2;
+        for (int rep = 0; rep < reps; rep++) {
+            int last = (rep == reps - 1);
+            sub.timeout = 60000;
+            if (rknpu_submit_ioctl(fd, &sub)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
+            submit_ok = 0;
+        }
+        c->warmed = 1;
     }
-    c->warmed = 1;
 
     // 7. Sync memory back and copy results
     for (int i = 0; i < S; i++) {
