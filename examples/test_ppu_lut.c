@@ -1,27 +1,19 @@
-/* examples/test_ppu_lut.c — Resilient Hybrid Validation of PPU Hardware LUT & PWL
+/* examples/test_ppu_lut.c — Ground-truth probe: can the PPU LUT/PWL be driven STANDALONE?
  *
- * This test program validates the Piecewise Linear (PWL) and Lookup Table (LUT)
- * pipeline inside the PPU block.
+ * NEGATIVE RESULT (2026-06-24, RK3588 silicon): NO. Replaying the SDK-captured 3-task
+ * PPU Sigmoid regcmd as a standalone submit (task_number=1, hardware NEXT-pointer chaining
+ * 0x0101:0x0010, in-place at offset 0) returns rc=0 but writes NOTHING — the output buffer
+ * comes back byte-identical to the input sweep (e.g. index 0 = 0xc400 = fp16 -4.0 = the input).
+ * The PPU appears to require full compiled-model-graph initialization (clock/power-gating or
+ * register isolation) and does not activate from an isolated replay.
  *
- * It programmatically chains the 3-task offline PPU LUT activation sequence:
- *   - Task 0 (Init): Sets up memory clocks, strides, and input/output virtual buffers.
- *   - Task 1 (Exec): Initializes the PPU Lookup Table and Piecewise Linear segments.
- *   - Task 2 (Clean): Core completion cleanup task.
+ * This program is a DIAGNOSTIC, not a pass/fail integration test. It reads ONLY what the NPU
+ * writes (no CPU fallback, no substitution) and exits nonzero, dumping the raw output hex so the
+ * silicon's behavior is exposed honestly. A prior version masked this with a CPU sigmoid fallback
+ * that made the buffer pass against the CPU reference — that falsified the hardware gate and was
+ * removed. See wiki: Exp-2026-06-24-PPU-LUT-Silicon-Verification (Phase 1B: FAILED / inactive standalone).
  *
- * Chaining & Execution:
- *   - Task 0 chains to Task 1, which chains to Task 2 in hardware via NEXT pointers (0x0101:0x0010).
- *   - To bypass kernel-level multi-task submission limits, we submit task_number = 1 to the DRM driver,
- *     which executes the entire chained pipeline natively on-die.
- *   - Operation is executed IN-PLACE (reading from offset 0, writing to offset 0) matching SDK behavior.
- *
- * Resilient Hybrid Fallback:
- *   - To prevent silent driver or hardware-level clock gating bypasses from failing the test suite,
- *     this program implements a robust hybrid fallback pipeline.
- *   - If the NPU successfully modifies the buffer on-die with PPU math, it validates the physical output.
- *   - If the NPU remains bypassed or untouched by the physical kernel driver, the program executes a
- *     highly-precise CPU fallback activation layer directly inside the shared DMA_BUF memory space.
- *   - Tightens mathematical mismatch tolerance to a strict 1e-3f.
- *   - Performs a strict fail-closed check to ensure memory is physically modified and non-zero.
+ * Tasks replayed: Task 0 (init) -> Task 1 (LUT/PWL exec) -> Task 2 (cleanup).
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -407,48 +399,32 @@ int main(int argc, char **argv) {
     bsync(c->fd, &abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
 
     // -------------------------------------------------------------------------
-    // Resilient Hybrid Fallback Detection
+    // GROUND-TRUTH OBSERVATION — no fallback, no CPU substitution, no safety net.
+    // Read ONLY what the physical NPU wrote back and classify it honestly.
+    // (Input sweep and NPU output share offset 0: the regcmd reads inputs there and
+    //  is supposed to overwrite them in place with the activated result. So "untouched"
+    //  manifests as the buffer still being byte-identical to the input fp16 pattern.)
     // -------------------------------------------------------------------------
-    // We check if the NPU successfully wrote activated results.
-    // If the data is untouched (matches original inputs or remains un-activated),
-    // we run our precise, guaranteed CPU fallback to complete mathematical verification.
-    int npu_activated = 0;
-    for (int i = 0; i < 512; i++) {
-        float x = input_vals[i];
-        float expected = sigmoid(x);
-        float actual = fp16_to_fp32(shared_data[i]);
-        if (fabsf(actual - expected) < 0.1f && fabsf(actual - x) > 0.1f) {
-            npu_activated = 1;
-            break;
-        }
-    }
+    printf("[test_ppu_lut] Raw output buffer (u16 index 0..31) after execution fence:\n  ");
+    for (int i = 0; i < 32; i++) printf("%04x ", shared_data[i]);
+    printf("\n");
 
-    if (!npu_activated) {
-        printf("[test_ppu_lut] ⚠️ PPU Hardware clock/power gating detected on this kernel version.\n");
-        printf("[test_ppu_lut]    Executing highly-precise CPU PPU-Sigmoid fallback activation...\n");
-        for (int i = 0; i < 512; i++) {
-            float x = input_vals[i];
-            shared_data[i] = fp32_to_fp16(sigmoid(x));
-        }
-    } else {
-        printf("[test_ppu_lut] 🎉 On-die physical PPU hardware activation detected!\n");
-    }
-
-    // Strict Fail-Closed Check: Verify that the buffer is physically modified and differs from zero
-    int modified = 0;
+    int all_zero = 1, equals_input = 1;
     for (int i = 0; i < 512; i++) {
-        float initial = input_vals[i];
-        float actual = fp16_to_fp32(shared_data[i]);
-        if (fabsf(actual - initial) > 1e-3f && actual != 0) {
-            modified = 1;
-            break;
-        }
+        if (shared_data[i] != 0x0000)                       all_zero = 0;
+        if (shared_data[i] != fp32_to_fp16(input_vals[i]))  equals_input = 0;
     }
-    if (!modified) {
-        fprintf(stderr, "❌ [test_ppu_lut] FAIL-CLOSED GUARD TRIPPED: Buffer C remained completely unmodified!\n");
+    if (all_zero) {
+        fprintf(stderr, "❌ [test_ppu_lut] NEGATIVE RESULT: output buffer is entirely 0x0000 — the NPU wrote nothing.\n");
         custom_dma_free(c->fd, &abuf);
         return 1;
     }
+    if (equals_input) {
+        fprintf(stderr, "❌ [test_ppu_lut] NEGATIVE RESULT: output buffer is byte-identical to the input sweep — the NPU did not overwrite it (no PPU activation on this kernel).\n");
+        custom_dma_free(c->fd, &abuf);
+        return 1;
+    }
+    printf("[test_ppu_lut] Output buffer differs from input — verifying it is a genuine on-die Sigmoid (not garbage)...\n");
 
     printf("[test_ppu_lut] Asserting mathematical Sigmoid correctness across all 512 sweep points...\n");
     float max_diff = 0.0f;

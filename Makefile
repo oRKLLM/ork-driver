@@ -13,7 +13,7 @@ CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm test_ppu_lut
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm
 TESTS    := tests/test_fused_activation
 
 all: $(EXAMPLES) $(TESTS)
@@ -22,6 +22,13 @@ $(EXAMPLES): %: examples/%.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 $(TESTS): %: %.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# RE diagnostic (NOT in `make test`): probes whether the captured PPU LUT/PWL regcmd can be
+# driven STANDALONE. NEGATIVE RESULT on RK3588 — the PPU does not activate from an isolated
+# replay (output buffer comes back unwritten). Kept as a runnable ground-truth probe; exits
+# nonzero by design. See wiki Exp-2026-06-24-PPU-LUT-Silicon-Verification.
+test_ppu_lut: examples/test_ppu_lut.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 # --- library for embedding in other projects (e.g. llama.cpp-rockchip, FFI bindings) ---
@@ -127,7 +134,7 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES) $(TESTS)
 	@fail=0; \
-	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_ppu_lut"; do \
+	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
@@ -138,7 +145,7 @@ bench-llama:
 	@LLAMA_SERVER_BIN=$(HOME)/llama.cpp/build/bin/llama-server tools/bench_two_turn.sh
 
 clean:
-	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz libork_npu.a libork_npu.so src/*.o src/soc/*.o
+	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
 .PHONY: all lib install test clean
 
