@@ -158,6 +158,9 @@ int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *task
 /* Async round-robin stream: S independent int8 matmuls dispatched dynamically across NPU cores (pull
  * model, no barrier). For batches of independent matmuls (e.g. EAGLE-3 verification). 0/ok, -1/-2 err. */
 int          ork_mm_run_stream_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+/* int4 (W4A4) async round-robin stream: S independent matmuls across NPU cores (a task's M rows become M
+ * single-row regcmds PC-chained on its core). Weights single-slice (Sn==1 && Sk==1). 0/ok, -1/-2 err. */
+int          ork_mm_run_stream_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);

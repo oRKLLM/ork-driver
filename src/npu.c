@@ -2424,6 +2424,98 @@ cleanup:
     return ok;
 }
 
+/* ---- ASYNC ROUND-ROBIN STREAM, int4 (ork_mm_run_stream_i4) ----
+ * int4 analog of ork_mm_run_stream_i8: dispatch S independent W4A4 matmuls to per-core pool workers that
+ * PULL the next task dynamically (atomic counter, no barrier), each running it as a single-core submit on
+ * its own core. int4 is single-row per regcmd (synth_i4 mc=1), so a task's M rows become M single-row
+ * regcmds PC-chained on one core (mirror run_chain_i4's chaining + the int16->int32 de-tile), submitted
+ * task_number=M on core_mask=1<<i. Weights must be single-slice (Sn==1 && Sk==1). A/C are plain host
+ * buffers staged via the per-core mrc/mtk/maf/mcc buffers (no zero-copy). 0/ok, -1 submit, -2 bad arg. */
+struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
+static void *stream_worker_i4(void *vp) {
+    struct streamw4 *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core;
+    pin_big_core(i);
+    int k; a->rc = 0;
+    uint32_t rc[REGCMD_I4_N];
+    while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
+        const ork_mm_task_i4 *t = &a->tasks[k];
+        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N;
+        uint32_t bdma = (uint32_t)w->Bb[0].dma;
+        uint8_t *abase = c->maf[i].cpu;                       /* per-row stride K bytes (nibble-pack uses K/2) */
+        for (int m = 0; m < M; m++) tile_i4_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
+            memset(rc, 0, sizeof rc);
+            synth_i4(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
+                     (uint32_t)(c->mcc[i].dma + (size_t)m * N * 2));
+            if (m < M - 1) {
+                uint64_t nd = c->mrc[i].dma + (size_t)(m + 1) * REGCMD_I4_N * 4;
+                rc[216] = 0x0010 | ((nd & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nd >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
+            } else { rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000; }
+            memcpy((char *)c->mrc[i].cpu + (size_t)m * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+        }
+        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)M * sizeof *mt);
+        for (int q = 0; q < M; q++) {
+            mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
+            mt[q].regcfg_amount = 116; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I4_N * 4;
+        }
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+        sub.flags = 0x5; sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
+        sub.timeout = 60000;
+        if (rknpu_submit_ioctl(fd, &sub)) { a->rc = -1; }
+        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;        /* widen int16 NPU output -> int32 caller C */
+        for (int row = 0; row < M; row++) {
+            int16_t *orow = o + (size_t)row * N; int32_t *crow = C + (size_t)row * N;
+            for (int col = 0; col < N; col++) crow[col] = orow[col];
+        }
+    }
+    return NULL;
+}
+int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+    if (!c || S < 1 || !tasks) return -2;
+    const int mrc_cap = 65536 / (REGCMD_I4_N * 4);
+    size_t maxMK = 0, maxMN2 = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I4 || tasks[i].M <= 0) return -2;
+        if (w->Sn != 1 || w->Sk != 1) return -2;              /* single-slice weight only (no K/N split) */
+        if (tasks[i].M > mrc_cap) return -2;                  /* M single-row regcmds must fit one mrc buffer */
+        size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 2;
+        if (mk > maxMK) maxMK = mk; if (mn > maxMN2) maxMN2 = mn;
+    }
+    int fd = c->fd;
+    int cold = 0;   /* warmup pass needed on a fresh stream-i4 mode OR freshly-allocated per-core buffer */
+    if (c->last_dt != 5 /* DT_I4_STREAM */) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 5; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
+    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
+    if (mc_ensure(c, nc)) return -1;
+    for (int i = 0; i < nc; i++) {
+        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403); if (!c->maf[i].cpu) return -1; cold = 1; }
+        if (c->mccsz[i] < maxMN2) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN2, 0x403); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
+    }
+    int rc = 0;
+    npu_pool_ensure(c);
+    struct streamw4 sw[ORK_MAXCORE];
+    int passes = cold ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        int ctr = 0;
+        for (int i = 0; i < nc; i++) sw[i] = (struct streamw4){c, i, S, tasks, &ctr, 0};
+        pthread_mutex_lock(&c->pmu);
+        c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker_i4; c->pjob_stride = sizeof(struct streamw4);
+        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+        pthread_mutex_unlock(&c->pmu);
+        stream_worker_i4(&sw[0]);                             /* core 0 on the calling thread */
+        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
+    }
+    for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
+    c->warmed = 1;
+    return rc;
+}
+
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
 void ork_fwht_norm(float *v, int n){
     for(int len=1; len<n; len<<=1)

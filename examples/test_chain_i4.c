@@ -62,8 +62,31 @@ int main(void) {
         printf("OK: chain_i4 output verified.\n");
     }
 
+    /* ---- stream_i4: S independent W4A4 matmuls (varying M) dispatched round-robin across cores ---- */
+    int SK = 128, SN = 128, NT = 4, Ms[4] = {1, 4, 8, 2};
+    int8_t *SB[4]; int8_t *SA[4]; int32_t *SC[4]; ork_w *sw[4]; ork_mm_task_i4 st[4];
+    for (int t = 0; t < NT; t++) {
+        SB[t] = malloc((size_t)SK * SN); SA[t] = malloc((size_t)Ms[t] * SK); SC[t] = calloc((size_t)Ms[t] * SN, 4);
+        for (int i = 0; i < SK * SN; i++) { sd = sd*1103515245+12345; SB[t][i] = (int8_t)((int)((sd>>17)%15)-7); }
+        for (int i = 0; i < Ms[t] * SK; i++) { sd = sd*1103515245+12345; SA[t][i] = (int8_t)((int)((sd>>17)%15)-7); }
+        sw[t] = ork_mm_pack_i4(ctx, SK, SN, SB[t]);
+        if (!sw[t]) { printf("stream pack failed\n"); return 1; }
+        st[t] = (ork_mm_task_i4){ sw[t], Ms[t], SA[t], SC[t] };
+    }
+    int src = ork_mm_run_stream_i4(ctx, NT, st);
+    int sbad = 0;
+    if (src) { printf("stream run failed %d\n", src); sbad = 1; }
+    else for (int t = 0; t < NT; t++)
+        for (int m = 0; m < Ms[t]; m++)
+            for (int n = 0; n < SN; n++) {
+                long s = 0; for (int k = 0; k < SK; k++) s += (long)SA[t][m*SK+k]*SB[t][k*SN+n];
+                if (SC[t][m*SN+n] != s) { if (sbad < 5) printf("stream C[%d][%d,%d]=%d exp %ld\n", t, m, n, SC[t][m*SN+n], s); sbad++; }
+            }
+    printf("%s: stream_i4 S=%d (varying M=1/4/8/2) %s\n", sbad?"FAIL":"OK", NT, sbad?"":"output verified");
+    for (int t = 0; t < NT; t++) { free(SB[t]); free(SA[t]); free(SC[t]); ork_w_free(sw[t]); }
+
     free(A1); free(A2); free(B); free(C1); free(C2);
     ork_w_free(w);
     ork_npu_free(ctx);
-    return bad ? 1 : 0;
+    return (bad || sbad) ? 1 : 0;
 }
