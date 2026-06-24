@@ -14,6 +14,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <string.h>
@@ -25,6 +26,9 @@
 struct ent { uint32_t handle; uint64_t dma, obj, size, off; void *cpu; };
 static struct ent tab[MAXB];
 static int nent = 0;
+/* ORK_SUBMIT_ONLY=1: print only SUBMIT/subcore/task headers (the multi-core pattern), skip the verbose
+ * hexdumps — so capturing a full model inference stays small. Set in init(). */
+static int g_submit_only = 0;
 
 static int (*real_ioctl)(int, unsigned long, ...) = NULL;
 static void *(*real_mmap)(void *, size_t, int, int, int, off_t) = NULL;
@@ -33,7 +37,8 @@ __attribute__((constructor))
 static void init(void) {
     real_ioctl = (int (*)(int, unsigned long, ...))dlsym(RTLD_NEXT, "ioctl");
     real_mmap  = (void *(*)(void *, size_t, int, int, int, off_t))dlsym(RTLD_NEXT, "mmap");
-    fprintf(stderr, "[rknpu_dump] loaded\n");
+    g_submit_only = getenv("ORK_SUBMIT_ONLY") != NULL;
+    fprintf(stderr, "[rknpu_dump] loaded%s\n", g_submit_only ? " (submit-only)" : "");
 }
 
 static struct ent *by_handle(uint32_t h) { for (int i=0;i<nent;i++) if (tab[i].handle==h) return &tab[i]; return NULL; }
@@ -67,6 +72,7 @@ void *mmap64(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
 }
 
 static void hexwords(const char *tag, const uint32_t *w, int n) {
+    if (g_submit_only) return;
     fprintf(stderr, "  --- %s (%d u32 words) ---\n", tag, n);
     for (int i=0;i<n;i+=4) {
         fprintf(stderr, "  [%03d] %08x %08x %08x %08x\n", i,
