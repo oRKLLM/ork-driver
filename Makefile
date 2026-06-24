@@ -13,7 +13,7 @@ CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm test_ppu_lut
 
 all: $(EXAMPLES)
 
@@ -80,6 +80,10 @@ i4_multim_fuzz: tools/i4_multim_fuzz.c $(CORE)
 prefill_check: tools/prefill_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE/calibration probe: sweeps registers to find vector/PPU instructions
+vec_fuzz: tools/vec_fuzz.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
@@ -119,7 +123,7 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES)
 	@fail=0; \
-	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
+	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_ppu_lut"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
@@ -130,7 +134,7 @@ bench-llama:
 	@LLAMA_SERVER_BIN=$(HOME)/llama.cpp/build/bin/llama-server tools/bench_two_turn.sh
 
 clean:
-	rm -f $(EXAMPLES) rknpu_bench libork_npu.a libork_npu.so src/*.o src/soc/*.o
+	rm -f $(EXAMPLES) rknpu_bench vec_fuzz libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
 .PHONY: all lib install test clean
 

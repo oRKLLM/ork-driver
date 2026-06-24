@@ -8,6 +8,8 @@ the [ork-driver wiki](https://github.com/oRKLLM/ork-driver/wiki).
 
 See [`README.md`](README.md) for the user-facing overview and API.
 
+The active reverse-engineering findings and optimization roadmap are documented in the sibling [Wiki Home](../ork-driver.wiki/Home.md) repository.
+
 ---
 
 ## 1. What it is
@@ -87,8 +89,10 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 # from a workstation: rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'
 ```
 
-- The validated board is RK3588.
-- The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can stall the next — keep that in mind when adding tests. If the board becomes completely wedged, it can be power-cycled via the Home Assistant MCP by toggling the `rock5b` smart plug.
+- The validated board is RK3588 (SBC IP: `10.3.0.236`).
+- The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can stall the next — keep that in mind when adding tests.
+  - **SBC Hard Wedge**: If the board becomes completely/hard wedged (unresponsive over SSH), use the Home Assistant MCP tools to power cycle the **"Rock 5B Plug"** smart plug. Specifically, call the `mcp_context-forge_home-assistant-hassturnoff(name="Rock 5B Plug")` tool to turn off the smart plug, followed by `mcp_context-forge_home-assistant-hassturnon(name="Rock 5B Plug")` to turn it back on.
+  - **NPU Wedge**: If only the NPU is wedged (submission hang/timeout, but the SBC is still responsive via SSH), execute a graceful reboot command over SSH to restart the board: `ssh board 'sudo reboot'`.
 - A `.bin` test model (e.g. `stories15M`) is needed only for the `llama2` example; it is
   git-ignored and `make test` skips that test gracefully when `MODEL` is absent.
 - **The examples ARE the tests** — each self-validates against a CPU reference (NPU output must

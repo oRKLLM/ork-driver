@@ -47,8 +47,16 @@ static struct ent *by_dma(uint64_t d)    { for (int i=0;i<nent;i++) if (tab[i].d
 /* range lookup: find the buffer CONTAINING d (task regcmds live at offsets into one regcmd buffer,
  * so exact-base by_dma misses task[1..3]); returns the entry and sets *off to the byte offset. */
 static struct ent *by_dma_range(uint64_t d, uint64_t *off) {
-    for (int i=0;i<nent;i++) if (d>=tab[i].dma && d<tab[i].dma+tab[i].size) { *off=d-tab[i].dma; return &tab[i]; }
-    return NULL; }
+    uint32_t d32 = (uint32_t)d;
+    for (int i=0;i<nent;i++) {
+        uint32_t dma32 = (uint32_t)tab[i].dma;
+        if (d32 >= dma32 && d32 < dma32 + tab[i].size) {
+            *off = d32 - dma32;
+            return &tab[i];
+        }
+    }
+    return NULL;
+}
 
 static void record_map(off_t off, void *p) {
     struct ent *e = by_off((uint64_t)off);
