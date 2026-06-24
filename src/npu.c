@@ -1895,6 +1895,18 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
 }
 const char *ork_npu_version(void){ return ORK_NPU_VERSION; }
 
+/* Max M rows a single full-K int8 submit handles at this K (mirrors run()'s M>1 Bf tiling, npu.c
+ * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
+ * caller must split the task into M-tiles. Guards against wedging the (shared) NPU on an oversized mc. */
+static int chain_fullk_mcap_i8(ork_npu *c, int K) {
+    int RB = 2 * c->soc->cbuf_elems, R = RB / K; if (R < 1) R = 1;
+    { int rp2 = 1; while (rp2 * 2 <= R) rp2 *= 2; R = rp2; }
+    double scale = (double)K / 512.0; int base = (int)(177.0 - 15.0 * (scale - 1.0)), slope = (int)(15.0 * scale);
+    int mg_max = base >= 0x1b ? (base - 0x1b) / slope + 1 : 0;
+    int chunk = mg_max * 64; if (chunk > R - 1) chunk = R - 1; if (chunk < 1) chunk = 1;
+    return chunk;
+}
+
 int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
@@ -1914,7 +1926,12 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (w->dtype != DT_I8) return -2;
         if (tasks[i].M <= 0) return -2;
         if (w->K % 32 || w->N % 32) return -2;
-        if (w->Sn != 1 || w->Sk != 1) return -2; // chain expects single-slice weights (K<=10752, N<=nmax)
+        // Each chain link is ONE full-K submit. Need a single-slice weight: either Sk==1 (Bb[0] holds
+        // the whole K) or a Bf full-K buffer (K<=10752; built by pack/repack for the MoE experts).
+        // K=2048 experts pack Sk=2 but carry Bf — use it so they can chain. N must be a single slice.
+        if (w->Sn != 1) return -2;
+        if (w->Sk != 1 && !w->Bf) return -2;
+        if (tasks[i].M > chain_fullk_mcap_i8(c, w->K)) return -3; // M too big for one submit; caller must M-tile
         if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
@@ -1990,7 +2007,10 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         int N = w->N;
 
         memset(rc, 0, sizeof(rc));
-        synth_i8(rc, M, K, N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i], 1, CBUF, 0);
+        // full-K single submit: Bf[0] (the K<=10752 full-K layout, e.g. Sk=2 experts) if present,
+        // else Bb[0] (which holds the whole K only when Sk==1). Both are the synth_i8 tile layout.
+        uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+        synth_i8(rc, M, K, N, act_dma[i], bdma, out_dma[i], 1, CBUF, 0);
         setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
         if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 

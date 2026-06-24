@@ -122,6 +122,35 @@ static int check_chain_i8(ork_npu*ctx) {
     return bad ? 1 : 0;
 }
 
+/* Chain experts whose K forces a 2-slice pack (Sk=2 at K=2048) but which carry a Bf full-K buffer.
+ * This is the MoE-prefill chaining path: the chain uses Bf so each expert is one PC-chained submit,
+ * even though pack_i8 K-splits at 1024. Varies M (decode M=1 + small prefill M>1, all <= the
+ * single-submit row cap). Different weights per expert; validate each vs the int32 CPU reference. */
+static int check_chain_i8_bf(ork_npu *ctx) {
+    enum { S = 3 };
+    int Ms[S] = {1, 8, 16};            // all <= chain_fullk_mcap_i8(K=2048) = 31 on RK3588
+    int K = 2048, N = 768;             // K=2048 -> Sk=2 + Bf; N=768 -> Sn=1 (N<=nmax)
+    int8_t *A[S] = {0}, *B[S] = {0}; int32_t *C[S] = {0}; ork_w *w[S] = {0};
+    ork_mm_task_i8 tasks[S];
+    for (int i = 0; i < S; i++) {
+        A[i] = malloc((size_t)Ms[i] * K); B[i] = malloc((size_t)K * N); C[i] = malloc((size_t)Ms[i] * N * 4);
+        for (size_t j = 0; j < (size_t)Ms[i] * K; j++) A[i][j] = (int8_t)(rnd() - 1);
+        for (size_t j = 0; j < (size_t)K * N; j++) B[i][j] = (int8_t)(rnd() - 1);
+        w[i] = ork_mm_pack_i8(ctx, K, N, B[i]);
+        if (!w[i]) { printf("pack_chain_i8_bf failed %d\n", i); return 1; }
+        tasks[i].w = w[i]; tasks[i].M = Ms[i]; tasks[i].A = A[i]; tasks[i].C = C[i];
+    }
+    int bad = 0, rc = ork_mm_run_chain_i8(ctx, S, tasks);
+    if (rc) { printf("run_chain_i8 (Bf) failed rc=%d\n", rc); bad = 1; }
+    else for (int i = 0; i < S; i++) for (int r = 0; r < Ms[i]; r++) for (int n = 0; n < N; n++) {
+        int32_t ref = 0; for (int k = 0; k < K; k++) ref += (int)A[i][(size_t)r*K+k] * (int)B[i][(size_t)k*N+n];
+        if (C[i][(size_t)r*N+n] != ref) { if (bad < 3) printf("  Bf mism task %d row %d col %d: exp %d got %d\n", i, r, n, ref, C[i][(size_t)r*N+n]); bad++; }
+    }
+    printf("  %s chained S=%d Bf K=%d N=%d (Sk=2, varying M=1/8/16) mism=%d\n", bad ? "WRONG" : "ok  ", S, K, N, bad);
+    for (int i = 0; i < S; i++) { if (w[i]) ork_w_free(w[i]); free(A[i]); free(B[i]); free(C[i]); }
+    return bad ? 1 : 0;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -180,6 +209,7 @@ int main(void){
     //8,1280,64);     /* 256 remainder slice */
     //4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     fail|=check_chain_i8(c8);         /* verify chained matmuls / MoE API */
+    fail|=check_chain_i8_bf(c8);      /* verify Bf-based chaining (Sk=2 experts, MoE-prefill path) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
