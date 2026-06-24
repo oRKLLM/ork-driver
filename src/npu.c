@@ -1908,30 +1908,6 @@ static int chain_fullk_mcap_i8(ork_npu *c, int K) {
     return chunk;
 }
 
-/* One core's slice of a fanned-out chain: submit programs [its mtk range] on core `core` as an
- * independent single-core PC-chain. Mirrors run_multicore's per-core submit (core_mask=1<<core, own
- * task object), so it's the validated multi-core mechanism — NOT the single-submit core_mask=0x7 path
- * (which hard-wedges the NPU). Programs live in the shared c->regcmd (read-only); the per-core task
- * object c->mtk[core] lists this core's tasks pointing into c->regcmd. */
-struct chain_cw { ork_npu *c; int core; int ntask; int reps; int barrier; int rc; };
-static void *chain_core_worker(void *vp) {
-    struct chain_cw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core;
-    pin_big_core(i);
-    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = 0x5; sub.task_number = a->ntask; sub.task_obj_addr = c->mtk[i].obj;
-    sub.core_mask = 1u << i; sub.fence_fd = -1;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)a->ntask};
-    a->rc = 0;
-    for (int rep = 0; rep < a->reps; rep++) {   /* reps>1 only on the cold (first) chain — see caller */
-        // Barrier so all cores fire their ioctl SIMULTANEOUSLY — staggered submits serialize in the
-        // kernel dispatch (this is what run_multicore does; without it cross-core scaling is ~1x).
-        if (a->barrier) pthread_barrier_wait(&c->b_ioctl);
-        sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { if (rep == a->reps - 1) a->rc = -1; continue; }
-    }
-    return NULL;
-}
-
 int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
@@ -1956,6 +1932,11 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // K=2048 experts pack Sk=2 but carry Bf — use it so they can chain. N must be a single slice.
         if (w->Sn != 1) return -2;
         if (w->Sk != 1 && !w->Bf) return -2;
+        // The full-K Bf submit uses synth_i8(sched=1), whose 0x1040 K-reduction schedule is only valid for
+        // K%512==0 && K<=4096 (same envelope as run()'s M>1 Bf path; 512/1024 are covered, 1536-4096 too).
+        // For other K (e.g. 768 down_proj, or K>4096) a full-K single submit is WRONG — reject so the caller
+        // falls back to per-task run_i8 (which K-splits correctly). -3 distinguishes this from bad-arg -2.
+        if (w->K % 512 != 0 || w->K > 4096) return -3;
         // M>mcap is fine — the synth loop M-tiles it into multiple chained programs (Step B below).
         if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
@@ -1982,8 +1963,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     struct buf *cbufs[1024];
     memset(cbufs, 0, sizeof(cbufs));
 
-    int ok = 0, any_dma = 0;   // any task using a zero-copy DMA buffer -> stay single-core (ZC+multicore
-                               // hits the known output cache-coherency bug; not the fan-out target case)
+    int ok = 0;
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         int M = tasks[i].M;
@@ -1993,7 +1973,6 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve input activations buffer
         struct buf *abuf = dma_find(c, tasks[i].A);
         if (abuf) {
-            any_dma = 1;
             bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);
             act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
         } else {
@@ -2007,7 +1986,6 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve output buffer
         struct buf *cbuf = dma_find(c, tasks[i].C);
         if (cbuf) {
-            any_dma = 1;
             bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
@@ -2038,25 +2016,9 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     if (P > 1024) { ok = -2; goto cleanup; }   // too many M-tiles for the chain regcmd/task buffers
 
-    // Cross-core fan-out (ORK_CHAIN_MC): split the P programs into nc contiguous ranges, one per NPU
-    // core, and submit each range as an independent single-core PC-chain CONCURRENTLY (the validated
-    // run_multicore mechanism — NOT one core_mask=0x7 submit, which hard-wedges). ~nc x on the chain.
-    // Default single-core; the win is for repack-free batched matmuls (dense / EAGLE-3 verification).
-    int ncore = c->soc->cores; if (ncore > 3) ncore = 3;
-    const int mrc_cap = 65536 / (REGCMD_I8_N * 4);   // programs per per-core regcmd BO c->mrc[i] (64KB)
-    int nc = (getenv("ORK_CHAIN_MC") && P >= 2 && ncore >= 2 && !any_dma) ? (ncore < P ? ncore : P) : 1;
-    if (nc > 1) {
-        // Each core gets its OWN regcmd buffer c->mrc[i] (not the shared c->regcmd) — concurrent submits
-        // that share one buffer object serialize in the kernel (a shared c->regcmd gave ~1x, no scaling).
-        if (mc_ensure(c, nc)) nc = 1;
-        else { int base = P / nc, rem = P % nc;
-               for (int i = 0; i < nc; i++) if (base + (i < rem ? 1 : 0) > mrc_cap) { nc = 1; break; } }
-    }
-    int coff[3] = {0,0,0}, ccnt[3] = {0,0,0};
-    { int base = P / nc, rem = P % nc, o = 0;
-      for (int i = 0; i < nc; i++) { ccnt[i] = base + (i < rem ? 1 : 0); coff[i] = o; o += ccnt[i]; } }
-    int pcore[1025]; { int p = 0; for (int i = 0; i < nc; i++) for (int j = 0; j < ccnt[i]; j++) pcore[p++] = i; }
-
+    // run_chain_i8 is SINGLE-CORE: it PC-chains all P programs into ONE submit (low latency, one ioctl
+    // for S matmuls — e.g. decode QKV/gate-up sharing an input). Cross-core throughput is now served by
+    // ork_mm_run_stream_i8 (async round-robin, ~3x); the old barrier fan-out here was superseded (~1.3x).
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -2074,92 +2036,42 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             synth_i8(rc, mc, K, N, act_dma[i] + (uint32_t)((size_t)m0 * K),
                      bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
             if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
-
-            // Link p -> p+1 UNLESS p+1 starts a new core range (each core's range is its own self-
-            // contained chain whose last program raises the interrupt). Single-core: link all but last.
-            int link = (p < P - 1);
-            for (int cc = 1; cc < nc; cc++) if (p + 1 == coff[cc]) link = 0;
-            // Destination: for fan-out, this core's OWN regcmd BO c->mrc[core] at its local index; else
-            // the big shared c->regcmd. Chain links/tasks are buffer-local so each core's chain is
-            // self-contained in its own BO (the key to NOT serializing concurrent submits).
-            struct buf *db = (nc > 1) ? &c->mrc[pcore[p]] : &c->regcmd;
-            int dloc = (nc > 1) ? (p - coff[pcore[p]]) : p;
-            if (link) {
-                // PC-chaining (mirrors the validated i4 path): patch the chain-control tail so this
-                // program jumps to the next regcmd instead of raising the completion interrupt. The
-                // range-final program keeps the template default (rc[216..219] = ...0x14,0x01010000 = raise).
-                uint64_t next_dma = db->dma + (size_t)(dloc + 1) * REGCMD_I8_N * 4;
+            if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
+                uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
                 rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
                 rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
                 rc[218] = 0x0014 | (0x0037 << 16);
                 rc[219] = (0x0101 << 16) | (0);
             }
-            memcpy((char*)db->cpu + (size_t)dloc * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+            memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
     }
-    if (nc > 1) { for (int i = 0; i < nc; i++) bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); }
-    else        bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
+    // One rknpu_task per program (P total, PC-chained), one single-core submit.
     int submit_ok = 0;
-    if (nc > 1) {
-        // CROSS-CORE: nc independent single-core PC-chains, submitted concurrently (one thread/core).
-        // Each core's task object c->mtk[i] lists its ccnt[i] programs pointing into THAT core's own
-        // regcmd BO c->mrc[i] (populated above) — separate BOs per core so the concurrent submits don't
-        // serialize. Mirrors run_multicore's per-core submit (mc_ensure already ran during nc selection).
-        for (int i = 0; i < nc; i++) {
-            struct rknpu_task *mt = (struct rknpu_task *) c->mtk[i].cpu;
-            memset(mt, 0, (size_t)ccnt[i] * sizeof(struct rknpu_task));
-            for (int j = 0; j < ccnt[i]; j++) {
-                mt[j].enable_mask = 0xd; mt[j].int_mask = 0x300; mt[j].int_clear = 0x1ffff;
-                mt[j].regcfg_amount = 108;
-                mt[j].regcmd_addr = c->mrc[i].dma + (size_t)j * REGCMD_I8_N * 4;
-            }
-            bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        }
-        // Warm up (2 reps) only on the cold chain — c->warmed is cleared by the dtype-switch reset above.
-        // Forcing a warmup EVERY call doubles the NPU work and cancels the multi-core speedup.
-        int reps = c->warmed ? 1 : 2;
-        // Dispatch via the PERSISTENT pool (pre-spawned, big-core-pinned, spinning) — not per-call
-        // pthread_create, whose spawn latency lands on the ioctl barrier's critical path and kills
-        // scaling. Mirrors run_multicore's dispatch exactly (pjob/pgen/pgo + the b_ioctl barrier).
-        npu_pool_ensure(c);
-        pthread_barrier_init(&c->b_ioctl, NULL, nc);
-        struct chain_cw cw[3];
-        for (int i = 0; i < nc; i++) cw[i] = (struct chain_cw){c, i, ccnt[i], reps, 1, 0};
-        pthread_mutex_lock(&c->pmu);
-        c->pjob = cw; c->pjob_nc = nc; c->pjob_fn = chain_core_worker; c->pjob_stride = sizeof(struct chain_cw);
-        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-        pthread_mutex_unlock(&c->pmu);
-        chain_core_worker(&cw[0]);                       /* core 0 on the calling thread */
-        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
-        pthread_barrier_destroy(&c->b_ioctl);
-        for (int i = 0; i < nc; i++) if (cw[i].rc) submit_ok = -1;
-        c->warmed = 1;
-    } else {
-        // SINGLE-CORE: one rknpu_task per program (P total, PC-chained), one submit.
-        struct rknpu_task *t = c->task.cpu;
-        memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
-        for (int p = 0; p < P; p++) {
-            t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
-            t[p].regcfg_amount = 108;
-            t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
-        }
-        bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        static int tc = -2;
-        if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
-        struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
-        sub.flags = 0x5; sub.task_number = P; sub.task_obj_addr = c->task.obj;
-        sub.core_mask = 1u << tc; sub.fence_fd = -1;
-        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
-        int reps = c->warmed ? 1 : 2;
-        for (int rep = 0; rep < reps; rep++) {
-            int last = (rep == reps - 1);
-            sub.timeout = 60000;
-            if (rknpu_submit_ioctl(fd, &sub)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
-            submit_ok = 0;
-        }
-        c->warmed = 1;
+    struct rknpu_task *t = c->task.cpu;
+    memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
+    for (int p = 0; p < P; p++) {
+        t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
+        t[p].regcfg_amount = 108;
+        t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
     }
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    static int tc = -2;
+    if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
+    struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
+    sub.flags = 0x5; sub.task_number = P; sub.task_obj_addr = c->task.obj;
+    sub.core_mask = 1u << tc; sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
+    int reps = c->warmed ? 1 : 2;
+    for (int rep = 0; rep < reps; rep++) {
+        int last = (rep == reps - 1);
+        sub.timeout = 60000;
+        if (rknpu_submit_ioctl(fd, &sub)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
+        submit_ok = 0;
+    }
+    c->warmed = 1;
 
     // 7. Sync memory back and copy results
     for (int i = 0; i < S; i++) {
