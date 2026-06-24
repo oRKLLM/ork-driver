@@ -43,18 +43,37 @@ int main(int argc, char **argv) {
         tasks[i].w = w; tasks[i].M = M; tasks[i].A = A; tasks[i].C = Cc;
     }
 
-    int rc = ork_mm_run_chain_i8(c, S, tasks);          /* warmup (also primes per-core warm state) */
-    if (rc) { fprintf(stderr, "run_chain_i8 warmup failed rc=%d\n", rc); return 1; }
+    int stream = getenv("ORK_STREAM") != NULL;
+    int rc = stream ? ork_mm_run_stream_i8(c, S, tasks) : ork_mm_run_chain_i8(c, S, tasks);  /* warmup */
+    if (rc) { fprintf(stderr, "run %s warmup failed rc=%d\n", stream ? "stream" : "chain", rc); return 1; }
+
+    /* correctness: verify task 0 row 0 against the int32 CPU reference (the stream path is new) */
+    { int bad = 0; const ork_mm_task_i8 *t = &tasks[0]; const int8_t *A = t->A;
+      int8_t *Bref = malloc((size_t)K * N);   /* regenerate task 0's B with the same seed prefix */
+      rs = 0x9e3779b9u; for (size_t j = 0; j < (size_t)K*N; j++) Bref[j] = (int8_t)rnd8();
+      for (int n = 0; n < N && bad < 3; n++) {
+          int32_t ref = 0; for (int kk = 0; kk < K; kk++) ref += (int)A[kk] * (int)Bref[(size_t)kk*N+n];
+          if (t->C[n] != ref) { printf("  CORRECTNESS MISMATCH col %d: got %d exp %d\n", n, t->C[n], ref); bad++; }
+      }
+      free(Bref); if (!bad) printf("  correctness OK (task0 row0 vs CPU)\n"); }
 
     double t0 = now_us();
     for (int it = 0; it < iters; it++) {
-        rc = ork_mm_run_chain_i8(c, S, tasks);
-        if (rc) { fprintf(stderr, "run_chain_i8 failed rc=%d (iter %d)\n", rc, it); return 1; }
+        rc = stream ? ork_mm_run_stream_i8(c, S, tasks) : ork_mm_run_chain_i8(c, S, tasks);
+        if (rc) { fprintf(stderr, "run failed rc=%d (iter %d)\n", rc, it); return 1; }
     }
     double dt = now_us() - t0;
 
+    /* re-check correctness AFTER the warm loop (rules out a cold-buffer warmup issue) */
+    { int bad = 0; const ork_mm_task_i8 *t = &tasks[0]; const int8_t *A = t->A;
+      int8_t *Bref = malloc((size_t)K * N); rs = 0x9e3779b9u;
+      for (size_t j = 0; j < (size_t)K*N; j++) Bref[j] = (int8_t)rnd8();
+      for (int n = 0; n < N && bad < 3; n++) { int32_t ref = 0; for (int kk=0;kk<K;kk++) ref += (int)A[kk]*(int)Bref[(size_t)kk*N+n];
+          if (t->C[n] != ref) { printf("  WARM-CHECK MISMATCH col %d: got %d exp %d\n", n, t->C[n], ref); bad++; } }
+      free(Bref); if (!bad) printf("  warm-check OK (task0 row0)\n"); }
+
     printf("chain S=%d K=%d N=%d M=%d iters=%d  [%s]  %.1f us/chain  (%.1f us/matmul)\n",
-           S, K, N, M, iters, getenv("ORK_CHAIN_MC") ? "MULTI-core" : "single-core",
+           S, K, N, M, iters, stream ? "STREAM-mc" : (getenv("ORK_CHAIN_MC") ? "MULTI-core" : "single-core"),
            dt / iters, dt / iters / S);
 
     ork_npu_free(c);

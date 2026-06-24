@@ -151,6 +151,34 @@ static int check_chain_i8_bf(ork_npu *ctx) {
     return bad ? 1 : 0;
 }
 
+/* Async round-robin stream: S independent matmuls dispatched dynamically across cores. Different weights,
+ * mixed K/N/M, validated EVERY output vs the int32 CPU reference (the stream path is new). */
+static int check_stream_i8(ork_npu *ctx) {
+    enum { S = 6 };
+    int Ks[S] = {2048, 512, 4096, 1536, 1024, 2048};  /* full-K Bf envelope: K%512==0, K<=4096 */
+    int Ns[S] = {512, 256, 2048, 512, 512, 768};
+    int Ms[S] = {64, 8, 1, 40, 128, 32};
+    int8_t *A[S]={0}, *B[S]={0}; int32_t *C[S]={0}; ork_w *w[S]={0};
+    ork_mm_task_i8 tasks[S];
+    for (int i = 0; i < S; i++) {
+        int K=Ks[i], N=Ns[i], M=Ms[i];
+        A[i]=malloc((size_t)M*K); B[i]=malloc((size_t)K*N); C[i]=malloc((size_t)M*N*4);
+        for (size_t j=0;j<(size_t)M*K;j++) A[i][j]=(int8_t)(rnd()-1);
+        for (size_t j=0;j<(size_t)K*N;j++) B[i][j]=(int8_t)(rnd()-1);
+        w[i]=ork_mm_pack_i8(ctx,K,N,B[i]); if(!w[i]){printf("pack_stream failed %d\n",i);return 1;}
+        tasks[i].w=w[i]; tasks[i].M=M; tasks[i].A=A[i]; tasks[i].C=C[i];
+    }
+    int bad=0, rc=ork_mm_run_stream_i8(ctx,S,tasks);
+    if(rc){printf("run_stream_i8 failed rc=%d\n",rc); bad=1;}
+    else for(int i=0;i<S;i++) for(int r=0;r<Ms[i];r++) for(int n=0;n<Ns[i];n++){
+        int32_t ref=0; for(int k=0;k<Ks[i];k++) ref+=(int)A[i][(size_t)r*Ks[i]+k]*(int)B[i][(size_t)k*Ns[i]+n];
+        if(C[i][(size_t)r*Ns[i]+n]!=ref){ if(bad<3) printf("  stream mism task %d r%d c%d: exp %d got %d\n",i,r,n,ref,C[i][(size_t)r*Ns[i]+n]); bad++; }
+    }
+    printf("  %s stream S=%d (mixed K/N/M, async round-robin) mism=%d\n", bad?"WRONG":"ok  ", S, bad);
+    for(int i=0;i<S;i++){ if(w[i])ork_w_free(w[i]); free(A[i]); free(B[i]); free(C[i]); }
+    return bad?1:0;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -210,6 +238,7 @@ int main(void){
     //4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
     fail|=check_chain_i8(c8);         /* verify chained matmuls / MoE API */
     fail|=check_chain_i8_bf(c8);      /* verify Bf-based chaining (Sk=2 experts, MoE-prefill path) */
+    fail|=check_stream_i8(c8);        /* verify async round-robin stream (cross-core, mixed shapes) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");

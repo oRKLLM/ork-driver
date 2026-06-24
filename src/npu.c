@@ -2182,6 +2182,110 @@ cleanup:
     return ok;
 }
 
+/* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
+ * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
+ * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool
+ * of per-core workers that PULL the next task dynamically (atomic counter) and run it as a single-core
+ * submit on their own core — no barrier, no static partition. A core that finishes early grabs the next
+ * task immediately, so the cores pipeline and never idle on a sync point. Each worker owns its per-core
+ * buffers (mrc/mtk/maf/mcc); tasks' weights are read-only-shared, outputs are disjoint. */
+struct streamw { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
+static void *stream_worker(void *vp) {
+    struct streamw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core, CBUF = c->soc->cbuf_elems;
+    pin_big_core(i);
+    int k;
+    a->rc = 0;
+    uint32_t rc[REGCMD_I8_N + 4];
+    while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
+        const ork_mm_task_i8 *t = &a->tasks[k];
+        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N, mcap = chain_fullk_mcap_i8(c, K);
+        uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+        memcpy(c->maf[i].cpu, t->A, (size_t)M * K);
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        int ntiles = (M + mcap - 1) / mcap, p = 0;
+        for (int m0 = 0; m0 < M; m0 += mcap, p++) {
+            int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+            memset(rc, 0, sizeof rc);
+            synth_i8(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
+                     (uint32_t)(c->mcc[i].dma + (size_t)m0 * N * 4), 1, CBUF, 0);
+            if (p < ntiles - 1) {
+                uint64_t nd = c->mrc[i].dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                rc[216] = 0x0010 | ((nd & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nd >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
+            }
+            memcpy((char *)c->mrc[i].cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+        }
+        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)ntiles * sizeof *mt);
+        for (int q = 0; q < ntiles; q++) {
+            mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
+            mt[q].regcfg_amount = 108; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I8_N * 4;
+        }
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+        sub.flags = 0x5; sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
+        sub.timeout = 60000;
+        if (rknpu_submit_ioctl(fd, &sub)) { a->rc = -1; }
+        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        memcpy(t->C, c->mcc[i].cpu, (size_t)M * N * 4);
+    }
+    return NULL;
+}
+
+/* Run S independent int8 matmuls as an async round-robin stream across the NPU cores. Each task's weight
+ * must be single-slice (Sk==1 or Bf full-K) and single N-slice; A/C are plain host buffers (copied via the
+ * per-core staging buffers — no zero-copy DMA here). Returns 0/ok, -1 submit fail, -2 bad arg. */
+int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if (!c || S < 1 || !tasks) return -2;
+    const int mrc_cap = 65536 / (REGCMD_I8_N * 4);
+    size_t maxMK = 0, maxMN4 = 0;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I8 || tasks[i].M <= 0) return -2;
+        if (w->Sn != 1 || !w->Bf) return -2;
+        // The full-K Bf single-submit is only schedule-valid for K%512==0 && K<=4096 (same envelope as
+        // run()'s M>1 Bf path; the 0x1040 K-reduction schedule breaks outside it). Caller must fall back
+        // to per-task run_i8 (which K-splits) for other K. Return -3 so it's distinguishable.
+        if (w->K % 512 != 0 || w->K > 4096) return -3;
+        if ((tasks[i].M + chain_fullk_mcap_i8(c, w->K) - 1) / chain_fullk_mcap_i8(c, w->K) > mrc_cap) return -2;
+        size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 4;
+        if (mk > maxMK) maxMK = mk; if (mn > maxMN4) maxMN4 = mn;
+    }
+    int fd = c->fd;
+    int cold = 0;   // need a warmup pass when the NPU was reset OR any per-core stream buffer is freshly
+                    // allocated (a fresh output buffer returns stale on its first write). NOT c->warmed —
+                    // that tracks the chain/single path, whose buffers are different from the stream's.
+    if (c->last_dt != 3) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 3; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
+    int ncore = c->soc->cores; if (ncore > ORK_MAXCORE) ncore = ORK_MAXCORE;
+    int nc = ncore < S ? ncore : S;
+    if (mc_ensure(c, nc)) return -1;
+    for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
+        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403); if (!c->maf[i].cpu) return -1; cold = 1; }
+        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; cold = 1; }
+    }
+    int rc = 0;
+    npu_pool_ensure(c);
+    struct streamw sw[ORK_MAXCORE];
+    // Cold (first call after a reset): a freshly-allocated NPU output buffer returns stale on its first
+    // write, so run one throwaway warmup pass that primes every per-core buffer, then the real pass.
+    // (Same idea as the single-core reps=2 warmup, applied at stream granularity.) Warm: a single pass.
+    int passes = cold ? 2 : 1;
+    for (int pass = 0; pass < passes; pass++) {
+        int ctr = 0;
+        for (int i = 0; i < nc; i++) sw[i] = (struct streamw){c, i, S, tasks, &ctr, 0};
+        pthread_mutex_lock(&c->pmu);
+        c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker; c->pjob_stride = sizeof(struct streamw);
+        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+        pthread_mutex_unlock(&c->pmu);
+        stream_worker(&sw[0]);                            /* core 0 on the calling thread */
+        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
+    }
+    for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
+    c->warmed = 1;
+    return rc;
+}
+
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
