@@ -50,6 +50,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
+    void *(*pjob_fn)(void *); size_t pjob_stride;   /* generalized pool dispatch: per-core worker + arg stride */
     pthread_barrier_t b_ioctl; int mc_submit_rc; int mc_error;
     /* zero-copy registry: caller-allocated NPU-coherent DMA buffers (ork_dma_alloc). When a matmul's
      * A/C live in one of these, the regcmd points at them directly — no host gather/writeout memcpy. */
@@ -889,8 +890,8 @@ static void *npu_pool_worker(void *vp){
         pthread_mutex_lock(&c->pmu);
         while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
         if(c->pstop){ pthread_mutex_unlock(&c->pmu); return NULL; }
-        mygen=c->pgen; int nc=c->pjob_nc; struct mcw *args=c->pjob; pthread_mutex_unlock(&c->pmu);
-        if(id<nc){ mcworker(&args[id]);
+        mygen=c->pgen; int nc=c->pjob_nc; void *args=c->pjob; void *(*fn)(void*)=c->pjob_fn; size_t st=c->pjob_stride; pthread_mutex_unlock(&c->pmu);
+        if(id<nc){ fn((char*)args + (size_t)id*st);   /* mcworker (run_multicore) or chain_core_worker */
             pthread_mutex_lock(&c->pmu); if(++c->pdone==nc-1) pthread_cond_signal(&c->pdn); pthread_mutex_unlock(&c->pmu); }
     }
 }
@@ -976,7 +977,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     c->mc_error = 0;
     if(nc>1) pthread_barrier_init(&c->b_ioctl, NULL, nc);
     const double t1=ork_now_us();
-    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
+    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=mcworker; c->pjob_stride=sizeof(struct mcw); c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
     mcworker(&args[0]);                                   /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     if(nc>1) pthread_barrier_destroy(&c->b_ioctl);
@@ -2118,12 +2119,19 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Warm up (2 reps) only on the cold chain — c->warmed is cleared by the dtype-switch reset above.
         // Forcing a warmup EVERY call doubles the NPU work and cancels the multi-core speedup.
         int reps = c->warmed ? 1 : 2;
-        pthread_barrier_init(&c->b_ioctl, NULL, nc);   // sync all cores' ioctls to fire simultaneously
-        struct chain_cw cw[3]; pthread_t th[3];
+        // Dispatch via the PERSISTENT pool (pre-spawned, big-core-pinned, spinning) — not per-call
+        // pthread_create, whose spawn latency lands on the ioctl barrier's critical path and kills
+        // scaling. Mirrors run_multicore's dispatch exactly (pjob/pgen/pgo + the b_ioctl barrier).
+        npu_pool_ensure(c);
+        pthread_barrier_init(&c->b_ioctl, NULL, nc);
+        struct chain_cw cw[3];
         for (int i = 0; i < nc; i++) cw[i] = (struct chain_cw){c, i, ccnt[i], reps, 1, 0};
-        for (int i = 1; i < nc; i++) pthread_create(&th[i], NULL, chain_core_worker, &cw[i]);
-        chain_core_worker(&cw[0]);
-        for (int i = 1; i < nc; i++) pthread_join(th[i], NULL);
+        pthread_mutex_lock(&c->pmu);
+        c->pjob = cw; c->pjob_nc = nc; c->pjob_fn = chain_core_worker; c->pjob_stride = sizeof(struct chain_cw);
+        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+        pthread_mutex_unlock(&c->pmu);
+        chain_core_worker(&cw[0]);                       /* core 0 on the calling thread */
+        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
         pthread_barrier_destroy(&c->b_ioctl);
         for (int i = 0; i < nc; i++) if (cw[i].rc) submit_ok = -1;
         c->warmed = 1;
