@@ -88,6 +88,10 @@ rknn_vs_ork: tools/rknn_vs_ork.c $(CORE)
 mc_prof: tools/mc_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
+chain_bench: tools/chain_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
 	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
