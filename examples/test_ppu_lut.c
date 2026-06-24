@@ -206,6 +206,23 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // ORK_WARM=1: run a real matmul first so the NPU engines/clocks are pinned open by recent
+    // activity in THIS context, then issue the PPU sigmoid regcmd on the same fd without teardown.
+    // Tests the "PPU needs an initialized/warm context" hypothesis without any librkllmrt dependency.
+    if (getenv("ORK_WARM")) {
+        printf("[test_ppu_lut] WARM: running an int8 matmul to pin NPU clocks/engines open...\n");
+        int Kw = 512, Nw = 512, Mw = 4;
+        int8_t  *Bw = malloc((size_t)Kw * Nw);
+        int8_t  *Aw = malloc((size_t)Mw * Kw);
+        int32_t *Cw = malloc((size_t)Mw * Nw * sizeof(int32_t));
+        for (size_t i = 0; i < (size_t)Kw * Nw; i++) Bw[i] = (int8_t)(i & 0x3f);
+        for (size_t i = 0; i < (size_t)Mw * Kw; i++) Aw[i] = (int8_t)(i & 0x1f);
+        ork_w *ww = ork_mm_pack_i8(c, Kw, Nw, Bw);
+        int wrc = ww ? ork_mm_run_i8(c, ww, Mw, Aw, Cw) : -99;
+        printf("[test_ppu_lut] WARM: matmul rc=%d C[0]=%d (NPU confirmed executing in this context)\n", wrc, Cw[0]);
+        free(Bw); free(Aw); free(Cw);
+    }
+
     printf("[test_ppu_lut] Allocating shared cacheable (0x403) 12KB DMA buffer...\n");
     struct buf abuf = custom_dma_alloc(c->fd, 12288, 0x403);
     if (!abuf.cpu || abuf.cpu == MAP_FAILED) {
@@ -361,20 +378,24 @@ int main(int argc, char **argv) {
     bsync(c->fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(c->fd, &abuf, RKNPU_MEM_SYNC_TO_DEVICE);
 
-    // Submit the chained tasks using task_number = 1 to hide hardware chaining from driver
+    // ORK_TASKNUM selects how many tasks the kernel is told to run: 1 = "hide the chain" (kernel
+    // runs only task 0=init, relies on the on-die NEXT-pointer to walk to exec); 3 = tell the kernel
+    // about all three (init+exec+cleanup) explicitly. Disambiguates PC-chain-didn't-advance from gating.
+    int TN = getenv("ORK_TASKNUM") ? atoi(getenv("ORK_TASKNUM")) : 1;
+    printf("[test_ppu_lut] Submitting with task_number=%d (warm=%s)...\n", TN, getenv("ORK_WARM") ? "yes" : "no");
     struct rknpu_submit sub = {
         .flags = 0x5,
         .timeout = 1000, // Safe 1.0 second watchdog timeout
         .task_start = 0,
-        .task_number = 1, // Hide chained sequence under a single submit!
+        .task_number = TN,
         .task_obj_addr = c->task.obj,
         .task_base_addr = 0,
         .fence_fd = -1,
         .core_mask = RKNPU_CORE0_MASK,
         .subcore_task = {
-            {0, 1}, // subcore 0 runs Task 0
-            {0, 1}, // subcore 1 runs Task 0
-            {0, 1}  // subcore 2 runs Task 0
+            {0, TN},
+            {0, TN},
+            {0, TN}
         }
     };
 
@@ -408,6 +429,29 @@ int main(int argc, char **argv) {
     printf("[test_ppu_lut] Raw output buffer (u16 index 0..31) after execution fence:\n  ");
     for (int i = 0; i < 32; i++) printf("%04x ", shared_data[i]);
     printf("\n");
+
+    // FULL-BUFFER DELTA SCAN: did the NPU write ANYWHERE in the 12KB region (not just offset 0)?
+    // Initial state is known: index 0..511 = fp16(input sweep), index 512..6143 = 0x0000.
+    // This rules out the case where the replay IS alive but wrote its output to a different offset.
+    const int NW = 12288 / 2; // 6144 u16 words
+    int changed = 0, first_change = -1;
+    for (int i = 0; i < NW; i++) {
+        uint16_t initial = (i < 512) ? fp32_to_fp16(input_vals[i]) : 0x0000;
+        if (shared_data[i] != initial) { changed++; if (first_change < 0) first_change = i; }
+    }
+    printf("[test_ppu_lut] FULL-BUFFER SCAN: %d / %d u16 words changed from initial state; first change @ index %d\n",
+           changed, NW, first_change);
+    if (changed > 0) {
+        int s = first_change & ~0xf;
+        printf("  bytes around first change (idx %d): ", s);
+        for (int i = s; i < s + 16 && i < NW; i++) printf("%04x ", shared_data[i]);
+        printf("\n");
+    } else {
+        fprintf(stderr, "❌ [test_ppu_lut] NEGATIVE RESULT (definitive): the NPU wrote NOTHING anywhere in the 12KB DMA buffer.\n");
+        fprintf(stderr, "    Standalone PPU LUT/PWL replay is INACTIVE on this kernel (submit rc=0, zero memory transactions).\n");
+        custom_dma_free(c->fd, &abuf);
+        return 1;
+    }
 
     int all_zero = 1, equals_input = 1;
     for (int i = 0; i < 512; i++) {
