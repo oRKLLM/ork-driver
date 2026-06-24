@@ -4,10 +4,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <math.h>
 #include "ork_npu.h"
 
 static unsigned sd = 99; static int r8(void){ sd = sd*1103515245+12345; return (int)((sd>>16)&0xff)-128; }
+
+/* dequant callback for ork_mm_pack_i8_dequant: here it just copies channel n from the reference
+ * f32[N][K] (n-major) — in ggml-ork this would call to_float to dequant Q4_K. */
+struct deqctx { const float *Bf; };
+static void deq_cb(void *ctx, int n, float *dst, int K) {
+    const struct deqctx *d = ctx; memcpy(dst, d->Bf + (size_t)n*K, (size_t)K*sizeof(float));
+}
 
 int main(int argc, char **argv) {
     int K = argc>1?atoi(argv[1]):512, N = argc>2?atoi(argv[2]):128, M = argc>3?atoi(argv[3]):4;
@@ -24,7 +32,7 @@ int main(int argc, char **argv) {
         for (int k=0;k<K;k++){ int q=(int)lrintf(Bf[(size_t)n*K+k]*iv); Bi[(size_t)k*N+n]=(int8_t)(q>127?127:q<-127?-127:q); }
     }
     int8_t *Ai = malloc((size_t)M*K); for (size_t j=0;j<(size_t)M*K;j++) Ai[j]=(int8_t)r8();
-    int32_t *C1 = malloc((size_t)M*N*4), *C2 = malloc((size_t)M*N*4);
+    int32_t *C1 = malloc((size_t)M*N*4), *C2 = malloc((size_t)M*N*4), *C3 = malloc((size_t)M*N*4);
 
     printf("[1] pack_i8 (reference)...\n"); fflush(stdout);
     ork_w *w1 = ork_mm_pack_i8(c, K, N, Bi);
@@ -38,7 +46,16 @@ int main(int argc, char **argv) {
     int rc2 = ork_mm_run_i8(c, w2, M, Ai, C2);
     printf("[2] pack_i8_f32 rc=%d C[0..2]=%d,%d,%d\n", rc2, C2[0], C2[1], C2[2]); fflush(stdout);
 
+    printf("[3] pack_i8_dequant (fused callback, no full f32 buffer)...\n"); fflush(stdout);
+    struct deqctx dc = { Bf };
+    ork_w *w3 = ork_mm_pack_i8_dequant(c, K, N, deq_cb, &dc, bsc);
+    printf("[3] packed=%p; run_i8...\n", (void*)w3); fflush(stdout);
+    int rc3 = w3 ? ork_mm_run_i8(c, w3, M, Ai, C3) : -99;
+    printf("[3] pack_i8_dequant rc=%d C[0..2]=%d,%d,%d\n", rc3, C3[0], C3[1], C3[2]); fflush(stdout);
+
     int mism = 0; if (!rc1 && !rc2) for (int i=0;i<M*N;i++) if (C1[i]!=C2[i]) mism++;
-    printf("RESULT: rc1=%d rc2=%d mism=%d %s\n", rc1, rc2, mism, (!rc1&&!rc2&&!mism)?"MATCH":"DIFFER");
-    return 0;
+    int mism3 = 0; if (!rc2 && !rc3) for (int i=0;i<M*N;i++) if (C2[i]!=C3[i]) mism3++;
+    printf("RESULT: rc1=%d rc2=%d rc3=%d | pack_i8 vs f32 mism=%d | f32 vs dequant mism=%d %s\n",
+           rc1, rc2, rc3, mism, mism3, (!rc1&&!rc2&&!rc3&&!mism&&!mism3)?"ALL MATCH":"DIFFER");
+    return (!rc1&&!rc2&&!rc3&&!mism&&!mism3) ? 0 : 1;
 }

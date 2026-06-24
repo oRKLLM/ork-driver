@@ -58,6 +58,14 @@ int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t
  * sources (e.g. Q4_K MoE experts via to_float) without the slow strided f32->int8 transpose. */
 ork_w       *ork_mm_pack_i8_f32(ork_npu *ctx, int K, int N, const float *f32, float *bscale_out);
 int          ork_mm_repack_i8_f32(ork_npu *ctx, ork_w *w, int K, int N, const float *f32, float *bscale_out);
+/* Fused dequant->int8 pack/repack: ork-driver calls `dequant(dctx, n, dst, K)` once per output channel
+ * to materialize that channel's K f32 weights into a small REUSED scratch (cache-resident — avoids the
+ * full f32[N][K] buffer and its DRAM round-trip), then NEON quant+tiles it. For packing a compressed
+ * weight source (e.g. Q4_K MoE experts via ggml to_float) without the cache-thrashing full-f32 pass.
+ * Same int8 result as pack_i8_f32 fed the equivalent f32. Writes per-channel bscale[N]. */
+typedef void (*ork_dequant_row_fn)(void *dctx, int n, float *dst, int K);
+ork_w       *ork_mm_pack_i8_dequant  (ork_npu *ctx, int K, int N, ork_dequant_row_fn dequant, void *dctx, float *bscale_out);
+int          ork_mm_repack_i8_dequant(ork_npu *ctx, ork_w *w, int K, int N, ork_dequant_row_fn dequant, void *dctx, float *bscale_out);
 ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */

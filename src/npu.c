@@ -533,6 +533,58 @@ int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, f
     free(inv);
     return 0;
 }
+/* ---- FUSED dequant->int8 pack/repack (callback per channel; NO full f32[N][K] buffer) ----
+ * Materialize one channel at a time into a reused K-float scratch (stays in cache), then NEON quant+tile
+ * it — avoids the DRAM round-trip of writing then re-reading a full f32[N][K], which dominates a Q4_K MoE
+ * repack. Same int8/bscale result as feeding the equivalent f32 to tile_f32_i8. */
+static int tile_dequant_i8(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row_fn fn, void *dctx, float *bscale) {
+    int KS = 1024, NMAX = c->soc->nmax, Sk = w->Sk, Sn = w->Sn, fd = c->fd, KTf = K/32;
+    float *sc = malloc((size_t)K * sizeof(float)); if (!sc) return -1;
+    for (int n = 0; n < N; n++) {
+        fn(dctx, n, sc, K);                                   /* dequant channel n -> reused scratch[K] */
+        float mx = 1e-9f; int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t vmx = vdupq_n_f32(1e-9f);
+        for (; k <= K-4; k += 4) vmx = vmaxq_f32(vmx, vabsq_f32(vld1q_f32(sc + k)));
+        float m[4]; vst1q_f32(m, vmx); float a=m[0]>m[1]?m[0]:m[1], b=m[2]>m[3]?m[2]:m[3]; mx=a>b?a:b;
+#endif
+        for (; k < K; k++) { float v = fabsf(sc[k]); if (v > mx) mx = v; }
+        float iv = 127.0f/mx; bscale[n] = mx/127.0f;
+        int ns = n/NMAX, nloc = n - ns*NMAX, nt = nloc/32, nl = nloc%32;
+        for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS, KT = Kp/32;
+            struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; if (!b->cpu) continue; int8_t *bb = b->cpu;
+            for (int kt = 0; kt < KT; kt++) quant32_f32_i8(bb + ((size_t)nt*KT*32*32 + (size_t)kt*32*32 + nl*32), sc + k0 + kt*32, iv);
+        }
+        if (w->Bf && K <= 10752) { struct buf *b = &w->Bf[ns]; if (b->cpu) { int8_t *bb = b->cpu;
+            for (int kt = 0; kt < KTf; kt++) quant32_f32_i8(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), sc + kt*32, iv); } }
+    }
+    free(sc);
+    for (int i = 0; i < Sk*Sn; i++) { struct buf *b = &w->Bb[i]; if (b->cpu) { bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
+    if (w->Bf) for (int ns = 0; ns < Sn; ns++) { struct buf *b = &w->Bf[ns]; if (b->cpu) { bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
+    return 0;
+}
+ork_w *ork_mm_pack_i8_dequant(ork_npu *c, int K, int N, ork_dequant_row_fn fn, void *dctx, float *bscale_out) {
+    if (K % 32 || N % 32) return NULL;
+    int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
+    ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
+    if (!w->Bb) { free(w); return NULL; }
+    for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+      for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+    if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
+        for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+    if (tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out) != 0) { ork_w_free(w); return NULL; }
+    return w;
+}
+int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row_fn fn, void *dctx, float *bscale_out) {
+    if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
+    if (w->K != K || w->N != N) return -2;
+    return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
+}
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----
