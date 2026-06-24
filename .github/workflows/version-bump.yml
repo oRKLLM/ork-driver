@@ -8,6 +8,7 @@ name: version-bump
 on:
   push:
     branches: [main]
+  workflow_dispatch:   # manual trigger (fallback / on-demand bump)
 
 # never run twice for the same ref at once (avoids racing bumps)
 concurrency:
