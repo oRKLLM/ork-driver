@@ -127,8 +127,8 @@ static int check_chain_i8(ork_npu*ctx) {
  * even though pack_i8 K-splits at 1024. Varies M (decode M=1 + small prefill M>1, all <= the
  * single-submit row cap). Different weights per expert; validate each vs the int32 CPU reference. */
 static int check_chain_i8_bf(ork_npu *ctx) {
-    enum { S = 3 };
-    int Ms[S] = {1, 8, 16};            // all <= chain_fullk_mcap_i8(K=2048) = 31 on RK3588
+    enum { S = 4 };
+    int Ms[S] = {1, 8, 40, 96};        // 1/8 single-submit; 40/96 force M-tiling (mcap=31 at K=2048)
     int K = 2048, N = 768;             // K=2048 -> Sk=2 + Bf; N=768 -> Sn=1 (N<=nmax)
     int8_t *A[S] = {0}, *B[S] = {0}; int32_t *C[S] = {0}; ork_w *w[S] = {0};
     ork_mm_task_i8 tasks[S];
@@ -146,7 +146,7 @@ static int check_chain_i8_bf(ork_npu *ctx) {
         int32_t ref = 0; for (int k = 0; k < K; k++) ref += (int)A[i][(size_t)r*K+k] * (int)B[i][(size_t)k*N+n];
         if (C[i][(size_t)r*N+n] != ref) { if (bad < 3) printf("  Bf mism task %d row %d col %d: exp %d got %d\n", i, r, n, ref, C[i][(size_t)r*N+n]); bad++; }
     }
-    printf("  %s chained S=%d Bf K=%d N=%d (Sk=2, varying M=1/8/16) mism=%d\n", bad ? "WRONG" : "ok  ", S, K, N, bad);
+    printf("  %s chained S=%d Bf K=%d N=%d (Sk=2, M=1/8/40/96 incl. M-tiling) mism=%d\n", bad ? "WRONG" : "ok  ", S, K, N, bad);
     for (int i = 0; i < S; i++) { if (w[i]) ork_w_free(w[i]); free(A[i]); free(B[i]); free(C[i]); }
     return bad ? 1 : 0;
 }

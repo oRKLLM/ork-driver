@@ -1931,7 +1931,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // K=2048 experts pack Sk=2 but carry Bf — use it so they can chain. N must be a single slice.
         if (w->Sn != 1) return -2;
         if (w->Sk != 1 && !w->Bf) return -2;
-        if (tasks[i].M > chain_fullk_mcap_i8(c, w->K)) return -3; // M too big for one submit; caller must M-tile
+        // M>mcap is fine — the synth loop M-tiles it into multiple chained programs (Step B below).
         if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
@@ -1998,45 +1998,60 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (tmp_A[j].cpu) extra[extra_n++] = tmp_A[j];
         if (tmp_C[j].cpu) extra[extra_n++] = tmp_C[j];
     }
-    // Allocate a large rc array for concatenation
+    // Each task is one full-K matmul of M rows; a single submit handles <= mcap rows, so a task with
+    // M>mcap expands into ceil(M/mcap) M-tile programs (offsetting into its A/C buffers). ALL programs
+    // across ALL tasks are PC-chained into one submit. Count total programs P first (must fit buffers).
+    int prog_off[1025];   // prog_off[i] = first program index of task i (S<=1024)
+    int P = 0;
+    for (int i = 0; i < S; i++) {
+        int mcap = chain_fullk_mcap_i8(c, tasks[i].w->K);
+        prog_off[i] = P;
+        P += (tasks[i].M + mcap - 1) / mcap;
+    }
+    if (P > 1024) { ok = -2; goto cleanup; }   // too many M-tiles for the chain regcmd/task buffers
+
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        int M = tasks[i].M;
-        int K = w->K;
-        int N = w->N;
-
-        memset(rc, 0, sizeof(rc));
+        int M = tasks[i].M, K = w->K, N = w->N, mcap = chain_fullk_mcap_i8(c, K);
         // full-K single submit: Bf[0] (the K<=10752 full-K layout, e.g. Sk=2 experts) if present,
         // else Bb[0] (which holds the whole K only when Sk==1). Both are the synth_i8 tile layout.
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
-        synth_i8(rc, M, K, N, act_dma[i], bdma, out_dma[i], 1, CBUF, 0);
-        setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
-        if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
+        int p = prog_off[i];
+        for (int m0 = 0; m0 < M; m0 += mcap, p++) {
+            int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+            memset(rc, 0, sizeof(rc));
+            // Let synth_i8(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
+            // Do NOT hardcode it (the old 0xb1 was an M=1 value; for mc>16 it computes rows past the
+            // first 64-group against the wrong K-partition — same class as the full-K prefill bug).
+            synth_i8(rc, mc, K, N, act_dma[i] + (uint32_t)((size_t)m0 * K),
+                     bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+            if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
 
-        if (i < S - 1) {
-            // PC-chaining (mirrors the validated i4 path): patch the chain-control tail so this task
-            // jumps to the next regcmd instead of raising the completion interrupt. The final task
-            // keeps the template default (rc[216..219] = 0,0,0x14,0x01010000 = raise interrupt).
-            uint64_t next_dma = c->regcmd.dma + (size_t)(i + 1) * REGCMD_I8_N * 4;
-            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
-            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-            rc[218] = 0x0014 | (0x0037 << 16);
-            rc[219] = (0x0101 << 16) | (0);
+            if (p < P - 1) {
+                // PC-chaining (mirrors the validated i4 path): patch the chain-control tail so this
+                // program jumps to the next regcmd instead of raising the completion interrupt. The
+                // final program keeps the template default (rc[216..219] = ...0x14,0x01010000 = raise).
+                uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+                rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037 << 16);
+                rc[219] = (0x0101 << 16) | (0);
+            }
+            memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
-        memcpy((char*)c->regcmd.cpu + i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
-    // One rknpu_task per chained regcmd (PC-chained), mirroring the validated i4 path.
+    // One rknpu_task per chained regcmd program (P total, PC-chained).
     struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
-    for (int i = 0; i < S; i++) {
-        t[i].enable_mask = 0xd;
-        t[i].int_mask = 0x300;
-        t[i].int_clear = 0x1ffff;
-        t[i].regcfg_amount = 108;
-        t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I8_N * 4;
+    memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
+    for (int p = 0; p < P; p++) {
+        t[p].enable_mask = 0xd;
+        t[p].int_mask = 0x300;
+        t[p].int_clear = 0x1ffff;
+        t[p].regcfg_amount = 108;
+        t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
     }
 
     bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -2050,11 +2065,11 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     sub.flags = 0x5;
-    sub.task_number = S;
+    sub.task_number = P;
     sub.task_obj_addr = c->task.obj;
     sub.core_mask = 1u << tc;
     sub.fence_fd = -1;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, P};
 
     int reps = c->warmed ? 1 : 2;
     int submit_ok = 0;
