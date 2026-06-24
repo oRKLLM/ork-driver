@@ -453,6 +453,86 @@ int ork_mm_repack_i8(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
+/* ---- NEON SIMD pack/repack DIRECTLY from f32[N][K] (n-major, as ggml's to_float produces) ----
+ * Fuses per-channel f32->int8 quant INTO the tile loop: for a fixed channel n the 32 K-values are
+ * contiguous in f32[n][:], so NEON-load 32 f32, mul by the channel inverse scale, round/clamp to
+ * [-127,127], narrow to 32 CONTIGUOUS int8 — no transposed scratch (the old transpose store was ~69%
+ * of the MoE repack). Computes per-channel bscale[] for the caller. */
+static void chan_scales_f32(const float *f32, int K, int N, float *inv, float *bscale) {
+    for (int n = 0; n < N; n++) {
+        const float *fr = f32 + (size_t)n * K; float mx = 1e-9f; int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t vmx = vdupq_n_f32(1e-9f);
+        for (; k <= K - 4; k += 4) vmx = vmaxq_f32(vmx, vabsq_f32(vld1q_f32(fr + k)));
+        float m[4]; vst1q_f32(m, vmx); float a = m[0] > m[1] ? m[0] : m[1], b = m[2] > m[3] ? m[2] : m[3]; mx = a > b ? a : b;
+#endif
+        for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
+        inv[n] = 127.0f / mx; bscale[n] = mx / 127.0f;
+    }
+}
+static inline void quant32_f32_i8(int8_t *dst, const float *fr, float inv) {
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    float32x4_t vinv = vdupq_n_f32(inv); int32x4_t lo = vdupq_n_s32(-127);
+    for (int kk = 0; kk < 32; kk += 8) {
+        int32x4_t i0 = vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(fr + kk),     vinv)), lo);
+        int32x4_t i1 = vmaxq_s32(vcvtnq_s32_f32(vmulq_f32(vld1q_f32(fr + kk + 4), vinv)), lo);
+        vst1_s8(dst + kk, vqmovn_s16(vcombine_s16(vqmovn_s32(i0), vqmovn_s32(i1))));
+    }
+#else
+    for (int kk = 0; kk < 32; kk++) { int q = (int)lrintf(fr[kk] * inv); dst[kk] = (int8_t)(q > 127 ? 127 : q < -127 ? -127 : q); }
+#endif
+}
+/* tile f32[N][K] -> int8 NPU layout (Bb K-split + Bf full-K) via precomputed per-channel inv[]. Each
+ * buffer gets the full init sync (TO|FROM then TO) that pack() uses — fresh buffers need it (a single TO
+ * leaves the device side uninitialized -> the NPU submit wedges/times out). */
+static void tile_f32_i8(ork_npu *c, ork_w *w, int K, int N, const float *f32, const float *inv) {
+    int KS = 1024, NMAX = c->soc->nmax, Sk = w->Sk, Sn = w->Sn, fd = c->fd;
+    for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
+      for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS, KT = Kp/32;
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; if (!b->cpu) continue; int8_t *bb = b->cpu;
+        for (int nt = 0; nt < NN; nt++) for (int nl = 0; nl < 32; nl++) {
+            int n = n0+nt*32+nl; const float *frn = f32 + (size_t)n*K + k0; float iv = inv[n];
+            for (int kt = 0; kt < KT; kt++) quant32_f32_i8(bb + ((size_t)nt*KT*32*32 + (size_t)kt*32*32 + nl*32), frn + kt*32, iv);
+        }
+        bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+    if (w->Bf && K <= 10752) { int KTf = K/32;
+        for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
+            struct buf *b = &w->Bf[ns]; if (!b->cpu) continue; int8_t *bb = b->cpu;
+            for (int nt = 0; nt < NN; nt++) for (int nl = 0; nl < 32; nl++) {
+                int n = n0+nt*32+nl; const float *frn = f32 + (size_t)n*K; float iv = inv[n];
+                for (int kt = 0; kt < KTf; kt++) quant32_f32_i8(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), frn + kt*32, iv);
+            }
+            bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+}
+ork_w *ork_mm_pack_i8_f32(ork_npu *c, int K, int N, const float *f32, float *bscale_out) {
+    if (K % 32 || N % 32) return NULL;
+    int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
+    ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
+    if (!w->Bb) { free(w); return NULL; }
+    for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+      for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+    if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
+        for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+    float *inv = malloc((size_t)N * sizeof(float)); if (!inv) { ork_w_free(w); return NULL; }
+    chan_scales_f32(f32, K, N, inv, bscale_out);
+    tile_f32_i8(c, w, K, N, f32, inv);
+    free(inv);
+    return w;
+}
+int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
+    if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
+    if (w->K != K || w->N != N) return -2;
+    float *inv = malloc((size_t)N * sizeof(float)); if (!inv) return -1;
+    chan_scales_f32(f32, K, N, inv, bscale_out);
+    tile_f32_i8(c, w, K, N, f32, inv);
+    free(inv);
+    return 0;
+}
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----

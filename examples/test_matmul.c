@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <math.h>
 #include "ork_npu.h"
 typedef ork_f16 f16;
 static unsigned sd=12345; static int rnd(){sd=sd*1103515245+12345;return (sd>>16)%4;}
@@ -210,6 +211,31 @@ static int check_chain_envelope(ork_npu *ctx) {
     return bad ? 1 : 0;
 }
 
+/* Validate the NEON f32->int8 pack (ork_mm_pack_i8_f32): pack f32 weights, run_i8, dequant with the
+ * returned per-channel bscale, compare to the f32 CPU reference (within int8 W8A8 tolerance). */
+static int check_pack_i8_f32(ork_npu *ctx) {
+    int M = 8, K = 2048, N = 512;   /* K=2048 -> Sk=2 + Bf, exercises the full-K tile path too */
+    float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
+    for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = ((int)rnd()-128)/64.0f;     /* [N][K] n-major */
+    for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
+    ork_w *w = ork_mm_pack_i8_f32(ctx, K, N, Bf, bsc);
+    if (!w) { printf("  pack_i8_f32 failed\n"); free(Bf);free(Af);free(bsc); return 1; }
+    int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
+    for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
+        asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
+    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    double se=0, sref=0;
+    if (!rc) for (int m=0;m<M;m++) for (int n=0;n<N;n++){
+        double ref=0; for(int k=0;k<K;k++) ref += (double)Af[(size_t)m*K+k]*Bf[(size_t)n*K+k];
+        double got = (double)asc[m]*bsc[n]*Ci[(size_t)m*N+n];
+        se += (got-ref)*(got-ref); sref += ref*ref; }
+    double rms = sqrt(se/((double)M*N)) / (sqrt(sref/((double)M*N))+1e-9);
+    int ok = (!rc) && rms < 0.03;
+    printf("  %s pack_i8_f32 (NEON f32->int8 quant+tile) M=%d K=%d N=%d  rc=%d RMS rel err=%.3f%%\n", ok?"ok  ":"WRONG", M,K,N, rc, rms*100);
+    ork_w_free(w); free(Bf);free(Af);free(bsc);free(Ai);free(asc);free(Ci);
+    return ok?0:1;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -271,6 +297,7 @@ int main(void){
     fail|=check_chain_i8_bf(c8);      /* verify Bf-based chaining (Sk=2 experts, MoE-prefill path) */
     fail|=check_stream_i8(c8);        /* verify async round-robin stream (cross-core, mixed shapes) */
     fail|=check_chain_envelope(c8);   /* verify full-K envelope guard (reject K%512!=0 vs silent-wrong) */
+    fail|=check_pack_i8_f32(c8);      /* verify NEON f32->int8 pack (used by the MoE repack) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");

@@ -51,6 +51,11 @@ ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);  /* 
 /* re-tile int8 B into an existing same-shape ork_w (reuses its DMA; no alloc/free) — for pooling
  * reused weights (MoE experts) without churning/fragmenting the NPU IOMMU. 0 ok / -1 / -2 mismatch. */
 int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t *B);
+/* NEON-fused pack/repack DIRECTLY from f32[N][K] (n-major): per-channel symmetric int8 quant + tile in
+ * one cache-friendly pass (no transpose scratch). Writes per-channel bscale[N]. For dequantizing weight
+ * sources (e.g. Q4_K MoE experts via to_float) without the slow strided f32->int8 transpose. */
+ork_w       *ork_mm_pack_i8_f32(ork_npu *ctx, int K, int N, const float *f32, float *bscale_out);
+int          ork_mm_repack_i8_f32(ork_npu *ctx, ork_w *w, int K, int N, const float *f32, float *bscale_out);
 ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */
