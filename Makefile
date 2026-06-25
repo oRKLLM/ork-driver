@@ -99,6 +99,11 @@ vec_fuzz: tools/vec_fuzz.c $(CORE)
 fence_probe: tools/fence_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Diagnostic (NOT in `make test`): speculative-decoding economics — M-batch amortization of the GEMV
+# submit floor + the CPU accept/reject gate cost. Mock data (structural overhead, not model quality).
+test_speculative_bridge: tools/test_speculative_bridge.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE diagnostic (NOT in `make test`): fuller-slice replay of the captured RKNN Sigmoid PPU op.
 # Reconstructs the full 5-buffer topology from examples/sigmoid_slice.h (extracted from the SDK
 # trace) to test whether populating the LUT/PWL config buffers (handles 4 & 5) makes the PPU write.
