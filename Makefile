@@ -95,6 +95,10 @@ prefill_check: tools/prefill_check.c $(CORE)
 vec_fuzz: tools/vec_fuzz.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Diagnostic (NOT in `make test`): anatomy of the post-NPU-fence latency gap (submit/bsync/copy + NEON consume).
+fence_probe: tools/fence_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE diagnostic (NOT in `make test`): fuller-slice replay of the captured RKNN Sigmoid PPU op.
 # Reconstructs the full 5-buffer topology from examples/sigmoid_slice.h (extracted from the SDK
 # trace) to test whether populating the LUT/PWL config buffers (handles 4 & 5) makes the PPU write.
