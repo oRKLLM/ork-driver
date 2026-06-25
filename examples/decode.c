@@ -11,24 +11,20 @@
 #include <string.h>
 #include <math.h>
 #include "ork_npu.h"
+#include "neon_activations.h"
 typedef ork_f16 f16;
 #define EPS 1e-5f
 #define SEQ 16
 
 typedef struct { const char*name; int H,NH,NKV,HD,FFN; } Cfg;
 
-static void rmsnorm(float*o,const float*x,const float*w,int n){
-    float ss=0; for(int i=0;i<n;i++)ss+=x[i]*x[i]; float s=1.0f/sqrtf(ss/n+EPS);
-    for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];
-}
+static void rmsnorm(float*o,const float*x,const float*w,int n){ ork_rmsnorm_f32(o,x,w,n,EPS); }
 static void rope_pos(float*x,int nh,int hd,int pos){       /* per head, at absolute position */
     for(int h=0;h<nh;h++){float*v=x+(size_t)h*hd;
         for(int i=0;i<hd/2;i++){float fr=powf(10000.0f,-2.0f*i/hd),ang=pos*fr,c=cosf(ang),s=sinf(ang);
             float a=v[i],b=v[i+hd/2]; v[i]=a*c-b*s; v[i+hd/2]=a*s+b*c;}}
 }
-static void softmax(float*x,int n){float m=x[0];for(int i=1;i<n;i++)if(x[i]>m)m=x[i];
-    float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++)x[i]/=s;}
-static float silu(float x){return x/(1.0f+expf(-x));}
+static void softmax(float*x,int n){ ork_softmax_f32(x,n); }
 
 typedef struct { int K,N; f16 *Brow; ork_w *w; } weight;
 static weight mkw(ork_npu*ctx,int K,int N,unsigned seed){weight wt={K,N,malloc((size_t)K*N*2),NULL};
@@ -61,7 +57,7 @@ static void step(ork_npu*ctx,const Cfg*c,const float*x1,float*y1,kv_t*kv,const f
     for(int i=0;i<H;i++)h[i]=x1[i]+o[i];
     rmsnorm(hn,h,wn2,H);
     mm1(ctx,Wg,hn,g,useNPU); mm1(ctx,Wu,hn,u,useNPU);
-    for(int i=0;i<FFN;i++)a[i]=silu(g[i])*u[i];
+    ork_silu_mul_to_f32(a,g,u,FFN);   /* SwiGLU: a = silu(g)*u (NEON) */
     mm1(ctx,Wd,a,d,useNPU);
     for(int i=0;i<H;i++)y1[i]=h[i]+d[i];
     free(xn);free(q);free(k);free(v);free(att);free(o);free(h);free(hn);free(g);free(u);free(a);free(d);

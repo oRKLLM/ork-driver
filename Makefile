@@ -12,8 +12,8 @@ ifneq ($(GIT_HASH),)
 CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
-CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm
+CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm test_activations
 TESTS    := tests/test_fused_activation
 
 all: $(EXAMPLES) $(TESTS)
@@ -140,7 +140,7 @@ install: libork_npu.a libork_npu.so
 MODEL ?= stories15M.bin
 test: $(EXAMPLES) $(TESTS)
 	@fail=0; \
-	for t in "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
+	for t in "test_activations" "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
 	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \

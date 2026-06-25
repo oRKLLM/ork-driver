@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include "ork_npu.h"
+#include "neon_activations.h"
 typedef ork_f16 f16;
 
 typedef struct { int dim,hidden,n_layers,n_heads,n_kv,vocab,seq; } Cfg;
@@ -30,13 +31,9 @@ typedef struct {
     ork_w **Wq,**Wk,**Wv,**Wo,**Wg,**Wd,**Wu; ork_w *Wcls;
 } Weights;
 
-static void rmsnorm(float*o,const float*x,const float*w,int n){
-    float ss=0; for(int i=0;i<n;i++)ss+=x[i]*x[i]; float s=1.0f/sqrtf(ss/n+1e-5f);
-    for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];
-}
-static float silu(float x){return x/(1.0f+expf(-x));}
-static void softmax(float*x,int n){float m=x[0];for(int i=1;i<n;i++)if(x[i]>m)m=x[i];
-    float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++)x[i]/=s;}
+/* RMSNorm / SwiGLU / softmax via the shared NEON kernels (src/neon_activations.c), validated vs libm in test_activations. */
+static void rmsnorm(float*o,const float*x,const float*w,int n){ ork_rmsnorm_f32(o,x,w,n,1e-5f); }
+static void softmax(float*x,int n){ ork_softmax_f32(x,n); }
 
 /* pack a llama2.c weight w[OUT][IN] (row-major) as ork_npu B[IN][OUT] (transposed), fp16 */
 static ork_w* pack_t(ork_npu*ctx,const float*w,int OUT,int IN){
@@ -104,7 +101,7 @@ int main(int argc,char**argv){
             rmsnorm(xn,xx,w.rms_ffn+(size_t)l*dim,dim);
             mv(ctx,w.Wg[l],w.w1+(size_t)l*hid*dim,hid,dim,xn,g,useNPU);
             mv(ctx,w.Wu[l],w.w3+(size_t)l*hid*dim,hid,dim,xn,uu,useNPU);
-            for(int i=0;i<hid;i++)g[i]=silu(g[i])*uu[i];
+            ork_silu_mul_f32(g,uu,hid);   /* SwiGLU: g = silu(g)*uu (NEON) */
             mv(ctx,w.Wd[l],w.w2+(size_t)l*dim*hid,dim,hid,g,o,useNPU);
             for(int i=0;i<dim;i++)xx[i]+=o[i];
         }

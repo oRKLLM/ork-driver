@@ -28,13 +28,10 @@ typedef struct {
     float **Sq, **Sk, **Sv, **So, **Sg, **Sd, **Su; float *Scls;
 } Weights;
 
-static void rmsnorm(float*o,const float*x,const float*w,int n){
-    float ss=0; for(int i=0;i<n;i++)ss+=x[i]*x[i]; float s=1.0f/sqrtf(ss/n+1e-5f);
-    for(int i=0;i<n;i++)o[i]=x[i]*s*w[i];
-}
-static float silu(float x){return x/(1.0f+expf(-x));}
-static void softmax(float*x,int n){float m=x[0];for(int i=1;i<n;i++)if(x[i]>m)m=x[i];
-    float s=0;for(int i=0;i<n;i++){x[i]=expf(x[i]-m);s+=x[i];} for(int i=0;i<n;i++)x[i]/=s;}
+/* RMSNorm / SwiGLU / softmax via the shared NEON kernels (src/neon_activations.c). */
+#include "neon_activations.h"
+static void rmsnorm(float*o,const float*x,const float*w,int n){ ork_rmsnorm_f32(o,x,w,n,1e-5f); }
+static void softmax(float*x,int n){ ork_softmax_f32(x,n); }
 
 
 /* pack W4A4 Hadamard */
@@ -212,7 +209,7 @@ int main(int argc,char**argv){
                 rmsnorm(xn,xx,w.rms_ffn+(size_t)l*dim,dim);
                 mv(ctx,w.Wg[l],w.Sg[l],w.w1+(size_t)l*hid*dim,hid,dim, K_hid_in,N_hid_out,G,xn,g,useNPU);
                 mv(ctx,w.Wu[l],w.Su[l],w.w3+(size_t)l*hid*dim,hid,dim, K_hid_in,N_hid_out,G,xn,uu,useNPU);
-                for(int i=0;i<hid;i++)g[i]=silu(g[i])*uu[i];
+                ork_silu_mul_f32(g,uu,hid);   /* SwiGLU (NEON) */
                 mv(ctx,w.Wd[l],w.Sd[l],w.w2+(size_t)l*dim*hid,dim,hid, K_hid_out,N_dim_out,G,g,o,useNPU);
                 for(int i=0;i<dim;i++)xx[i]+=o[i];
             }
