@@ -129,6 +129,10 @@ mc_prof: tools/mc_prof.c $(CORE)
 chain_bench: tools/chain_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: static gated "exhaustive MoE ring" — all experts in one chained submit, per-token zero-mask
+test_exhaustive_moe: tools/test_exhaustive_moe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic: isolate ork_mm_pack_i8_f32 (NEON f32->int8) vs pack_i8 on identical logical weights
 pack_f32_probe: tools/pack_f32_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
