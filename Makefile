@@ -51,6 +51,16 @@ rknpu_bench: tools/rknpu_bench.c
 ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
+# NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
+# .orkpack dump/load roundtrip is byte-identical and far faster than packing.
+dma_probe: tools/dma_probe.c
+	$(CC) $(CFLAGS) -o $@ $<
+stream_probe: tools/stream_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+persist_probe: tools/persist_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # RE probe: hunt the weight stride register for in-place K-slicing of a full-K buffer.
 slice_probe: tools/slice_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
