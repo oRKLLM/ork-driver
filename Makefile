@@ -95,6 +95,12 @@ prefill_check: tools/prefill_check.c $(CORE)
 vec_fuzz: tools/vec_fuzz.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE diagnostic (NOT in `make test`): fuller-slice replay of the captured RKNN Sigmoid PPU op.
+# Reconstructs the full 5-buffer topology from examples/sigmoid_slice.h (extracted from the SDK
+# trace) to test whether populating the LUT/PWL config buffers (handles 4 & 5) makes the PPU write.
+slice_replay: tools/slice_replay.c $(CORE) examples/sigmoid_slice.h
+	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE) -lm
+
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
 batch_probe: tools/batch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
