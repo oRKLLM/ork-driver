@@ -78,6 +78,15 @@ ork_w       *ork_mm_pack_i4_grouped(ork_npu *ctx, int K, int N, const int8_t *B,
 ork_w       *ork_mm_pack_i4_to_i8(ork_npu *ctx, int K, int N, const int8_t *B);
 
 void         ork_w_free(ork_w *w);
+/* Free a packed weight AND reclaim its NPU DMA/IOVA (for layer-streaming eviction; needs the ctx for
+ * the device fd). Reclaims only per-tile-owned weights (pack/pack_i4/pack_i8); arena-view weights are
+ * left to teardown. Use this instead of ork_w_free when you need the 4 GiB IOVA window back. */
+void         ork_mm_free(ork_npu *ctx, ork_w *w);
+size_t       ork_w_bytes(const ork_w *w);   /* resident NPU bytes (Bb+Bf) — for a streaming cache's IOVA budget */
+/* PERSIST: dump a packed weight's tile bytes (out=NULL → size), and reload pre-tiled int8 bytes straight
+ * into DMA (no dequant/quant/tile) — the .orkpack fast path that makes streaming re-packs a plain copy. */
+size_t       ork_w_dump(const ork_w *w, void *out, size_t cap);
+ork_w       *ork_mm_load_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
 /* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
  *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32.

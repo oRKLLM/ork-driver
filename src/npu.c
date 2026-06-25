@@ -54,8 +54,13 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     pthread_barrier_t b_ioctl; int mc_submit_rc; int mc_error;
     /* zero-copy registry: caller-allocated NPU-coherent DMA buffers (ork_dma_alloc). When a matmul's
      * A/C live in one of these, the regcmd points at them directly — no host gather/writeout memcpy. */
-    struct buf dma_tab[64]; int dma_n; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; };
+    struct buf dma_tab[64]; int dma_n;
+    /* global weight arena: a POOL of large DMA chunks (each under the ~4GB single-allocation cap), bump-
+     * allocated across ALL packed weights. One weight's tiles always land contiguously in a single chunk
+     * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
+     * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
+    struct buf wchunk[64]; int wchunk_n; size_t wchunk_off; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown) */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -162,6 +167,26 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags){
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); b->cpu=0; }
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+/* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
+static void bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+/* Reserve `need` contiguous bytes of resident weight storage from the arena pool; returns the backing chunk
+ * (and sets *base = byte offset within it) or NULL if a fresh chunk can't be allocated (caller then falls
+ * back to per-tile bcreate). Chunk size = ORK_WARENA_CHUNK_MB (default 1 GiB), kept under the single-alloc
+ * cap; a weight larger than the default chunk gets its own exact-size chunk. */
+static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
+    size_t a=(need+4095u)&~(size_t)4095u;
+    if(c->wchunk_n==0 || c->wchunk_off+a > c->wchunk[c->wchunk_n-1].size){
+        if(c->wchunk_n >= (int)(sizeof c->wchunk/sizeof c->wchunk[0])) return NULL;
+        const char *e=getenv("ORK_WARENA_CHUNK_MB"); long mb=e?atol(e):1024; if(mb<=0) return NULL;
+        size_t csz=(size_t)mb*1024u*1024u; if(a>csz) csz=a;
+        struct buf b=bcreate(c->fd,csz,0x403);
+        if(!b.cpu){ fprintf(stderr,"[ork] weight arena chunk %zuMB failed; per-buffer fallback\n",csz/1024u/1024u); return NULL; }
+        c->wchunk[c->wchunk_n++]=b; c->wchunk_off=0;
+    }
+    struct buf *ch=&c->wchunk[c->wchunk_n-1];
+    *base=c->wchunk_off; c->wchunk_off+=a;
+    return ch;
+}
 static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
 
 static struct ork_npu *g_npu_ctx = NULL;
@@ -397,7 +422,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
     int KS=dt ? 1024 : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,0x403);
@@ -431,6 +456,40 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
+
+/* PERSIST. Serialize a packed weight's resident tile bytes (Bb only; Bf is a regenerable decode-only
+ * optimization) into `out` in tile order — the on-disk form for pre-packed (.orkpack) weights. Each
+ * tile is its page-padded buffer size, so it round-trips through ork_mm_load_i8. Pass out=NULL to size. */
+size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
+    if(!w || !w->Bb) return 0;
+    size_t off=0, nb=(size_t)w->Sk*w->Sn;
+    for(size_t i=0;i<nb;i++){ const struct buf *b=&w->Bb[i]; if(!b->cpu) continue;
+        if(out){ if(off+b->size>cap) return 0; memcpy((char*)out+off,b->cpu,b->size); }
+        off+=b->size; }
+    return off;
+}
+/* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
+ * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
+ * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack
+ * order. Returns NULL on shape/size mismatch. Mirrors pack()'s int8 geometry (KS=1024). */
+ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K%32 || N%32) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; need+=pgup((size_t)Kp*Nc);}}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return w;
+}
 
 /* Re-tile int8 B[K,N] into an EXISTING ork_w's resident buffers (same K,N), reusing the DMA
  * allocations — NO bcreate/bdestroy. For pooling reused weights (e.g. MoE experts) so the NPU IOMMU
@@ -586,6 +645,27 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
     return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
 }
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
+/* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
+ * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
+ * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; arena-view weights
+ * (grouped-i4 share c->wchunk) carry owns=0 and are left to ctx teardown. */
+void ork_mm_free(ork_npu *c, ork_w *w){
+    if(!w) return;
+    if(c && w->owns){
+        size_t nb=(size_t)w->Sk*w->Sn;
+        if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
+        if(w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
+    }
+    free(w->Bb); free(w->Bf); free(w);
+}
+/* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
+ * to budget the 4 GiB IOVA window and decide when to evict. */
+size_t ork_w_bytes(const ork_w *w){
+    if(!w) return 0; size_t t=0;
+    if(w->Bb) for(size_t i=0;i<(size_t)w->Sk*w->Sn;i++) t+=w->Bb[i].size;
+    if(w->Bf) for(int i=0;i<w->Sn;i++) t+=w->Bf[i].size;
+    return t;
+}
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----
  * Tiling: N split into 64-wide tiles (the captured regcmd's N width), K split at the 10752 single-
@@ -636,7 +716,7 @@ static void tile_i4_Aslice_mm(uint8_t*dst,const int8_t*A,int M,int K,int k0,int 
 ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
     if(K%32||N%64) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;  /* wide N-slices ≤ nmax */
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++)for(int ks=0;ks<Sk;ks++){
         int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -658,16 +738,33 @@ ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
     int NMAX=c->soc->nmax, Sk=K/G, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;w->gsize=G;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
-    for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
-        int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403);
-        if(!b->cpu){
-            fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack_i4_grouped (size=%zu)\n",(size_t)ns*Sk+g,(size_t)G*Nc/2);
-            for(int i=0;i<ns*Sk+g;i++) bdestroy(c->fd,&w->Bb[i]);
-            ork_w_free(w); return NULL;
+    /* Reserve the whole weight as one contiguous region in an arena chunk; each group-tile is a 4KB-aligned
+     * VIEW into it (shared obj, dma=chunk.dma+off). Collapses the per-group bcreate storm to (at most) one
+     * chunk allocation amortized across many weights => fast warmup, no IOVA-handle OOM. The weight's region
+     * is flushed to device in a single bsync_off. Falls back to per-tile bcreate if the pool is exhausted. */
+    size_t wtotal=0;
+    for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        wtotal += (((size_t)G*Nc/2)+4095u)&~(size_t)4095u; }
+    size_t base; struct buf *ch=warena_reserve(c,wtotal,&base);
+    if(ch){
+        size_t off=base;
+        for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
+            int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; size_t ts=(size_t)G*Nc/2;
+            struct buf*b=&w->Bb[(size_t)ns*Sk+g];
+            b->handle=ch->handle; b->obj=ch->obj; b->dma=ch->dma+off; b->cpu=(char*)ch->cpu+off; b->size=ts;
+            tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
+            off += (ts+4095u)&~(size_t)4095u;
         }
-        tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync_off(c->fd,ch->obj,base,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        bsync_off(c->fd,ch->obj,base,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
+    } else {
+        for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
+            int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403);
+            if(!b->cpu){ fprintf(stderr,"[ork] ERROR: weight alloc failed (G=%d Nc=%d) in pack_i4_grouped\n",G,Nc); free(w->Bb); free(w); return NULL; }
+            tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
+            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+        }
     }
     return w;
 }
