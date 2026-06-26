@@ -760,6 +760,89 @@ static void inflate_chan_nf4_f32(const uint8_t *qidx, int K, const int8_t lut[16
 #endif
     for (; k < K; k++) qf32[k] = (float)lut[qidx[k]];
 }
+/* ---- DIRECT int4 -> int8-tiled inflate (no f32 intermediate, no re-quant) ----
+ * The f32 path inflates nibble -> f32 code -> tile_f32_i8, which re-quantizes via
+ * lrintf(code*1.0) clamped to [-127,127]. But the codes are ALWAYS exact small ints
+ * (UNIFORM in [-7,7]; NF4 LUT = round(level*127) in [-127,127]) so that quant is the
+ * identity: the int8 byte placed in the tile equals the int4 code. So we can inflate
+ * straight to int8 and rearrange bytes into the tile layout with NO float round-trip.
+ * Output is bit-identical to the f32 path (proven by the matmul/memcmp gate). */
+/* UNIFORM: expand one channel's nibble-packed int4 codes -> LINEAR int8 [-7,7] in i8[K]. */
+static void expand_chan_i4_i8(const uint8_t *nib, int K, int8_t *i8) {
+    int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    uint8x8_t vlo = vdup_n_u8(0x0f);
+    for (; k <= K - 16; k += 16) {
+        uint8x8_t pk = vld1_u8(nib + (k>>1));                 /* 8 bytes = 16 nibbles */
+        int8x8_t even = vreinterpret_s8_u8(vand_u8(pk, vlo)); /* low nibbles  (codes k,k+2,...) */
+        int8x8_t odd  = vreinterpret_s8_u8(vshr_n_u8(pk, 4)); /* high nibbles (codes k+1,...) */
+        even = vshr_n_s8(vshl_n_s8(even, 4), 4);              /* sign-extend 4-bit */
+        odd  = vshr_n_s8(vshl_n_s8(odd,  4), 4);
+        int8x8x2_t zip = vzip_s8(even, odd);                  /* interleave -> code order */
+        vst1q_s8(i8 + k, vcombine_s8(zip.val[0], zip.val[1]));
+    }
+#endif
+    for (; k < K; k++) {
+        uint8_t nb = (k & 1) ? (nib[k>>1] >> 4) : (nib[k>>1] & 0xf);
+        i8[k] = (int8_t)(nb << 4) >> 4;                       /* sign-extend 4-bit */
+    }
+}
+/* NF4: inflate one channel's indices (stored in the nibble) -> LINEAR int8 codes via the LUT.
+ * The nibble store keeps the 0..15 index (low/high nibble per k); LUT[idx] = round(level*127). */
+static void inflate_chan_nf4_i8(const uint8_t *nib, int K, const int8_t lut[16], int8_t *i8) {
+    int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int8x16_t vlut = vld1q_s8(lut); uint8x8_t vlo = vdup_n_u8(0x0f);
+    for (; k <= K - 16; k += 16) {
+        uint8x8_t pk = vld1_u8(nib + (k>>1));                 /* 8 bytes = 16 indices */
+        uint8x8_t even = vand_u8(pk, vlo);                    /* low nibbles (idx k,k+2,...) */
+        uint8x8_t odd  = vshr_n_u8(pk, 4);                    /* high nibbles (idx k+1,...) */
+        uint8x8x2_t zip = vzip_u8(even, odd);                 /* interleave -> index order */
+        uint8x16_t vi = vcombine_u8(zip.val[0], zip.val[1]);
+        vst1q_s8(i8 + k, vqtbl1q_s8(vlut, vi));               /* code = lut[idx] */
+    }
+#endif
+    for (; k < K; k++) { uint8_t idx = (k & 1) ? (nib[k>>1] >> 4) : (nib[k>>1] & 0xf); i8[k] = lut[idx]; }
+}
+/* Rearrange LINEAR int8 codes i8[N][K] -> the NPU tiled int8 layout, copying bytes (NO quant, NO float).
+ * Byte-for-byte the same destination math as tile_f32_i8 (per (ns,ks) buffer: element of channel
+ * n=n0+nt*32+nl at k-pos k0+kt*32+ki lands at nt*KT*32*32 + kt*32*32 + nl*32 + ki) but feeding the int8
+ * code directly, since tile_f32_i8 with inv=1 maps code -> clamp(lrintf(code),-127,127) = code (identity).
+ * Same per-buffer init bsync sequence as tile_f32_i8 (fresh buffers need TO|FROM then TO). */
+static void tile_i8_to_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8) {
+    int KS = 1024, NMAX = c->soc->nmax, Sk = w->Sk, Sn = w->Sn, fd = c->fd;
+    for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
+      for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS, KT = Kp/32;
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; if (!b->cpu) continue; int8_t *bb = b->cpu;
+        for (int nt = 0; nt < NN; nt++) for (int nl = 0; nl < 32; nl++) {
+            int n = n0+nt*32+nl; const int8_t *src = i8 + (size_t)n*K + k0;
+            for (int kt = 0; kt < KT; kt++)
+                memcpy(bb + ((size_t)nt*KT*32*32 + (size_t)kt*32*32 + nl*32), src + kt*32, 32);
+        }
+        bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+    if (w->Bf && K <= 10752) { int KTf = K/32;
+        for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
+            struct buf *b = &w->Bf[ns]; if (!b->cpu) continue; int8_t *bb = b->cpu;
+            for (int nt = 0; nt < NN; nt++) for (int nl = 0; nl < 32; nl++) {
+                int n = n0+nt*32+nl; const int8_t *src = i8 + (size_t)n*K;
+                for (int kt = 0; kt < KTf; kt++)
+                    memcpy(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), src + kt*32, 32);
+            }
+            bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+}
+/* DIRECT int4 -> int8-tiled fill: inflate w's nibble store straight into its resident DMA tiles, no f32.
+ * (kind selects UNIFORM sign-extend vs NF4 LUT.) Uses a per-channel linear-int8 scratch i8scratch[N*K]
+ * (1 byte/elem vs the f32 path's 4) reused across channels. Produces bit-identical tiled bytes to the
+ * f32 path. Caller provides scratch (size N*K) so the streaming consumer can reuse one allocation. */
+static void tile_direct_i4_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
+    if (kind == ORK_QK_CODEBOOK_NF4) {
+        int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+        for (int n = 0; n < N; n++) inflate_chan_nf4_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
+    } else {
+        for (int n = 0; n < N; n++) expand_chan_i4_i8(w->Bi4 + (size_t)n*(K/2), K, i8scratch + (size_t)n*K);
+    }
+    tile_i8_to_tiles(c, w, K, N, i8scratch);
+}
 /* ---- imatrix (importance-matrix) weighted per-channel scale selection ----
  * The quant scale is per-OUTPUT-channel; the imatrix is per-INPUT-channel (length K, importance[k] =
  * <activation_k^2>). They are orthogonal, so the imatrix can't re-weight a nearest-level pick. Instead we
@@ -916,10 +999,20 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     /* retain the compact store + scales so the loaded weight re-dumps byte-identically */
     w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
-    float *qf32=malloc((size_t)N*K*sizeof(float)), *inv=malloc((size_t)N*sizeof(float));
-    if(!w->Bi4 || !w->bscale || !qf32 || !inv){ free(qf32); free(inv); ork_mm_free(c,w); return NULL; }
+    if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
     memcpy(w->bscale,p,sc); p+=sc;
     memcpy(w->Bi4,p,nib);
+    /* ORK_DIRECT_I4: inflate nibbles STRAIGHT to int8-tiled (1 byte/elem scratch, no f32 round-trip,
+     * no re-quant) — bit-identical to the f32 path. Default off; preserves the f32 path for review. */
+    if(getenv("ORK_DIRECT_I4")){
+        int8_t *i8=malloc((size_t)N*K);
+        if(!i8){ ork_mm_free(c,w); return NULL; }
+        tile_direct_i4_i8(c, w, K, N, w->quant_kind, i8);
+        free(i8);
+        return w;
+    }
+    float *qf32=malloc((size_t)N*K*sizeof(float)), *inv=malloc((size_t)N*sizeof(float));
+    if(!qf32 || !inv){ free(qf32); free(inv); ork_mm_free(c,w); return NULL; }
     int8_t nf4_lut[16];
     if(w->quant_kind==ORK_QK_CODEBOOK_NF4) for(int i=0;i<16;i++) nf4_lut[i]=(int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
     for(int nn=0;nn<N;nn++){
@@ -961,6 +1054,25 @@ void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a
 void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1) {
     if (!w) return;
     tile_f32_i8(c, w, w->K, w->N, qf32, inv1);
+}
+/* DIRECT path microbench: inflate w's nibbles STRAIGHT to int8-tiled (no f32, no re-quant) into the
+ * resident DMA tiles. i8scratch is caller-provided (size N*K); kind forces UNIFORM/NF4. Bit-identical
+ * to ork_slice_inflate_i4a8_kind + ork_slice_tile_i8, but in one pass with no float round-trip. */
+void ork_slice_direct_i4a8_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
+    if (!w || !w->Bi4) return;
+    tile_direct_i4_i8(c, w, w->K, w->N, kind, i8scratch);
+}
+/* DIRECT inflate ONLY (nibble -> linear int8 i8[N*K]); the rearrange/bsync is the separate tile step.
+ * Lets the bench split direct inflate cost from the tile+bsync cost. */
+void ork_slice_direct_inflate_i8(const ork_w *w, int8_t *i8, int kind) {
+    if (!w || !w->Bi4) return;
+    int K = w->K, N = w->N;
+    if (kind == ORK_QK_CODEBOOK_NF4) {
+        int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+        for (int n = 0; n < N; n++) inflate_chan_nf4_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8 + (size_t)n*K);
+    } else {
+        for (int n = 0; n < N; n++) expand_chan_i4_i8(w->Bi4 + (size_t)n*(K/2), K, i8 + (size_t)n*K);
+    }
 }
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
     if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
