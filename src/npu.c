@@ -593,7 +593,7 @@ static void chan_scales_f32(const float *f32, int K, int N, float *inv, float *b
         float m[4]; vst1q_f32(m, vmx); float a = m[0] > m[1] ? m[0] : m[1], b = m[2] > m[3] ? m[2] : m[3]; mx = a > b ? a : b;
 #endif
         for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
-        inv[n] = 127.0f / mx; bscale[n] = mx / 127.0f;
+        inv[n] = 127.0f / mx; if (bscale) bscale[n] = mx / 127.0f;
     }
 }
 static inline void quant32_f32_i8(int8_t *dst, const float *fr, float inv) {
