@@ -157,6 +157,11 @@ prefetch_headroom: tools/prefetch_headroom.c $(CORE)
 disk_stream_bench: tools/disk_stream_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: can we break the ~1.06 GB/s weight dma_buf fill wall? A/B write-combine (0x401) vs cacheable
+# (0x403) vs NEON streaming-store fills, each with an NPU-read correctness check vs a CPU int8 reference.
+dmabuf_fill_probe: tools/dmabuf_fill_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic: Tier 4a per-group Hadamard for W4A4, validated end-to-end ON THE NPU (plain vs rotated RMS)
 hadamard_i4_npu: tools/hadamard_i4_npu.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

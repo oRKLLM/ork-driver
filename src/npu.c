@@ -418,6 +418,24 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
     s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
     s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
 }
+/* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
+ * rknpu mem-create flag set, so the probe can A/B the write-combine (0x401) vs cacheable (0x403) fill
+ * bandwidth + NPU-read correctness WITHOUT changing the default ork_dma_alloc behavior. Additive; not
+ * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
+void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
+    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
+    struct buf b=bcreate(c->fd,size,flags); if(!b.cpu) return NULL;
+    c->dma_tab[c->dma_n++]=b; return b.cpu;
+}
+/* Diagnostic only: clean-only flush (TO_DEVICE) of a sub-range — push dirty CPU cache lines out to DRAM
+ * so the NPU reads correct data, WITHOUT the FROM_DEVICE invalidate. This is the bsync a cacheable
+ * weight buffer needs before submit (the "clean cost" the probe measures separately). */
+void ork_dma_clean_to_device(ork_npu *c, void *ptr, size_t size){
+    struct buf *b=dma_find(c,ptr); if(!b) return;
+    struct rknpu_mem_sync s; memset(&s,0,sizeof s);
+    s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
+}
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
 int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
 int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
@@ -521,6 +539,46 @@ int ork_mm_repack_i8(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
+/* ---- Diagnostic only (tools/dmabuf_fill_probe.c): a load_i8 variant whose resident Bb tiles are
+ * allocated with a CALLER-CHOSEN rknpu mem flag (0x401 WC vs 0x403 cacheable), so the probe can A/B
+ * the weight-fill bandwidth AND the NPU read correctness for each flag. Allocates + leaves the blob
+ * copied in once (a valid initial state); the probe then times steady-state re-fills via the accessors
+ * below. Additive; not in the public header; does NOT change pack/run or the default load_i8. ---- */
+ork_w *ork_mm_load_i8_flags(ork_npu *c,int K,int N,const void *blob,size_t n,unsigned flags){
+    if(K%32 || N%32) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,flags);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return w;
+}
+/* Diagnostic accessors over an ork_w's resident Bb tiles (for the fill probe): number of tiles, and
+ * the cpu ptr + byte size of tile i. The probe memcpys blob bytes into these to time steady-state fill. */
+int    ork_w_ntiles(const ork_w *w){ return (w&&w->Bb)?w->Sk*w->Sn:0; }
+void  *ork_w_tile_cpu(const ork_w *w,int i){ return (w&&w->Bb&&i>=0&&i<w->Sk*w->Sn)?w->Bb[i].cpu:NULL; }
+size_t ork_w_tile_size(const ork_w *w,int i){ return (w&&w->Bb&&i>=0&&i<w->Sk*w->Sn)?w->Bb[i].size:0; }
+/* clean-only flush (TO_DEVICE) of tile i — the bsync a cacheable weight buffer needs before submit. */
+void   ork_w_tile_clean(ork_npu *c,const ork_w *w,int i){
+    if(!w||!w->Bb||i<0||i>=w->Sk*w->Sn||!w->Bb[i].cpu) return;
+    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+}
+/* the full TO|FROM then TO bsync (the current ork_dma_bsync_to_device pattern), per tile. */
+void   ork_w_tile_bsync_full(ork_npu *c,const ork_w *w,int i){
+    if(!w||!w->Bb||i<0||i>=w->Sk*w->Sn||!w->Bb[i].cpu) return;
+    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+}
+
 /* ---- NEON SIMD pack/repack DIRECTLY from f32[N][K] (n-major, as ggml's to_float produces) ----
  * Fuses per-channel f32->int8 quant INTO the tile loop: for a fixed channel n the 32 K-values are
  * contiguous in f32[n][:], so NEON-load 32 f32, mul by the channel inverse scale, round/clamp to
