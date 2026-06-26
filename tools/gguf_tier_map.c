@@ -15,6 +15,11 @@
  *   ./gguf_tier_map <model.gguf> [bit_threshold]
  *     bit_threshold (default 5): tensors with effective bits-per-weight >= threshold -> int8,
  *                                otherwise -> int4. This is the precision/memory dial.
+ *
+ *   ./gguf_tier_map --emit-map <model.gguf> [bit_threshold]
+ *     Emit a machine-parseable `name<TAB>tier` map (tier = "int4" | "int8"), one tensor per
+ *     line, NOTHING else on stdout (diagnostics go to stderr). Feed to ggml-ork via
+ *     ORK_ORKPACK_TIERMAP=<file> so an fp16 source GGUF inherits THIS GGUF's int4/int8 split.
  */
 
 /* expose fseeko/off_t (POSIX) under -std=c11 on glibc; harmless on macOS */
@@ -207,17 +212,21 @@ static void skip_value(rdr *r, uint32_t vt) {
 /* ---- main ----------------------------------------------------------------- */
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
+    int emit_map = 0;
+    int argi = 1;
+    if (argc >= 2 && strcmp(argv[1], "--emit-map") == 0) { emit_map = 1; argi = 2; }
+    if (argc < argi + 1) {
         fprintf(stderr,
-            "usage: %s <model.gguf> [bit_threshold]\n"
+            "usage: %s [--emit-map] <model.gguf> [bit_threshold]\n"
             "  tensors with effective bits/weight >= threshold -> int8, else int4\n"
-            "  (threshold default 5: Q5/Q6/Q8/F16/F32 -> int8; Q4/Q3/Q2/IQ* -> int4)\n",
+            "  (threshold default 5: Q5/Q6/Q8/F16/F32 -> int8; Q4/Q3/Q2/IQ* -> int4)\n"
+            "  --emit-map: print only `name<TAB>tier` lines (tier=int4|int8) for ORK_ORKPACK_TIERMAP\n",
             argv[0]);
         return 2;
     }
-    const char *path = argv[1];
+    const char *path = argv[argi];
     double threshold = 5.0;
-    if (argc >= 3) threshold = strtod(argv[2], NULL);
+    if (argc >= argi + 2) threshold = strtod(argv[argi + 1], NULL);
 
     FILE *f = fopen(path, "rb");
     if (!f) { fprintf(stderr, "error: cannot open %s\n", path); return 1; }
@@ -248,11 +257,13 @@ int main(int argc, char **argv) {
         fclose(f); return 1;
     }
 
-    printf("GGUF v%u  tensors=%" PRIu64 "  metadata_kv=%" PRIu64 "  threshold=%.4g bits\n",
-           version, tensor_count, kv_count, threshold);
-    printf("%-44s %-9s %5s %-22s -> %-4s\n",
-           "tensor_name", "ggml_type", "bits", "dims", "tier");
-    printf("--------------------------------------------------------------------------------------------\n");
+    if (!emit_map) {
+        printf("GGUF v%u  tensors=%" PRIu64 "  metadata_kv=%" PRIu64 "  threshold=%.4g bits\n",
+               version, tensor_count, kv_count, threshold);
+        printf("%-44s %-9s %5s %-22s -> %-4s\n",
+               "tensor_name", "ggml_type", "bits", "dims", "tier");
+        printf("--------------------------------------------------------------------------------------------\n");
+    }
 
     /* per-tier accumulators */
     uint64_t cnt_i8 = 0, cnt_i4 = 0, cnt_unknown = 0;
@@ -303,9 +314,12 @@ int main(int argc, char **argv) {
             p += snprintf(dbuf + p, sizeof(dbuf) - p, "%s%" PRIu64, d ? "x" : "", dims[d]);
         if (n_dims == 0) snprintf(dbuf, sizeof(dbuf), "(scalar)");
 
-        printf("%-44s %-9s %5.2f %-22s -> %s%s\n",
-               name, ti.name, ti.bits < 0 ? 0.0 : ti.bits, dbuf, tier,
-               unknown ? "  (unknown type -> conservative int8)" : "");
+        if (emit_map)
+            printf("%s\t%s\n", name, tier);   // machine-parseable: name<TAB>tier, nothing else
+        else
+            printf("%-44s %-9s %5.2f %-22s -> %s%s\n",
+                   name, ti.name, ti.bits < 0 ? 0.0 : ti.bits, dbuf, tier,
+                   unknown ? "  (unknown type -> conservative int8)" : "");
 
         /* (1) bit-policy consistency: high-bit -> int8, low-bit -> int4 */
         int want_i8 = (bits >= threshold);
@@ -330,6 +344,12 @@ int main(int argc, char **argv) {
     if (R.err) {
         fprintf(stderr, "error: failed parsing tensor infos\n");
         return 1;
+    }
+
+    if (emit_map) {
+        fprintf(stderr, "[emit-map] %" PRIu64 " int8 + %" PRIu64 " int4 = %" PRIu64 " tensors\n",
+                cnt_i8, cnt_i4, cnt_i8 + cnt_i4);
+        return 0;
     }
 
     /* ---- summary ---- */
