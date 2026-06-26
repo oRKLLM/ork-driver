@@ -867,6 +867,34 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     free(qf32); free(inv);
     return w;
 }
+/* ---- DIAGNOSTIC ONLY (tools/prefetch_headroom.c): isolate the STEADY-STATE per-slice streaming prep.
+ * These re-run the TAIL of the int4 pack path (inflate stored nibbles -> int8 codes; tile into the
+ * ALREADY-ALLOCATED resident DMA buffers) on an int4-packed weight, with NO bcreate/alloc — exactly the
+ * work a streaming double-buffer would do per cycled slice. They do not alter pack/run behavior. */
+/* inflate w->Bi4 (all N channels) -> int8 codes as f32 in caller scratch qf32[N*K] (UNIFORM sign-extend
+ * / NF4 LUT per quant_kind). Mirrors the inflate loop in pack_i4a8 / load_i4a8. */
+/* force the inflate KIND (lets the bench time UNIFORM and NF4 on the same nibble store; the inflate
+ * cost is data-independent, so it's a valid per-path microbench either way). */
+void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind) {
+    if (!w || !w->Bi4) return;
+    int K = w->K, N = w->N;
+    if (kind == ORK_QK_CODEBOOK_NF4) {
+        int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+        for (int nn = 0; nn < N; nn++) {
+            const uint8_t *nibp = w->Bi4 + (size_t)nn*(K/2); float *qf = qf32 + (size_t)nn*K;
+            for (int k = 0; k < K; k++) { uint8_t idx = (k&1) ? (nibp[k>>1]>>4) : (nibp[k>>1]&0xf); qf[k] = (float)lut[idx]; }
+        }
+    } else {
+        for (int nn = 0; nn < N; nn++) expand_chan_i4_f32(w->Bi4 + (size_t)nn*(K/2), K, qf32 + (size_t)nn*K);
+    }
+}
+void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a8_kind(w, qf32, w ? w->quant_kind : 0); }
+/* tile inflated codes qf32[N*K] into w's existing resident DMA buffers (inv=1; codes are exact). Reuses
+ * the production tile_f32_i8 — same memcpy/quant + bsync(TO_DEVICE) the steady-state stream would issue. */
+void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1) {
+    if (!w) return;
+    tile_f32_i8(c, w, w->K, w->N, qf32, inv1);
+}
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
     if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
     if (w->K != K || w->N != N) return -2;

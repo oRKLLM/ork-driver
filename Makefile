@@ -147,6 +147,11 @@ test_exhaustive_moe: tools/test_exhaustive_moe.c $(CORE)
 pack_f32_probe: tools/pack_f32_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic (P5.3): can a CPU prefetch thread hide per-slice streaming prep (int4->int8 inflate + tile
+# into a reused DMA buffer) behind the NPU computing the previous slice? Splits prep into inflate vs tile.
+prefetch_headroom: tools/prefetch_headroom.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic: Tier 4a per-group Hadamard for W4A4, validated end-to-end ON THE NPU (plain vs rotated RMS)
 hadamard_i4_npu: tools/hadamard_i4_npu.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
