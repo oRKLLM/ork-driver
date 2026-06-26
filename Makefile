@@ -157,6 +157,11 @@ prefetch_headroom: tools/prefetch_headroom.c $(CORE)
 direct_i4_test: tools/direct_i4_test.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic (Phase-5 M0 gate): is a sparse-MoE expert FFN GEMM on the NPU (DIRECT int4-NF4 inflate +
+# cacheable tiled buf, single + chained) now competitive with a NEON int8 CPU GEMM? vs the old f32 repack.
+moe_expert_probe: tools/moe_expert_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic (P5.3 follow-on): does filling the resident NPU dma_buf from DISK (mmap warm/cold, pread cold)
 # add a penalty vs RAM, and how much cheaper is the pre-tiled int8 fill than the int4 inflate+tile path?
 disk_stream_bench: tools/disk_stream_bench.c $(CORE)
