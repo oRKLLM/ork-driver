@@ -693,7 +693,55 @@ static void inflate_chan_nf4_f32(const uint8_t *qidx, int K, const int8_t lut[16
 #endif
     for (; k < K; k++) qf32[k] = (float)lut[qidx[k]];
 }
+/* ---- imatrix (importance-matrix) weighted per-channel scale selection ----
+ * The quant scale is per-OUTPUT-channel; the imatrix is per-INPUT-channel (length K, importance[k] =
+ * <activation_k^2>). They are orthogonal, so the imatrix can't re-weight a nearest-level pick. Instead we
+ * pick the per-channel scale (clip ratio): for a grid of r in (0,1], the candidate scale is r*absmax;
+ * quantizing at a smaller scale clips outliers but gives the bulk more resolution. We keep the r whose
+ * dequant minimizes Sum_k imatrix[k]*(w[k]-dequant[k])^2. O(grid*K) per channel (pack is one-time). */
+static const float ORK_IM_CLIP_GRID[] = { 1.0f, 0.92f, 0.85f, 0.78f, 0.70f, 0.62f, 0.55f };
+#define ORK_IM_CLIP_N ((int)(sizeof(ORK_IM_CLIP_GRID)/sizeof(ORK_IM_CLIP_GRID[0])))
+/* Quantize one channel at the given per-channel absmax (uniform: scale=absmax/7; NF4: scale=absmax/127)
+ * into a reused dq[K] scratch (the dequantized weight, in original f32 units), and return the
+ * importance-weighted reconstruction error Sum_k im[k]*(w[k]-dq[k])^2 (im NULL => unit weights).
+ * Does NOT touch the nibble store — used to score a clip candidate; the winner is re-committed below. */
+static float wq_err_chan(const float *fr, int K, float absmax, int nf4, const float *im, float *dq) {
+    if (nf4) {
+        float sc = absmax / 127.0f, inv = absmax > 0 ? 1.0f/absmax : 0.0f;
+        for (int k = 0; k < K; k++) {
+            float wn = fr[k]*inv; if (wn > 1.0f) wn = 1.0f; else if (wn < -1.0f) wn = -1.0f;
+            int hi = 0; while (hi < 15 && ORK_NF4_LEVELS[hi] < wn) hi++;
+            int lo = hi > 0 ? hi-1 : 0, idx;
+            if (lo == hi) idx = hi;
+            else { float t = (wn-ORK_NF4_LEVELS[lo])/(ORK_NF4_LEVELS[hi]-ORK_NF4_LEVELS[lo]); idx = (t >= 0.5f) ? hi : lo; }
+            dq[k] = (float)((int8_t)lrintf(ORK_NF4_LEVELS[idx]*127.0f)) * sc;  /* match the int8 LUT path */
+        }
+    } else {
+        float scale = absmax / 7.0f, inv = scale > 0 ? 1.0f/scale : 0.0f;
+        for (int k = 0; k < K; k++) {
+            int q = (int)lrintf(fr[k]*inv); if (q > 7) q = 7; else if (q < -7) q = -7;
+            dq[k] = (float)q * scale;
+        }
+    }
+    float e = 0.0f;
+    for (int k = 0; k < K; k++) { float d = fr[k]-dq[k]; e += (im ? im[k] : 1.0f) * d*d; }
+    return e;
+}
+/* Search the clip grid for one channel and return the absmax (= r*rawabsmax) that minimizes the
+ * imatrix-weighted error. dq is reused scratch[K]. With im==NULL this would just return rawabsmax. */
+static float wq_best_absmax(const float *fr, int K, float rawabsmax, int nf4, const float *im, float *dq) {
+    float best_abs = rawabsmax, best_e = wq_err_chan(fr, K, rawabsmax, nf4, im, dq);
+    for (int g = 1; g < ORK_IM_CLIP_N; g++) {
+        float cand = rawabsmax * ORK_IM_CLIP_GRID[g];
+        float e = wq_err_chan(fr, K, cand, nf4, im, dq);
+        if (e < best_e) { best_e = e; best_abs = cand; }
+    }
+    return best_abs;
+}
 ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscale_out) {
+    return ork_mm_pack_i4a8_im(c, K, N, f32, NULL, bscale_out);
+}
+ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const float *imatrix, float *bscale_out) {
     if (K % 32 || N % 32) return NULL;
     int sr = getenv("ORK_SR") != NULL; uint32_t seed = 0x2545F491u;   /* SR PRNG: fixed seed => deterministic/testable */
     int nf4 = getenv("ORK_NF4") != NULL;   /* ORK_NF4: non-uniform NF4 codebook instead of the uniform int4 grid */
@@ -720,7 +768,10 @@ ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscal
     int8_t nf4_lut[16]; uint8_t *qidx = NULL;
     if (nf4) { for (int i = 0; i < 16; i++) nf4_lut[i] = (int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
                qidx = malloc((size_t)N * K); }
-    if (!w->Bi4 || !qf32 || !inv || (nf4 && !qidx)) { free(qf32); free(inv); free(qidx); ork_w_free(w); return NULL; }
+    /* imatrix path: reused per-channel dequant scratch[K] for the clip-grid search (NULL imatrix => unused) */
+    float *imdq = imatrix ? malloc((size_t)K * sizeof(float)) : NULL;
+    if (!w->Bi4 || !qf32 || !inv || (nf4 && !qidx) || (imatrix && !imdq)) {
+        free(qf32); free(inv); free(qidx); free(imdq); ork_w_free(w); return NULL; }
     for (int n = 0; n < N; n++) {
         const float *fr = f32 + (size_t)n*K; float mx = 1e-9f; int k = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -729,6 +780,7 @@ ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscal
         float m[4]; vst1q_f32(m, vmx); float a=m[0]>m[1]?m[0]:m[1], bb=m[2]>m[3]?m[2]:m[3]; mx=a>bb?a:bb;
 #endif
         for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
+        if (imatrix) mx = wq_best_absmax(fr, K, mx, nf4, imatrix, imdq);  /* clip-grid scale selection */
         uint8_t *nib = w->Bi4 + (size_t)n*(K/2);
         if (nf4) { bscale_out[n] = mx / 127.0f;        /* int8 LUT range +-127 */
                    quant_chan_nf4(fr, K, mx, sr, &seed, nib, qidx + (size_t)n*K); }
@@ -741,7 +793,7 @@ ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscal
     if (nf4) for (int n = 0; n < N; n++) inflate_chan_nf4_f32(qidx + (size_t)n*K, K, nf4_lut, qf32 + (size_t)n*K);
     else     for (int n = 0; n < N; n++) expand_chan_i4_f32(w->Bi4 + (size_t)n*(K/2), K, qf32 + (size_t)n*K);
     tile_f32_i8(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
-    free(qf32); free(inv); free(qidx);
+    free(qf32); free(inv); free(qidx); free(imdq);
     return w;
 }
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {

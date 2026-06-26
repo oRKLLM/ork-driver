@@ -360,6 +360,78 @@ static int check_nf4_accuracy_gate(void) {
     return ok?0:1;
 }
 
+/* (3) IMATRIX weighted scale selection (ork_mm_pack_i4a8_im, Phase 1.3): build channels where a few
+ * INPUT columns are "important" (large imatrix[k]) and hold mid-range, non-outlier values, while a few
+ * UNIMPORTANT columns hold large outliers. Plain absmax then wastes the int4 grid resolving outliers
+ * that don't matter; imatrix-weighted clip selection picks a tighter scale that resolves the important
+ * bulk better. We measure the IMPORTANCE-WEIGHTED reconstruction error Sum_k im[k]*(w-dequant)^2 for the
+ * absmax (imatrix=NULL) pack and the imatrix pack, and assert imatrix < absmax. We also assert the NULL
+ * path is byte-identical to the prior absmax behavior (bscale[n] == absmax_n/7), and that a real matmul
+ * on the imatrix-packed weights stays finite/bounded vs a CPU reference. */
+static double i4a8_chan_werr(const float *wr, int K, float bscale, const float *im) {
+    /* dequant the channel the SAME way the uniform int4 pack does (scale=bscale, RN, clamp [-7,7]) and
+     * accumulate the importance-weighted squared error. bscale == chosen scale (absmax/7 or r*absmax/7). */
+    float biv = bscale > 0 ? 1.0f/bscale : 0.0f; double e = 0;
+    for (int k=0;k<K;k++){ int q=(int)lrintf(wr[k]*biv); if(q>7)q=7; else if(q<-7)q=-7;
+        double dq=(double)q*bscale, d=(double)wr[k]-dq; e += (double)im[k]*d*d; }
+    return e;
+}
+static int check_pack_i4a8_imatrix(ork_npu *ctx) {
+    int M = 8, K = 2048, N = 512;
+    float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float));
+    float *bsc0 = malloc((size_t)N*sizeof(float)), *bsc1 = malloc((size_t)N*sizeof(float));
+    float *im = malloc((size_t)K*sizeof(float));
+    /* importance: first 64 input columns important (weight 50), the rest unimportant (weight ~0.01) */
+    for (int k=0;k<K;k++) im[k] = (k < 64) ? 50.0f : 0.01f;
+    /* weights: important columns hold mid-range values; a handful of unimportant columns carry big
+     * outliers (which inflate absmax and waste the int4 grid). */
+    for (int n=0;n<N;n++){ float *wr = Bf + (size_t)n*K;
+        for (int k=0;k<K;k++){
+            if (k < 64)            wr[k] = ((int)rnd()-128)/256.0f;        /* important: ~[-0.5,0.5] mid-range */
+            else if ((k % 401)==0) wr[k] = ((rnd()&1)?+1:-1)*(6.0f + (rnd()&7)); /* unimportant outliers ~+-6..13 */
+            else                   wr[k] = ((int)rnd()-128)/4096.0f;       /* unimportant: tiny */
+        }
+    }
+    for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
+    /* absmax pack (imatrix=NULL) and imatrix pack */
+    ork_w *w0 = ork_mm_pack_i4a8_im(ctx, K, N, Bf, NULL, bsc0);
+    ork_w *w1 = ork_mm_pack_i4a8_im(ctx, K, N, Bf, im,   bsc1);
+    if (!w0 || !w1) { printf("  pack_i4a8_im failed\n"); free(Bf);free(Af);free(bsc0);free(bsc1);free(im);
+        if(w0)ork_w_free(w0); if(w1)ork_w_free(w1); return 1; }
+    /* (a) NULL path byte-identical: bsc0[n] must equal absmax_n/7 exactly (the prior absmax behavior). */
+    int null_ok = 1;
+    for (int n=0;n<N;n++){ const float *wr=Bf+(size_t)n*K; float mx=1e-9f;
+        for (int k=0;k<K;k++){float v=fabsf(wr[k]); if(v>mx)mx=v;}
+        if (bsc0[n] != mx/7.0f) { null_ok = 0; break; } }
+    /* (b) weighted-error comparison: imatrix pack must beat absmax pack on the importance-weighted error */
+    double e0=0, e1=0;
+    for (int n=0;n<N;n++){ const float *wr=Bf+(size_t)n*K;
+        e0 += i4a8_chan_werr(wr, K, bsc0[n], im);
+        e1 += i4a8_chan_werr(wr, K, bsc1[n], im); }
+    /* (c) correctness: matmul on the imatrix-packed weights stays finite + bounded vs CPU reference */
+    int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
+    for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
+        asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
+    int rc = ork_mm_run_i8(ctx, w1, M, Ai, Ci);
+    double se=0, sref=0; int finite=1;
+    if (!rc) for (int n=0;n<N;n++){
+        const float *wr = Bf + (size_t)n*K; float bs = bsc1[n], biv = bs>0?1.0f/bs:0.0f;
+        for (int m=0;m<M;m++){
+            double ref=0;
+            for (int k=0;k<K;k++){ int q=(int)lrintf(wr[k]*biv); if(q>7)q=7; else if(q<-7)q=-7;
+                ref += ((double)Ai[(size_t)m*K+k]*asc[m]) * ((double)q*bs); }
+            double got = (double)asc[m]*bs*Ci[(size_t)m*N+n];
+            if (!isfinite(got)) finite=0;
+            se += (got-ref)*(got-ref); sref += ref*ref; }
+    }
+    double rms = sqrt(se/((double)M*N)) / (sqrt(sref/((double)M*N))+1e-9);
+    int ok = (!rc) && null_ok && finite && (e1 < e0) && rms < 0.03;
+    printf("  %s pack_i4a8 imatrix M=%d K=%d N=%d  rc=%d NULL-identical=%d  weighted err: absmax=%.4g imatrix=%.4g (ratio im/absmax=%.3f)  matmul RMS=%.3f%%\n",
+           ok?"ok  ":"WRONG", M,K,N, rc, null_ok, e0, e1, e0>0?e1/e0:0.0, rms*100);
+    ork_w_free(w0); ork_w_free(w1); free(Bf);free(Af);free(bsc0);free(bsc1);free(im);free(Ai);free(asc);free(Ci);
+    return ok?0:1;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -425,6 +497,7 @@ int main(void){
     fail|=check_pack_i4a8(c8);        /* verify "effective w4a8": int4 wt / int8 compute / int4 storage */
     fail|=check_pack_nf4_correct(c8); /* verify NF4 codebook compute correctness (ORK_NF4 path) */
     fail|=check_nf4_accuracy_gate();  /* Phase-1 gate: NF4 beats uniform int4 on Gaussian weights (CPU-only) */
+    fail|=check_pack_i4a8_imatrix(c8);/* Phase-1.3: imatrix weighted scale selection beats absmax on important cols */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");

@@ -81,6 +81,14 @@ int          ork_mm_repack_i8_dequant(ork_npu *ctx, ork_w *w, int K, int N, ork_
  * lookup (vqtbl); better accuracy for Gaussian-ish weights. Set via env ORK_NF4 on ork_mm_pack_i4a8. */
 enum { ORK_QK_UNIFORM = 0, ORK_QK_CODEBOOK_NF4 = 1 };
 ork_w       *ork_mm_pack_i4a8(ork_npu *ctx, int K, int N, const float *f32, float *bscale_out);
+/* As ork_mm_pack_i4a8, but with optional importance-matrix (imatrix) weighted per-channel scale
+ * selection. imatrix = optional per-INPUT-channel importance, length K (NULL = uniform / current
+ * absmax behavior, byte-for-byte identical to ork_mm_pack_i4a8). When non-NULL, each output channel's
+ * quant scale is chosen by searching a small clip-ratio grid r*absmax to minimize the importance-
+ * weighted reconstruction error Sum_k imatrix[k]*(w[n][k] - dequant)^2 — clipping trades outlier error
+ * for bulk resolution; imatrix decides which input columns' error matters. Applies to both the uniform
+ * and NF4 (ORK_NF4) paths. O(grid*K) per channel (pack is one-time). K%32, N%32. */
+ork_w       *ork_mm_pack_i4a8_im(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, float *bscale_out);
 ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */
