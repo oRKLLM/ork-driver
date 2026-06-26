@@ -273,6 +273,93 @@ static int check_pack_i4a8(ork_npu *ctx) {
     return ok?0:1;
 }
 
+/* The fixed bitsandbytes NF4 levels (index 0..15) — must match ORK_NF4_LEVELS in src/npu.c. */
+static const float NF4_LEVELS[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f };
+/* nearest NF4 index for normalized w in [-1,1] (round-to-nearest, matches quant_chan_nf4 sr=0) */
+static int nf4_nearest(float wn) {
+    if (wn > 1.0f) wn = 1.0f; else if (wn < -1.0f) wn = -1.0f;
+    int hi = 0; while (hi < 15 && NF4_LEVELS[hi] < wn) hi++;
+    int lo = hi > 0 ? hi-1 : 0;
+    if (lo == hi) return hi;
+    float t = (wn - NF4_LEVELS[lo]) / (NF4_LEVELS[hi]-NF4_LEVELS[lo]);
+    return (t >= 0.5f) ? hi : lo;
+}
+/* Box-Muller standard-normal sample (own LCG so it's deterministic + independent of rnd()) */
+static unsigned gsd = 99173; static double gunif(void){ gsd = gsd*1103515245u+12345u; return ((gsd>>8)&0xffffff)/16777216.0 + 1e-9; }
+static float gauss(void){ double u1=gunif(), u2=gunif(); return (float)(sqrt(-2.0*log(u1))*cos(6.283185307179586*u2)); }
+
+/* (1) NF4 COMPUTE correctness: pack random f32 weights with the NF4 codebook (ORK_NF4 set), run run_i8,
+ * compare to a CPU reference that uses the SAME nearest-NF4 indices (level*bscale x dequant'd int8 acts).
+ * Isolates compute correctness given the NF4-quantized weights. Tolerance: int8-activation quant noise. */
+static int check_pack_nf4_correct(ork_npu *ctx) {
+    int M = 8, K = 2048, N = 512;
+    float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
+    for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = gauss();                    /* Gaussian weights: NF4's design point */
+    for (size_t j=0;j<(size_t)M*K;j++) Af[j] = gauss();
+    setenv("ORK_NF4", "1", 1);
+    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    unsetenv("ORK_NF4");
+    if (!w) { printf("  pack_i4a8(NF4) failed\n"); free(Bf);free(Af);free(bsc); return 1; }
+    int qk = ork_w_quant_kind(w); int qk_ok = (qk == ORK_QK_CODEBOOK_NF4);
+    int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
+    for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
+        asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
+    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    /* CPU reference: per channel n, absmax=max|w|, bscale=absmax/127; each weight -> nearest NF4 level,
+     * dequant = level*absmax = level*127*bscale. Compare against asc[m]*bsc[n]*Ci. */
+    double se=0, sref=0;
+    if (!rc) for (int n=0;n<N;n++){
+        const float *wr = Bf + (size_t)n*K; float bs = bsc[n]; float absmax = bs*127.0f; float ainv = absmax>0?1.0f/absmax:0.0f;
+        for (int m=0;m<M;m++){
+            double ref=0;
+            for (int k=0;k<K;k++){ int idx = nf4_nearest(wr[k]*ainv);
+                double wdq = (double)NF4_LEVELS[idx]*absmax; double adq = (double)Ai[(size_t)m*K+k]*asc[m];
+                ref += adq*wdq; }
+            double got = (double)asc[m]*bs*Ci[(size_t)m*N+n];
+            se += (got-ref)*(got-ref); sref += ref*ref; }
+    }
+    double rms = sqrt(se/((double)M*N)) / (sqrt(sref/((double)M*N))+1e-9);
+    int ok = (!rc) && qk_ok && rms < 0.03;
+    printf("  %s pack_i4a8 NF4 correctness M=%d K=%d N=%d  rc=%d quant_kind=%d RMS rel err=%.3f%%\n",
+           ok?"ok  ":"WRONG", M,K,N, rc, qk, rms*100);
+    ork_w_free(w); free(Bf);free(Af);free(bsc);free(Ai);free(asc);free(Ci);
+    return ok?0:1;
+}
+
+/* (2) ACCURACY GATE (Phase-1): on Gaussian N(0,1) weights, NF4's reconstruction error must beat uniform
+ * int4. Quantize the SAME weights both ways (CPU-side, matching the pack math) and compare RMS of
+ * (dequant(q) - w) vs the original f32. Asserts NF4_err < uniform_err. */
+static int check_nf4_accuracy_gate(void) {
+    int K = 4096, N = 256;
+    float *Bf = malloc((size_t)N*K*sizeof(float));
+    for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = gauss();
+    double se_u=0, se_n=0, sw=0;
+    for (int n=0;n<N;n++){
+        const float *wr = Bf + (size_t)n*K; float mx=1e-9f;
+        for (int k=0;k<K;k++){ float v=fabsf(wr[k]); if(v>mx)mx=v; }
+        float uscale = mx/7.0f;                          /* uniform int4: scale=max/7, RN, clamp [-7,7] */
+        float ainv = mx>0?1.0f/mx:0.0f;                  /* NF4: normalize by absmax */
+        for (int k=0;k<K;k++){
+            int q=(int)lrintf(wr[k]/uscale); if(q>7)q=7; else if(q<-7)q=-7;
+            double udq = (double)q*uscale;
+            int idx = nf4_nearest(wr[k]*ainv); double ndq = (double)NF4_LEVELS[idx]*mx;
+            double d_u = udq - wr[k], d_n = ndq - wr[k];
+            se_u += d_u*d_u; se_n += d_n*d_n; sw += (double)wr[k]*wr[k];
+        }
+    }
+    double n_tot=(double)N*K, wr_rms=sqrt(sw/n_tot)+1e-12;
+    double err_u = sqrt(se_u/n_tot), err_n = sqrt(se_n/n_tot);
+    int ok = err_n < err_u;
+    printf("  %s NF4 accuracy gate (Gaussian N(0,1), K=%d N=%d): uniform err=%.4f  NF4 err=%.4f  ratio NF4/uniform=%.3f  (w_rms=%.3f)\n",
+           ok?"ok  ":"WRONG", K, N, err_u/wr_rms, err_n/wr_rms, err_n/err_u, wr_rms);
+    free(Bf);
+    return ok?0:1;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -336,6 +423,8 @@ int main(void){
     fail|=check_chain_envelope(c8);   /* verify full-K envelope guard (reject K%512!=0 vs silent-wrong) */
     fail|=check_pack_i8_f32(c8);      /* verify NEON f32->int8 pack (used by the MoE repack) */
     fail|=check_pack_i4a8(c8);        /* verify "effective w4a8": int4 wt / int8 compute / int4 storage */
+    fail|=check_pack_nf4_correct(c8); /* verify NF4 codebook compute correctness (ORK_NF4 path) */
+    fail|=check_nf4_accuracy_gate();  /* Phase-1 gate: NF4 beats uniform int4 on Gaussian weights (CPU-only) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");

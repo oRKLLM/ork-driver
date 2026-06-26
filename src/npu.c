@@ -638,12 +638,68 @@ static void expand_chan_i4_f32(const uint8_t *nib, int K, float *qf32) {
         qf32[k] = (float)c;
     }
 }
+/* ---- NF4 codebook (non-uniform int4): the 16 fixed bitsandbytes NF4 normalized levels, index 0..15 ----
+ * Unlike UNIFORM (a symmetric int4 grid), the 4-bit value indexes this per-tensor codebook of levels tuned
+ * for ~N(0,1) weights. Per-channel scale = max|w_n| (so bscale[n]=absmax/127 and the int8 LUT = round(level*127)
+ * reconstructs level*absmax). Better accuracy than uniform int4 for Gaussian-ish weights. */
+static const float ORK_NF4_LEVELS[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.39491748809814453f,
+    -0.28444138169288635f, -0.18477343022823334f, -0.09105003625154495f, 0.0f,
+    0.07958029955625534f, 0.16093020141124725f, 0.24611230194568634f, 0.33791524171829224f,
+    0.44070982933044434f, 0.5626170039176941f, 0.7229568362236023f, 1.0f };
+/* Quantize one output channel's K f32 weights to NF4: per-element find the nearest NF4 level -> 4-bit index
+ * (0..15), nibble-pack into `nib` (K/2 bytes). The NF4 levels are monotonically increasing, so we find the
+ * bracketing pair [lo,hi] and pick the nearer. sr!=0: stochastic-round between the two bracketing levels —
+ * pick lo with probability proportional to (w_norm - level[lo])/(level[hi]-level[lo]) toward hi. `absmax`
+ * is the per-channel max|w| (>0); w_norm=w/absmax in [-1,1]. Indices written to qidx[K] for the int8 inflate. */
+static void quant_chan_nf4(const float *fr, int K, float absmax, int sr, uint32_t *seed, uint8_t *nib, uint8_t *qidx) {
+    float inv = absmax > 0 ? 1.0f/absmax : 0.0f;
+    for (int k = 0; k < K; k++) {
+        float wn = fr[k]*inv; if (wn > 1.0f) wn = 1.0f; else if (wn < -1.0f) wn = -1.0f;
+        /* find bracketing pair: hi = first level >= wn */
+        int hi = 0; while (hi < 15 && ORK_NF4_LEVELS[hi] < wn) hi++;
+        int lo = hi > 0 ? hi-1 : 0;
+        int idx;
+        if (lo == hi) idx = hi;
+        else {
+            float dlo = ORK_NF4_LEVELS[hi]-ORK_NF4_LEVELS[lo];     /* span > 0 */
+            float t = (wn - ORK_NF4_LEVELS[lo]) / dlo;             /* fractional pos in [0,1] toward hi */
+            if (sr) { float u = (float)(ork_xs32(seed) >> 8) * (1.0f/16777216.0f); /* u in [0,1) */
+                      idx = (t > u) ? hi : lo; }                   /* P(hi) = t */
+            else      idx = (t >= 0.5f) ? hi : lo;                 /* nearest level */
+        }
+        qidx[k] = (uint8_t)idx;
+        uint8_t nb = (uint8_t)(idx & 0xf);
+        if (k & 1) nib[k>>1] |= (uint8_t)(nb << 4); else nib[k>>1] = nb;
+    }
+}
+/* Inflate one channel's NF4 indices (0..15) -> int8 codes via the fixed 16-entry LUT (round(level*127)),
+ * writing f32 for the int8 tiler. NEON path uses vqtbl1q_u8 (16-byte table lookup, 16 idx/iter). The LUT
+ * is the SAME for every channel (per-tensor codebook); bscale[n]=absmax/127 carries the per-channel scale. */
+static void inflate_chan_nf4_f32(const uint8_t *qidx, int K, const int8_t lut[16], float *qf32) {
+    int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    int8x16_t vlut = vld1q_s8(lut);
+    for (; k <= K - 16; k += 16) {
+        uint8x16_t vi = vld1q_u8(qidx + k);
+        int8x16_t codes = vqtbl1q_s8(vlut, vi);               /* table lookup: code = lut[idx] */
+        int16x8_t lo16 = vmovl_s8(vget_low_s8(codes));
+        int16x8_t hi16 = vmovl_s8(vget_high_s8(codes));
+        vst1q_f32(qf32 + k,      vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))));
+        vst1q_f32(qf32 + k + 4,  vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16))));
+        vst1q_f32(qf32 + k + 8,  vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))));
+        vst1q_f32(qf32 + k + 12, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16))));
+    }
+#endif
+    for (; k < K; k++) qf32[k] = (float)lut[qidx[k]];
+}
 ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscale_out) {
     if (K % 32 || N % 32) return NULL;
     int sr = getenv("ORK_SR") != NULL; uint32_t seed = 0x2545F491u;   /* SR PRNG: fixed seed => deterministic/testable */
+    int nf4 = getenv("ORK_NF4") != NULL;   /* ORK_NF4: non-uniform NF4 codebook instead of the uniform int4 grid */
     int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
     ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->quant_kind = ORK_QK_UNIFORM;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->quant_kind = nf4 ? ORK_QK_CODEBOOK_NF4 : ORK_QK_UNIFORM;
     w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
@@ -660,7 +716,11 @@ ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscal
     /* int8 expansion scratch (f32 codes) + per-channel inv for the int8 tiler (codes are exact, inv=1) */
     float *qf32 = malloc((size_t)N * K * sizeof(float));
     float *inv  = malloc((size_t)N * sizeof(float));
-    if (!w->Bi4 || !qf32 || !inv) { free(qf32); free(inv); ork_w_free(w); return NULL; }
+    /* NF4: a per-tensor int8 LUT = round(level*127), and an index scratch (0..15) to inflate through it */
+    int8_t nf4_lut[16]; uint8_t *qidx = NULL;
+    if (nf4) { for (int i = 0; i < 16; i++) nf4_lut[i] = (int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+               qidx = malloc((size_t)N * K); }
+    if (!w->Bi4 || !qf32 || !inv || (nf4 && !qidx)) { free(qf32); free(inv); free(qidx); ork_w_free(w); return NULL; }
     for (int n = 0; n < N; n++) {
         const float *fr = f32 + (size_t)n*K; float mx = 1e-9f; int k = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -669,16 +729,19 @@ ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscal
         float m[4]; vst1q_f32(m, vmx); float a=m[0]>m[1]?m[0]:m[1], bb=m[2]>m[3]?m[2]:m[3]; mx=a>bb?a:bb;
 #endif
         for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
-        float scale = mx / 7.0f;                       /* int4 range +-7 (NOT 127) */
-        bscale_out[n] = scale;
         uint8_t *nib = w->Bi4 + (size_t)n*(K/2);
-        quant_chan_i4(fr, K, scale, sr, &seed, nib, qf32 + (size_t)n*K);
-        inv[n] = 1.0f;                                 /* qf32 already holds the int4 codes; no rescale */
+        if (nf4) { bscale_out[n] = mx / 127.0f;        /* int8 LUT range +-127 */
+                   quant_chan_nf4(fr, K, mx, sr, &seed, nib, qidx + (size_t)n*K); }
+        else     { float scale = mx / 7.0f;            /* int4 range +-7 (NOT 127) */
+                   bscale_out[n] = scale;
+                   quant_chan_i4(fr, K, scale, sr, &seed, nib, qf32 + (size_t)n*K); }
+        inv[n] = 1.0f;                                 /* qf32 holds exact codes; no rescale */
     }
-    /* NEON-expand from the compact nibble store (validates the pack/expand round-trip is what we tile) */
-    for (int n = 0; n < N; n++) expand_chan_i4_f32(w->Bi4 + (size_t)n*(K/2), K, qf32 + (size_t)n*K);
+    /* inflate the compact nibble store -> int8 f32 codes (validates the pack/inflate round-trip is what we tile) */
+    if (nf4) for (int n = 0; n < N; n++) inflate_chan_nf4_f32(qidx + (size_t)n*K, K, nf4_lut, qf32 + (size_t)n*K);
+    else     for (int n = 0; n < N; n++) expand_chan_i4_f32(w->Bi4 + (size_t)n*(K/2), K, qf32 + (size_t)n*K);
     tile_f32_i8(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
-    free(qf32); free(inv);
+    free(qf32); free(inv); free(qidx);
     return w;
 }
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
@@ -764,6 +827,7 @@ size_t ork_w_bytes(const ork_w *w){
     if(w->Bf) for(int i=0;i<w->Sn;i++) t+=w->Bf[i].size;
     return t;
 }
+int ork_w_quant_kind(const ork_w *w){ return w ? (int)w->quant_kind : -1; }   /* ORK_QK_* (int4-store codebook) */
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----
  * Tiling: N split into 64-wide tiles (the captured regcmd's N width), K split at the 10752 single-
