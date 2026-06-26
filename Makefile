@@ -152,6 +152,11 @@ pack_f32_probe: tools/pack_f32_probe.c $(CORE)
 prefetch_headroom: tools/prefetch_headroom.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic (P5.3 follow-on): does filling the resident NPU dma_buf from DISK (mmap warm/cold, pread cold)
+# add a penalty vs RAM, and how much cheaper is the pre-tiled int8 fill than the int4 inflate+tile path?
+disk_stream_bench: tools/disk_stream_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic: Tier 4a per-group Hadamard for W4A4, validated end-to-end ON THE NPU (plain vs rotated RMS)
 hadamard_i4_npu: tools/hadamard_i4_npu.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

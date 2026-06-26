@@ -409,6 +409,15 @@ static struct buf *dma_find(ork_npu *c, const void *p){
         if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
     return NULL;
 }
+/* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
+ * device after a host write (the bsync the streaming fill would issue). Not in the public header. */
+void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
+    struct buf *b=dma_find(c,ptr); if(!b) return;
+    struct rknpu_mem_sync s; memset(&s,0,sizeof s);
+    s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
+}
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
 int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
 int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
