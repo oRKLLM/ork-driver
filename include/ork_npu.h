@@ -107,10 +107,22 @@ void         ork_w_free(ork_w *w);
 void         ork_mm_free(ork_npu *ctx, ork_w *w);
 size_t       ork_w_bytes(const ork_w *w);   /* resident NPU bytes (Bb+Bf) — for a streaming cache's IOVA budget */
 int          ork_w_quant_kind(const ork_w *w);   /* ORK_QK_* of the int4 weight store (UNIFORM / CODEBOOK_NF4) */
+/* Per-output-channel dequant scale (length N) retained on an int4-packed weight (ork_mm_pack_i4a8 /
+ * ork_mm_load_i4a8); C_real[m][n] = aScale[m]*bscale[n]*Ci[m][n]. NULL for non-int4 weights. */
+const float *ork_w_bscale(const ork_w *w);
 /* PERSIST: dump a packed weight's tile bytes (out=NULL → size), and reload pre-tiled int8 bytes straight
  * into DMA (no dequant/quant/tile) — the .orkpack fast path that makes streaming re-packs a plain copy. */
 size_t       ork_w_dump(const ork_w *w, void *out, size_t cap);
 ork_w       *ork_mm_load_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+/* COMPACT int4 PERSIST (the streaming consumer for a mixed .orkpack): dump the COMPACT int4 nibble store
+ * + per-channel scales (~half of the int8 ork_w_dump), and reload it straight into NPU DMA, inflating the
+ * nibbles -> int8 (UNIFORM sign-extend / NF4 LUT, per the stored quant_kind) and re-tiling on load. Only
+ * valid for an int4-packed weight (ork_mm_pack_i4a8); the LUT is derived from quant_kind, not stored.
+ * Blob layout: { u32 magic 'O4N1', u32 version=1, i32 K, i32 N, u32 quant_kind } + bscale[N] (N f32) +
+ * Bi4 (K*N/2 bytes). out=NULL -> required size; returns 0 if `w` has no int4 store. Loaded weight runs
+ * via ork_mm_run_i8 and re-dumps byte-identically. NULL on a malformed blob / shape mismatch. */
+size_t       ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap);
+ork_w       *ork_mm_load_i4a8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
 /* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
  *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32.

@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <string.h>
 #include "ork_npu.h"
 typedef ork_f16 f16;
 static unsigned sd=12345; static int rnd(){sd=sd*1103515245+12345;return (sd>>16)%4;}
@@ -432,6 +433,64 @@ static int check_pack_i4a8_imatrix(ork_npu *ctx) {
     return ok?0:1;
 }
 
+/* COMPACT int4 persist/load round-trip (Phase 2.1): pack random f32 with int4 (NF4 or UNIFORM) via
+ * ork_mm_pack_i4a8 and run it (C_resident). Dump the COMPACT int4 form (ork_w_dump_i4a8, size-query then
+ * fill), reload it (ork_mm_load_i4a8) and run again (C_streamed). Asserts the Phase-2 streaming gate:
+ *   (a) C_streamed == C_resident EXACTLY (same nibbles/scales/LUT => bit-identical NPU output),
+ *   (b) re-dumping the loaded weight yields byte-identical bytes (full self-contained round-trip),
+ *   (c) the per-channel bscale survives the round-trip. */
+static int check_dump_load_i4a8(ork_npu *ctx, int nf4) {
+    int M = 8, K = 2048, N = 512;
+    const char *tag = nf4 ? "NF4" : "UNIFORM";
+    float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
+    for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = gauss();
+    for (size_t j=0;j<(size_t)M*K;j++) Af[j] = gauss();
+    if (nf4) setenv("ORK_NF4", "1", 1);
+    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    if (nf4) unsetenv("ORK_NF4");
+    if (!w) { printf("  dump_load_i4a8(%s): pack failed\n", tag); free(Bf);free(Af);free(bsc); return 1; }
+
+    /* int8-quantize A (matches the run_i8 activation path) */
+    int8_t *Ai = malloc((size_t)M*K); int32_t *C_res = malloc((size_t)M*N*4), *C_str = malloc((size_t)M*N*4);
+    for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
+        float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
+    int rc1 = ork_mm_run_i8(ctx, w, M, Ai, C_res);
+
+    /* dump compact int4 form: size-query then fill */
+    size_t need = ork_w_dump_i4a8(w, NULL, 0);
+    int bad = 0;
+    if (need == 0) { printf("  dump_load_i4a8(%s): size-query returned 0\n", tag); bad = 1; }
+    size_t expect = 5*4 /*hdr: 2 u32 + 2 i32 + 1 u32*/ + (size_t)N*sizeof(float) + (size_t)K*N/2;
+    if (!bad && need != expect) { printf("  dump_load_i4a8(%s): size %zu != expected %zu\n", tag, need, expect); bad = 1; }
+    void *blob = malloc(need);
+    size_t got = ork_w_dump_i4a8(w, blob, need);
+    if (!bad && got != need) { printf("  dump_load_i4a8(%s): fill returned %zu != %zu\n", tag, got, need); bad = 1; }
+
+    /* reload + run */
+    ork_w *wl = bad ? NULL : ork_mm_load_i4a8(ctx, K, N, blob, need);
+    if (!bad && !wl) { printf("  dump_load_i4a8(%s): load failed\n", tag); bad = 1; }
+    int rc2 = wl ? ork_mm_run_i8(ctx, wl, M, Ai, C_str) : -1;
+
+    /* (a) bit-identical output */
+    int out_exact = (!bad && rc1==0 && rc2==0) ? (memcmp(C_res, C_str, (size_t)M*N*4)==0) : 0;
+    /* (b) byte-identical re-dump */
+    int rt_exact = 0;
+    if (wl) { void *blob2 = malloc(need); size_t got2 = ork_w_dump_i4a8(wl, blob2, need);
+              rt_exact = (got2==need && memcmp(blob, blob2, need)==0); free(blob2); }
+    /* (c) bscale carried + quant_kind */
+    int bsc_ok = 0;
+    if (wl) { const float *bl = ork_w_bscale(wl); bsc_ok = (bl != NULL);
+              if (bl) for (int n=0;n<N;n++) if (bl[n] != bsc[n]) { bsc_ok = 0; break; } }
+    int qk_ok = wl ? (ork_w_quant_kind(wl) == (nf4?ORK_QK_CODEBOOK_NF4:ORK_QK_UNIFORM)) : 0;
+
+    int ok = !bad && out_exact && rt_exact && bsc_ok && qk_ok;
+    printf("  %s dump_load_i4a8 %s M=%d K=%d N=%d  blob=%zuB (int8 dump=%zuB)  rc=%d/%d  out_exact=%d roundtrip=%d bscale=%d qk=%d\n",
+           ok?"ok  ":"WRONG", tag, M,K,N, need, (size_t)K*N, rc1, rc2, out_exact, rt_exact, bsc_ok, qk_ok);
+    ork_w_free(w); if (wl) ork_mm_free(ctx, wl);
+    free(Bf);free(Af);free(bsc);free(Ai);free(C_res);free(C_str);free(blob);
+    return ok?0:1;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -498,6 +557,8 @@ int main(void){
     fail|=check_pack_nf4_correct(c8); /* verify NF4 codebook compute correctness (ORK_NF4 path) */
     fail|=check_nf4_accuracy_gate();  /* Phase-1 gate: NF4 beats uniform int4 on Gaussian weights (CPU-only) */
     fail|=check_pack_i4a8_imatrix(c8);/* Phase-1.3: imatrix weighted scale selection beats absmax on important cols */
+    fail|=check_dump_load_i4a8(c8, 1);/* Phase-2.1: compact int4 persist/load round-trip (NF4) — streamed==resident */
+    fail|=check_dump_load_i4a8(c8, 0);/* Phase-2.1: compact int4 persist/load round-trip (UNIFORM) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");

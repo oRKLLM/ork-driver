@@ -60,7 +60,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
      * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
     struct buf wchunk[64]; int wchunk_n; size_t wchunk_off; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -761,6 +761,8 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
     /* compact int4 nibble store (n-major, K contiguous): the memory-win form, kept on the ork_w */
     w->Bi4_bytes = (size_t)N * (K/2);
     w->Bi4 = malloc(w->Bi4_bytes);
+    /* retain per-channel dequant scale on the ork_w so the compact int4 form can be dumped self-contained */
+    w->bscale = malloc((size_t)N * sizeof(float));
     /* int8 expansion scratch (f32 codes) + per-channel inv for the int8 tiler (codes are exact, inv=1) */
     float *qf32 = malloc((size_t)N * K * sizeof(float));
     float *inv  = malloc((size_t)N * sizeof(float));
@@ -770,7 +772,7 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
                qidx = malloc((size_t)N * K); }
     /* imatrix path: reused per-channel dequant scratch[K] for the clip-grid search (NULL imatrix => unused) */
     float *imdq = imatrix ? malloc((size_t)K * sizeof(float)) : NULL;
-    if (!w->Bi4 || !qf32 || !inv || (nf4 && !qidx) || (imatrix && !imdq)) {
+    if (!w->Bi4 || !w->bscale || !qf32 || !inv || (nf4 && !qidx) || (imatrix && !imdq)) {
         free(qf32); free(inv); free(qidx); free(imdq); ork_w_free(w); return NULL; }
     for (int n = 0; n < N; n++) {
         const float *fr = f32 + (size_t)n*K; float mx = 1e-9f; int k = 0;
@@ -782,11 +784,12 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
         for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
         if (imatrix) mx = wq_best_absmax(fr, K, mx, nf4, imatrix, imdq);  /* clip-grid scale selection */
         uint8_t *nib = w->Bi4 + (size_t)n*(K/2);
-        if (nf4) { bscale_out[n] = mx / 127.0f;        /* int8 LUT range +-127 */
+        if (nf4) { w->bscale[n] = mx / 127.0f;         /* int8 LUT range +-127 */
                    quant_chan_nf4(fr, K, mx, sr, &seed, nib, qidx + (size_t)n*K); }
         else     { float scale = mx / 7.0f;            /* int4 range +-7 (NOT 127) */
-                   bscale_out[n] = scale;
+                   w->bscale[n] = scale;
                    quant_chan_i4(fr, K, scale, sr, &seed, nib, qf32 + (size_t)n*K); }
+        bscale_out[n] = w->bscale[n];                  /* back-compat: caller's out array */
         inv[n] = 1.0f;                                 /* qf32 holds exact codes; no rescale */
     }
     /* inflate the compact nibble store -> int8 f32 codes (validates the pack/inflate round-trip is what we tile) */
@@ -794,6 +797,74 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
     else     for (int n = 0; n < N; n++) expand_chan_i4_f32(w->Bi4 + (size_t)n*(K/2), K, qf32 + (size_t)n*K);
     tile_f32_i8(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
     free(qf32); free(inv); free(qidx); free(imdq);
+    return w;
+}
+/* ---- COMPACT int4 PERSIST (.orkpack streaming form) ----
+ * Unlike ork_w_dump (which serializes the EXPANDED int8 tile bytes, ~K*N), this dumps the COMPACT int4
+ * nibble store (~K*N/2) + per-channel scales — about half the size — and ork_mm_load_i4a8 re-inflates the
+ * nibbles -> int8 and re-tiles on load (the tail of the pack path, but from stored nibbles, not f32). The
+ * blob is self-contained: the NF4 LUT is NOT stored (it's derived from quant_kind). */
+#define ORK_I4A8_MAGIC  0x4F344E31u           /* 'O','4','N','1' */
+#define ORK_I4A8_VER    1u
+struct ork_i4a8_hdr { uint32_t magic, version; int32_t K, N; uint32_t quant_kind; };
+/* Serialize the compact int4 form: header + bscale[N] (f32) + Bi4 (K*N/2 bytes). out=NULL -> required
+ * size. Returns 0 if `w` is not an int4-packed weight (no Bi4/bscale) or on cap overflow. */
+size_t ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap){
+    if(!w || !w->Bi4 || !w->bscale) return 0;
+    size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)w->N*sizeof(float), nib=(size_t)w->K*w->N/2;
+    size_t need=hdr+sc+nib;
+    if(!out) return need;
+    if(cap<need) return 0;
+    struct ork_i4a8_hdr h={ORK_I4A8_MAGIC, ORK_I4A8_VER, w->K, w->N, w->quant_kind};
+    char *p=out;
+    memcpy(p,&h,hdr); p+=hdr;
+    memcpy(p,w->bscale,sc); p+=sc;
+    memcpy(p,w->Bi4,nib);
+    return need;
+}
+/* Reload the compact int4 form straight into NPU DMA: parse+validate header, read bscale + Bi4, inflate
+ * each channel's nibbles -> int8 (UNIFORM sign-extend / NF4 LUT per quant_kind) and tile_f32_i8 into a
+ * fresh DMA buffer — the tail of the pack path, from stored nibbles instead of re-quantized f32. Retains
+ * a copy of Bi4 + bscale so the loaded weight can be re-dumped byte-identically. NULL on malformed blob. */
+ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
+    if(K%32 || N%32) return NULL;
+    size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
+    if(n != hdr+sc+nib) return NULL;
+    const char *p=blob;
+    struct ork_i4a8_hdr h; memcpy(&h,p,hdr); p+=hdr;
+    if(h.magic!=ORK_I4A8_MAGIC || h.version!=ORK_I4A8_VER || h.K!=K || h.N!=N) return NULL;
+    if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->quant_kind=(uint8_t)h.quant_kind;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    if(!w->Bb){ free(w); return NULL; }
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+    if(K<=10752){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            struct buf *b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc,0x403); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    /* retain the compact store + scales so the loaded weight re-dumps byte-identically */
+    w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
+    float *qf32=malloc((size_t)N*K*sizeof(float)), *inv=malloc((size_t)N*sizeof(float));
+    if(!w->Bi4 || !w->bscale || !qf32 || !inv){ free(qf32); free(inv); ork_mm_free(c,w); return NULL; }
+    memcpy(w->bscale,p,sc); p+=sc;
+    memcpy(w->Bi4,p,nib);
+    int8_t nf4_lut[16];
+    if(w->quant_kind==ORK_QK_CODEBOOK_NF4) for(int i=0;i<16;i++) nf4_lut[i]=(int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+    for(int nn=0;nn<N;nn++){
+        if(w->quant_kind==ORK_QK_CODEBOOK_NF4){
+            /* NF4 store keeps the 0..15 index in the nibble; inflate via the int8 LUT */
+            const uint8_t *nibp=w->Bi4+(size_t)nn*(K/2); float *qf=qf32+(size_t)nn*K;
+            for(int k=0;k<K;k++){ uint8_t idx=(k&1)?(nibp[k>>1]>>4):(nibp[k>>1]&0xf); qf[k]=(float)nf4_lut[idx]; }
+        } else expand_chan_i4_f32(w->Bi4+(size_t)nn*(K/2), K, qf32+(size_t)nn*K);
+        inv[nn]=1.0f;                                  /* qf32 holds exact codes; no rescale */
+    }
+    tile_f32_i8(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
+    free(qf32); free(inv);
     return w;
 }
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
@@ -857,7 +928,7 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
     if (w->K != K || w->N != N) return -2;
     return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
 }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w); }   /* device buffers freed at ctx teardown */
 /* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
  * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
  * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; arena-view weights
@@ -869,7 +940,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
         if(w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
     }
-    free(w->Bb); free(w->Bf); free(w->Bi4); free(w);
+    free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
@@ -880,6 +951,7 @@ size_t ork_w_bytes(const ork_w *w){
     return t;
 }
 int ork_w_quant_kind(const ork_w *w){ return w ? (int)w->quant_kind : -1; }   /* ORK_QK_* (int4-store codebook) */
+const float *ork_w_bscale(const ork_w *w){ return w ? w->bscale : NULL; }     /* per-channel dequant scale (int4 store), NULL if none */
 
 /* ---- W4A4 public API (int4 A x int4 B -> int32 C), built on the validated synth_i4/regcmd_i4. ----
  * Tiling: N split into 64-wide tiles (the captured regcmd's N width), K split at the 10752 single-
