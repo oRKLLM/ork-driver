@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -e
 
-sudo systemctl stop orkllm || true
+# NOTE: do NOT stop orkllm here. Idle, it sits on the little cores with no NPU
+# handle (zero contention) and keeps the telemetry dashboard live; this bench runs
+# llama-server directly and never spawns an orkllm worker. Stopping it was the
+# wrong lever (it also killed the dashboard) — established policy: leave orkllm up.
 
 # --- Guaranteed performance-governor pinning ----------------------------------
-# A benchmark on a parked DDR governor reads ~half the real decode (stopping
-# orkllm above releases its perf pin), so we pin DDR + the big cores, then VERIFY
+# A benchmark on a parked DDR governor reads ~half the real decode, so we pin DDR
+# + the big cores, then VERIFY
 # by reading the values back and ABORT if any isn't 'performance' — a non-pinned
 # run must never be mistaken for a valid number. Originals are restored on exit.
 DMC_GOV=/sys/class/devfreq/dmc/governor
