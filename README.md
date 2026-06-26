@@ -36,6 +36,35 @@ ork_npu_free(ctx);
 
 The matmul engine is the foundation; `examples/` builds on it up to a full LLM forward pass.
 
+## Quantization: int8, int4, NF4, mixed-precision
+
+The same `pack` → `run` shape is available quantized. The NPU MAC is int8, so int4 is a
+**storage** win (half the bytes on disk / in host RAM); weights inflate to int8 just before the
+tiled DMA.
+
+```c
+// w8a8: int8 weights, int8 activations -> int32 accumulate (A int8[M,K], C int32[M,N])
+ork_w *w = ork_mm_pack_i8_f32(ctx, K, N, Bf32, bscale);  ork_mm_run_i8(ctx, w, M, A, C);
+
+// w4a8: 4-bit weight STORAGE, int8 compute. Uniform grid by default;
+//   ORK_NF4=1 -> NF4 (normal-float-4) codebook (better for Gaussian-ish weights);
+//   ORK_SR=1  -> stochastic rounding.
+ork_w *w4 = ork_mm_pack_i4a8(ctx, K, N, Bf32, bscale);
+
+// w4a8 + importance matrix: per-input-channel weights pick a clip-optimal per-channel scale.
+ork_w *wi = ork_mm_pack_i4a8_im(ctx, K, N, Bf32, imatrix /*len K, NULL=uniform*/, bscale);
+```
+
+- **Compact int4 persist** — `ork_w_dump_i4a8` serializes the nibble store + per-channel scales
+  (`'O4N1'` blob, ~½ the tiled-int8 dump); `ork_mm_load_i4a8` reloads it straight into NPU DMA
+  (inflate → tile). `ork_w_bscale` / `ork_w_quant_kind` expose the stored scales / codebook.
+- **Mixed-precision allocation** — `tools/gguf_tier_map.c` reads any GGUF's per-tensor quant
+  types and maps them onto `{int8, int4}` tiers by an effective-bits threshold (the
+  accuracy↔memory dial); `--emit-map` writes a `name<TAB>tier` file. The llama.cpp-rockchip
+  `ggml-ork` backend uses this to build a mixed int8/int4-NF4 `.orkpack` (int4 for the bulk,
+  int8 for importance-bumped tensors), quantizing **values from an fp16 source** with the GGUF
+  used only as the allocation oracle.
+
 ## Build & run (on a Rockchip board)
 
 Requires the `rknpu` DRM driver (stock on Rockchip Linux), a C compiler, and access to
