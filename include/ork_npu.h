@@ -66,6 +66,20 @@ int          ork_mm_repack_i8_f32(ork_npu *ctx, ork_w *w, int K, int N, const fl
 typedef void (*ork_dequant_row_fn)(void *dctx, int n, float *dst, int K);
 ork_w       *ork_mm_pack_i8_dequant  (ork_npu *ctx, int K, int N, ork_dequant_row_fn dequant, void *dctx, float *bscale_out);
 int          ork_mm_repack_i8_dequant(ork_npu *ctx, ork_w *w, int K, int N, ork_dequant_row_fn dequant, void *dctx, float *bscale_out);
+/* "Effective w4a8": int4-PRECISION weights, int8 compute, int4 STORAGE. RK3588's NPU MACs are int8-only
+ * (no native w4a8), so this quantizes f32[N][K] (n-major, as ggml's to_float produces) to int4 per output
+ * channel (symmetric, scale = max|w_n|/7, range [-7,7]), keeps the compact nibble-packed form on the ork_w
+ * (K*N/2 bytes — the memory win), NEON-expands int4->int8 [-7,7] in software, and tiles that into the int8
+ * resident layout. Runs unchanged via ork_mm_run_i8 (returns a DT_I8 ork_w). Writes per-channel bscale[N]
+ * (C_real[m][n] = aScale[m]*bscale[n]*Ci[m][n]). Round-to-nearest by default; set env ORK_SR for
+ * stochastic rounding (debiases quantization — dot-product error grows ~sqrt(K) not O(K)). K%32, N%32. */
+/* Int4 weight-store codebook kind (ork_w.quant_kind, set by pack_i4a8 / the int4 .orkpack form). 0 = UNIFORM:
+ * the 4-bit value is a uniform int4 grid level; int4->int8 inflation is a sign-extend. 1 = CODEBOOK_NF4: the
+ * 4-bit value indexes a 16-entry per-tensor LUT of non-uniform levels (NF4-style) — inflate via a NEON table
+ * lookup (vqtbl); better accuracy for Gaussian-ish weights. CODEBOOK is RESERVED (not yet implemented); the
+ * field exists now so it lands as a new value + a branch at the inflation point, no struct/.orkpack change. */
+enum { ORK_QK_UNIFORM = 0, ORK_QK_CODEBOOK_NF4 = 1 };
+ork_w       *ork_mm_pack_i4a8(ork_npu *ctx, int K, int N, const float *f32, float *bscale_out);
 ork_w       *ork_mm_pack_i4(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int4 weights, [-8,7] in int8; K%32, N%64 */
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_mm_run_i4_grouped, which dequantizes per group into fp32. */

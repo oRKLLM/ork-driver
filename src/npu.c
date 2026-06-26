@@ -60,7 +60,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
      * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
     struct buf wchunk[64]; int wchunk_n; size_t wchunk_off; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown) */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -583,6 +583,104 @@ ork_w *ork_mm_pack_i8_f32(ork_npu *c, int K, int N, const float *f32, float *bsc
     free(inv);
     return w;
 }
+/* ---- "effective w4a8": int4-PRECISION weights, int8 compute, int4 STORAGE ----
+ * RK3588's NPU MACs are int8-only — there is no native int4->int8 datapath. So we synthesize w4a8:
+ * quantize each weight to int4 precision (per-channel scale = max|w|/7, range [-7,7]), keep the
+ * compact nibble-packed form on the ork_w (w->Bi4, K*N/2 bytes — the memory win + the on-disk form
+ * for .orkpack/streaming), then NEON-expand the nibbles back to int8 [-7,7] and DMA-tile that through
+ * the existing int8 path so the result runs via ork_mm_run_i8 unchanged. bscale_out[n] carries the
+ * dequant scale (C_real[m][n] = aScale[m]*bscale[n]*Ci[m][n], same convention as pack_i8_f32). */
+static inline uint32_t ork_xs32(uint32_t *s){ uint32_t x=*s; x^=x<<13; x^=x>>17; x^=x<<5; *s=x; return x; }
+/* quantize one output channel's K f32 weights -> int4 q in [-7,7], nibble-pack into `nib` (K/2 bytes),
+ * and write the dequantized int8 q-value (== the int4 code) as f32 into `qf32[K]` for the int8 tiler.
+ * sr!=0: stochastic rounding (q=floor(w/scale + u), u in [0,1) from xorshift) — SR removes the
+ * quantization BIAS so dot-product error grows ~sqrt(K) instead of O(K). seed advanced per element. */
+static void quant_chan_i4(const float *fr, int K, float scale, int sr, uint32_t *seed, uint8_t *nib, float *qf32) {
+    float inv = scale > 0 ? 1.0f/scale : 0.0f;
+    for (int k = 0; k < K; k++) {
+        int q;
+        if (sr) { float u = (float)(ork_xs32(seed) >> 8) * (1.0f/16777216.0f);  /* u in [0,1) */
+                  q = (int)floorf(fr[k]*inv + u); }
+        else      q = (int)lrintf(fr[k]*inv);
+        if (q > 7) q = 7; else if (q < -7) q = -7;
+        qf32[k] = (float)q;
+        uint8_t nb = (uint8_t)(q & 0xf);              /* low nibble holds the signed 4-bit code */
+        if (k & 1) nib[k>>1] |= (uint8_t)(nb << 4); else nib[k>>1] = nb;
+    }
+}
+/* NEON-expand one channel's nibble-packed int4 codes -> int8 [-7,7] sign-extended floats in qf32[K].
+ * (The "NEON where the NPU can't": the hardware has no int4->int8 expansion datapath; we do it in
+ * software, then feed the int8 tiler.) Bulk path does 16 codes (8 bytes) per iteration. */
+static void expand_chan_i4_f32(const uint8_t *nib, int K, float *qf32) {
+    int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    uint8x8_t vlo = vdup_n_u8(0x0f);
+    for (; k <= K - 16; k += 16) {
+        uint8x8_t pk = vld1_u8(nib + (k>>1));                 /* 8 bytes = 16 nibbles */
+        int8x8_t even = vreinterpret_s8_u8(vand_u8(pk, vlo)); /* low nibbles  (codes k,k+2,...) */
+        int8x8_t odd  = vreinterpret_s8_u8(vshr_n_u8(pk, 4)); /* high nibbles (codes k+1,...) */
+        /* sign-extend 4-bit: shift the nibble into the top of an int8, then arithmetic-shift back */
+        even = vshr_n_s8(vshl_n_s8(even, 4), 4);
+        odd  = vshr_n_s8(vshl_n_s8(odd,  4), 4);
+        int8x8x2_t zip = vzip_s8(even, odd);                  /* interleave -> code order */
+        int8x16_t codes = vcombine_s8(zip.val[0], zip.val[1]);
+        int16x8_t lo16 = vmovl_s8(vget_low_s8(codes));
+        int16x8_t hi16 = vmovl_s8(vget_high_s8(codes));
+        vst1q_f32(qf32 + k,      vcvtq_f32_s32(vmovl_s16(vget_low_s16(lo16))));
+        vst1q_f32(qf32 + k + 4,  vcvtq_f32_s32(vmovl_s16(vget_high_s16(lo16))));
+        vst1q_f32(qf32 + k + 8,  vcvtq_f32_s32(vmovl_s16(vget_low_s16(hi16))));
+        vst1q_f32(qf32 + k + 12, vcvtq_f32_s32(vmovl_s16(vget_high_s16(hi16))));
+    }
+#endif
+    for (; k < K; k++) {
+        uint8_t nb = (k & 1) ? (nib[k>>1] >> 4) : (nib[k>>1] & 0xf);
+        int8_t c = (int8_t)(nb << 4) >> 4;                    /* sign-extend 4-bit */
+        qf32[k] = (float)c;
+    }
+}
+ork_w *ork_mm_pack_i4a8(ork_npu *c, int K, int N, const float *f32, float *bscale_out) {
+    if (K % 32 || N % 32) return NULL;
+    int sr = getenv("ORK_SR") != NULL; uint32_t seed = 0x2545F491u;   /* SR PRNG: fixed seed => deterministic/testable */
+    int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
+    ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->quant_kind = ORK_QK_UNIFORM;
+    w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
+    if (!w->Bb) { free(w); return NULL; }
+    for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+      for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+    if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
+        for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+    /* compact int4 nibble store (n-major, K contiguous): the memory-win form, kept on the ork_w */
+    w->Bi4_bytes = (size_t)N * (K/2);
+    w->Bi4 = malloc(w->Bi4_bytes);
+    /* int8 expansion scratch (f32 codes) + per-channel inv for the int8 tiler (codes are exact, inv=1) */
+    float *qf32 = malloc((size_t)N * K * sizeof(float));
+    float *inv  = malloc((size_t)N * sizeof(float));
+    if (!w->Bi4 || !qf32 || !inv) { free(qf32); free(inv); ork_w_free(w); return NULL; }
+    for (int n = 0; n < N; n++) {
+        const float *fr = f32 + (size_t)n*K; float mx = 1e-9f; int k = 0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t vmx = vdupq_n_f32(1e-9f);
+        for (; k <= K-4; k += 4) vmx = vmaxq_f32(vmx, vabsq_f32(vld1q_f32(fr + k)));
+        float m[4]; vst1q_f32(m, vmx); float a=m[0]>m[1]?m[0]:m[1], bb=m[2]>m[3]?m[2]:m[3]; mx=a>bb?a:bb;
+#endif
+        for (; k < K; k++) { float v = fabsf(fr[k]); if (v > mx) mx = v; }
+        float scale = mx / 7.0f;                       /* int4 range +-7 (NOT 127) */
+        bscale_out[n] = scale;
+        uint8_t *nib = w->Bi4 + (size_t)n*(K/2);
+        quant_chan_i4(fr, K, scale, sr, &seed, nib, qf32 + (size_t)n*K);
+        inv[n] = 1.0f;                                 /* qf32 already holds the int4 codes; no rescale */
+    }
+    /* NEON-expand from the compact nibble store (validates the pack/expand round-trip is what we tile) */
+    for (int n = 0; n < N; n++) expand_chan_i4_f32(w->Bi4 + (size_t)n*(K/2), K, qf32 + (size_t)n*K);
+    tile_f32_i8(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
+    free(qf32); free(inv);
+    return w;
+}
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
     if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
     if (w->K != K || w->N != N) return -2;
@@ -644,7 +742,7 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
     if (w->K != K || w->N != N) return -2;
     return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
 }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w); }   /* device buffers freed at ctx teardown */
 /* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
  * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
  * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; arena-view weights
@@ -656,7 +754,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
         if(w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
     }
-    free(w->Bb); free(w->Bf); free(w);
+    free(w->Bb); free(w->Bf); free(w->Bi4); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */

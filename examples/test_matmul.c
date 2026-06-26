@@ -236,6 +236,43 @@ static int check_pack_i8_f32(ork_npu *ctx) {
     return ok?0:1;
 }
 
+/* Validate the "effective w4a8" pack (ork_mm_pack_i4a8): int4-precision weights, int8 compute, int4
+ * storage. Packs f32 weights to int4 (round-to-nearest, ORK_SR unset for determinism), runs run_i8,
+ * dequants with the returned per-channel bscale, and compares to a CPU reference that computes the SAME
+ * int4-quantized weights (dequantized by bscale) x the int8 activations. This isolates COMPUTE
+ * correctness given int4 weights (not int4-vs-fp32 accuracy). Tolerance: int8-activation W8 quant noise. */
+static int check_pack_i4a8(ork_npu *ctx) {
+    int M = 8, K = 2048, N = 512;   /* K=2048 -> Sk=2 + Bf, exercises the full-K tile path too */
+    float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
+    for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = ((int)rnd()-128)/64.0f;     /* [N][K] n-major */
+    for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
+    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    if (!w) { printf("  pack_i4a8 failed\n"); free(Bf);free(Af);free(bsc); return 1; }
+    /* int8-quantize A (per-row symmetric, same as the W8A8 path) */
+    int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
+    for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
+        asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
+    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    /* CPU reference: re-quantize the weights to int4 the SAME way (scale=max/7, RN, clamp [-7,7]),
+     * dequant by bsc[n], and dot against the dequantized int8 activations. */
+    double se=0, sref=0;
+    if (!rc) for (int n=0;n<N;n++){
+        const float *wr = Bf + (size_t)n*K; float bs = bsc[n], biv = bs>0?1.0f/bs:0.0f;
+        for (int m=0;m<M;m++){
+            double ref=0;
+            for (int k=0;k<K;k++){ int q=(int)lrintf(wr[k]*biv); if(q>7)q=7; else if(q<-7)q=-7;
+                double wdq = (double)q*bs; double adq = (double)Ai[(size_t)m*K+k]*asc[m];
+                ref += adq*wdq; }
+            double got = (double)asc[m]*bs*Ci[(size_t)m*N+n];
+            se += (got-ref)*(got-ref); sref += ref*ref; }
+    }
+    double rms = sqrt(se/((double)M*N)) / (sqrt(sref/((double)M*N))+1e-9);
+    int ok = (!rc) && rms < 0.03;
+    printf("  %s pack_i4a8 (int4 wt / int8 compute / int4 storage) M=%d K=%d N=%d  rc=%d RMS rel err=%.3f%%\n", ok?"ok  ":"WRONG", M,K,N, rc, rms*100);
+    ork_w_free(w); free(Bf);free(Af);free(bsc);free(Ai);free(asc);free(Ci);
+    return ok?0:1;
+}
+
 static int test_overlap_guards(ork_npu *ctx) {
     printf("Testing memory overlap safety guards...\n");
     int M = 1, K = 32, N = 32;
@@ -298,6 +335,7 @@ int main(void){
     fail|=check_stream_i8(c8);        /* verify async round-robin stream (cross-core, mixed shapes) */
     fail|=check_chain_envelope(c8);   /* verify full-K envelope guard (reject K%512!=0 vs silent-wrong) */
     fail|=check_pack_i8_f32(c8);      /* verify NEON f32->int8 pack (used by the MoE repack) */
+    fail|=check_pack_i4a8(c8);        /* verify "effective w4a8": int4 wt / int8 compute / int4 storage */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
