@@ -789,7 +789,7 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
         else     { float scale = mx / 7.0f;            /* int4 range +-7 (NOT 127) */
                    w->bscale[n] = scale;
                    quant_chan_i4(fr, K, scale, sr, &seed, nib, qf32 + (size_t)n*K); }
-        bscale_out[n] = w->bscale[n];                  /* back-compat: caller's out array */
+        if (bscale_out) bscale_out[n] = w->bscale[n];  /* back-compat: caller's out array (optional; w->bscale is canonical) */
         inv[n] = 1.0f;                                 /* qf32 holds exact codes; no rescale */
     }
     /* inflate the compact nibble store -> int8 f32 codes (validates the pack/inflate round-trip is what we tile) */
