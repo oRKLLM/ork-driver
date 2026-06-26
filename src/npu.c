@@ -498,7 +498,11 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
 /* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
  * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
  * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack
- * order. Returns NULL on shape/size mismatch. Mirrors pack()'s int8 geometry (KS=1024). */
+ * order. Returns NULL on shape/size mismatch. Mirrors pack()'s int8 geometry (KS=1024).
+ * Also rebuilds the full-K Bf buffer (K<=10752) — Bf is not dumped (it's a regenerable re-tiling of the
+ * SAME bytes), but the decode fast path AND run_chain_i8 (Sk>1 experts) need it, so a loaded weight must
+ * carry it to be a first-class drop-in for a packed one. Bf is reconstructed from Bb (un-tile → B[K][N] →
+ * re-tile full-K); on IOVA exhaustion it's abandoned (Bf=NULL) → decode/run_i8 K-split still works. */
 ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K%32 || N%32) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
@@ -515,6 +519,26 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    /* Rebuild Bf (full-K layout) so loaded weights chain + decode like packed ones. The Bb tiles are
+     * 32x32 blocks: Bb[ns][ks] holds B[k0+kt*32+kk][n0+nt*32+nl] at [nt][kt][nl][kk]. Bf[ns] re-tiles the
+     * full K dimension (KTf=K/32) of the SAME logical B for that N-slice.
+     * ONLY build Bf where a full-K submit is actually valid (K%512==0 && K<=4096) — the same envelope
+     * run() / run_chain_i8 use. Outside it (e.g. K=1792 ffn_down experts) Bf would never be read and just
+     * doubles resident NPU bytes, exhausting the 4 GiB IOMMU window when many experts are loaded. Those
+     * weights run via the K-split Bb path (run_i8), which doesn't need Bf. */
+    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*bf=&w->Bf[ns]; *bf=bcreate(c->fd,(size_t)K*Nc,0x403);
+            if(!bf->cpu){ ok=0; break; }                /* IOVA full → give up on Bf */
+            int8_t*fb=bf->cpu;
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+                const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
+                for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++){
+                    int ktf=(k0/32)+kt;   /* full-K tile index */
+                    fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
+                        sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
+            bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
 
