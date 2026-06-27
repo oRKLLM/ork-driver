@@ -167,6 +167,37 @@ What's done (fp16/int8 matmul, multi-core, decode ≈ closed runtime, prefill fl
 what's left (int4/`w4a16`, llama.cpp integration, auto-tuner, more SoCs) — with the closed
 dead-ends — is tracked in **[ROADMAP.md](ROADMAP.md)**.
 
+## Troubleshooting
+
+### Board won't boot after a hard NPU wedge (solid-blue LED, no network)
+
+A repeatedly bad NPU submit can hard-wedge the device beyond what a `sudo reboot` (or even a
+power-cycle) clears — the board comes up to a **solid-blue LED and never reaches the network**.
+On RK3588 boards this is made worse by **using a non-official power supply** (the board is
+power-supply sensitive; a marginal PSU won't reliably cold-boot it). A bad state can end up in
+the **SPI bootloader**, so swapping the SSD alone doesn't fix it.
+
+Milder cases recover with a physical **cold boot** — press the power button (and, on some
+boards, the recovery/reset button next to it) rather than relying on a smart-plug power-cycle.
+
+If it still hangs at the blue LED, the recovery that worked (DietPi on a Radxa ROCK 5B, SSD +
+SPI boot) was to **re-flash the SPI bootloader from a known-good microSD**:
+
+1. Confirm it isn't the SSD — remove the SSD; if the blue-LED hang persists, the boot fault is in
+   the SPI/bootloader, not the disk.
+2. **Erase the SPI flash** and boot from a **known-good microSD** (it should boot).
+3. From the booted system, **re-flash the SPI** (`dietpi-config` → *Advanced Options* → flash
+   bootloader to SPI).
+4. Reinstall the SSD and remove the microSD. (It may still refuse to boot at this point.)
+5. Re-insert the microSD — the board then boots **from the SSD** (the microSD presence completes
+   the boot).
+6. Shut down, remove the microSD, and boot once more — it now boots cleanly from the SSD.
+
+**Prevention:** use the official power supply, and **stop NPU runs with `SIGINT`, never
+`SIGKILL`** — `kill -9` skips the driver's cleanup path and leaks IOVA (`failed to allocate
+IOVA: -12`), which forces reboots and is the kind of repeated-bad-submit churn that hard-wedges
+the device in the first place.
+
 ## Credits & scope
 
 Independent, community project — **not affiliated with or endorsed by Rockchip**. "Rockchip",
