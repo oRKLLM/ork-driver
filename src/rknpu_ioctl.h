@@ -36,6 +36,39 @@ typedef long long          __s64;
 #endif
 #define DRM_IOWR(nr, type) _IOWR(DRM_IOCTL_BASE, nr, type)
 
+/* ---- Generic DRM PRIME (dma-buf <-> GEM handle), from <drm/drm.h> ---- */
+struct drm_prime_handle {
+	__u32 handle;   /* in for HANDLE_TO_FD / out for FD_TO_HANDLE */
+	__u32 flags;    /* DRM_CLOEXEC|DRM_RDWR, only for handle->fd */
+	__s32 fd;       /* out for HANDLE_TO_FD / in for FD_TO_HANDLE */
+};
+/* nr 0x2e: import an existing dma-buf fd, get back a GEM handle (no page alloc). */
+#define DRM_IOCTL_PRIME_FD_TO_HANDLE  DRM_IOWR(0x2e, struct drm_prime_handle)
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD  DRM_IOWR(0x2d, struct drm_prime_handle)
+
+/* ---- dma-heap allocation, from <linux/dma-heap.h> ---- */
+struct dma_heap_allocation_data {
+	__u64 len;        /* in: bytes */
+	__u32 fd;         /* out: dma-buf fd */
+	__u32 fd_flags;   /* in: O_RDWR|O_CLOEXEC */
+	__u64 heap_flags; /* in: 0 */
+};
+#define DMA_HEAP_IOC_MAGIC   'H'
+#define DMA_HEAP_IOCTL_ALLOC _IOWR(DMA_HEAP_IOC_MAGIC, 0x0, struct dma_heap_allocation_data)
+
+/* ---- dma-buf CPU-access cache sync, from <linux/dma-buf.h>. Required to flush CPU writes to an
+ * IMPORTED cacheable dma-buf so the device (NPU) sees them — the rknpu MEM_SYNC only flushes buffers
+ * the rknpu driver itself allocated, not foreign imported dma-bufs. Bracket the CPU fill with
+ * SYNC_START|WRITE before and SYNC_END|WRITE after. ---- */
+struct dma_buf_sync { __u64 flags; };
+#define DMA_BUF_SYNC_READ      (1 << 0)
+#define DMA_BUF_SYNC_WRITE     (2 << 0)
+#define DMA_BUF_SYNC_RW        (DMA_BUF_SYNC_READ | DMA_BUF_SYNC_WRITE)
+#define DMA_BUF_SYNC_START     (0 << 2)
+#define DMA_BUF_SYNC_END       (1 << 2)
+#define DMA_BUF_BASE           'b'
+#define DMA_BUF_IOCTL_SYNC     _IOW(DMA_BUF_BASE, 0, struct dma_buf_sync)
+
 /* ---- RKNPU command numbers (offset from DRM_COMMAND_BASE) ---- */
 #define RKNPU_ACTION       0x00
 #define RKNPU_SUBMIT       0x01

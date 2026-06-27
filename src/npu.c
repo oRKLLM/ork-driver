@@ -41,7 +41,7 @@ static long   g_prof_i8_calls = 0, g_prof_i4_calls = 0;
 static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
-struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; };
+struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. */
 struct ork_pw { struct ork_npu *c; int id; };   /* persistent NPU-pool worker arg */
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int core_budget;
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
@@ -165,7 +165,47 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags){
     return (struct buf){c.handle,c.dma_addr,c.obj_addr,p,c.size};
 }
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
-    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); b->cpu=0; }
+    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
+
+/* Zero-copy IMPORT (no page alloc, no copy): allocate a dma-buf from /dev/dma_heap/system, mmap it,
+ * import it into the NPU's IOMMU domain via PRIME_FD_TO_HANDLE -> MEM_CREATE(handle, flags=0, size=0).
+ * The kernel maps the EXISTING dma-buf pages and returns the IOVA (dma_addr) to put in the regcmd.
+ * Caller fills *cpu with the (pre-tiled) bytes, then issues a MEM_SYNC clean (bsync TO_DEVICE) before
+ * the first submit. Returns a buf whose heap_fd holds the dma-buf fd (closed by bdestroy). On any
+ * failure returns {0} (cpu==NULL). g_dmaheap_fd is the cached /dev/dma_heap/system fd (-1 = unopened,
+ * -2 = open failed; import then unavailable and callers fall back to bcreate). */
+static int g_dmaheap_fd = -1;
+static int dmaheap_open(void){
+    if(g_dmaheap_fd==-1){
+        const char *h=getenv("ORK_DMA_HEAP"); char path[64];
+        snprintf(path,sizeof path,"/dev/dma_heap/%s", h&&*h?h:"system");
+        g_dmaheap_fd=open(path,O_RDWR|O_CLOEXEC); if(g_dmaheap_fd<0) g_dmaheap_fd=-2;
+    }
+    return g_dmaheap_fd>=0 ? g_dmaheap_fd : -1;
+}
+/* dma-buf CPU-access cache sync on the dma-buf fd (flushes CPU caches for an imported cacheable
+ * buffer — the rknpu MEM_SYNC does not cover foreign imports). Bracket the CPU fill: START|WRITE
+ * before, END|WRITE after. No-op if the buffer wasn't imported (heap_fd<=0). */
+static void dmabuf_sync(int heap_fd,uint64_t flags){
+    if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
+}
+static struct buf bimport(int fd,size_t size){
+    int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
+    size_t sz=pgup(size);
+    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
+    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC"); return (struct buf){0}; }
+    int dbuf=(int)a.fd;
+    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
+    if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
+    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
+    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    struct buf b; memset(&b,0,sizeof b);
+    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf;
+    return b;
+}
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
 static void bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
@@ -403,11 +443,27 @@ void ork_dma_free(ork_npu *c, void *ptr){
     if(!c||!ptr) return;
     for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; memset(&c->dma_tab[c->dma_n], 0, sizeof(struct buf)); return; }
 }
+/* Zero-copy IMPORT (no alloc, no copy) — see header. Registered in dma_tab like ork_dma_alloc so
+ * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
+void *ork_dma_import(ork_npu *c, size_t size){
+    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
+    struct buf b=bimport(c->fd,size); if(!b.cpu) return NULL;
+    c->dma_tab[c->dma_n++]=b; return b.cpu;
+}
+void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
 static struct buf *dma_find(ork_npu *c, const void *p){
     for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
         if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
     return NULL;
+}
+/* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
+ * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
+void ork_dma_import_sync(ork_npu *c, void *ptr, size_t size){
+    (void)size; struct buf *b=dma_find(c,ptr); if(!b) return;
+    /* For imported dma-bufs the dma-buf's own SYNC ioctl flushes the CPU caches (the rknpu MEM_SYNC
+     * does not cover foreign imports). END|WRITE = "CPU done writing" -> clean to device. */
+    dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
 }
 /* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
  * device after a host write (the bsync the streaming fill would issue). Not in the public header. */
@@ -538,6 +594,47 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
                     fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
                         sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
             bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    return w;
+}
+
+/* Zero-copy IMPORT variant of ork_mm_load_i8: each resident tile is a dma-buf the NPU reads in place
+ * (PRIME import) instead of a MEM_CREATE-alloc'd buffer the blob is memcpy'd into. The bytes still get
+ * written once (into the imported mmap) + synced once; the saving is the kernel page allocation, not
+ * the host fill (load is from a disk/RAM blob either way). Same blob format / round-trip as load_i8.
+ * Falls through to NULL (caller uses ork_mm_load_i8) if import is unavailable. */
+ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K%32 || N%32) return NULL;
+    if(dmaheap_open()<0) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+        memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc); off+=b->size;
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    /* Bf full-K rebuild (same envelope as ork_mm_load_i8): imported too, abandoned on failure. */
+    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc);
+            if(!bf->cpu){ ok=0; break; }
+            int8_t*fb=bf->cpu;
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+                const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
+                for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++){
+                    int ktf=(k0/32)+kt;
+                    fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
+                        sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }

@@ -22,7 +22,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 /* Library version (semver). The build may also inject a short git hash via -DORK_GIT_HASH (the
  * Makefile does this when built where git is available); ork_npu_version() then returns
  * "MAJOR.MINOR.PATCH+g<hash>", else just the semver. Bump MINOR on backward-compatible API adds. */
-#define ORK_NPU_VERSION "0.3.7"
+#define ORK_NPU_VERSION "0.4.0"
 const char  *ork_npu_version(void);  /* e.g. "0.3.0" or "0.3.0+g1a2b3c4" */
 
 /* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
@@ -45,6 +45,24 @@ void         ork_npu_set_core_budget(ork_npu *ctx, int n);
  * pointer as A/C exactly as a malloc'd one. NULL on failure or table-full (fall back to malloc). */
 void        *ork_dma_alloc(ork_npu *ctx, size_t size);
 void         ork_dma_free (ork_npu *ctx, void *ptr);
+
+/* Zero-copy IMPORT: allocate a dma-buf (from /dev/dma_heap/system), mmap it, and IOMMU-map the
+ * EXISTING pages into the NPU — no second allocation, no copy. Caller fills the returned pointer with
+ * the (pre-tiled) bytes, then calls ork_dma_import_sync once to flush them to the device; the NPU then
+ * reads them in place across all submits (write-once-read-many weights). Returns the CPU pointer (pass
+ * it as A/C to ork_mm_run exactly like an ork_dma_alloc one — it is registered in the same zero-copy
+ * table), or NULL on failure (dma-heap absent / IOVA full) so the caller can fall back to ork_dma_alloc.
+ * Still 32-bit-IOVA-capped (does not escape the ~4 GiB window); it eliminates the COPY, not the cap. */
+void        *ork_dma_import(ork_npu *ctx, size_t size);
+void         ork_dma_import_sync(ork_npu *ctx, void *ptr, size_t size);  /* clean CPU writes -> device (size 0 = whole buffer) */
+void         ork_dma_import_free(ork_npu *ctx, void *ptr);
+
+/* Load pre-tiled int8 weight bytes (ork_w_dump / .orkpack) into NPU-resident storage WITHOUT the
+ * alloc+memcpy of ork_mm_load_i8: each tile is imported zero-copy (dma-buf the NPU reads in place).
+ * Same blob format and round-trip as ork_mm_load_i8; returns NULL on shape/size mismatch or if import
+ * is unavailable (caller falls back to ork_mm_load_i8). Weights are write-once: filled+synced here,
+ * read-only across every submit. ork_mm_free / ork_w_free release the imports (MEM_DESTROY + close fd). */
+ork_w       *ork_mm_load_i8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
 /* Pack + upload B[K,N] (row-major) into NPU-resident tile layout; reuse across runs.
  * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */

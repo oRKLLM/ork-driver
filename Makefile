@@ -60,6 +60,9 @@ stream_probe: tools/stream_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 persist_probe: tools/persist_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+# Zero-copy weight IMPORT + fixed-slot streaming validation/measurement (board only; needs dma-heap).
+zerocopy_import_test: tools/zerocopy_import_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 # RE probe: hunt the weight stride register for in-place K-slicing of a full-K buffer.
 slice_probe: tools/slice_probe.c $(CORE)
