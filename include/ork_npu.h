@@ -22,7 +22,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 /* Library version (semver). The build may also inject a short git hash via -DORK_GIT_HASH (the
  * Makefile does this when built where git is available); ork_npu_version() then returns
  * "MAJOR.MINOR.PATCH+g<hash>", else just the semver. Bump MINOR on backward-compatible API adds. */
-#define ORK_NPU_VERSION "0.4.1"
+#define ORK_NPU_VERSION "0.5.0"
 const char  *ork_npu_version(void);  /* e.g. "0.3.0" or "0.3.0+g1a2b3c4" */
 
 /* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
@@ -141,6 +141,34 @@ ork_w       *ork_mm_load_i8(ork_npu *ctx, int K, int N, const void *blob, size_t
  * via ork_mm_run_i8 and re-dumps byte-identically. NULL on a malformed blob / shape mismatch. */
 size_t       ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap);
 ork_w       *ork_mm_load_i4a8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+/* Zero-copy IMPORT variant of ork_mm_load_i4a8: resident tiles are dma-bufs the NPU reads in place (PRIME
+ * import); the int4 nibbles inflate -> int8 directly into them. Bit-identical to ork_mm_load_i4a8 (same
+ * blob, same tiled bytes, same re-dump). Returns NULL if import is unavailable (caller falls back to
+ * ork_mm_load_i4a8) or on a malformed blob / shape mismatch. */
+ork_w       *ork_mm_load_i4a8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+
+/* ---- Streaming weight pool: a RAM-resident inflated-int8 cache with CHEAP map/unmap ----
+ * For models too big to keep resident in the ~4 GiB NPU IOVA window. The caller (e.g. a layer/expert LRU)
+ * keeps a set of ALREADY-INFLATED int8 weights resident in CPU RAM (budget by RAM — much larger than the
+ * IOVA window) and maps/unmaps them to IOVA cheaply on demand: a cache HIT pays only the cheap MEM_CREATE
+ * import (~170us@4MB), skipping the expensive int4->int8 inflate (paid ONCE on add) and the expensive
+ * MEM_DESTROY (paid only on eviction). The pool provides the lifecycle ONLY — the eviction/LRU POLICY and
+ * the RAM budget live in the caller. Both stores: int8 (fill=copy ork_w_dump bytes) and int4 (fill=inflate
+ * the ork_w_dump_i4a8 nibbles). A transient prefetch double-buffer is just a small pool the caller fills
+ * ahead on a thread. All ops bit-exact vs the equivalent ork_mm_load_*. NULL/create-fail if the dma-heap
+ * is absent (caller falls back to ork_mm_load_i8 / ork_mm_load_i4a8 + ork_mm_run_i8). */
+typedef struct ork_stream_pool  ork_stream_pool;
+typedef struct ork_stream_entry ork_stream_entry;
+ork_stream_pool  *ork_stream_pool_create(ork_npu *ctx);                 /* NULL if import unavailable */
+ork_stream_entry *ork_stream_pool_add_i4a8(ork_stream_pool *p, int K, int N, const void *blob, size_t n); /* int4 store; fill=inflate (once) */
+ork_stream_entry *ork_stream_pool_add_i8  (ork_stream_pool *p, int K, int N, const void *blob, size_t n); /* int8 store; fill=copy (once) */
+int               ork_stream_pool_map  (ork_stream_pool *p, ork_stream_entry *e);  /* CHEAP: MEM_CREATE import -> IOVA (per submit) */
+int               ork_stream_pool_run  (ork_stream_pool *p, ork_stream_entry *e, int M, const int8_t *A, int32_t *C);
+void              ork_stream_pool_unmap(ork_stream_pool *p, ork_stream_entry *e);  /* MEM_DESTROY; entry STAYS in RAM */
+void              ork_stream_pool_remove(ork_stream_pool *p, ork_stream_entry *e); /* free the RAM buffer (caller's evict) */
+void              ork_stream_pool_free (ork_stream_pool *p);
+size_t            ork_stream_entry_bytes (const ork_stream_entry *e);   /* RAM bytes held (for the caller's budget) */
+int               ork_stream_entry_mapped(const ork_stream_entry *e);   /* 1 if currently IOVA-mapped */
 
 /* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
  *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32.

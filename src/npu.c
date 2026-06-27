@@ -1148,6 +1148,60 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     free(qf32); free(inv);
     return w;
 }
+/* Rearrange linear int8 codes i8[N][K] into IMPORTED (dma-buf) tiles, using the dma-buf's OWN cache sync
+ * (the rknpu MEM_SYNC does NOT cover foreign imports). Same byte math as tile_i8_to_tiles. */
+static void tile_i8_to_import_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8){
+    int KS=1024, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu)continue; int8_t*bb=b->cpu;
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+        for(int nt=0;nt<NN;nt++)for(int nl=0;nl<32;nl++){ int n=n0+nt*32+nl; const int8_t*src=i8+(size_t)n*K+k0;
+            for(int kt=0;kt<KT;kt++) memcpy(bb+((size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32),src+kt*32,32); }
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    if(w->Bf && K<=10752){ int KTf=K/32;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*b=&w->Bf[ns]; if(!b->cpu)continue; int8_t*bb=b->cpu;
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            for(int nt=0;nt<NN;nt++)for(int nl=0;nl<32;nl++){ int n=n0+nt*32+nl; const int8_t*src=i8+(size_t)n*K;
+                for(int kt=0;kt<KTf;kt++) memcpy(bb+((size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32),src+kt*32,32); }
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+}
+/* Zero-copy IMPORT variant of ork_mm_load_i4a8: resident tiles are dma-bufs the NPU reads in place (PRIME
+ * import), and the int4 nibbles inflate -> int8 directly into them (no f32 round-trip). Bit-identical to
+ * ork_mm_load_i4a8 (same blob, same tiled bytes). Falls through to NULL (caller uses ork_mm_load_i4a8) if
+ * import is unavailable. Retains Bi4 + bscale so the loaded weight re-dumps byte-identically. */
+ork_w *ork_mm_load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_t n){
+    if(K%32 || N%32 || dmaheap_open()<0) return NULL;
+    size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
+    if(n != hdr+sc+nib) return NULL;
+    const char *p=blob;
+    struct ork_i4a8_hdr h; memcpy(&h,p,hdr); p+=hdr;
+    if(h.magic!=ORK_I4A8_MAGIC || h.version!=ORK_I4A8_VER || h.K!=K || h.N!=N) return NULL;
+    if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->quant_kind=(uint8_t)h.quant_kind;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+    if(K%512==0 && K<=4096){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            struct buf*b=&w->Bf[ns]; *b=bimport(c->fd,(size_t)K*Nc); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
+    if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
+    memcpy(w->bscale,p,sc); p+=sc; memcpy(w->Bi4,p,nib);
+    int8_t *i8=malloc((size_t)N*K); if(!i8){ ork_mm_free(c,w); return NULL; }
+    if(w->quant_kind==ORK_QK_CODEBOOK_NF4){ int8_t lut[16]; for(int i=0;i<16;i++) lut[i]=(int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+        for(int nn=0;nn<N;nn++) inflate_chan_nf4_i8(w->Bi4+(size_t)nn*(K/2),K,lut,i8+(size_t)nn*K);
+    } else for(int nn=0;nn<N;nn++) expand_chan_i4_i8(w->Bi4+(size_t)nn*(K/2),K,i8+(size_t)nn*K);
+    tile_i8_to_import_tiles(c,w,K,N,i8);
+    free(i8);
+    return w;
+}
 /* ---- DIAGNOSTIC ONLY (tools/prefetch_headroom.c): isolate the STEADY-STATE per-slice streaming prep.
  * These re-run the TAIL of the int4 pack path (inflate stored nibbles -> int8 codes; tile into the
  * ALREADY-ALLOCATED resident DMA buffers) on an int4-packed weight, with NO bcreate/alloc — exactly the
@@ -1195,6 +1249,226 @@ void ork_slice_direct_inflate_i8(const ork_w *w, int8_t *i8, int kind) {
         for (int n = 0; n < N; n++) expand_chan_i4_i8(w->Bi4 + (size_t)n*(K/2), K, i8 + (size_t)n*K);
     }
 }
+
+/* ---- DIAGNOSTIC ONLY (tools/stream_prefetch_probe.c): a "staging slot" that splits the int4-streaming
+ * swap into its three phases so a probe can time each AND run a real double-buffered loop:
+ *   (a) FILL  = int4->int8 inflate + tile into a BARE (mmap'd, NOT yet IOMMU-mapped) dma-buf + dma-buf
+ *               cache clean  -> the prefetchable CPU work (ork_stage_fill).
+ *   (b) MAP   = PRIME_FD_TO_HANDLE + MEM_CREATE(handle) on each bare dma-buf -> IOVA; build an ork_w view
+ *               over them  -> the swap-time zero-copy import (ork_stage_map).
+ *   (c) RUN   = ork_mm_run_i8 against the mapped view (ork_stage_run) -> the NPU submit.
+ * ork_stage_unmap MEM_DESTROYs the maps (keeps the bare dma-buf+mmap for recycle); ork_stage_free closes.
+ * This is exactly the int4 prefetch-inflate staging ring the design proposes, exposed for measurement
+ * before promoting it into the library. Not in the public header. */
+struct ork_stage {
+    int K, N, Sk, Sn;
+    struct buf *Bb;            /* Sk*Sn tile dma-bufs (bare: cpu/heap_fd set; dma/handle 0 until mapped) */
+    struct buf *Bf;            /* Sn full-K dma-bufs (NULL if outside the Bf envelope) */
+    int8_t *i8scratch;         /* reused N*K linear-int8 inflate scratch */
+    ork_w view;                /* ork_w that points Bb/Bf at this slot's bufs once mapped (run target) */
+    int mapped;
+};
+/* bare DMA-heap dma-buf: alloc + mmap, NO PRIME/MEM_CREATE (no IOVA yet). heap_fd = dma-buf fd. */
+static struct buf bstage_alloc(size_t size){
+    int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
+    size_t sz=pgup(size);
+    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
+    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(stage)"); return (struct buf){0}; }
+    int dbuf=(int)a.fd;
+    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
+    if(p==MAP_FAILED){ perror("mmap(stage)"); close(dbuf); return (struct buf){0}; }
+    struct buf b; memset(&b,0,sizeof b); b.cpu=p; b.size=sz; b.heap_fd=dbuf; return b;
+}
+/* IOMMU-map an already-allocated bare dma-buf (sets dma/obj/handle). 0 ok / -1 fail. */
+static int bstage_map(int fd, struct buf*b){
+    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=b->heap_fd; ph.flags=0;
+    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME(stage)"); return -1; }
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(stage)"); return -1; }
+    b->handle=mc.handle; b->dma=mc.dma_addr; b->obj=mc.obj_addr; return 0;
+}
+/* MEM_DESTROY the map (keep the dma-buf + mmap alive for recycle): clears dma/obj/handle only. */
+static void bstage_unmap(int fd, struct buf*b){
+    if(!b->obj && !b->handle) return;
+    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    b->dma=0; b->obj=0; b->handle=0;
+}
+static void bstage_free(struct buf*b){ if(!b->cpu) return; munmap(b->cpu,b->size); if(b->heap_fd>0) close(b->heap_fd); memset(b,0,sizeof *b); }
+
+/* tile shape mirrors ork_mm_load_i4a8: KS=1024 K-split, NMAX N-split; Bf full-K when K%512==0 && K<=4096
+ * (same envelope as load_i8_import). Returns NULL if dma-heap absent / alloc fails. */
+struct ork_stage *ork_stage_create(ork_npu *c, int K, int N){
+    if(K%32 || N%32 || dmaheap_open()<0) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    struct ork_stage *s=calloc(1,sizeof *s); if(!s) return NULL;
+    s->K=K; s->N=N; s->Sk=Sk; s->Sn=Sn;
+    s->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    s->i8scratch=malloc((size_t)N*K);
+    if(!s->Bb || !s->i8scratch){ free(s->Bb); free(s->i8scratch); free(s); return NULL; }
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
+        struct buf*b=&s->Bb[(size_t)ns*Sk+ks]; *b=bstage_alloc((size_t)Kp*Nc);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bstage_free(&s->Bb[i]); free(s->Bb); free(s->i8scratch); free(s); return NULL; }}}
+    if(K%512==0 && K<=4096){ s->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            struct buf*b=&s->Bf[ns]; *b=bstage_alloc((size_t)K*Nc); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bstage_free(&s->Bf[ns]); free(s->Bf); s->Bf=NULL; } }
+    return s;
+}
+/* FILL: inflate src's int4 nibble store -> int8, tile into this slot's BARE dma-bufs, clean caches.
+ * src must be an int4-packed weight (ork_mm_pack_i4a8) with the same K,N. No IOVA needed (bare bufs).
+ * This is the prefetchable CPU work — safe to call on a background thread (touches only this slot). */
+void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src){
+    if(!s || !src || !src->Bi4) return;
+    int K=s->K, N=s->N, KS=1024, NMAX=c->soc->nmax, Sk=s->Sk, Sn=s->Sn, kind=src->quant_kind;
+    int8_t *i8=s->i8scratch;
+    if(kind==ORK_QK_CODEBOOK_NF4){ int8_t lut[16]; for(int i=0;i<16;i++) lut[i]=(int8_t)lrintf(ORK_NF4_LEVELS[i]*127.0f);
+        for(int n=0;n<N;n++) inflate_chan_nf4_i8(src->Bi4+(size_t)n*(K/2),K,lut,i8+(size_t)n*K);
+    } else for(int n=0;n<N;n++) expand_chan_i4_i8(src->Bi4+(size_t)n*(K/2),K,i8+(size_t)n*K);
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&s->Bb[(size_t)ns*Sk+ks]; int8_t*bb=b->cpu;
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+        for(int nt=0;nt<NN;nt++)for(int nl=0;nl<32;nl++){ int n=n0+nt*32+nl; const int8_t*sp=i8+(size_t)n*K+k0;
+            for(int kt=0;kt<KT;kt++) memcpy(bb+((size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32),sp+kt*32,32); }
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    if(s->Bf){ int KTf=K/32;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*b=&s->Bf[ns]; int8_t*bb=b->cpu;
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            for(int nt=0;nt<NN;nt++)for(int nl=0;nl<32;nl++){ int n=n0+nt*32+nl; const int8_t*sp=i8+(size_t)n*K;
+                for(int kt=0;kt<KTf;kt++) memcpy(bb+((size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32),sp+kt*32,32); }
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+}
+/* MAP: IOMMU-map every bare dma-buf in the slot and point the slot's ork_w view at them. 0 ok / -1. */
+int ork_stage_map(ork_npu *c, struct ork_stage *s){
+    if(!s || s->mapped) return s?0:-1;
+    for(int i=0;i<s->Sk*s->Sn;i++) if(bstage_map(c->fd,&s->Bb[i])) return -1;
+    if(s->Bf) for(int ns=0;ns<s->Sn;ns++) if(bstage_map(c->fd,&s->Bf[ns])) return -1;
+    memset(&s->view,0,sizeof s->view);
+    s->view.K=s->K; s->view.N=s->N; s->view.Sk=s->Sk; s->view.Sn=s->Sn; s->view.dtype=DT_I8; s->view.owns=0;
+    s->view.Bb=s->Bb; s->view.Bf=s->Bf;
+    s->mapped=1; return 0;
+}
+/* RUN the slot's matmul (must be mapped). Same as ork_mm_run_i8 on the slot's view. */
+int ork_stage_run(ork_npu *c, struct ork_stage *s, int M, const int8_t *A, int32_t *C){
+    if(!s || !s->mapped) return -1;
+    return ork_mm_run_i8(c, &s->view, M, A, C);
+}
+/* UNMAP: MEM_DESTROY the maps; keep the bare dma-buf+mmap for the next fill (recycle the slot). */
+void ork_stage_unmap(ork_npu *c, struct ork_stage *s){
+    if(!s || !s->mapped) return;
+    for(int i=0;i<s->Sk*s->Sn;i++) bstage_unmap(c->fd,&s->Bb[i]);
+    if(s->Bf) for(int ns=0;ns<s->Sn;ns++) bstage_unmap(c->fd,&s->Bf[ns]);
+    s->mapped=0;
+}
+void ork_stage_free(ork_npu *c, struct ork_stage *s){
+    if(!s) return; ork_stage_unmap(c,s);
+    for(int i=0;i<s->Sk*s->Sn;i++) bstage_free(&s->Bb[i]);
+    if(s->Bf){ for(int ns=0;ns<s->Sn;ns++) bstage_free(&s->Bf[ns]); free(s->Bf); }
+    free(s->Bb); free(s->i8scratch); free(s);
+}
+static size_t stage_bb_bytes(struct ork_stage*s){ size_t t=0; for(int i=0;i<s->Sk*s->Sn;i++) t+=s->Bb[i].size; if(s->Bf) for(int ns=0;ns<s->Sn;ns++) t+=s->Bf[ns].size; return t; }
+
+/* ============================================================================================
+ * ork_stream_pool — RAM-resident inflated-int8 weight cache with cheap map/unmap (public API).
+ *
+ * Phase-1 found: the EXPENSIVE per-swap costs are the int4->int8 inflate (fill) and the MEM_DESTROY
+ * (unmap); the MEM_CREATE import (map) is CHEAP (170us@4MB / 654us@16MB). The win is therefore to pay
+ * the inflate ONCE per entry (held resident in CPU RAM, budgeted by the caller — RAM >> the 4 GiB IOVA
+ * window), and on a cache HIT pay only the cheap map; unmap only on eviction (amortized over the hits).
+ *
+ * The pool just provides the lifecycle (hold-in-RAM, cheap map/unmap, free); the LRU/eviction POLICY and
+ * RAM budget live in the CALLER (e.g. ggml-ork's wcache). Both stores covered: int8 (fill = copy the
+ * stored tile bytes) and int4 (fill = inflate the nibbles). A transient prefetch double-buffer is just a
+ * small pool the caller fills ahead on a thread — no separate API. Each entry is backed by an ork_stage
+ * (bare RAM-resident dma-buf, filled once, persists across unmap; map = bare MEM_CREATE import).
+ * ============================================================================================ */
+struct ork_stream_entry { struct ork_stage *stg; int K, N; int mapped; };
+struct ork_stream_pool  { ork_npu *c; struct ork_stream_entry **e; int n, cap; };
+
+struct ork_stream_pool *ork_stream_pool_create(ork_npu *c){
+    if(!c || dmaheap_open()<0) return NULL;          /* import path unavailable -> caller falls back */
+    struct ork_stream_pool *p=calloc(1,sizeof *p); if(!p) return NULL;
+    p->c=c; p->cap=16; p->e=calloc(p->cap,sizeof*p->e); if(!p->e){ free(p); return NULL; }
+    return p;
+}
+static struct ork_stream_entry *pool_new_entry(struct ork_stream_pool*p,int K,int N){
+    struct ork_stage *stg=ork_stage_create(p->c,K,N); if(!stg) return NULL;
+    struct ork_stream_entry *e=calloc(1,sizeof *e); if(!e){ ork_stage_free(p->c,stg); return NULL; }
+    e->stg=stg; e->K=K; e->N=N;
+    if(p->n>=p->cap){ int nc=p->cap*2; void*r=realloc(p->e,nc*sizeof*p->e); if(!r){ ork_stage_free(p->c,stg); free(e); return NULL; } p->e=r; p->cap=nc; }
+    p->e[p->n++]=e; return e;
+}
+/* int4-stored: fill = inflate nibbles -> int8 + tile (the .orkpack i4a8 blob, ork_w_dump_i4a8). The fill
+ * happens ONCE here (the expensive op, cached in RAM). NULL on import-unavailable / malformed blob. */
+struct ork_stream_entry *ork_stream_pool_add_i4a8(struct ork_stream_pool *p, int K, int N, const void *blob, size_t n){
+    if(!p) return NULL;
+    /* validate + materialize an int4 source ork_w from the blob (host-side Bi4+bscale), inflate into the
+     * entry's staging dma-buf, then drop the temporary source (we only needed its nibble store to fill). */
+    ork_w *src=ork_mm_load_i4a8(p->c,K,N,blob,n);  /* allocates resident DMA too — temporary; freed below */
+    if(!src) return NULL;
+    struct ork_stream_entry *e=pool_new_entry(p,K,N);
+    if(!e){ ork_mm_free(p->c,src); return NULL; }
+    ork_stage_fill(p->c,e->stg,src);               /* the ONE-TIME inflate into RAM-resident staging */
+    ork_mm_free(p->c,src);
+    return e;
+}
+/* int8-stored: fill = copy the stored tile bytes (ork_w_dump blob) into the staging dma-bufs. Same blob
+ * layout/validation as ork_mm_load_i8. NULL on import-unavailable / size mismatch. */
+struct ork_stream_entry *ork_stream_pool_add_i8(struct ork_stream_pool *p, int K, int N, const void *blob, size_t n){
+    if(!p || K%32 || N%32) return NULL;
+    int KS=1024, NMAX=p->c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+    if(n!=need) return NULL;
+    struct ork_stream_entry *e=pool_new_entry(p,K,N); if(!e) return NULL;
+    struct ork_stage *s=e->stg; size_t off=0;
+    for(int i=0;i<s->Sk*s->Sn;i++){ struct buf*b=&s->Bb[i];
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+        memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); }
+    /* Bf full-K rebuild from the just-filled Bb tiles (same envelope as load_i8_import) */
+    if(s->Bf){ int KTf=K/32;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*bf=&s->Bf[ns]; int8_t*fb=bf->cpu;
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+                const int8_t*sb=(const int8_t*)s->Bb[(size_t)ns*Sk+ks].cpu;
+                for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++){
+                    int ktf=(k0/32)+kt;
+                    fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
+                        sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    return e;
+}
+/* CHEAP map: bare MEM_CREATE import of the already-filled RAM buffer -> IOVA. The per-submit op on a hit.
+ * 0 ok / -1. Idempotent (already-mapped = 0). */
+int  ork_stream_pool_map  (struct ork_stream_pool *p, struct ork_stream_entry *e){
+    if(!p||!e) return -1; if(e->mapped) return 0;
+    if(ork_stage_map(p->c,e->stg)) return -1; e->mapped=1; return 0;
+}
+int  ork_stream_pool_run  (struct ork_stream_pool *p, struct ork_stream_entry *e, int M, const int8_t *A, int32_t *C){
+    if(!p||!e||!e->mapped) return -1; return ork_stage_run(p->c,e->stg,M,A,C);
+}
+/* UNMAP: MEM_DESTROY the IOVA mapping; entry STAYS filled in RAM (next map is cheap, no re-inflate). */
+void ork_stream_pool_unmap(struct ork_stream_pool *p, struct ork_stream_entry *e){
+    if(!p||!e||!e->mapped) return; ork_stage_unmap(p->c,e->stg); e->mapped=0;
+}
+size_t ork_stream_entry_bytes(const struct ork_stream_entry *e){ return e?stage_bb_bytes(e->stg):0; }  /* RAM held (for the caller's budget) */
+int    ork_stream_entry_mapped(const struct ork_stream_entry *e){ return e?e->mapped:0; }
+/* REMOVE: free the entry's RAM dma-buf (the caller's evict). Unmaps first if mapped. */
+void ork_stream_pool_remove(struct ork_stream_pool *p, struct ork_stream_entry *e){
+    if(!p||!e) return;
+    for(int i=0;i<p->n;i++) if(p->e[i]==e){ ork_stage_free(p->c,e->stg); free(e); p->e[i]=p->e[--p->n]; return; }
+}
+void ork_stream_pool_free(struct ork_stream_pool *p){
+    if(!p) return;
+    for(int i=0;i<p->n;i++){ ork_stage_free(p->c,p->e[i]->stg); free(p->e[i]); }
+    free(p->e); free(p);
+}
+
 int ork_mm_repack_i8_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, float *bscale_out) {
     if (!w || w->dtype != DT_I8 || !w->Bb) return -1;
     if (w->K != K || w->N != N) return -2;

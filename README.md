@@ -65,6 +65,51 @@ ork_w *wi = ork_mm_pack_i4a8_im(ctx, K, N, Bf32, imatrix /*len K, NULL=uniform*/
   int8 for importance-bumped tensors), quantizing **values from an fp16 source** with the GGUF
   used only as the allocation oracle.
 
+## Zero-copy import & streaming models bigger than the IOVA window
+
+The NPU's IOMMU is 32-bit, so only ~4 GiB of weights are DMA-mappable at once. Two surfaces help:
+
+**Zero-copy import** — allocate a dma-buf the NPU reads *in place* (no second allocation, no
+host→device copy):
+
+```c
+void *p = ork_dma_import(ctx, bytes);      // dma-heap buffer, mmap'd + IOMMU-mapped
+memcpy(p, tiled_bytes, bytes);             // fill once (pre-tiled weights, or an activation A)
+ork_dma_import_sync(ctx, p, bytes);        // flush CPU writes -> device (dma-buf cache clean)
+// ... pass p as A/C to ork_mm_run, exactly like an ork_dma_alloc buffer ...
+ork_dma_import_free(ctx, p);
+```
+
+`ork_mm_load_i8_import` / `ork_mm_load_i4a8_import` are the import-backed loaders: same blob and
+byte-identical result as `ork_mm_load_i8` / `ork_mm_load_i4a8`, but each resident tile is an
+imported dma-buf (saves the kernel page alloc). All four return `NULL` if the dma-heap is absent so
+the caller falls back. Import eliminates the *copy*, not the 4 GiB *cap*.
+
+**Streaming pool** (`ork_stream_pool_*`) — for models too big to keep resident, hold a set of
+**already-inflated int8 weights resident in CPU RAM** (budget by RAM, far larger than the 4 GiB IOVA
+window) and map/unmap them to IOVA cheaply on demand. A cache *hit* pays only the cheap `MEM_CREATE`
+import (~170 µs @ 4 MiB), skipping the expensive int4→int8 inflate (paid **once** on `add`) and the
+expensive `MEM_DESTROY` (paid only on **evict**):
+
+```c
+ork_stream_pool  *pool = ork_stream_pool_create(ctx);
+ork_stream_entry *e = ork_stream_pool_add_i4a8(pool, K, N, blob, n); // fill = inflate, ONCE
+// per use (cache hit): cheap map -> run -> unmap; entry stays filled in RAM after unmap
+ork_stream_pool_map(pool, e); ork_stream_pool_run(pool, e, M, A, C); ork_stream_pool_unmap(pool, e);
+ork_stream_pool_remove(pool, e);   // the caller's eviction frees the RAM buffer
+```
+
+The pool provides the **lifecycle only** (hold-in-RAM, cheap map/unmap, free); the LRU/eviction
+**policy and RAM budget live in the caller**. Both stores are covered: `add_i8` (fill = copy the
+stored tile bytes) and `add_i4a8` (fill = inflate the nibbles). A transient prefetch double-buffer is
+just a small pool the caller fills ahead on a background thread. `ork_stream_pool_create` returns
+`NULL` if the dma-heap is unavailable (fall back to `ork_mm_load_i8` + `ork_mm_run_i8`).
+
+> Note: a *transient* ring that maps **and unmaps every swap** does not reach resident speed — the
+> per-swap `MEM_DESTROY` (~0.5–2 ms) is irreducible overhead on top of the submit, and the inflate
+> only hides behind the submit at large M (crossover ≈ M 256 on a 2048×2048 layer). The RAM-resident
+> cache wins by keeping that cost off the per-submit hot path.
+
 ## Build & run (on a Rockchip board)
 
 Requires the `rknpu` DRM driver (stock on Rockchip Linux), a C compiler, and access to
