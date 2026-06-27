@@ -162,6 +162,16 @@ direct_i4_test: tools/direct_i4_test.c $(CORE)
 moe_expert_probe: tools/moe_expert_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# adversarial verify of the 21ms-floor claim: LFM2.5 expert dims at M=1, RESIDENT int8 weights,
+# run_i8 vs run_chain_i8 vs run_stream_i8 vs CPU NEON i8.
+moe_m1_probe: tools/moe_m1_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# FEASIBILITY: does an NPU expert submit OVERLAP with CPU expert compute at M=1, and does a
+# concurrent split beat the CPU-fused MoE? (LFM2.5/Qwen3.6 decode shapes; crossing isolated.)
+moe_concurrent_probe: tools/moe_concurrent_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
 # diagnostic (P5.3 follow-on): does filling the resident NPU dma_buf from DISK (mmap warm/cold, pread cold)
 # add a penalty vs RAM, and how much cheaper is the pre-tiled int8 fill than the int4 inflate+tile path?
 disk_stream_bench: tools/disk_stream_bench.c $(CORE)
