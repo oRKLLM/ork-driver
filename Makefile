@@ -172,6 +172,13 @@ moe_m1_probe: tools/moe_m1_probe.c $(CORE)
 moe_concurrent_probe: tools/moe_concurrent_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
 
+# BATCHED (M>1) extension of moe_concurrent_probe: at what batch size M does NPU||CPU distributed
+# expert execution beat the CPU-fused MoE? Sweeps M=1..128, best NPU/CPU split per M; crossing tracked.
+# -march=native: enable ARM SDOT (asimddp) so the CPU baseline (T_cpu_all) uses the same int8 dot kernel
+# llama.cpp uses on RK3588 — a FAIR baseline, not the slower vmull/vpadal fallback.
+moe_batched_probe: tools/moe_batched_probe.c $(CORE)
+	$(CC) $(CFLAGS) -march=native -o $@ $< $(CORE) -lm -lpthread
+
 # diagnostic (P5.3 follow-on): does filling the resident NPU dma_buf from DISK (mmap warm/cold, pread cold)
 # add a penalty vs RAM, and how much cheaper is the pre-tiled int8 fill than the int4 inflate+tile path?
 disk_stream_bench: tools/disk_stream_bench.c $(CORE)
