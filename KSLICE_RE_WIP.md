@@ -134,6 +134,11 @@ level is consistent with the prefill-throughput gap. The "~6×" in the brief lik
 rkllm's 3-core fan-out (each core a different N-slice/M-subtile) + warm-weight pipelining.
 
 ## REPLICATION RECIPE (revised, the real one)
+> ⚠️ SUPERSEDED by the 2026-06-28 RESOLUTION at the bottom of this file: route (B) below is NOT
+> buildable — the per-task M-row offset it assumes does not exist in rkllm's encoding (proven by the
+> two-prompt + exhaustive-108-reg diff). Kept for the record. The real residual lever is shrinking the
+> per-row CBUF working set to raise R, not a multi-task submit.
+
 The lever is "raise the M-per-submit ceiling at large K." Two routes:
 - **(A) Lift ork's R-1 clamp where the hardware still computes correctly.** The experiment shows
   ork's current single-task program is only correct to M=R-1. To exceed it, the CBUF-resident row
@@ -170,3 +175,56 @@ The lever is "raise the M-per-submit ceiling at large K." Two routes:
 - Board: isolated checkout ~/ork-st (do NOT touch ~/ork-driver). Logs: ~/fused2.log ~/fused_trace.log.
   Experiment tool: ~/ork-st/mtile_probe (built). Decode scripts: scratchpad/decode*.py, compare.py.
 - Commit LOCAL only; do not push. (local: npu.c+header+Makefile+tools/mtile_probe.c added.)
+
+---
+
+## ★★★ 2026-06-28 RESOLUTION — route B does NOT exist; the "per-task M-offset" is a misread ★★★
+
+Two new captures (`~/fused_short.log` = 39-token prompt, `~/fused2.log` = ~250-token prompt; rk_bench_short
+in ~/rkbench) + an EXHAUSTIVE 108-register diff across the 6 tasks settle the open question.
+
+### Finding 1 — `0x102c` ("mc") is M-INVARIANT (the WIP's foundational assumption was wrong)
+The 39-token prefill and the ~250-token prefill emit the **byte-identical** per-task schedule
+`mc=[2,4,6,10,12,14]` (sum 48) in EVERY 6-task submit, and identical A/W/C bases. mc does NOT
+track the prompt token count. So `0x102c` is NOT "per-task M" — it is a FIXED hardware micro-tile
+schedule the macro-block engine always emits per matmul, independent of how many tokens prefill.
+
+### Finding 2 — there is NO per-task M-row START offset register (exhaustive diff)
+Diffing ALL 108 register writes across the 6 tasks of SUBMIT#0: the ONLY varying fields are
+0x102c/0x1028=mc, 0x1020/0x1084=(mc<<16)|1, 0x1044=56·mc, 0x107c=4·mc, 0x1080=-3·mc,
+0x4024=16·mc, 0x40c0=128·mc, 0x3014/0x405c/0x4030=mc-1, 0x1040=cumulative-M group sched.
+**Every varying field is a COUNT/EXTENT scaling with mc; none is a start/base.** A-base 0x1070,
+W-base 0x1110, C-base 0x4020 are byte-identical across all 6 tasks.
+
+### Finding 3 — the apparent "offset" in the big 35-task submit is a SCRATCH ping-pong, not an M-row stride
+SUBMIT#26 (the whole transformer block) has a few tasks with A-base/C-base bumped by 0x240/0x480/0x6c0.
+But the A-offset and C-offset are EQUAL (both +0x240, etc.). A genuine M-row offset would differ
+(A stride = K bytes/row = 3584; C stride = N·4 bytes/row = 4864). Equal, tiny (0x240=576), and drawn
+from a fixed small set {0,0x240,0x480,0x6c0} ⇒ these are double/quad-buffer SCRATCH offsets for the
+CNA feature staging, NOT activation-row strides. (Tasks with K=0/N=1 are sync/no-op descriptors.)
+
+### CONCLUSION — route B is not buildable as briefed, AND the premise it rests on is false
+rkllm does NOT run "effective M=36 via 6 shared-weight tasks at distinct M-row offsets." Its 6-task
+schedule is a fixed, M-invariant per-matmul micro-tiling. rkllm prefills more tokens by issuing MORE
+submits (measured: 39 tok → 1406 submits; 163 tok → 3012 submits), paying the per-submit floor per
+chunk — the SAME mechanism ork uses. There is no hidden multi-task M-amortization to copy.
+
+### The 29× GOPS lever is REAL but ork ALREADY captures it up to its hardware ceiling
+mtile_probe mode0 (ork's own program), single core, full K, bit-exact vs CPU ref:
+- K=2048 (R=pow2_floor(2·cbuf/K)=32): M=1→7 GOPS, M=16→105, M=32→190, M=36→205. Bit-exact through M=36.
+- K=3584 (R=16): M=1→6, M=16→91. Bit-exact through M=16; WRONG (miscompute, not wedge) at M≥20.
+The single-task ceiling is M≈R. mode1 (rkllm field overrides) is WRONG from M=2 — confirming those
+overrides are not a usable mode. ork's production prefill (npu.c:1957 CHAIN-PREFILL) PC-chains ALL
+M-tiles of a core into ONE submit, so the ~155µs submit floor is paid ONCE per chunk, not per 15 rows
+— it already does the floor-amortization route B was meant to add. The M-tile=15 only sets internal
+program granularity (clamped to R-1=15 at K=3584; true HW ceiling R=16, ~1 row left on the table).
+
+### What's actually left of the prefill-utilization gap (NOT route B)
+- ork is M-capped at R=pow2_floor(2·cbuf/K), which SHRINKS as K grows (K=3584→16). At M=16, single
+  core ≈91 GOPS; the floor is per-submit-amortized by chaining, but each chained PROGRAM still
+  re-stages the CBUF working set. Raising R needs a SMALLER per-row working set (K-tiling the CBUF
+  residency), not a multi-task offset — a different, harder lever.
+- The remaining gap to librkllmrt is pipeline/3-core scheduling, not a missing M-amortization trick.
+
+### NO route-B code was written (correctly — building on the non-existent offset would wedge).
+mtile_probe mode1 (the field-override attempt) stays in the tree as the documented-WRONG reference.
