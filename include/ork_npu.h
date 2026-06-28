@@ -210,6 +210,14 @@ void         ork_npu_mc_timing(int core, double *copy, double *submit, double *a
  * cap; recoverable), -2 on bad dims. See tools/ksubmit_probe.c. */
 int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 
+/* RE/calibration only: run ONE full-K int8 submit at (M,K,N) in ork's current M-tile mode (mode=0)
+ * or the rkllm-captured M-tile mode (mode=1: 0x1010=0x20 const, 0x1044=(K/64)*M, 0x107c=4*M,
+ * 0x1040=0xb1-0xf*(ceil(M/8)-1)). Returns the full C[M*N] int32 + warm-submit us. Tests whether
+ * rkllm's larger-M-per-submit is bit-exact on ork and lifts effective TOPS. 0/ok, -1 wedged, -2 bad.
+ * A[M*K], B[K*N] row-major int8; C[M*N] int32. See tools/mtile_probe.c. */
+int          ork_npu_probe_mtile_i8(ork_npu *ctx, int M, int K, int N, int mode,
+                                    const int8_t *A, const int8_t *B, int32_t *C, double *us);
+
 /* RE/calibration only: does batching tasks per RKNPU_SUBMIT amortize the per-submit round-trip
  * floor? Runs `ntask` identical small int8 matmuls as ntask separate ioctls vs one ioctl with
  * task_number=ntask, writing the two total wall times (us). Returns 0/ok, -1 wedged, -2 bad dims.

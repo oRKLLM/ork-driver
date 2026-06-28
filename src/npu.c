@@ -3069,6 +3069,50 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
  * weights. Returns 0 if the submit completed (C[N] int32 valid), -1 if it wedged (K over the
  * per-op K-tile cap; recoverable — the next call's RKNPU_ACT_RESET clears it), -2 on bad dims. */
+/* RE/calibration: run ONE full-K int8 submit at (M,K,N) in either ork's current synth_i8 M-tile
+ * mode (mode=0) or the rkllm-captured M-tile mode (mode=1), and return the full C[M*N] int32 plus
+ * the warm-submit time (us). rkllm-mode mirrors fused2.log: 0x1010=0x20 const (NOT 16*min(M+1,R)),
+ * 0x1044=(K/64)*M, 0x107c=4*M, 0x1040=0xb1-0xf*(ceil(M/8)-1). Lets us test whether rkllm's larger
+ * M-per-submit (M up to 36) is bit-exact on ork and whether it lifts effective TOPS. A[M*K] B[K*N]
+ * row-major int8; C[M*N] int32. Returns 0/ok (C valid), -1 wedged, -2 bad dims. ISOLATED buffers. */
+static double ork_now_us(void);
+int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
+                           const int8_t *A,const int8_t *B,int32_t *C,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N];
+    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    if(mode==1){   /* override with the rkllm-captured M-tile program */
+        setr(rc,REGCMD_I8_N,0x201,0x1010,0x20);
+        setr(rc,REGCMD_I8_N,0x201,0x1044,(K/64)*M);
+        setr(rc,REGCMD_I8_N,0x201,0x107c,4*M);
+        int mg=(M+7)/8; int v=0xb1-0x0f*(mg-1); if(v<0x1b)v=0x1b;
+        setr(rc,REGCMD_I8_N,0x201,0x1040,v);
+        setr(rc,REGCMD_I8_N,0x201,0x1020,(M<<16)|1);
+        setr(rc,REGCMD_I8_N,0x201,0x1084,(M<<16)|1);
+    }
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_mtile_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0;
+    for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
+        double t0=ork_now_us();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*4); if(us)*us=t1; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
 int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax) return -2;

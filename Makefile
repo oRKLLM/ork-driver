@@ -51,6 +51,10 @@ rknpu_bench: tools/rknpu_bench.c
 ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE/calibration probe: ork-current vs rkllm-captured M-tile mode, bit-exact + effective GOPS.
+mtile_probe: tools/mtile_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
