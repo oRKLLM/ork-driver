@@ -82,8 +82,12 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * allocated across ALL packed weights. One weight's tiles always land contiguously in a single chunk
      * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
      * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
-    struct buf wchunk[64]; int wchunk_n; size_t wchunk_off; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
+    struct buf wchunk[64]; int wchunk_n; size_t wchunk_off;
+    /* PACK DOMAIN: per-ctx default domain for the NEXT pack/load (set by ork_npu_set_pack_domain for the
+     * ggml-ork caller). Read once at each pack's entry to stamp w->domain; from there the weight carries
+     * its own domain. Not a process-global — concurrent ctxs don't clobber each other. -1 => default. */
+    int pack_domain; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -181,19 +185,22 @@ static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
 /* PER-WEIGHT IOMMU DOMAIN. The rk_iommu v2 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, not per
  * device, so spreading weights over multiple domains keeps >4 GiB resident at once. ORK_IOMMU_DOMAIN
  * is the process-wide DEFAULT domain (env, default 0). Each ork_w then carries its own `domain`:
- *   - g_pack_domain  is read by bcreate/bimport — set it to w->domain just before allocating that
- *                    weight's resident tiles so they land in the chosen domain.
- *   - g_run_domain   is read by rknpu_submit_ioctl — set it to w->domain at the top of run() so the
- *                    submit runs against the same domain the weight lives in.
- * Activation/output/scratch buffers are allocated under whatever domain is current; resident weights
- * and their submits dominate the IOVA budget, so per-weight placement is what matters. */
+ *   - bcreate/bimport take the domain as a PARAMETER — pass w->domain when allocating that weight's
+ *     resident tiles so they land in the chosen domain.
+ *   - rknpu_submit_ioctl takes the domain as a PARAMETER and stamps sub->iommu_domain_id — pass
+ *     w->domain so the submit runs against the same domain the weight lives in. The per-submit struct
+ *     is per-call/per-stack, so concurrent multi-core workers each carry their own domain (no global).
+ * Activation/output/scratch buffers are allocated under the active domain (dom_activate); resident
+ * weights and their submits dominate the IOVA budget, so per-weight placement is what matters. */
 static int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_IOMMU_DOMAIN"); v=e?atoi(e):0;} return v; }
-static int g_pack_domain = -1;   /* -1 => use default; set per-weight during pack/load */
-static int g_run_domain  = -1;   /* -1 => use default; set per-weight at run() entry */
-static int ork_pack_dom(void){ return g_pack_domain>=0 ? g_pack_domain : ork_dom_default(); }
-static int ork_run_dom (void){ return g_run_domain >=0 ? g_run_domain  : ork_dom_default(); }
-static struct buf bcreate(int fd,size_t size,uint32_t flags){
-    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_pack_dom();
+/* THREAD-SAFETY: the IOMMU domain is threaded through call parameters and the per-submit
+ * rknpu_submit struct, NOT a process-global — two concurrent submits / packs must not race a
+ * shared mutable domain. bcreate/bimport take an explicit `domain`; rknpu_submit_ioctl sets
+ * sub->iommu_domain_id from a parameter. The pack-path default for the ggml-ork caller lives on
+ * the ork_npu ctx (c->pack_domain), read once per pack to stamp w->domain. dom<0 => default. */
+static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
+static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
+    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_dom(domain);
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");return (struct buf){0};}
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");return (struct buf){0};}
@@ -227,7 +234,7 @@ static int dmaheap_open(void){
 static void dmabuf_sync(int heap_fd,uint64_t flags){
     if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
 }
-static struct buf bimport(int fd,size_t size){
+static struct buf bimport(int fd,size_t size,int domain){
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
     size_t sz=pgup(size);
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
@@ -237,7 +244,7 @@ static struct buf bimport(int fd,size_t size){
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=ork_pack_dom();
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=ork_dom(domain);
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf;
@@ -256,7 +263,7 @@ static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
         if(c->wchunk_n >= (int)(sizeof c->wchunk/sizeof c->wchunk[0])) return NULL;
         const char *e=getenv("ORK_WARENA_CHUNK_MB"); long mb=e?atol(e):1024; if(mb<=0) return NULL;
         size_t csz=(size_t)mb*1024u*1024u; if(a>csz) csz=a;
-        struct buf b=bcreate(c->fd,csz,0x403);
+        struct buf b=bcreate(c->fd,csz,0x403,-1);
         if(!b.cpu){ fprintf(stderr,"[ork] weight arena chunk %zuMB failed; per-buffer fallback\n",csz/1024u/1024u); return NULL; }
         c->wchunk[c->wchunk_n++]=b; c->wchunk_off=0;
     }
@@ -269,8 +276,8 @@ static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.v
 /* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
  * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
  * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
- * use, so the run path's lazy bcreate allocates it in `dom` — callers set g_pack_domain=dom before the
- * run). No-op when single-domain (dom==dom_active and only domain 0 ever used). */
+ * use, so the run path's lazy bcreate allocates it in `dom` via c->dom_active). No-op when
+ * single-domain (dom==dom_active and only domain 0 ever used). */
 static void dom_activate(ork_npu *c,int dom){
     if(dom<0||dom>=ORK_MAXDOM) dom=0;
     if(dom==c->dom_active) return;
@@ -290,11 +297,9 @@ static void dom_activate(ork_npu *c,int dom){
     /* first time we touch domain `dom`: it has no regcmd/task yet. Allocate them in this domain now
      * (the run/mc paths assume regcmd+task exist) and seed the task descriptor like ork_npu_init does. */
     if(!neo->used && !c->regcmd.cpu){
-        int save=g_pack_domain; g_pack_domain=dom;
-        c->regcmd=bcreate(c->fd,2097152,0x403); c->task=bcreate(c->fd,524288,0x40b);
+        c->regcmd=bcreate(c->fd,2097152,0x403,dom); c->task=bcreate(c->fd,524288,0x40b,dom);
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
             memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-        g_pack_domain=save;
     }
 }
 
@@ -362,8 +367,8 @@ static void trace_submit(struct rknpu_submit *sub) {
     }
 }
 
-static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
-    sub->iommu_domain_id = ork_run_dom();  /* match the domain the weight's resident tiles live in */
+static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+    sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
     if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
@@ -478,9 +483,9 @@ ork_npu *ork_npu_init(void){
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
-    c->regcmd=bcreate(fd,2097152,0x403); c->task=bcreate(fd,524288,0x40b); c->Af=bcreate(fd,(size_t)4*32768*2,0x403);
+    c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
@@ -516,7 +521,7 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
  * residency automatically (no API change); the caller just allocates A/C here. ---- */
 void *ork_dma_alloc(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bcreate(c->fd,size,0x401); if(!b.cpu) return NULL;
+    struct buf b=bcreate(c->fd,size,0x401,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_free(ork_npu *c, void *ptr){
@@ -527,7 +532,7 @@ void ork_dma_free(ork_npu *c, void *ptr){
  * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
 void *ork_dma_import(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bimport(c->fd,size); if(!b.cpu) return NULL;
+    struct buf b=bimport(c->fd,size,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
@@ -560,7 +565,7 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
  * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
 void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bcreate(c->fd,size,flags); if(!b.cpu) return NULL;
+    struct buf b=bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 /* Diagnostic only: clean-only flush (TO_DEVICE) of a sub-range — push dirty CPU cache lines out to DRAM
@@ -586,7 +591,7 @@ void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>
  * run time ork_mm_run* submits that weight's matmuls against the same domain automatically. Activation/
  * output scratch follows the most-recently-set pack domain. domain<0 reverts to the process default
  * (env ORK_IOMMU_DOMAIN, else 0). Domains are created lazily by the kernel on first use. */
-void ork_npu_set_pack_domain(ork_npu *c,int domain){ (void)c; g_pack_domain = domain<0 ? -1 : domain; }
+void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(c) c->pack_domain = domain<0 ? -1 : domain; }
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
@@ -595,10 +600,42 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
     int KS=dt ? 1024 : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_pack_dom(); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_dom(c->pack_domain); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    /* FIX 2 (gated, ORK_CONSOLIDATE_I8): consolidate all int8 Bb tiles into ONE per-weight DMA buffer,
+     * tiles being page-aligned base+offset VIEWS — cuts thousands of GEM objects / MEM_CREATE / page-pad
+     * to one alloc (matches rkllm's one-buffer-per-domain). owns flips to 0 + own_buf_valid so ork_mm_free
+     * reclaims the single buffer. Each tile's regcmd bdma is own_buf.dma+off (validate_regcmd + the run
+     * path read it exactly like a per-tile dma — same as the validated grouped-i4 own_buf path). Off by
+     * default: this touches the regcmd ADDRESS MATH that wedged the wide-N path before; opt-in to de-risk.
+     * Falls back to per-tile owning bcreate (below) on any alloc failure. */
+    int consolidate = (dt==DT_I8) && getenv("ORK_CONSOLIDATE_I8");
+    if(consolidate){
+        size_t wtotal=0;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+          for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;(void)k0;
+            wtotal += pgup((size_t)Kp*Nc*esz);}}
+        struct buf own=bcreate(c->fd,wtotal,0x403,w->domain);
+        if(own.cpu){
+            w->own_buf=own; w->own_buf_valid=1; w->owns=0;   /* tiles are views; reclaim own_buf as one */
+            size_t off=0;
+            for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
+              for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=pgup((size_t)Kp*Nc*esz);
+                struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+                /* size = PAGE-PADDED tile (== per-tile bcreate's b->size) so ork_w_dump byte-matches the
+                 * non-consolidated layout and round-trips through ork_mm_load_i8. */
+                b->handle=own.handle; b->obj=own.obj; b->dma=own.dma+off; b->cpu=(char*)own.cpu+off; b->size=ts;
+                int8_t*bb=b->cpu; const int8_t*Bi=B;
+                for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                    bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
+                off += ts;}}
+            bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
+        } else { consolidate=0; }   /* alloc failed → per-tile fallback below */
+    }
+    if(!consolidate)
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,0x403);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,0x403,w->domain);
         if(!b->cpu){
             fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack (size=%zu)\n",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
             for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
@@ -618,7 +655,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
      * K-split path (correct, just slower). No crash, no ceiling guess. */
     if(dt==DT_I8 && K<=10752){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403);
+            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
             int8_t*bb=b->cpu; const int8_t*Bi=B;
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
@@ -656,12 +693,12 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_pack_dom();
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
@@ -674,7 +711,7 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
      * weights run via the K-split Bb path (run_i8), which doesn't need Bf. */
     if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
-            struct buf*bf=&w->Bf[ns]; *bf=bcreate(c->fd,(size_t)K*Nc,0x403);
+            struct buf*bf=&w->Bf[ns]; *bf=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain);
             if(!bf->cpu){ ok=0; break; }                /* IOVA full → give up on Bf */
             int8_t*fb=bf->cpu;
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
@@ -701,12 +738,12 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
         memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc); off+=b->size;
@@ -714,7 +751,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     /* Bf full-K rebuild (same envelope as ork_mm_load_i8): imported too, abandoned on failure. */
     if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
-            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc);
+            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
             int8_t*fb=bf->cpu;
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
@@ -762,12 +799,12 @@ ork_w *ork_mm_load_i8_flags(ork_npu *c,int K,int N,const void *blob,size_t n,uns
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,flags);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,flags,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
@@ -849,11 +886,11 @@ ork_w *ork_mm_pack_i8_f32(ork_npu *c, int K, int N, const float *f32, float *bsc
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
         if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
         if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     float *inv = malloc((size_t)N * sizeof(float)); if (!inv) { ork_w_free(w); return NULL; }
     chan_scales_f32(f32, K, N, inv, bscale_out);
@@ -1108,16 +1145,16 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
     int nf4 = getenv("ORK_NF4") != NULL;   /* ORK_NF4: non-uniform NF4 codebook instead of the uniform int4 grid */
     int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
     ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->quant_kind = nf4 ? ORK_QK_CODEBOOK_NF4 : ORK_QK_UNIFORM;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->domain=ork_dom(c->pack_domain); w->quant_kind = nf4 ? ORK_QK_CODEBOOK_NF4 : ORK_QK_UNIFORM;
     w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
         if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
         if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     /* compact int4 nibble store (n-major, K contiguous): the memory-win form, kept on the ork_w */
     w->Bi4_bytes = (size_t)N * (K/2);
@@ -1197,16 +1234,16 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
-    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->quant_kind=(uint8_t)h.quant_kind;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403);
+        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if(K<=10752){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc,0x403); if(!b->cpu) ok=0; }
+            struct buf *b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     /* retain the compact store + scales so the loaded weight re-dumps byte-identically */
     w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
@@ -1271,15 +1308,15 @@ ork_w *ork_mm_load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_
     if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
-    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->quant_kind=(uint8_t)h.quant_kind;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if(K%512==0 && K<=4096){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf*b=&w->Bf[ns]; *b=bimport(c->fd,(size_t)K*Nc); if(!b->cpu) ok=0; }
+            struct buf*b=&w->Bf[ns]; *b=bimport(c->fd,(size_t)K*Nc,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
     if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
@@ -1606,11 +1643,11 @@ ork_w *ork_mm_pack_i8_dequant(ork_npu *c, int K, int N, ork_dequant_row_fn fn, v
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403);
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
         if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403); if (!b->cpu) ok = 0; }
+            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
         if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     if (tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out) != 0) { ork_w_free(w); return NULL; }
     return w;
@@ -1623,15 +1660,21 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
 void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w); }   /* device buffers freed at ctx teardown */
 /* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
  * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
- * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; arena-view weights
- * (grouped-i4 share c->wchunk) carry owns=0 and are left to ctx teardown. */
+ * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; weights whose tiles
+ * are VIEWS into a single dedicated buffer (grouped-i4, own_buf_valid=1) reclaim that one buffer. */
 void ork_mm_free(ork_npu *c, ork_w *w){
     if(!w) return;
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
-        if(w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
     }
+    /* Bf is ALWAYS its own per-N-slice bcreate/bimport (never a view), even when Bb is consolidated into
+     * own_buf — so reclaim it whenever present, independent of owns. */
+    if(c && w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
+    /* dedicated single-buffer weights (grouped-i4, or consolidated int8): Bb[] entries are VIEWS (share
+     * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
+     * of a sub-pointer). Reclaims IOVA. */
+    if(c && w->own_buf_valid) bdestroy(c->fd,&w->own_buf);
     free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
@@ -1694,11 +1737,11 @@ static void tile_i4_Aslice_mm(uint8_t*dst,const int8_t*A,int M,int K,int k0,int 
 ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
     if(K%32||N%64) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;  /* wide N-slices ≤ nmax */
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++)for(int ks=0;ks<Sk;ks++){
         int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
         if(!b->cpu){
             fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack_i4 (size=%zu)\n",(size_t)ns*Sk+ks,(size_t)Kp*Nc/2);
             for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
@@ -1714,32 +1757,37 @@ ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
 ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
     if(K%32||N%64||G%32||K%G||G>ORK_I4_KS) return NULL;
     int NMAX=c->soc->nmax, Sk=K/G, Sn=(N+NMAX-1)/NMAX;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;w->gsize=G;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;w->gsize=G; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
-    /* Reserve the whole weight as one contiguous region in an arena chunk; each group-tile is a 4KB-aligned
-     * VIEW into it (shared obj, dma=chunk.dma+off). Collapses the per-group bcreate storm to (at most) one
-     * chunk allocation amortized across many weights => fast warmup, no IOVA-handle OOM. The weight's region
-     * is flushed to device in a single bsync_off. Falls back to per-tile bcreate if the pool is exhausted. */
+    /* Reserve the whole weight as ONE dedicated DMA buffer (own_buf); each group-tile is a 4KB-aligned
+     * VIEW into it (shared obj, dma=own_buf.dma+off). Collapses the per-group bcreate storm to a single
+     * allocation => fast warmup, no IOVA-handle OOM, and — crucially — RECLAIMABLE: ork_mm_free destroys
+     * own_buf (returning its IOVA to the 4 GiB window), so drop/reload of a grouped weight does NOT leak
+     * (streaming / MoE-swap). The whole region is flushed to device in a single bsync. Falls back to
+     * per-tile owning bcreate (also reclaimable) if the dedicated alloc fails. */
     size_t wtotal=0;
     for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         wtotal += (((size_t)G*Nc/2)+4095u)&~(size_t)4095u; }
-    size_t base; struct buf *ch=warena_reserve(c,wtotal,&base);
-    if(ch){
-        size_t off=base;
+    struct buf own=bcreate(c->fd,wtotal,0x403,w->domain);
+    if(own.cpu){
+        w->own_buf=own; w->own_buf_valid=1;
+        size_t off=0;
         for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
             int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; size_t ts=(size_t)G*Nc/2;
             struct buf*b=&w->Bb[(size_t)ns*Sk+g];
-            b->handle=ch->handle; b->obj=ch->obj; b->dma=ch->dma+off; b->cpu=(char*)ch->cpu+off; b->size=ts;
+            b->handle=own.handle; b->obj=own.obj; b->dma=own.dma+off; b->cpu=(char*)own.cpu+off; b->size=ts;
             tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
             off += (ts+4095u)&~(size_t)4095u;
         }
-        bsync_off(c->fd,ch->obj,base,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-        bsync_off(c->fd,ch->obj,base,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
     } else {
+        w->owns=1;   /* per-tile owning bcreate: reclaimable by ork_mm_free */
         for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
             int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403);
-            if(!b->cpu){ fprintf(stderr,"[ork] ERROR: weight alloc failed (G=%d Nc=%d) in pack_i4_grouped\n",G,Nc); free(w->Bb); free(w); return NULL; }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403,w->domain);
+            if(!b->cpu){ fprintf(stderr,"[ork] ERROR: weight alloc failed (G=%d Nc=%d) in pack_i4_grouped\n",G,Nc);
+                for(int i=0;i<ns*Sk+g;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
             tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
         }
@@ -1780,7 +1828,7 @@ static int submit1(ork_npu *c){
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=60000;
-        if(rknpu_submit_ioctl(fd,&sub)){ if(last){perror("SUBMIT");return -1;} continue; }
+        if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
         bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
@@ -1791,7 +1839,7 @@ static int submit1(ork_npu *c){
 static int mc_ensure(ork_npu *c,int nc){
     int fd=c->fd;
     if(!c->mtk_all.cpu) {
-        c->mtk_all=bcreate(fd, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b);
+        c->mtk_all=bcreate(fd, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
         if(!c->mtk_all.cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate mtk_all task buffer (IOMMU full?)\n");
             return -1;
@@ -1799,7 +1847,7 @@ static int mc_ensure(ork_npu *c,int nc){
     }
     for(int i=0;i<nc;i++){
         if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
-        c->mrc[i]=bcreate(fd,65536,0x403); c->mtk[i]=bcreate(fd,65536,0x40b); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403);
+        c->mrc[i]=bcreate(fd,65536,0x403,c->dom_active); c->mtk[i]=bcreate(fd,65536,0x40b,c->dom_active); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403,c->dom_active);
         if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
             return -1;
@@ -1848,7 +1896,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
         sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=60000;
-        if(rknpu_submit_ioctl(fd,&sub)){ if(last){ a->rc=-1; return; } }
+        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){ a->rc=-1; return; } }
         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     c->mwarm[i]=1;
@@ -1968,7 +2016,7 @@ static void *mcworker(void *vp){
                         sub.core_mask=1u<<i;
                         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
                         sub.timeout=60000;
-                        if(rknpu_submit_ioctl(fd,&sub)){ if(last){a->rc=-1;c->mc_error=1;break;} continue; }
+                        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;break;} continue; }
                         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                     }
                     c->mwarm[i]=1;
@@ -2142,7 +2190,7 @@ static void *mcworker(void *vp){
                     sub.core_mask=1u<<i;
                     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
                     sub.timeout=60000;
-                    if(rknpu_submit_ioctl(fd,&sub)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
+                    if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
                     bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                 }
                 c->mwarm[i]=1;
@@ -2429,15 +2477,15 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             if(want>maxout)maxout=want;
             /* grow regcmd/task buffers to hold up to 256 chained programs */
             size_t needrc=(size_t)256*REGCMD_I8_N*4, needtk=(size_t)256*sizeof(struct rknpu_task);
-            if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403);
+            if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active);
                 if(!c->mrc[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mrc[%d] alloc failed (%zu)\n",i,needrc); return -1; } c->mwarm[i]=0; }
-            if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b);
+            if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active);
                 if(!c->mtk[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mtk[%d] alloc failed (%zu)\n",i,needtk); return -1; } }
         }
         core_maxout[i] = maxout;
         if(c->mccsz[i]<maxout){
             bdestroy(fd,&c->mcc[i]);
-            c->mcc[i]=bcreate(fd,maxout,0x403);
+            c->mcc[i]=bcreate(fd,maxout,0x403,c->dom_active);
             c->mccsz[i]=maxout;
             c->mwarm[i]=0;
             c->mwarm[0]=0;
@@ -2448,7 +2496,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         }
         if(c->maf[i].size<maxaf){
             bdestroy(fd,&c->maf[i]);
-            c->maf[i]=bcreate(fd,maxaf,0x403);
+            c->maf[i]=bcreate(fd,maxaf,0x403,c->dom_active);
             if(!c->maf[i].cpu){
                 fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation buffer maf[%d] (size=%zu, IOMMU full?)\n", i, maxaf);
                 return -1;
@@ -2564,7 +2612,7 @@ static void *i4_mcworker(void *vp){
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
                     sub.timeout = 60000;
-                    if (rknpu_submit_ioctl(fd, &sub)) {
+                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
                         if (last) {
                             a->rc = -1;
                             free(acc);
@@ -2639,10 +2687,10 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
-    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
+    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
     size_t asz=(size_t)M*ORK_I4_KS/2;
     if(asz < (size_t)4*32768*2) asz=(size_t)4*32768*2;
-    for(int i=0;i<nc;i++){ if(c->maf[i].size<asz){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,asz,0x403); if(!c->maf[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation maf[%d] (size=%zu)\n", i, asz);return -2;} } }
+    for(int i=0;i<nc;i++){ if(c->maf[i].size<asz){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,asz,0x403,c->dom_active); if(!c->maf[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation maf[%d] (size=%zu)\n", i, asz);return -2;} } }
     /* Zero-copy chaining (the portable half of the int8 zero-copy design — perf-neutral, correctness
      * for DMA pipelines). int4 can't read/write the caller's A/C *directly* (A needs the nibble re-tile,
      * the int16 hardware output needs widening to the int32 C), so the internal AF/O scratch is
@@ -2712,7 +2760,7 @@ static void *i4_mcworker_g(void *vp){
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
                     sub.timeout = 60000;
-                    if (rknpu_submit_ioctl(fd, &sub)) {
+                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
                         if (last) {
                             a->rc = -1;
                             free(acc);
@@ -2799,7 +2847,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
     if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*2;
-    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate grouped multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
+    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate grouped multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
     struct i4gw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
     for(int i=0;i<nc;i++) args[i]=(struct i4gw){c,i,nc,M,w,A,aScale,bScale,C,0};
     c->mc_error = 0;
@@ -2811,11 +2859,10 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
 }
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
-    g_run_domain = w->domain;   /* submit this weight's matmuls against the domain its tiles live in */
     /* multi-domain residence: swap in this domain's scratch (regcmd/task/Af/Cc/mc-*) so the submit's
-     * buffers all live in the weight's domain, and make any lazy scratch bcreate below land there too.
+     * buffers all live in the weight's domain (c->dom_active), and make any lazy scratch bcreate below
+     * land there too. Submits stamp their own iommu_domain_id from w->domain (per-submit, no global).
      * No-op for the common single-domain case (w->domain==0, dom_active==0). */
-    g_pack_domain = w->domain;
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
@@ -2852,10 +2899,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         size_t sz=(size_t)rows*Kp*1;
         if(sz>maxaf)maxaf=sz;
     }
-    if(c->ccsz<maxout){bdestroy(fd,&c->Cc);c->Cc=bcreate(fd,maxout,0x403);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu){fprintf(stderr, "[ork] ERROR: failed to allocate single-core/pre-core output buffer Cc (size=%zu, IOMMU full?)\n", maxout);return -1;}}
+    if(c->ccsz<maxout){bdestroy(fd,&c->Cc);c->Cc=bcreate(fd,maxout,0x403,c->dom_active);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu){fprintf(stderr, "[ork] ERROR: failed to allocate single-core/pre-core output buffer Cc (size=%zu, IOMMU full?)\n", maxout);return -1;}}
     if(c->Af.size<maxaf){
         bdestroy(fd,&c->Af);
-        c->Af=bcreate(fd,maxaf,0x403);
+        c->Af=bcreate(fd,maxaf,0x403,c->dom_active);
         if(!c->Af.cpu){
             fprintf(stderr, "[ork] ERROR: failed to allocate activation buffer Af (size=%zu, IOMMU full?)\n", maxaf);
             return -1;
@@ -2964,12 +3011,12 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
 int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403); if(!W.cpu) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
     int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
     uint32_t rc[REGCMD_I8_N];
@@ -2981,7 +3028,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;   /* rep0 warmup (cold buffer stale), rep1 real */
-        if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
@@ -3001,9 +3048,9 @@ static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC
 int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,double*us_batched){
     int fd=c->fd,CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||ntask<1||ntask>32) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403); if(!W.cpu) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     memset(W.cpu,1,(size_t)K*N); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
     int8_t*ad=c->Af.cpu; memset(ad,1,K); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
@@ -3020,14 +3067,14 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    if(rknpu_submit_ioctl(fd,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
+    if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
     for(int i=0;i<ntask;i++){ sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        if(rknpu_submit_ioctl(fd,&sub)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
     *us_unbatched=ork_now_us()-t0;
     sub.task_number=ntask; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)ntask};
     t0=ork_now_us();                                 /* (b) one ioctl, ntask tasks */
-    if(rknpu_submit_ioctl(fd,&sub)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(rknpu_submit_ioctl(fd,&sub,-1)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     *us_batched=ork_now_us()-t0;
     bdestroy(fd,&W);bdestroy(fd,&O); return 0;
 }
@@ -3043,12 +3090,12 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
                             const f16 *A,const f16 *B,float *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(Kfull%32||Kp%32||N%16||N>c->soc->nmax||Kp>Kfull) return -2;
-    struct buf W=bcreate(fd,(size_t)Kfull*N*2,0x403); if(!W.cpu) return -2;
+    struct buf W=bcreate(fd,(size_t)Kfull*N*2,0x403,-1); if(!W.cpu) return -2;
     int NN=N/16,KTf=Kfull/32; f16*bb=W.cpu;     /* full-K fp16 layout [Ntile][KTfull][16][32] */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KTf*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
     f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N];
     synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
@@ -3060,7 +3107,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;
-        if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
@@ -3098,10 +3145,10 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
                      const int8_t *A,const int8_t *B,int16_t *C){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N/2,0x403); if(!W.cpu) return -2;        /* B int4: half bytes */
+    struct buf W=bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;        /* B int4: half bytes */
     tile_i4_B(W.cpu,B,K,N,nibB);
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*2,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
+    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
     /* M-tiling: the captured W4A4 program runs M=1 per task; we replicate it per row. Each row's A is
      * its own native (K/32,1,32) block (contiguous K/2 bytes); each row's C is (N/8,1,8) = N int16. */
     uint8_t*ad=c->Af.cpu;
@@ -3118,7 +3165,7 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
         if (validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         sub.timeout=60000; ok=-1;
-        for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
+        for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
             bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
             for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) C[(size_t)m*N + nt*8+nl] = cr[nt*8+nl]; }
@@ -3135,10 +3182,10 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
 int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int16_t *raw){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax||M<1) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N/2,0x403); if(!W.cpu) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;
     tile_i4_B(W.cpu,B,K,N,0);
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*2,0x403); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
     /* A layout selector via ORK_I4_ALAY: 0=(K/32,M,32) interleaved, 1=per-row contiguous (K/32,1,32)
      * x M (what the captured M=1 program reads). Lets the probe tell whether the program is single-row. */
     { int alay=getenv("ORK_I4_ALAY")?atoi(getenv("ORK_I4_ALAY")):0;
@@ -3153,7 +3200,7 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(rknpu_submit_ioctl(fd,&sub)){ ok=-1; continue; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)M*N*2);
     bdestroy(fd,&W);bdestroy(fd,&O);
@@ -3163,13 +3210,13 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
 int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, const int8_t *B, int32_t *C) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     if (K % 32 || N % 32 || N > c->soc->nmax || S < 1 || S > 32) return -2;
-    struct buf W = bcreate(fd, (size_t)K * N, 0x403); if (!W.cpu) return -2;
+    struct buf W = bcreate(fd, (size_t)K * N, 0x403,-1); if (!W.cpu) return -2;
     int NN = N / 32, KT = K / 32; int8_t *bb = W.cpu;
     for (int nt = 0; nt < NN; nt++) for (int kt = 0; kt < KT; kt++) for (int nl = 0; nl < 32; nl++) for (int kk = 0; kk < 32; kk++)
         bb[(size_t)nt * KT * 32 * 32 + (size_t)kt * 32 * 32 + nl * 32 + kk] = B[(size_t)(kt * 32 + kk) * N + (nt * 32 + nl)];
     bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
     
-    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403); if (!O.cpu) { bdestroy(fd, &W); return -2; }
+    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403,-1); if (!O.cpu) { bdestroy(fd, &W); return -2; }
     
     int8_t *ad = c->Af.cpu;
     for (int i = 0; i < S; i++) {
@@ -3228,7 +3275,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     int ok = -1;
     for (int rep = 0; rep < 2; rep++) {
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { ok = -1; continue; }
+        if (rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
         bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         for (int i = 0; i < S; i++) {
             memcpy(C + i * N, (char*)O.cpu + i * 4096, (size_t)N * 4);
@@ -3244,15 +3291,15 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     if (K % 32 || N % 32 || N > c->soc->nmax || S < 1 || S > 64) return -2;
     
-    struct buf W = bcreate(fd, (size_t)K * N, 0x403);
-    struct buf A = bcreate(fd, (size_t)S * K, 0x403);
-    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403);
+    struct buf W = bcreate(fd, (size_t)K * N, 0x403,-1);
+    struct buf A = bcreate(fd, (size_t)S * K, 0x403,-1);
+    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403,-1);
     
-    struct buf regs_chain = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403);
-    struct buf regs_sep = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403);
+    struct buf regs_chain = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
+    struct buf regs_sep = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
     
-    struct buf task_chain = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b);
-    struct buf task_sep = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b);
+    struct buf task_chain = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
+    struct buf task_sep = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
     
     if (!W.cpu || !A.cpu || !O.cpu || !regs_chain.cpu || !regs_sep.cpu || !task_chain.cpu || !task_sep.cpu) {
         fprintf(stderr, "[ork] ERROR: failed to allocate benchmark_chain buffers (IOMMU full?)\n");
@@ -3328,7 +3375,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
     sub.timeout = 60000;
-    if (rknpu_submit_ioctl(fd, &sub)) {
+    if (rknpu_submit_ioctl(fd, &sub, -1)) {
         perror("Warmup failed");
     }
     bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -3348,7 +3395,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
             sub_s.fence_fd = -1;
             sub_s.subcore_task[0] = sub_s.subcore_task[1] = sub_s.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
             sub_s.timeout = 60000;
-            if (rknpu_submit_ioctl(fd, &sub_s)) {
+            if (rknpu_submit_ioctl(fd, &sub_s, -1)) {
                 perror("Separate submit failed");
                 break;
             }
@@ -3367,7 +3414,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         sub_c.fence_fd = -1;
         sub_c.subcore_task[0] = sub_c.subcore_task[1] = sub_c.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
         sub_c.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub_c)) {
+        if (rknpu_submit_ioctl(fd, &sub_c, -1)) {
             perror("Chained submit failed");
             break;
         }
@@ -3414,7 +3461,6 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
     if (tasks[0].w) {  /* chained weights share one submit => one domain; swap in that domain's scratch */
-        g_run_domain = tasks[0].w->domain; g_pack_domain = tasks[0].w->domain;
         if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     }
 
@@ -3481,7 +3527,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);
             act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
         } else {
-            tmp_A[i] = bcreate(fd, (size_t)M * K, 0x403);
+            tmp_A[i] = bcreate(fd, (size_t)M * K, 0x403, c->dom_active);
             if (!tmp_A[i].cpu) { ok = -1; goto cleanup; }
             memcpy(tmp_A[i].cpu, tasks[i].A, (size_t)M * K);
             bsync(fd, &tmp_A[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -3495,7 +3541,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
         } else {
-            tmp_C[i] = bcreate(fd, (size_t)M * N * 4, 0x403);
+            tmp_C[i] = bcreate(fd, (size_t)M * N * 4, 0x403, c->dom_active);
             if (!tmp_C[i].cpu) { ok = -1; goto cleanup; }
             bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_TO_DEVICE);
             out_dma[i] = (uint32_t)tmp_C[i].dma;
@@ -3573,7 +3619,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
+        if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
     }
     c->warmed = 1;
@@ -3643,7 +3689,7 @@ static void *stream_worker(void *vp) {
         sub.flags = 0x5; sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { a->rc = -1; }
+        if (rknpu_submit_ioctl(fd, &sub, w->domain)) { a->rc = -1; }
         bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         memcpy(t->C, c->mcc[i].cpu, (size_t)M * N * 4);
     }
@@ -3655,6 +3701,8 @@ static void *stream_worker(void *vp) {
  * per-core staging buffers — no zero-copy DMA here). Returns 0/ok, -1 submit fail, -2 bad arg. */
 int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
+    /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
     const int mrc_cap = 65536 / (REGCMD_I8_N * 4);
     size_t maxMK = 0, maxMN4 = 0;
     for (int i = 0; i < S; i++) {
@@ -3679,8 +3727,8 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
-        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403); if (!c->maf[i].cpu) return -1; cold = 1; }
-        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; cold = 1; }
+        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
+        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403, c->dom_active); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; cold = 1; }
     }
     int rc = 0;
     npu_pool_ensure(c);
@@ -3713,6 +3761,8 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
      * single-core chain path. Chaining only pays off when batching S>1 independent matmuls. */
     if (S == 1) return ork_mm_run_i4(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
+    /* chained weights share one submit => one domain; swap in that domain's scratch */
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
     int fd = c->fd;
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -3738,8 +3788,8 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (abuf) bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
 
-    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403);
-    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403);
+    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
+    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
     if (!chain_A.cpu || !chain_C.cpu) {
         if (chain_A.cpu) bdestroy(fd, &chain_A);
         if (chain_C.cpu) bdestroy(fd, &chain_C);
@@ -3809,7 +3859,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { if (last) { ok = -1; goto cleanup; } continue; }
+        if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { ok = -1; goto cleanup; } continue; }
         bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     c->warmed = 1;
@@ -3891,7 +3941,7 @@ static void *stream_worker_i4(void *vp) {
         sub.flags = 0x5; sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub)) { a->rc = -1; }
+        if (rknpu_submit_ioctl(fd, &sub, w->domain)) { a->rc = -1; }
         bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;        /* widen int16 NPU output -> int32 caller C */
         for (int row = 0; row < M; row++) {
@@ -3903,6 +3953,8 @@ static void *stream_worker_i4(void *vp) {
 }
 int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
+    /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
     const int mrc_cap = 65536 / (REGCMD_I4_N * 4);
     size_t maxMK = 0, maxMN2 = 0;
     for (int i = 0; i < S; i++) {
@@ -3919,8 +3971,8 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {
-        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403); if (!c->maf[i].cpu) return -1; cold = 1; }
-        if (c->mccsz[i] < maxMN2) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN2, 0x403); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
+        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
+        if (c->mccsz[i] < maxMN2) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN2, 0x403, c->dom_active); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
     }
     int rc = 0;
     npu_pool_ensure(c);
