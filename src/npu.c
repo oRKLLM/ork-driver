@@ -60,7 +60,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
      * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
     struct buf wchunk[64]; int wchunk_n; size_t wchunk_off; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -155,12 +155,22 @@ static int budget(ork_npu*c, int M){
 
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
-/* DE-RISK PROBE: ORK_IOMMU_DOMAIN routes every MEM_CREATE + submit through a chosen IOMMU domain id
- * (default 0). Lets the validated matmul run entirely in domain 1 to prove domain-1 buffers are
- * NPU-submittable (multi-domain >4GiB residence). Harmless when unset. Not a shipping feature. */
-static int ork_dom_id(void){ const char*e=getenv("ORK_IOMMU_DOMAIN"); return e?atoi(e):0; }
+/* PER-WEIGHT IOMMU DOMAIN. The rk_iommu v2 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, not per
+ * device, so spreading weights over multiple domains keeps >4 GiB resident at once. ORK_IOMMU_DOMAIN
+ * is the process-wide DEFAULT domain (env, default 0). Each ork_w then carries its own `domain`:
+ *   - g_pack_domain  is read by bcreate/bimport — set it to w->domain just before allocating that
+ *                    weight's resident tiles so they land in the chosen domain.
+ *   - g_run_domain   is read by rknpu_submit_ioctl — set it to w->domain at the top of run() so the
+ *                    submit runs against the same domain the weight lives in.
+ * Activation/output/scratch buffers are allocated under whatever domain is current; resident weights
+ * and their submits dominate the IOVA budget, so per-weight placement is what matters. */
+static int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_IOMMU_DOMAIN"); v=e?atoi(e):0;} return v; }
+static int g_pack_domain = -1;   /* -1 => use default; set per-weight during pack/load */
+static int g_run_domain  = -1;   /* -1 => use default; set per-weight at run() entry */
+static int ork_pack_dom(void){ return g_pack_domain>=0 ? g_pack_domain : ork_dom_default(); }
+static int ork_run_dom (void){ return g_run_domain >=0 ? g_run_domain  : ork_dom_default(); }
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
-    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_dom_id();
+    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_pack_dom();
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");return (struct buf){0};}
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");return (struct buf){0};}
@@ -204,7 +214,7 @@ static struct buf bimport(int fd,size_t size){
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK;
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=ork_pack_dom();
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf;
@@ -298,7 +308,7 @@ static void trace_submit(struct rknpu_submit *sub) {
 }
 
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
-    sub->iommu_domain_id = ork_dom_id();  /* DE-RISK PROBE: match the domain bcreate placed buffers in */
+    sub->iommu_domain_id = ork_run_dom();  /* match the domain the weight's resident tiles live in */
     trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {
@@ -504,13 +514,23 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 
+/* PER-WEIGHT IOMMU DOMAIN PLACEMENT. The rk_iommu 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, so a
+ * model larger than 4 GiB stays fully resident (no streaming) by spreading its weights over domains.
+ * Set the domain BEFORE packing/loading a weight: every subsequent ork_mm_pack_i8 / ork_mm_load_i8 (and
+ * the fp16/int4 variants) places its resident tiles in `domain` and stamps it on the returned ork_w; at
+ * run time ork_mm_run* submits that weight's matmuls against the same domain automatically. Activation/
+ * output scratch follows the most-recently-set pack domain. domain<0 reverts to the process default
+ * (env ORK_IOMMU_DOMAIN, else 0). Domains are created lazily by the kernel on first use. */
+void ork_npu_set_pack_domain(ork_npu *c,int domain){ (void)c; g_pack_domain = domain<0 ? -1 : domain; }
+int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
+
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
     int KS=dt ? 1024 : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_pack_dom(); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,0x403);
@@ -571,7 +591,7 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
-    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_pack_dom();
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -2444,6 +2464,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
 }
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
+    g_run_domain = w->domain;   /* submit this weight's matmuls against the domain its tiles live in */
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
     int b=budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
@@ -3040,6 +3061,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
+    if (tasks[0].w) g_run_domain = tasks[0].w->domain;  /* chained weights share one submit => one domain */
 
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and

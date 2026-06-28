@@ -22,7 +22,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 /* Library version (semver). The build may also inject a short git hash via -DORK_GIT_HASH (the
  * Makefile does this when built where git is available); ork_npu_version() then returns
  * "MAJOR.MINOR.PATCH+g<hash>", else just the semver. Bump MINOR on backward-compatible API adds. */
-#define ORK_NPU_VERSION "0.5.1"
+#define ORK_NPU_VERSION "0.6.0"
 const char  *ork_npu_version(void);  /* e.g. "0.3.0" or "0.3.0+g1a2b3c4" */
 
 /* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
@@ -38,6 +38,15 @@ int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params ar
  * default). Multi-core + the full-K int8 decode layout are chosen automatically per matmul; this
  * just bounds them (e.g. reserve cores for another workload). */
 void         ork_npu_set_core_budget(ork_npu *ctx, int n);
+
+/* Per-weight NPU IOMMU domain placement. The rk_iommu 32-bit IOVA window (~4 GiB) is per
+ * iommu_domain_id, so a model larger than 4 GiB can stay FULLY resident (no streaming, no per-token
+ * map/unmap) by placing its weights across several domains. Call this before ork_mm_pack_i8 /
+ * ork_mm_load_i8 (and the fp16/int4 variants): each weight packed/loaded afterward lands its resident
+ * tiles in `domain` and records it; ork_mm_run* then submits that weight's matmuls against the same
+ * domain automatically. domain<0 reverts to the process default (env ORK_IOMMU_DOMAIN, else 0). */
+void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
+int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
 
 /* Zero-copy DMA buffers (NPU-coherent, CPU-mapped). Allocate the activation A and/or output C here
  * and the matmul reads/writes them in place — no host gather/writeout memcpy (the ~33% prefill
