@@ -155,8 +155,12 @@ static int budget(ork_npu*c, int M){
 
 
 static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
+/* DE-RISK PROBE: ORK_IOMMU_DOMAIN routes every MEM_CREATE + submit through a chosen IOMMU domain id
+ * (default 0). Lets the validated matmul run entirely in domain 1 to prove domain-1 buffers are
+ * NPU-submittable (multi-domain >4GiB residence). Harmless when unset. Not a shipping feature. */
+static int ork_dom_id(void){ const char*e=getenv("ORK_IOMMU_DOMAIN"); return e?atoi(e):0; }
 static struct buf bcreate(int fd,size_t size,uint32_t flags){
-    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK;
+    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_dom_id();
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");return (struct buf){0};}
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");return (struct buf){0};}
@@ -294,6 +298,7 @@ static void trace_submit(struct rknpu_submit *sub) {
 }
 
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
+    sub->iommu_domain_id = ork_dom_id();  /* DE-RISK PROBE: match the domain bcreate placed buffers in */
     trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {

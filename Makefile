@@ -56,6 +56,10 @@ ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
 dma_probe: tools/dma_probe.c
 	$(CC) $(CFLAGS) -o $@ $<
+# domain_probe is standalone (raw rknpu ioctls): proves >4 GiB residence by splitting buffers across
+# multiple IOMMU domains (iommu_domain_id field) — single domain caps ~4 GiB, 8 domains reach ~32 GiB.
+domain_probe: tools/domain_probe.c
+	$(CC) $(CFLAGS) -o $@ $<
 stream_probe: tools/stream_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 persist_probe: tools/persist_probe.c $(CORE)
