@@ -158,6 +158,21 @@ static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n
     }
     return 0;
 }
+/* PHASE-B K-TILE knob (ORK_KTILE, default OFF). The int8 weight K-axis is sliced into KS-element
+ * slices (Bb[ns*Sk+ks]) and the slice partials accumulated host-side; the single-task M-tile is capped
+ * by R=pow2_floor(2*cbuf/Kp), which GROWS as Kp shrinks. Default KS=1024 (R=64). Setting ORK_KTILE=kt
+ * (a multiple of 32, < K) forces KS=kt at BOTH pack and run, so a smaller slice yields a bigger R ->
+ * a larger M-tile -> more per-task M-amortization. To make a K<=10752 weight actually TAKE the K-split
+ * path (it would otherwise run full-K via Bf), Bf is suppressed when KTILE is active and < K. The run
+ * path is the existing, bit-exact-validated per-slice/chain-ksplit accumulation — no new regcmd; every
+ * program still goes through validate_regcmd, and accumulation == full-K == the CPU ref. WEDGE-SAFE:
+ * it reuses the proven wide-K accumulate; an out-of-range value is ignored (falls back to KS=1024). */
+static int int8_ks(ork_npu *c){ (void)c;
+    static int kt=-2;
+    if(kt==-2){ const char*e=getenv("ORK_KTILE"); kt=e?atoi(e):0;
+        if(kt && (kt<32 || kt%32)) kt=0; }   /* must be a multiple of 32; else ignore */
+    return kt>0?kt:1024;
+}
 /* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
@@ -598,7 +613,7 @@ int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
-    int KS=dt ? 1024 : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
+    int KS=dt ? int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_dom(c->pack_domain); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     /* FIX 2 (gated, ORK_CONSOLIDATE_I8): consolidate all int8 Bb tiles into ONE per-weight DMA buffer,
@@ -653,7 +668,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
      * K-split path (correct, just slower). No crash, no ceiling guess. */
-    if(dt==DT_I8 && K<=10752){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(dt==DT_I8 && K<=10752 && !(int8_ks(c)<K && getenv("ORK_KTILE"))){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
@@ -1905,7 +1920,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
 static void *mcworker(void *vp){
     struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
     int K=a->w->K, N=a->w->N, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     ork_w *w=a->w; const void *A=a->A; struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*CC=&c->mcc[i];
     size_t maxout = a->maxout;
     if(c->mccsz[i]<maxout){
@@ -2451,7 +2466,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
     int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     /* CHAIN-PREFILL (ORK_CHAIN_PREFILL, default ON): in the int8 M>1 full-K prefill path each core
      * normally issues one ioctl per M-tile (serial ~134us floor each — the dominant prefill submit
      * source, ~18/matmul/core). When set, the core instead PC-chains ALL its M-tiles into ONE submit
@@ -2932,7 +2947,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(nc>1) return run_multicore(c,w,M,A,C,nc);
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
+    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */

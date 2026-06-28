@@ -55,6 +55,10 @@ ksubmit_probe: tools/ksubmit_probe.c $(CORE)
 mtile_probe: tools/mtile_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Tiling AUTOTUNER: per-shape tiling-config search (cores x M/N/K-tile), bit-exact-gated + GOPS.
+autotune: tools/autotune.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
