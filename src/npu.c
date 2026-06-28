@@ -1962,49 +1962,86 @@ static void *mcworker(void *vp){
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        /* SMALL-TILE PACKING (ORK_SMALLTILE, default OFF): mirror rkllm — pack many SMALL CBUF-resident
+         * tiles back-to-back in the one chained submit instead of a few LARGE per-core tiles. With it set:
+         * M-tile = ORK_SMALLTILE_M (default 32) and each core's Ncore columns are sub-tiled into
+         * ORK_SMALLTILE_N-wide column blocks (default 1216, snapped to a multiple of nt_sz). Goal: each
+         * task's working set stays in CBUF/SRAM so the MAC stays fed across tasks. Same validated regcmd
+         * /K-handling (no 0x107c/0x1044 K-grouping). validate_regcmd + fall back to the per-tile path.
+         *
+         * HARD CONSTRAINT (RE finding): the M-tile is bounded above by R-1, where R = the number of
+         * feature ROWS that fit in CBUF for this K (R = pow2_floor(2*CBUF/K)). synth_i8 loads only
+         * `rows = min(mc+1, R)` rows (reg 0x1010) and the K-reduction schedule (reg 0x1040) is keyed
+         * to that; an M-tile of more than R-1 rows spills past the CBUF-resident window and the rows
+         * beyond it are computed against the wrong K-partition (silent miscompute, NOT a wedge). For
+         * K=3584 on RK3588 R=16 -> M-tile must be <=15. So ORK_SMALLTILE_M is a CEILING that we clamp
+         * down to R-1; we never raise the tile above the CBUF-resident cap. The N axis IS the free
+         * packing lever (sub-tile Ncore into ORK_SMALLTILE_N columns). */
+        static int st_on=-1, st_m=0, st_n=0;
+        if(st_on<0){ const char*e=getenv("ORK_SMALLTILE"); st_on=e?atoi(e):0;
+            const char*em=getenv("ORK_SMALLTILE_M"); st_m=em?atoi(em):32;
+            const char*en=getenv("ORK_SMALLTILE_N"); st_n=en?atoi(en):1216;
+            if(st_m<1)st_m=32; if(st_n<nt_sz)st_n=nt_sz; }
+        if(st_on){ int cap=R-1; if(cap<1)cap=1; chunk=st_m; if(chunk>cap)chunk=cap; if(chunk>M)chunk=M; if(chunk<1)chunk=1; }
+        int nsub_w = st_on ? ((st_n+nt_sz-1)/nt_sz)*nt_sz : 0;   /* N-subtile width (mult of nt_sz); 0=whole Ncore */
         /* require the active N-range across ALL N-slices; verify all are active (Sn is 1 for the
          * 7B prefill matmuls — nmax=8192 >= N). If any N-slice is inactive for this core, fall back. */
         int all_active=1;
         for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
         if(all_active){
-            /* count programs across all N-slices x M-tiles */
-            int nmt=(M+chunk-1)/chunk; int P=w->Sn*nmt;
+            /* count programs across all N-slices x N-subtiles x M-tiles */
+            int nmt=(M+chunk-1)/chunk; int P=0;
+            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz;
+                int nsw = nsub_w ? nsub_w : Ncore; int nnsub=(Ncore+nsw-1)/nsw;
+                P += nnsub*nmt; }
             size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
-            if(needrc<=RC->size && needtk<=c->mtk[i].size && !c->mc_error){
+            /* per-program output descriptor (column-subtiled): each program writes a contiguous
+             * [mco, Nsub] int32 block; scatter accounts for its (m0, n0+coff+nc0) offset. */
+            int maxpd = P; if(maxpd<1)maxpd=1;
+            struct { size_t cc_off; int m0,mco,nc0,Nsub,n0,coff; } *pd = malloc((size_t)maxpd*sizeof *pd);
+            if(needrc<=RC->size && needtk<=c->mtk[i].size && pd && !c->mc_error){
                 /* stage all M rows of A into AF (contiguous [M,K]) */
                 double _tc0=ork_now_us();
                 memcpy(AF->cpu, A, (size_t)M*K); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                /* CC is laid out per-N-slice: slice ns occupies CC offset (ns*M*Ncore) — but Ncore can
-                 * differ per slice. Use a running output byte offset. */
                 uint32_t rc[REGCMD_I8_N];
                 struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
                 int p=0; size_t cc_off=0;
-                int sl_ccoff[64]; int sl_ncore[64]; int sl_coff[64];   /* Sn small */
                 int bad=0;
                 for(int ns=0;ns<w->Sn && !bad;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
                     int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
                     int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
-                    sl_ccoff[ns]=(int)(cc_off/4); sl_ncore[ns]=Ncore; sl_coff[ns]=coff;
-                    for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                        memset(rc,0,sizeof rc);
-                        synth_i8(rc,mco,Kp,Ncore,
-                                 (uint32_t)(AF->dma+(uint64_t)m0*K), (uint32_t)wbase,
-                                 (uint32_t)(CC->dma+cc_off+(uint64_t)m0*Ncore*4), 1, CBUF, 0);
-                        if(validate_regcmd("mcworker_pref_chain", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
-                        if(p<P-1){   /* PC-chain to next program (same words as run_chain_i8) */
-                            uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
-                            rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
-                            rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
+                    int n0=ns*NMAX;
+                    int nsw = nsub_w ? nsub_w : Ncore;
+                    for(int nc0=0;nc0<Ncore && !bad;nc0+=nsw){int Nsub=(Ncore-nc0<nsw)?(Ncore-nc0):nsw;
+                        /* weight for this column subtile: Bf tile layout is [Ntile][Ktile][32][32];
+                         * advancing by one nt_sz-column tile = K*32 bytes. */
+                        uint64_t wsub=wbase+(uint64_t)nc0*K;
+                        for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                            memset(rc,0,sizeof rc);
+                            synth_i8(rc,mco,Kp,Nsub,
+                                     (uint32_t)(AF->dma+(uint64_t)m0*K), (uint32_t)wsub,
+                                     (uint32_t)(CC->dma+cc_off), 1, CBUF, 0);
+                            if(validate_regcmd("mcworker_pref_chain", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
+                            if(p<P-1){   /* PC-chain to next program (same words as run_chain_i8) */
+                                uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
+                                rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+                                rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
+                            }
+                            memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
+                            struct rknpu_task t; memset(&t,0,sizeof t);
+                            t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
+                            t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
+                            tk[p]=t;
+                            pd[p].cc_off=cc_off; pd[p].m0=m0; pd[p].mco=mco; pd[p].nc0=nc0;
+                            pd[p].Nsub=Nsub; pd[p].n0=n0; pd[p].coff=coff;
+                            p++;
+                            cc_off += (size_t)mco*Nsub*4;
+                            if(cc_off>CC->size){ bad=1; break; }
                         }
-                        memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
-                        struct rknpu_task t; memset(&t,0,sizeof t);
-                        t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
-                        t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
-                        tk[p]=t; p++;
                     }
-                    cc_off += (size_t)M*Ncore*4;
                 }
                 if(!bad && p==P){
                     bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -2021,19 +2058,23 @@ static void *mcworker(void *vp){
                     }
                     c->mwarm[i]=1;
                     double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
-                    if(a->rc!=-1){   /* scatter CC -> cres (per N-slice disjoint rows) */
+                    if(a->rc!=-1){   /* scatter each program's [mco,Nsub] block -> cres */
                         int32_t*cr=a->cres;
-                        for(int ns=0;ns<w->Sn;ns++){
-                            int32_t*cc=(int32_t*)CC->cpu + sl_ccoff[ns];
-                            int Ncore=sl_ncore[ns], coff=sl_coff[ns], n0=ns*NMAX;
-                            for(int r=0;r<M;r++)for(int n=0;n<Ncore;n++)cr[(size_t)r*N+(n0+coff+n)]=cc[(size_t)r*Ncore+n];
+                        for(int q=0;q<P;q++){
+                            int32_t*cc=(int32_t*)((char*)CC->cpu+pd[q].cc_off);
+                            int mco=pd[q].mco,Nsub=pd[q].Nsub,m0=pd[q].m0;
+                            int col0=pd[q].n0+pd[q].coff+pd[q].nc0;
+                            for(int r=0;r<mco;r++)for(int n=0;n<Nsub;n++)
+                                cr[(size_t)(m0+r)*N+(col0+n)]=cc[(size_t)r*Nsub+n];
                         }
                         g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
                     }
+                    free(pd);
                     return NULL;
                 }
                 /* fall through to per-tile path on bad/validate failure */
             }
+            free(pd);
         }
         /* fall through to original per-tile prefill below */
     }
@@ -2451,14 +2492,34 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             size_t sz=(size_t)rows*Kp*1;
             if(sz>maxaf)maxaf=sz;
             /* CHAIN-PREFILL: AF holds ALL M rows (staged once), CC holds full M*eff_cols output
-             * (each chained M-tile writes its own disjoint rows; readback once after the submit). */
+             * (each chained tile writes its own disjoint block; readback once after the submit).
+             * The chained programs are laid out CONTIGUOUSLY in CC (running offset across N-slices
+             * and, under ORK_SMALLTILE, column subtiles), so CC must hold the SUM over N-slices
+             * of M*Ncore*4 — not the max. (Sn==1 for the 7B prefill matmuls, so this == the old
+             * max there.) Also grow mrc/mtk to hold the (possibly large) chained program count. */
             if(use_chain_pref){
                 size_t afull=(size_t)M*Kp*1; if(afull>maxaf)maxaf=afull;
+                static int st_on2=-1,st_m2=0,st_n2=0;
+                if(st_on2<0){const char*e=getenv("ORK_SMALLTILE");st_on2=e?atoi(e):0;
+                    const char*em=getenv("ORK_SMALLTILE_M");st_m2=em?atoi(em):32;
+                    const char*en=getenv("ORK_SMALLTILE_N");st_n2=en?atoi(en):1216;
+                    if(st_m2<1)st_m2=32; if(st_n2<nt_sz)st_n2=nt_sz;}
+                int cap2=R-1; if(cap2<1)cap2=1; int ch=st_on2?(st_m2>cap2?cap2:st_m2):chunk; if(ch>M)ch=M; if(ch<1)ch=1;
+                int nsw=st_on2?((st_n2+nt_sz-1)/nt_sz)*nt_sz:0;
+                int nmt=(M+ch-1)/ch; int P=0; size_t ccsum=0;
                 for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
                     int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz;
                     int eff_cols = (cols>0)?cols:nt_sz;
-                    size_t ofull=(size_t)M*eff_cols*4; if(ofull>maxout)maxout=ofull;
+                    int nsw2=nsw?nsw:eff_cols; int nnsub=(eff_cols+nsw2-1)/nsw2;
+                    P += nnsub*nmt;
+                    ccsum += (size_t)M*eff_cols*4;
                 }
+                if(ccsum>maxout)maxout=ccsum;
+                size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
+                if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active);
+                    if(!c->mrc[i].cpu){ fprintf(stderr,"[ork] ERROR: pref mrc[%d] alloc failed (%zu)\n",i,needrc); return -1; } c->mwarm[i]=0; }
+                if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active);
+                    if(!c->mtk[i].cpu){ fprintf(stderr,"[ork] ERROR: pref mtk[%d] alloc failed (%zu)\n",i,needtk); return -1; } }
             }
         }
         if(use_chain_ksplit){
