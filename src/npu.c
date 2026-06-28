@@ -39,6 +39,12 @@ static double ork_now_us(void);
 static int    g_ork_prof = 0;
 static long   g_prof_i8_calls = 0, g_prof_i4_calls = 0;
 static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
+/* RKNPU_SUBMIT ioctl counter (ORK_PROFILE). g_prof_submits = total ioctls; the run path tags each
+ * via g_prof_submit_class so we can split within-matmul tiling (K/N/M sub-submits) from chained
+ * (one ioctl covering >1 program). Printed on free. Pure diagnostic — no effect when prof off. */
+static long   g_prof_submits = 0;       /* total RKNPU_SUBMIT ioctls */
+static long   g_prof_submit_progs = 0;  /* total PC-chained programs across all submits (>= submits) */
+static long   g_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. */
@@ -358,6 +364,7 @@ static void trace_submit(struct rknpu_submit *sub) {
 
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub) {
     sub->iommu_domain_id = ork_run_dom();  /* match the domain the weight's resident tiles live in */
+    if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {
@@ -486,6 +493,9 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
                                     g_prof_i8_calls, g_prof_i8_us/1e3, g_prof_i8_us/g_prof_i8_calls);
         if(g_prof_i4_calls) fprintf(stderr,"[ork PROFILE] run_i4: %ld calls, %.1f ms total, %.0f us/call\n",
                                     g_prof_i4_calls, g_prof_i4_us/1e3, g_prof_i4_us/g_prof_i4_calls);
+        if(g_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
+                                   g_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/g_prof_submits, g_prof_submit_chained,
+                                   g_prof_i8_calls?(double)g_prof_submits/g_prof_i8_calls:0.0);
     }
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
@@ -1824,7 +1834,7 @@ void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub
 void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 
-struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; };
+struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; int chain_pref; };
 
 static void unified_ioctl(struct mcw *a, int i, int nc) {
     ork_npu *c = a->c; int fd = c->fd; int reps = a->reps; struct buf *CC = &c->mcc[i];
@@ -1894,6 +1904,90 @@ static void *mcworker(void *vp){
             }
         }
         return NULL;
+    }
+    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
+        /* CHAIN-PREFILL: PC-chain ALL of this core's M-tiles into ONE submit (instead of one ioctl per
+         * M-tile). M-tiles have disjoint output rows -> no data dependency. AF holds all M rows (staged
+         * once); each chained program writes its own disjoint rows of CC; readback CC once after. SAME
+         * weight => SAME domain & core. Only the ACTIVE N-range is chained; an inactive core (no N-tiles
+         * — rare, auto-tuner avoids it) falls through to the per-tile path below. */
+        int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        /* require the active N-range across ALL N-slices; verify all are active (Sn is 1 for the
+         * 7B prefill matmuls — nmax=8192 >= N). If any N-slice is inactive for this core, fall back. */
+        int all_active=1;
+        for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
+        if(all_active){
+            /* count programs across all N-slices x M-tiles */
+            int nmt=(M+chunk-1)/chunk; int P=w->Sn*nmt;
+            size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
+            if(needrc<=RC->size && needtk<=c->mtk[i].size && !c->mc_error){
+                /* stage all M rows of A into AF (contiguous [M,K]) */
+                double _tc0=ork_now_us();
+                memcpy(AF->cpu, A, (size_t)M*K); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
+                /* CC is laid out per-N-slice: slice ns occupies CC offset (ns*M*Ncore) — but Ncore can
+                 * differ per slice. Use a running output byte offset. */
+                uint32_t rc[REGCMD_I8_N];
+                struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
+                int p=0; size_t cc_off=0;
+                int sl_ccoff[64]; int sl_ncore[64]; int sl_coff[64];   /* Sn small */
+                int bad=0;
+                for(int ns=0;ns<w->Sn && !bad;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                    int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
+                    int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
+                    sl_ccoff[ns]=(int)(cc_off/4); sl_ncore[ns]=Ncore; sl_coff[ns]=coff;
+                    for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                        memset(rc,0,sizeof rc);
+                        synth_i8(rc,mco,Kp,Ncore,
+                                 (uint32_t)(AF->dma+(uint64_t)m0*K), (uint32_t)wbase,
+                                 (uint32_t)(CC->dma+cc_off+(uint64_t)m0*Ncore*4), 1, CBUF, 0);
+                        if(validate_regcmd("mcworker_pref_chain", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
+                        if(p<P-1){   /* PC-chain to next program (same words as run_chain_i8) */
+                            uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
+                            rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+                            rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
+                        }
+                        memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
+                        struct rknpu_task t; memset(&t,0,sizeof t);
+                        t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
+                        t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
+                        tk[p]=t; p++;
+                    }
+                    cc_off += (size_t)M*Ncore*4;
+                }
+                if(!bad && p==P){
+                    bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                    int reps=c->mwarm[i]?1:2;
+                    for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
+                        struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+                        sub.flags=0x5; sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
+                        sub.core_mask=1u<<i;
+                        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
+                        sub.timeout=60000;
+                        if(rknpu_submit_ioctl(fd,&sub)){ if(last){a->rc=-1;c->mc_error=1;break;} continue; }
+                        bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
+                    }
+                    c->mwarm[i]=1;
+                    double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
+                    if(a->rc!=-1){   /* scatter CC -> cres (per N-slice disjoint rows) */
+                        int32_t*cr=a->cres;
+                        for(int ns=0;ns<w->Sn;ns++){
+                            int32_t*cc=(int32_t*)CC->cpu + sl_ccoff[ns];
+                            int Ncore=sl_ncore[ns], coff=sl_coff[ns], n0=ns*NMAX;
+                            for(int r=0;r<M;r++)for(int n=0;n<Ncore;n++)cr[(size_t)r*N+(n0+coff+n)]=cc[(size_t)r*Ncore+n];
+                        }
+                        g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
+                    }
+                    return NULL;
+                }
+                /* fall through to per-tile path on bad/validate failure */
+            }
+        }
+        /* fall through to original per-tile prefill below */
     }
     if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
@@ -2116,6 +2210,14 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
     int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt ? 1024 : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
+    /* CHAIN-PREFILL (ORK_CHAIN_PREFILL, default ON): in the int8 M>1 full-K prefill path each core
+     * normally issues one ioctl per M-tile (serial ~134us floor each — the dominant prefill submit
+     * source, ~18/matmul/core). When set, the core instead PC-chains ALL its M-tiles into ONE submit
+     * (task_number=P). Independent disjoint-row outputs -> no data dep, same weight/domain/core. This
+     * needs the core's AF to hold ALL M rows (M*K) and CC the full M*Ncore output (each tile writes
+     * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits. */
+    static int chain_pref=-1; if(chain_pref<0){const char*e=getenv("ORK_CHAIN_PREFILL"); chain_pref=e?atoi(e):1;}
+    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096;
     size_t core_maxout[ORK_MAXCORE] = {0};
     for(int i=0;i<nc;i++){
         size_t maxout=0, maxaf=0;
@@ -2141,6 +2243,16 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             int rows=chunk<M?chunk:M;
             size_t sz=(size_t)rows*Kp*1;
             if(sz>maxaf)maxaf=sz;
+            /* CHAIN-PREFILL: AF holds ALL M rows (staged once), CC holds full M*eff_cols output
+             * (each chained M-tile writes its own disjoint rows; readback once after the submit). */
+            if(use_chain_pref){
+                size_t afull=(size_t)M*Kp*1; if(afull>maxaf)maxaf=afull;
+                for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                    int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz;
+                    int eff_cols = (cols>0)?cols:nt_sz;
+                    size_t ofull=(size_t)M*eff_cols*4; if(ofull>maxout)maxout=ofull;
+                }
+            }
         }
         core_maxout[i] = maxout;
         if(c->mccsz[i]<maxout){
@@ -2169,7 +2281,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     size_t need=(size_t)M*w->N*4;
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;} memset(c->cres,0,need);
     struct mcw args[ORK_MAXCORE]; int rc=0;
-    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0,reps,core_maxout[i]};
+    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0,reps,core_maxout[i],use_chain_pref};
     npu_pool_ensure(c);
     c->mc_error = 0;
     if(nc>1) pthread_barrier_init(&c->b_ioctl, NULL, nc);

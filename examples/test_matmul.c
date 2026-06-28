@@ -48,6 +48,31 @@ static int check_i8(ork_npu*ctx,int M,int K,int N){
     printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
     ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
 }
+/* CHAIN-PREFILL correctness: exercise the int8 M>1 full-K prefill multi-core path with shapes that
+ * force BOTH multiple M-tiles (M >> chunk) AND multiple N-tiles across cores (N spanning several
+ * N-tiles so the auto-tuner picks nc>1). Validates the exact integer product. Run the binary with
+ * ORK_CHAIN_PREFILL=1 (default, chained) and =0 (per-tile) — both MUST match this exact reference. */
+static int check_chain_prefill(ork_npu*ctx){
+    int shapes[][3] = { {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048} };
+    int ns = (int)(sizeof(shapes)/sizeof(shapes[0]));
+    int fail=0;
+    for(int s=0;s<ns;s++){
+        int M=shapes[s][0],K=shapes[s][1],N=shapes[s][2];
+        printf("ChainPrefill: M=%d K=%d N=%d\n",M,K,N); fflush(stdout);
+        int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
+        for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
+        ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
+        if(!w){printf("  pack_i8 failed\n");free(A);free(B);free(C);return 1;}
+        if(ork_mm_run_i8(ctx,w,M,A,C)){printf("  run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        long bad=0;
+        for(int i=0;i<M && bad<5;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref){bad++;if(bad<=3)printf("    mism @ (%d,%d): got %d ref %d\n",i,n,C[(size_t)i*N+n],ref);}}
+        printf("  %s\n",bad?"WRONG":"ok"); fflush(stdout);
+        if(bad)fail=1;
+        ork_w_free(w);free(A);free(B);free(C);
+    }
+    return fail;
+}
 static int check_chain_i8(ork_npu*ctx) {
     int S = 4;
     int Ms[4] = {1, 1, 1, 1};
@@ -548,6 +573,7 @@ int main(void){
     //1,8192,512);    /* decode */
     //8,1280,64);     /* 256 remainder slice */
     //4,6144,2048);   /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
+    fail|=check_chain_prefill(c8);    /* verify CHAIN-PREFILL: int8 M>1 multi-core M-tile chaining (bit-exact) */
     fail|=check_chain_i8(c8);         /* verify chained matmuls / MoE API */
     fail|=check_chain_i8_bf(c8);      /* verify Bf-based chaining (Sk=2 experts, MoE-prefill path) */
     fail|=check_stream_i8(c8);        /* verify async round-robin stream (cross-core, mixed shapes) */
