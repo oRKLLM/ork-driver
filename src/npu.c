@@ -43,10 +43,27 @@ static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. */
 struct ork_pw { struct ork_npu *c; int id; };   /* persistent NPU-pool worker arg */
+#define ORK_MAXDOM 16
+/* Parked per-domain copy of the submit-touched scratch (see ork_npu.dom_save). Mirrors exactly the
+ * ork_npu fields that name DMA buffers a submit references + their warm/size bookkeeping. cres is host
+ * RAM (domain-agnostic) so it is NOT parked here. */
+struct ork_dom_scratch {
+    int used;
+    struct buf regcmd, task, Af, Cc; size_t ccsz; int warmed;
+    struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
+    size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
+};
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int core_budget;
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
+    /* PER-DOMAIN SCRATCH (multi-domain residence): a submit runs in ONE iommu_domain_id, so EVERY buffer
+     * it touches (regcmd, task, activation Af, output Cc, and the per-core multi-core scratch) must live in
+     * the same domain as the weight. The fields above are the ACTIVE working set; dom_active is which
+     * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
+     * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
+    int dom_active; int dom_seen[ORK_MAXDOM];
+    struct ork_dom_scratch *dom_save;   /* [ORK_MAXDOM]; lazily allocated when multi-domain is first used */
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
@@ -242,6 +259,38 @@ static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
     return ch;
 }
 static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
+
+/* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
+ * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
+ * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
+ * use, so the run path's lazy bcreate allocates it in `dom` — callers set g_pack_domain=dom before the
+ * run). No-op when single-domain (dom==dom_active and only domain 0 ever used). */
+static void dom_activate(ork_npu *c,int dom){
+    if(dom<0||dom>=ORK_MAXDOM) dom=0;
+    if(dom==c->dom_active) return;
+    if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
+    struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
+    /* park active -> old */
+    old->used=1; old->regcmd=c->regcmd; old->task=c->task; old->Af=c->Af; old->Cc=c->Cc; old->ccsz=c->ccsz; old->warmed=c->warmed;
+    memcpy(old->mrc,c->mrc,sizeof old->mrc); memcpy(old->mtk,c->mtk,sizeof old->mtk); memcpy(old->maf,c->maf,sizeof old->maf);
+    memcpy(old->mcc,c->mcc,sizeof old->mcc); old->mtk_all=c->mtk_all; memcpy(old->mccsz,c->mccsz,sizeof old->mccsz);
+    memcpy(old->mwarm,c->mwarm,sizeof old->mwarm); old->mc_alloc=c->mc_alloc;
+    /* restore neo -> active (zeroed if first use → lazy alloc in this domain) */
+    c->regcmd=neo->regcmd; c->task=neo->task; c->Af=neo->Af; c->Cc=neo->Cc; c->ccsz=neo->ccsz; c->warmed=neo->warmed;
+    memcpy(c->mrc,neo->mrc,sizeof c->mrc); memcpy(c->mtk,neo->mtk,sizeof c->mtk); memcpy(c->maf,neo->maf,sizeof c->maf);
+    memcpy(c->mcc,neo->mcc,sizeof c->mcc); c->mtk_all=neo->mtk_all; memcpy(c->mccsz,neo->mccsz,sizeof c->mccsz);
+    memcpy(c->mwarm,neo->mwarm,sizeof c->mwarm); c->mc_alloc=neo->mc_alloc;
+    c->dom_active=dom;
+    /* first time we touch domain `dom`: it has no regcmd/task yet. Allocate them in this domain now
+     * (the run/mc paths assume regcmd+task exist) and seed the task descriptor like ork_npu_init does. */
+    if(!neo->used && !c->regcmd.cpu){
+        int save=g_pack_domain; g_pack_domain=dom;
+        c->regcmd=bcreate(c->fd,2097152,0x403); c->task=bcreate(c->fd,524288,0x40b);
+        if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
+            memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+        g_pack_domain=save;
+    }
+}
 
 static struct ork_npu *g_npu_ctx = NULL;
 
@@ -441,8 +490,14 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
-    bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);
+    bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);bdestroy(fd,&c->mtk_all);
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
+    /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
+    if(c->dom_save){ for(int d=0;d<ORK_MAXDOM;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
+        struct ork_dom_scratch *s=&c->dom_save[d];
+        bdestroy(fd,&s->regcmd);bdestroy(fd,&s->task);bdestroy(fd,&s->Af);bdestroy(fd,&s->Cc);bdestroy(fd,&s->mtk_all);
+        for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&s->mrc[i]);bdestroy(fd,&s->mtk[i]);bdestroy(fd,&s->maf[i]);bdestroy(fd,&s->mcc[i]);} }
+        free(c->dom_save); }
     for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
@@ -2465,6 +2520,11 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     g_run_domain = w->domain;   /* submit this weight's matmuls against the domain its tiles live in */
+    /* multi-domain residence: swap in this domain's scratch (regcmd/task/Af/Cc/mc-*) so the submit's
+     * buffers all live in the weight's domain, and make any lazy scratch bcreate below land there too.
+     * No-op for the common single-domain case (w->domain==0, dom_active==0). */
+    g_pack_domain = w->domain;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
     int b=budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
@@ -3061,7 +3121,10 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
-    if (tasks[0].w) g_run_domain = tasks[0].w->domain;  /* chained weights share one submit => one domain */
+    if (tasks[0].w) {  /* chained weights share one submit => one domain; swap in that domain's scratch */
+        g_run_domain = tasks[0].w->domain; g_pack_domain = tasks[0].w->domain;
+        if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    }
 
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
