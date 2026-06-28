@@ -1834,7 +1834,7 @@ void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub
 void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 
-struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; int chain_pref; };
+struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; int chain_pref; int chain_ksplit; };
 
 static void unified_ioctl(struct mcw *a, int i, int nc) {
     ork_npu *c = a->c; int fd = c->fd; int reps = a->reps; struct buf *CC = &c->mcc[i];
@@ -2033,6 +2033,159 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
+    if(a->chain_ksplit && dt==DT_I8 && M>1 && (K%512)==0 && K>4096){
+        /* CHAIN-KSPLIT: wide-K (K>4096, Bf=NULL → no full-K weight) normally K-splits into
+         * ceil(K/KS) separate ioctls/call (run_i8's dominant prefill submit cost). Instead PC-chain
+         * the K-slice (and M-tile) programs into ONE submit per core, then host-accumulate the
+         * K-slice partials. The NPU has no on-device C+= mode in our regcmd, so each K-slice must
+         * write its own partial slot; we cap the simultaneous partials per submit to a CC byte
+         * budget and accumulate between batches (still far fewer ioctls than per-slice). Only the
+         * ACTIVE N-range is chained; a core with any inactive N-slice falls through. Gated
+         * ORK_CHAIN_KSPLIT (default on); the address math is per-slice exact (the wide-N crash was
+         * an overflow in the full-K chain — here every aA/aB/aC is recomputed per program). */
+        int all_active=1;
+        for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
+        if(all_active && !c->mc_error){
+            /* per-core CC partial budget (bytes). ffn_down (K=18944→19 slices, Ncore~1.2k, M=256)
+             * needs ~24 MB; default 64 MB covers it in one batch. ORK_CHAIN_KSPLIT_MB overrides. */
+            static long ccbudget=-1; if(ccbudget<0){const char*e=getenv("ORK_CHAIN_KSPLIT_MB"); ccbudget=(long)(e?atoi(e):64)*1024*1024;}
+            int bad=0;
+            /* Walk K-slices, batching into PC-chains that fit the CC budget. Each program in a batch
+             * writes a disjoint CC region (its own K-slice partial for its N-slice/M-tile). After a
+             * batch submit, accumulate every partial into cres, then reuse CC for the next batch. */
+            int ks=0;
+            while(ks<w->Sk && !bad && !c->mc_error){
+                /* plan this batch: greedily add K-slices while CC partials fit the budget */
+                int ks_end=ks; size_t cc_total=0; int P=0;
+                /* record per (program) descriptor for accumulate; bounded by REGCMD/task buffer caps */
+                struct { int ns,ks,m0,mco,Ncore,coff,n0; size_t cc_off, af_off; } pd[256];
+                size_t cc_off=0, af_off=0;
+                for(int kk=ks; kk<w->Sk; kk++){
+                    int k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
+                    int sched=(Kp==1024||Kp==512),R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+                    double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+                    int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
+                    /* tentative bytes for this K-slice (all N-slices, all M-tiles) */
+                    size_t kk_bytes=0; int kk_progs=0;
+                    for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz;
+                        for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                            kk_bytes += (size_t)mco*Ncore*4; kk_progs++; }
+                    }
+                    /* always take at least one K-slice even if it alone exceeds budget. A K-slice must
+                     * be placed WHOLE (all its N/M programs) or not at all — partial placement drops
+                     * part of the K-reduction → wrong result. If even the first slice can't fit pd[],
+                     * bail to the per-tile fall-through (bad). */
+                    if(kk>ks && (cc_total+kk_bytes>(size_t)ccbudget || P+kk_progs>(int)(sizeof(pd)/sizeof(pd[0])))) break;
+                    if(P+kk_progs>(int)(sizeof(pd)/sizeof(pd[0]))){ bad=1; break; }   /* first slice too big for pd[] */
+                    /* lay out program descriptors for this K-slice */
+                    int placed=0;
+                    for(int ns=0;ns<w->Sn && placed<kk_progs;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz;
+                        for(int m0=0;m0<M && placed<kk_progs;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                            pd[P].ns=ns; pd[P].ks=kk; pd[P].m0=m0; pd[P].mco=mco; pd[P].Ncore=Ncore; pd[P].coff=coff; pd[P].n0=ns*NMAX;
+                            pd[P].cc_off=cc_off; cc_off+=(size_t)mco*Ncore*4;
+                            pd[P].af_off=af_off; af_off+=(size_t)mco*Kp;   /* gathered A tile [mco][Kp] */
+                            P++; placed++;
+                        }
+                    }
+                    cc_total=cc_off; ks_end=kk+1;
+                    if(P>=(int)(sizeof(pd)/sizeof(pd[0]))) break;
+                }
+                if(bad) break;   /* planning could not represent a K-slice → per-tile fall-through */
+                size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
+                if(needrc>RC->size || needtk>c->mtk[i].size || cc_total>CC->size || af_off>AF->size){ bad=1; break; }
+                /* gather each program's A tile [mco][Kp] into AF (regcmd reads A with row-stride Kp,
+                 * so the full-K-strided host A must be re-tiled per K-slice). */
+                double _tc0=ork_now_us();
+                for(int p=0;p<P;p++){
+                    int kk=pd[p].ks, k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
+                    int8_t*ad=(int8_t*)AF->cpu+pd[p].af_off; const int8_t*Ai=A;
+                    for(int r=0;r<pd[p].mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Ai[(size_t)(pd[p].m0+r)*K+k0+j];
+                }
+                bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
+                /* synth + PC-chain every program in this batch */
+                uint32_t rc[REGCMD_I8_N];
+                struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
+                for(int p=0;p<P && !bad;p++){
+                    int kk=pd[p].ks, k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
+                    int sched=(Kp==1024||Kp==512);
+                    struct buf*Bb=&w->Bb[(size_t)pd[p].ns*w->Sk+kk];
+                    uint64_t wbase=Bb->dma+(uint64_t)(pd[p].coff/nt_sz)*Kp*32;   /* coff/nt_sz = t0 tile index */
+                    memset(rc,0,sizeof rc);
+                    synth_i8(rc, pd[p].mco, Kp, pd[p].Ncore,
+                             (uint32_t)(AF->dma+pd[p].af_off),   /* this program's gathered [mco][Kp] tile */
+                             (uint32_t)wbase,
+                             (uint32_t)(CC->dma+pd[p].cc_off), sched, CBUF, 0);
+                    if(validate_regcmd("mcworker_pref_ksplit", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
+                    if(p<P-1){   /* PC-chain to next program */
+                        uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
+                        rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+                        rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
+                    }
+                    memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
+                    struct rknpu_task t; memset(&t,0,sizeof t);
+                    t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
+                    t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
+                    tk[p]=t;
+                }
+                if(bad) break;
+                bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                int reps=c->mwarm[i]?1:2;
+                double _tsub0=ork_now_us();
+                for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
+                    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+                    sub.flags=0x5; sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
+                    sub.core_mask=1u<<i;
+                    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
+                    sub.timeout=60000;
+                    if(rknpu_submit_ioctl(fd,&sub)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
+                    bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
+                }
+                c->mwarm[i]=1;
+                g_mc_sub[i]+=ork_now_us()-_tsub0; g_mc_n[i]++;
+                if(bad||a->rc==-1) break;
+                /* accumulate this batch's K-slice partials into cres (cres pre-zeroed by run_multicore) */
+                double _ta0=ork_now_us();
+                int32_t*cr=a->cres;
+                for(int p=0;p<P;p++){
+                    int32_t*cc=(int32_t*)((char*)CC->cpu+pd[p].cc_off);
+                    int Ncore=pd[p].Ncore, base_n=pd[p].n0+pd[p].coff;
+                    for(int r=0;r<pd[p].mco;r++){
+                        size_t cr_off=(size_t)(pd[p].m0+r)*N+base_n;
+                        size_t cc_row=(size_t)r*Ncore; int col=0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                        for(;col<=Ncore-16;col+=16){
+                            int32x4_t a0=vld1q_s32(&cc[cc_row+col]),    a1=vld1q_s32(&cc[cc_row+col+4]);
+                            int32x4_t a2=vld1q_s32(&cc[cc_row+col+8]),  a3=vld1q_s32(&cc[cc_row+col+12]);
+                            int32x4_t b0=vld1q_s32(&cr[cr_off+col]),    b1=vld1q_s32(&cr[cr_off+col+4]);
+                            int32x4_t b2=vld1q_s32(&cr[cr_off+col+8]),  b3=vld1q_s32(&cr[cr_off+col+12]);
+                            vst1q_s32(&cr[cr_off+col],   vaddq_s32(b0,a0)); vst1q_s32(&cr[cr_off+col+4], vaddq_s32(b1,a1));
+                            vst1q_s32(&cr[cr_off+col+8], vaddq_s32(b2,a2)); vst1q_s32(&cr[cr_off+col+12],vaddq_s32(b3,a3));
+                        }
+#endif
+                        for(;col<Ncore;col++) cr[cr_off+col]+=cc[cc_row+col];
+                    }
+                }
+                g_mc_acc[i]+=ork_now_us()-_ta0;
+                ks=ks_end;
+            }
+            if(!bad && a->rc!=-1) return NULL;
+            /* on any failure fall through to the robust per-tile K-split path below. Zero THIS core's
+             * output columns first (we may have partially accumulated) so the per-tile path's +=
+             * starts clean; other cores own disjoint columns and are untouched. */
+            c->mc_error=0; a->rc=0;
+            int32_t*cr=a->cres;
+            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
+                int Ncore=(t1-t0)*nt_sz, base_n=ns*NMAX+t0*nt_sz;
+                for(int r=0;r<M;r++) memset(&cr[(size_t)r*N+base_n],0,(size_t)Ncore*4);
+            }
+        }
+    }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
         int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
         int active = (t1 > t0);
@@ -2218,6 +2371,12 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits. */
     static int chain_pref=-1; if(chain_pref<0){const char*e=getenv("ORK_CHAIN_PREFILL"); chain_pref=e?atoi(e):1;}
     int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096;
+    /* CHAIN-KSPLIT (ORK_CHAIN_KSPLIT, default ON): wide-K int8 prefill (K>4096, no Bf) PC-chains its
+     * K-slice submits into one ioctl/core (see mcworker). Needs maf to hold all M*K of A and mcc to
+     * hold a budget's worth of K-slice partials + mrc/mtk to hold the chained programs. */
+    static int chain_ks=-1; if(chain_ks<0){const char*e=getenv("ORK_CHAIN_KSPLIT"); chain_ks=e?atoi(e):1;}
+    static long ks_ccbudget=-1; if(ks_ccbudget<0){const char*e=getenv("ORK_CHAIN_KSPLIT_MB"); ks_ccbudget=(long)(e?atoi(e):64)*1024*1024;}
+    int use_chain_ksplit = chain_ks && dt==DT_I8 && M>1 && (K%512)==0 && K>4096;
     size_t core_maxout[ORK_MAXCORE] = {0};
     for(int i=0;i<nc;i++){
         size_t maxout=0, maxaf=0;
@@ -2254,6 +2413,27 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 }
             }
         }
+        if(use_chain_ksplit){
+            /* AF holds all M*K of A. CC holds a batch of K-slice partials: cap to the SMALLER of the
+             * budget and the total partials this core would produce (so small matmuls don't over-alloc).
+             * Programs/batch bounded by pd[] (256) and the mrc/mtk capacity (grown below). */
+            /* AF holds per-program gathered A tiles [mco][Kp]; a full batch can re-gather A per
+             * N-slice, so the worst case is Sn*M*K (sum of Kp over a batch == K when whole-K). */
+            size_t afull=(size_t)w->Sn*M*K; if(afull>maxaf)maxaf=afull;
+            size_t total_part=0;
+            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz; if(cols<=0)continue;
+                total_part+=(size_t)w->Sk*M*cols*4;   /* Sk slices x M rows x this core's cols */
+            }
+            size_t want=(size_t)ks_ccbudget; if(total_part<want)want=total_part;
+            if(want>maxout)maxout=want;
+            /* grow regcmd/task buffers to hold up to 256 chained programs */
+            size_t needrc=(size_t)256*REGCMD_I8_N*4, needtk=(size_t)256*sizeof(struct rknpu_task);
+            if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403);
+                if(!c->mrc[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mrc[%d] alloc failed (%zu)\n",i,needrc); return -1; } c->mwarm[i]=0; }
+            if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b);
+                if(!c->mtk[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mtk[%d] alloc failed (%zu)\n",i,needtk); return -1; } }
+        }
         core_maxout[i] = maxout;
         if(c->mccsz[i]<maxout){
             bdestroy(fd,&c->mcc[i]);
@@ -2281,7 +2461,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     size_t need=(size_t)M*w->N*4;
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;} memset(c->cres,0,need);
     struct mcw args[ORK_MAXCORE]; int rc=0;
-    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0,reps,core_maxout[i],use_chain_pref};
+    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0,reps,core_maxout[i],use_chain_pref,use_chain_ksplit};
     npu_pool_ensure(c);
     c->mc_error = 0;
     if(nc>1) pthread_barrier_init(&c->b_ioctl, NULL, nc);

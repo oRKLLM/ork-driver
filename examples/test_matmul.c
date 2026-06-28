@@ -53,7 +53,10 @@ static int check_i8(ork_npu*ctx,int M,int K,int N){
  * N-tiles so the auto-tuner picks nc>1). Validates the exact integer product. Run the binary with
  * ORK_CHAIN_PREFILL=1 (default, chained) and =0 (per-tile) — both MUST match this exact reference. */
 static int check_chain_prefill(ork_npu*ctx){
-    int shapes[][3] = { {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048} };
+    /* {256,18944,3584} is the wide-K ffn_down shape that exercises CHAIN-KSPLIT (K>4096, K-split
+     * passes PC-chained into one submit/core then host-accumulated). MUST match the CPU ref both
+     * with ORK_CHAIN_KSPLIT=1 (chained) and =0 (per-tile K-split). */
+    int shapes[][3] = { {256,18944,3584}, {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048} };
     int ns = (int)(sizeof(shapes)/sizeof(shapes[0]));
     int fail=0;
     for(int s=0;s<ns;s++){
