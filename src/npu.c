@@ -1975,12 +1975,15 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
+    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096 && w->Sn==1){
         /* CHAIN-PREFILL: PC-chain ALL of this core's M-tiles into ONE submit (instead of one ioctl per
          * M-tile). M-tiles have disjoint output rows -> no data dependency. AF holds all M rows (staged
          * once); each chained program writes its own disjoint rows of CC; readback CC once after. SAME
          * weight => SAME domain & core. Only the ACTIVE N-range is chained; an inactive core (no N-tiles
-         * — rare, auto-tuner avoids it) falls through to the per-tile path below. */
+         * — rare, auto-tuner avoids it) falls through to the per-tile path below.
+         * Sn==1 ONLY (mirrors use_chain_pref in run_multicore): a chained submit spanning >1 N-slice
+         * references multiple distinct Bf[ns] buffers, which wedges the kernel CDMA walker (errno 110 /
+         * "cdma address wild"). Wide-N (Sn>1) falls through to the per-tile prefill path below. */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
@@ -2144,7 +2147,7 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(a->chain_ksplit && dt==DT_I8 && M>1 && (K%512)==0 && K>4096){
+    if(a->chain_ksplit && dt==DT_I8 && M>1 && (K%512)==0 && K>4096 && w->Sn==1){
         /* CHAIN-KSPLIT: wide-K (K>4096, Bf=NULL → no full-K weight) normally K-splits into
          * ceil(K/KS) separate ioctls/call (run_i8's dominant prefill submit cost). Instead PC-chain
          * the K-slice (and M-tile) programs into ONE submit per core, then host-accumulate the
@@ -2152,8 +2155,12 @@ static void *mcworker(void *vp){
          * write its own partial slot; we cap the simultaneous partials per submit to a CC byte
          * budget and accumulate between batches (still far fewer ioctls than per-slice). Only the
          * ACTIVE N-range is chained; a core with any inactive N-slice falls through. Gated
-         * ORK_CHAIN_KSPLIT (default on); the address math is per-slice exact (the wide-N crash was
-         * an overflow in the full-K chain — here every aA/aB/aC is recomputed per program). */
+         * ORK_CHAIN_KSPLIT (default on); the address math is per-slice exact.
+         * Sn==1 ONLY: like chain-prefill, a chained submit spanning >1 N-slice references multiple
+         * distinct Bb[ns*Sk+ks] weight buffers, the cross-buffer reference the kernel CDMA walker
+         * rejects (errno 110 / "cdma address wild"). ffn_down (the only wide-K matmul, K=18944 N=3584)
+         * is Sn=1 so this is a no-op there; a hypothetical wide-K+wide-N weight (N>nmax) falls through
+         * to the proven per-slice K-split accumulate below. */
         int all_active=1;
         for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
@@ -2479,15 +2486,21 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * source, ~18/matmul/core). When set, the core instead PC-chains ALL its M-tiles into ONE submit
      * (task_number=P). Independent disjoint-row outputs -> no data dep, same weight/domain/core. This
      * needs the core's AF to hold ALL M rows (M*K) and CC the full M*Ncore output (each tile writes
-     * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits. */
+     * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits.
+     * Sn==1 ONLY: a chained submit that spans >1 N-slice references several distinct Bf[ns] weight
+     * buffers across its PC-chained programs, which the kernel's regcmd CDMA walker rejects
+     * (RKNPU_SUBMIT errno 110 / "cdma address wild" → 60s job timeout → NPU soft-reset). Same Sn==1
+     * constraint the validated run_chain_i8 / run_stream_i8 chain entrypoints already enforce. Wide-N
+     * (e.g. ffn_gate/up N=18944 → Sn=3 when nmax<N) falls through to the proven per-tile prefill path
+     * below (one ioctl per N-slice×M-tile) — the clean baseline. */
     static int chain_pref=-1; if(chain_pref<0){const char*e=getenv("ORK_CHAIN_PREFILL"); chain_pref=e?atoi(e):1;}
-    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096;
+    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096 && w->Sn==1;
     /* CHAIN-KSPLIT (ORK_CHAIN_KSPLIT, default ON): wide-K int8 prefill (K>4096, no Bf) PC-chains its
      * K-slice submits into one ioctl/core (see mcworker). Needs maf to hold all M*K of A and mcc to
      * hold a budget's worth of K-slice partials + mrc/mtk to hold the chained programs. */
     static int chain_ks=-1; if(chain_ks<0){const char*e=getenv("ORK_CHAIN_KSPLIT"); chain_ks=e?atoi(e):1;}
     static long ks_ccbudget=-1; if(ks_ccbudget<0){const char*e=getenv("ORK_CHAIN_KSPLIT_MB"); ks_ccbudget=(long)(e?atoi(e):64)*1024*1024;}
-    int use_chain_ksplit = chain_ks && dt==DT_I8 && M>1 && (K%512)==0 && K>4096;
+    int use_chain_ksplit = chain_ks && dt==DT_I8 && M>1 && (K%512)==0 && K>4096 && w->Sn==1;   /* Sn>1 (wide-K+wide-N): per-slice fall-through (cross-Bb-buffer chain wedges; see mcworker) */
     size_t core_maxout[ORK_MAXCORE] = {0};
     for(int i=0;i<nc;i++){
         size_t maxout=0, maxaf=0;
