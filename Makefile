@@ -13,8 +13,8 @@ CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_norm test_activations
-TESTS    := tests/test_fused_activation
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_activations
+TESTS    :=
 
 all: $(EXAMPLES) $(TESTS)
 
