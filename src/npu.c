@@ -309,10 +309,17 @@ static void dom_activate(ork_npu *c,int dom){
     memcpy(c->mcc,neo->mcc,sizeof c->mcc); c->mtk_all=neo->mtk_all; memcpy(c->mccsz,neo->mccsz,sizeof c->mccsz);
     memcpy(c->mwarm,neo->mwarm,sizeof c->mwarm); c->mc_alloc=neo->mc_alloc;
     c->dom_active=dom;
-    /* first time we touch domain `dom`: it has no regcmd/task yet. Allocate them in this domain now
-     * (the run/mc paths assume regcmd+task exist) and seed the task descriptor like ork_npu_init does. */
+    /* first time we touch domain `dom`: it has none of the init-time scratch yet. Mirror ork_npu_init
+     * EXACTLY — allocate regcmd+task+Af in THIS domain and seed the task descriptor — so a freshly-activated
+     * domain carries every buffer ork_npu_init guarantees, none NULL and none a stale domain-0 IOVA. regcmd
+     * and task have NO lazy size-guard (the chain path writes c->regcmd.cpu / c->task.cpu directly), so they
+     * MUST be created here. Af is created here too so first-use == init: the run path's `c->Af.size<maxaf`
+     * realloc already covers it, but the unguarded RE/probe entrypoints (ork_npu_probe_*) read c->Af.cpu
+     * raw, and a non-NULL in-domain Af is the safe, complete invariant rather than relying on each caller.
+     * Cc and the per-core mc-* scratch are NOT allocated here: their sizes are matmul-dependent, so every
+     * run path lazily (re)allocates them in c->dom_active under their own .size/.cpu guards. */
     if(!neo->used && !c->regcmd.cpu){
-        c->regcmd=bcreate(c->fd,2097152,0x403,dom); c->task=bcreate(c->fd,524288,0x40b,dom);
+        c->regcmd=bcreate(c->fd,2097152,0x403,dom); c->task=bcreate(c->fd,524288,0x40b,dom); c->Af=bcreate(c->fd,(size_t)4*32768*2,0x403,dom);
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
             memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     }
