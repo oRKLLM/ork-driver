@@ -4080,9 +4080,19 @@ static void *stream_worker_i4(void *vp) {
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
         sub.flags = 0x5; sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
-        sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub, w->domain)) { a->rc = -1; }
-        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        /* Prime THIS core's buffers on its first use (mwarm[i]): a freshly-allocated NPU output buffer
+         * returns stale on its first write, so the first task to land on a core does a throwaway warmup
+         * rep then the real rep. Per-core (not an outer double-pass) because tasks are pulled round-robin
+         * — a core that idles in pass 0 would otherwise stay unprimed and zero-fill the next task it grabs.
+         * Same idiom as the run_multicore / chain workers. */
+        int reps = c->mwarm[i] ? 1 : 2;
+        for (int rep = 0; rep < reps; rep++) {
+            int last = (rep == reps - 1);
+            sub.timeout = 60000;
+            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
+            bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        }
+        c->mwarm[i] = 1;
         int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;        /* widen int16 NPU output -> int32 caller C */
         for (int row = 0; row < M; row++) {
             int16_t *orow = o + (size_t)row * N; int32_t *crow = C + (size_t)row * N;
@@ -4115,19 +4125,20 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (c->mccsz[i] < maxMN2) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN2, 0x403, c->dom_active); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
     }
     int rc = 0;
+    if (cold) for (int i = 0; i < nc; i++) c->mwarm[i] = 0;   /* fresh mode/buffer => each core re-primes (per-core warmup in the worker) */
     npu_pool_ensure(c);
     struct streamw4 sw[ORK_MAXCORE];
-    int passes = cold ? 2 : 1;
-    for (int pass = 0; pass < passes; pass++) {
-        int ctr = 0;
-        for (int i = 0; i < nc; i++) sw[i] = (struct streamw4){c, i, S, tasks, &ctr, 0};
-        pthread_mutex_lock(&c->pmu);
-        c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker_i4; c->pjob_stride = sizeof(struct streamw4);
-        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-        pthread_mutex_unlock(&c->pmu);
-        stream_worker_i4(&sw[0]);                             /* core 0 on the calling thread */
-        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
-    }
+    /* Single dispatch: priming is per-core inside the worker (mwarm[i]), so the result is correct
+     * regardless of how the round-robin atomic counter assigns tasks to cores — no outer double-pass
+     * (which left a core that idled in the first pass unprimed, zero-filling whatever task it then grabbed). */
+    int ctr = 0;
+    for (int i = 0; i < nc; i++) sw[i] = (struct streamw4){c, i, S, tasks, &ctr, 0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker_i4; c->pjob_stride = sizeof(struct streamw4);
+    c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    stream_worker_i4(&sw[0]);                             /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
     for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
     c->warmed = 1;
     return rc;
