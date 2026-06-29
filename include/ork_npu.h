@@ -280,6 +280,26 @@ int          ork_mm_run_stream_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tas
  * single-row regcmds PC-chained on its core). Weights single-slice (Sn==1 && Sk==1). 0/ok, -1/-2 err. */
 int          ork_mm_run_stream_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 
+/* Async submit (CPU‖NPU overlap foundation), PATH-AGNOSTIC. The RKNPU submit ioctl blocks the caller
+ * until the NPU job finishes; the NPU is single-stream (one queue), so async here means the BLOCKING
+ * submit runs on a worker thread while the CALLING thread does independent CPU work, joining at the
+ * dependency. This is a DISPATCH-level wrapper around the synchronous run functions, so it works for
+ * fp16 (ork_mm_run), int8 (ork_mm_run_i8), int4 (ork_mm_run_i4), and the chain/stream variants — same
+ * numerics as the synchronous run (reused verbatim). Each launcher returns a handle immediately (NULL
+ * on bad args → fall back to the matching synchronous run); ork_async_wait joins, returns the result
+ * (0/ok, <0 err) and frees the handle. CONTRACT: keep at most ONE async job in flight and issue no
+ * other ork_mm_* on the same ctx between launch and wait (only independent CPU work) — the NPU is
+ * single-stream. The task arrays passed to the chain/stream launchers must stay valid until wait. */
+typedef struct ork_async ork_async;
+ork_async   *ork_mm_run_async        (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float   *C);
+ork_async   *ork_mm_run_i8_async     (ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+ork_async   *ork_mm_run_i4_async     (ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+ork_async   *ork_mm_run_chain_i8_async (ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+ork_async   *ork_mm_run_chain_i4_async (ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
+ork_async   *ork_mm_run_stream_i8_async(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+ork_async   *ork_mm_run_stream_i4_async(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
+int          ork_async_wait(ork_async *h);
+
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);
 

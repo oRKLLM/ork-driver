@@ -4113,6 +4113,85 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     return rc;
 }
 
+/* ===================== ASYNC SUBMIT (CPU‖NPU overlap foundation) =====================
+ * The RKNPU SUBMIT ioctl is synchronous: the kernel blocks the calling thread until the NPU job
+ * completes (flags=0x5 PC|PINGPONG, fence_fd=-1). The NPU is single-stream (one submit queue), so
+ * "async" here does NOT mean two concurrent NPU jobs — it means the BLOCKING submit is issued on a
+ * worker thread so the CALLING thread can do independent CPU work while the one NPU job runs, then
+ * join at the dependency. This is DISPATCH-level and PATH-AGNOSTIC: it wraps the proven blocking run
+ * functions verbatim, so it works identically for fp16 (ork_mm_run), int8 (ork_mm_run_i8), int4
+ * (ork_mm_run_i4), and the chain/stream variants — nothing here is precision-specific (the int4
+ * i4a8-inflated-to-int8 path is just a DT_I8 weight, so it rides the i8 entry). No kernel-fence
+ * dependency that could wedge.
+ *
+ * Thread-safety: the caller MUST keep at most ONE async job in flight and MUST NOT touch A/C or
+ * issue any other ork_mm_* on the same ctx between launch and wait (only independent CPU work) — the
+ * NPU is single-stream, so there is never a concurrent submit racing the submit domain / ctx scratch. */
+enum ork_async_kind { OAK_F16=0, OAK_I8, OAK_I4, OAK_CHAIN_I8, OAK_CHAIN_I4, OAK_STREAM_I8, OAK_STREAM_I4 };
+struct ork_async { pthread_t th; int started; int rc; enum ork_async_kind kind;
+    ork_npu *c; ork_w *w; int M;
+    const void *A; void *C;                 /* single-matmul A/C (typed per kind) */
+    int S; const void *tasks; };            /* chain/stream task array (typed per kind) */
+
+static void *ork_async_worker(void *p){
+    struct ork_async *h = (struct ork_async *)p;
+    switch (h->kind) {
+        case OAK_F16:      h->rc = ork_mm_run        (h->c, h->w, h->M, (const f16*)h->A, (float*)h->C); break;
+        case OAK_I8:       h->rc = ork_mm_run_i8     (h->c, h->w, h->M, (const int8_t*)h->A, (int32_t*)h->C); break;
+        case OAK_I4:       h->rc = ork_mm_run_i4     (h->c, h->w, h->M, (const int8_t*)h->A, (int32_t*)h->C); break;
+        case OAK_CHAIN_I8: h->rc = ork_mm_run_chain_i8 (h->c, h->S, (const ork_mm_task_i8*)h->tasks); break;
+        case OAK_CHAIN_I4: h->rc = ork_mm_run_chain_i4 (h->c, h->S, (const ork_mm_task_i4*)h->tasks); break;
+        case OAK_STREAM_I8:h->rc = ork_mm_run_stream_i8(h->c, h->S, (const ork_mm_task_i8*)h->tasks); break;
+        case OAK_STREAM_I4:h->rc = ork_mm_run_stream_i4(h->c, h->S, (const ork_mm_task_i4*)h->tasks); break;
+    }
+    return NULL;
+}
+
+static ork_async *ork_async_launch(struct ork_async tmpl){
+    struct ork_async *h = calloc(1, sizeof *h);
+    if (!h) return NULL;
+    *h = tmpl; h->rc = -1; h->started = 0;
+    if (pthread_create(&h->th, NULL, ork_async_worker, h) != 0) { free(h); return NULL; }
+    h->started = 1;
+    return h;
+}
+
+/* Per-path async launchers. Each returns a handle immediately (NULL on bad args -> caller falls back
+ * to the matching synchronous run). The returned handle MUST be passed to ork_async_wait exactly once
+ * (joins the thread, frees the handle). Numerics are identical to the synchronous run (reused verbatim). */
+ork_async *ork_mm_run_async    (ork_npu *c, ork_w *w, int M, const ork_f16 *A, float   *C){
+    if (!c || !w || M < 1) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_F16, .c=c, .w=w, .M=M, .A=A, .C=C }); }
+ork_async *ork_mm_run_i8_async (ork_npu *c, ork_w *w, int M, const int8_t  *A, int32_t *C){
+    if (!c || !w || w->dtype != DT_I8 || M < 1) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_I8, .c=c, .w=w, .M=M, .A=A, .C=C }); }
+ork_async *ork_mm_run_i4_async (ork_npu *c, ork_w *w, int M, const int8_t  *A, int32_t *C){
+    if (!c || !w || M < 1) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_I4, .c=c, .w=w, .M=M, .A=A, .C=C }); }
+ork_async *ork_mm_run_chain_i8_async (ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+    if (!c || S < 1 || !tasks) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_CHAIN_I8, .c=c, .S=S, .tasks=tasks }); }
+ork_async *ork_mm_run_chain_i4_async (ork_npu *c, int S, const ork_mm_task_i4 *tasks){
+    if (!c || S < 1 || !tasks) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_CHAIN_I4, .c=c, .S=S, .tasks=tasks }); }
+ork_async *ork_mm_run_stream_i8_async(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+    if (!c || S < 1 || !tasks) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_STREAM_I8, .c=c, .S=S, .tasks=tasks }); }
+ork_async *ork_mm_run_stream_i4_async(ork_npu *c, int S, const ork_mm_task_i4 *tasks){
+    if (!c || S < 1 || !tasks) return NULL;
+    return ork_async_launch((struct ork_async){ .kind=OAK_STREAM_I4, .c=c, .S=S, .tasks=tasks }); }
+
+/* Join the async submit's worker thread, return its result (0/ok, <0 err), and free the handle.
+ * NULL handle returns -1 (lets the caller treat "couldn't launch async" as a hard error and fall
+ * back). After this returns, C holds the matmul output exactly as the synchronous path would. */
+int ork_async_wait(ork_async *h){
+    if (!h) return -1;
+    int rc = -1;
+    if (h->started) { pthread_join(h->th, NULL); rc = h->rc; }
+    free(h);
+    return rc;
+}
+
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
 void ork_fwht_norm(float *v, int n){
     for(int len=1; len<n; len<<=1)
