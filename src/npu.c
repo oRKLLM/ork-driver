@@ -1975,15 +1975,17 @@ static void *mcworker(void *vp){
         }
         return NULL;
     }
-    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096 && w->Sn==1){
-        /* CHAIN-PREFILL: PC-chain ALL of this core's M-tiles into ONE submit (instead of one ioctl per
+    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
+        /* CHAIN-PREFILL: PC-chain this core's M-tiles into chained submits (instead of one ioctl per
          * M-tile). M-tiles have disjoint output rows -> no data dependency. AF holds all M rows (staged
-         * once); each chained program writes its own disjoint rows of CC; readback CC once after. SAME
-         * weight => SAME domain & core. Only the ACTIVE N-range is chained; an inactive core (no N-tiles
-         * — rare, auto-tuner avoids it) falls through to the per-tile path below.
-         * Sn==1 ONLY (mirrors use_chain_pref in run_multicore): a chained submit spanning >1 N-slice
-         * references multiple distinct Bf[ns] buffers, which wedges the kernel CDMA walker (errno 110 /
-         * "cdma address wild"). Wide-N (Sn>1) falls through to the per-tile prefill path below. */
+         * once); each chained program writes its own disjoint rows of CC; readback CC once per submit.
+         * SAME weight => SAME domain & core. Only the ACTIVE N-range is chained; an inactive core (no
+         * N-tiles — rare, auto-tuner avoids it) falls through to the per-tile path below.
+         * PER-N-SLICE (LEVER #1): we emit ONE submit per N-slice so each submit's chained programs all
+         * reference the SINGLE weight buffer Bf[ns] (the cross-N-slice chain referencing multiple
+         * distinct Bf[ns] buffers in one submit is what wedged the kernel CDMA walker — errno 110 /
+         * "cdma address wild"). Wide-N (Sn>1) now chains within each slice instead of falling through
+         * to per-tile; Sn==1 is unchanged (one slice == one submit, as before). */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
@@ -2015,31 +2017,42 @@ static void *mcworker(void *vp){
         for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
         if(all_active){
-            /* count programs across all N-slices x N-subtiles x M-tiles */
-            int nmt=(M+chunk-1)/chunk; int P=0;
+            /* PER-N-SLICE CHAINING (LEVER #1): emit ONE submit per N-slice — chain only that slice's
+             * M-tiles x N-subtiles. Every chained program in a submit references the SINGLE weight
+             * buffer Bf[ns] (column subtiles are byte offsets WITHIN Bf[ns], not separate allocations),
+             * so this never reintroduces the cross-N-slice / cross-buffer chain that wedges the kernel
+             * CDMA walker (errno 110). For Sn==1 this is identical to the old single-chain behaviour
+             * (one slice -> one submit); for Sn>1 it replaces (Sn x nmt) per-tile ioctls with (Sn)
+             * chained submits. RC/tk/CC are reused from offset 0 for each slice (sequential submits on
+             * this core's NPU core), so they only need to hold ONE slice's worth of programs. */
+            int nmt=(M+chunk-1)/chunk;
+            /* worst-case programs in a SINGLE N-slice (bounds pd[] / RC / tk usage) */
+            int Pmax=0;
             for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
                 int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz;
                 int nsw = nsub_w ? nsub_w : Ncore; int nnsub=(Ncore+nsw-1)/nsw;
-                P += nnsub*nmt; }
-            size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
+                int Pns=nnsub*nmt; if(Pns>Pmax)Pmax=Pns; }
+            size_t needrc=(size_t)Pmax*REGCMD_I8_N*4, needtk=(size_t)Pmax*sizeof(struct rknpu_task);
             /* per-program output descriptor (column-subtiled): each program writes a contiguous
              * [mco, Nsub] int32 block; scatter accounts for its (m0, n0+coff+nc0) offset. */
-            int maxpd = P; if(maxpd<1)maxpd=1;
+            int maxpd = Pmax; if(maxpd<1)maxpd=1;
             struct { size_t cc_off; int m0,mco,nc0,Nsub,n0,coff; } *pd = malloc((size_t)maxpd*sizeof *pd);
             if(needrc<=RC->size && needtk<=c->mtk[i].size && pd && !c->mc_error){
-                /* stage all M rows of A into AF (contiguous [M,K]) */
+                /* stage all M rows of A into AF (contiguous [M,K]) once; reused by every N-slice */
                 double _tc0=ork_now_us();
                 memcpy(AF->cpu, A, (size_t)M*K); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
                 double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
                 uint32_t rc[REGCMD_I8_N];
                 struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
-                int p=0; size_t cc_off=0;
                 int bad=0;
                 for(int ns=0;ns<w->Sn && !bad;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
                     int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
                     int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
                     int n0=ns*NMAX;
                     int nsw = nsub_w ? nsub_w : Ncore;
+                    /* build THIS N-slice's chain into RC/tk/CC from offset 0; every program references
+                     * Bf[ns] + a column byte-offset within it (single-buffer => no errno-110 hazard). */
+                    int p=0; size_t cc_off=0;
                     for(int nc0=0;nc0<Ncore && !bad;nc0+=nsw){int Nsub=(Ncore-nc0<nsw)?(Ncore-nc0):nsw;
                         /* weight for this column subtile: Bf tile layout is [Ntile][Ktile][32][32];
                          * advancing by one nt_sz-column tile = K*32 bytes. */
@@ -2050,11 +2063,12 @@ static void *mcworker(void *vp){
                                      (uint32_t)(AF->dma+(uint64_t)m0*K), (uint32_t)wsub,
                                      (uint32_t)(CC->dma+cc_off), 1, CBUF, 0);
                             if(validate_regcmd("mcworker_pref_chain", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
-                            if(p<P-1){   /* PC-chain to next program (same words as run_chain_i8) */
-                                uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
-                                rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
-                                rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
-                            }
+                            /* PC-chain to next program (same words as run_chain_i8). The final program
+                             * of the slice gets its chain words cleared below so the chain terminates
+                             * WITHIN this single-buffer slice (no cross-slice link). */
+                            uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
+                            rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+                            rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
                             memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
                             struct rknpu_task t; memset(&t,0,sizeof t);
                             t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
@@ -2065,10 +2079,15 @@ static void *mcworker(void *vp){
                             p++;
                             cc_off += (size_t)mco*Nsub*4;
                             if(cc_off>CC->size){ bad=1; break; }
+                            /* p is bounded by this slice's tile count <= Pmax (= maxpd, the malloc'd
+                             * pd[] / sized RC/tk). The loop math can't exceed it; no guard needed. */
                         }
                     }
-                }
-                if(!bad && p==P){
+                    if(bad||p<1) break;
+                    int P=p;   /* programs in THIS N-slice's chain */
+                    /* terminate the chain: the last program must not link past itself */
+                    { uint32_t *l=(uint32_t*)((char*)RC->cpu+(size_t)(P-1)*REGCMD_I8_N*4);
+                      l[216]=l[217]=l[218]=l[219]=0; }
                     bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
                     int reps=c->mwarm[i]?1:2;
@@ -2078,26 +2097,27 @@ static void *mcworker(void *vp){
                         sub.core_mask=1u<<i;
                         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
                         sub.timeout=60000;
-                        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;break;} continue; }
+                        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
                         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                     }
                     c->mwarm[i]=1;
-                    double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
-                    if(a->rc!=-1){   /* scatter each program's [mco,Nsub] block -> cres */
-                        int32_t*cr=a->cres;
-                        for(int q=0;q<P;q++){
-                            int32_t*cc=(int32_t*)((char*)CC->cpu+pd[q].cc_off);
-                            int mco=pd[q].mco,Nsub=pd[q].Nsub,m0=pd[q].m0;
-                            int col0=pd[q].n0+pd[q].coff+pd[q].nc0;
-                            for(int r=0;r<mco;r++)for(int n=0;n<Nsub;n++)
-                                cr[(size_t)(m0+r)*N+(col0+n)]=cc[(size_t)r*Nsub+n];
-                        }
-                        g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
+                    double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0; _ts0=_ta0;
+                    if(bad||a->rc==-1) break;
+                    /* scatter THIS slice's [mco,Nsub] blocks -> cres (disjoint output cols/rows) */
+                    int32_t*cr=a->cres;
+                    for(int q=0;q<P;q++){
+                        int32_t*cc=(int32_t*)((char*)CC->cpu+pd[q].cc_off);
+                        int mco=pd[q].mco,Nsub=pd[q].Nsub,m0=pd[q].m0;
+                        int col0=pd[q].n0+pd[q].coff+pd[q].nc0;
+                        for(int r=0;r<mco;r++)for(int n=0;n<Nsub;n++)
+                            cr[(size_t)(m0+r)*N+(col0+n)]=cc[(size_t)r*Nsub+n];
                     }
-                    free(pd);
-                    return NULL;
+                    g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
                 }
-                /* fall through to per-tile path on bad/validate failure */
+                if(!bad && a->rc!=-1){ free(pd); return NULL; }
+                /* on bad/validate/submit failure, fall through to the per-tile path. It rewrites ALL
+                 * of this core's output columns (= over the same disjoint rows/cols this core owns),
+                 * so an aborted partial-slice scatter above is harmless. */
             }
             free(pd);
         }
@@ -2487,14 +2507,14 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * (task_number=P). Independent disjoint-row outputs -> no data dep, same weight/domain/core. This
      * needs the core's AF to hold ALL M rows (M*K) and CC the full M*Ncore output (each tile writes
      * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits.
-     * Sn==1 ONLY: a chained submit that spans >1 N-slice references several distinct Bf[ns] weight
-     * buffers across its PC-chained programs, which the kernel's regcmd CDMA walker rejects
-     * (RKNPU_SUBMIT errno 110 / "cdma address wild" → 60s job timeout → NPU soft-reset). Same Sn==1
-     * constraint the validated run_chain_i8 / run_stream_i8 chain entrypoints already enforce. Wide-N
-     * (e.g. ffn_gate/up N=18944 → Sn=3 when nmax<N) falls through to the proven per-tile prefill path
-     * below (one ioctl per N-slice×M-tile) — the clean baseline. */
+     * PER-N-SLICE (LEVER #1): the chain is emitted ONE submit per N-slice, so every chained submit
+     * references a SINGLE weight buffer Bf[ns]. A chain spanning >1 N-slice would reference several
+     * distinct Bf[ns] buffers and the kernel's regcmd CDMA walker rejects that (RKNPU_SUBMIT errno
+     * 110 / "cdma address wild" → 60s job timeout → NPU soft-reset) — exactly what the old Sn==1 gate
+     * avoided. Now wide-N (e.g. ffn_gate/up N=18944 → Sn=3 when nmax<N) still chains, just per slice:
+     * (Sn) chained submits instead of (Sn × M-tiles) per-tile ioctls. */
     static int chain_pref=-1; if(chain_pref<0){const char*e=getenv("ORK_CHAIN_PREFILL"); chain_pref=e?atoi(e):1;}
-    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096 && w->Sn==1;
+    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096;
     /* CHAIN-KSPLIT (ORK_CHAIN_KSPLIT, default ON): wide-K int8 prefill (K>4096, no Bf) PC-chains its
      * K-slice submits into one ioctl/core (see mcworker). Needs maf to hold all M*K of A and mcc to
      * hold a budget's worth of K-slice partials + mrc/mtk to hold the chained programs. */
