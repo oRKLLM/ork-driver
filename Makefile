@@ -246,3 +246,6 @@ clean:
 
 attn_cost: tools/attn_cost.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+attn_cost7b: tools/attn_cost7b.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
