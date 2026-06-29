@@ -227,11 +227,14 @@ install: libork_npu.a libork_npu.so
 # 0/nonzero). Run them on the board; a wall timeout catches an NPU hang. The llama2 test
 # needs a model and is skipped when absent. ---
 MODEL ?= stories15M.bin
+# per-test wall timeout (s) — catches an NPU hang. test_matmul's full shape + ChainPrefill sweep
+# is ~3m15s, so the wall must exceed it; still bounds a genuine hang. Override: make test TEST_TIMEOUT=120
+TEST_TIMEOUT ?= 360
 test: $(EXAMPLES) $(TESTS)
 	@fail=0; \
 	for t in "test_activations" "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4"; do \
-	  echo "== $$t"; timeout 120 sudo ./$$t || fail=1; done; \
-	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout 120 sudo ./llama2 "$(MODEL)" 6 || fail=1; \
+	  echo "== $$t"; timeout $(TEST_TIMEOUT) sudo ./$$t || fail=1; done; \
+	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
 
