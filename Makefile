@@ -181,6 +181,11 @@ async_decode_probe: tools/async_decode_probe.c $(CORE)
 batch_verify_probe: tools/batch_verify_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
 
+# diagnostic: per-submit DMA cache-maintenance (bsync) cost across output sizes — bounds the
+# cacheability/DISABLE_FLUSH lever (API lead #3). Not in all/test.
+bsync_cost_probe: tools/bsync_cost_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
 # diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
 chain_bench: tools/chain_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
