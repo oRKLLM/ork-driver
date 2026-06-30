@@ -167,6 +167,11 @@ overlap_probe: tools/overlap_probe.c $(CORE)
 async_decode_probe: tools/async_decode_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
 
+# diagnostic: M-sweep over real 7B decode projections — does per-verified-token cost amortize for M>1
+# batched verify (spec-decode)? 1-core vs 3-core scaling per M. Not in all/test.
+batch_verify_probe: tools/batch_verify_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
 # diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
 chain_bench: tools/chain_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
