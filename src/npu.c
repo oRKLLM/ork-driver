@@ -4195,6 +4195,23 @@ struct ork_async { pthread_t th; int started; int rc; enum ork_async_kind kind;
     const void *A; void *C;                 /* single-matmul A/C (typed per kind) */
     int S; const void *tasks; };            /* chain/stream task array (typed per kind) */
 
+/* Big-core SET mask (high-numbered cluster, matching pin_big_core's "high = big" assumption). Used to
+ * launch the async worker bound to the WHOLE big cluster rather than one core: a single-core pin would
+ * trap a freshly-created worker behind the caller (it inherits the caller's mask and can't run to
+ * migrate); a set lets the scheduler place it on any FREE big core -> real CPU‖NPU overlap, never an
+ * A55. (The run_multicore pool deliberately pins DISTINCT single cores instead — that's a simultaneous
+ * barrier where distinct cores avoid contention; the async worker is a single overlapping thread.) */
+static int ork_big_core_set(cpu_set_t *s){
+#if defined(__linux__)
+    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
+    if(off) return 0;
+    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return 0;
+    CPU_ZERO(s); for(int k=(int)(ncpu/2);k<ncpu;k++) CPU_SET(k,s);  /* top half = big cluster on RK35xx */
+    return 1;
+#else
+    (void)s; return 0;
+#endif
+}
 static void *ork_async_worker(void *p){
     struct ork_async *h = (struct ork_async *)p;
     switch (h->kind) {
@@ -4213,7 +4230,19 @@ static ork_async *ork_async_launch(struct ork_async tmpl){
     struct ork_async *h = calloc(1, sizeof *h);
     if (!h) return NULL;
     *h = tmpl; h->rc = -1; h->started = 0;
-    if (pthread_create(&h->th, NULL, ork_async_worker, h) != 0) { free(h); return NULL; }
+    /* Bind the worker to the big-core SET (not a single core) AT CREATION: a single-core child would
+     * inherit the caller's narrow mask and stay trapped on the caller's core; setting the mask *after*
+     * pthread_create races (the child can run the whole submit on the caller's core before Linux
+     * migrates a sleeping thread). Setting it via pthread_attr means the child is *born* with the
+     * big-cluster mask, so the scheduler places it on an idle big core from the first instruction →
+     * real CPU‖NPU overlap, never an A55. ORK_NO_AFFINITY (in ork_big_core_set) leaves it unpinned. */
+    pthread_attr_t at; pthread_attr_init(&at);
+#if defined(__linux__)
+    { cpu_set_t s; if (ork_big_core_set(&s)) pthread_attr_setaffinity_np(&at, sizeof s, &s); }
+#endif
+    int rc = pthread_create(&h->th, &at, ork_async_worker, h);
+    pthread_attr_destroy(&at);
+    if (rc != 0) { free(h); return NULL; }
     h->started = 1;
     return h;
 }
