@@ -206,6 +206,11 @@ scheduler, then handles the practical limits (contraction-dim and output-width c
 state) so callers just see `C = A·B`. The full reverse-engineering record lives in the
 [ork-driver wiki](https://github.com/oRKLLM/ork-driver/wiki) (start with the [regcmd ISA Reference](https://github.com/oRKLLM/ork-driver/wiki/regcmd-ISA-Reference)).
 
+The single-core matmul is **weight-DMA-bound** — each M-tile submit re-streams the whole `K×N`
+weight from DRAM — so the kernel picks the **largest M-tile the `0x1040` schedule allows**
+(`mg_max*64`) to amortize that weight stream over as many activation rows as possible (~2× single-core
+vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for the full account.
+
 ## Status & roadmap
 
 What's done (fp16/int8 matmul, multi-core, decode ≈ closed runtime, prefill flash attention) and

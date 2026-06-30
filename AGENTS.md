@@ -117,6 +117,27 @@ tools/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs)
 docs/ADDING_AN_SOC.md   how to add/validate a SoC (RE narrative + scratch live on the wiki)
 ```
 
+### Weight-DMA amortization (the single-core M-tile lever)
+
+The single-core int8 matmul is **weight-DMA-bound, not compute- or row-bound**: every M-tile submit
+re-streams the entire `K×N` weight from DRAM (~11 GB/s), and that cost is *independent of how many
+rows the tile carries* — measured `µs/submit` is flat from mc=4→31 and scales ~linearly with N. So the
+per-row throughput lever is **rows per weight-stream**: a bigger M-tile amortizes the one weight load
+over more rows and cuts total weight re-reads (`M / mc` of them).
+
+The M-tile size `mc` is therefore capped at the **largest value the hardware computes correctly**, which
+is the `0x1040` K-reduction schedule limit `mg_max*64` — **not** `R-1` where `R = pow2_floor(2*cbuf/K)`.
+The old `R-1` / "CBUF-resident rows" cap was a **disproven RE finding**: activations *stream* (they need
+not be CBUF-resident), reg `0x1010` is only a perf hint (correctness is identical regardless of it), and
+`mg_max*64` is the exact bit-exact ceiling — validated `mc=mg_max*64` is correct and `mc+1` miscomputes
+at every K (704@K512, 320@K1024, 128@K2048, 64@K3584/4096). Raising the cap from `R-1` (~31) to
+`mg_max*64` gave **~2.1× single-core / ~1.6× three-core at K=2048, ~1.5× at K=3584, bit-exact** (2026-06-30).
+
+Consequences: `cbuf_elems` no longer sets the int8 M-tile size (it only feeds the neutral `0x1010` hint);
+it still governs the fp16 path. This fix is int8 full-K only — the wide-K (`K>4096`) K-slice path and fp16
+keep their own caps (fp16 has a separate latent large-tile M-scheduler bug). When touching any M-tile cap,
+the bound is `mg_max*64`; never reintroduce an `R-1`/`pow2_floor` ceiling.
+
 ### Multi-SoC: data, not branches
 
 The regcmd ISA and DRM path are **shared** across the RK35xx family; only *parameters* differ

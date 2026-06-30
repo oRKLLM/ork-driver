@@ -161,9 +161,9 @@ static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n
 }
 /* PHASE-B K-TILE knob (ORK_KTILE, default OFF). The int8 weight K-axis is sliced into KS-element
  * slices (Bb[ns*Sk+ks]) and the slice partials accumulated host-side; the single-task M-tile is capped
- * by R=pow2_floor(2*cbuf/Kp), which GROWS as Kp shrinks. Default KS=1024 (R=64). Setting ORK_KTILE=kt
- * (a multiple of 32, < K) forces KS=kt at BOTH pack and run, so a smaller slice yields a bigger R ->
- * a larger M-tile -> more per-task M-amortization. To make a K<=10752 weight actually TAKE the K-split
+ * by the 0x1040 K-reduction schedule (mg_max*64), which GROWS as Kp shrinks. Default KS=1024. Setting
+ * ORK_KTILE=kt (a multiple of 32, < K) forces KS=kt at BOTH pack and run, so a smaller slice yields a
+ * larger M-tile -> more per-task M-amortization (weighed against the host-accumulate cost of more slices). To make a K<=10752 weight actually TAKE the K-split
  * path (it would otherwise run full-K via Bf), Bf is suppressed when KTILE is active and < K. The run
  * path is the existing, bit-exact-validated per-slice/chain-ksplit accumulation — no new regcmd; every
  * program still goes through validate_regcmd, and accumulation == full-K == the CPU ref. WEDGE-SAFE:
@@ -443,9 +443,10 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
     if(sched){
         int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-        /* EXPERIMENTAL (ORK_RCAP, default off): override the 0x1010 CBUF-resident row count — testing
-         * whether ork's cbuf_elems is conservative (rknn's captured single-core tile uses 30 rows here
-         * vs ork's pow2_floor 16). Bigger 0x1010 = fewer weight re-reads = the single-core lever. */
+        /* DEBUG knob (ORK_RCAP, default off): override the 0x1010 row-count hint. MEASURED NEUTRAL —
+         * 0x1010 is only a hint; it does NOT change correctness or speed (the real single-core lever is
+         * the M-tile size mg_max*64, set by the caller — see AGENTS.md "weight-DMA amortization"). Kept
+         * only for RE/diagnostics. */
         static int rcap=-2; if(rcap==-2){const char*e=getenv("ORK_RCAP"); rcap=e?atoi(e):-1;}
         if(rcap>0) R=rcap;
         int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
@@ -2009,7 +2010,7 @@ static void *mcworker(void *vp){
          * to per-tile; Sn==1 is unchanged (one slice == one submit, as before). */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
         /* SMALL-TILE PACKING (ORK_SMALLTILE, default OFF): mirror rkllm — pack many SMALL CBUF-resident
          * tiles back-to-back in the one chained submit instead of a few LARGE per-core tiles. With it set:
          * M-tile = ORK_SMALLTILE_M (default 32) and each core's Ncore columns are sub-tiled into
@@ -2017,14 +2018,15 @@ static void *mcworker(void *vp){
          * task's working set stays in CBUF/SRAM so the MAC stays fed across tasks. Same validated regcmd
          * /K-handling (no 0x107c/0x1044 K-grouping). validate_regcmd + fall back to the per-tile path.
          *
-         * HARD CONSTRAINT (RE finding): the M-tile is bounded above by R-1, where R = the number of
-         * feature ROWS that fit in CBUF for this K (R = pow2_floor(2*CBUF/K)). synth_i8 loads only
-         * `rows = min(mc+1, R)` rows (reg 0x1010) and the K-reduction schedule (reg 0x1040) is keyed
-         * to that; an M-tile of more than R-1 rows spills past the CBUF-resident window and the rows
-         * beyond it are computed against the wrong K-partition (silent miscompute, NOT a wedge). For
-         * K=3584 on RK3588 R=16 -> M-tile must be <=15. So ORK_SMALLTILE_M is a CEILING that we clamp
-         * down to R-1; we never raise the tile above the CBUF-resident cap. The N axis IS the free
-         * packing lever (sub-tile Ncore into ORK_SMALLTILE_N columns). */
+         * M-TILE CEILING (corrected 2026-06-30): the real upper bound is the 0x1040 K-reduction
+         * schedule, == mg_max*64 (mc+1 miscomputes; bit-exact-validated at every K: 704@K512, 320@K1024,
+         * 128@K2048, 64@K3584/4096). The old "R-1 / CBUF-resident rows" RE finding was WRONG — it claimed
+         * R=pow2_floor(2*CBUF/K) (~31) was a hard cap, but activations STREAM (they need not be CBUF-
+         * resident) and reg 0x1010 is only a perf hint (correctness is identical regardless). That false
+         * cap throttled the M-tile ~2-4x below mg_max*64 and made the kernel re-stream the K*N weight from
+         * DRAM far too often (single-core is weight-DMA-bound) — see AGENTS.md "weight-DMA amortization".
+         * SMALLTILE deliberately wants SMALL tiles, so it still clamps to R-1 below as its own ceiling
+         * (not a correctness limit). The N axis is the free packing lever (sub-tile Ncore). */
         static int st_on=-1, st_m=0, st_n=0;
         if(st_on<0){ const char*e=getenv("ORK_SMALLTILE"); st_on=e?atoi(e):0;
             const char*em=getenv("ORK_SMALLTILE_M"); st_m=em?atoi(em):32;
@@ -2148,7 +2150,7 @@ static void *mcworker(void *vp){
     if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
             int active = (t1 > t0);
@@ -2565,7 +2567,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
             int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
             double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-            int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+            int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
             int rows=chunk<M?chunk:M;
             size_t sz=(size_t)rows*Kp*1;
             if(sz>maxaf)maxaf=sz;
@@ -3039,7 +3041,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
         int rows=chunk<M?chunk:M;
         size_t sz=(size_t)rows*Kp*1;
         if(sz>maxaf)maxaf=sz;
@@ -3059,9 +3061,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* the M-scheduler is now enabled for non-pow2 Kp (e.g. K=6144) via continuous scheduling */
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
-        /* EXPERIMENTAL (ORK_MCAP, default off): force the M-tile (rows/submit) size, decoupled from the
-         * 0x1010 cap — replicates rknn's larger single-core M-tile (mc=45 here) to cut weight re-reads. */
+        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
+        /* DEBUG knob (ORK_MCAP, default off): force the M-tile (rows/submit) size. The default above is
+         * now the validated optimum (mg_max*64), so this only lowers it (diagnostics) or — if set above
+         * mg_max*64 — miscomputes. Was used to discover the weight-DMA-amortization lever; kept for RE. */
         { static int mcap=-2; if(mcap==-2){const char*e=getenv("ORK_MCAP"); mcap=e?atoi(e):-1;}
           if(mcap>0){ chunk=mcap; if(chunk>M)chunk=M; if(chunk<1)chunk=1; } }
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
@@ -3645,7 +3648,7 @@ static int chain_fullk_mcap_i8(ork_npu *c, int K) {
     { int rp2 = 1; while (rp2 * 2 <= R) rp2 *= 2; R = rp2; }
     double scale = (double)K / 512.0; int base = (int)(177.0 - 15.0 * (scale - 1.0)), slope = (int)(15.0 * scale);
     int mg_max = base >= 0x1b ? (base - 0x1b) / slope + 1 : 0;
-    int chunk = mg_max * 64; if (chunk > R - 1) chunk = R - 1; if (chunk < 1) chunk = 1;
+    int chunk = mg_max * 64; if (chunk < 1) chunk = 1;   /* schedule-valid max rows (mg_max*64), not R-1 — see "weight-DMA amortization" in AGENTS.md */
     return chunk;
 }
 

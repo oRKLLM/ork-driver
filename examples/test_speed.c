@@ -37,21 +37,24 @@ int main(void){
     ork_w_free(w); free(A); free(B); free(C); ork_npu_free(c);
     
     int fail = 0;
-    /* Thresholds ratcheted to current RK3588 perf (2026-06-30): M=512 K=N=2048 int8 measures
-     * 1-core ~11.7ms, 3-core ~4.55ms (scaling ~2.55-2.62x) across runs, ~3% spread. Set with margin
-     * below best-observed so a real regression (lost core, little-core pinning, kernel slowdown) trips
-     * it but normal variance does not. Was 1.4x / 9000us — far too loose for the current kernel. */
-    if (cores > 1 && (t1 / tN) < 2.2) {
-        printf("FAIL: Multi-core scaling (%.2fx) is below 2.2x threshold. Possible thread pinning regression.\n", t1/tN);
+    /* Thresholds re-ratcheted 2026-06-30 after the WEIGHT-DMA AMORTIZATION fix (M-tile cap raised from
+     * R-1 to the 0x1040 schedule max mg_max*64 — see AGENTS.md). M=512 K=N=2048 int8 now measures
+     * 1-core ~5.1ms (was ~11.7ms; ~2.1x faster), 3-core ~2.8ms (was ~4.55ms; ~1.6x). NOTE: the SCALING
+     * RATIO DROPPED (~2.55x -> ~1.82x) BECAUSE single-core sped up MORE than multi-core — that is the
+     * intended win, not a regression. So the absolute-latency guards (below) are now the real regression
+     * detectors; the scaling floor only catches a lost/parked core (scaling collapses toward 1.0). */
+    if (cores > 1 && (t1 / tN) < 1.5) {
+        printf("FAIL: Multi-core scaling (%.2fx) is below 1.5x floor — likely a lost/parked core.\n", t1/tN);
         fail = 1;
     }
-    /* Absolute latency guards (RK3588; RK3576 may differ — loosen there if validated). */
-    if (tN > 6000.0) {
-        printf("FAIL: Multi-core latency (%.1f us) exceeds 6000 us limit.\n", tN);
+    /* Absolute latency guards (RK3588; RK3576 may differ — loosen there if validated). Margin ~25%
+     * over best-observed (1-core ~5.1ms, 3-core ~2.8ms) so normal ~3-7% spread does not trip them. */
+    if (tN > 3600.0) {
+        printf("FAIL: Multi-core latency (%.1f us) exceeds 3600 us limit.\n", tN);
         fail = 1;
     }
-    if (t1 > 14000.0) {
-        printf("FAIL: Single-core latency (%.1f us) exceeds 14000 us limit (per-core kernel regression).\n", t1);
+    if (t1 > 6500.0) {
+        printf("FAIL: Single-core latency (%.1f us) exceeds 6500 us limit (per-core kernel regression).\n", t1);
         fail = 1;
     }
 
