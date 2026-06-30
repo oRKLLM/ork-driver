@@ -155,6 +155,15 @@ RKNN_DIR ?= /tmp/rknn
 rknn_vs_ork: tools/rknn_vs_ork.c $(CORE)
 	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< $(CORE) -L$(RKNN_DIR) -lrknnrt -lm
 
+# calibration: drive the closed RKNN matmul API with B_quant_type per-channel(1) vs per-group(2) to
+# probe whether per-K-group dequant is a single hardware submit. Needs librknnrt (RKNN_DIR). Not in all/test.
+pgquant_capture: tools/pgquant_capture.c
+	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< -L$(RKNN_DIR) -lrknnrt -lm
+
+# LD_PRELOAD shim: decode rknpu SUBMIT task_number/subcore tasks (monolithic kernel vs PC-chained tasks).
+submit_introspect.so: tools/submit_introspect.c
+	$(CC) -shared -fPIC -O2 -o $@ $< -ldl
+
 # diagnostic: why does large-M (prefill) multi-core barely scale? per-core copy/submit/acc split.
 mc_prof: tools/mc_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
