@@ -163,6 +163,10 @@ mc_prof: tools/mc_prof.c $(CORE)
 overlap_probe: tools/overlap_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: decode async-overlap hypothesis — real 7B M=1 matmuls, sync vs async-pipelined w/ CPU prep. Not in all/test.
+async_decode_probe: tools/async_decode_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
 # diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
 chain_bench: tools/chain_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
