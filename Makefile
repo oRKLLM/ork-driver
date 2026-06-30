@@ -283,3 +283,11 @@ attn_cost7b: tools/attn_cost7b.c $(CORE)
 # RE: dump one single-core int8 ork matmul's regcmd (ORK_TRACE=1) for the weight-residence diff vs rknn.
 ork_trace_mm: tools/ork_trace_mm.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
+# RE: reproduce the mixed-K cross-matmul state interaction (layer/model fail at cbuf raise).
+seq_check: tools/seq_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
+# RE: round-robin single-core (run_stream) vs barrier multi-core, at R=32 (cbuf reinstated).
+rr_experiment: tools/rr_experiment.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm

@@ -65,13 +65,13 @@ int main(int argc,char**argv){
    * whether ork's kernel stays competitive where spec-decode verify operates (lead #1/#4 follow-up). */
   if(argc>2 && argv[2][0]=='m'){
     int KN[][2]={{3584,3584},{3584,18944}};  /* 7B attn (Q/O) + FFN (gate/up) */
-    int Ms[]={1,8,16,32};
+    int Ms[]={1,32,64,128,256,512};
     printf("ork vs RKNN matmul API, M-sweep (int8, %d warm iters). us/matmul:\n",iters);
     for(int kn=0;kn<2;kn++){
       int K=KN[kn][0],N=KN[kn][1];
       printf("  K=%d N=%d:\n",K,N);
       printf("    %-4s %10s %10s %11s %14s\n","M","ork-1core","ork-3core","rknn-1core","ork3c/rknn");
-      for(int mi=0;mi<4;mi++){
+      for(unsigned mi=0;mi<sizeof(Ms)/sizeof(int);mi++){
         int M=Ms[mi];
         double o1=bench_ork(M,K,N,iters,1), o3=bench_ork(M,K,N,iters,3), r=bench_rknn(M,K,N,iters);
         printf("    %-4d %10.1f %10.1f %11.1f %14.2f\n",M,o1,o3,r,(r>0?o3/r:0));
