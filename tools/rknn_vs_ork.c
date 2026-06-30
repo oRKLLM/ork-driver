@@ -61,6 +61,24 @@ int main(int argc,char**argv){
     printf("  normal A (AC_layout=0): %.1f us\n  native A (AC_layout=1): %.1f us   -> native/normal %.2f\n",n0,n1,n1>0?n1/n0:0);
     return 0;
   }
+  /* M-sweep: ork vs the closed RKNN matmul API across the batched-verify regime (M=1..32), to check
+   * whether ork's kernel stays competitive where spec-decode verify operates (lead #1/#4 follow-up). */
+  if(argc>2 && argv[2][0]=='m'){
+    int KN[][2]={{3584,3584},{3584,18944}};  /* 7B attn (Q/O) + FFN (gate/up) */
+    int Ms[]={1,8,16,32};
+    printf("ork vs RKNN matmul API, M-sweep (int8, %d warm iters). us/matmul:\n",iters);
+    for(int kn=0;kn<2;kn++){
+      int K=KN[kn][0],N=KN[kn][1];
+      printf("  K=%d N=%d:\n",K,N);
+      printf("    %-4s %10s %10s %11s %14s\n","M","ork-1core","ork-3core","rknn-1core","ork3c/rknn");
+      for(int mi=0;mi<4;mi++){
+        int M=Ms[mi];
+        double o1=bench_ork(M,K,N,iters,1), o3=bench_ork(M,K,N,iters,3), r=bench_rknn(M,K,N,iters);
+        printf("    %-4d %10.1f %10.1f %11.1f %14.2f\n",M,o1,o3,r,(r>0?o3/r:0));
+      }
+    }
+    return 0;
+  }
   int shapes[][3]={{1,2048,2048},{1,2048,6144},{1,6144,2048},{1,2048,1536},{512,2048,2048}};
   printf("int8 matmul, %d warm iters. us/matmul (lower=faster):\n",iters);
   printf("  %-16s %10s %10s %10s %12s\n","M x K x N","ork-1core","ork-3core","rknn-1core","ork1/rknn");
