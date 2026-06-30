@@ -279,3 +279,7 @@ attn_cost: tools/attn_cost.c $(CORE)
 
 attn_cost7b: tools/attn_cost7b.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# RE: dump one single-core int8 ork matmul's regcmd (ORK_TRACE=1) for the weight-residence diff vs rknn.
+ork_trace_mm: tools/ork_trace_mm.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm

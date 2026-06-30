@@ -442,13 +442,22 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I8_N,0x1001,0x403c,((s-1)<<16)|(N-1));setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/4)-1)<<16)|((N/4)-1));
     setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
     if(sched){
-        int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
+        int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+        /* EXPERIMENTAL (ORK_RCAP, default off): override the 0x1010 CBUF-resident row count — testing
+         * whether ork's cbuf_elems is conservative (rknn's captured single-core tile uses 30 rows here
+         * vs ork's pow2_floor 16). Bigger 0x1010 = fewer weight re-reads = the single-core lever. */
+        static int rcap=-2; if(rcap==-2){const char*e=getenv("ORK_RCAP"); rcap=e?atoi(e):-1;}
+        if(rcap>0) R=rcap;
+        int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
         /* 0x1040 = K-reduction schedule, selected per 64-row group. MUST be ceil(mc/64): a tile of
          * 65..127 rows spills past the first 64-row group, so it needs the NEXT schedule (the one a
          * full 128-row tile uses), not the <=64 schedule. floor(mc/64) gave 65..127-row tiles the
          * <=64 schedule -> rows 64..mc-1 computed against the wrong K-partition (the prefill bug). */
         double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
-        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I8_N,0x201,0x1040,v);
+        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b;
+        static int r1040=-2; if(r1040==-2){const char*e=getenv("ORK_R1040"); r1040=e?atoi(e):-1;}
+        if(r1040>0) v=r1040;   /* EXPERIMENTAL: override the 0x1040 schedule (rknn's captured 0x75 for the 30-row tile) */
+        setr(rc,REGCMD_I8_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
 }
@@ -2996,7 +3005,12 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
     int b=budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
+    /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
+     * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
+     * measuring chained-ork-1core vs rknn-1core apples-to-apples (rknn chains its M-tiles in 1 submit). */
     if(nc>1) return run_multicore(c,w,M,A,C,nc);
+    { static int mc1=-1; if(mc1<0){const char*e=getenv("ORK_MC1"); mc1=e?atoi(e):0;}
+      if(mc1 && M>1 && c->soc->cores>=1) return run_multicore(c,w,M,A,C,1); }
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
@@ -3043,6 +3057,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         int Kp=K, sched=1, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(chunk > R - 1) chunk = R - 1; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;
+        /* EXPERIMENTAL (ORK_MCAP, default off): force the M-tile (rows/submit) size, decoupled from the
+         * 0x1010 cap — replicates rknn's larger single-core M-tile (mc=45 here) to cut weight re-reads. */
+        { static int mcap=-2; if(mcap==-2){const char*e=getenv("ORK_MCAP"); mcap=e?atoi(e):-1;}
+          if(mcap>0){ chunk=mcap; if(chunk>M)chunk=M; if(chunk<1)chunk=1; } }
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
          * Opt-in (ORK_ZC_OUT) + off by default. */
