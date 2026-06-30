@@ -181,7 +181,15 @@ static int int8_ks(ork_npu *c){ (void)c;
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
 static int budget(ork_npu*c, int M){
-    if (M == 1) return 1;
+    if (M == 1) {
+        /* M=1 decode: single-core by default (the dispatch floor usually beats the
+         * multi-core barrier at one row). ORK_DECODE_MC=1 lets matmuls split N-tiles
+         * across cores — testing whether the 2 idle cores help the big FFN matmuls. */
+        static int dmc=-1;
+        if (dmc<0){ const char*e=getenv("ORK_DECODE_MC"); dmc=e?atoi(e):0; }
+        if (!dmc) return 1;
+        /* else fall through to the normal multi-core budget */
+    }
     int b=c->core_budget;
     const char *env_mc = getenv("ORK_NPU_MC");
     if (env_mc) {
