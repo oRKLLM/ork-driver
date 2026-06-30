@@ -75,6 +75,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
     void *(*pjob_fn)(void *); size_t pjob_stride;   /* generalized pool dispatch: per-core worker + arg stride */
     pthread_barrier_t b_ioctl; int mc_submit_rc; int mc_error;
+    int last_async_cpu;   /* sched_getcpu() of the most recent async worker at entry (diagnostic/test: -1 = none) */
     /* zero-copy registry: caller-allocated NPU-coherent DMA buffers (ork_dma_alloc). When a matmul's
      * A/C live in one of these, the regcmd points at them directly — no host gather/writeout memcpy. */
     struct buf dma_tab[64]; int dma_n;
@@ -513,7 +514,7 @@ ork_npu *ork_npu_init(void){
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
@@ -4214,6 +4215,9 @@ static int ork_big_core_set(cpu_set_t *s){
 }
 static void *ork_async_worker(void *p){
     struct ork_async *h = (struct ork_async *)p;
+#if defined(__linux__)
+    h->c->last_async_cpu = sched_getcpu();   /* record placement (attr-pinned big-core set) for diagnostics/tests */
+#endif
     switch (h->kind) {
         case OAK_F16:      h->rc = ork_mm_run        (h->c, h->w, h->M, (const f16*)h->A, (float*)h->C); break;
         case OAK_I8:       h->rc = ork_mm_run_i8     (h->c, h->w, h->M, (const int8_t*)h->A, (int32_t*)h->C); break;
@@ -4282,6 +4286,10 @@ int ork_async_wait(ork_async *h){
     free(h);
     return rc;
 }
+
+/* CPU the most recent async worker was placed on at entry (sched_getcpu), or -1 if none has run /
+ * not Linux. Lets a test assert the worker landed on a big core (not the caller's core, not an A55). */
+int ork_npu_last_async_cpu(ork_npu *c){ return c ? c->last_async_cpu : -1; }
 
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
 void ork_fwht_norm(float *v, int n){

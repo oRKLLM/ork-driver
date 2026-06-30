@@ -37,17 +37,24 @@ int main(void){
     ork_w_free(w); free(A); free(B); free(C); ork_npu_free(c);
     
     int fail = 0;
-    if (cores > 1 && (t1 / tN) < 1.4) {
-        printf("FAIL: Multi-core scaling (%.2fx) is below 1.4x threshold. Possible thread pinning regression.\n", t1/tN);
+    /* Thresholds ratcheted to current RK3588 perf (2026-06-30): M=512 K=N=2048 int8 measures
+     * 1-core ~11.7ms, 3-core ~4.55ms (scaling ~2.55-2.62x) across runs, ~3% spread. Set with margin
+     * below best-observed so a real regression (lost core, little-core pinning, kernel slowdown) trips
+     * it but normal variance does not. Was 1.4x / 9000us — far too loose for the current kernel. */
+    if (cores > 1 && (t1 / tN) < 2.2) {
+        printf("FAIL: Multi-core scaling (%.2fx) is below 2.2x threshold. Possible thread pinning regression.\n", t1/tN);
         fail = 1;
     }
-    
-    /* Strict threshold for RK3588 (RK3576 may differ, so keep this reasonable but strict for known hardware) */
-    if (tN > 9000.0) {
-        printf("FAIL: Multi-core latency (%.1f us) exceeds 9000 us limit.\n", tN);
+    /* Absolute latency guards (RK3588; RK3576 may differ — loosen there if validated). */
+    if (tN > 6000.0) {
+        printf("FAIL: Multi-core latency (%.1f us) exceeds 6000 us limit.\n", tN);
         fail = 1;
     }
-    
+    if (t1 > 14000.0) {
+        printf("FAIL: Single-core latency (%.1f us) exceeds 14000 us limit (per-core kernel regression).\n", t1);
+        fail = 1;
+    }
+
     if (!fail) printf("SPEED OK\n");
     return fail;
 }

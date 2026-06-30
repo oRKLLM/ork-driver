@@ -300,6 +300,9 @@ ork_async   *ork_mm_run_chain_i4_async (ork_npu *ctx, int S, const ork_mm_task_i
 ork_async   *ork_mm_run_stream_i8_async(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
 ork_async   *ork_mm_run_stream_i4_async(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 int          ork_async_wait(ork_async *h);
+/* CPU the most recent async worker was placed on at entry (sched_getcpu), -1 if none/non-Linux.
+ * Diagnostic + regression test for the worker-pinning pattern (worker lands on a big core). */
+int          ork_npu_last_async_cpu(ork_npu *ctx);
 
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);
