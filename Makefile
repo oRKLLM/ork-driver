@@ -293,6 +293,11 @@ seq_check: tools/seq_check.c $(CORE)
 sparse_check: tools/sparse_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
 
+# diagnostic: fp16 matmul correctness at a chosen (M,K,N,cores), sampled. Used to validate the fp16
+# M-scheduler row ceiling (sched=1 miscomputes >8 rows at K>=2048; single-core vs multi-core). Not in all/test.
+fp16_sparse_check: tools/fp16_sparse_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
 # RE: round-robin single-core (run_stream) vs barrier multi-core, at R=32 (cbuf reinstated).
 rr_experiment: tools/rr_experiment.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm

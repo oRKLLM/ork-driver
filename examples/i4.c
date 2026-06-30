@@ -67,6 +67,14 @@ int main(void){
     fail|=test(c,1,12288,64);     /* K-split (>10752) + accumulate */
     fail|=test(c,3,2048,256);     /* M + N tiling, mid K          */
     fail|=test(c,8,512,256);      /* regression: prefill M=8 multi-core */
+    /* SINGLE-CORE int4 (budget=1): W4A4 is physically single-row (mc=1, captured regcmd) + PC-chained
+     * for M>1 — no sched=1 M-scheduler/mg_max*64 tile (so the fp16/int8 large-tile bugs don't apply),
+     * but this guards the 1-core M>1 chain path that the multi-core cases above don't exercise. */
+    { int cores=ork_npu_cores(c);
+      ork_npu_set_core_budget(c,1);
+      fail|=test(c,8,512,256);    /* int4 1-core M=8 (chained rows) */
+      fail|=test(c,4,2048,256);   /* int4 1-core M=4, K-split + accumulate */
+      ork_npu_set_core_budget(c,cores); }
     printf("per-group W4A4 (fp32 -> int4 group-quant -> NPU dequant) vs fp32:\n");
     fail|=gtest(c,1,2048,256,128);    /* decode, group_size 128 (16 groups) */
     fail|=gtest(c,1,4096,512,128);    /* more groups + N-tiling                */

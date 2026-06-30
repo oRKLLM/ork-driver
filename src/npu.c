@@ -3121,7 +3121,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
+        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) miscomputes >8 rows at Kp>=2048 (validated mc<=8 OK / mc>=9 garbage) — gate it OFF for Kp>=2048 (mc=(RB/2)/Kp=8, correct), matching mcworker. Was missing the Kp<2048 guard -> fp16 single-core K>=2048 produced garbage for M>8. */
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             double _tc0=ork_now_us();

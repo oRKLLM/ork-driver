@@ -567,6 +567,12 @@ int main(void){
     //8,512,16384);     /* N-tiling: N>8192 (NPU output-width cap) */
     //1,288,32000);     /* LM-head shape: non-pow2 K + N tiled into 4 slices */
     //4,6144,2048);     /* non-pow2 K<=8192 — decode (M=1) single-submit boundary */
+    /* SINGLE-CORE fp16 regression (budget=1): the run() M-scheduler (sched=1) miscomputes >8 rows at
+     * Kp>=2048 (validated mc<=8 OK / mc>=9 garbage); it is now gated to sched=0 there. The layer/model
+     * path is multi-core (always tiles to mc=8) so this single-core M>8 path was previously UNTESTED. */
+    ork_npu_set_core_budget(ctx, 1);
+    fail|=check(ctx, 64, 2048, 256);    /* fp16 1-core K=2048 M=64>8 — pre-fix: garbage */
+    fail|=check(ctx, 256, 3584, 256);   /* fp16 1-core K=3584 M=256       */
     ork_npu_free(ctx);
     ork_npu*c8=ork_npu_init(); if(!c8){printf("init failed (NPU?)\n");return 1;}
     ork_npu_set_core_budget(c8, 3);
@@ -589,6 +595,12 @@ int main(void){
     fail|=check_dump_load_i4a8(c8, 1);/* Phase-2.1: compact int4 persist/load round-trip (NF4) — streamed==resident */
     fail|=check_dump_load_i4a8(c8, 0);/* Phase-2.1: compact int4 persist/load round-trip (UNIFORM) */
     fail|=test_overlap_guards(c8);    /* verify memory overlap guards */
+    /* SINGLE-CORE int8 regression (budget=1, run LAST so it doesn't disturb the multi-core checks
+     * above): exercises the weight-DMA M-tile = mg_max*64 (128 @K2048) on the single-core full-K path —
+     * the lever that was throttled to R-1=31. Bit-exact integer ref guards both the size and the fix. */
+    ork_npu_set_core_budget(c8, 1);
+    fail|=check_i8(c8, 512, 2048, 256);   /* int8 1-core K=2048 M=512 (mg_max*64 tile) */
+    fail|=check_i8(c8, 256, 3584, 256);   /* int8 1-core K=3584 M=256 (mg_max*64=64)   */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
