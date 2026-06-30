@@ -291,3 +291,7 @@ seq_check: tools/seq_check.c $(CORE)
 # RE: round-robin single-core (run_stream) vs barrier multi-core, at R=32 (cbuf reinstated).
 rr_experiment: tools/rr_experiment.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
+# RE: reproduce the fp16 layer/model failure at cbuf raise (multi-core fp16 matmul + CPU ref).
+fp16_check: tools/fp16_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm

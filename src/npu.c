@@ -1947,6 +1947,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
 static void *mcworker(void *vp){
     struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
     int K=a->w->K, N=a->w->N, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
+    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* cbuf raise (57344, int8 R=32 @K3584) is INT8-ONLY: the fp16 M-scheduler is validated only to the 32768-tile and miscomputes larger fp16 M-tiles (latent bug) */
     int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     ork_w *w=a->w; const void *A=a->A; struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*CC=&c->mcc[i];
     size_t maxout = a->maxout;
@@ -2521,6 +2522,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
     int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
+    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see mcworker) */
     int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
     /* CHAIN-PREFILL (ORK_CHAIN_PREFILL, default ON): in the int8 M>1 full-K prefill path each core
      * normally issues one ioctl per M-tile (serial ~134us floor each — the dominant prefill submit
@@ -3013,6 +3015,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
       if(mc1 && M>1 && c->soc->cores>=1) return run_multicore(c,w,M,A,C,1); }
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
+    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see mcworker) */
     int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
