@@ -20,11 +20,14 @@
  * mechanism — the independent groups {Q,K,V} and {gate,up} can overlap; the chain edges can't. The
  * point is to validate the mechanism and quantify the ceiling, not to claim a full decode is this fast.
  */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sched.h>
+#include <pthread.h>
 #include "ork_npu.h"
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
@@ -43,14 +46,55 @@ static void cpu_prep(const float *x, int8_t *out, int K, int reps){
     }
 }
 
+/* Prototype of the REAL async fix: a PERSISTENT worker created once and pinned to a chosen big core
+ * (or a big-core SET) — not per-matmul pthread_create (spawn cost), not inheriting the caller's pin
+ * (collision), not unpinned (A55 drift). Mirrors ork's own run_multicore pool (condvar feed/done). */
+typedef struct {
+    ork_npu*c; ork_w*w; int M; const int8_t*A; int32_t*C;   /* the job */
+    int core_lo, core_hi;                                   /* bind to cores [lo..hi] (big-core set) */
+    pthread_mutex_t mu; pthread_cond_t go, dn; int has_job, done, stop;
+} awork;
+static void* aworker(void*p){ awork*a=(awork*)p;
+    cpu_set_t s; CPU_ZERO(&s); for(int k=a->core_lo;k<=a->core_hi;k++) CPU_SET(k,&s);
+    pthread_setaffinity_np(pthread_self(),sizeof s,&s);     /* bound to the big-core set, never A55 */
+    for(;;){ pthread_mutex_lock(&a->mu);
+        while(!a->has_job && !a->stop) pthread_cond_wait(&a->go,&a->mu);
+        if(a->stop){ pthread_mutex_unlock(&a->mu); return NULL; }
+        a->has_job=0; pthread_mutex_unlock(&a->mu);
+        ork_mm_run_i8(a->c,a->w,a->M,a->A,a->C);
+        pthread_mutex_lock(&a->mu); a->done=1; pthread_cond_signal(&a->dn); pthread_mutex_unlock(&a->mu); }
+}
+static void aw_submit(awork*a, ork_w*w, int M, const int8_t*A, int32_t*C){
+    pthread_mutex_lock(&a->mu); a->w=w; a->M=M; a->A=A; a->C=C; a->done=0; a->has_job=1;
+    pthread_cond_signal(&a->go); pthread_mutex_unlock(&a->mu); }
+static void aw_wait(awork*a){
+    pthread_mutex_lock(&a->mu); while(!a->done) pthread_cond_wait(&a->dn,&a->mu); pthread_mutex_unlock(&a->mu); }
+
 int main(int argc,char**argv){
     int iters=argc>1?atoi(argv[1]):60;
+    /* ORK_PROBE_PIN=<lo> [ORK_PROBE_PIN_HI=<hi>] → use a PERSISTENT worker bound to big cores [lo..hi]
+     * (e.g. PIN=5 → {5}; PIN=4 HI=6 → big-core set {4,5,6}); caller pinned to ORK_PROBE_CALLER (default 7).
+     * All big (cpu4-7 on RK3588) — overlap WITHOUT little-core drift, no per-matmul spawn. Unset → stock
+     * ork async API (per-call pthread_create, inherits caller pin unless ORK_NO_AFFINITY=1). */
+    int pin_lo=-1; { const char*e=getenv("ORK_PROBE_PIN"); if(e) pin_lo=atoi(e); }
+    int pin_hi=pin_lo; { const char*e=getenv("ORK_PROBE_PIN_HI"); if(e) pin_hi=atoi(e); }
+    int caller_core=7; { const char*e=getenv("ORK_PROBE_CALLER"); if(e) caller_core=atoi(e); }
+    if(pin_lo>=0){ cpu_set_t s; CPU_ZERO(&s); CPU_SET(caller_core,&s); pthread_setaffinity_np(pthread_self(),sizeof s,&s); }
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     int cores=ork_npu_cores(c);
     int budget=cores; { const char*e=getenv("ORK_PROBE_CORES"); if(e) budget=atoi(e); if(budget<1)budget=1; if(budget>cores)budget=cores; }
-    printf("INIT OK: soc=%s cores=%d  submit-budget=%d (3=ORK_DECODE_MC uses all cores; 1=leaves %d free to overlap)\n",
-           ork_npu_soc(c), cores, budget, cores-budget);
+    printf("INIT OK: soc=%s cores=%d  submit-budget=%d  async=%s\n",
+           ork_npu_soc(c), cores, budget,
+           pin_lo>=0 ? "PERSISTENT worker (pinned big-core set, no per-call spawn)" : "stock ork API (per-call pthread_create)");
+    if(pin_lo>=0) printf("  caller pinned cpu%d ; worker bound cpu%d..%d\n", caller_core, pin_lo, pin_hi);
     ork_npu_set_core_budget(c, budget);
+
+    /* start the persistent async worker (production-shape fix) */
+    awork aw; memset(&aw,0,sizeof aw);
+    pthread_t awth=0;
+    if(pin_lo>=0){ aw.c=c; aw.core_lo=pin_lo; aw.core_hi=pin_hi;
+        pthread_mutex_init(&aw.mu,NULL); pthread_cond_init(&aw.go,NULL); pthread_cond_init(&aw.dn,NULL);
+        pthread_create(&awth,NULL,aworker,&aw); }
 
     /* Qwen2.5-7B decode projections, M=1: {K,N} for Q,K,V,O,gate,up,down */
     int KN[7][2]={ {3584,3584},{3584,512},{3584,512},{3584,3584},{3584,18944},{3584,18944},{18944,3584} };
@@ -97,14 +141,21 @@ int main(int argc,char**argv){
         for(int it=0;it<iters;it++) for(int m=0;m<7;m++){ cpu_prep(X[m],prep[m],KN[m][0],reps); ork_mm_run_i8(c,w[m],M,A[m],Cs[m]); }
         double t_sync=(now_us()-s0)/iters;
 
-        /* ASYNC: pipeline cpu_prep(m+1) behind NPU compute(m) */
+        /* ASYNC: pipeline cpu_prep(m+1) behind NPU compute(m). pin_lo>=0 → persistent pinned worker
+         * (production fix); else → stock per-call ork async API. */
         double a0=now_us();
         for(int it=0;it<iters;it++){
             cpu_prep(X[0],prep[0],KN[0][0],reps);
             for(int m=0;m<7;m++){
-                ork_async*hh=ork_mm_run_i8_async(c,w[m],M,A[m],Ca[m]);
-                if(m<6) cpu_prep(X[m+1],prep[m+1],KN[m+1][0],reps);
-                ork_async_wait(hh);
+                if(pin_lo>=0){
+                    aw_submit(&aw,w[m],M,A[m],Ca[m]);
+                    if(m<6) cpu_prep(X[m+1],prep[m+1],KN[m+1][0],reps);
+                    aw_wait(&aw);
+                } else {
+                    ork_async*hh=ork_mm_run_i8_async(c,w[m],M,A[m],Ca[m]);
+                    if(m<6) cpu_prep(X[m+1],prep[m+1],KN[m+1][0],reps);
+                    ork_async_wait(hh);
+                }
             }
         }
         double t_async=(now_us()-a0)/iters;
@@ -114,5 +165,6 @@ int main(int argc,char**argv){
                t_cpu_tok/t_npu_tok, t_cpu_tok, t_sync, t_async, t_sync/t_async, ceil_us, 100.0*ceil_us/t_async);
     }
     printf("\n(decode operating point ~ cpu/npu 1.9 from measured NPU 33%%/cpu7 62%%)\n");
+    if(pin_lo>=0){ pthread_mutex_lock(&aw.mu); aw.stop=1; pthread_cond_signal(&aw.go); pthread_mutex_unlock(&aw.mu); pthread_join(awth,NULL); }
     ork_npu_free(c); return 0;
 }
