@@ -169,6 +169,7 @@ If your optimizations successfully increase the performance baselines above the 
 | `ORK_ZC_OUT=1` | output zero-copy (off by default — **correct** at the matmul level since the DMA cache-coherency fix `3fad74a` (+ Sn>1 `033a45b`), but ~0 end-to-end gain, so opt-in; **not safe under concurrent multi-core** — the coherency bsyncs aren't serialized across cores) |
 | `ORK_PROFILE=1` | per-section timing (quant / NPU run / dequant; decode vs prefill; run_multicore phases) — printed by ggml-ork on free |
 | `ORK_QUANT=4` | int4 W4A4 instead of int8 (experimental, incoherent) |
+| `ORK_DECODE_MC=1` | let M=1 (decode) matmuls split N-tiles across all 3 cores (default: single-core at M=1). +1.62× decode on the big FFN projections (7B-Q8_0, 0.92→1.49 t/s); off by default because small-N decode matmuls lose the multi-core barrier to the single-core dispatch floor. Residual gap to rkllm is the synchronous-execution wall, not core count |
 
 ### Diagnostic tools (board only; not in `all`/`test`)
 - `make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters] [a]` — per-matmul ork vs the closed RKNN matmul API (same int8 (M,K,N)); `a` arg = the AC-layout probe.
