@@ -288,6 +288,11 @@ ork_trace_mm: tools/ork_trace_mm.c $(CORE)
 seq_check: tools/seq_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
 
+# diagnostic: fast SAMPLED correctness for shapes whose full O(M*N*K) CPU ref takes minutes (wide-K,
+# e.g. ffn_down M=256 K=18944) — the slow ref masks NPU health and trips test/probe timeouts. Not in all/test.
+sparse_check: tools/sparse_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
 # RE: round-robin single-core (run_stream) vs barrier multi-core, at R=32 (cbuf reinstated).
 rr_experiment: tools/rr_experiment.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
