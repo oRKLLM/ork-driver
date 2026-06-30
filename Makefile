@@ -159,6 +159,10 @@ rknn_vs_ork: tools/rknn_vs_ork.c $(CORE)
 mc_prof: tools/mc_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# diagnostic: ceiling of within-backend CPU/NPU overlap (quant/deq pipelined behind NPU run). Not in all/test.
+overlap_probe: tools/overlap_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
 chain_bench: tools/chain_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
