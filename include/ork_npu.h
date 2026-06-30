@@ -203,6 +203,7 @@ void         ork_npu_run_timing(double *setup, double *submit, double *copy, lon
  * the timed region. core in [0, cores). */
 void         ork_npu_mc_reset(void);
 void         ork_npu_mc_timing(int core, double *copy, double *submit, double *acc, long *n);
+double       ork_npu_mc_synth(int core);   /* host synth+bsync subset of `submit` (overlappable); ioctl/NPU = submit - synth */
 
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8
  * submit at (K,N) (N <= SoC N-cap, K%32, N%32) on its own buffers. Returns 0 if the submit

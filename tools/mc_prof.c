@@ -47,8 +47,9 @@ int main(int argc,char**argv){
     printf("  per-core phase totals over %d warm iters (us; copy=act host-copy+bsync, submit=regcmd+ioctl+result bsync, acc=host accumulate):\n", iters);
     for(int i=0;i<cores;i++){
         double cp,su,ac; long n; ork_npu_mc_timing(i,&cp,&su,&ac,&n);
-        printf("    core %d: submits=%ld  copy=%.0f  submit=%.0f  acc=%.0f  | per-submit: copy=%.1f submit=%.1f acc=%.1f\n",
-               i, n, cp, su, ac, n?cp/n:0, n?su/n:0, n?ac/n:0);
+        double sy=ork_npu_mc_synth(i), io=su-sy;   /* synth = overlappable host inside submit; io = ioctl/NPU (unhideable) */
+        printf("    core %d: submits=%ld  copy=%.0f  submit=%.0f (synth=%.0f ioctl=%.0f)  acc=%.0f  | overlappable host (copy+synth+acc)=%.0f vs NPU ioctl=%.0f -> pipeline ceiling %.3fx\n",
+               i, n, cp, su, sy, io, ac, cp+sy+ac, io, io>0?(cp+su+ac)/io:0);
     }
     ork_w_free(w); if(!dma)free(A); ork_npu_free(c); free(B);free(C); return 0;   /* dma A freed by ork_npu_free */
 }

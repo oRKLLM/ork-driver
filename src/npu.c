@@ -1900,9 +1900,11 @@ static double ork_now_us(void);   /* fwd (defined below) */
  * (host accumulate). Pins why large-M multi-core barely scales. Read via ork_npu_mc_timing. */
 #define MCPROF_MAX 8
 static double g_mc_copy[MCPROF_MAX], g_mc_sub[MCPROF_MAX], g_mc_acc[MCPROF_MAX]; static long g_mc_n[MCPROF_MAX];
-void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub[i]=g_mc_acc[i]=0;g_mc_n[i]=0;} }
+static double g_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of g_mc_sub (the OVERLAPPABLE part; ioctl/NPU = sub-synth) */
+void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub[i]=g_mc_acc[i]=g_mc_synth[i]=0;g_mc_n[i]=0;} }
 void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
+double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?g_mc_synth[core]:0; }
 
 struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; int chain_pref; int chain_ksplit; };
 
@@ -2045,7 +2047,7 @@ static void *mcworker(void *vp){
                 uint32_t rc[REGCMD_I8_N];
                 struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
                 int bad=0;
-                for(int ns=0;ns<w->Sn && !bad;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
+                for(int ns=0;ns<w->Sn && !bad;ns++){ double _tsy0=ork_now_us(); int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
                     int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
                     int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
                     int n0=ns*NMAX;
@@ -2090,6 +2092,7 @@ static void *mcworker(void *vp){
                       l[216]=l[217]=l[218]=l[219]=0; }
                     bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
                     bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                    g_mc_synth[i]+=ork_now_us()-_tsy0;   /* host synth+bsync (overlappable); ioctl/NPU = g_mc_sub - this */
                     int reps=c->mwarm[i]?1:2;
                     for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
                         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
