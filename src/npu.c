@@ -784,6 +784,26 @@ size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
         off+=tsz; }}
     return off;
 }
+/* NPU-availability gate for the hybrid pack scheduler: return 1 if the NPU appears IN USE (any core
+ * loaded above a small threshold), 0 if idle. Reads the kernel's rolling per-core load counter. A
+ * hybrid conversion routes a weight to the NPU tile/pack path ONLY when this is 0, so a background
+ * .orkpack build never steals cycles from live inference on another process — the CPU path (tile from
+ * pagecache into DRAM, zero-copy import) handles everything while the NPU serves. Best-effort: on any
+ * read failure it returns 0 (assume idle) so the caller keeps the NPU option. Cheap enough to poll per
+ * weight. Threshold >5% treats warm-up/idle noise as free but any real submit stream as busy. */
+int ork_npu_busy(ork_npu *ctx){
+    (void)ctx;
+    FILE *f=fopen("/sys/kernel/debug/rknpu/load","r");
+    if(!f) return 0;
+    char buf[256]; size_t n=fread(buf,1,sizeof buf-1,f); fclose(f);
+    if(!n) return 0; buf[n]=0;
+    /* format: "NPU load:  Core0:  0%, Core1:  0%, Core2:  0%," — busy if any core % exceeds threshold */
+    for(const char *p=buf; (p=strchr(p,'%')); p++){
+        const char *q=p; while(q>buf && (q[-1]==' ' || (q[-1]>='0'&&q[-1]<='9'))) q--;
+        if(atoi(q)>5) return 1;
+    }
+    return 0;
+}
 /* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
  * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
  * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack

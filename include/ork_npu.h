@@ -61,6 +61,17 @@ uint32_t     ork_pack_format_version(void);
 void         ork_unpin_current_thread(void);
 
 /**
+ * @brief NPU-availability gate: 1 if the NPU appears in use (any core loaded), 0 if idle.
+ *
+ * For a hybrid pack scheduler that routes each weight's tiling to the NPU (its pack path) only when
+ * the device is idle, and to the CPU (tile from pagecache into DRAM, then zero-copy import) otherwise —
+ * so a background .orkpack conversion never steals cycles from live inference in another process.
+ * Reads the kernel's rolling per-core load counter; best-effort (returns 0 if unreadable). Cheap to
+ * poll per weight.
+ */
+int          ork_npu_busy(ork_npu *ctx);
+
+/**
  * @brief Open the NPU, detect the SoC from the device tree, and power it on.
  * @return Device context (one per process), or NULL on failure — no NPU present, or no permission to
  *         open /dev/dri/cardN (the process needs access to the DRM render node).
