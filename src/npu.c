@@ -764,6 +764,26 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
         off+=b->size; }
     return off;
 }
+/* CPU-ONLY int8 dump: produce the SAME bytes as ork_mm_pack_i8() + ork_w_dump(), but tile straight
+ * into a caller DRAM buffer — no NPU. There is NO reason to allocate an IOMMU/IOVA DMA buffer, tile
+ * into it, cache-flush it TO the device, and read it back just to write a .orkpack file: that whole
+ * bcreate+bsync round-trip is the serial single-stream consumer that bottlenecks conversion. Here the
+ * tiling (same tile_i8_range, page-padded per tile, same Sk×Sn order as ork_w_dump) runs pure-CPU and
+ * parallel across all cores; the NPU is touched only at LOAD time (ork_mm_load_i8_import). Pass out=NULL
+ * to size. K%32, N%32. Byte-identical to the pack+dump path (fresh DMA bufs are zeroed; we zero-pad). */
+size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    if(!c || !B || (K%32) || (N%32)) return 0;
+    int KS=int8_ks(c), NMAX=c->soc->nmax;
+    int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=pgup((size_t)Kp*Nc);
+        if(out){ if(off+tsz>cap) return 0;
+            int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
+            struct tile_i8_arg ta={bb,B,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta); }
+        off+=tsz; }}
+    return off;
+}
 /* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
  * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
  * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack

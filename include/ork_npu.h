@@ -209,6 +209,11 @@ const float *ork_w_bscale(const ork_w *w);
 /* PERSIST: dump a packed weight's tile bytes (out=NULL → size), and reload pre-tiled int8 bytes straight
  * into DMA (no dequant/quant/tile) — the .orkpack fast path that makes streaming re-packs a plain copy. */
 size_t       ork_w_dump(const ork_w *w, void *out, size_t cap);
+/* CPU-ONLY int8 dump: tile B[K,N] (int8, row-major) straight into `out` (plain DRAM) in the exact
+ * .orkpack byte layout of ork_mm_pack_i8()+ork_w_dump(), WITHOUT allocating an NPU/IOVA buffer or any
+ * DMA — the NPU is needed only at load time. Building a .orkpack is a pure-CPU, all-cores job; this
+ * avoids the serial bcreate/bsync round-trip. out=NULL → return the byte size. K%32, N%32. */
+size_t       ork_w_dump_i8_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
 ork_w       *ork_mm_load_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* COMPACT int4 PERSIST (the streaming consumer for a mixed .orkpack): dump the COMPACT int4 nibble store
  * + per-channel scales (~half of the int8 ork_w_dump), and reload it straight into NPU DMA, inflating the
