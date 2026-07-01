@@ -13,7 +13,8 @@
  */
 #ifndef ORK_NPU_H
 #define ORK_NPU_H
-#include <stdint.h>
+#include <stdint.h>   /* int8_t, int32_t, ... */
+#include <stddef.h>   /* size_t — used by the DMA / dump / load / stream-pool APIs below */
 
 typedef _Float16 ork_f16;
 typedef struct ork_npu ork_npu;     /* device context (one per process) */
