@@ -32,6 +32,25 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 const char  *ork_npu_version(void);
 
 /**
+ * @brief On-disk pack-format (.orkpack) compatibility token — the library's MAJOR version.
+ *
+ * A persisted weight (ork_w_dump / ork_w_dump_i4a8) is only binary-compatible with builds that share
+ * this value. It is deliberately the MAJOR component of ORK_NPU_VERSION, because a change that alters
+ * the persisted bytes' meaning is by definition NOT backward-compatible and therefore REQUIRES a major
+ * bump — while MINOR/PATCH releases are backward-compatible and keep existing .orkpacks valid. What
+ * mandates a major bump: a resident tile LAYOUT / geometry change (K-slice size, the SoC output-width
+ * cap / N-tiling, the 32x32 block or Bb dump order) or a weight QUANT change (int8/int4 scale rule,
+ * int4 nibble packing, NF4 codebook).
+ *
+ * ork-driver stamps this into the int4 blob header and rejects a mismatch on load (ork_mm_load_i4a8
+ * returns NULL). The int8 dump (ork_w_dump) is a headerless raw-tile stream — same-(K,N) blobs from an
+ * incompatible major have the SAME size, so ork-driver cannot self-detect there; the caller's on-disk
+ * container (e.g. oRKLLM's .orkpack file) MUST record ork_pack_format_version() next to the bytes and
+ * regenerate the cache at startup when it differs from this build's value.
+ */
+uint32_t     ork_pack_format_version(void);
+
+/**
  * @brief Open the NPU, detect the SoC from the device tree, and power it on.
  * @return Device context (one per process), or NULL on failure — no NPU present, or no permission to
  *         open /dev/dri/cardN (the process needs access to the DRM render node).

@@ -1244,7 +1244,7 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
  * nibbles -> int8 and re-tiles on load (the tail of the pack path, but from stored nibbles, not f32). The
  * blob is self-contained: the NF4 LUT is NOT stored (it's derived from quant_kind). */
 #define ORK_I4A8_MAGIC  0x4F344E31u           /* 'O','4','N','1' */
-#define ORK_I4A8_VER    1u
+#define ORK_I4A8_VER    ork_pack_format_version()  /* int4 blob compat = library MAJOR (see ork_npu.h) */
 struct ork_i4a8_hdr { uint32_t magic, version; int32_t K, N; uint32_t quant_kind; };
 /* Serialize the compact int4 form: header + bscale[N] (f32) + Bi4 (K*N/2 bytes). out=NULL -> required
  * size. Returns 0 if `w` is not an int4-packed weight (no Bi4/bscale) or on cap overflow. */
@@ -3639,6 +3639,10 @@ const char *ork_npu_version(void){
     return ORK_NPU_VERSION;   /* no git at build time (e.g. native board build) → semver only */
 #endif
 }
+
+/* .orkpack compat token = library MAJOR version (atoi stops at the first '.'): a format-breaking change
+ * requires a major bump, while minor/patch stay backward-compatible. See ork_npu.h. */
+uint32_t ork_pack_format_version(void){ return (uint32_t)atoi(ORK_NPU_VERSION); }
 
 /* Max M rows a single full-K int8 submit handles at this K (mirrors run()'s M>1 Bf tiling, npu.c
  * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
