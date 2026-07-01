@@ -642,15 +642,37 @@ int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
  * core (big+little), no knob. Spawn-per-region: the tiled memcpy dwarfs the pthread spawn cost. */
 struct ork_pf_arg { void (*fn)(int,int,void*); void *ctx; int lo, hi; };
 static void *ork_pf_thunk(void *a){ struct ork_pf_arg *p=a; p->fn(p->lo,p->hi,p->ctx); return NULL; }
+/* All online CPUs (big+little) as an affinity mask. The pack pool runs UN-pinned across every
+ * core: the calling thread may be pinned to the big cluster (an inference worker often is), but
+ * the one-time pack is a CPU-bound batch job with no live inference to protect, so it should use
+ * the whole machine. Setting the full mask on the spawned threads overrides the inherited pin.
+ * Returns the online-core count, or 0 if it couldn't be determined. */
+static int ork_all_cores_mask(cpu_set_t *s){
+    long n=sysconf(_SC_NPROCESSORS_ONLN); if(n<1) return 0;
+    CPU_ZERO(s); for(long i=0;i<n && i<CPU_SETSIZE;i++) CPU_SET((int)i,s);
+    return (int)n;
+}
+/* Un-pin the calling thread: allow it to run on ALL online cores. For CPU-bound pack/quant
+ * worker threads spawned by a caller (e.g. an inference worker) that is pinned to the big
+ * cluster — the one-time pack has no live inference to protect, so it should use every core.
+ * Public so the ggml-ork dequant/quant workers (std::thread, no attr) can un-pin themselves. */
+void ork_unpin_current_thread(void){
+    cpu_set_t all; if(ork_all_cores_mask(&all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
+}
 static void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
-    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;
+    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;   /* pool size = detected online cores */
     if(nthr>n) nthr=n; if(nthr<1) nthr=1; if(nthr>64) nthr=64;
     if(nthr<=1){ fn(0,n,ctx); return; }
+    /* Un-pin the pool: spread across ALL cores regardless of the caller's affinity. */
+    cpu_set_t all; int have_all = ork_all_cores_mask(&all);
+    pthread_attr_t at; int have_at = (pthread_attr_init(&at)==0);
+    if(have_at && have_all) pthread_attr_setaffinity_np(&at, sizeof all, &all);
     pthread_t th[64]; struct ork_pf_arg pf[64];
     int chunk=(n+nthr-1)/nthr, t=0;
     for(int a=0;a<n && t<nthr;a+=chunk){ pf[t]=(struct ork_pf_arg){fn,ctx,a,(a+chunk<n)?a+chunk:n};
-        if(pthread_create(&th[t],NULL,ork_pf_thunk,&pf[t])!=0) fn(pf[t].lo,pf[t].hi,ctx); else t++; }
+        if(pthread_create(&th[t], have_at?&at:NULL, ork_pf_thunk,&pf[t])!=0) fn(pf[t].lo,pf[t].hi,ctx); else t++; }
     for(int i=0;i<t;i++) pthread_join(th[i],NULL);
+    if(have_at) pthread_attr_destroy(&at);
 }
 /* Tile a contiguous [nt] range of int8 weight columns into the NPU 32x32 block layout. Shared by the Bb
  * K-slice tiles and the full-K Bf rebuild (same structure; differ only in KT and the k0 offset). Each nt

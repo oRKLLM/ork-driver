@@ -51,6 +51,16 @@ const char  *ork_npu_version(void);
 uint32_t     ork_pack_format_version(void);
 
 /**
+ * Un-pin the calling thread so it may run on ALL online CPU cores, overriding any inherited
+ * affinity (e.g. a host that pinned its process/threads to the big cluster). Intended for the
+ * CPU-bound weight dequant/quant/pack worker threads a caller spawns during a one-time pack:
+ * there is no live inference to protect, so the pack should saturate every core. ork-driver's
+ * own pack pool (ork_parallel_for) already does this; call this from external worker threads
+ * (e.g. ggml-ork's std::thread dequant/quant loop) that ork-driver doesn't create.
+ */
+void         ork_unpin_current_thread(void);
+
+/**
  * @brief Open the NPU, detect the SoC from the device tree, and power it on.
  * @return Device context (one per process), or NULL on failure — no NPU present, or no permission to
  *         open /dev/dri/cardN (the process needs access to the DRM render node).
