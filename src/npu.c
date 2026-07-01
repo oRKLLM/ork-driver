@@ -637,6 +637,31 @@ int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
+/* Parallel-for over [0,n): split across ALL online cores (dynamic core count from the OS). For the
+ * CPU-bound weight tiling during pack — a batch job with no live inference to protect, so it uses every
+ * core (big+little), no knob. Spawn-per-region: the tiled memcpy dwarfs the pthread spawn cost. */
+struct ork_pf_arg { void (*fn)(int,int,void*); void *ctx; int lo, hi; };
+static void *ork_pf_thunk(void *a){ struct ork_pf_arg *p=a; p->fn(p->lo,p->hi,p->ctx); return NULL; }
+static void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
+    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;
+    if(nthr>n) nthr=n; if(nthr<1) nthr=1; if(nthr>64) nthr=64;
+    if(nthr<=1){ fn(0,n,ctx); return; }
+    pthread_t th[64]; struct ork_pf_arg pf[64];
+    int chunk=(n+nthr-1)/nthr, t=0;
+    for(int a=0;a<n && t<nthr;a+=chunk){ pf[t]=(struct ork_pf_arg){fn,ctx,a,(a+chunk<n)?a+chunk:n};
+        if(pthread_create(&th[t],NULL,ork_pf_thunk,&pf[t])!=0) fn(pf[t].lo,pf[t].hi,ctx); else t++; }
+    for(int i=0;i<t;i++) pthread_join(th[i],NULL);
+}
+/* Tile a contiguous [nt] range of int8 weight columns into the NPU 32x32 block layout. Shared by the Bb
+ * K-slice tiles and the full-K Bf rebuild (same structure; differ only in KT and the k0 offset). Each nt
+ * range is disjoint in bb, so this is bit-identical to the serial loop. */
+struct tile_i8_arg { int8_t *bb; const int8_t *Bi; int KT, k0, n0, N; };
+static void tile_i8_range(int lo,int hi,void *a){
+    struct tile_i8_arg *t=a;
+    for(int nt=lo;nt<hi;nt++)for(int kt=0;kt<t->KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        t->bb[(size_t)nt*t->KT*1024+(size_t)kt*1024+(size_t)nl*32+kk]=
+            t->Bi[(size_t)(t->k0+kt*32+kk)*t->N+(t->n0+nt*32+nl)];
+}
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
     int KS=dt ? int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
@@ -686,8 +711,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
                 bb[nt*KT*16*32+kt*16*32+nl*32+kk]=Bf[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
         } else { int8_t*bb=b->cpu; const int8_t*Bi=B;
-            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
-                bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
+            struct tile_i8_arg ta={bb,Bi,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core tiling
         }
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     /* AUTO full-K decode layout (int8, K<=10752): lets the multi-core decode do
@@ -699,8 +723,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
             struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
             int8_t*bb=b->cpu; const int8_t*Bi=B;
-            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
-                bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=Bi[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
+            struct tile_i8_arg ta={bb,Bi,KTf,0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core full-K rebuild
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
@@ -1508,11 +1531,38 @@ void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src){
                 for(int kt=0;kt<KTf;kt++) memcpy(bb+((size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32),sp+kt*32,32); }
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
 }
+/* FILL from raw untiled int8 B[K][N] (row-major, K-major — as ggml-ork's per-channel quant produces):
+ * tile directly into this slot's BARE dma-bufs (RAM-backed, NO IOVA / NO bcreate). The int8 counterpart
+ * of ork_stage_fill (which inflates int4 first). Lets a caller add a freshly-quantized weight to the
+ * stream pool WITHOUT the transient IOVA pack that would compete with the pool's mapped hot set. Tiling
+ * is parallelized across all cores (ork_parallel_for + tile_i8_range) — same layout as pack()/load_i8. */
+void ork_stage_fill_i8(ork_npu *c, struct ork_stage *s, const int8_t *B){
+    if(!s || !B) return;
+    int K=s->K, N=s->N, KS=1024, NMAX=c->soc->nmax, Sk=s->Sk, Sn=s->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&s->Bb[(size_t)ns*Sk+ks];
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+        struct tile_i8_arg ta={(int8_t*)b->cpu,B,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);
+        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    if(s->Bf){ int KTf=K/32;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+            struct buf*b=&s->Bf[ns];
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            struct tile_i8_arg ta={(int8_t*)b->cpu,B,KTf,0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+}
 /* MAP: IOMMU-map every bare dma-buf in the slot and point the slot's ork_w view at them. 0 ok / -1. */
 int ork_stage_map(ork_npu *c, struct ork_stage *s){
     if(!s || s->mapped) return s?0:-1;
-    for(int i=0;i<s->Sk*s->Sn;i++) if(bstage_map(c->fd,&s->Bb[i])) return -1;
-    if(s->Bf) for(int ns=0;ns<s->Sn;ns++) if(bstage_map(c->fd,&s->Bf[ns])) return -1;
+    int ok=1;
+    for(int i=0;i<s->Sk*s->Sn && ok;i++) if(bstage_map(c->fd,&s->Bb[i])) ok=0;
+    if(ok && s->Bf) for(int ns=0;ns<s->Sn && ok;ns++) if(bstage_map(c->fd,&s->Bf[ns])) ok=0;
+    if(!ok){   /* IOVA full mid-map — roll back the partial maps so a retry (after eviction) starts clean */
+        for(int i=0;i<s->Sk*s->Sn;i++) bstage_unmap(c->fd,&s->Bb[i]);
+        if(s->Bf) for(int ns=0;ns<s->Sn;ns++) bstage_unmap(c->fd,&s->Bf[ns]);
+        return -1;
+    }
     memset(&s->view,0,sizeof s->view);
     s->view.K=s->K; s->view.N=s->N; s->view.Sk=s->Sk; s->view.Sn=s->Sn; s->view.dtype=DT_I8; s->view.owns=0;
     s->view.Bb=s->Bb; s->view.Bf=s->Bf;
@@ -1552,8 +1602,8 @@ static size_t stage_bb_bytes(struct ork_stage*s){ size_t t=0; for(int i=0;i<s->S
  * small pool the caller fills ahead on a thread — no separate API. Each entry is backed by an ork_stage
  * (bare RAM-resident dma-buf, filled once, persists across unmap; map = bare MEM_CREATE import).
  * ============================================================================================ */
-struct ork_stream_entry { struct ork_stage *stg; int K, N; int mapped; };
-struct ork_stream_pool  { ork_npu *c; struct ork_stream_entry **e; int n, cap; };
+struct ork_stream_entry { struct ork_stage *stg; int K, N; int mapped; uint64_t last_use; };
+struct ork_stream_pool  { ork_npu *c; struct ork_stream_entry **e; int n, cap; uint64_t clock; };
 
 struct ork_stream_pool *ork_stream_pool_create(ork_npu *c){
     if(!c || dmaheap_open()<0) return NULL;          /* import path unavailable -> caller falls back */
@@ -1611,14 +1661,45 @@ struct ork_stream_entry *ork_stream_pool_add_i8(struct ork_stream_pool *p, int K
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
     return e;
 }
+/* int8-RAW: tile a freshly-quantized UNTILED int8 B[K][N] straight into RAM staging (NO IOVA / NO
+ * bcreate) — the zero-transient-pack add. The caller already quantized the weight; we tile it directly
+ * into the pool instead of packing to IOVA first (which would compete with the pool's mapped hot set).
+ * Map it later with ork_stream_pool_map. NULL on bad dims / import-unavailable. */
+struct ork_stream_entry *ork_stream_pool_add_i8_raw(struct ork_stream_pool *p, int K, int N, const int8_t *B){
+    if(!p || !B || K%32 || N%32) return NULL;
+    struct ork_stream_entry *e=pool_new_entry(p,K,N); if(!e) return NULL;
+    ork_stage_fill_i8(p->c,e->stg,B);
+    return e;
+}
 /* CHEAP map: bare MEM_CREATE import of the already-filled RAM buffer -> IOVA. The per-submit op on a hit.
  * 0 ok / -1. Idempotent (already-mapped = 0). */
 int  ork_stream_pool_map  (struct ork_stream_pool *p, struct ork_stream_entry *e){
     if(!p||!e) return -1; if(e->mapped) return 0;
     if(ork_stage_map(p->c,e->stg)) return -1; e->mapped=1; return 0;
 }
+/* Unmap the least-recently-used MAPPED entry other than `keep` (frees IOVA, keeps it RAM-resident so the
+ * next touch is a cheap remap). Returns 1 if one was unmapped, 0 if none left to evict. */
+static int pool_unmap_lru(struct ork_stream_pool *p, struct ork_stream_entry *keep){
+    struct ork_stream_entry *lru=NULL;
+    for(int i=0;i<p->n;i++){ struct ork_stream_entry *e=p->e[i];
+        if(e->mapped && e!=keep && (!lru || e->last_use<lru->last_use)) lru=e; }
+    if(!lru) return 0;
+    ork_stage_unmap(p->c,lru->stg); lru->mapped=0; return 1;
+}
+/* RUN a pooled weight, SELF-MANAGING the IOVA sliding window: if the entry isn't currently mapped, map
+ * it — and if that fails because the 4 GiB IOVA window is full, evict (unmap) the LRU mapped entry and
+ * retry until it fits (self-calibrating; no budget guess). The LRU MECHANISM lives here in ork-driver;
+ * the caller only sets the RAM budget (how many entries are held resident). 0 ok / -1 (OOM / bad args). */
 int  ork_stream_pool_run  (struct ork_stream_pool *p, struct ork_stream_entry *e, int M, const int8_t *A, int32_t *C){
-    if(!p||!e||!e->mapped) return -1; return ork_stage_run(p->c,e->stg,M,A,C);
+    if(!p||!e) return -1;
+    if(!e->mapped){
+        while(ork_stage_map(p->c,e->stg)!=0){          /* IOVA full → evict LRU mapped entry, retry */
+            if(!pool_unmap_lru(p,e)) return -1;         /* nothing left to evict → genuine OOM */
+        }
+        e->mapped=1;
+    }
+    e->last_use=++p->clock;
+    return ork_stage_run(p->c,e->stg,M,A,C);
 }
 /* UNMAP: MEM_DESTROY the IOVA mapping; entry STAYS filled in RAM (next map is cheap, no re-inflate). */
 void ork_stream_pool_unmap(struct ork_stream_pool *p, struct ork_stream_entry *e){

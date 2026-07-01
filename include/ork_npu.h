@@ -230,6 +230,10 @@ typedef struct ork_stream_entry ork_stream_entry;
 ork_stream_pool  *ork_stream_pool_create(ork_npu *ctx);                 /* NULL if import unavailable */
 ork_stream_entry *ork_stream_pool_add_i4a8(ork_stream_pool *p, int K, int N, const void *blob, size_t n); /* int4 store; fill=inflate (once) */
 ork_stream_entry *ork_stream_pool_add_i8  (ork_stream_pool *p, int K, int N, const void *blob, size_t n); /* int8 store; fill=copy (once) */
+/* int8 store from a freshly-quantized UNTILED int8 B[K][N] (row-major): tile straight into RAM staging,
+ * NO transient IOVA pack (no bcreate). For a caller that just quantized a weight and wants it in the pool
+ * without packing to IOVA first (which competes with the pool's mapped hot set). NULL on bad dims. */
+ork_stream_entry *ork_stream_pool_add_i8_raw(ork_stream_pool *p, int K, int N, const int8_t *B);
 int               ork_stream_pool_map  (ork_stream_pool *p, ork_stream_entry *e);  /* CHEAP: MEM_CREATE import -> IOVA (per submit) */
 int               ork_stream_pool_run  (ork_stream_pool *p, ork_stream_entry *e, int M, const int8_t *A, int32_t *C);
 void              ork_stream_pool_unmap(ork_stream_pool *p, ork_stream_entry *e);  /* MEM_DESTROY; entry STAYS in RAM */
