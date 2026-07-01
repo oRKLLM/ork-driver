@@ -20,24 +20,40 @@ typedef _Float16 ork_f16;
 typedef struct ork_npu ork_npu;     /* device context (one per process) */
 typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 
-/* Library version (semver). The build may also inject a short git hash via -DORK_GIT_HASH (the
- * Makefile does this when built where git is available); ork_npu_version() then returns
- * "MAJOR.MINOR.PATCH+g<hash>", else just the semver. Bump MINOR on backward-compatible API adds. */
+/**
+ * @brief Library version, semver (e.g. "0.6.20"). Bump MINOR on backward-compatible API adds.
+ *
+ * Compile-time string; ork_npu_version() returns the same value at runtime, optionally suffixed with
+ * a short git hash ("MAJOR.MINOR.PATCH+g<hash>") when built with -DORK_GIT_HASH (the Makefile injects
+ * it where git is available).
+ */
 #define ORK_NPU_VERSION "0.6.20"
-const char  *ork_npu_version(void);  /* e.g. "0.3.0" or "0.3.0+g1a2b3c4" */
+/** @brief Runtime library version. @return "MAJOR.MINOR.PATCH" or "MAJOR.MINOR.PATCH+g<hash>". */
+const char  *ork_npu_version(void);
 
-/* Open the NPU, detect the SoC, power on. Returns NULL on failure (no NPU / no perms). */
+/**
+ * @brief Open the NPU, detect the SoC from the device tree, and power it on.
+ * @return Device context (one per process), or NULL on failure — no NPU present, or no permission to
+ *         open /dev/dri/cardN (the process needs access to the DRM render node).
+ */
 ork_npu     *ork_npu_init(void);
+/** @brief Power off the NPU and free a context obtained from ork_npu_init(). */
 void         ork_npu_free(ork_npu *ctx);
 
 /* SoC introspection */
-const char  *ork_npu_soc(const ork_npu *ctx);    /* "rk3588", "rk3576", ... */
-int          ork_npu_cores(const ork_npu *ctx);  /* NPU core count */
-int          ork_npu_validated(const ork_npu *ctx); /* 1 if this SoC's params are HW-validated */
+/** @brief SoC name detected from the device tree, e.g. "rk3588", "rk3576". */
+const char  *ork_npu_soc(const ork_npu *ctx);
+/** @brief Number of NPU cores on this SoC (RK3588 = 3). */
+int          ork_npu_cores(const ork_npu *ctx);
+/** @brief 1 if this SoC's parameters are hardware-validated; 0 if inherited/untested (init warns). */
+int          ork_npu_validated(const ork_npu *ctx);
 
-/* Policy: cap how many NPU cores the auto-tuner may use per matmul (n<=0 → all SoC cores, the
- * default). Multi-core + the full-K int8 decode layout are chosen automatically per matmul; this
- * just bounds them (e.g. reserve cores for another workload). */
+/**
+ * @brief Cap how many NPU cores the auto-tuner may use per matmul (policy hint).
+ * @param n Max cores; n<=0 means all SoC cores (the default). Multi-core and the full-K int8 decode
+ *          layout are still chosen automatically per matmul — this only bounds them (e.g. to reserve
+ *          a core for another workload).
+ */
 void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 
 /* Per-weight NPU IOMMU domain placement. The rk_iommu 32-bit IOVA window (~4 GiB) is per
@@ -49,11 +65,17 @@ void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
 int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
 
-/* Zero-copy DMA buffers (NPU-coherent, CPU-mapped). Allocate the activation A and/or output C here
- * and the matmul reads/writes them in place — no host gather/writeout memcpy (the ~33% prefill
- * residual vs the closed runtime). ork_mm_run detects residency automatically; pass the returned
- * pointer as A/C exactly as a malloc'd one. NULL on failure or table-full (fall back to malloc). */
+/**
+ * @brief Allocate an NPU-coherent, CPU-mapped buffer for zero-copy activations/outputs.
+ *
+ * Put the activation A and/or output C here and the matmul reads/writes them in place — no host
+ * gather/writeout memcpy (the ~33% prefill residual vs the closed runtime). ork_mm_run* detects
+ * residency automatically: pass the returned pointer as A/C exactly like a malloc'd one.
+ * @param size Bytes to allocate.
+ * @return CPU-visible pointer, or NULL on failure / zero-copy table full (fall back to malloc).
+ */
 void        *ork_dma_alloc(ork_npu *ctx, size_t size);
+/** @brief Free a buffer returned by ork_dma_alloc(). */
 void         ork_dma_free (ork_npu *ctx, void *ptr);
 
 /* Zero-copy IMPORT: allocate a dma-buf (from /dev/dma_heap/system), mmap it, and IOMMU-map the
@@ -74,10 +96,22 @@ void         ork_dma_import_free(ork_npu *ctx, void *ptr);
  * read-only across every submit. ork_mm_free / ork_w_free release the imports (MEM_DESTROY + close fd). */
 ork_w       *ork_mm_load_i8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
-/* Pack + upload B[K,N] (row-major) into NPU-resident tile layout; reuse across runs.
- * fp16: K%32==0, N%16==0.  int8: K%32==0, N%32==0.  Returns NULL on bad dims. */
-ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);  /* fp16 weights */
-ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);  /* int8/w8a8 weights */
+/**
+ * @brief Pack + upload B[K,N] (row-major) into the NPU-resident tile layout; reuse across runs (fp16).
+ * @param K Inner/contraction dim. Must be K%32==0.
+ * @param N Output columns. Must be N%16==0.
+ * @param B Row-major fp16 weights, K*N elements.
+ * @return Resident weight handle for ork_mm_run(), or NULL on bad dims (K%32!=0 or N%16!=0).
+ */
+ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);
+/**
+ * @brief Pack + upload B[K,N] (row-major) into the NPU-resident tile layout; reuse across runs (int8/w8a8).
+ * @param K Inner/contraction dim. Must be K%32==0.
+ * @param N Output columns. Must be N%32==0.
+ * @param B Row-major int8 weights, K*N elements.
+ * @return Resident weight handle for ork_mm_run_i8(), or NULL on bad dims (K%32!=0 or N%32!=0).
+ */
+ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);
 /* re-tile int8 B into an existing same-shape ork_w (reuses its DMA; no alloc/free) — for pooling
  * reused weights (MoE experts) without churning/fragmenting the NPU IOMMU. 0 ok / -1 / -2 mismatch. */
 int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t *B);
@@ -128,10 +162,15 @@ ork_w       *ork_mm_pack_i4_grouped(ork_npu *ctx, int K, int N, const int8_t *B,
  * Returns an int8 dtype ork_w (run with ork_mm_run_i8). */
 ork_w       *ork_mm_pack_i4_to_i8(ork_npu *ctx, int K, int N, const int8_t *B);
 
+/** @brief Free a packed weight's bookkeeping. Does NOT reclaim the NPU IOVA window — see ork_mm_free(). */
 void         ork_w_free(ork_w *w);
-/* Free a packed weight AND reclaim its NPU DMA/IOVA (for layer-streaming eviction; needs the ctx for
- * the device fd). Reclaims only per-tile-owned weights (pack/pack_i4/pack_i8); arena-view weights are
- * left to teardown. Use this instead of ork_w_free when you need the 4 GiB IOVA window back. */
+/**
+ * @brief Free a packed weight AND reclaim its NPU DMA/IOVA window (needs ctx for the device fd).
+ *
+ * Use this instead of ork_w_free() when you need the ~4 GiB IOVA window back (e.g. layer-streaming
+ * eviction). Reclaims only per-tile-owned weights (pack/pack_i8/pack_i4); arena-view weights are left
+ * to teardown.
+ */
 void         ork_mm_free(ork_npu *ctx, ork_w *w);
 size_t       ork_w_bytes(const ork_w *w);   /* resident NPU bytes (Bb+Bf) — for a streaming cache's IOVA budget */
 int          ork_w_quant_kind(const ork_w *w);   /* ORK_QK_* of the int4 weight store (UNIFORM / CODEBOOK_NF4) */
@@ -180,12 +219,27 @@ void              ork_stream_pool_free (ork_stream_pool *p);
 size_t            ork_stream_entry_bytes (const ork_stream_entry *e);   /* RAM bytes held (for the caller's budget) */
 int               ork_stream_entry_mapped(const ork_stream_entry *e);   /* 1 if currently IOVA-mapped */
 
-/* C[M,N] = A[M,K] x packed weights. Run dtype must match the pack dtype. Returns 0 on ok.
- *   fp16: A fp16 (row-major), C fp32.   int8: A int8 (row-major), C int32.
- *   int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 (raw sum; apply scales:
- *                C_real[m][n] = aScale[m]*bScale[n]*C[m][n]). */
+/**
+ * @brief Run C[M,N] = A[M,K] x packed weights (fp16). Run dtype must match the pack dtype.
+ * @param w Weight from ork_mm_pack().
+ * @param M Activation rows; any M>=1 (tiled + scheduled internally, no caller-visible cap).
+ * @param A Row-major fp16 activations, M*K elements.
+ * @param C Output, M*N fp32, row-major (caller-allocated). May be an ork_dma_alloc() buffer (zero-copy).
+ * @return 0 on success, negative on error (bad args / submit failure).
+ */
 int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float   *C);
+/**
+ * @brief Run C[M,N] = A[M,K] x packed weights (int8/w8a8). Run dtype must match the pack dtype.
+ * @param w Weight from ork_mm_pack_i8().
+ * @param M Activation rows; any M>=1 (tiled + scheduled internally, no caller-visible cap).
+ * @param A Row-major int8 activations, M*K elements.
+ * @param C Output, M*N int32 raw sums, row-major (caller-allocated). Apply the per-tensor/-channel
+ *          scales in the caller. May be an ork_dma_alloc() buffer (zero-copy).
+ * @return 0 on success, negative on error (bad args / submit failure).
+ */
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+/* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
+ * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
 /* grouped int4 (per-group W4A4 dequant): A int4 [M*K] ([-8,7] in int8); aScale [M*(K/G)] (per row,
  * per group), bScale [(K/G)*N] (per group, per channel). C fp32 [M*N] = dequantized result. Pair
