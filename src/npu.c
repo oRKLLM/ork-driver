@@ -32,6 +32,13 @@
 #endif
 typedef ork_f16 f16;
 enum { DT_F16=0, DT_I8=1, DT_I4=2 };
+/* last_dt SCHEDULE markers that all run int8 regcmd PROGRAMS on the NPU: single-core (DT_I8=1) and the
+ * chain/stream path (3, "DT_I8_CHAIN"). Switching AMONG these is not a hardware MODE change, so it needs
+ * no RKNPU_ACT_RESET — the reset is only for ENTERING int8 from fp16/int4/cold (the first-int8-submit
+ * wedge). Decoupling the reset from the marker lets decode interleave run_i8 singletons with run_stream
+ * (QKV/gate-up) groups without a ~107ms NPU soft-reset at every matmul boundary. The cold 2-pass warmup
+ * (fresh-output-buffer priming) is kept independently — see the reset sites. */
+#define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -689,20 +696,23 @@ static void *ork_pool_worker(void *a){
 }
 static void ork_pool_init(void){
     if(g_pool.inited) return;
-    int n=(int)sysconf(_SC_NPROCESSORS_ONLN); if(n<1)n=1; if(n>ORK_POOL_MAX)n=ORK_POOL_MAX;
+    int cores=(int)sysconf(_SC_NPROCESSORS_ONLN); if(cores<1)cores=1;
+    /* ORK_POOL_MULT oversubscribes the cores (e.g. =2 → 2 threads/core) to hide memory-latency stalls
+     * in the tiling/dequant (bandwidth is not saturated, so extra threads can fill the stall bubbles). */
+    int mult = getenv("ORK_POOL_MULT") ? atoi(getenv("ORK_POOL_MULT")) : 1; if(mult<1)mult=1; if(mult>8)mult=8;
+    int n = cores*mult; if(n>ORK_POOL_MAX)n=ORK_POOL_MAX;
     g_pool.n = n; g_pool.inited = 1;
     for(int i=1;i<n;i++)   /* worker 0 == the caller; helpers 1..n-1 */
         if(pthread_create(&g_pool.th[i], NULL, ork_pool_worker, (void*)(intptr_t)i)!=0){ g_pool.n = i; break; }
 }
 static void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
     if(n<=0) return;
-    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;
-    if(nthr>n) nthr=n; if(nthr<1) nthr=1; if(nthr>ORK_POOL_MAX) nthr=ORK_POOL_MAX;
-    if(nthr<=1){ fn(0,n,ctx); return; }
+    if(n==1){ fn(0,1,ctx); return; }
     static pthread_mutex_t dispatch = PTHREAD_MUTEX_INITIALIZER;   /* pool is a shared singleton — one job at a time */
     pthread_mutex_lock(&dispatch);
     ork_pool_init();
-    if(nthr > g_pool.n) nthr = g_pool.n;
+    int nthr = g_pool.n; if(nthr>n) nthr=n; if(nthr<1) nthr=1;   /* use the whole pool (incl. oversubscription) */
+    if(nthr<=1){ pthread_mutex_unlock(&dispatch); fn(0,n,ctx); return; }
     int chunk = (n + nthr - 1) / nthr;
     pthread_mutex_lock(&g_pool.mu);
     g_pool.fn = fn; g_pool.ctx = ctx;
@@ -2705,7 +2715,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
-    if(dt!=c->last_dt){ if(dt==DT_I8) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=dt; }
+    if(dt!=c->last_dt){ if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=dt; }
     if(mc_ensure(c,nc)) return -1;
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
@@ -3208,7 +3218,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
-    if(dt!=c->last_dt){ if(dt==DT_I8) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=dt; }
+    if(dt!=c->last_dt){ if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=dt; }
     size_t need=(size_t)M*N*4;                         /* output is fp32 or int32 (both 4 bytes) */
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;}
     memset(c->cres,0,need);
@@ -3883,7 +3893,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     // single-submit (non-chained) int8 runs leave the NPU in a state that corrupts
     // the first chained task's output if reps=1.
     if (c->last_dt != 3 /* DT_I8_CHAIN */) {
-        act(fd, RKNPU_ACT_RESET, 0);
+        if (!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);   /* reset only entering int8; warmup handles int8->chain */
         c->warmed = 0;
         c->last_dt = 3; // DT_I8_CHAIN
         c->ccsz = 0; // invalidate Cc size
@@ -4075,8 +4085,16 @@ static void *stream_worker(void *vp) {
         sub.flags = 0x5; sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
         sub.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub, w->domain)) { a->rc = -1; }
-        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        /* A freshly-allocated NPU output buffer returns stale on its FIRST write, so prime THIS core's
+         * output buffer with a throwaway submit on its first use (mirror mcworker's reps=c->mwarm[i]?1:2).
+         * Per-core + deterministic: the old coarse whole-stream 2-pass could miss a core whose buffer the
+         * dynamic task counter left idle on the warmup pass, yielding a flaky stale (zero) result. */
+        int reps = c->mwarm[i] ? 1 : 2;
+        for (int rep = 0; rep < reps; rep++) {
+            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (rep == reps - 1) a->rc = -1; continue; }
+            bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        }
+        c->mwarm[i] = 1;   /* this core's buffer index is disjoint per worker — no cross-thread race */
         memcpy(t->C, c->mcc[i].cpu, (size_t)M * N * 4);
     }
     return NULL;
@@ -4104,35 +4122,31 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (mk > maxMK) maxMK = mk; if (mn > maxMN4) maxMN4 = mn;
     }
     int fd = c->fd;
-    int cold = 0;   // need a warmup pass when the NPU was reset OR any per-core stream buffer is freshly
-                    // allocated (a fresh output buffer returns stale on its first write). NOT c->warmed —
-                    // that tracks the chain/single path, whose buffers are different from the stream's.
-    if (c->last_dt != 3) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 3; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
+    // RESET is only for ENTERING int8 from fp16/int4/cold — switching among int8 markers (single-core
+    // DT_I8 <-> chain/stream 3) needs none (see ORK_I8_LIVE), so decode can interleave run_i8 singletons
+    // with run_stream groups without a ~107ms soft-reset per matmul. Freshly-allocated per-core output
+    // buffers are primed deterministically by stream_worker's reps=2-on-first-use (mwarm[i]); a reset
+    // here clears every core's mwarm so they re-prime.
+    if (c->last_dt != 3) { if (!ORK_I8_LIVE(c->last_dt)) { act(fd, RKNPU_ACT_RESET, 0); c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; } c->last_dt = 3; }
     // Core count is caller-configurable up to the SoC max: budget() honors ork_npu_set_core_budget()
     // and the ORK_NPU_MC env (both capped to soc->cores). Capped to S (no more cores than tasks).
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
-        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
-        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403, c->dom_active); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; cold = 1; }
+        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; }
+        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403, c->dom_active); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; c->mwarm[i] = 0; /* fresh output buffer -> re-prime */ }
     }
     int rc = 0;
     npu_pool_ensure(c);
     struct streamw sw[ORK_MAXCORE];
-    // Cold (first call after a reset): a freshly-allocated NPU output buffer returns stale on its first
-    // write, so run one throwaway warmup pass that primes every per-core buffer, then the real pass.
-    // (Same idea as the single-core reps=2 warmup, applied at stream granularity.) Warm: a single pass.
-    int passes = cold ? 2 : 1;
-    for (int pass = 0; pass < passes; pass++) {
-        int ctr = 0;
-        for (int i = 0; i < nc; i++) sw[i] = (struct streamw){c, i, S, tasks, &ctr, 0};
-        pthread_mutex_lock(&c->pmu);
-        c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker; c->pjob_stride = sizeof(struct streamw);
-        c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-        pthread_mutex_unlock(&c->pmu);
-        stream_worker(&sw[0]);                            /* core 0 on the calling thread */
-        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
-    }
+    int ctr = 0;   /* single pass: stream_worker primes each fresh per-core buffer via reps=2-on-first-use */
+    for (int i = 0; i < nc; i++) sw[i] = (struct streamw){c, i, S, tasks, &ctr, 0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker; c->pjob_stride = sizeof(struct streamw);
+    c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    stream_worker(&sw[0]);                            /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
     for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
     c->warmed = 1;
     return rc;
