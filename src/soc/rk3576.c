@@ -6,5 +6,5 @@
 #include "../soc.h"
 const struct ork_soc ork_soc_rk3576 = {
     .id="rk3576", .card="/dev/dri/card1", .cores=2,
-    .cbuf_elems=32768, .nmax=8192, .ks=2048, .validated=0,
+    .cbuf_elems=32768, .nmax=8192, .ks=2048, .decode_mc_min_nk=0, .validated=0,
 };
