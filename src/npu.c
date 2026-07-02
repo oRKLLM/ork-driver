@@ -188,20 +188,15 @@ static int int8_ks(ork_npu *c){ (void)c;
  * (no env needed); the engine sets a core budget via ork_npu_set_core_budget.
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
-static int budget(ork_npu*c, int M, int K, int N){
-    if (M == 1) {
-        /* M=1 decode: whether to split N across cores is a DATA-DRIVEN, per-shape choice — no env knob.
-         * Multi-core parallelizes the COLD per-token weight-DMA (~K*N bytes streamed fresh each token —
-         * the real decode cost), so it pays only above enough weight bytes to amortize the 3-core barrier
-         * + dispatch floor; below that the single-core path wins. The crossover K*N is soc->decode_mc_min_nk
-         * (measured IN-MODEL — mc_prof's warm loop caches the one weight and hides the weight-DMA, so it
-         * mis-measures this). This replaces the old ORK_DECODE_MC on/off gate. DEV: ORK_DECMC_MINNK overrides
-         * the soc cap for the in-model threshold sweep — remove before landing on main. */
-        static long ov=-2; if(ov==-2){ const char*e=getenv("ORK_DECMC_MINNK"); ov = e? atol(e) : -1; }
-        size_t minnk = ov>=0 ? (size_t)ov : (size_t)c->soc->decode_mc_min_nk;
-        if ((size_t)K * (size_t)N < minnk) return 1;   /* small weight: single-core */
-        /* else fall through to the multi-core budget (N-block shrink below still guards tiny N) */
-    }
+static int budget(ork_npu*c, int M){
+    /* M=1 is single-core by default here; the int8 DECODE path in run() overrides to the multi-core budget
+     * (it calls budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
+     * +40% end-to-end decode (Qwen3-1.7B) and MONOTONIC in the in-model N-sweep: every int8 shape benefits,
+     * so there is no per-shape threshold and no env knob (the old ORK_DECODE_MC gate is gone). mc_prof's warm
+     * loop had mis-measured a crossover that doesn't exist in real cold decode. fp16/int4 M==1 stay single-core
+     * (fp16 large-tile M-scheduler unvalidated; int4 not the decode path). The NN<nc*2 shrink at the call site
+     * still keeps truly tiny int8 N single-core. */
+    if (M == 1) return 1;
     int b=c->core_budget;
     const char *env_mc = getenv("ORK_NPU_MC");
     if (env_mc) {
@@ -2048,7 +2043,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
-    int nc=budget(c, M, w->K, w->N); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
+    int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -3175,7 +3170,7 @@ static void *i4_mcworker_g(void *vp){
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    int fd=c->fd, NB=w->N/64, nc=budget(c, M, w->K, w->N);
+    int fd=c->fd, NB=w->N/64, nc=budget(c, M);
     if(nc>NB)nc=NB;
     if(nc>c->soc->cores)nc=c->soc->cores;
     if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
@@ -3207,7 +3202,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
-    int b=budget(c, M, w->K, w->N), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
+    /* int8 M=1 decode: use the multi-core budget (split N across cores) — validated +40% end-to-end, every
+     * shape benefits (in-model sweep monotonic). budget(c,2) skips the M==1 single-core default + honors
+     * ORK_NPU_MC. fp16/int4 M==1 keep single-core (budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
+    int b=(M==1 && w->dtype==DT_I8) ? budget(c,2) : budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
     /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
      * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
@@ -4134,7 +4132,7 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (c->last_dt != 3) { if (!ORK_I8_LIVE(c->last_dt)) { act(fd, RKNPU_ACT_RESET, 0); c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; } c->last_dt = 3; }
     // Core count is caller-configurable up to the SoC max: budget() honors ork_npu_set_core_budget()
     // and the ORK_NPU_MC env (both capped to soc->cores). Capped to S (no more cores than tasks).
-    int nc = budget(c, 2, 0, 0); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
+    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
         if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; }
@@ -4382,7 +4380,7 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     int fd = c->fd;
     int cold = 0;   /* warmup pass needed on a fresh stream-i4 mode OR freshly-allocated per-core buffer */
     if (c->last_dt != 5 /* DT_I4_STREAM */) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 5; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
-    int nc = budget(c, 2, 0, 0); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
+    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {
         if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }

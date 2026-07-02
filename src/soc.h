@@ -16,11 +16,6 @@ struct ork_soc {
     int cbuf_elems;        /* fp16 feature CBUF budget: rows-per-M-tile = cbuf_elems/K (int8: 2x) */
     int nmax;              /* max matmul output width (N) per submit; wider N is tiled */
     int ks;                /* K-slice size: the scheduler-fast contraction range */
-    int decode_mc_min_nk;  /* M=1 decode: min matmul weight size (K*N) to split N across cores. Multi-core
-                            * parallelizes the COLD per-token weight-DMA, so it pays only above enough bytes
-                            * to amortize the 3-core barrier; below this the single-core path wins. Data-
-                            * derived (measured in-model — mc_prof's warm loop mis-measures it). 0 = always
-                            * multi-core at M=1 (subject to the N-block shrink). Replaces the ORK_DECODE_MC env. */
     int validated;         /* 1 = these params confirmed on real hardware; 0 = inherited/untested */
 };
 

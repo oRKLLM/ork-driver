@@ -19,5 +19,5 @@
 #include "../soc.h"
 const struct ork_soc ork_soc_rk3588 = {
     .id="rk3588", .card="/dev/dri/card1", .cores=3,
-    .cbuf_elems=57344, .nmax=8192, .ks=2048, .decode_mc_min_nk=0, .validated=1,
+    .cbuf_elems=57344, .nmax=8192, .ks=2048, .validated=1,
 };
