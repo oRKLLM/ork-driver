@@ -294,7 +294,7 @@ static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
         const char *e=getenv("ORK_WARENA_CHUNK_MB"); long mb=e?atol(e):1024; if(mb<=0) return NULL;
         size_t csz=(size_t)mb*1024u*1024u; if(a>csz) csz=a;
         struct buf b=bcreate(c->fd,csz,0x403,-1);
-        if(!b.cpu){ fprintf(stderr,"[ork] weight arena chunk %zuMB failed; per-buffer fallback\n",csz/1024u/1024u); return NULL; }
+        if(!b.cpu){ fprintf(stderr,"[ork] WARNING: weight arena chunk %zuMB alloc failed — falling back to per-buffer\n",csz/1024u/1024u); return NULL; }
         c->wchunk[c->wchunk_n++]=b; c->wchunk_off=0;
     }
     struct buf *ch=&c->wchunk[c->wchunk_n-1];
@@ -523,7 +523,7 @@ static void warn_if_governor_parked(void){
 
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
-    if(!soc){fprintf(stderr,"[ork] unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
+    if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();
     g_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
