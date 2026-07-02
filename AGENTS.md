@@ -44,6 +44,18 @@ The active reverse-engineering findings and optimization roadmap are documented 
 - Development is single-track on `main` for now (this is a young library, not a release-channel
   product like oRKLLM). Use short-lived feature branches for larger work and fast-forward them in.
 
+### Never throw away experimental code — consult first
+
+When experimental or in-progress code hits a blocker (a deadlock, hang, failing integration, or a
+dead-looking result), **NEVER revert it, `git reset --hard` it away, force-push over it, or otherwise
+discard it on your own — always consult the user first.** The disposition (stash it, move it to a
+feature branch, commit it WIP, or revert after backup) is the user's call, not the agent's. The blocker
+is rarely the code's fault; discarded work is often still correct and valuable once the real cause is
+understood (e.g. a "deadlock" that turned out to be a fast-to-fix reset-thrash, where the reverted path
+was the actual route to the win). If something must be moved off `main`/a shared branch to unblock,
+prefer a recoverable option (feature branch or stash) over a destructive one (`reset --hard`/force-push),
+and say which you're doing. Surface the blocker, confirm the code is intact, and let the user choose.
+
 ### No commit-message trailers
 
 Do not append `Co-Authored-By:` lines, `🤖 Generated with…` lines, or any tool/assistant
