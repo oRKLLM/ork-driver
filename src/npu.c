@@ -189,15 +189,14 @@ static int int8_ks(ork_npu *c){ (void)c;
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
 static int budget(ork_npu*c, int M){
-    if (M == 1) {
-        /* M=1 decode: single-core by default (the dispatch floor usually beats the
-         * multi-core barrier at one row). ORK_DECODE_MC=1 lets matmuls split N-tiles
-         * across cores — testing whether the 2 idle cores help the big FFN matmuls. */
-        static int dmc=-1;
-        if (dmc<0){ const char*e=getenv("ORK_DECODE_MC"); dmc=e?atoi(e):0; }
-        if (!dmc) return 1;
-        /* else fall through to the normal multi-core budget */
-    }
+    /* M=1 is single-core by default here; the int8 DECODE path in run() overrides to the multi-core budget
+     * (it calls budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
+     * +40% end-to-end decode (Qwen3-1.7B) and MONOTONIC in the in-model N-sweep: every int8 shape benefits,
+     * so there is no per-shape threshold and no env knob (the old ORK_DECODE_MC gate is gone). mc_prof's warm
+     * loop had mis-measured a crossover that doesn't exist in real cold decode. fp16/int4 M==1 stay single-core
+     * (fp16 large-tile M-scheduler unvalidated; int4 not the decode path). The NN<nc*2 shrink at the call site
+     * still keeps truly tiny int8 N single-core. */
+    if (M == 1) return 1;
     int b=c->core_budget;
     const char *env_mc = getenv("ORK_NPU_MC");
     if (env_mc) {
@@ -3203,7 +3202,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
-    int b=budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
+    /* int8 M=1 decode: use the multi-core budget (split N across cores) — validated +40% end-to-end, every
+     * shape benefits (in-model sweep monotonic). budget(c,2) skips the M==1 single-core default + honors
+     * ORK_NPU_MC. fp16/int4 M==1 keep single-core (budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
+    int b=(M==1 && w->dtype==DT_I8) ? budget(c,2) : budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
     /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
      * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
