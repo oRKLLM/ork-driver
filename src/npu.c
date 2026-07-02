@@ -640,39 +640,82 @@ int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 /* Parallel-for over [0,n): split across ALL online cores (dynamic core count from the OS). For the
  * CPU-bound weight tiling during pack — a batch job with no live inference to protect, so it uses every
  * core (big+little), no knob. Spawn-per-region: the tiled memcpy dwarfs the pthread spawn cost. */
-struct ork_pf_arg { void (*fn)(int,int,void*); void *ctx; int lo, hi; };
-static void *ork_pf_thunk(void *a){ struct ork_pf_arg *p=a; p->fn(p->lo,p->hi,p->ctx); return NULL; }
 /* All online CPUs (big+little) as an affinity mask. The pack pool runs UN-pinned across every
  * core: the calling thread may be pinned to the big cluster (an inference worker often is), but
  * the one-time pack is a CPU-bound batch job with no live inference to protect, so it should use
- * the whole machine. Setting the full mask on the spawned threads overrides the inherited pin.
- * Returns the online-core count, or 0 if it couldn't be determined. */
+ * the whole machine. Returns the online-core count, or 0 if it couldn't be determined. */
 static int ork_all_cores_mask(cpu_set_t *s){
     long n=sysconf(_SC_NPROCESSORS_ONLN); if(n<1) return 0;
     CPU_ZERO(s); for(long i=0;i<n && i<CPU_SETSIZE;i++) CPU_SET((int)i,s);
     return (int)n;
 }
-/* Un-pin the calling thread: allow it to run on ALL online cores. For CPU-bound pack/quant
- * worker threads spawned by a caller (e.g. an inference worker) that is pinned to the big
- * cluster — the one-time pack has no live inference to protect, so it should use every core.
- * Public so the ggml-ork dequant/quant workers (std::thread, no attr) can un-pin themselves. */
+/* Un-pin the calling thread: allow it to run on ALL online cores. Public so the ggml-ork dequant/
+ * quant workers (std::thread, no attr) can un-pin themselves. */
 void ork_unpin_current_thread(void){
     cpu_set_t all; if(ork_all_cores_mask(&all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
 }
+
+/* PERSISTENT worker pool for ork_parallel_for. Spawn the workers ONCE and reuse them across every
+ * call, amortizing the pthread_create/join that dominated fine-grained per-weight tiling — a fresh
+ * pool per weight left the cores mostly idle in spawn/join overhead (measured: per-weight CPU tiling
+ * capped ~20%). Workers are un-pinned (all cores) and sleep on a condvar between jobs; lazy-init on
+ * first use, live for the process. One job at a time (the callers dispatch serially). */
+#define ORK_POOL_MAX 64
+static struct {
+    int inited, n, quit;
+    pthread_t th[ORK_POOL_MAX];
+    pthread_mutex_t mu; pthread_cond_t go, done;
+    void (*fn)(int,int,void*); void *ctx;
+    int lo[ORK_POOL_MAX], hi[ORK_POOL_MAX];
+    int gen, running;
+} g_pool = { .mu = PTHREAD_MUTEX_INITIALIZER, .go = PTHREAD_COND_INITIALIZER, .done = PTHREAD_COND_INITIALIZER };
+
+static void *ork_pool_worker(void *a){
+    int id = (int)(intptr_t)a;
+    ork_unpin_current_thread();
+    int seen = 0;
+    pthread_mutex_lock(&g_pool.mu);
+    for(;;){
+        while(g_pool.gen == seen && !g_pool.quit) pthread_cond_wait(&g_pool.go, &g_pool.mu);
+        if(g_pool.quit){ pthread_mutex_unlock(&g_pool.mu); return NULL; }
+        seen = g_pool.gen;
+        void (*fn)(int,int,void*) = g_pool.fn; void *ctx = g_pool.ctx;
+        int lo = g_pool.lo[id], hi = g_pool.hi[id];
+        pthread_mutex_unlock(&g_pool.mu);
+        if(fn && hi > lo) fn(lo, hi, ctx);
+        pthread_mutex_lock(&g_pool.mu);
+        if(--g_pool.running == 0) pthread_cond_signal(&g_pool.done);
+    }
+}
+static void ork_pool_init(void){
+    if(g_pool.inited) return;
+    int n=(int)sysconf(_SC_NPROCESSORS_ONLN); if(n<1)n=1; if(n>ORK_POOL_MAX)n=ORK_POOL_MAX;
+    g_pool.n = n; g_pool.inited = 1;
+    for(int i=1;i<n;i++)   /* worker 0 == the caller; helpers 1..n-1 */
+        if(pthread_create(&g_pool.th[i], NULL, ork_pool_worker, (void*)(intptr_t)i)!=0){ g_pool.n = i; break; }
+}
 static void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
-    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;   /* pool size = detected online cores */
-    if(nthr>n) nthr=n; if(nthr<1) nthr=1; if(nthr>64) nthr=64;
+    if(n<=0) return;
+    int nthr=(int)sysconf(_SC_NPROCESSORS_ONLN); if(nthr<1)nthr=1;
+    if(nthr>n) nthr=n; if(nthr<1) nthr=1; if(nthr>ORK_POOL_MAX) nthr=ORK_POOL_MAX;
     if(nthr<=1){ fn(0,n,ctx); return; }
-    /* Un-pin the pool: spread across ALL cores regardless of the caller's affinity. */
-    cpu_set_t all; int have_all = ork_all_cores_mask(&all);
-    pthread_attr_t at; int have_at = (pthread_attr_init(&at)==0);
-    if(have_at && have_all) pthread_attr_setaffinity_np(&at, sizeof all, &all);
-    pthread_t th[64]; struct ork_pf_arg pf[64];
-    int chunk=(n+nthr-1)/nthr, t=0;
-    for(int a=0;a<n && t<nthr;a+=chunk){ pf[t]=(struct ork_pf_arg){fn,ctx,a,(a+chunk<n)?a+chunk:n};
-        if(pthread_create(&th[t], have_at?&at:NULL, ork_pf_thunk,&pf[t])!=0) fn(pf[t].lo,pf[t].hi,ctx); else t++; }
-    for(int i=0;i<t;i++) pthread_join(th[i],NULL);
-    if(have_at) pthread_attr_destroy(&at);
+    static pthread_mutex_t dispatch = PTHREAD_MUTEX_INITIALIZER;   /* pool is a shared singleton — one job at a time */
+    pthread_mutex_lock(&dispatch);
+    ork_pool_init();
+    if(nthr > g_pool.n) nthr = g_pool.n;
+    int chunk = (n + nthr - 1) / nthr;
+    pthread_mutex_lock(&g_pool.mu);
+    g_pool.fn = fn; g_pool.ctx = ctx;
+    for(int t=0;t<g_pool.n;t++){ int a=t*chunk; if(a>n)a=n; int b=a+chunk; if(b>n)b=n; g_pool.lo[t]=a; g_pool.hi[t]=b; }
+    g_pool.running = g_pool.n - 1;   /* every helper wakes + decrements (idle ones just have empty ranges) */
+    g_pool.gen++;
+    pthread_cond_broadcast(&g_pool.go);
+    pthread_mutex_unlock(&g_pool.mu);
+    if(g_pool.hi[0] > g_pool.lo[0]) fn(g_pool.lo[0], g_pool.hi[0], ctx);   /* caller runs chunk 0 */
+    pthread_mutex_lock(&g_pool.mu);
+    while(g_pool.running > 0) pthread_cond_wait(&g_pool.done, &g_pool.mu);
+    pthread_mutex_unlock(&g_pool.mu);
+    pthread_mutex_unlock(&dispatch);
 }
 /* Tile a contiguous [nt] range of int8 weight columns into the NPU 32x32 block layout. Shared by the Bb
  * K-slice tiles and the full-K Bf rebuild (same structure; differ only in KT and the k0 offset). Each nt
