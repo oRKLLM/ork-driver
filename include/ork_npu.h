@@ -323,6 +323,15 @@ int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A
 int          ork_npu_probe_i8_out8(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
                                    int mult, int shift, int8_t *C, double *us);
 
+/* ork-NATIVE fused-SiLU LUT generator: build ork's OWN silu LUT for the fused-output path (no RKNN
+ * dependence). Measures ork's index(acc) for (r_mult,r_shift,cfg4068) via one calibration submit, then
+ * builds lut[1030] = silu curve matched to ork's mapping for (in_scale,out_scale). Do this ONCE per
+ * register config; run matmuls via ork_npu_probe_i8_silu_cfg(..,r_mult,r_shift,0,0xffffc000,cfg4068,lut,1030,..).
+ * Pick R=r_mult/2^r_shift ~= 660*in_scale so the acc range spans silu's transition. Validated ~1 int8.
+ * 0/ok, -1 fail. See tools/silu_native.c. */
+int          ork_mm_silu_build_lut(ork_npu *ctx, double in_scale, double out_scale,
+                                   int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut);
+
 /* PPU FUSED SiLU (step 2): full-K int8 matmul with SiLU applied on-chip via the LUT output stage. Two
  * sequential submits (LUT-load into PPU SRAM, then matmul reading it). A[M*K],B[K*N] int8; C[M*N] int8.
  * 0/ok (executed), -1 wedged, -2 bad. WIP: replays the capture scale (per-scale LUT gen is pending). */

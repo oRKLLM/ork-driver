@@ -3623,6 +3623,47 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
 }
 
 static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
+
+static double silu_f(double x){ return x/(1.0+exp(-x)); }
+/* ork_mm_silu_build_lut — generate ork's OWN silu LUT for the fused-output path (ork-NATIVE: no RKNN
+ * dependence, works on ork's 108-reg matmul program). Since ork controls both the LUT and the output-stage
+ * registers, correct fused SiLU is a 2-step construction (see tools/silu_native.c, validated ~1 int8):
+ *   (1) MEASURE ork's index(acc) for (r_mult,r_shift,cfg4068) via one ramp-LUT calibration submit;
+ *   (2) BUILD lut[idx(acc)] = clamp_int16( silu(acc*in_scale)/out_scale / R ), R=r_mult/2^r_shift; interp gaps.
+ * The caller then runs the matmul via ork_npu_probe_i8_silu_cfg(..,r_mult,r_shift,0,0xffffc000,cfg4068,lut,1030,..)
+ * — do the build ONCE per (registers) and reuse the lut across matmuls of the same scale. Pick r_mult/r_shift
+ * so R ~= 660*in_scale (the matmul's acc range then spans silu's transition band). out_bias MUST be 0 (the
+ * validated config; the ramp readback assumes it). Fills lut[1030]. 0/ok, -1 fail. */
+int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
+                          int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
+    const int K=512, N=64;
+    signed char *A=malloc(K), *B=calloc(1,(size_t)K*N); int8_t *C=malloc(N);
+    int16_t *ramp=malloc(1030*2); int *acc=malloc(N*sizeof(int)), *idx=malloc(N*sizeof(int));
+    if(!A||!B||!C||!ramp||!acc||!idx){ free(A);free(B);free(C);free(ramp);free(acc);free(idx); return -1; }
+    double R = (double)r_mult / (double)(1u<<r_shift);
+    for(int k=0;k<K;k++)A[k]=1;
+    int accmax=(int)(8.0/in_scale); int step=(2*accmax)/(N-1); if(step<1)step=1;
+    for(int n=0;n<N;n++){ int T=-accmax+n*step; int b=T/K; for(int k=0;k<K;k++)B[k*N+n]=(signed char)(b+(k<(T-b*K)?1:0)); }
+    for(int n=0;n<N;n++){ int a=0; for(int k=0;k<K;k++)a+=A[k]*B[k*N+n]; acc[n]=a; }
+    /* pass 1: ramp LUT[i]=(i-512)*8 -> out = R*LUT[idx] -> idx = round(out/(R*8)) + 512 */
+    for(int i=0;i<1030;i++){ int v=(i-512)*8; if(v>32767)v=32767; if(v<-32768)v=-32768; ramp[i]=(int16_t)v; }
+    if(ork_npu_probe_i8_silu_cfg(c,1,K,N,A,B,r_mult,r_shift,0u,0xffffc000u,cfg4068,ramp,1030,C,0)){
+        free(A);free(B);free(C);free(ramp);free(acc);free(idx); return -1; }
+    for(int n=0;n<N;n++){ int i=(int)lround(C[n]/(R*8.0))+512; idx[n]=i; }
+    /* pass 2: build ork's silu LUT at the measured indices; interp gaps, hold at ends */
+    int *set=calloc(1030,sizeof(int)); for(int i=0;i<1030;i++)lut[i]=0;
+    for(int n=0;n<N;n++){ int i=idx[n]; if(i<0||i>1029)continue;
+        double v=silu_f(acc[n]*in_scale)/out_scale/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768;
+        lut[i]=(int16_t)q; set[i]=1; }
+    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
+    if(lo<0){ free(A);free(B);free(C);free(ramp);free(acc);free(idx);free(set); return -1; }
+    for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
+    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
+        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
+    free(A);free(B);free(C);free(ramp);free(acc);free(idx);free(set);
+    return 0;
+}
+
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`
  * identical small int8 matmuls (single core) as (a) ntask separate task_number=1 ioctls vs (b) ONE
  * ioctl with task_number=ntask. Returns 0/ok, -1 wedge, -2 bad dims (K%32, N%32, 1<=ntask<=32).
