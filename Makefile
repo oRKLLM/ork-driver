@@ -67,6 +67,10 @@ silu_calibrate: tools/silu_calibrate.c $(CORE)
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Matmul-level benchmark: fused-SiLU output stage vs plain matmul + the CPU-silu handoff it replaces.
+silu_bench: tools/silu_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
