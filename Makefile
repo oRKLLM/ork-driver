@@ -59,6 +59,10 @@ mtile_probe: tools/mtile_probe.c $(CORE)
 autotune: tools/autotune.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Pack-time SiLU calibrator: search the fused-output register space (R/cfg4068/bias) vs a silu ref.
+silu_calibrate: tools/silu_calibrate.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
