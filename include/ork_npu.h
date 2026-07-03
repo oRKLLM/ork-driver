@@ -27,7 +27,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  * a short git hash ("MAJOR.MINOR.PATCH+g<hash>") when built with -DORK_GIT_HASH (the Makefile injects
  * it where git is available).
  */
-#define ORK_NPU_VERSION "0.6.33"
+#define ORK_NPU_VERSION "0.6.32"
 /** @brief Runtime library version. @return "MAJOR.MINOR.PATCH" or "MAJOR.MINOR.PATCH+g<hash>". */
 const char  *ork_npu_version(void);
 
@@ -314,6 +314,34 @@ double       ork_npu_mc_synth(int core);   /* host synth+bsync subset of `submit
  * completed (C[N] int32 valid — validate vs CPU), -1 if it wedged (K exceeds the per-op K-tile
  * cap; recoverable), -2 on bad dims. See tools/ksubmit_probe.c. */
 int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
+
+/* PPU fused-output stage (step 1): run ONE full-K int8 matmul at (M,K,N) with the int8-REQUANTIZED
+ * output stage instead of int32. out_i8 = clamp_i8((acc_i32 * mult) >> shift); identity = (0x4000,14).
+ * Isolated bit-exact test bed for the on-NPU fused path (SiLU/EW-mul build on this int8-output stage).
+ * A[M*K], B[K*N] row-major int8; C[M*N] int8 out; us = warm-submit time. 0/ok, -1 wedged, -2 bad dims.
+ * See ork_ppu_fuse_enabled(); the CPU/NEON requant path stays the default fallback. */
+int          ork_npu_probe_i8_out8(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
+                                   int mult, int shift, int8_t *C, double *us);
+
+/* PPU FUSED SiLU (step 2): full-K int8 matmul with SiLU applied on-chip via the LUT output stage. Two
+ * sequential submits (LUT-load into PPU SRAM, then matmul reading it). A[M*K],B[K*N] int8; C[M*N] int8.
+ * 0/ok (executed), -1 wedged, -2 bad. WIP: replays the capture scale (per-scale LUT gen is pending). */
+int          ork_npu_probe_i8_silu(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
+                                   int8_t *C, double *us);
+/* Fused-SiLU probe with the decoded output-stage knobs exposed: r_mult/r_shift = the unified scale
+ * R = r_mult/2^r_shift (reg 0x4084/0x4088; sets both the acc->LUT-index step and the LUT->output gain);
+ * out_bias = reg 0x4080 (output bias / asymmetric zero-point); idx_off = reg 0x4110 (LUT-index offset C0);
+ * cfg4068 = reg 0x4068 (per-scale field, no observed output effect). lut != NULL overrides the LUT contents
+ * (for the staircase/const-LUT calibration harness); lut==NULL uses the fixed captured silu curve. */
+int          ork_npu_probe_i8_silu_cfg(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
+                                       int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off,
+                                       uint32_t cfg4068, const int16_t *lut, int nlut, int8_t *C, double *us);
+
+/* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
+ * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
+ * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
+ * optimization (RE'd against the rk3588 PPU register layout), never a dependency. */
+int          ork_ppu_fuse_enabled(ork_npu *ctx);
 
 /* RE/calibration only: run ONE full-K int8 submit at (M,K,N) in ork's current M-tile mode (mode=0)
  * or the rkllm-captured M-tile mode (mode=1: 0x1010=0x20 const, 0x1044=(K/64)*M, 0x107c=4*M,

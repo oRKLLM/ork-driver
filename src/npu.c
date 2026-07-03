@@ -25,6 +25,7 @@
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
 #include "regcmd_i4.h"
+#include "regcmd_silu.h"
 #include "ork_npu.h"
 #include "soc.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -468,6 +469,98 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
 }
+
+/* ── On-NPU (PPU) fused output stage — additive, GATED, CPU/NEON path stays the default ──────────
+ *
+ * The synth_i8 template above emits INT8_MM_INT8_TO_INT32: the matmul writes a full-precision int32
+ * accumulator to C, and the caller does requantize + activation (SiLU) + the SwiGLU elementwise-mul
+ * on the CPU/NEON (src/neon_activations.c). The PPU can instead do those in the matmul's OUTPUT STAGE
+ * on-chip (RE'd 2026-07-03, see PPU_FUSED_ACTIVATION_WIP.md): int8-output requantize (this helper),
+ * a fused activation LUT (enable=0x18 SiLU), and a dual-input elementwise-multiply. Fusing them turns
+ * the FFN inner into an on-NPU chain and removes the per-op CPU round-trip (the M=1 decode bubble).
+ *
+ * WHY THE CPU/NEON PATH IS KEPT (not replaced): the fused output stage is HARDWARE-SPECIFIC to the
+ * RK3588-family PPU register layout decoded here. The CPU/NEON requant+SiLU+mul path is retained
+ * DELIBERATELY as the default fallback so that:
+ *   (1) PORTABILITY — a future/different NPU (or an RK35xx whose PPU output stage differs) that we
+ *       have not yet reverse-engineered can still run w8a8 correctly via the CPU intermediary; the
+ *       fused path is an optimization layered on top, never a hard dependency.
+ *   (2) BRING-UP — while the fused regcmd path is being validated bit-exact on silicon, the CPU path
+ *       is the known-good route; the gate lets us ship the matmul without blocking on PPU fusion.
+ *   (3) VALIDATION — it is the bit-exact reference the fused-output tests diff against.
+ * Hence the gate (ork_ppu_fuse_enabled): callers/higher layers opt IN to the fused path; when it is
+ * off (the default), or the SoC is not a validated PPU target, ork-driver emits the int32 output and
+ * the caller's CPU/NEON stage runs — identical numerics, no behavior change for existing callers.
+ *
+ * set_i8_out8 rewrites a synth_i8'd regcmd's output stage from int32 to int8-requantized. From the
+ * matmul INT8_TO_INT32 vs INT8_TO_INT8 capture diff (mm_out_probe): exactly 6 regs change (the rest —
+ * addresses, M/N counts — are shared). The hardware requant is
+ *   out_i8 = clamp_i8( round_half_to_even(acc_i32 * mult / 2^shift) )
+ * — convergent (banker's) rounding, verified bit-exact on silicon; identity = mult=0x4000, shift=14.
+ * stride = C row stride in ELEMENTS (defaults to N). NOTE: the int8-output stage rides on synth_i8's
+ * compute regcmd, whose 0x1040 K-reduction schedule is validated for K>=512 (the prefill domain); at
+ * tiny K (<=128) that schedule's small-K branch miscomputes and the requant reads garbage. FFN/attn
+ * matmuls are all K>=512, so this is not a practical limit. */
+static void set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
+    int s=stride>0?stride:N;
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4050,0x0124);                             /* int8 output row byte-stride config (const; int32=0x07fc) */
+    setr(rc,REGCMD_I8_N,0x1001,0x40c0,0x0020);                             /* output element size = 1 byte (int32=0x0080) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);                              /* requant multiplier */
+    setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);                             /* requant shift (>>) */
+}
+
+/* Runtime gate for the PPU fused-output path. Gated on the DETECTED SoC: the fused output stage (int8
+ * requantize, SiLU LUT, dual-input EW-mul) is reverse-engineered and validated against the RK3588 PPU
+ * register layout; on any other chip the layout may differ, so we fall back to the portable, known-good
+ * CPU/NEON requant+activation path (see the block above). No env var — the chipset is detected once at
+ * startup (ork_soc_detect via device-tree) and this returns 1 only on rk3588. As the fused path is
+ * validated on further SoCs, extend this check. */
+int ork_ppu_fuse_enabled(ork_npu *c){
+    return c && c->soc && c->soc->id && strcmp(c->soc->id, "rk3588") == 0;
+}
+
+/* set_i8_silu — fused SiLU output stage: the matmul applies SiLU on-chip via a PWL LUT in its output
+ * stage (enable=0x1d on the task). Decoded + validated against silicon 2026-07-03 (staircase/const-LUT
+ * probes + a composite model that reproduces the captured curve to ~2 int8; see PPU_FUSED_ACTIVATION_WIP.md).
+ *
+ * VALIDATED PIPELINE (the FIXED silu LUT is streamed separately by the REGCMD_SILU_LUT prologue into PPU
+ * LUT SRAM; this program reads it):
+ *     ii        = acc_i32 * R                      ; R = r_mult / 2^r_shift  (Q6 fixed-point index-input)
+ *     idx       = ii >> 6                           ; 6 low bits = PWL interpolation weight
+ *     V16       = LUT[idx]*(1-frac) + LUT[idx+1]*frac
+ *     out_i8    = clamp_i8( R * V16 + out_bias )     ; SAME R gain; out_bias is the (asymmetric) zero-point
+ *   R is a SINGLE scale knob (reg 0x4084 mantissa / 0x4088 shift): it sets BOTH the acc->index step AND
+ *   the LUT->output gain. C0 (the silu-zero index ~512) rides on reg 0x4110 (idx_off); out_bias = reg 0x4080.
+ *   The LUT is SCALE-INDEPENDENT (one fixed silu*S curve, 2 banks: neg half idx 0..511, pos half 512..1023).
+ *
+ * REGISTER ROLES (corrected — earlier labels were wrong): 0x4084/0x4088 = the unified scale R (NOT a
+ * separate "requant"); 0x4060/0x4070/0x4108/0x410c/0x411c/0x4128/0x412c = FIXED config (scale-independent,
+ * confirmed constant across a 6-model scale grid); 0x4010 high byte 0x44 + 0x4004/0x5004=0x30 = activation
+ * enable; 0x4068 = a per-scale field with NO observed effect on the output (set to a replay-safe value).
+ *
+ * SCALE-DEPENDENCE (for a generator; not yet bit-exact-calibrated): R ~= 1/(S*out_scale), out_bias and C0
+ * track out_scale. Until gen(in_scale,out_scale) is calibrated bit-exact, callers pass the register values
+ * directly (a captured/known-good set). Params: r_mult,r_shift -> R (0x4084/0x4088); out_bias -> 0x4080;
+ * idx_off -> 0x4110; cfg4068 -> 0x4068 (unobserved). */
+static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
+                        uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+    set_i8_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4060,0x00020040); /* activation mode bit 0x0002 (fixed) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4068,cfg4068);    /* per-scale field, no observed output effect (replay) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4070,0x00000302); /* fixed */
+    setr(rc,REGCMD_I8_N,0x1001,0x4080,out_bias);   /* output bias / asymmetric zero-point (silu(0) -> out_bias) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4108,0x00000068); /* LUT config (fixed) */
+    setr(rc,REGCMD_I8_N,0x1001,0x410c,0x00050500); /* LUT config (fixed) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4110,idx_off);    /* index offset -> C0 (silu-zero index ~512) */
+    setr(rc,REGCMD_I8_N,0x1001,0x411c,0x00004000); /* fixed config (scale-independent) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4128,0x40320000); /* fixed config */
+    setr(rc,REGCMD_I8_N,0x1001,0x412c,0x000001a0); /* fixed config */
+}
+
 /* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
  * the base (the real hardware program, not a guess), overriding only the K/N/address-dependent regs.
  * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) stay as captured; K, N (≤nmax),
@@ -3426,6 +3519,107 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
+}
+
+/* RE/validation for the PPU fused-output stage (step 1): run ONE full-K int8 matmul at (M,K,N) with
+ * the int8-REQUANTIZED output stage (set_i8_out8) instead of int32, and return C[M*N] as int8. This
+ * is the isolated bit-exact test bed for the fused path — the caller compares against the CPU model
+ * out_i8 = clamp_i8((acc_i32 * mult) >> shift). Isolated buffers, does not touch resident weights.
+ * A[M*K] B[K*N] row-major int8; C[M*N] int8 out. mult/shift = fixed-point requant (identity =
+ * 0x4000,14). 0/ok (C valid), -1 wedged, -2 bad dims. See ork_ppu_fuse_enabled + set_i8_out8. */
+int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+                          int mult,int shift,int8_t *C,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int8 output: M*N bytes */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N];
+    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    set_i8_out8(rc,N,0,mult,shift);           /* rewrite output stage: int32 -> int8 requantize */
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_i8_out8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0;
+    for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
+        double t0=ork_now_us();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
+ * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
+ * (REGCMD_SILU_LUT, enable=0x18) streams the int16 silu curve into PPU LUT SRAM; (2) the matmul compute
+ * (synth_i8 + set_i8_silu, enable=0x1d) reads that LUT in its output stage. The LUT persists in SRAM
+ * between the two sequential submits. Isolated buffers. A[M*K] B[K*N] row-major int8; C[M*N] int8.
+ * 0/ok (path executed, C valid), -1 wedged, -2 bad dims. FIRST-RUN status: replays the mm_silu capture
+ * scale/LUT verbatim — proves the path EXECUTES + LUT-persists; per-scale generation is WIP. */
+int ork_npu_probe_i8_silu(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int8_t *C,double *us){
+    /* g2 captured register set (a known-good replay): R=0x51aa/2^0x14, bias=-97, idx_off, 0x4068 field. */
+    return ork_npu_probe_i8_silu_cfg(c,M,K,N,A,B,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0,C,us);
+}
+/* Fused-SiLU probe with the decoded knobs exposed (see set_i8_silu): r_mult/r_shift = the unified scale R
+ * (0x4084/0x4088), out_bias = 0x4080, idx_off = 0x4110, cfg4068 = 0x4068. lut != NULL overrides the LUT
+ * contents (streams the first `nlut` int16 values into the LUT-load's 0x4104 writes) — for the staircase/
+ * const-LUT calibration harness; lut==NULL keeps the captured fixed silu curve. */
+int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+                              int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
+                              const int16_t *lut,int nlut,int8_t *C,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
+    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+
+    /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) — streams the silu LUT into PPU SRAM ---- */
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma); /* patch the one output addr */
+    if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;   /* override LUT data: stream lut[] into the 0x4104 writes in order */
+        for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+    }
+
+    /* ---- submit 2: matmul compute (enable=0x1d, regcfg=108) reading the resident LUT ---- */
+    uint32_t rc[REGCMD_I8_N];
+    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+    struct buf extra[2]={W,O};
+    if(validate_regcmd("probe_i8_silu",c,rc,REGCMD_I8_N,NULL,extra,2)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      int ok=-1; double t1=0;
+      for(int rep=0;rep<3;rep++){ sub.timeout=60000; double t0=ork_now_us();
+          if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+          bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+      if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
+      bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+      return ok;
+    }
 }
 
 static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
