@@ -63,6 +63,10 @@ autotune: tools/autotune.c $(CORE)
 silu_calibrate: tools/silu_calibrate.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
+silu_native: tools/silu_native.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
