@@ -27,14 +27,24 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true          # need existing vX.Y.Z tags to pick a non-colliding next version
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Bump ORK_NPU_VERSION
         run: |
           set -euo pipefail
+          git fetch --tags --force origin   # belt-and-suspenders: ensure all tags are local
           HDR=include/ork_npu.h
-          CUR=$(grep -E '#define[[:space:]]+ORK_NPU_VERSION' "$HDR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
-          [ -n "$CUR" ] || { echo "could not parse ORK_NPU_VERSION from $HDR"; exit 1; }
+          HVER=$(grep -E '#define[[:space:]]+ORK_NPU_VERSION' "$HDR" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          [ -n "$HVER" ] || { echo "could not parse ORK_NPU_VERSION from $HDR"; exit 1; }
+
+          # Base the bump on max(header, latest tag), not the header alone: a prior run may have pushed
+          # a vX.Y.Z tag while its [skip ci] header commit failed to land (non-ff race), leaving the tag
+          # AHEAD of the header. Incrementing the header alone then re-collides with that tag forever
+          # (fatal: tag already exists -> exit 128). Anchoring on the tags guarantees a fresh version.
+          TVER=$(git tag -l 'v*' | sed -E 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+          CUR=$(printf '%s\n%s\n' "$HVER" "${TVER:-0.0.0}" | sort -V | tail -1)
+          echo "header=$HVER latest-tag=${TVER:-none} -> base=$CUR"
           IFS=. read -r MAJOR MINOR PATCH <<< "$CUR"
 
           MSG=$(git log -1 --pretty=%B)
@@ -44,7 +54,11 @@ jobs:
             *)          PATCH=$((PATCH+1)) ;;
           esac
           NEW="$MAJOR.$MINOR.$PATCH"
-          echo "ORK_NPU_VERSION: $CUR -> $NEW"
+          # paranoia: if NEW somehow still exists as a tag, keep incrementing PATCH until it's free
+          while git rev-parse -q --verify "refs/tags/v$NEW" >/dev/null; do
+            PATCH=$((PATCH+1)); NEW="$MAJOR.$MINOR.$PATCH"
+          done
+          echo "ORK_NPU_VERSION: $HVER -> $NEW"
 
           sed -i -E "s/(#define[[:space:]]+ORK_NPU_VERSION[[:space:]]+\")[0-9]+\.[0-9]+\.[0-9]+/\1$NEW/" "$HDR"
           grep -E '#define[[:space:]]+ORK_NPU_VERSION' "$HDR"
