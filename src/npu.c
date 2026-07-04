@@ -3699,7 +3699,9 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
             t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; }
+            int reps=c->warmed?1:2;   /* a freshly (re)allocated output buffer is COLD — its first submit returns stale data; warm it once */
+            for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }
+            c->warmed=1; if(rc_ret) break;
             bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
@@ -3745,7 +3747,9 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
             t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_I8_EW_N/2; t->regcmd_addr=c->regcmd.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; }
+            int reps=c->warmed?1:2;   /* cold output buffer warmup (first submit returns stale data) */
+            for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }
+            c->warmed=1; if(rc_ret) break;
             bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
