@@ -4051,6 +4051,69 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     return ok;
 }
 
+/* Standalone int8 element-wise ADD — RE probe (settable scale regs to decode the add structure). out[m][n] from
+ * the 2-input SDP op with ALU=add (REGCMD_ADD), reprogrammed to (M,N) by set_mul_geom. Caller sets za(0x4044),
+ * zb(0x4074), zo(0x4080), out scale mult(0x4084)/shift(0x4088), and the b-operand scale bscale(0x4078); the
+ * ALU-mode regs (0x4040/0x4048/0x4070) stay from the template. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
+int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
+                         int mult,int shift,uint32_t bscale,int za,int zb,int zo,int8_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
+    int8_t*ac=A.cpu,*bc=B.cpu;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=a[m*N+n]; bc[p]=b[m*N+n]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
+    set_mul_geom(rc,REGCMD_ADD_N,M,N);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_ADD_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_ADD_N,0x2001,0x5038,(uint32_t)B.dma);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4084,(uint32_t)mult);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4088,(uint32_t)shift);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4078,bscale);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4044,(uint32_t)za);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4074,(uint32_t)zb);
+    setr(rc,REGCMD_ADD_N,0x1001,0x4080,(uint32_t)zo);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    #undef EWCUBE
+    return ok;
+}
+
+/* Public on-NPU element-wise ADD (int8): out[m*N+n] = clamp_i8(round( (a*a_scale + b*b_scale)/out_scale ))
+ * via the 2-input SDP op with ALU=add. Decoded structure: out = clamp((a*mult_a + b*mult_b) >> (0x4088-14) + zo),
+ * mult_a=0x4084, mult_b=0x4078 are Q-format scale ratios (a_scale/out_scale, b_scale/out_scale). Symmetric quant
+ * (zero-points 0). EXACT for RESIDUAL add (a_scale==b_scale==out_scale => out=clamp_i8(a+b)) and power-of-2
+ * scale ratios; ARBITRARY unequal scales are approximate (the wide b-scale field 0x4078 isn't fully decoded).
+ * Residual connections use equal scales, so the exact case is the intended one.
+ * in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1,-2,-3. */
+int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
+                   double a_scale,double b_scale,double out_scale,int8_t *out,double *us){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)||out_scale<=0) return -2;
+    double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
+    /* mults are Q(S) with headroom: keep <=0x4000 (validated safe range; 0x4000 == coeff 1 at S=14). */
+    int S=14; while(S>0 && cmax*(double)(1u<<S) > 0x4000) S--;
+    while(S<30 && cmax*(double)(1u<<(S+1)) <= 0x4000) S++;
+    long ma=lround(ca*(double)(1u<<S)), mb=lround(cb*(double)(1u<<S));
+    if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
+    return ork_npu_probe_add_i8(c,a,b,M,N,(int)ma,S+14,(uint32_t)mb,0,0,0,out,us);
+}
+
 /* ── Standalone on-NPU SiLU (activation-LUT SDP op) — RE probe ─────────────────────────────────────
  * Applies the PPU activation LUT to a SINGLE int8 memory input [M][N] via the standalone 69-reg/enable=0x18
  * SDP op (REGCMD_SILU_STD), reprogrammed to (M,N) by set_mul_geom. Two submits on the single-stream NPU:

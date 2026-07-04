@@ -435,6 +435,17 @@ int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn
 int          ork_npu_silu_i16(ork_npu *ctx, const short *in, int M, int N,
                               double in_scale, double out_scale, short *out, double *us);
 
+/* On-NPU element-wise ADD (int8): out = clamp_i8(round( (a*a_scale + b*b_scale)/out_scale )) via the 2-input SDP
+ * ALU=add op. Symmetric quant. Residual add (a_scale==b_scale==out_scale) => out=clamp_i8(a+b), bit-exact.
+ * in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
+                            double a_scale, double b_scale, double out_scale, signed char *out, double *us);
+
+/* Standalone int8 element-wise ADD — RE probe (settable scale regs). 2-input SDP op with ALU=add. Caller sets
+ * out scale mult/shift, b-operand scale bscale, and zero-points za/zb/zo. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
+int          ork_npu_probe_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
+                                  int mult, int shift, unsigned bscale, int za, int zb, int zo, signed char *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
