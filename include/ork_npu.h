@@ -419,6 +419,12 @@ int          ork_npu_probe_silu_std_i16(ork_npu *ctx, const short *in, int M, in
 int          ork_npu_silu_i8(ork_npu *ctx, const signed char *in, int M, int N,
                              double in_scale, double out_scale, signed char *out, double *us);
 
+/* Replay an ASSEMBLED int16 LUT-op (tools/re/assemble_op.c output): stream `lut` via the loader, run `regcmd`
+ * verbatim (RKNN's matched index/scale params baked in), patch only addresses + M/N. Bit-exact to RKNN, no
+ * index decode. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn, const short *lut, int nlut,
+                                    const short *in, int M, int N, short *out, double *us);
+
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT
  * index model is approximate pending an int16-op gain sweep. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */

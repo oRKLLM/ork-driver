@@ -4242,6 +4242,54 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     return ok;
 }
 
+/* Replay an ASSEMBLED int16 LUT-op (from tools/re/assemble_op.c): stream `lut` via the LUT-loader, then run the
+ * given `regcmd` VERBATIM (RKNN's matched index/scale params baked in) — patching only addresses + M/N geometry.
+ * Bit-exact to RKNN, no index decode. in/out int16 [M*N], N%8==0. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
+                           const int16_t *in,int M,int N,int16_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)||rn>REGCMD_SILU_STD_I16_N) return -2;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
+    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    memset(A.cpu,0,sz);memset(O.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
+      for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+          lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+    }
+    uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
+    set_mul_geom(rc,rn,M,N);
+    setr(rc,rn,0x2001,0x5040,0); setr(rc,rn,0x2001,0x5038,0);
+    setr(rc,rn,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,rn,0x2001,0x5018,(uint32_t)A.dma);
+    memcpy(c->regcmd.cpu,rc,(size_t)rn*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(uint32_t)(rn/2-4); tk->regcmd_addr=c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef EWCUBEH
+    return ok;
+}
+
 /* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
  * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
  * (REGCMD_SILU_LUT, enable=0x18) streams the int16 silu curve into PPU LUT SRAM; (2) the matmul compute
