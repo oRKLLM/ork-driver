@@ -3673,6 +3673,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     /* ---- submit 1: stream the (fixed or supplied) silu LUT into PPU SRAM, ONCE ---- */
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    struct buf O=bcreate(fd,maxout,0x403,c->dom_active); if(!O.cpu){bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);return -2;}  /* DIAG: dedicated fresh int8 output (isolate c->Cc reuse) */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
     setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
@@ -3692,21 +3693,20 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)O.dma,1,CBUF,0);
             set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
             t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            int reps=c->warmed?1:2;   /* a freshly (re)allocated output buffer is COLD — its first submit returns stale data; warm it once */
-            for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }
-            c->warmed=1; if(rc_ret) break;
-            bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
-            int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+            for(int rep=0;rep<3;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }   /* DIAG: 3-rep warmup like the probe */
+            if(rc_ret) break;
+            bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+            int8_t*cc=O.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
     }
-    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&O);
     return rc_ret;
 }
 
