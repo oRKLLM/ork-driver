@@ -42,10 +42,11 @@ static int run_f16(ork_npu *c, int M, int N){
     printf("  f16 [%dx%-4d] %s bad=%d/%d max|err|=%.4f  (%.1f us)\n",M,N,bad?"FAIL":"ok  ",bad,M*N,mx,us);
     return bad?1:0;
 }
-/* int16 residual add: out = clamp_i16(a+b) exact */
+/* int16 residual add: out = clamp_i16(a+b), bit-exact for in-range sums. Inputs kept in +-14000 so a+b fits
+ * int16 (residual quant picks out_scale so the sum fits — out-of-range saturation is a mis-scale case). */
 static int run_i16(ork_npu *c, int M, int N){
     static short a[MAXE], b[MAXE], out[MAXE];
-    for(int i=0;i<M*N;i++){ a[i]=(short)(((i*97)%20000)-10000); b[i]=(short)(((i*53)%16000)-8000); }
+    for(int i=0;i<M*N;i++){ a[i]=(short)(((i*97)%28000)-14000); b[i]=(short)(((i*53)%36000)-18000)/2; }
     double us=0;
     int r=ork_npu_add_i16(c,a,b,M,N,0.001,0.001,0.001,out,&us);
     if(r){ printf("  i16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
@@ -77,7 +78,7 @@ int main(void){
     printf("on-NPU element-wise ADD (fp16 residual) vs CPU ref:\n");
     static const int shp[][2] = { {8,64}, {16,64}, {8,128}, {4,512} };
     for(unsigned s=0;s<sizeof(shp)/sizeof(shp[0]);s++) fail |= run_f16(c, shp[s][0], shp[s][1]);
-    /* int16 add is EXPERIMENTAL (SDP X1/X2 sub-module scale decode pending) — informational, not gated */
+    /* int16 add is EXPERIMENTAL (SDP X1 operand halves negatives — sign/shift decode pending) — not gated */
     (void)run_i16;
 
     ork_npu_free(c);

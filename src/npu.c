@@ -4177,9 +4177,11 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     setr(rc,REGCMD_ADD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
     setr(rc,REGCMD_ADD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
     setr(rc,REGCMD_ADD_I16_N,0x2001,0x5038,(uint32_t)B.dma);
-    /* EXPERIMENTAL: int16 add's operand scaling lives in NVDLA SDP X1/X2 sub-module regs that differ from int8's
-     * (0x4048 carries an extra per-operand scale); not yet fully decoded, so int16 add is NOT bit-exact. Env
-     * overrides (ORK_ADD16_R48/84/88/78) are provided for RE sweeps. */
+    /* EXPERIMENTAL: int16 add is NOT bit-exact over the signed range. Isolated: the ERDMA/X2 operand (0x5038, via
+     * 0x4078) is exact for BOTH signs; the SRDMA/X1 operand (0x5018, via 0x4084) is exact for POSITIVE but HALVES
+     * NEGATIVES (int8's X1 didn't — a int16-specific X1 sign/shift behavior). 0x4048 and the shift couple into it,
+     * and configs that fix negatives double-count or scale x2. A clean signed fix needs a full X1/X2 sub-module
+     * scale decode (multi-reg, sign-dependent) — not yet cracked. Env overrides (ORK_ADD16_R48/84/88/78) for RE. */
     uint32_t r48=0x40000000,r84=(uint32_t)ma,r88=(uint32_t)(S+14),r78=(uint32_t)mb; const char*e;
     if((e=getenv("ORK_ADD16_R48")))r48=(uint32_t)strtoul(e,0,16);
     if((e=getenv("ORK_ADD16_R84")))r84=(uint32_t)strtoul(e,0,16);
