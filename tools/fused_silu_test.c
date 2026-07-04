@@ -24,6 +24,12 @@ int main(void){
     if(!w){ fprintf(stderr,"pack failed\n"); return 2; }
 
     int rc=0;
+    /* ---- test -1: fused SiLU run FIRST (isolation: no multi-core matmul / probe before it) ---- */
+    { int8_t *c_iso=malloc(M*N);
+      int ri=ork_mm_run_i8_silu(c, w, M, A, c_iso, 0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
+      int nz=0; for(int i=0;i<M*N;i++) if(c_iso[i]) nz++;
+      printf("[ISO fused SiLU first] rc=%d nonzero=%d/%d (0=bias-only bug, >0=acc reaches SDP)\n", ri, nz, M*N);
+      free(c_iso); }
     /* ---- test 0: plain resident matmul (bisect: is the weight/setup good?) vs CPU ref ---- */
     { int32_t *c_mm=malloc((size_t)M*N*4);
       int r0=ork_mm_run_i8(c,w,M,A,c_mm);
