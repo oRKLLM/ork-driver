@@ -4044,6 +4044,76 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     return ok;
 }
 
+/* ── Standalone on-NPU SiLU (activation-LUT SDP op) — RE probe ─────────────────────────────────────
+ * Applies the PPU activation LUT to a SINGLE int8 memory input [M][N] via the standalone 69-reg/enable=0x18
+ * SDP op (REGCMD_SILU_STD), reprogrammed to (M,N) by set_mul_geom. Two submits on the single-stream NPU:
+ * (1) LUT-load (REGCMD_SILU_LUT, streams the int16 curve into PPU SRAM); (2) the standalone op reads it.
+ * SDP math: idx=(in*R)>>6 + C0(idx_off); out=clamp_i8(R*LUT-interp(idx) + out_bias); R=r_mult/2^r_shift.
+ * The caller supplies the scale regs (r_mult,r_shift,out_bias,idx_off,cfg4064,cfg4068) and the LUT; lut==NULL
+ * keeps the captured curve. This is the RE/calibration entry (measure idx(in) with a ramp LUT, then build the
+ * silu curve at those indices — same 2-pass scheme as ork_mm_silu_build_lut but through THIS op, not a matmul).
+ * in/out int8 [M*N] row-major; N%16==0. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
+int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
+                           int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,
+                           uint32_t cfg4064,uint32_t cfg4068,const int16_t *lut,int nlut,
+                           int8_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
+    #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* int8 atom-16 cube, surf_stride=M*16 */
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
+    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    memset(A.cpu,0,sz);memset(O.cpu,0,sz);
+    int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[EWCUBE(m,n)]=in[m*N+n];
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+
+    /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) ---- */
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
+        for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) WEDGED\n"); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) ok\n");
+    }
+
+    /* ---- submit 2: standalone SiLU op (enable=0x18, regcfg=69) reading the resident LUT ---- */
+    uint32_t rc[REGCMD_SILU_STD_N]; memcpy(rc,REGCMD_SILU_STD,sizeof rc);
+    set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
+    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5040,0);                 /* single-input: no ERDMA 2nd operand */
+    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5038,0);                 /* (set_mul_geom is for the 2-input EW-mul) */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4020,(uint32_t)O.dma);   /* output */
+    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5018,(uint32_t)A.dma);   /* input (SRDMA) */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4084,(uint32_t)r_mult);  /* R mantissa */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4088,(uint32_t)r_shift); /* R shift */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4080,out_bias);          /* out_bias */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4110,idx_off);           /* C0 index offset */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4064,cfg4064);           /* index param */
+    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4068,cfg4068);           /* index param */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* full task setup — submit-1 repointed regcmd_addr at the LUT-load buffer, so re-point it here */
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef EWCUBE
+    return ok;
+}
+
 /* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
  * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
  * (REGCMD_SILU_LUT, enable=0x18) streams the int16 silu curve into PPU LUT SRAM; (2) the matmul compute

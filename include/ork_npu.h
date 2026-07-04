@@ -390,6 +390,16 @@ int          ork_npu_ewmul_f16(ork_npu *ctx, const ork_f16 *up, const ork_f16 *s
 int          ork_npu_ewmul_i16(ork_npu *ctx, const int16_t *up, const int16_t *silu, int M, int N,
                                int mult, int shift, int16_t *out, double *us);
 
+/* Standalone on-NPU SiLU (activation-LUT SDP op): applies the PPU silu LUT to a single int8 input [M][N] via
+ * the 69-reg/enable=0x18 standalone op (REGCMD_SILU_STD), reprogrammed to (M,N). Two submits (LUT-load + op).
+ * SDP: idx=(in*R)>>6 + C0; out=clamp_i8(R*LUT-interp(idx) + out_bias), R=r_mult/2^r_shift. Caller supplies the
+ * scale regs + LUT (lut==NULL keeps the captured curve). RE/calibration entry (measure idx(in) via a ramp LUT
+ * then build the curve). in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+int          ork_npu_probe_silu_std(ork_npu *ctx, const signed char *in, int M, int N,
+                                    int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
+                                    unsigned cfg4064, unsigned cfg4068, const short *lut, int nlut,
+                                    signed char *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
