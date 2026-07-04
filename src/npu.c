@@ -3663,6 +3663,8 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror run()) */
+    if(getenv("ORK_FUSED_DUMP")) fprintf(stderr,"DOMAINS: w->domain=%d dom_active=%d\n",w->domain,c->dom_active);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
     act(fd,RKNPU_ACT_RESET,0);                           /* clean PPU/SDP state before the LUT-load (probe does this) */
     int nosilu=getenv("ORK_FUSED_NOSILU")!=NULL;         /* DIAG: plain int8 requant (no LUT/silu) to isolate acc-vs-LUT */
@@ -3695,7 +3697,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
               t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
               bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
               struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-              if(rknpu_submit_ioctl(fd,&ls,-1)){ rc_ret=-1; break; } }
+              if(rknpu_submit_ioctl(fd,&ls,c->dom_active)){ rc_ret=-1; break; } }
             if(getenv("ORK_FUSED_DUMP")&&m0==0&&ns==0){ int8_t*wp=w->Bf[ns].cpu,*ap=c->Af.cpu;
                 fprintf(stderr,"WBf[0..7]=%d %d %d %d %d %d %d %d  Af[0..7]=%d %d %d %d  Bf.dma=%llx\n",
                     wp[0],wp[1],wp[2],wp[3],wp[4],wp[5],wp[6],wp[7],ap[0],ap[1],ap[2],ap[3],(unsigned long long)w->Bf[ns].dma); }
@@ -3708,7 +3710,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
             t->enable_mask=nosilu?0xd:0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            for(int rep=0;rep<3;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }   /* DIAG: 3-rep warmup like the probe */
+            for(int rep=0;rep<3;rep++){ if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ rc_ret=-1; break; } }   /* DIAG: 3-rep warmup like the probe */
             if(rc_ret) break;
             bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
             int8_t*cc=O.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
