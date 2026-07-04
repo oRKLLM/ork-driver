@@ -16,8 +16,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
+#include <math.h>
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6 + t.tv_nsec/1e3; }
+
+/* representative CPU per-token work that would run alongside the NPU FFN in a real layer (attention
+ * scores / norm / activation-quant are all fp32 memory-bound sweeps). A tunable fp32 FMA sweep. */
+static volatile float g_sink;
+static void cpu_work(float *buf, int n, int reps){
+    float acc=0;
+    for(int r=0;r<reps;r++) for(int i=0;i<n;i++) acc = acc*1.0000001f + buf[i]*0.9999999f;
+    g_sink = acc;
+}
+
+/* ---- pipeline threading: one thread runs the NPU FFN inner `iters` times ---- */
+struct npu_arg { ork_npu*c; ork_w*wg,*wu,*wd; int M,Dff; const int8_t*x; int8_t*silu_gate,*up,*glu; int32_t*out; int iters; };
+static void* npu_thread(void*a){
+    struct npu_arg*p=a; double us=0;
+    for(int it=0; it<p->iters; it++){
+        ork_mm_run_i8_silu(p->c,p->wg,p->M,p->x,p->silu_gate,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
+        ork_mm_run_i8_out8(p->c,p->wu,p->M,p->x,p->up,0x4000,14);
+        ork_npu_ewmul_i8(p->c,p->up,p->silu_gate,p->M,p->Dff,0x4000,14,p->glu,&us);
+        ork_mm_run_i8(p->c,p->wd,p->M,p->glu,p->out);
+    }
+    return NULL;
+}
 
 int main(int argc,char**argv){
     int M = argc>1?atoi(argv[1]):64;
@@ -72,6 +96,29 @@ int main(int argc,char**argv){
     printf("  ewmul     : %.1f us/ffn\n", t_e/iters);
     printf("  down      : %.1f us/ffn\n", t_d/iters);
     printf("  TOTAL     : %.1f us/ffn  (%.1f ffn/s)\n", tot/iters, iters*1e6/tot);
+
+    if(argc>3 && !strcmp(argv[3],"pipe")){
+        int n=512*1024; float*buf=malloc((size_t)n*4); for(int i=0;i<n;i++) buf[i]=(i%17)*0.01f;
+        double per_npu=tot/iters;                                   /* us per FFN */
+        double c0=now_us(); cpu_work(buf,n,1); double per_rep=now_us()-c0;
+        int reps=(int)(per_npu/per_rep); if(reps<1)reps=1;          /* balance CPU work to ~one FFN */
+        double cc0=now_us(); for(int it=0;it<iters;it++) cpu_work(buf,n,reps); double T_cpu=now_us()-cc0;
+        double T_npu=tot;                                           /* NPU FFN over `iters` (from the timed loop) */
+        struct npu_arg na={c,wg,wu,wd,M,Dff,x,silu_gate,up,glu,out,iters};
+        pthread_t th; double o0=now_us();
+        pthread_create(&th,NULL,npu_thread,&na);
+        for(int it=0;it<iters;it++) cpu_work(buf,n,reps);           /* CPU runs concurrently with the NPU FFN */
+        pthread_join(th,NULL);
+        double T_ov=now_us()-o0;
+        printf("=== PIPELINE (M=%d, %d iters, CPU work balanced to ~1 FFN) ===\n",M,iters);
+        printf("  NPU FFN alone  : %.1f ms\n", T_npu/1000);
+        printf("  CPU work alone : %.1f ms\n", T_cpu/1000);
+        printf("  SERIAL (sum)   : %.1f ms\n", (T_npu+T_cpu)/1000);
+        printf("  OVERLAPPED     : %.1f ms\n", T_ov/1000);
+        printf("  speedup vs serial: %.2fx  (ideal max ~%.2fx)\n",
+               (T_npu+T_cpu)/T_ov, (T_npu+T_cpu)/(T_npu>T_cpu?T_npu:T_cpu));
+        free(buf);
+    }
 
     ork_mm_free(c,wg); ork_mm_free(c,wu); ork_mm_free(c,wd); ork_npu_free(c);
     return 0;
