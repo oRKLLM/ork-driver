@@ -155,18 +155,63 @@ int main(int argc, char**argv){
         unsigned c4064 = argc>2?(unsigned)strtoul(argv[2],0,16):0xffff7dc8;
         unsigned c4068 = argc>3?(unsigned)strtoul(argv[3],0,16):0x411c1000;
         int A = argc>4?atoi(argv[4]):500;
+        unsigned idx_off = argc>5?(unsigned)strtoul(argv[5],0,16):0xffffc000;
         int Mf=16,Nf=64; static short in16[1024],out16[1024]; static short lut[1030];
         for(int i=0;i<Mf*Nf;i++) in16[i]=(short)(-A + (2*A)*i/(Mf*Nf-1));
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         double us=0;
-        int r=ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,0xffffc000u,c4064,c4068,lut,1030,out16,&us);
+        int r=ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us);
         if(r){ printf("c4064=%08x c4068=%08x WEDGED\n",c4064,c4068); ork_npu_free(c); return 1; }
         double sx=0,sy=0,sxx=0,sxy=0; int n=0;
         for(int i=0;i<Mf*Nf;i++){ int o=out16[i]; if(o<=-32000||o>=32000)continue; double x=in16[i],y=o+512; sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;n++; }
         if(n<3){ printf("c4064=%08x c4068=%08x (n=%d)\n",c4064,c4068,n); ork_npu_free(c); return 0; }
         double gain=(n*sxy-sx*sy)/(n*sxx-sx*sx), off=(sy-gain*sx)/n;
-        printf("c4064=%08x c4068=%08x  gain=%.5f offset=%.1f  (n=%d)\n",c4064,c4068,gain,off,n);
+        printf("idx_off=%08x c4064=%08x c4068=%08x  gain=%.5f offset=%.1f  (n=%d)\n",idx_off,c4064,c4068,gain,off,n);
         ork_npu_free(c); return 0;
+    }
+    if(!strcmp(argv[1],"silui16x")){
+        /* BIT-EXACT int16 attempt: (1) measure FRACTIONAL idx(v) via a linear ramp at high R (linear ramp is
+         * interpolated exactly, so out=R*(idx-512) reveals idx to 1/R). (2) Solve the LUT by Gauss-Seidel so the
+         * op's 6-bit linear interp lands on silu(v) at each input's exact fractional idx. (3) run at R=1, validate.
+         * Uses gain-1.24 params; idx assumed R-independent (verified for int8). */
+        double in_scale=argc>2?atof(argv[2]):0.03, out_scale=argc>3?atof(argv[3]):0.03;
+        unsigned idx_off=argc>4?(unsigned)strtoul(argv[4],0,16):0xffffe000;
+        unsigned c4068=argc>5?(unsigned)strtoul(argv[5],0,16):0x411c0200;
+        unsigned c4064=0xffff7dc8;
+        int Mf=16,Nf=64; static short in16[1024],out16[1024]; static short lut[1030];
+        static double Iv[1024], Tv[1024]; int nv=0;
+        for(int i=0;i<Mf*Nf;i++) in16[i]=(short)(i-512);         /* inputs -512..511, one each */
+        /* (1) fractional-idx calibration: linear ramp LUT (interpolated EXACTLY), R=64 -> out=64*(idx-512) */
+        for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
+        double us=0;
+        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,8,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        double gsum=0; int gc=0; double prevI=-1;
+        for(int i=0;i<Mf*Nf;i++){ int v=in16[i]; double I=out16[i]/64.0+512.0; if(I<2||I>1027)continue;
+            Iv[nv]=I; Tv[nv]=siluf(v*in_scale)/out_scale; if(prevI>0){gsum+=fabs(I-prevI);gc++;} prevI=I; nv++; }
+        double gain=gc?gsum/gc:0;
+        /* (2) solve LUT via Gauss-Seidel so op interp at each measured fractional idx hits silu(v) */
+        double flut[1030]; for(int k=0;k<1030;k++) flut[k]=0;
+        for(int j=0;j<nv;j++){ int k=(int)lround(Iv[j]); if(k>=0&&k<1030) flut[k]=Tv[j]; }  /* seed */
+        for(int k=1;k<1030;k++) if(flut[k]==0&&flut[k-1]!=0) flut[k]=flut[k-1];
+        for(int it=0;it<500;it++){ double maxr=0;
+            for(int j=0;j<nv;j++){ int f=(int)floor(Iv[j]); double fr=Iv[j]-f; if(f<0||f+1>=1030)continue;
+                double pred=flut[f]*(1-fr)+flut[f+1]*fr, r=Tv[j]-pred; if(fabs(r)>maxr)maxr=fabs(r);
+                double w=(1-fr)*(1-fr)+fr*fr; if(w<1e-9)continue;
+                flut[f]+=r*(1-fr)/w; flut[f+1]+=r*fr/w; }
+            if(maxr<0.005)break; }
+        for(int k=0;k<1030;k++){ long q=lround(flut[k]); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(short)q; }
+        /* (3) run at R=1, validate over the in-range inputs */
+        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        int bad=0; long mx=0; int checked=0;
+        for(int i=0;i<Mf*Nf;i++){ int v=in16[i]; double I=64.0; /* recompute in-range via idx from calib not avail; use target range */
+            double ref_d=siluf(v*in_scale)/out_scale; long ref=lround(ref_d); if(ref>32767)ref=32767; if(ref<-32768)ref=-32768;
+            /* only score inputs whose idx was in range (approx: |out| not saturated) */
+            if(out16[i]<=-32760||out16[i]>=32760) continue; checked++;
+            long e=labs((long)out16[i]-ref); if(e>mx)mx=e; if(e>1)bad++;
+            if((i%61)==0) printf("  in=%5d out=%6d ref=%6ld\n",v,out16[i],ref); (void)I; }
+        printf("silui16x rc=0 (%.1f us) idx_off=%08x c4068=%08x gain=%.3f in_scale=%.3f  nv=%d checked=%d bad(|e|>1)=%d max|e|=%ld\n",
+               us,idx_off,c4068,gain,in_scale,nv,checked,bad,mx);
+        ork_npu_free(c); return bad?1:0;
     }
     if(!strcmp(argv[1],"silui16")){
         /* int16 SiLU: measure idx(in) via ramp (R=0.5), build silu curve, run + validate vs CPU. Inputs span
