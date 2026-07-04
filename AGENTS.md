@@ -127,7 +127,8 @@ src/rknpu_ioctl.h      open DRM uABI of the upstream rknpu kernel driver
 src/regcmd_*.h         captured regcmd templates (our RE; no proprietary content)
 examples/              test_matmul · layer · decode · model · llama2 — the test suite (each
                        self-validates vs CPU; MHA/GQA/arbitrary-head_dim covered). `make test` runs them.
-tools/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs)
+tools/re/               NPU reverse-engineering toolkit (capture→decode→templatize new ops/NPUs; README there)
+tools/re/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs / new ops)
 docs/ADDING_AN_SOC.md   how to add/validate a SoC (RE narrative + scratch live on the wiki)
 ```
 
