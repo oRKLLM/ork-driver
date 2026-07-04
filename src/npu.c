@@ -72,6 +72,10 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
+    /* persistent SDP element-wise/activation-op scratch (a/b/out), REUSED across ewmul/add calls to avoid
+     * per-op MEM_CREATE/MEM_DESTROY churn (that churn dominates standalone-op latency AND fragments the
+     * IOVA window -> wedge). Grows monotonically to the largest cube seen; freed at teardown. */
+    struct buf ppu_a, ppu_b, ppu_o; size_t ppu_sz;
     /* PER-DOMAIN SCRATCH (multi-domain residence): a submit runs in ONE iommu_domain_id, so EVERY buffer
      * it touches (regcmd, task, activation Af, output Cc, and the per-core multi-core scratch) must live in
      * the same domain as the weight. The fields above are the ACTIVE working set; dom_active is which
@@ -287,6 +291,19 @@ static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->s
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
+/* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
+ * Reused across every ewmul/add call so the per-op MEM_CREATE/MEM_DESTROY churn (which dominates the
+ * standalone-op cost and fragments the IOVA window) is paid ONCE, not per call. 0 on success, -1 on alloc
+ * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
+static int ppu_scratch3(ork_npu *c,size_t sz){
+    if(sz<4096) sz=4096;
+    if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu) return 0;
+    bdestroy(c->fd,&c->ppu_a); bdestroy(c->fd,&c->ppu_b); bdestroy(c->fd,&c->ppu_o);
+    c->ppu_a=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
+    c->ppu_b=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_b.cpu){bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
+    c->ppu_o=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_o.cpu){bdestroy(c->fd,&c->ppu_a);bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
+    c->ppu_sz=sz; return 0;
+}
 
 /* Zero-copy IMPORT (no page alloc, no copy): allocate a dma-buf from /dev/dma_heap/system, mmap it,
  * import it into the NPU's IOMMU domain via PRIME_FD_TO_HANDLE -> MEM_CREATE(handle, flags=0, size=0).
@@ -827,6 +844,7 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);bdestroy(fd,&c->mtk_all);
+    bdestroy(fd,&c->ppu_a);bdestroy(fd,&c->ppu_b);bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
     /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
     if(c->dom_save){ for(int d=0;d<ORK_MAXDOM;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
@@ -4162,9 +4180,8 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    if(ppu_scratch3(c,sz)) return -2;                          /* reuse persistent scratch (no per-op churn) */
+    struct buf A=c->ppu_a, B=c->ppu_b, O=c->ppu_o;
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=a16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=b16[m*N+n]; }
@@ -4183,7 +4200,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    /* scratch persists (ppu_scratch3) — not destroyed */
     #undef EWCUBEH
     return ok;
 }
