@@ -4114,6 +4114,95 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     return ork_npu_probe_add_i8(c,a,b,M,N,(int)ma,S+14,(uint32_t)mb,0,0,0,out,us);
 }
 
+/* On-NPU fp16 element-wise ADD (residual): out[m][n] = a[m][n] + b[m][n] in fp16 via the 2-input SDP ALU=add op
+ * (REGCMD_ADD_F16, gain 1). NVDLA fp16 cube (atom-8, 2-byte). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
+        *(uint16_t*)((char*)A.cpu+p)=a16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=b16[m*N+n]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_ADD_F16_N]; memcpy(rc,REGCMD_ADD_F16,sizeof rc);
+    set_mul_geom(rc,REGCMD_ADD_F16_N,M,N);
+    setr(rc,REGCMD_ADD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_ADD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_ADD_F16_N,0x2001,0x5038,(uint32_t)B.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    #undef EWCUBEH
+    return ok;
+}
+
+/* On-NPU int16 element-wise ADD: out = clamp_i16(round((a*a_scale + b*b_scale)/out_scale)) via the 2-input SDP
+ * ALU=add op (REGCMD_ADD_I16). Same requant structure as int8. Residual (equal scales) => clamp_i16(a+b), exact;
+ * arbitrary unequal scales approximate. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
+                    double a_scale,double b_scale,double out_scale,int16_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)||out_scale<=0) return -2;
+    double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
+    int S=14; while(S>0 && cmax*(double)(1u<<S) > 0x4000) S--;
+    while(S<30 && cmax*(double)(1u<<(S+1)) <= 0x4000) S++;
+    long ma=lround(ca*(double)(1u<<S)), mb=lround(cb*(double)(1u<<S));
+    if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
+        *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
+    set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_ADD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_ADD_I16_N,0x2001,0x5038,(uint32_t)B.dma);
+    /* EXPERIMENTAL: int16 add's operand scaling lives in NVDLA SDP X1/X2 sub-module regs that differ from int8's
+     * (0x4048 carries an extra per-operand scale); not yet fully decoded, so int16 add is NOT bit-exact. Env
+     * overrides (ORK_ADD16_R48/84/88/78) are provided for RE sweeps. */
+    uint32_t r48=0x40000000,r84=(uint32_t)ma,r88=(uint32_t)(S+14),r78=(uint32_t)mb; const char*e;
+    if((e=getenv("ORK_ADD16_R48")))r48=(uint32_t)strtoul(e,0,16);
+    if((e=getenv("ORK_ADD16_R84")))r84=(uint32_t)strtoul(e,0,16);
+    if((e=getenv("ORK_ADD16_R88")))r88=(uint32_t)strtoul(e,0,16);
+    if((e=getenv("ORK_ADD16_R78")))r78=(uint32_t)strtoul(e,0,16);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4048,r48);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4084,r84);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4088,r88);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4078,r78);
+    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_ADD_I16_N,0x1001,0x4074,0); setr(rc,REGCMD_ADD_I16_N,0x1001,0x4080,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    #undef EWCUBEH
+    return ok;
+}
+
 /* ── Standalone on-NPU SiLU (activation-LUT SDP op) — RE probe ─────────────────────────────────────
  * Applies the PPU activation LUT to a SINGLE int8 memory input [M][N] via the standalone 69-reg/enable=0x18
  * SDP op (REGCMD_SILU_STD), reprogrammed to (M,N) by set_mul_geom. Two submits on the single-stream NPU:

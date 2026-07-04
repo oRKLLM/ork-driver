@@ -441,6 +441,16 @@ int          ork_npu_silu_i16(ork_npu *ctx, const short *in, int M, int N,
 int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
                             double a_scale, double b_scale, double out_scale, signed char *out, double *us);
 
+/* On-NPU fp16 element-wise ADD (residual): out = a + b in fp16 via the 2-input SDP ALU=add op. in/out fp16
+ * [M*N], N%8==0; rk3588-gated. 0/ok,-1,-2,-3. */
+int          ork_npu_add_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
+
+/* On-NPU int16 element-wise ADD — EXPERIMENTAL, not yet bit-exact. int16's per-operand scaling lives in NVDLA
+ * SDP X1/X2 sub-module regs that differ from the int8 op (0x4048 carries an extra scale) and isn't fully decoded.
+ * out = clamp_i16(round((a*a_scale + b*b_scale)/out_scale)). in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int          ork_npu_add_i16(ork_npu *ctx, const short *a, const short *b, int M, int N,
+                             double a_scale, double b_scale, double out_scale, short *out, double *us);
+
 /* Standalone int8 element-wise ADD — RE probe (settable scale regs). 2-input SDP op with ALU=add. Caller sets
  * out scale mult/shift, b-operand scale bscale, and zero-points za/zb/zo. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
 int          ork_npu_probe_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,

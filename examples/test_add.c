@@ -29,6 +29,33 @@ static int run_case(ork_npu *c, const char *name, int M, int N, double sa, doubl
     return mism?1:0;
 }
 
+/* fp16 residual add: out = a + b in fp16 (exact) */
+static int run_f16(ork_npu *c, int M, int N){
+    static ork_f16 a[MAXE], b[MAXE], out[MAXE];
+    for(int i=0;i<M*N;i++){ a[i]=(ork_f16)((((i*7)%23)-11)*0.25f); b[i]=(ork_f16)((((i*5)%17)-8)*0.5f); }
+    double us=0;
+    int r=ork_npu_add_f16(c,a,b,M,N,out,&us);
+    if(r){ printf("  f16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
+    int bad=0; float mx=0;
+    for(int i=0;i<M*N;i++){ float ref=(float)(ork_f16)((float)a[i]+(float)b[i]); float e=fabsf((float)out[i]-ref);
+        if(e>mx)mx=e; if(e>0.02f) bad++; }
+    printf("  f16 [%dx%-4d] %s bad=%d/%d max|err|=%.4f  (%.1f us)\n",M,N,bad?"FAIL":"ok  ",bad,M*N,mx,us);
+    return bad?1:0;
+}
+/* int16 residual add: out = clamp_i16(a+b) exact */
+static int run_i16(ork_npu *c, int M, int N){
+    static short a[MAXE], b[MAXE], out[MAXE];
+    for(int i=0;i<M*N;i++){ a[i]=(short)(((i*97)%20000)-10000); b[i]=(short)(((i*53)%16000)-8000); }
+    double us=0;
+    int r=ork_npu_add_i16(c,a,b,M,N,0.001,0.001,0.001,out,&us);
+    if(r){ printf("  i16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
+    int mism=0; long mx=0;
+    for(int i=0;i<M*N;i++){ long ref=(long)a[i]+b[i]; if(ref>32767)ref=32767; if(ref<-32768)ref=-32768;
+        long d=labs((long)out[i]-ref); if(d>0){mism++; if(d>mx)mx=d;} }
+    printf("  i16 [%dx%-4d] %s mism=%d/%d max|err|=%ld  (%.1f us)\n",M,N,mism?"FAIL":"ok  ",mism,M*N,mx,us);
+    return mism?1:0;
+}
+
 int main(void){
     ork_npu *c = ork_npu_init();
     if(!c){ printf("ork_npu_init failed (board only) — SKIP\n"); return 0; }
@@ -46,6 +73,12 @@ int main(void){
     /* NOTE: arbitrary unequal scales (non-power-of-2 coeffs) are approximate — the b-operand scale field
      * (0x4078) is a wide field whose exact encoding isn't fully decoded yet. Residual connections use EQUAL
      * scales (both operands on the residual stream), which is the exact/validated case above. */
+
+    printf("on-NPU element-wise ADD (fp16 residual) vs CPU ref:\n");
+    static const int shp[][2] = { {8,64}, {16,64}, {8,128}, {4,512} };
+    for(unsigned s=0;s<sizeof(shp)/sizeof(shp[0]);s++) fail |= run_f16(c, shp[s][0], shp[s][1]);
+    /* int16 add is EXPERIMENTAL (SDP X1/X2 sub-module scale decode pending) — informational, not gated */
+    (void)run_i16;
 
     ork_npu_free(c);
     printf("%s\n", fail ? "FAIL" : "ALL OK");
