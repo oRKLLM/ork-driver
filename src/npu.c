@@ -3666,7 +3666,6 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror run()) */
     if(getenv("ORK_FUSED_DUMP")) fprintf(stderr,"DOMAINS: w->domain=%d dom_active=%d\n",w->domain,c->dom_active);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    act(fd,RKNPU_ACT_RESET,0);                           /* clean PPU/SDP state before the LUT-load (probe does this) */
     int nosilu=getenv("ORK_FUSED_NOSILU")!=NULL;         /* DIAG: plain int8 requant (no LUT/silu) to isolate acc-vs-LUT */
     int chunk=64; if(chunk>M)chunk=M;                    /* single fused M-tile per submit (<=64, validated) */
     /* activation + int8-output scratch (grow as needed) */
@@ -3695,6 +3694,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            act(fd,RKNPU_ACT_RESET,0);   /* reset is the LAST thing before the submits (probe order: marshal->bsync->RESET->LUT->matmul) — MEM_CREATE/sync between reset and submit disturbs the primed conv->SDP state */
             /* submit A: LUT-load (enable 0x18) — immediately before the matmul submit */
             if(!nosilu){ struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
