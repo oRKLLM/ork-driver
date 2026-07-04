@@ -582,6 +582,25 @@ static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
  * a working op completes in ~100us, so a short guard is safe; the kernel soft-resets on timeout either way. */
 static unsigned ew_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_EW_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
 
+/* Generalize the standalone element-wise MUL op (REGCMD_MUL{,_F16,_I16}) from the captured M=8,N=64 geometry
+ * to arbitrary (M tokens = RDMA width, N channels). Derived by capturing the op at N=128 and M=16 and diffing:
+ * M-dependent regs = M-1 (0x500c/0x4030/0x405c) and M*16 (strides 0x5040/0x4024/0x40c0 = EW_SURF_STRIDE /
+ * output stride / SURFACE_ADD); N-dependent = N-1 (0x5014/0x4058) and (N-1)|(N-1)<<16 (0x403c). The channel
+ * atom (16 for int8, 8 for the 2-byte fp16/int16) sets the cube; both give surf_stride = M*16 bytes. */
+static void set_mul_geom(uint32_t *rc,int n,int M,int N){
+    uint32_t sstride=(uint32_t)(M*16);
+    setr(rc,n,0x2001,0x500c,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+    setr(rc,n,0x2001,0x5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+    setr(rc,n,0x2001,0x5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+    setr(rc,n,0x2001,0x5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
+    setr(rc,n,0x1001,0x4024,sstride);                  /* output surface stride */
+    setr(rc,n,0x1001,0x4030,(uint32_t)(M-1));
+    setr(rc,n,0x1001,0x403c,(uint32_t)(((N-1)<<16)|(N-1)));
+    setr(rc,n,0x1001,0x4058,(uint32_t)(N-1));
+    setr(rc,n,0x1001,0x405c,(uint32_t)(M-1));
+    setr(rc,n,0x1001,0x40c0,sstride);                  /* SURFACE_ADD = M*16 */
+}
+
 /* Apply ork's synth_i8 matmul GEOMETRY (same formulas as synth_i8, sched=1) onto an arbitrary regcmd `rc`
  * of length `n`. Used to inject ork's geometry into RKNN's EW-mul TEMPLATE (REGCMD_EWMUL_LIN) — which keeps
  * RKNN's register ORDER + EW output-stage/lane (so it executes) while making the conv engine read ork's own
@@ -3905,24 +3924,26 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
 
 /* Public EW-mul: out[m*N+n] = clamp_i8(round(up[m][n]*silu[m][n] * mult/2^shift)) computed ON THE NPU via the
  * standalone SDP element-wise op. Marshals up/silu (logical [M][N]) into the NVDLA feature cube (atom-16),
- * submits REGCMD_MUL with symmetric zero-points (za=zb=zo=0), de-marshals. Supports the captured op geometry
- * (M=8, N=64); other shapes need the cube dims/strides reprogrammed (returns -2). mult must be 0..0x7fff
- * (OUT_CVT_SCALE is a SIGNED 16-bit field). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
+ * submits REGCMD_MUL with symmetric zero-points (za=zb=zo=0), de-marshals. GENERALIZED to arbitrary M,N via
+ * set_mul_geom (M,N reprogrammed from the captured M=8/N=64 op). N must be a multiple of 16 (channel atom).
+ * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M!=8||N!=64) return -2;                       /* captured op geometry (generalization = reprogram dims) */
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;             /* N multiple of the int8 atom (16) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
-    #define EWCUBE(m,n) (((n)/16)*128 + (m)*16 + ((n)%16))   /* NVDLA feature cube, atom=16, W=8, C=64 */
-    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
+    #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* NVDLA cube, atom=16, surf_stride=M*16 */
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;                    /* int8 cube = M*N bytes */
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=up[m*N+n]; bc[p]=silu[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_N,M,N);
     setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);        /* output */
     setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);        /* up  (SRDMA)  */
     setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);        /* silu (ERDMA) */
@@ -3945,23 +3966,26 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
 }
 
 /* fp16 element-wise MULTIPLY: out[m][n] = up[m][n] * silu[m][n] in fp16 on the NPU (standalone SDP fp16 op,
- * no requant). Marshals into the NVDLA fp16 feature cube (atom=8, 2-byte channels) internally. Shape M=8,N=64
- * (captured geometry); rk3588-gated. up/silu/out are fp16 bit-patterns (ork_f16). 0/ok,-1 wedged,-2 shape,-3 SoC. */
+ * no requant). Marshals into the NVDLA fp16 feature cube (atom=8, 2-byte channels) internally. GENERALIZED to
+ * arbitrary M,N (N a multiple of 8); rk3588-gated. up/silu/out are fp16 bit-patterns (ork_f16).
+ * 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M!=8||N!=64) return -2;
-    #define EWCUBEH(m,n) (((n)/8)*128 + (m)*16 + ((n)%8)*2)      /* BYTE offset, fp16 atom=8, W=8, C=64 */
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the fp16 atom (8) */
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* BYTE offset, fp16 atom=8, surf_stride=M*16 */
     const uint16_t *u16=(const uint16_t*)up,*s16=(const uint16_t*)silu; uint16_t *o16=(uint16_t*)out;
-    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* fp16 cube = M*N*2 bytes */
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
     setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
     setr(rc,REGCMD_MUL_F16_N,0x2001,0x5018,(uint32_t)A.dma);
     setr(rc,REGCMD_MUL_F16_N,0x2001,0x5038,(uint32_t)B.dma);
@@ -3980,23 +4004,25 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
 
 /* int16 element-wise MULTIPLY: out[m][n] = clamp_i16(round(up[m][n]*silu[m][n] * mult/2^shift)) on the NPU
  * (standalone SDP int16 op). The w4a4 path's EW precision (ork's int4 matmul outputs int16). 2-byte operands,
- * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. Shape M=8,N=64; rk3588-
- * gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+ * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. GENERALIZED to arbitrary
+ * M,N (N a multiple of 8); rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M!=8||N!=64) return -2;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
-    #define EWCUBEH(m,n) (((n)/8)*128 + (m)*16 + ((n)%8)*2)      /* 2-byte atom=8 cube (fp16/int16), W=8,C=64 */
-    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* 2-byte atom=8 cube (fp16/int16), surf_stride=M*16 */
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* int16 cube = M*N*2 bytes */
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
     setr(rc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)A.dma);
     setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);
