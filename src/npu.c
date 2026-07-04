@@ -3757,6 +3757,40 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
     return rc_ret;
 }
 
+/* Resident-weight int8 matmul with int8-REQUANTIZED output (no activation): C = clamp_i8(round((A·W)*
+ * mult/2^shift)) as int8 [M*N]. For keeping int8 intermediates on the NPU across a chained FFN inner
+ * (the "up" projection feeding the EW-mul). Same resident full-K path + submit1 as the fused runs. */
+int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int mult,int shift){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(w->dtype!=DT_I8 || !w->Bf) return -2;
+    int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
+    if(K%512 || K>4096 || N%32) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    int chunk=64; if(chunk>M)chunk=M;
+    size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
+    if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    int rc_ret=0;
+    for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        uint64_t wbase=w->Bf[ns].dma; bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+            int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
+            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); act(fd,RKNPU_ACT_RESET,0);
+            uint32_t rc[REGCMD_I8_N];
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            set_i8_out8(rc,Nc,0,mult,shift);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+              t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            c->warmed=0; if(submit1(c)){ rc_ret=-1; break; }
+            int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+        }
+    }
+    return rc_ret;
+}
+
 /* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
  * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
  * weights. Returns 0 if the submit completed (C[N] int32 valid), -1 if it wedged (K over the

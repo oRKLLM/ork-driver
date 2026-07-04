@@ -301,6 +301,10 @@ int          ork_mm_run_i8_silu(ork_npu *ctx, ork_w *w, int M, const int8_t *A, 
  * (K%512==0, K<=4096). Together with ork_mm_run_i8_silu this is the full fused SwiGLU FFN inner. */
 int          ork_mm_run_i8_ewmul(ork_npu *ctx, ork_w *w, int M, const int8_t *A, const int8_t *G,
                                  int8_t *C, int mult, int shift);
+/* Resident int8 matmul with int8-requantized output: C = clamp_i8(round((A·W)*mult/2^shift)) [M*N].
+ * Keeps intermediates int8 on the NPU (the "up" projection feeding a chained FFN-inner EW-mul). */
+int          ork_mm_run_i8_out8(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int8_t *C,
+                                int mult, int shift);
 /* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
