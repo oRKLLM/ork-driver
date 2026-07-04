@@ -419,6 +419,12 @@ int          ork_npu_probe_silu_std_i16(ork_npu *ctx, const short *in, int M, in
 int          ork_npu_silu_i8(ork_npu *ctx, const signed char *in, int M, int N,
                              double in_scale, double out_scale, signed char *out, double *us);
 
+/* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
+ * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT
+ * index model is approximate pending an int16-op gain sweep. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int          ork_npu_silu_i16(ork_npu *ctx, const short *in, int M, int N,
+                              double in_scale, double out_scale, short *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific

@@ -127,6 +127,28 @@ int main(int argc, char**argv){
         printf("siluf16 rc=0 (%.1f us) bad(|e|>0.5)=%d/%d max|e|=%.3f\n",us,bad,Mf*Nf,mx);
         ork_npu_free(c); return bad?1:0;
     }
+    if(!strcmp(argv[1],"sweep")){
+        /* Fit idx = gain*in + offset for given c4064/c4068 on the int8 op (ramp LUT R=0.5 -> idx=2*out+512).
+         * Non-verbose: prints one line so it can be called across a grid to decode the index-gain encoding. */
+        unsigned c4064 = argc>2?(unsigned)strtoul(argv[2],0,16):0xffff7dc8;
+        unsigned c4068 = argc>3?(unsigned)strtoul(argv[3],0,16):0x411c0800;
+        unsigned idx_off = argc>4?(unsigned)strtoul(argv[4],0,16):0xffffc000;
+        int idxof[256]; for(int v=0;v<256;v++)idxof[v]=-1;
+        for(int i=0;i<M*N;i++) in[i]=(signed char)((i%256)-128);
+        for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
+        double us=0;
+        int r=ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,idx_off,c4064,c4068,lut,1030,out,&us);
+        if(r){ printf("c4064=%08x c4068=%08x WEDGED\n",c4064,c4068); ork_npu_free(c); return 1; }
+        for(int i=0;i<M*N;i++){ int v=(unsigned char)in[i]; int o=out[i]; if(o>-127&&o<127) idxof[v]=2*o+512; }
+        /* fit slope/intercept from unsaturated samples via least squares */
+        double sx=0,sy=0,sxx=0,sxy=0; int n=0;
+        for(int vv=-128;vv<128;vv++){ int idx=idxof[(unsigned char)vv]; if(idx<0)continue; sx+=vv;sy+=idx;sxx+=(double)vv*vv;sxy+=(double)vv*idx;n++; }
+        if(n<3){ printf("c4064=%08x c4068=%08x  (n=%d too few)\n",c4064,c4068,n); ork_npu_free(c); return 0; }
+        double gain=(n*sxy-sx*sy)/(n*sxx-sx*sx), off=(sy-gain*sx)/n;
+        int vlo=999,vhi=-999; for(int vv=-128;vv<128;vv++)if(idxof[(unsigned char)vv]>=0){ if(vv<vlo)vlo=vv; if(vv>vhi)vhi=vv; }
+        printf("c4064=%08x c4068=%08x  gain=%.4f offset=%.1f  (n=%d, in[%d..%d])\n",c4064,c4068,gain,off,n,vlo,vhi);
+        ork_npu_free(c); return 0;
+    }
     if(!strcmp(argv[1],"silui16")){
         /* int16 SiLU: measure idx(in) via ramp (R=0.5), build silu curve, run + validate vs CPU. Inputs span
          * [-A,A] int16; in_scale maps int16->real, out_scale maps real->int16 output. */
