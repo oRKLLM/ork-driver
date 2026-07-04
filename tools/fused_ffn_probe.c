@@ -17,9 +17,13 @@
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
 #include <math.h>
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6 + t.tv_nsec/1e3; }
+/* pin the calling thread to big cores [lo..hi] (RK3588 A76 = 4..7) so the NPU-driver thread and the
+ * CPU-work thread don't fight for the same core during the overlap. */
+static void pin(int lo,int hi){ cpu_set_t s; CPU_ZERO(&s); for(int i=lo;i<=hi;i++)CPU_SET(i,&s); pthread_setaffinity_np(pthread_self(),sizeof s,&s); }
 
 /* representative CPU per-token work that would run alongside the NPU FFN in a real layer (attention
  * scores / norm / activation-quant are all fp32 memory-bound sweeps). A tunable fp32 FMA sweep. */
@@ -33,7 +37,7 @@ static void cpu_work(float *buf, int n, int reps){
 /* ---- pipeline threading: one thread runs the NPU FFN inner `iters` times ---- */
 struct npu_arg { ork_npu*c; ork_w*wg,*wu,*wd; int M,Dff; const int8_t*x; int8_t*silu_gate,*up,*glu; int32_t*out; int iters; };
 static void* npu_thread(void*a){
-    struct npu_arg*p=a; double us=0;
+    struct npu_arg*p=a; double us=0; pin(4,4);   /* NPU-driver thread on its own big core */
     for(int it=0; it<p->iters; it++){
         ork_mm_run_i8_silu(p->c,p->wg,p->M,p->x,p->silu_gate,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
         ork_mm_run_i8_out8(p->c,p->wu,p->M,p->x,p->up,0x4000,14);
@@ -107,8 +111,10 @@ int main(int argc,char**argv){
         struct npu_arg na={c,wg,wu,wd,M,Dff,x,silu_gate,up,glu,out,iters};
         pthread_t th; double o0=now_us();
         pthread_create(&th,NULL,npu_thread,&na);
+        pin(5,7);                                                   /* CPU work off the NPU thread's core */
         for(int it=0;it<iters;it++) cpu_work(buf,n,reps);           /* CPU runs concurrently with the NPU FFN */
         pthread_join(th,NULL);
+        pin(4,7);
         double T_ov=now_us()-o0;
         printf("=== PIPELINE (M=%d, %d iters, CPU work balanced to ~1 FFN) ===\n",M,iters);
         printf("  NPU FFN alone  : %.1f ms\n", T_npu/1000);
