@@ -24,6 +24,14 @@ int main(void){
     if(!w){ fprintf(stderr,"pack failed\n"); return 2; }
 
     int rc=0;
+    /* ---- test 0: plain resident matmul (bisect: is the weight/setup good?) vs CPU ref ---- */
+    { int32_t *c_mm=malloc((size_t)M*N*4);
+      int r0=ork_mm_run_i8(c,w,M,A,c_mm);
+      long mism=0,maxe=0;
+      for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long acc=0; for(int k=0;k<K;k++) acc+=(long)A[(size_t)m*K+k]*B[(size_t)k*N+n];
+          long e=labs(acc-c_mm[(size_t)m*N+n]); if(e){mism++; if(e>maxe)maxe=e;} }
+      printf("[plain matmul] resident-vs-CPU: rc=%d mism=%ld/%d max|e|=%ld %s\n", r0, mism, M*N, maxe, mism?"FAIL(weight/setup bad)":"OK(weight good)");
+      free(c_mm); }
     /* ---- test 1: fused SiLU (probe's known-good g2 constants) ---- */
     int8_t *c_ref=malloc(M*N), *c_run=malloc(M*N);
     int r1 = ork_npu_probe_i8_silu(c, M, K, N, A, B, c_ref, NULL);
