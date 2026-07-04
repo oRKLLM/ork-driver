@@ -346,6 +346,25 @@ int          ork_npu_probe_i8_silu_cfg(ork_npu *ctx, int M, int K, int N, const 
                                        int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off,
                                        uint32_t cfg4068, const int16_t *lut, int nlut, int8_t *C, double *us);
 
+/* RE/validation for the fused EW-mul (SwiGLU dual-input) output stage: full-K int8 matmul A*B whose output
+ * stage int8-requantizes the accumulator and multiplies it by a SECOND input G (= silu(gate)); returns
+ * C[M*N] int8. Splices the 0x50xx second-DPU lane (regcfg 108->126). A[M*K] B[K*N] G[M*N] row-major int8.
+ * First-run contract: validate at the captured shape (M=8,N=32) — see EWMUL_WIP.md. 0/ok, -1 wedged, -2 dims. */
+int          ork_npu_probe_i8_ewmul(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
+                                    const int8_t *G, int mult, int shift, int8_t *C, double *us);
+
+/* Path (b): submit RKNN's captured EW-mul op VERBATIM (REGCMD_EWMUL) with ork's buffers, only repointing
+ * addresses. Tests whether the templatized op executes on ork's submit path (RKNN's own geometry). Buffers
+ * mirror the captured handle layout: in->input(4KiB), wt->weights(32KiB,+0x2300), gl->silu(8KiB,+0x400),
+ * out<-output(4KiB). 0/ok, -1 wedged. ORK_EW_DUMP=1 prints the regcmd and skips the submit. */
+int          ork_npu_probe_i8_ewmul_tmpl(ork_npu *ctx, const void *in, int Isz, const void *wt, int Wsz,
+                                         const void *gl, int Gsz, void *out, int Osz, double *us);
+
+/* Path (b) matmul replay: the captured matmul-shaped EW-mul op (K=512,N=64,M=8) with ork's tile packing.
+ * out = requant(A*B) (mul) G, G=silu(gate) int8. A[8*512] B[512*64] G[8*64] C[8*64] int8. 0/ok,-1,-2. */
+int          ork_npu_probe_i8_ewmul_lin(ork_npu *ctx, const int8_t *A, const int8_t *B, const int8_t *G,
+                                        int8_t *C, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific

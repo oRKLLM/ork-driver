@@ -26,6 +26,7 @@
 #include "regcmd_i8.h"
 #include "regcmd_i4.h"
 #include "regcmd_silu.h"
+#include "regcmd_ewmul.h"
 #include "ork_npu.h"
 #include "soc.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -559,6 +560,121 @@ static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
     setr(rc,REGCMD_I8_N,0x1001,0x411c,0x00004000); /* fixed config (scale-independent) */
     setr(rc,REGCMD_I8_N,0x1001,0x4128,0x40320000); /* fixed config */
     setr(rc,REGCMD_I8_N,0x1001,0x412c,0x000001a0); /* fixed config */
+}
+
+/* ── Fused EW-mul (SwiGLU dual-input) output stage ───────────────────────────────────────────────
+ * The SwiGLU inner is out = silu(gate(x)) ⊙ up(x). The SiLU half fuses into gate's output stage
+ * (set_i8_silu). The elementwise-multiply by silu(gate) fuses into UP's output stage as a DUAL-INPUT
+ * op: the PPU reads a SECOND input through a second DPU lane (regs 0x50xx, lane 0x2001) and multiplies
+ * it into the requantized up_acc. Decoded from the RKNN SwiGLU capture (sw_up.reg EW-mul compute op):
+ *   0x4070 = 0x904002c4      main-lane EW-mul enable/mode (plain=0x0302, silu=0x0383)
+ *   0x50xx (18 regs)          second-input read surface; 0x5018 = its base address (= silu(gate) buffer)
+ *   0x4100..0x412c = 0        NO LUT (pure multiply, not an activation)
+ *
+ * ork's REGCMD_I8 has NO 0x50xx lane (108 reg entries). synth_i8_ew SPLICES the captured
+ * REGCMD_EW_LANE (18 entries) into a synth_i8'd regcmd, before its 8-word trailer -> 126 reg entries
+ * (submit with regcfg_amount=126). set_i8_ewmul then patches the main-lane output stage (int8 requant +
+ * EW-mul enable) and the 2nd-input address. The 0x50xx stride/partner-address fields are seeded from the
+ * capture and refined by board matched-diff (see EWMUL_WIP.md) — first-run status is DIAGNOSTIC. */
+#define REGCMD_I8_EW_N (REGCMD_I8_N + REGCMD_EW_LANE_N)   /* 224 + 36 = 260 words = 126 reg entries + trailer */
+
+/* EW-mul RE submit timeout (ms). ORK_EW_TIMEOUT lets the wedge-search fail fast (~1-2s) instead of 60s —
+ * a working op completes in ~100us, so a short guard is safe; the kernel soft-resets on timeout either way. */
+static unsigned ew_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_EW_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
+
+/* Apply ork's synth_i8 matmul GEOMETRY (same formulas as synth_i8, sched=1) onto an arbitrary regcmd `rc`
+ * of length `n`. Used to inject ork's geometry into RKNN's EW-mul TEMPLATE (REGCMD_EWMUL_LIN) — which keeps
+ * RKNN's register ORDER + EW output-stage/lane (so it executes) while making the conv engine read ork's own
+ * [Nt][Kt][32][32] A/B tile layout (so acc is correct). Addresses (0x1070/0x1110/0x4020) patched by caller. */
+static void apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
+    setr(rc,n,0x201,0x1024,((K-1)<<16)|K);setr(rc,n,0x201,0x1030,K*N);setr(rc,n,0x201,0x1034,K);
+    setr(rc,n,0x201,0x1044,(K+63)/64);setr(rc,n,0x201,0x1088,K);setr(rc,n,0x201,0x107c,K/16);
+    setr(rc,n,0x201,0x1020,0x10000|mc);setr(rc,n,0x201,0x1084,0x10000|mc);setr(rc,n,0x201,0x102c,mc);
+    setr(rc,n,0x1001,0x4034,mc-1);setr(rc,n,0x1001,0x405c,(mc-1)<<16);setr(rc,n,0x801,0x3014,(mc-1)<<16);
+    setr(rc,n,0x1001,0x403c,((N-1)<<16)|(N-1));setr(rc,n,0x1001,0x4058,N-1);setr(rc,n,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
+    setr(rc,n,0x201,0x1038,0x1010000|N);setr(rc,n,0x801,0x3018,N-1);
+    int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+    int rows=(mc+1<R)?(mc+1):R; setr(rc,n,0x201,0x1010,16*rows);
+    double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
+    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,n,0x201,0x1040,v);
+}
+
+/* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
+ * already filled by synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
+ * [108 reg entries] [REGCMD_EW_LANE 18 entries] [8-word trailer]. */
+static void splice_ew_lane(uint32_t*rc,const uint32_t*base){
+    memcpy(rc,               base,             216*4);                 /* 108 register entries (0x10xx/0x30xx/0x40xx) */
+    memcpy(rc+216,           REGCMD_EW_LANE,   REGCMD_EW_LANE_N*4);    /* 18 second-lane entries (0x50xx) */
+    memcpy(rc+216+REGCMD_EW_LANE_N, base+216,  8*4);                   /* the original end-of-regcmd trailer, now last */
+}
+
+/* set_i8_ewmul — NVDLA SDP element-wise MULTIPLY grafted onto ork's WORKING conv+int8-out program.
+ * Recipe from the mesa "rocket" driver source (NVDLA-derived): ork's synth_i8+set_i8_out8 does the conv ->
+ * SDP pipeline -> int8-out (OUT_CVT gain in 0x4084/0x4088). We ADD the SDP element-wise path: EW_CFG for a
+ * multiply with the operand from the element-wise RDMA, and program the DPU_RDMA (0x50xx) to fetch the 2nd
+ * input (silu(gate)) from aG at RDMA_EW_BASE_ADDR (0x5038). The DPU_RDMA block is APPENDED after 0x40xx
+ * (rocket emits DPU then a contiguous DPU_RDMA block — append is valid). aG = silu(gate) dma base.
+ * NVDLA fields (registers.xml): EW_CFG 0x4070 bits: EW_BYPASS(0) EW_OP_BYPASS(1) EW_OP_TYPE(2,1=mul)
+ * EW_OP_SRC(6,1=rdma) EW_LUT_BYPASS(7) EW_OP_CVT_BYPASS(8) EW_RELU_BYPASS(9). EW_CVT 0x4074 offset /
+ * 0x4078 {scale[0-15],shift[16-21]} scales the operand. RDMA: 0x5034 ERDMA_CFG(en+mode), 0x5038 EW_BASE,
+ * 0x5040 EW_SURF_STRIDE, 0x500c/5010/5014 = W-1/H-1/C-1, 0x5068 {E,N,B,M}_WEIGHT. Submit enable_mask=0x1d. */
+static void set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG){
+    set_i8_out8(rc,N,stride,mult,shift);                         /* ork conv + int8-out; OUT_CVT gain=0x4084/88 */
+    int s=stride>0?stride:N;
+    if(getenv("ORK_EW_REGOP")){
+        /* DECISIVE ISOLATION: EW multiply with a REGISTER-constant operand (EW_OP_SRC=0, bit6=0), NO RDMA.
+         * out = up_acc * EW_OP_VALUE_0. If this works, the EW stage is fine on ork geometry & the RDMA is the
+         * wedge; if it wedges, the EW stage itself is incompatible with ork's dense conv geometry. */
+        setr(rc,REGCMD_I8_N,0x1001,0x4070,0x90400284);          /* EW_CFG mul, OP_SRC=0 (register operand) */
+        setr(rc,REGCMD_I8_N,0x1001,0x4090,(uint32_t)strtoul(getenv("ORK_EW_REGOP"),0,0)); /* EW_OP_VALUE_0 */
+        setr(rc,REGCMD_I8_N,0x1001,0x4050,0x00000125);
+        setr(rc,REGCMD_I8_N,0x1001,0x4010,0x000000e0);
+    } else if(!getenv("ORK_EW_NOMUL")){
+        /* EW_CFG: multiply(bit2), operand from RDMA(bit6), operand-CVT active(bit8=0), LUT+ReLU bypass(7,9).
+         * ORK_EW_CFG / ORK_EW_ERDMA override EW_CFG / ERDMA_CFG for int8-vs-int16 data-size tuning. */
+        uint32_t ewcfg=0x904002c4; { const char*e=getenv("ORK_EW_CFG"); if(e) ewcfg=(uint32_t)strtoul(e,0,0); }
+        setr(rc,REGCMD_I8_N,0x1001,0x4070,ewcfg);
+        setr(rc,REGCMD_I8_N,0x1001,0x4074,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
+        setr(rc,REGCMD_I8_N,0x1001,0x4078,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
+        /* output-stage EW-active bits (required so the DPU expects the element-wise/RDMA stage; mode bits,
+         * geometry-independent). ORK_EW_NO50=skip individual ones during bisection. */
+        setr(rc,REGCMD_I8_N,0x1001,0x4050,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
+        setr(rc,REGCMD_I8_N,0x1001,0x4010,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
+        { const char*eo=getenv("ORK_EW_COFF"); if(eo) setr(rc,REGCMD_I8_N,0x1001,0x4074,(uint32_t)strtoul(eo,0,0)); }
+        { const char*es=getenv("ORK_EW_CSCL"); if(es) setr(rc,REGCMD_I8_N,0x1001,0x4078,(uint32_t)strtoul(es,0,0)); }
+        /* DPU_RDMA (0x50xx): fetch silu(gate) as the element-wise operand at EW_BASE (0x5038).
+         * ORK_EW_SPTR overrides RDMA_S_POINTER (0x5004): 0xe = PP mode (producer/consumer ping-pong, needs a
+         * partner to advance the pointer — deadlocks in a standalone shot); try 0/1 for single-shot no-PP. */
+        { uint32_t sp=0x0000000e; const char*e=getenv("ORK_EW_SPTR"); if(e) sp=(uint32_t)strtoul(e,0,0);
+          setr(rc,REGCMD_I8_EW_N,0x2001,0x5004,sp); }
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5008,0x00000001);       /* RDMA_OPERATION_ENABLE (only in EW-memory path) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x500c,M-1);              /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5010,0x00000000);       /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5014,N-1);              /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+        uint32_t erdma=0x40000004; { const char*e=getenv("ORK_EW_ERDMA"); if(e) erdma=(uint32_t)strtoul(e,0,0); }
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5034,erdma);            /* RDMA_ERDMA_CFG: enable(bit0=0)+data_size/mode */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5038,aG);               /* RDMA_EW_BASE_ADDR = silu(gate) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5018,aG);               /* RDMA_SRC_BASE_ADDR (valid) */
+        /* rocket rkt_regcmd.c element-wise: the operand is read via the BRDMA channel from SRC_BASE (0x5018),
+         * with BRDMA_DATA_USE=1 (0x501c bits1-4 => value 0x2). (I earlier wrongly DISABLED BRDMA -> the RDMA
+         * never delivered the operand -> DPU hung.) NRDMA off; BS_BASE valid (not the stale RKNN addr). */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x501c,0x00000002);       /* RDMA_BRDMA_CFG: BRDMA_DATA_USE=1 (on) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5028,0x00000000);       /* RDMA_NRDMA_CFG: NRDMA_DATA_USE=0 (off) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5020,aG);               /* RDMA_BS_BASE_ADDR: valid (not stale RKNN) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x5040,s);                /* RDMA_EW_SURF_STRIDE (dense = N) */
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x504c,s);
+        setr(rc,REGCMD_I8_EW_N,0x2001,0x506c,s);
+        /* 0x5044 (FEATURE_MODE_CFG int8) + 0x5068 (RDMA_WEIGHT=0x01010101) come from REGCMD_EW_LANE as-is. */
+        /* ORK_EW_STRIDE overrides EW_SURF_STRIDE (cube atom-16 layout probe: M*16) */
+        { const char*e=getenv("ORK_EW_STRIDE"); if(e){ uint32_t v=(uint32_t)strtoul(e,0,0);
+            setr(rc,REGCMD_I8_EW_N,0x2001,0x5040,v); setr(rc,REGCMD_I8_EW_N,0x2001,0x506c,v); setr(rc,REGCMD_I8_EW_N,0x2001,0x504c,v); } }
+        /* PC_OPERATION_ENABLE (regcmd trailer, reg 0x8 lane 0x81): ork's REGCMD_I8 trailer has 0x0d
+         * (CNA|CORE|DPU) — the DPU_RDMA block (bit 0x10) is NOT enabled, so the RDMA never runs and the DPU
+         * waits forever. RKNN's EW op has 0x1d here. Enable the RDMA block in the regcmd's own op-enable. */
+        setr(rc,REGCMD_I8_EW_N,0x0081,0x0008,0x0000001d);
+    }
+    /* ORK_EW_BIAS overrides 0x4080 (output offset/bias) */
+    { const char*e=getenv("ORK_EW_BIAS"); if(e) setr(rc,REGCMD_I8_N,0x1001,0x4080,(uint32_t)strtoul(e,0,0)); }
 }
 
 /* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
@@ -3553,6 +3669,189 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
     bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* RE/validation for the FUSED EW-mul output stage (step 3, SwiGLU dual-input): run a full-K int8 matmul
+ * whose output stage int8-requantizes the accumulator AND multiplies it by a SECOND input G (= silu(gate)),
+ * returning C[M*N] int8. This splices the 0x50xx second-DPU lane into the regcmd (synth_i8_ew) and submits
+ * with regcfg_amount=126 (108 matmul + 18 second-lane). A[M*K] B[K*N] G[M*N] row-major int8.
+ * FIRST-RUN CONTRACT: the 0x50xx dims/strides are the CAPTURED values (M=8,N=32) — validate at that shape
+ * first; the exact multiply/scale semantics and the shape-dependent 0x50xx fields are resolved by board
+ * matched-diff (see EWMUL_WIP.md). 0/ok (path executed, C valid), -1 wedged, -2 bad dims. */
+int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,const int8_t *G,
+                           int mult,int shift,int8_t *C,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(!ork_ppu_fuse_enabled(c)) return -3;   /* PPU EW-mul RE'd against the rk3588 PPU layout only */
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}         /* int8 output */
+    /* over-allocate the 2nd-input buffer: the captured 0x5020/0x5038 partner offsets (+0x4080/+0x400 from
+     * base) must land IN-BOUNDS or the IOMMU faults (submit timeout). 64 KiB covers them for these shapes. */
+    size_t gsz=(size_t)M*N; if(gsz<0x10000)gsz=0x10000;
+    struct buf Gb=bcreate(fd,gsz,0x403,-1); if(!Gb.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* 2nd input */
+    memset(Gb.cpu,0,gsz); memcpy(Gb.cpu,G,(size_t)M*N); bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
+    synth_i8(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    splice_ew_lane(rc,base);                                    /* insert the 0x50xx second-input lane */
+    set_i8_ewmul(rc,M,N,0,mult,shift,(uint32_t)Gb.dma);           /* int8 requant + EW-mul + 2nd-input addr */
+    if(getenv("ORK_EW_DUMP")){                                  /* inspect the assembled regcmd, no submit */
+        printf("# assembled EW-mul regcmd (%d entries) aG=0x%x aC=0x%x\n",REGCMD_I8_EW_N/2,(uint32_t)Gb.dma,(uint32_t)O.dma);
+        for(int k=0;k+1<REGCMD_I8_EW_N;k+=2){uint32_t w0=rc[k],w1=rc[k+1];
+            printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,w0&0xffff,w1>>16,((w0>>16)&0xffff)|((w1&0xffff)<<16));}
+        bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb); return 0;
+    }
+    struct buf extra[3] = {W, O, Gb};
+    if (validate_regcmd("probe_i8_ewmul", c, rc, REGCMD_I8_EW_N, NULL, extra, 3)) { bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* bump the task's register-config count 108 -> 126 AND enable_mask 0xd -> 0x1d (the 0x10 bit enables the
+     * PPU / second DPU lane; the captured EW-mul op runs at enable=0x1d, same as the SiLU compute op) for
+     * this submit, then restore (c->task is shared). */
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
+    uint32_t saved=tk->regcfg_amount, saved_en=tk->enable_mask;
+    tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0;
+    for(int rep=0;rep<3;rep++){ sub.timeout=ew_timeout_ms();
+        double t0=ork_now_us();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saved; tk->enable_mask=saved_en; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);  /* restore shared task */
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
+    bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb);
+    return ok;
+}
+
+/* PATH (b) bring-up: submit RKNN's captured EW-mul op (REGCMD_EWMUL) VERBATIM with ork's buffers, only
+ * repointing the 6 buffer addresses. Its geometry is RKNN's own (unlike the synth_i8 overlay the HW
+ * rejected), so this tests whether the templatized op EXECUTES on ork's submit path. Buffers mirror the
+ * captured handle layout (input/weight/silu/output); contents are caller-provided (execution does not
+ * depend on them). Returns 0/ok, -1 wedged. On ok, out[] gets the raw output buffer (Osz bytes).
+ * in[Isz] wt[Wsz] gl[Gsz] are copied into the input/weight/silu buffers at their captured offsets. */
+int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,int Wsz,
+                                const void*gl,int Gsz,void*out,int Osz,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
+    struct buf I=bcreate(fd,4096,0x403,-1); if(!I.cpu) return -2;
+    struct buf Wt=bcreate(fd,32768,0x403,-1); if(!Wt.cpu){bdestroy(fd,&I);return -2;}
+    struct buf Gl=bcreate(fd,8192,0x403,-1); if(!Gl.cpu){bdestroy(fd,&I);bdestroy(fd,&Wt);return -2;}
+    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);return -2;}
+    memset(I.cpu,0,4096); memset(Wt.cpu,0,32768); memset(Gl.cpu,0,8192); memset(O.cpu,0,4096);
+    if(in) memcpy(I.cpu, in, Isz<4096?Isz:4096);
+    if(wt) memcpy((char*)Wt.cpu+0x2300, wt, Wsz<(32768-0x2300)?Wsz:(32768-0x2300)); /* weights at captured +0x2300 */
+    if(gl) memcpy((char*)Gl.cpu+0x400, gl, Gsz<(8192-0x400)?Gsz:(8192-0x400));      /* silu(gate) at captured +0x400 */
+    bsync(fd,&I,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Gl,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_EWMUL_N]; memcpy(rc,REGCMD_EWMUL,sizeof rc);
+    /* ORK_EW_MULT/ORK_EW_SHIFT: override the captured requant (0x4084/0x4088, captured >>29 kills small acc)
+     * so the output is interpretable when driving the verbatim op with our own uniform data. */
+    { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
+      if(em) setr(rc,REGCMD_EWMUL_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
+      if(es) setr(rc,REGCMD_EWMUL_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0)); }
+    setr(rc,REGCMD_EWMUL_N,0x0201,0x1070,(uint32_t)I.dma);          /* input x */
+    setr(rc,REGCMD_EWMUL_N,0x0201,0x1110,(uint32_t)Wt.dma+0x2300);  /* weights */
+    setr(rc,REGCMD_EWMUL_N,0x1001,0x4020,(uint32_t)O.dma);          /* output */
+    setr(rc,REGCMD_EWMUL_N,0x2001,0x5018,(uint32_t)Gl.dma+0x400);   /* 2nd-input silu(gate) */
+    setr(rc,REGCMD_EWMUL_N,0x2001,0x5038,(uint32_t)Gl.dma+0x800);   /* 2nd-input partner */
+    setr(rc,REGCMD_EWMUL_N,0x2001,0x5020,(uint32_t)Wt.dma+0x2480);  /* 2nd-input param (in weight buf) */
+    if(getenv("ORK_EW_DUMP")){ printf("# verbatim EW-mul regcmd, in=0x%x wt=0x%x gl=0x%x out=0x%x\n",
+        (uint32_t)I.dma,(uint32_t)Wt.dma,(uint32_t)Gl.dma,(uint32_t)O.dma);
+        for(int k=0;k+1<REGCMD_EWMUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
+        bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);bdestroy(fd,&O); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
+    tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms();
+    double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ if(out)memcpy(out,O.cpu,Osz<4096?Osz:4096); if(us)*us=t1; }
+    bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);bdestroy(fd,&O);
+    return ok;
+}
+
+/* Path (b) MATMUL replay: submit the captured matmul-shaped EW-mul op (REGCMD_EWMUL_LIN, K=512/N=64/M=8)
+ * with ork's buffers + ork's standard tile packing (B as [Nt][Kt][32][32], A linear). out = requant(A*B) ⊙ G,
+ * G = silu(gate) int8 2nd-input. Fixed shape (the captured one) for now — used to read the multiply semantics
+ * and validate vs CPU; generalization to arbitrary M/K/N is the next step. A[M*K] B[K*N] G[M*N] int8; C[M*N].
+ * ORK_EW_S20=v writes uint32 v into the 0x5020 param region (2nd-input scale probe). 0/ok,-1 wedged,-2 dims. */
+int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const int8_t *G,int8_t *C,double *us){
+    const int M=8,K=512,N=64; int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
+    struct buf Wt=bcreate(fd,0x18000,0x403,-1); if(!Wt.cpu) return -2;   /* weights + 0x5020 param region */
+    int NN=N/32,KT=K/32; int8_t*bb=Wt.cpu;
+    /* LAYOUT-INVARIANT probe trick: fill the WHOLE weight buffer with B[0] so the matmul reads the same
+     * value no matter how RKNN's op tiles it (acc = K*A*B[0] for every output, independent of layout).
+     * Then overlay ork's tile packing (a no-op when B is uniform). Lets P1 run before RKNN's A/B layout
+     * is reversed. For non-uniform B this region still holds B[0] outside the tile — only valid for the
+     * uniform-input probes. */
+    memset(bb,(unsigned char)B[0],0x18000);
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    { const char*e=getenv("ORK_EW_S20"); if(e){ uint32_t v=(uint32_t)strtoul(e,0,0); for(int i=0;i<N;i++)((uint32_t*)((char*)Wt.cpu+0x8080))[i]=v; } }
+    bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&Wt);return -2;}
+    struct buf Gb=bcreate(fd,4096,0x403,-1); if(!Gb.cpu){bdestroy(fd,&Wt);bdestroy(fd,&O);return -2;}
+    memset(O.cpu,0,4096); memset(Gb.cpu,0,4096); memcpy(Gb.cpu,G,(size_t)M*N); bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+    int8_t*ad=c->Af.cpu; memset(ad,(unsigned char)A[0],0x8000); for(int j=0;j<M*K;j++)ad[j]=A[j];  /* fill for layout-invariance */
+    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_EWMUL_LIN_N]; memcpy(rc,REGCMD_EWMUL_LIN,sizeof rc);
+    /* EMITTER: inject ork's matmul geometry into RKNN's EW template (unless ORK_EW_VERBATIM) so the conv
+     * engine reads ork's [Nt][Kt][32][32] A/B layout while keeping RKNN's register order + EW output stage. */
+    if(!getenv("ORK_EW_VERBATIM")){
+        apply_ork_geom(rc,REGCMD_EWMUL_LIN_N,M,K,N,c->soc->cbuf_elems);
+        /* Also inject ork's DENSE int8-out output-stage byte config (set_i8_out8) so the output writes dense
+         * [M][N] where ork reads it — the template's RKNN output-byte config produced bias-only garbage.
+         * Keep the SDP element-wise MULTIPLY enable (0x4070=0x904002c4) + 0x4050 bit0 (2nd-input enable). */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4010,0x00000000);    /* int8-out (clear int32 bit) */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4038,(((N/16)-1)<<16)|((N/16)-1)); /* dense output group stride */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4050,0x00000125);    /* int8 row config + 2nd-input enable (bit0) */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x40c0,0x00000020);    /* output element size = 1 byte (dense) */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4080,0x00000000);    /* zero bias for the probe */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x500c,M-1);           /* 2nd-lane geometry -> ork's (M,N) */
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5010,M-1);
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5014,N-1);
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5040,N);
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x504c,N);
+        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x506c,N);
+    }
+    /* ORK_EW_MULT/SHIFT override the captured requant so small test accumulators requant to a readable value. */
+    { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
+      if(em) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
+      if(es) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0)); }
+    uint32_t gstride = getenv("ORK_EW_VERBATIM") ? 0x80 : (uint32_t)N;  /* 2nd-input row stride */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x0201,0x1070,(uint32_t)c->Af.dma);        /* input A */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x0201,0x1110,(uint32_t)Wt.dma);           /* up-weights */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5018,(uint32_t)Gb.dma);           /* silu(gate) 2nd input */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5038,(uint32_t)Gb.dma+gstride);   /* 2nd-input partner = base+stride */
+    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5020,(uint32_t)Wt.dma+0x8080);    /* 2nd-input param (in weight buf) */
+    /* ORK_EW_NOMUL: turn OFF the EW multiply (0x4070 -> plain 0x0302) to read R=requant(acc) alone —
+     * isolates "does the matmul+requant work" from "does the multiply work". */
+    if(getenv("ORK_EW_NOMUL")) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4070,0x00000302);
+    if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_EWMUL_LIN_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
+        bdestroy(fd,&Wt);bdestroy(fd,&O);bdestroy(fd,&Gb); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
+    tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
+    if(ok==0 && getenv("ORK_EW_SCAN")){ int nz=0,first=-1; signed char*o=O.cpu;
+        for(int i=0;i<4096;i++){ if(o[i]){ nz++; if(first<0)first=i; } }
+        printf("  [scan] output-buffer nonzero bytes=%d first@0x%x  bytes@first: ",nz,first);
+        for(int i=(first<0?0:first);i<(first<0?16:first+16);i++)printf("%d ",o[i]); printf("\n"); }
+    bdestroy(fd,&Wt);bdestroy(fd,&O);bdestroy(fd,&Gb);
     return ok;
 }
 

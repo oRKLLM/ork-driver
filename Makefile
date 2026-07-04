@@ -71,6 +71,10 @@ silu_native: tools/silu_native.c $(CORE)
 silu_bench: tools/silu_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# EW-mul (SwiGLU dual-input) board diagnostic: runs the spliced 126-reg fused EW-mul op + dumps numerics.
+ewmul_probe: tools/ewmul_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
 # .orkpack dump/load roundtrip is byte-identical and far faster than packing.
