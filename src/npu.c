@@ -3663,7 +3663,8 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(DT_I8!=c->last_dt){ if(!ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    act(fd,RKNPU_ACT_RESET,0);                           /* clean PPU/SDP state before the LUT-load (probe does this) */
     int chunk=64; if(chunk>M)chunk=M;                    /* single fused M-tile per submit (<=64, validated) */
     /* activation + int8-output scratch (grow as needed) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
@@ -3718,7 +3719,8 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(DT_I8!=c->last_dt){ if(!ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    act(fd,RKNPU_ACT_RESET,0);                           /* clean PPU/SDP state before the fused EW-mul (probe does this) */
     int chunk=64; if(chunk>M)chunk=M;
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
     if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
