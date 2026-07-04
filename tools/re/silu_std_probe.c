@@ -149,6 +149,25 @@ int main(int argc, char**argv){
         printf("c4064=%08x c4068=%08x  gain=%.4f offset=%.1f  (n=%d, in[%d..%d])\n",c4064,c4068,gain,off,n,vlo,vhi);
         ork_npu_free(c); return 0;
     }
+    if(!strcmp(argv[1],"sweepi16")){
+        /* Fit idx = gain*in + offset on the INT16 op (ramp LUT R=1 -> out=idx-512, int16 unclamped -> idx=out+512).
+         * Sweep c4068 to find the gain-1 value (integer idx => bit-exact). Inputs [-A,A]. */
+        unsigned c4064 = argc>2?(unsigned)strtoul(argv[2],0,16):0xffff7dc8;
+        unsigned c4068 = argc>3?(unsigned)strtoul(argv[3],0,16):0x411c1000;
+        int A = argc>4?atoi(argv[4]):500;
+        int Mf=16,Nf=64; static short in16[1024],out16[1024]; static short lut[1030];
+        for(int i=0;i<Mf*Nf;i++) in16[i]=(short)(-A + (2*A)*i/(Mf*Nf-1));
+        for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
+        double us=0;
+        int r=ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,0xffffc000u,c4064,c4068,lut,1030,out16,&us);
+        if(r){ printf("c4064=%08x c4068=%08x WEDGED\n",c4064,c4068); ork_npu_free(c); return 1; }
+        double sx=0,sy=0,sxx=0,sxy=0; int n=0;
+        for(int i=0;i<Mf*Nf;i++){ int o=out16[i]; if(o<=-32000||o>=32000)continue; double x=in16[i],y=o+512; sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;n++; }
+        if(n<3){ printf("c4064=%08x c4068=%08x (n=%d)\n",c4064,c4068,n); ork_npu_free(c); return 0; }
+        double gain=(n*sxy-sx*sy)/(n*sxx-sx*sx), off=(sy-gain*sx)/n;
+        printf("c4064=%08x c4068=%08x  gain=%.5f offset=%.1f  (n=%d)\n",c4064,c4068,gain,off,n);
+        ork_npu_free(c); return 0;
+    }
     if(!strcmp(argv[1],"silui16")){
         /* int16 SiLU: measure idx(in) via ramp (R=0.5), build silu curve, run + validate vs CPU. Inputs span
          * [-A,A] int16; in_scale maps int16->real, out_scale maps real->int16 output. */
