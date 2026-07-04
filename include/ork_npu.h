@@ -453,6 +453,11 @@ int          ork_npu_gelu_i8(ork_npu *ctx, const signed char *in, int M, int N,
 int          ork_npu_gelu_i16(ork_npu *ctx, const short *in, int M, int N,
                               double in_scale, double out_scale, short *out, double *us);
 
+/* On-NPU rsqrt (int8/int16) — RMSNorm building block, via the same activation-LUT op (rsqrt curve, positive
+ * domain): out = clamp(round( rsqrt(in*in_scale)/out_scale )). 0/ok,-1,-2,-3. */
+int          ork_npu_rsqrt_i8(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, signed char *out, double *us);
+int          ork_npu_rsqrt_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
+
 /* On-NPU int16 element-wise ADD — EXPERIMENTAL, not yet bit-exact. int16's per-operand scaling lives in NVDLA
  * SDP X1/X2 sub-module regs that differ from the int8 op (0x4048 carries an extra scale) and isn't fully decoded.
  * out = clamp_i16(round((a*a_scale + b*b_scale)/out_scale)). in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */

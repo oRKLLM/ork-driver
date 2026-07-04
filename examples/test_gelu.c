@@ -12,6 +12,21 @@
 #define MAXE (128*512)
 static int clampi8(long v){ if(v>127)v=127; if(v<-128)v=-128; return (int)v; }
 static double geluf(double x){ return 0.5*x*(1.0+erf(x*0.7071067811865476)); }
+static double rsqrtf_(double x){ return x>1e-9 ? 1.0/sqrt(x) : 0.0; }
+
+/* rsqrt (RMSNorm building block): positive inputs, out = clamp_i8(round(rsqrt(in*is)/os)) */
+static int run_rsqrt_i8(ork_npu *c, int M, int N, double is, double os, int tol){
+    static signed char in[MAXE], out[MAXE];
+    for(int i=0;i<M*N;i++) in[i]=(signed char)(1+(i%126));   /* positive domain */
+    double us=0;
+    int r=ork_npu_rsqrt_i8(c,in,M,N,is,os,out,&us);
+    if(r){ printf("  rsqrt i8 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
+    int mism=0,mx=0;
+    for(int i=0;i<M*N;i++){ int ref=clampi8(lround(rsqrtf_(in[i]*is)/os)); int d=abs((int)out[i]-ref);
+        if(d>tol){mism++; if(d>mx)mx=d;} }
+    printf("  rsqrt i8 [%dx%-4d] is=%.4f os=%.4f %s mism=%d/%d max|err|=%d  (%.1f us)\n",M,N,is,os,mism?"FAIL":"ok  ",mism,M*N,mx,us);
+    return mism?1:0;
+}
 
 static int run_i8(ork_npu *c, int M, int N, double is, double os, int tol){
     static signed char in[MAXE], out[MAXE];
@@ -52,6 +67,9 @@ int main(void){
     printf("on-NPU GELU (int16, full range) vs CPU ref:\n");
     static const int s16[][2] = { {8,64}, {16,64}, {8,128}, {4,512} };
     for(unsigned s=0;s<sizeof(s16)/sizeof(s16[0]);s++) fail |= run_i16(c, s16[s][0], s16[s][1], 0.0001, 0.0001, 0.0025);
+    printf("on-NPU rsqrt (int8, RMSNorm building block) vs CPU ref:\n");
+    fail |= run_rsqrt_i8(c, 8, 64, 0.5, 0.03125, 3);
+    fail |= run_rsqrt_i8(c, 16, 64, 0.25, 0.0625, 3);
     ork_npu_free(c);
     printf("%s\n", fail ? "FAIL" : "ALL OK");
     return fail;
