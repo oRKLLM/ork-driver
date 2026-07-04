@@ -369,6 +369,15 @@ int          ork_npu_probe_i8_ewmul_lin(ork_npu *ctx, const int8_t *A, const int
  * clamp_i8(round(a[i]*b[i]*gain)+bias). a,b,out int8[n] (n<=4096). The clean on-NPU element-wise path. 0/ok. */
 int          ork_npu_probe_i8_mul(ork_npu *ctx, const int8_t *a, const int8_t *b, int n, int8_t *out, double *us);
 
+/* On-NPU element-wise MULTIPLY of two int8 [M][N] tensors (e.g. the SwiGLU inner silu(gate)⊙up):
+ * out[m*N+n] = clamp_i8(round(up[m][n]*silu[m][n] * mult/2^shift)) computed on the NPU (standalone SDP op).
+ * Handles the NVDLA feature-cube marshaling internally; symmetric int8 (zero-points 0). mult in 0..0x7fff
+ * (OUT_CVT_SCALE is signed 16-bit); gain = mult/2^shift (= s_up·s_silu/s_out for SwiGLU). Supported shape:
+ * M=8,N=64 (the captured op geometry) — other shapes return -2 pending cube-dim generalization. rk3588-gated
+ * (returns -3 elsewhere). 0/ok, -1 wedged, -2 bad shape. Validated bit-exact vs CPU (examples/test_ewmul_i8). */
+int          ork_npu_ewmul_i8(ork_npu *ctx, const int8_t *up, const int8_t *silu, int M, int N,
+                              int mult, int shift, int8_t *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
