@@ -3944,6 +3944,40 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     return ok;
 }
 
+/* fp16 element-wise MULTIPLY: out[m][n] = up[m][n] * silu[m][n] in fp16 on the NPU (standalone SDP fp16 op,
+ * no requant). Marshals into the NVDLA fp16 feature cube (atom=8, 2-byte channels) internally. Shape M=8,N=64
+ * (captured geometry); rk3588-gated. up/silu/out are fp16 bit-patterns (ork_f16). 0/ok,-1 wedged,-2 shape,-3 SoC. */
+int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M!=8||N!=64) return -2;
+    #define EWCUBEH(m,n) (((n)/8)*128 + (m)*16 + ((n)%8)*2)      /* BYTE offset, fp16 atom=8, W=8, C=64 */
+    const uint16_t *u16=(const uint16_t*)up,*s16=(const uint16_t*)silu; uint16_t *o16=(uint16_t*)out;
+    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
+        *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
+    setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5038,(uint32_t)B.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    #undef EWCUBEH
+    return ok;
+}
+
 /* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
  * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
  * (REGCMD_SILU_LUT, enable=0x18) streams the int16 silu curve into PPU LUT SRAM; (2) the matmul compute

@@ -378,6 +378,12 @@ int          ork_npu_probe_i8_mul(ork_npu *ctx, const int8_t *a, const int8_t *b
 int          ork_npu_ewmul_i8(ork_npu *ctx, const int8_t *up, const int8_t *silu, int M, int N,
                               int mult, int shift, int8_t *out, double *us);
 
+/* fp16 element-wise MULTIPLY of two [M][N] fp16 tensors on the NPU: out[m][n] = up[m][n]*silu[m][n] (no
+ * requant — fp16 standalone SDP op). NVDLA fp16 feature-cube marshaled internally. up/silu/out are fp16
+ * bit-patterns. Supported shape M=8,N=64; rk3588-gated. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
+int          ork_npu_ewmul_f16(ork_npu *ctx, const ork_f16 *up, const ork_f16 *silu, int M, int N,
+                               ork_f16 *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
