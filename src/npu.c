@@ -3696,6 +3696,9 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
               bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
               struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
               if(rknpu_submit_ioctl(fd,&ls,-1)){ rc_ret=-1; break; } }
+            if(getenv("ORK_FUSED_DUMP")&&m0==0&&ns==0){ int8_t*wp=w->Bf[ns].cpu,*ap=c->Af.cpu;
+                fprintf(stderr,"WBf[0..7]=%d %d %d %d %d %d %d %d  Af[0..7]=%d %d %d %d  Bf.dma=%llx\n",
+                    wp[0],wp[1],wp[2],wp[3],wp[4],wp[5],wp[6],wp[7],ap[0],ap[1],ap[2],ap[3],(unsigned long long)w->Bf[ns].dma); }
             uint32_t rc[REGCMD_I8_N];
             synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)O.dma,1,CBUF,0);
             if(nosilu) set_i8_out8(rc,Nc,0,r_mult,r_shift); else set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
