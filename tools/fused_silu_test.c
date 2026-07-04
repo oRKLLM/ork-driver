@@ -24,6 +24,12 @@ int main(void){
     if(!w){ fprintf(stderr,"pack failed\n"); return 2; }
 
     int rc=0;
+    /* ---- test -2: fused EW-mul FIRST (clean NPU) — isolate whether the ewmul path works standalone ---- */
+    { int8_t *e0=malloc(M*N);
+      int re=ork_mm_run_i8_ewmul(c, w, M, A, G, e0, 0x4000, 14);
+      int nz=0; for(int i=0;i<M*N;i++) if(e0[i]) nz++;
+      printf("[ISO fused EW-mul first] rc=%d nonzero=%d/%d\n", re, nz, M*N);
+      free(e0); }
     /* ---- test -1: fused SiLU run FIRST (isolation: no multi-core matmul / probe before it) ---- */
     { int8_t *c_iso=malloc(M*N);
       int ri=ork_mm_run_i8_silu(c, w, M, A, c_iso, 0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
