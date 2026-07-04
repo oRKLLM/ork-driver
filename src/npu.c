@@ -3876,9 +3876,14 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
     setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT"),*eb=getenv("ORK_EW_BIAS");
+      const char*co=getenv("ORK_EW_COFF"),*cs=getenv("ORK_EW_CSCL");
       if(em) setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
       if(es) setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0));
-      if(eb) setr(rc,REGCMD_MUL_N,0x1001,0x4080,(uint32_t)strtoul(eb,0,0)); }
+      if(eb) setr(rc,REGCMD_MUL_N,0x1001,0x4080,(uint32_t)strtoul(eb,0,0));
+      if(co) setr(rc,REGCMD_MUL_N,0x1001,0x4074,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
+      if(cs) setr(rc,REGCMD_MUL_N,0x1001,0x4078,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
+      const char*ao=getenv("ORK_EW_AOFF");
+      if(ao) setr(rc,REGCMD_MUL_N,0x1001,0x4044,(uint32_t)strtoul(ao,0,0)); } /* BS_ALU_OPERAND = za (operand a zero-pt) */
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
         bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O); return 0; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
