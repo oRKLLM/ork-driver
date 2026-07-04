@@ -3664,66 +3664,50 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror run()) */
-    if(getenv("ORK_FUSED_DUMP")) fprintf(stderr,"DOMAINS: w->domain=%d dom_active=%d\n",w->domain,c->dom_active);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int nosilu=getenv("ORK_FUSED_NOSILU")!=NULL;         /* DIAG: plain int8 requant (no LUT/silu) to isolate acc-vs-LUT */
     int chunk=64; if(chunk>M)chunk=M;                    /* single fused M-tile per submit (<=64, validated) */
-    /* activation + int8-output scratch (grow as needed) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
     if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
     if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
-    /* ---- submit 1: stream the (fixed or supplied) silu LUT into PPU SRAM, ONCE ---- */
+    /* build the LUT-load regcmd once (fixed silu*S PWL LUT, or the supplied lut[]) */
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
-    struct buf O=bcreate(fd,maxout,0x403,c->dom_active); if(!O.cpu){bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);return -2;}  /* DIAG: dedicated fresh int8 output (isolate c->Cc reuse) */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
     setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* ---- matmul + fused-SiLU per N-slice x M-tile; LUT-load submit paired back-to-back before each
-     * matmul submit (the PPU LUT SRAM does not persist across the intervening task/regcmd reconfig —
-     * proven by regcmd byte-equality yet bias-only output when the load was hoisted out of the loop) ---- */
+    /* Per N-slice x M-tile: LUT-load (enable 0x18) then the matmul+fused-SiLU. The matmul goes through
+     * submit1() (output in the warmed c->Cc, correct domain) — a hand-rolled submit to a fresh output
+     * buffer produces bias-only output (the conv accumulator doesn't reach the SDP); submit1's warmed
+     * c->Cc is the working path (validated bit-exact vs the probe). LUT-load is paired per tile. */
     int rc_ret=0;
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma;
-        bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);   /* re-sync resident weight (intervening bcreate/submits may have dirtied aliasing cache lines) */
-        struct buf Wf={0};                               /* DIAG ORK_FUSED_FRESHW: copy resident weight into a FRESH buffer (isolate buffer-object state, mirror probe) */
-        if(getenv("ORK_FUSED_FRESHW")){ Wf=bcreate(fd,w->Bf[ns].size,0x403,c->dom_active); if(Wf.cpu){ memcpy(Wf.cpu,w->Bf[ns].cpu,w->Bf[ns].size); bsync(fd,&Wf,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&Wf,RKNPU_MEM_SYNC_TO_DEVICE); wbase=Wf.dma; } }
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-            act(fd,RKNPU_ACT_RESET,0);   /* reset is the LAST thing before the submits (probe order: marshal->bsync->RESET->LUT->matmul) — MEM_CREATE/sync between reset and submit disturbs the primed conv->SDP state */
-            /* submit A: LUT-load (enable 0x18) — immediately before the matmul submit */
-            if(!nosilu){ struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+            act(fd,RKNPU_ACT_RESET,0);
+            /* submit A: stream the LUT into PPU SRAM (enable 0x18) */
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
               bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
               struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
               if(rknpu_submit_ioctl(fd,&ls,c->dom_active)){ rc_ret=-1; break; } }
-            if(getenv("ORK_FUSED_DUMP")&&m0==0&&ns==0){ int8_t*wp=w->Bf[ns].cpu,*ap=c->Af.cpu;
-                fprintf(stderr,"WBf[0..7]=%d %d %d %d %d %d %d %d  Af[0..7]=%d %d %d %d  Bf.dma=%llx\n",
-                    wp[0],wp[1],wp[2],wp[3],wp[4],wp[5],wp[6],wp[7],ap[0],ap[1],ap[2],ap[3],(unsigned long long)w->Bf[ns].dma); }
+            /* submit B: matmul + fused-SiLU output stage -> int8 in c->Cc (via submit1: warmup + domain) */
             uint32_t rc[REGCMD_I8_N];
-            uint32_t outdma=getenv("ORK_FUSED_S1")?(uint32_t)c->Cc.dma:(uint32_t)O.dma;   /* DIAG ORK_FUSED_S1: use c->Cc + submit1() (run()'s exact submit path) */
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,outdma,1,CBUF,0);
-            if(nosilu) set_i8_out8(rc,Nc,0,r_mult,r_shift); else set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
-            if(getenv("ORK_FUSED_DUMP")){ for(int k=0;k+1<REGCMD_I8_N;k+=2) fprintf(stderr,"RUN %04x=%08x l=%04x\n",rc[k]&0xffff,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16),rc[k+1]>>16); }
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-            t->enable_mask=nosilu?0xd:0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-            bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-            int8_t*cc;
-            if(getenv("ORK_FUSED_S1")){ c->warmed=0; if(submit1(c)){ rc_ret=-1; break; } cc=c->Cc.cpu; }   /* run()'s exact submit (c->Cc, warmup, dom_active) */
-            else { struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-              for(int rep=0;rep<3;rep++){ if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ rc_ret=-1; break; } }   /* DIAG: 3-rep warmup like the probe */
-              if(rc_ret) break; bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); cc=O.cpu; }
-            for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
-            if(getenv("ORK_FUSED_DUMP")&&m0==0&&ns==0){ int8_t*o=O.cpu; fprintf(stderr,"OUT0[%s]: %d %d %d %d %d %d %d %d\n",nosilu?"nosilu":"silu",o[0],o[1],o[2],o[3],o[4],o[5],o[6],o[7]); }
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+              t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            c->warmed=0; if(submit1(c)){ rc_ret=-1; break; }
+            int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
-        if(Wf.cpu) bdestroy(fd,&Wf);
     }
-    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&O);
+    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
     return rc_ret;
 }
 
@@ -3738,8 +3722,8 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    act(fd,RKNPU_ACT_RESET,0);                           /* clean PPU/SDP state before the fused EW-mul (probe does this) */
     int chunk=64; if(chunk>M)chunk=M;
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
     if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
@@ -3755,19 +3739,16 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             int8_t*gd=Gb.cpu; memset(gd,0,gsz); for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) gd[(size_t)r*Nc+n]=G[(size_t)(m0+r)*N+(n0+n)];
             bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+            act(fd,RKNPU_ACT_RESET,0);
             uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
             synth_i8(base,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
             splice_ew_lane(rc,base);
             set_i8_ewmul(rc,mc,Nc,0,mult,shift,(uint32_t)Gb.dma);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-            t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_I8_EW_N/2; t->regcmd_addr=c->regcmd.dma;
-            bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            int reps=c->warmed?1:2;   /* cold output buffer warmup (first submit returns stale data) */
-            for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; } }
-            c->warmed=1; if(rc_ret) break;
-            bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+              t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_I8_EW_N/2; t->regcmd_addr=c->regcmd.dma;
+              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            c->warmed=0; if(submit1(c)){ rc_ret=-1; break; }   /* submit1: warmed c->Cc + correct domain (a hand-rolled submit gives bias-only) */
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
     }
