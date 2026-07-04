@@ -3695,6 +3695,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
             uint32_t rc[REGCMD_I8_N];
             synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)O.dma,1,CBUF,0);
             set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            if(getenv("ORK_FUSED_DUMP")){ for(int k=0;k+1<REGCMD_I8_N;k+=2) fprintf(stderr,"RUN %04x=%08x l=%04x\n",rc[k]&0xffff,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16),rc[k+1]>>16); }
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
             t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
@@ -4716,6 +4717,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     uint32_t rc[REGCMD_I8_N];
     synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+    if(getenv("ORK_FUSED_DUMP")){ for(int k=0;k+1<REGCMD_I8_N;k+=2) fprintf(stderr,"PROBE %04x=%08x l=%04x\n",rc[k]&0xffff,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16),rc[k+1]>>16); }
     struct buf extra[2]={W,O};
     if(validate_regcmd("probe_i8_silu",c,rc,REGCMD_I8_N,NULL,extra,2)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
