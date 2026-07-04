@@ -295,6 +295,12 @@ int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int3
 int          ork_mm_run_i8_silu(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int8_t *C,
                                 int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
                                 unsigned cfg4068, const short *lut, int nlut);
+/* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
+ * multiply by G (= silu(gate) from ork_mm_run_i8_silu) applied IN the up matmul's SDP output stage.
+ * gain = mult/2^shift = s_up*s_silu/s_out. G is dense int8 [M*N]. Resident full-K int8 weight
+ * (K%512==0, K<=4096). Together with ork_mm_run_i8_silu this is the full fused SwiGLU FFN inner. */
+int          ork_mm_run_i8_ewmul(ork_npu *ctx, ork_w *w, int M, const int8_t *A, const int8_t *G,
+                                 int8_t *C, int mult, int shift);
 /* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
