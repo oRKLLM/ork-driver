@@ -287,6 +287,14 @@ int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, floa
  * @return 0 on success, negative on error (bad args / submit failure).
  */
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+/* FUSED SwiGLU gate matmul: C = silu(requant(A·W)) as int8 [M*N], activation applied IN the matmul's
+ * SDP output stage (no extra submit / round-trip). Resident full-K int8 weight (K%512==0, K<=4096).
+ * R = r_mult/2^r_shift + out_bias is the SCALAR OUT_CVT (so quantize A PER-TENSOR, not per-row);
+ * idx_off/cfg4068 = the SiLU index-map params; lut/nlut optional (NULL = fixed silu*S LUT). rk3588
+ * only. The productionizable on-NPU-activation path (standalone SDP ops lose ~8x — RE-roadmap M4.6). */
+int          ork_mm_run_i8_silu(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int8_t *C,
+                                int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
+                                unsigned cfg4068, const short *lut, int nlut);
 /* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);

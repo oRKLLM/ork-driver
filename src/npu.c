@@ -3646,6 +3646,67 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     double t0=ork_now_us(); int r=run(c,w,M,A,C); g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; return r;
 }
 
+/* ---- FUSED FFN: matmul with an on-NPU output-stage activation (SwiGLU fusion) --------------------
+ * These run a RESIDENT-weight int8 matmul and apply the activation / element-wise-multiply IN the
+ * matmul's SDP output stage — so the activation rides the matmul's own submit (no extra submit, no
+ * mode-switch re-warm, no host round-trip). This is the ONLY regime where an on-NPU activation beats
+ * inline NEON (standalone SDP ops lose ~8x to interleaving; see the RE-roadmap M4.6).
+ * The SDP OUT_CVT scale R (r_mult/2^r_shift) + out_bias are SCALAR (per-tensor), so the caller must
+ * quantize the activation PER-TENSOR (one scale for the whole A tile), NOT per-row. Full-K resident
+ * weight (w->Bf, K%512==0, K<=4096), N-tiled, single-core, M-tile<=64/submit. The fixed silu*S PWL LUT
+ * is streamed into PPU SRAM ONCE (submit-1) then every matmul+silu submit reads it. rk3588-gated.
+ * out C = silu(requant(A·W)) as int8 [M*N]. 0/ok, -1 wedge, -2 shape, -3 SoC. */
+int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
+                       int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
+                       const int16_t *lut,int nlut){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(w->dtype!=DT_I8 || !w->Bf) return -2;
+    int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
+    if(K%512 || K>4096 || N%32) return -2;
+    if(DT_I8!=c->last_dt){ if(!ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    int chunk=64; if(chunk>M)chunk=M;                    /* single fused M-tile per submit (<=64, validated) */
+    /* activation + int8-output scratch (grow as needed) */
+    size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
+    if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    /* ---- submit 1: stream the (fixed or supplied) silu LUT into PPU SRAM, ONCE ---- */
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
+        for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }
+    /* ---- submits 2..: matmul + fused-SiLU output stage, per N-slice x M-tile, reading the resident LUT ---- */
+    int rc_ret=0;
+    for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        uint64_t wbase=w->Bf[ns].dma;
+        for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+            int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
+            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            uint32_t rc[REGCMD_I8_N];
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+            t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+            bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+            if(rknpu_submit_ioctl(fd,&sub,-1)){ rc_ret=-1; break; }
+            bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+            int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+        }
+    }
+    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    return rc_ret;
+}
+
 /* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
  * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
  * weights. Returns 0 if the submit completed (C[N] int32 valid), -1 if it wedged (K over the
