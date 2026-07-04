@@ -96,7 +96,11 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* PACK DOMAIN: per-ctx default domain for the NEXT pack/load (set by ork_npu_set_pack_domain for the
      * ggml-ork caller). Read once at each pack's entry to stamp w->domain; from there the weight carries
      * its own domain. Not a process-global — concurrent ctxs don't clobber each other. -1 => default. */
-    int pack_domain; };
+    int pack_domain;
+    /* Standalone-activation LUT-op index-map cache: idx(in) for the SDP activation op depends only on the
+     * (constant) index params, NOT on in/out scale, so calibrate ONCE per ctx (a ramp-LUT submit) and reuse
+     * for any scale. silu_idx_ok=1 once filled; silu_idx[256] maps (uint8)input -> LUT index (-1 if saturated). */
+    int silu_idx_ok; short silu_idx[256]; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
@@ -4220,6 +4224,51 @@ int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
         lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
     free(A);free(B);free(C);free(ramp);free(acc);free(idx);free(set);
     return 0;
+}
+
+/* Constant SDP index params for the standalone activation-LUT op (from the RKNN SiLU capture). The op's
+ * index math idx(in) depends ONLY on these (not on in/out scale), so one calibration serves every scale. */
+#define ORK_SILU_IDXOFF 0xffffc000u
+#define ORK_SILU_C4064  0xffff7dc8u
+#define ORK_SILU_C4068  0x411c0800u
+
+/* Calibrate idx(in) for the standalone activation op ONCE per ctx: run a ramp LUT (LUT[i]=i-512) at R=0.5
+ * (out=clamp_i8(0.5*(idx-512)) -> idx=2*out+512), sweeping all 256 int8 inputs. R=0.5 keeps out unclamped
+ * across the full input range. Fills c->silu_idx[(uint8)in] (=-1 where saturated). 0/ok, -1 wedged. */
+static int silu_calibrate_idx(ork_npu *c){
+    if(c->silu_idx_ok) return 0;
+    const int M=4,N=64;                       /* 256 elems = each int8 value exactly once */
+    int8_t in[256],out[256]; int16_t lut[1030];
+    for(int i=0;i<256;i++) in[i]=(int8_t)(i-128);
+    for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
+    if(ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,0)) return -1;
+    for(int v=0;v<256;v++) c->silu_idx[v]=-1;
+    for(int i=0;i<M*N;i++){ int v=(uint8_t)in[i]; int o=out[i]; if(o>-127&&o<127) c->silu_idx[v]=(short)(2*o+512); }
+    c->silu_idx_ok=1; return 0;
+}
+
+/* build a LUT curve at the calibrated indices for f(v*in_scale)/out_scale (R=1); interp gaps, hold ends */
+static void silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
+    int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
+    for(int vv=-128;vv<128;vv++){ int idx=c->silu_idx[(uint8_t)vv]; if(idx<0||idx>1029)continue;
+        double val=f(vv*in_scale)/out_scale; long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768;
+        lut[idx]=(int16_t)q; set[idx]=1; }
+    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
+    if(lo<0)return; for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
+    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
+        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
+}
+
+/* Public on-NPU SiLU (int8): out[m*N+n] = clamp_i8(round( silu(in[m][n]*in_scale) / out_scale )) via the
+ * standalone SDP activation-LUT op. Lazily calibrates idx(in) once per ctx, builds the silu curve for the
+ * requested (in_scale,out_scale), loads it, and runs the op (2 submits). in/out int8 [M*N], N%16==0.
+ * rk3588-gated. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
+int ork_npu_silu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(silu_calibrate_idx(c)) return -1;
+    int16_t lut[1030]; silu_build_curve(c,silu_f,in_scale,out_scale,lut);
+    return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
 }
 
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`

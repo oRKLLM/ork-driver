@@ -13,7 +13,7 @@ CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu
 TESTS    :=
 
 all: $(EXAMPLES) $(TESTS)
@@ -275,7 +275,7 @@ MODEL ?= stories15M.bin
 TEST_TIMEOUT ?= 360
 test: $(EXAMPLES) $(TESTS)
 	@fail=0; \
-	for t in "test_activations" "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16"; do \
+	for t in "test_activations" "test_matmul" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu"; do \
 	  echo "== $$t"; timeout $(TEST_TIMEOUT) sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \

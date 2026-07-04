@@ -400,6 +400,12 @@ int          ork_npu_probe_silu_std(ork_npu *ctx, const signed char *in, int M, 
                                     unsigned cfg4064, unsigned cfg4068, const short *lut, int nlut,
                                     signed char *out, double *us);
 
+/* On-NPU SiLU (int8): out[m*N+n] = clamp_i8(round( silu(in[m][n]*in_scale) / out_scale )) via the standalone
+ * SDP activation-LUT op. Calibrates the op's index map once per ctx, builds the silu curve for (in_scale,
+ * out_scale), loads it, runs the op. in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+int          ork_npu_silu_i8(ork_npu *ctx, const signed char *in, int M, int N,
+                             double in_scale, double out_scale, signed char *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
