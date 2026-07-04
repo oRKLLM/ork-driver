@@ -3870,6 +3870,7 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
     memcpy(A.cpu,a,n);memcpy(B.cpu,b,n);
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);   /* clear device-side output (op writes only part -> avoid stale) */
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);        /* output */
@@ -3894,6 +3895,10 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ memcpy(out,O.cpu,n); if(us)*us=t1; }
+    if(ok==0 && getenv("ORK_EW_SCAN")){ signed char*o=O.cpu; int nz=0,first=-1,last=-1;
+        for(int i=0;i<4096;i++){ if(o[i]){ nz++; if(first<0)first=i; last=i; } }
+        printf("  [scan4k] nonzero=%d span[0x%x..0x%x]  vals@first: ",nz,first,last);
+        for(int i=(first<0?0:first);i<(first<0?16:first+24)&&i<4096;i++)printf("%d ",o[i]); printf("\n"); }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
     return ok;
 }
