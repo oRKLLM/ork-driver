@@ -19,6 +19,8 @@
 static int clampi8(long v){ if(v>127)v=127; if(v<-128)v=-128; return (int)v; }
 static int clampi16(long v){ if(v>32767)v=32767; if(v<-32768)v=-32768; return (int)v; }
 static double siluf(double x){ return x/(1.0+exp(-x)); }
+/* fp16 LUT stores fp16 bit patterns: encode a float as the raw 16-bit half it becomes */
+static short f2hbits(double x){ union{ ork_f16 h; unsigned short u; } z; z.h=(ork_f16)x; return (short)z.u; }
 
 int main(int argc, char**argv){
     if(argc<2){ printf("usage: %s ramp|silu ...\n",argv[0]); return 2; }
@@ -81,6 +83,79 @@ int main(int argc, char**argv){
             if((i%37)==0) printf("  in=%4d out=%4d ref=%6.1f\n",in[i],out[i],ref); }
         printf("silu rc=0 (%.1f us) R=%.4f in_scale=%.3f out_scale=%.3f  bad(|e|>2)=%d/%d max|e|=%.2f\n",
                us,Rrun,in_scale,out_scale,bad,M*N,mx);
+        ork_npu_free(c); return bad?1:0;
+    }
+    if(!strcmp(argv[1],"rampf16")){
+        /* fp16 calibration: ramp LUT (int16 i-512), sweep fp16 inputs; reveals idx(in) + LUT->fp16 encoding */
+        unsigned idx_off = argc>2?(unsigned)strtoul(argv[2],0,16):0xffffc000;
+        unsigned c4064   = argc>3?(unsigned)strtoul(argv[3],0,16):0x80000000;
+        unsigned c4068   = argc>4?(unsigned)strtoul(argv[4],0,16):0x69840000;
+        double lo=argc>5?atof(argv[5]):-0.3, hi=argc>6?atof(argv[6]):0.3;
+        int Mf=8,Nf=64; static ork_f16 inf[512],outf[512]; static short lut[1030];
+        for(int i=0;i<1030;i++) lut[i]=f2hbits((double)(i-512));   /* LUT holds fp16 bits of (i-512) */
+        for(int i=0;i<Mf*Nf;i++){ double x=lo+(hi-lo)*i/(Mf*Nf-1); inf[i]=(ork_f16)x; }
+        double us=0;
+        int r=ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us);
+        printf("rampf16 rc=%d (%.1f us) idx_off=0x%x c4064=0x%x c4068=0x%x\n",r,us,idx_off,c4064,c4068);
+        if(r){ ork_npu_free(c); return 1; }
+        for(int i=0;i<Mf*Nf;i+=16) printf("  in=%8.3f -> out=%8.3f\n",(double)(float)inf[i],(double)(float)outf[i]);
+        ork_npu_free(c); return 0;
+    }
+    if(!strcmp(argv[1],"siluf16")){
+        /* fp16 SiLU: measure idx(in) via ramp, build silu curve at those indices, run + validate vs CPU silu.
+         * fp16 input IS the real value (no in_scale); out = silu(in). */
+        unsigned idx_off=0xffffc000,c4064=0x80000000,c4068=0x69840000;
+        double lo=argc>2?atof(argv[2]):-12.0, hi=argc>3?atof(argv[3]):12.0;
+        int Mf=8,Nf=64; static ork_f16 inf[512],outf[512]; static short lut[1030];
+        static double xv[512]; static int idxv[512];
+        for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
+        for(int i=0;i<Mf*Nf;i++){ xv[i]=lo+(hi-lo)*i/(Mf*Nf-1); inf[i]=(ork_f16)xv[i]; }
+        double us=0;
+        if(ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
+        for(int i=0;i<Mf*Nf;i++){ int idx=(int)lround((double)(float)outf[i])+512; idxv[i]=idx;
+            if(idx>=0&&idx<1030){ double s=siluf(xv[i]); lut[idx]=(short)clampi16(lround(s*256.0)); set[idx]=1; } } /* scale silu by 256 in LUT */
+        int flo=-1,fhi=-1; for(int i=0;i<1030;i++)if(set[i]){flo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){fhi=i;break;}
+        for(int i=0;i<flo;i++)lut[i]=lut[flo]; for(int i=fhi+1;i<1030;i++)lut[i]=lut[fhi];
+        for(int i=flo;i<=fhi&&flo>=0;i++){ if(set[i])continue; int a=i,b=i; while(a>flo&&!set[a])a--; while(b<fhi&&!set[b])b++;
+            lut[i]=(short)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
+        if(ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        int bad=0; double mx=0;
+        for(int i=0;i<Mf*Nf;i++){ double ref=siluf(xv[i]), got=(double)(float)outf[i];
+            double e=fabs(got-ref); if(e>mx)mx=e; if(e>0.5)bad++;
+            if((i%29)==0) printf("  in=%7.3f out=%8.4f ref=%8.4f\n",xv[i],got,ref); }
+        printf("siluf16 rc=0 (%.1f us) bad(|e|>0.5)=%d/%d max|e|=%.3f\n",us,bad,Mf*Nf,mx);
+        ork_npu_free(c); return bad?1:0;
+    }
+    if(!strcmp(argv[1],"silui16")){
+        /* int16 SiLU: measure idx(in) via ramp (R=0.5), build silu curve, run + validate vs CPU. Inputs span
+         * [-A,A] int16; in_scale maps int16->real, out_scale maps real->int16 output. */
+        double in_scale=argc>2?atof(argv[2]):0.0625, out_scale=argc>3?atof(argv[3]):0.0625;
+        int A=argc>4?atoi(argv[4]):112;
+        unsigned idx_off=argc>5?(unsigned)strtoul(argv[5],0,16):0xffffc000;
+        unsigned c4064=argc>6?(unsigned)strtoul(argv[6],0,16):0xffff7dc8;  /* default: int8's proven index gain */
+        unsigned c4068=argc>7?(unsigned)strtoul(argv[7],0,16):0x411c0800;
+        int Mf=8,Nf=64; static short in16[512],out16[512]; static short lut[1030]; static int idxof[512];
+        for(int i=0;i<Mf*Nf;i++) in16[i]=(short)(-A + (2*A)*i/(Mf*Nf-1));
+        for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
+        double us=0;
+        /* int16 output isn't clamped at 127, so calibrate AND run at R=1 (out=idx-512 -> idx=out+512) */
+        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
+        for(int i=0;i<Mf*Nf;i++){ int o=out16[i]; idxof[i]=(o>-32000&&o<32000)?o+512:-1; int idx=idxof[i];
+            if(idx>=0&&idx<1030){ double s=siluf(in16[i]*in_scale)/out_scale; lut[idx]=(short)clampi16(lround(s)); set[idx]=1; } }
+        int flo=-1,fhi=-1; for(int i=0;i<1030;i++)if(set[i]){flo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){fhi=i;break;}
+        if(flo<0){ printf("no idx measured\n"); ork_npu_free(c); return 1; }
+        for(int i=0;i<flo;i++)lut[i]=lut[flo]; for(int i=fhi+1;i<1030;i++)lut[i]=lut[fhi];
+        for(int i=flo;i<=fhi;i++){ if(set[i])continue; int a=i,b=i; while(a>flo&&!set[a])a--; while(b<fhi&&!set[b])b++;
+            lut[i]=(short)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
+        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        int bad=0; double mx=0;
+        for(int i=0;i<Mf*Nf;i++){ double ref=siluf(in16[i]*in_scale)/out_scale, got=out16[i];
+            double e=fabs(got-ref); if(e>mx)mx=e; if(e>2)bad++;
+            if((i%37)==0) printf("  in=%6d out=%6d ref=%8.1f\n",in16[i],out16[i],ref); }
+        printf("silui16 rc=0 (%.1f us) in_scale=%.4f out_scale=%.4f A=%d bad(|e|>2)=%d/%d max|e|=%.2f\n",
+               us,in_scale,out_scale,A,bad,Mf*Nf,mx);
         ork_npu_free(c); return bad?1:0;
     }
     printf("unknown mode\n"); ork_npu_free(c); return 2;

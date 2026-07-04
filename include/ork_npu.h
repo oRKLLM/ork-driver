@@ -400,6 +400,19 @@ int          ork_npu_probe_silu_std(ork_npu *ctx, const signed char *in, int M, 
                                     unsigned cfg4064, unsigned cfg4068, const short *lut, int nlut,
                                     signed char *out, double *us);
 
+/* fp16 standalone activation-LUT op — RE probe. Applies the PPU LUT to a single fp16 input [M][N] via
+ * REGCMD_SILU_STD_F16. Two submits (LUT-load + op). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int          ork_npu_probe_silu_std_f16(ork_npu *ctx, const ork_f16 *in, int M, int N,
+                                        unsigned idx_off, unsigned cfg4064, unsigned cfg4068,
+                                        const short *lut, int nlut, ork_f16 *out, double *us);
+
+/* int16 (w16a16i) standalone activation-LUT op — RE probe. Same requant-LUT math as the int8 op but int16
+ * I/O (atom-8 cube) via REGCMD_SILU_STD_I16. Two submits (LUT-load + op). in/out int16 [M*N], N%8==0. */
+int          ork_npu_probe_silu_std_i16(ork_npu *ctx, const short *in, int M, int N,
+                                        int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
+                                        unsigned cfg4064, unsigned cfg4068, const short *lut, int nlut,
+                                        short *out, double *us);
+
 /* On-NPU SiLU (int8): out[m*N+n] = clamp_i8(round( silu(in[m][n]*in_scale) / out_scale )) via the standalone
  * SDP activation-LUT op. Calibrates the op's index map once per ctx, builds the silu curve for (in_scale,
  * out_scale), loads it, runs the op. in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
