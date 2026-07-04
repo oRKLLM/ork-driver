@@ -4563,6 +4563,7 @@ static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC
 static double silu_f(double x){ return x/(1.0+exp(-x)); }
 static double gelu_f(double x){ return 0.5*x*(1.0+erf(x*0.7071067811865476)); }   /* exact (erf) GELU */
 static double rsqrt_f(double x){ return x>1e-9 ? 1.0/sqrt(x) : 0.0; }              /* rsqrt (RMSNorm) — positive domain */
+static double exp_f(double x){ return exp(x); }                                    /* exp (softmax) */
 /* ork_mm_silu_build_lut — generate ork's OWN silu LUT for the fused-output path (ork-NATIVE: no RKNN
  * dependence, works on ork's 108-reg matmul program). Since ork controls both the LUT and the output-stage
  * registers, correct fused SiLU is a 2-step construction (see tools/silu_native.c, validated ~1 int8):
@@ -4660,6 +4661,10 @@ int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,doub
 int ork_npu_rsqrt_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     return act_lut_i8(c,rsqrt_f,in,M,N,in_scale,out_scale,out,us);
 }
+/* On-NPU exp (int8) — softmax building block: out = clamp_i8(round( exp(in*in_scale)/out_scale )). */
+int ork_npu_exp_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    return act_lut_i8(c,exp_f,in,M,N,in_scale,out_scale,out,us);
+}
 
 /* int16 index params = RKNN's CAPTURED int16 SiLU index params (from REGCMD_SILU_STD_I16). Their gain (~0.008)
  * maps the FULL int16 input range onto a ~525-wide LUT-index band centred at ~510 — the same regime RKNN uses,
@@ -4721,6 +4726,10 @@ int ork_npu_gelu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,do
 /* On-NPU rsqrt (int16) — RMSNorm building block. RKNN-class accuracy. */
 int ork_npu_rsqrt_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     return act_lut_i16(c,rsqrt_f,in,M,N,in_scale,out_scale,out,us);
+}
+/* On-NPU exp (int16) — softmax building block. RKNN-class accuracy. */
+int ork_npu_exp_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    return act_lut_i16(c,exp_f,in,M,N,in_scale,out_scale,out,us);
 }
 
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`

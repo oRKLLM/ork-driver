@@ -457,6 +457,9 @@ int          ork_npu_gelu_i16(ork_npu *ctx, const short *in, int M, int N,
  * domain): out = clamp(round( rsqrt(in*in_scale)/out_scale )). 0/ok,-1,-2,-3. */
 int          ork_npu_rsqrt_i8(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, signed char *out, double *us);
 int          ork_npu_rsqrt_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
+/* On-NPU exp (int8/int16) — softmax building block, activation-LUT (exp curve): out=clamp(round(exp(in*is)/os)). */
+int          ork_npu_exp_i8(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, signed char *out, double *us);
+int          ork_npu_exp_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
 
 /* On-NPU int16 element-wise ADD — EXPERIMENTAL, not yet bit-exact. int16's per-operand scaling lives in NVDLA
  * SDP X1/X2 sub-module regs that differ from the int8 op (0x4048 carries an extra scale) and isn't fully decoded.

@@ -70,6 +70,12 @@ int main(void){
     printf("on-NPU rsqrt (int8, RMSNorm building block) vs CPU ref:\n");
     fail |= run_rsqrt_i8(c, 8, 64, 0.5, 0.03125, 3);
     fail |= run_rsqrt_i8(c, 16, 64, 0.25, 0.0625, 3);
+    printf("on-NPU exp (int8, softmax building block) vs CPU ref:\n");
+    { static signed char in[512], out[512]; for(int i=0;i<512;i++) in[i]=(signed char)(-(i%64));  /* <=0, softmax domain */
+      double us=0; int r=ork_npu_exp_i8(c,in,8,64,0.05,0.008,out,&us); int mism=0,mx=0;
+      if(r) { printf("  exp i8 FAIL rc=%d\n",r); fail|=1; } else {
+        for(int i=0;i<512;i++){ int ref=clampi8(lround(exp(in[i]*0.05)/0.008)); int d=abs((int)out[i]-ref); if(d>3){mism++;if(d>mx)mx=d;} }
+        printf("  exp i8   [8x64  ] %s mism=%d/512 max|err|=%d  (%.1f us)\n",mism?"FAIL":"ok  ",mism,mx,us); fail|=mism?1:0; } }
     ork_npu_free(c);
     printf("%s\n", fail ? "FAIL" : "ALL OK");
     return fail;
