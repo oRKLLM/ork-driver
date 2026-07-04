@@ -3855,6 +3855,44 @@ int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const 
     return ok;
 }
 
+/* Standalone SDP element-wise MULTIPLY: submit REGCMD_MUL (captured pure-Mul op, no conv) with a,b,out patched.
+ * out[i] = clamp_i8(round(a[i]*b[i]*gain) + bias), gain/bias baked from the captured op (0x4084/88/80).
+ * a,b,out int8[n] (n<=4096). Reads a via SRDMA(0x5018), b via ERDMA(0x5038), writes out(0x4020). enable=0x18,
+ * regcfg=69. This is the CLEAN on-NPU element-wise path (NVDLA standalone SDP layer, both operands from memory)
+ * — sidesteps the conv-geometry coupling that blocked the fused-into-matmul approach. 0/ok,-1 wedged. */
+int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(n<1||n>4096) return -2;
+    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
+    memcpy(A.cpu,a,n);memcpy(B.cpu,b,n);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
+    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);        /* output */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
+    { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT"),*eb=getenv("ORK_EW_BIAS");
+      if(em) setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
+      if(es) setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0));
+      if(eb) setr(rc,REGCMD_MUL_N,0x1001,0x4080,(uint32_t)strtoul(eb,0,0)); }
+    if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
+        bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ memcpy(out,O.cpu,n); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    return ok;
+}
+
 /* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
  * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
  * (REGCMD_SILU_LUT, enable=0x18) streams the int16 silu curve into PPU LUT SRAM; (2) the matmul compute

@@ -25,6 +25,19 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("no board / init failed\n");return 0;}
     if(!ork_ppu_fuse_enabled(c)){printf("PPU fuse not enabled on this SoC — SKIP\n");ork_npu_free(c);return 0;}
 
+    if(argc>1 && !strcmp(argv[1],"mul")){
+        /* standalone SDP element-wise MUL: a*b -> out. uniform a,b (layout-agnostic) validates it executes+multiplies. */
+        int av=argc>2?atoi(argv[2]):4, bv=argc>3?atoi(argv[3]):8; int Nn=512;
+        static int8_t a[512],b[512],o[512];
+        int ramp=(av==999);  /* av=999 => ramp a, fixed b, to read the multiply relation */
+        for(int i=0;i<Nn;i++){ a[i]=ramp?(int8_t)((i%64)-32):(int8_t)av; b[i]=(int8_t)bv; }
+        double us=0; int r=ork_npu_probe_i8_mul(c,a,b,Nn,o,&us);
+        if(r){ printf("mul returned %d (%s)\n",r,r==-1?"WEDGED":"bad dims"); ork_npu_free(c); return 1; }
+        printf("STANDALONE MUL EXECUTED OK, %.1f us. a=%s b=%d\n", us, ramp?"ramp":"const", bv);
+        printf(" i:  a   b   out\n"); for(int i=0;i<16;i++) printf(" %2d: %3d %3d  %4d\n", i, a[i], b[i], (int)o[i]);
+        ork_npu_free(c); return 0;
+    }
+
     if(argc>1 && !strcmp(argv[1],"ew64")){
         /* path-a EW-mul at N=64 (matches the ORK_EW_RK override values) — wedge binary-search vehicle */
         static signed char A[8*512], B[512*64], G[8*64]; static int8_t C[8*64];

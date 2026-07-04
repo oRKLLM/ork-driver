@@ -365,6 +365,10 @@ int          ork_npu_probe_i8_ewmul_tmpl(ork_npu *ctx, const void *in, int Isz, 
 int          ork_npu_probe_i8_ewmul_lin(ork_npu *ctx, const int8_t *A, const int8_t *B, const int8_t *G,
                                         int8_t *C, double *us);
 
+/* Standalone SDP element-wise MULTIPLY (NVDLA standalone SDP layer, both operands from memory): out[i] =
+ * clamp_i8(round(a[i]*b[i]*gain)+bias). a,b,out int8[n] (n<=4096). The clean on-NPU element-wise path. 0/ok. */
+int          ork_npu_probe_i8_mul(ork_npu *ctx, const int8_t *a, const int8_t *b, int n, int8_t *out, double *us);
+
 /* Runtime gate for the PPU fused-output path. Gated on the SoC detected at startup: returns 1 only on
  * a validated PPU target (currently rk3588). On any other chip, ork-driver emits int32 output and the
  * caller's CPU/NEON requant+activation stage runs — identical numerics. The fused stage is a HW-specific
