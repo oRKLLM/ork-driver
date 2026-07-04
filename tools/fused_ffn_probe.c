@@ -11,6 +11,7 @@
  * sampled. Dims default to a small FFN (K=2048, D_ff=2048) so down's K stays <=4096 (the full-K envelope).
  * Build with the CORE srcs; run: sudo ./fused_ffn_probe [M] [iters]
  */
+#define _GNU_SOURCE
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -50,7 +51,8 @@ static void* npu_thread(void*a){
 int main(int argc,char**argv){
     int M = argc>1?atoi(argv[1]):64;
     int iters = argc>2?atoi(argv[2]):200;
-    const int Kh=2048, Dff=2048;   /* hidden, ffn-inner (down K=Dff<=4096) */
+    const int Kh=2048; int Dff=2048; /* hidden, ffn-inner */
+    { const char*e=getenv("ORK_DFF"); if(e){int v=atoi(e); if(v>0)Dff=v;} }  /* real Qwen3-1.7B FFN = 6144 */
     ork_npu *c = ork_npu_init();
     if(!c){ fprintf(stderr,"init failed\n"); return 2; }
 

@@ -63,6 +63,10 @@ autotune: tools/autotune.c $(CORE)
 silu_calibrate: tools/silu_calibrate.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# validate the raised fused-SiLU M-tile cap (mg_max*64) by self-consistency vs forced mc=64.
+fused_mtile_check: tools/fused_mtile_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

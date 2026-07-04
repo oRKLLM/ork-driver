@@ -3656,6 +3656,17 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * weight (w->Bf, K%512==0, K<=4096), N-tiled, single-core, M-tile<=64/submit. The fixed silu*S PWL LUT
  * is streamed into PPU SRAM ONCE (submit-1) then every matmul+silu submit reads it. rk3588-gated.
  * out C = silu(requant(A·W)) as int8 [M*N]. 0/ok, -1 wedge, -2 shape, -3 SoC. */
+
+/* Fused-path M-tile cap = the 0x1040 K-reduction schedule's validated max rows (mg_max*64), the SAME
+ * bit-exact ceiling the plain int8 matmul uses (synth_i8 sets 0x1040 from mc, so the fused output stage
+ * inherits the exact schedule). Was hardcoded 64 (conservative) — that DOUBLED submits at prefill
+ * (mc=128@K2048). K<=4096 here so Kp==K. See AGENTS.md "weight-DMA amortization". */
+static inline int fused_mtile(int K,int M){
+    double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale);
+    int mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0; int chunk = mg_max*64;
+    const char*e=getenv("ORK_FUSED_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }  /* A/B override (validation) */
+    if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
+}
 int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
                        int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                        const int16_t *lut,int nlut){
@@ -3665,10 +3676,13 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     if(K%512 || K>4096 || N%32) return -2;
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror run()) */
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=64; if(chunk>M)chunk=M;                    /* single fused M-tile per submit (<=64, validated) */
+    int chunk=fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64: doubled prefill submits) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
-    if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    /* realloc Af/Cc if too small OR in the WRONG domain: chained FFN weights (gate/up/down) can live in
+     * different IOMMU domains, and dom_activate() above may have switched dom_active — a submit against a
+     * buffer whose IOVA was reserved in another domain faults the NPU (soft reset). Keep them in dom_active. */
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     /* build the LUT-load regcmd once (fixed silu*S PWL LUT, or the supplied lut[]) */
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
@@ -3678,24 +3692,23 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* Per N-slice x M-tile: LUT-load (enable 0x18) then the matmul+fused-SiLU. The matmul goes through
-     * submit1() (output in the warmed c->Cc, correct domain) — a hand-rolled submit to a fresh output
-     * buffer produces bias-only output (the conv accumulator doesn't reach the SDP); submit1's warmed
-     * c->Cc is the working path (validated bit-exact vs the probe). LUT-load is paired per tile. */
+    /* Stream the LUT into PPU SRAM ONCE (enable 0x18) — it persists across the matmul submits below, so we
+     * DON'T reload per M-tile (that was ~half the submits at prefill). Then per N-slice x M-tile: matmul +
+     * fused-SiLU via submit1() (warmed c->Cc + correct domain — a hand-rolled submit to a fresh buffer gives
+     * bias-only output; submit1's warmed c->Cc is the validated bit-exact path vs the probe). */
     int rc_ret=0;
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma;
         bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);   /* re-sync the resident weight to device */
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-            /* submit A: stream the LUT into PPU SRAM (enable 0x18) */
-            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-              t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-              struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-              if(rknpu_submit_ioctl(fd,&ls,c->dom_active)){ rc_ret=-1; break; } }
-            /* submit B: matmul + fused-SiLU output stage -> int8 in c->Cc (via submit1: warmup + domain) */
+            /* matmul + fused-SiLU output stage -> int8 in c->Cc (via submit1: warmup + domain) */
             uint32_t rc[REGCMD_I8_N];
             synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
             set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
@@ -3766,10 +3779,11 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
     if(K%512 || K>4096 || N%32) return -2;
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=64; if(chunk>M)chunk=M;
+    int chunk=fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
-    if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    /* realloc on size OR domain change (see ork_mm_run_i8_silu: cross-domain reuse faults the NPU) */
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     int rc_ret=0;
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma; bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
