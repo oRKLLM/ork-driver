@@ -4180,6 +4180,56 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     return ok;
 }
 
+/* Faithful fp16 replay: run RKNN's fp16 LUT-LOAD program (loader/ln, the LE-table exponential-mode loader with
+ * RKNN's curve baked in) verbatim + the fp16 compute op (REGCMD_SILU_STD_F16) verbatim — patching only the I/O
+ * addresses + M/N. Unlike ork_npu_probe_silu_std_f16, this uses the fp16 loader (NOT the int8 LO-table loader)
+ * and keeps the compute's baked index params. in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
+int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)||ln<2200||ln>2300) return -2;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)ln*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
+    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    memset(A.cpu,0,sz);memset(O.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+EWCUBEH(m,n))=i16[m*N+n];
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    /* submit 1: fp16 LUT-load (verbatim, RKNN's LE-table curve baked in; patch only the scratch out addr) */
+    memcpy(Lrc.cpu,loader,(size_t)ln*4);
+    setr((uint32_t*)Lrc.cpu,ln,0x1001,0x4020,(uint32_t)Lsc.dma);
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+    }
+    /* submit 2: fp16 compute op (REGCMD_SILU_STD_F16 verbatim baked params; patch I/O + M/N) */
+    uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
+    if(!getenv("ORK_F16_VERBATIM")){        /* LE-exp index config may live in "geometry" regs — allow pure verbatim */
+        set_mul_geom(rc,REGCMD_SILU_STD_F16_N,M,N);
+        setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5038,0);
+    }
+    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef EWCUBEH
+    return ok;
+}
+
 /* int16 (w16a16i) standalone activation-LUT op — RE probe. Same requant-LUT math as the int8 op
  * (out=clamp_i16(R*LUT-interp(idx)+out_bias)) but int16 I/O (atom-8 2-byte cube) via REGCMD_SILU_STD_I16.
  * Two submits (LUT-load + op). Caller supplies scale regs + LUT. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */

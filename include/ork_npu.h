@@ -400,6 +400,10 @@ int          ork_npu_probe_silu_std(ork_npu *ctx, const signed char *in, int M, 
                                     unsigned cfg4064, unsigned cfg4068, const short *lut, int nlut,
                                     signed char *out, double *us);
 
+/* Faithful fp16 replay: run RKNN's fp16 LUT-load program (`loader`/`ln`) + the fp16 compute op verbatim,
+ * patching only I/O + M/N. Uses the fp16 (LE-table) loader, not the int8 LO loader. in/out fp16 [M*N], N%8==0. */
+int          ork_npu_replay_full_f16(ork_npu *ctx, const unsigned *loader, int ln, const ork_f16 *in, int M, int N, ork_f16 *out, double *us);
+
 /* fp16 standalone activation-LUT op — RE probe. Applies the PPU LUT to a single fp16 input [M][N] via
  * REGCMD_SILU_STD_F16. Two submits (LUT-load + op). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int          ork_npu_probe_silu_std_f16(ork_npu *ctx, const ork_f16 *in, int M, int N,
