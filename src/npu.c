@@ -56,7 +56,7 @@ static long   g_prof_submit_progs = 0;  /* total PC-chained programs across all 
 static long   g_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
-struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. */
+struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; int domain; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. domain: the iommu domain this buffer's IOVA was reserved in (for the IOVA wedge-guard accounting; set by bcreate/bimport, released by bdestroy). */
 struct ork_pw { struct ork_npu *c; int id; };   /* persistent NPU-pool worker arg */
 #define ORK_MAXDOM 16
 /* Parked per-domain copy of the submit-touched scratch (see ork_npu.dom_save). Mirrors exactly the
@@ -238,17 +238,54 @@ static int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("
  * sub->iommu_domain_id from a parameter. The pack-path default for the ggml-ork caller lives on
  * the ork_npu ctx (c->pack_domain), read once per pack to stamp w->domain. dom<0 => default. */
 static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
+/* ---- IOVA WEDGE GUARD -----------------------------------------------------------------------
+ * The rk_iommu v2 IOVA window is 32-bit (~4 GiB) PER iommu_domain_id, and the kernel rknpu driver
+ * FAULTS inside MEM_CREATE (rknpu_iommu_dma_map_sg -> rknpu_gem_object_create) when that window is
+ * exhausted/fragmented, rather than returning -ENOMEM — an in-syscall OOPS that hard-wedges the NPU
+ * (recoverable only by reboot; a power-cut mid-wedge risks SPI-bootloader corruption). A userspace
+ * return-value check on MEM_CREATE therefore cannot prevent it (the kernel dies before returning).
+ * So we account mapped bytes PER DOMAIN and REFUSE the allocation in userspace before issuing
+ * MEM_CREATE once a per-domain safe ceiling would be exceeded — the allocating call then returns
+ * {0} (cpu==NULL) and its caller falls back (CPU) cleanly. Ceiling default 3900 MiB (headroom under
+ * the 4 GiB cap for fragmentation + kernel overhead); tune with ORK_IOVA_CEIL_MB. This guards EVERY
+ * DMA-allocating path (weights, scratch, PPU-op buffers, zero-copy imports), not just one op. */
+#define ORK_IOVA_NDOM 64
+static size_t g_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
+static size_t ork_iova_ceiling(void){
+    static size_t v=0;
+    if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):3900; if(mb<=0)mb=3900; v=(size_t)mb*1024u*1024u; }
+    return v;
+}
+/* reserve `need` bytes in domain `dom`; 1 = ok (accounted), 0 = would exceed cap (caller must not alloc). */
+static int ork_iova_reserve(int dom,size_t need){
+    if(dom<0||dom>=ORK_IOVA_NDOM) return 1;   /* out-of-range domain: untracked, allow (rare) */
+    if(g_iova_bytes[dom]+need > ork_iova_ceiling()){
+        fprintf(stderr,"[ork] IOVA guard: domain %d at %zu MiB + %zu MiB would exceed the %zu MiB cap "
+                "— refusing MEM_CREATE so the caller falls back (raise ORK_IOVA_CEIL_MB or spread domains)\n",
+                dom, g_iova_bytes[dom]>>20, need>>20, ork_iova_ceiling()>>20);
+        return 0;
+    }
+    g_iova_bytes[dom]+=need; return 1;
+}
+static void ork_iova_release(int dom,size_t bytes){
+    if(dom<0||dom>=ORK_IOVA_NDOM) return;
+    g_iova_bytes[dom] = g_iova_bytes[dom]>bytes ? g_iova_bytes[dom]-bytes : 0;
+}
 static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
-    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=pgup(size); c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=ork_dom(domain);
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");return (struct buf){0};}
+    int dom=ork_dom(domain); size_t need=pgup(size);
+    if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
+    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");return (struct buf){0};}
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");ork_iova_release(dom,need);return (struct buf){0};}
     void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
-    if(p==MAP_FAILED){perror("mmap");return (struct buf){0};}
-    return (struct buf){c.handle,c.dma_addr,c.obj_addr,p,c.size};
+    if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
+    struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
+    return b;
 }
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
 
 /* Zero-copy IMPORT (no page alloc, no copy): allocate a dma-buf from /dev/dma_heap/system, mmap it,
@@ -281,12 +318,14 @@ static struct buf bimport(int fd,size_t size,int domain){
     int dbuf=(int)a.fd;
     void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
+    int dom=ork_dom(domain);
+    if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
-    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=ork_dom(domain);
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     struct buf b; memset(&b,0,sizeof b);
-    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf;
+    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     return b;
 }
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
