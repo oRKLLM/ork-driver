@@ -445,6 +445,14 @@ int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed cha
  * [M*N], N%8==0; rk3588-gated. 0/ok,-1,-2,-3. */
 int          ork_npu_add_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
 
+/* On-NPU GELU (int8): out = clamp_i8(round( gelu(in*in_scale)/out_scale )) via the same standalone SDP
+ * activation-LUT op as SiLU (the LUT holds the GELU curve). Bit-exact-class. N%16==0. 0/ok,-1,-2,-3. */
+int          ork_npu_gelu_i8(ork_npu *ctx, const signed char *in, int M, int N,
+                             double in_scale, double out_scale, signed char *out, double *us);
+/* On-NPU GELU (int16 / w16a16i): same op, GELU curve. RKNN-class accuracy. N%8==0. 0/ok,-1,-2,-3. */
+int          ork_npu_gelu_i16(ork_npu *ctx, const short *in, int M, int N,
+                              double in_scale, double out_scale, short *out, double *us);
+
 /* On-NPU int16 element-wise ADD — EXPERIMENTAL, not yet bit-exact. int16's per-operand scaling lives in NVDLA
  * SDP X1/X2 sub-module regs that differ from the int8 op (0x4048 carries an extra scale) and isn't fully decoded.
  * out = clamp_i16(round((a*a_scale + b*b_scale)/out_scale)). in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */

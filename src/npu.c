@@ -4561,6 +4561,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
 static double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
 
 static double silu_f(double x){ return x/(1.0+exp(-x)); }
+static double gelu_f(double x){ return 0.5*x*(1.0+erf(x*0.7071067811865476)); }   /* exact (erf) GELU */
 /* ork_mm_silu_build_lut — generate ork's OWN silu LUT for the fused-output path (ork-NATIVE: no RKNN
  * dependence, works on ork's 108-reg matmul program). Since ork controls both the LUT and the output-stage
  * registers, correct fused SiLU is a 2-step construction (see tools/silu_native.c, validated ~1 int8):
@@ -4633,16 +4634,26 @@ static void silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,doubl
         lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
 }
 
+/* Generic int8 pointwise activation via the standalone SDP LUT op: out = clamp_i8(round( f(in*in_scale)/out_scale )).
+ * The op is activation-agnostic (the LUT contents define f); calibrate idx once, build f's curve, run. */
+static int act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(silu_calibrate_idx(c)) return -1;
+    int16_t lut[1030]; silu_build_curve(c,f,in_scale,out_scale,lut);
+    return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
+}
+
 /* Public on-NPU SiLU (int8): out[m*N+n] = clamp_i8(round( silu(in[m][n]*in_scale) / out_scale )) via the
  * standalone SDP activation-LUT op. Lazily calibrates idx(in) once per ctx, builds the silu curve for the
  * requested (in_scale,out_scale), loads it, and runs the op (2 submits). in/out int8 [M*N], N%16==0.
  * rk3588-gated. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_silu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
-    if(silu_calibrate_idx(c)) return -1;
-    int16_t lut[1030]; silu_build_curve(c,silu_f,in_scale,out_scale,lut);
-    return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
+    return act_lut_i8(c,silu_f,in,M,N,in_scale,out_scale,out,us);
+}
+/* On-NPU GELU (int8): same standalone activation-LUT op, GELU curve. Bit-exact-class like SiLU. */
+int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    return act_lut_i8(c,gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 
 /* int16 index params = RKNN's CAPTURED int16 SiLU index params (from REGCMD_SILU_STD_I16). Their gain (~0.008)
@@ -4676,24 +4687,31 @@ static int silu_calibrate_idx16(ork_npu *c){
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
  * and samples silu there, so the op's interpolation lands on silu at the exact grid. RKNN-class accuracy.
  * in/out int16 [M*N], N%8==0. rk3588-gated. 0/ok,-1 wedged,-2 bad shape,-3 SoC. */
-int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+static int act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     if(silu_calibrate_idx16(c)) return -1;
     /* q_in(k): for each integer idx k, average the q_in of the samples that measured idx==k (dense sampling
-     * gives ~8 samples/idx at R=1 — exactly the op's grid, no R shift). Then LUT[k]=silu(q_in(k)*in_scale)/os. */
+     * gives ~8 samples/idx at R=1 — exactly the op's grid, no R shift). Then LUT[k]=f(q_in(k)*in_scale)/os. */
     static double qsum[1030]; static int qn[1030];
     for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
     for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
     int16_t lut[1030]; int lo=-1,hi=-1;
     for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k;
-        double q_in=qsum[k]/qn[k]; double val=silu_f(q_in*in_scale)/out_scale; long q=lround(val);
+        double q_in=qsum[k]/qn[k]; double val=f(q_in*in_scale)/out_scale; long q=lround(val);
         if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
     if(lo<0) return -1;
     for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
     for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
     return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
+}
+int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    return act_lut_i16(c,silu_f,in,M,N,in_scale,out_scale,out,us);
+}
+/* On-NPU GELU (int16 / w16a16i): same activation-LUT op, GELU curve. RKNN-class accuracy like SiLU int16. */
+int ork_npu_gelu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    return act_lut_i16(c,gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`
