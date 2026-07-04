@@ -103,7 +103,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     int silu_idx_ok; short silu_idx[256];
     /* int16 variant: with the gain-1 index params (0x4068 low16=0x1000) idx = in + 512 (integer, no LUT
      * interpolation -> bit-exact), usable for |in| < 512. silu_idx16[in+512] = measured LUT index (-1 if none). */
-    int silu_idx16_ok; short silu_idx16[1024]; };
+    int silu_idx16_ok; short silu_idx16[4096]; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
@@ -4443,43 +4443,55 @@ int ork_npu_silu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,doub
     return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
 }
 
-/* int16 index params: same offset/fine-bias as int8 but the 0x4068 GAIN field (low 16 bits) set to 0x1000 =>
- * gain 1 => idx = in + 512 (integer, no LUT interpolation => bit-exact). Usable for |in| < 512. The 0x4068
- * gain field is 4096/gain-ish (0x0800=>2, 0x1000=>1, decoded on-silicon); gain 1 gives the widest exact range. */
-#define ORK_SILU16_C4068 0x411c1000u
+/* int16 index params = RKNN's CAPTURED int16 SiLU index params (from REGCMD_SILU_STD_I16). Their gain (~0.008)
+ * maps the FULL int16 input range onto a ~525-wide LUT-index band centred at ~510 — the same regime RKNN uses,
+ * so the idx is densely + smoothly sampled and place-and-interpolate reproduces silu well (unlike int8's params
+ * which give gain~2 and only span |in|<256). We keep these index params and only override R->1 / out_bias->0,
+ * then build our own curve for the caller's (in_scale,out_scale) — mirroring the working int8 path. */
+#define ORK_SILU16_IDXOFF 0xffffc000u
+#define ORK_SILU16_C4064  0xff43770au
+#define ORK_SILU16_C4068  0x7eae1100u
+#define SILU16_NS         4096        /* dense samples across [-32768,32767], step 16 */
+#define SILU16_QSTEP      16
 
-/* Calibrate the int16 idx map once per ctx: ramp LUT at R=1 (int16 output isn't clamped at 127), sweep inputs
- * [-512,511] via M=16,N=64=1024 elems, idx(v)=out+512. Fills silu_idx16[in+512]. 0/ok, -1 wedged. */
+/* Calibrate the int16 idx map once per ctx at RKNN's index params, AT R=1 (== the run R, so the measured idx
+ * matches the run exactly — no R-dependent idx shift). Ramp LUT (interpolated exactly) -> out=idx-512 ->
+ * idx=out+512 (integer). Dense sampling (step 16) resolves the idx transitions for accurate inversion.
+ * silu_idx16[s] = measured integer LUT index for q_in=-32768+s*16; INT16_MIN if saturated. */
 static int silu_calibrate_idx16(ork_npu *c){
     if(c->silu_idx16_ok) return 0;
-    const int M=16,N=64;                      /* 1024 elems = each value in [-512,511] once */
-    int16_t in[1024],out[1024]; int16_t lut[1030];
-    for(int i=0;i<1024;i++) in[i]=(int16_t)(i-512);
+    const int M=64,N=64;                      /* 4096 samples across the full int16 range (step 16) */
+    static int16_t in[SILU16_NS],out[SILU16_NS]; int16_t lut[1030];
+    for(int s=0;s<SILU16_NS;s++) in[s]=(int16_t)(-32768 + s*SILU16_QSTEP);
     for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
-    if(ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
-    for(int i=0;i<1024;i++) c->silu_idx16[i]=-1;
-    for(int i=0;i<M*N;i++){ int v=in[i]+512; int o=out[i]; if(v>=0&&v<1024&&o>-32000&&o<32000) c->silu_idx16[v]=(short)(o+512); }
+    if(ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
+    for(int s=0;s<SILU16_NS;s++){ int o=out[s]; c->silu_idx16[s]=(o>-490&&o<510)?(short)(o+512):(short)-32768; }
     c->silu_idx16_ok=1; return 0;
 }
 
 /* Public on-NPU SiLU (int16 / w16a16i): out = clamp_i16(round( silu(in*in_scale)/out_scale )) via the standalone
- * int16 activation-LUT op. Uses gain-1 index params so each integer input maps to an integer LUT index
- * (no interpolation). REQUIRES |in| < 512 (the caller quantizes the silu input to fit; gain 1 gives idx = in+512).
+ * int16 activation-LUT op, using RKNN's captured index params (full-range coverage). Builds the LUT the way RKNN
+ * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
+ * and samples silu there, so the op's interpolation lands on silu at the exact grid. RKNN-class accuracy.
  * in/out int16 [M*N], N%8==0. rk3588-gated. 0/ok,-1 wedged,-2 bad shape,-3 SoC. */
 int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     if(silu_calibrate_idx16(c)) return -1;
-    int16_t lut[1030]; int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
-    for(int vv=-511;vv<512;vv++){ int idx=c->silu_idx16[vv+512]; if(idx<0||idx>1029)continue;
-        double val=silu_f(vv*in_scale)/out_scale; long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768;
-        lut[idx]=(int16_t)q; set[idx]=1; }
-    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
+    /* q_in(k): for each integer idx k, average the q_in of the samples that measured idx==k (dense sampling
+     * gives ~8 samples/idx at R=1 — exactly the op's grid, no R shift). Then LUT[k]=silu(q_in(k)*in_scale)/os. */
+    static double qsum[1030]; static int qn[1030];
+    for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
+    for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
+    int16_t lut[1030]; int lo=-1,hi=-1;
+    for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k;
+        double q_in=qsum[k]/qn[k]; double val=silu_f(q_in*in_scale)/out_scale; long q=lround(val);
+        if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
     if(lo<0) return -1;
-    for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
-    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
-        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
-    return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU16_C4068,lut,1030,out,us);
+    for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
+    for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
+        lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
+    return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
 }
 
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`
