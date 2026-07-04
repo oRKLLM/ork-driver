@@ -4343,15 +4343,22 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)ln*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
-    memset(A.cpu,0,sz);memset(O.cpu,0,sz);
+    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;              /* orig x */
+    struct buf S=bcreate(fd,sz,0x403,-1); if(!S.cpu){bdestroy(fd,&A);return -2;} /* stage-1 sigmoid intermediate */
+    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&S);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)ln*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);return -2;}
+    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    memset(A.cpu,0,sz);memset(S.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+EWCUBEH(m,n))=i16[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
-    /* submit 1: fp16 LUT-load (verbatim, RKNN's LE-table curve baked in; patch only the scratch out addr) */
+    #define SUBMIT1(REG,RN,RA) do{ memcpy(c->regcmd.cpu,(REG),(size_t)(RN)*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); \
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk); \
+        tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(RA); tk->regcmd_addr=c->regcmd.dma; \
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); \
+        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; \
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }while(0)
+    /* submit 1: fp16 LUT-load (verbatim; patch only the scratch out addr) — uses Lrc not c->regcmd (2210 words) */
     memcpy(Lrc.cpu,loader,(size_t)ln*4);
     setr((uint32_t*)Lrc.cpu,ln,0x1001,0x4020,(uint32_t)Lsc.dma);
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -4359,27 +4366,25 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
-    /* submit 2: fp16 compute op (REGCMD_SILU_STD_F16 verbatim baked params; patch I/O + M/N) */
-    uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
-    if(!getenv("ORK_F16_VERBATIM")){        /* LE-exp index config may live in "geometry" regs — allow pure verbatim */
-        set_mul_geom(rc,REGCMD_SILU_STD_F16_N,M,N);
-        setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5038,0);
-    }
-    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
-    tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    /* submit 2: stage-1 (REGCMD_SILU_STD_F16, sigmoid via LE-LUT) VERBATIM, x@A -> sigmoid@S */
+    { uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
+      setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4020,(uint32_t)S.dma);
+      setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+      SUBMIT1(rc,REGCMD_SILU_STD_F16_N,69); }
+    /* submit 3: stage-2 (REGCMD_SILU_F16_T2, x*sigmoid) VERBATIM, sigmoid@S (0x5018) * x@A (0x5038) -> O */
+    { uint32_t rc[REGCMD_SILU_F16_T2_N]; memcpy(rc,REGCMD_SILU_F16_T2,sizeof rc);
+      setr(rc,REGCMD_SILU_F16_T2_N,0x1001,0x4020,(uint32_t)O.dma);
+      setr(rc,REGCMD_SILU_F16_T2_N,0x2001,0x5018,(uint32_t)S.dma);
+      setr(rc,REGCMD_SILU_F16_T2_N,0x2001,0x5038,(uint32_t)A.dma);
+      SUBMIT1(rc,REGCMD_SILU_F16_T2_N,69); }
+    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=0;
+    bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef SUBMIT1
     #undef EWCUBEH
-    return ok;
+    return 0;
 }
 
 /* int16 (w16a16i) standalone activation-LUT op — RE probe. Same requant-LUT math as the int8 op
