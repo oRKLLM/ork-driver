@@ -13,12 +13,13 @@
 
 int main(int argc, char** argv) {
     int per_channel = argc > 1 ? atoi(argv[1]) : 0;
+    int mmtype = argc > 2 ? atoi(argv[2]) : 3;       /* 3=INT8_TO_INT8, 2=TO_INT32, 9=TO_FLOAT32 */
     const int M = 32, K = 512, N = 64;               /* small: keep the regcmd simple to diff */
 
     rknn_matmul_ctx ctx; rknn_matmul_info info; rknn_matmul_io_attr io;
     memset(&info, 0, sizeof info); memset(&io, 0, sizeof io);
     info.M = M; info.K = K; info.N = N;
-    info.type = RKNN_INT8_MM_INT8_TO_INT8;           /* int8 A x int8 B -> int8 C (has a requant scale) */
+    info.type = (rknn_matmul_type) mmtype;           /* output precision: reveals the 0x4010/0x40c0/0x4050 format regs */
     info.AC_layout = 0; info.B_layout = 0;
     info.B_quant_type = per_channel ? 1 : 0;         /* 0=per-layer, 1=per-channel — the diff we want */
 

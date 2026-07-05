@@ -67,6 +67,10 @@ silu_calibrate: tools/silu_calibrate.c $(CORE)
 fused_mtile_check: tools/fused_mtile_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# validate the INT32-output fused SiLU (silu emitted at int32 precision vs int8) against CPU silu.
+silu32_check: tools/silu32_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

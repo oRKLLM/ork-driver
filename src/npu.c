@@ -3724,6 +3724,89 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     return rc_ret;
 }
 
+/* ⚠ WIP / DOES NOT WORK YET (2026-07-05): the int32-output + LUT-activation combo below WEDGES the NPU.
+ * The output-precision is a field in reg 0x4010, but the MATMUL program's encoding for non-int8 output WITH
+ * the activation/LUT stage enabled is undocumented and could not be captured (RKNN never fuses activation into
+ * a non-int8-output matmul — it does activations as separate layers), so there's no known-good regcmd to copy.
+ * Known encodings (0x4010): matmul int8+silu=0x44e0, matmul int32(no act)=0x80000000; standalone silu int8=
+ * 0x2000, int16=0x24004401, fp16=0xa8000002 (a DIFFERENT program). Naive int32+act (0x800044e0) wedges. The
+ * ablation (ORK_GATE_ABLATE) proved a non-int8 silu output would recover the FFN-chain quality gap (fp32 silu
+ * = baseline PPL); this needs either a careful 0x4010 PREC-field sweep (wedge-prone) or an un-fused int32-matmul
+ * -> standalone int16/fp16-silu path. NOT called by the chain (which still uses int8 ork_mm_run_i8_silu). ── */
+/* set_i8_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
+ * synth_i8's default int32 output format (does NOT apply set_i8_out8's int8 override) and enables the SiLU
+ * LUT with the int32-output bit (0x8000) set in 0x4010. out_i32 = R*V16[idx(acc)] + out_bias, unclamped —
+ * with a fine-scale LUT that maps silu across ~±8000 (int16 V16 * R), that's ~13-14 bit silu instead of int8.
+ * The ablation (ORK_GATE_ABLATE) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
+ * = baseline PPL); this recovers it while keeping silu free on-NPU. Same LUT/config regs as set_i8_silu. */
+static void set_i8_silu32(uint32_t*rc,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+    setr(rc,REGCMD_I8_N,0x1001,0x4084,(uint32_t)r_mult);   /* R mantissa (acc->index step + LUT->output gain) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4088,(uint32_t)r_shift);  /* R shift */
+    setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,0x800044e0);         /* int32 output (bit 31, per REGCMD_I8 template) + LUT/activation enable (0x44xx|0xe0) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4060,0x00020040);
+    setr(rc,REGCMD_I8_N,0x1001,0x4068,cfg4068);
+    setr(rc,REGCMD_I8_N,0x1001,0x4070,0x00000302);
+    setr(rc,REGCMD_I8_N,0x1001,0x4080,out_bias);
+    setr(rc,REGCMD_I8_N,0x1001,0x4108,0x00000068);
+    setr(rc,REGCMD_I8_N,0x1001,0x410c,0x00050500);
+    setr(rc,REGCMD_I8_N,0x1001,0x4110,idx_off);
+    setr(rc,REGCMD_I8_N,0x1001,0x411c,0x00004000);
+    setr(rc,REGCMD_I8_N,0x1001,0x4128,0x40320000);
+    setr(rc,REGCMD_I8_N,0x1001,0x412c,0x000001a0);
+}
+
+/* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
+ * Same path as ork_mm_run_i8_silu but the silu value is emitted at int32 precision (dequant with the fine
+ * out_scale the LUT was built for). K%512, K<=4096, N%32. 0/ok, -1 wedge, -2 shape, -3 SoC. */
+int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
+                         int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
+                         const int16_t *lut,int nlut){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(w->dtype!=DT_I8 || !w->Bf) return -2;
+    int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
+    if(K%512 || K>4096 || N%32) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    int chunk=fused_mtile(K,M);
+    size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX*4;   /* int32 output: 4 bytes/elem */
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
+        for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    int rc_ret=0;
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
+    for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        uint64_t wbase=w->Bf[ns].dma;
+        bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+            int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
+            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            uint32_t rc[REGCMD_I8_N];
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
+            set_i8_silu32(rc,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+              t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(submit1(c)){ rc_ret=-1; break; }
+            int32_t*cc=(int32_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+        }
+    }
+    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    return rc_ret;
+}
+
 /* Resident-weight fused UP matmul + element-wise MULTIPLY by G (=silu(gate)) in the SDP output stage:
  * C = clamp_i8( round( (A·W_up) * G * gain ) ), gain = mult/2^shift = s_up*s_silu/s_out. Completes the
  * fused SwiGLU (gate via ork_mm_run_i8_silu -> G; up here). The 2nd operand G is fetched by the SDP

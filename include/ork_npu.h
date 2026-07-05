@@ -295,6 +295,12 @@ int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int3
 int          ork_mm_run_i8_silu(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int8_t *C,
                                 int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
                                 unsigned cfg4068, const short *lut, int nlut);
+/* Same as ork_mm_run_i8_silu but INT32 output (silu NOT quantized to int8): out_i32 = R*V16[idx]+out_bias,
+ * unclamped. With a fine-scale LUT (out_scale ~ silu_max/8000) this is ~13-14 bit silu, recovering the
+ * quality the int8 silu output loses (the FFN-chain gap) while keeping silu free on-NPU. C is int32 [M*N]. */
+int          ork_mm_run_i8_silu32(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int *C,
+                                  int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
+                                  unsigned cfg4068, const short *lut, int nlut);
 /* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
  * multiply by G (= silu(gate) from ork_mm_run_i8_silu) applied IN the up matmul's SDP output stage.
  * gain = mult/2^shift = s_up*s_silu/s_out. G is dense int8 [M*N]. Resident full-K int8 weight
