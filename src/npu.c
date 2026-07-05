@@ -3743,14 +3743,16 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
 static void set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     /* SWEEP knobs: output-format registers env-configurable to find the matmul+LUT non-int8 output encoding.
      * PREC = bits[1:0] of 0x4010 (int8=0, int16=1, fp16=2; bit31=int32-bypass-CVT). int8+silu = 0x44e0. */
-    static uint32_t r4010=0,r40c0=0,r4050=0; static int div38=0,init=0;
+    static uint32_t r4010=0,r40c0=0,r4050=0,r84=0,r88=0; static int div38=0,ovg=0,init=0;
     if(!init){ init=1; const char*e;
         e=getenv("ORK_SILU_4010"); r4010=e?(uint32_t)strtoul(e,0,0):0x000044e1u;   /* default: PREC=1 (int16), CVT kept */
         e=getenv("ORK_SILU_40C0"); r40c0=e?(uint32_t)strtoul(e,0,0):0x40u;          /* 2-byte element (int8=0x20,int32=0x80) */
         e=getenv("ORK_SILU_4050"); r4050=e?(uint32_t)strtoul(e,0,0):0x0124u;        /* row byte-stride (int8=0x124,int32=0x7fc) */
-        e=getenv("ORK_SILU_38DIV"); div38=e?atoi(e):8; }                            /* group stride divisor (int8=16,int32=4,int16=8) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4084,(uint32_t)r_mult);   /* R mantissa (acc->index step + LUT->output gain) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4088,(uint32_t)r_shift);  /* R shift */
+        e=getenv("ORK_SILU_38DIV"); div38=e?atoi(e):8;                              /* group stride divisor (int8=16,int32=4,int16=8) */
+        const char*g=getenv("ORK_SILU_4084"); if(g){ ovg=1; r84=(uint32_t)strtoul(g,0,0);
+            const char*s=getenv("ORK_SILU_4088"); r88=s?(uint32_t)strtoul(s,0,0):0; } }  /* CVT gain override (fp16=0x00010001) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4084,ovg?r84:(uint32_t)r_mult);   /* CVT gain (int R mantissa, or fp16 0x00010001) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4088,ovg?r88:(uint32_t)r_shift);  /* CVT shift */
     setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
     setr(rc,REGCMD_I8_N,0x1001,0x4010,r4010);              /* output precision (PREC field) + LUT/activation enable */
     setr(rc,REGCMD_I8_N,0x1001,0x40c0,r40c0);              /* output element size */
