@@ -301,6 +301,13 @@ int          ork_mm_run_i8_silu(ork_npu *ctx, ork_w *w, int M, const int8_t *A, 
 int          ork_mm_run_i8_silu32(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int *C,
                                   int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
                                   unsigned cfg4068, const short *lut, int nlut);
+/* fp16 gate matmul + fused SiLU with fp16->fp32 output (NO int8 activation quant) — the "end-goal" precise
+ * on-NPU gate. Recovers the PPL the int8 silu output loses, but the fp16 matmul is ~3.3x int8 (net-loss today,
+ * gated OFF, built for a future int8-win pipeline). w = fp16 weight (ork_mm_pack), A = fp16 [M,K], C = fp32
+ * [M,N] silu(gate). K%32, N%16, N<=nmax. 0/ok,-1,-2,-3. WIP: fp16 LUT calibration approximate. */
+int          ork_mm_run_f16_silu(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float *C,
+                                 unsigned out_bias, unsigned idx_off, unsigned cfg4068,
+                                 const short *lut, int nlut);
 /* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
  * multiply by G (= silu(gate) from ork_mm_run_i8_silu) applied IN the up matmul's SDP output stage.
  * gain = mult/2^shift = s_up*s_silu/s_out. G is dense int8 [M*N]. Resident full-K int8 weight

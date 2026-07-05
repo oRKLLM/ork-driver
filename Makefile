@@ -75,6 +75,10 @@ silu32_check: tools/silu32_check.c $(CORE)
 f16_gate_bench: tools/f16_gate_bench.c $(CORE)
 	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(CORE) -lm
 
+# smoke-test the fp16 fused gate+SiLU primitive (runs? silu-shaped?).
+silu_f16_check: tools/silu_f16_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

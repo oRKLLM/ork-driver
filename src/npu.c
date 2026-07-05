@@ -3824,6 +3824,85 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
     return rc_ret;
 }
 
+/* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
+ * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)
+ * so the silu value is emitted at fp16→fp32 precision, NOT quantized to int8. Same flying-mode LUT-stage regs
+ * as set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
+ * set_i8_silu's set_i8_out8 override to int8). This is the "end-goal" higher-precision fused gate — currently
+ * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
+ * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
+static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+    setr(rc,REGCMD_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_N,0x2001,0x5004,0x0030); /* activation mode on */
+    setr(rc,REGCMD_N,0x1001,0x4060,0x00020040);   /* silu LUT-stage config (shared with the int8 fused path) */
+    setr(rc,REGCMD_N,0x1001,0x4068,cfg4068);
+    setr(rc,REGCMD_N,0x1001,0x4070,0x00000302);
+    setr(rc,REGCMD_N,0x1001,0x4080,out_bias);
+    setr(rc,REGCMD_N,0x1001,0x4108,0x00000068);
+    setr(rc,REGCMD_N,0x1001,0x410c,0x00050500);
+    setr(rc,REGCMD_N,0x1001,0x4110,idx_off);
+    setr(rc,REGCMD_N,0x1001,0x411c,0x00004000);
+    setr(rc,REGCMD_N,0x1001,0x4128,0x40320000);
+    setr(rc,REGCMD_N,0x1001,0x412c,0x000001a0);
+    /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
+}
+
+/* ork_mm_run_f16_silu — fp16 gate matmul + fused SiLU with fp16→fp32 output (no int8 activation quant). The
+ * "end-goal" precise on-NPU gate: recovers the full PPL gap the int8 silu output loses (ablation), at the cost
+ * of the fp16 matmul (~3.3x int8, tools/f16_gate_bench) — a measured net-loss TODAY, so gated OFF, built out
+ * for a future pipeline where it pays off. w = fp16 weight (ork_mm_pack), A = fp16 [M,K], C = fp32 [M,N] silu.
+ * K%32, N<=nmax. fp16 M-tile kept <=16 (the validated fp16 tiling; larger fp16 tiles have a latent bug).
+ * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): the pipeline RUNS on-NPU (no wedge — the all-fp16
+ * graft works, unlike int8-in→fp16-out which wedges on proc mismatch), but does NOT yet produce correct silu
+ * (tools/silu_f16_check: neg gates→garbage, pos→0). Needs a fp16-program LUT/idx(acc) CALIBRATION (measure
+ * idx(acc) with a ramp + build the curve, like silu_native does for int8; the fp16 CVT gain/cfg4068 also need
+ * fitting). Kept gated OFF (net-loss on speed anyway, fp16 mm ~3.3x int8) — built out for a future pipeline. */
+int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
+                        uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,const int16_t *lut,int nlut){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    /* fp16 weights live in w->Bb tiles (Bf is int8-only). Fused silu needs the WHOLE-K weight in one buffer,
+     * so require a single tile: Sk==1 (K within one fp16 K-slice, <=2048) and Sn==1 (N<=nmax). */
+    if(w->dtype!=DT_F16 || !w->Bb || w->Sk!=1 || w->Sn!=1) return -2;
+    int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
+    if(K%32 || N%16 || N>NMAX) return -2;
+    if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(DT_F16!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_F16; }
+    int chunk=16; if(chunk>M)chunk=M;                       /* fp16 M-tile <=16 (validated; larger has latent bug) */
+    size_t maxaf=(size_t)chunk*K*2, maxout=(size_t)chunk*NMAX*4;   /* A fp16 (2B), C fp32 (4B) */
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
+        for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    int rc_ret=0;
+    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x5;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
+    /* fp16 single-N-tile (N<=NMAX); K single-slice (caller keeps K within the fp16 envelope). */
+    for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+        ork_f16*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
+        bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+        uint32_t rc[REGCMD_N];
+        synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
+        set_f16_silu(rc,out_bias,idx_off,cfg4068);
+        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+          t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_N; t->regcmd_addr=c->regcmd.dma;
+          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(submit1(c)){ rc_ret=-1; break; }
+        float*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<N;n++) C[(size_t)(m0+r)*N+n]=cc[(size_t)r*N+n];
+    }
+    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    return rc_ret;
+}
+
 /* Resident-weight fused UP matmul + element-wise MULTIPLY by G (=silu(gate)) in the SDP output stage:
  * C = clamp_i8( round( (A·W_up) * G * gain ) ), gain = mult/2^shift = s_up*s_silu/s_out. Completes the
  * fused SwiGLU (gate via ork_mm_run_i8_silu -> G; up here). The 2nd operand G is fetched by the SDP
