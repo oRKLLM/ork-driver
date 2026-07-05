@@ -3918,6 +3918,45 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     return rc_ret;
 }
 
+static double silu_f(double x);   /* fwd decl (defined below near the other activation refs) */
+/* ork_mm_build_f16_silu_lut — calibrate the fp16 fused SiLU for a layer whose real gate spans [-Gmax,Gmax].
+ * The fp16 SDP index only spreads for NEGATIVE acc, so the recipe (see Exp-2026-07-05) is: pack the gate
+ * weight as -S*W (S returned here) so a positive gate -> negative acc that spreads across the LUT. This does
+ * the 2-pass measure-then-build on a self-contained probe and returns the LUT + S (bake into the pack) + R +
+ * out_scale (silu = C_out * out_scale). Runtime: acc=-S*gate -> C=R*LUT[idx(acc)] -> silu(gate)=C*out_scale.
+ * One idx(acc) measurement covers the acc range S produces. 0/ok, -1/-2 fail. */
+int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
+    if(!ork_ppu_fuse_enabled(c) || Gmax<=0) return -2;
+    const int Kp=512, Np=64;
+    double S = 296.0/Gmax;                                   /* acc = -S*gate spans ~[-296,296] (the spread band) */
+    ork_f16 *A=malloc((size_t)8*Kp*2), *B=malloc((size_t)Kp*Np*2); float *C=malloc((size_t)8*Np*4);
+    if(!A||!B||!C){ free(A);free(B);free(C); return -2; }
+    for(int i=0;i<8*Kp;i++)A[i]=(ork_f16)1.0f;
+    double tru[64];
+    for(int n=0;n<Np;n++){ tru[n]=Gmax*(n-32)/32.0; double b=(-S*tru[n])/(double)Kp; for(int k=0;k<Kp;k++)B[(size_t)k*Np+n]=(ork_f16)b; }
+    ork_w *w=ork_mm_pack(c,Kp,Np,B); if(!w){ free(A);free(B);free(C); return -2; }
+    #define F16RUN() ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
+    int rc=-2;
+    for(int i=0;i<1030;i++)lut[i]=1000; if(F16RUN()){goto done;} double o1=C[32];
+    for(int i=0;i<1030;i++)lut[i]=3000; if(F16RUN()){goto done;} double o2=C[32];
+    double R=(o2-o1)/2000.0, bias=o1-R*1000.0; if(fabs(R)<1e-9){goto done;}
+    for(int i=0;i<1030;i++)lut[i]=(int16_t)(i-512); if(F16RUN()){goto done;}
+    int idx[64]; for(int n=0;n<Np;n++) idx[n]=(int)lround((C[n]-bias)/R)+512;
+    double out_scale = silu_f(Gmax)/8000.0; if(out_scale<=0) out_scale=1e-3;
+    int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
+    for(int n=0;n<Np;n++){ int i=idx[n]; if(i<0||i>1029)continue;
+        double v=(silu_f(tru[n])/out_scale - bias)/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[i]=(int16_t)q; set[i]=1; }
+    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
+    if(lo<0)goto done;
+    for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
+    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
+        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
+    if(S_out)*S_out=S; if(R_out)*R_out=R; if(out_scale_out)*out_scale_out=out_scale; rc=0;
+done:
+    #undef F16RUN
+    ork_mm_free(c,w); free(A);free(B);free(C); return rc;
+}
+
 /* Resident-weight fused UP matmul + element-wise MULTIPLY by G (=silu(gate)) in the SDP output stage:
  * C = clamp_i8( round( (A·W_up) * G * gain ) ), gain = mult/2^shift = s_up*s_silu/s_out. Completes the
  * fused SwiGLU (gate via ork_mm_run_i8_silu -> G; up here). The 2nd operand G is fetched by the SDP

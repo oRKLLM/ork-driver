@@ -308,6 +308,10 @@ int          ork_mm_run_i8_silu32(ork_npu *ctx, ork_w *w, int M, const int8_t *A
 int          ork_mm_run_f16_silu(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float *C,
                                  unsigned out_bias, unsigned idx_off, unsigned cfg4068,
                                  const short *lut, int nlut);
+/* Calibrate the fp16 fused SiLU for a layer whose real gate spans [-Gmax,Gmax]: fills lut[1030] and returns
+ * S (pack the gate weight as -S*W), R, and out_scale (silu(gate) = C_out * out_scale). See Exp-2026-07-05. */
+int          ork_mm_build_f16_silu_lut(ork_npu *ctx, double Gmax, short *lut,
+                                       double *S_out, double *R_out, double *out_scale_out);
 /* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
  * multiply by G (= silu(gate) from ork_mm_run_i8_silu) applied IN the up matmul's SDP output stage.
  * gain = mult/2^shift = s_up*s_silu/s_out. G is dense int8 [M*N]. Resident full-K int8 weight
