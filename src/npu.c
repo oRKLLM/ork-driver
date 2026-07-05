@@ -3832,7 +3832,11 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
  * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
  * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
-    setr(rc,REGCMD_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_N,0x2001,0x5004,0x0030); /* activation mode on */
+    { const char*e=getenv("ORK_F16_C4004"); uint32_t v=e?(uint32_t)strtoul(e,0,0):0x0030;
+      setr(rc,REGCMD_N,0x1001,0x4004,v); setr(rc,REGCMD_N,0x2001,0x5004,v); } /* activation mode on */
+    /* 0x4010 = fp16 output CVT (post-LUT). Deliberately kept at REGCMD's 0xa8000002 (fp16->fp32); overriding
+     * is WEDGE-PRONE (proc-precision mismatch). ORK_F16_C4010 for the upper-bank RE probe only. */
+    { const char*e=getenv("ORK_F16_C4010"); if(e) setr(rc,REGCMD_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); }
     /* index/output gain (0x4084/0x4088): REGCMD's default is ~1 -> gate barely moves the LUT index (curve
      * under-sampled). Env-override to spread gate over the LUT (fp16 analog of the int8 acc->index R). */
     { const char*g=getenv("ORK_F16_R84"); if(g){ setr(rc,REGCMD_N,0x1001,0x4084,(uint32_t)strtoul(g,0,0));
@@ -3846,14 +3850,14 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
      * (negatives then clamp ~0, ~= silu(neg)). Env-overridable for the calibration crack. */
     { const char*e=getenv("ORK_F16_ZA"); if(e) setr(rc,REGCMD_N,0x1001,0x4044,(uint32_t)strtoul(e,0,0)); }
     setr(rc,REGCMD_N,0x1001,0x4068,cfg4068);
-    setr(rc,REGCMD_N,0x1001,0x4070,0x00000302);
+    { const char*e=getenv("ORK_F16_C4070"); setr(rc,REGCMD_N,0x1001,0x4070,e?(uint32_t)strtoul(e,0,0):0x00000302); }
     setr(rc,REGCMD_N,0x1001,0x4080,out_bias);
     { const char*e=getenv("ORK_F16_C4108"); setr(rc,REGCMD_N,0x1001,0x4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
     { const char*e=getenv("ORK_F16_C410C"); setr(rc,REGCMD_N,0x1001,0x410c,e?(uint32_t)strtoul(e,0,0):0x00050500); }
     setr(rc,REGCMD_N,0x1001,0x4110,idx_off);
-    setr(rc,REGCMD_N,0x1001,0x411c,0x00004000);
-    setr(rc,REGCMD_N,0x1001,0x4128,0x40320000);
-    setr(rc,REGCMD_N,0x1001,0x412c,0x000001a0);
+    { const char*e=getenv("ORK_F16_C411C"); setr(rc,REGCMD_N,0x1001,0x411c,e?(uint32_t)strtoul(e,0,0):0x00004000); }
+    { const char*e=getenv("ORK_F16_C4128"); setr(rc,REGCMD_N,0x1001,0x4128,e?(uint32_t)strtoul(e,0,0):0x40320000); }
+    { const char*e=getenv("ORK_F16_C412C"); setr(rc,REGCMD_N,0x1001,0x412c,e?(uint32_t)strtoul(e,0,0):0x000001a0); }
     /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
 }
 
