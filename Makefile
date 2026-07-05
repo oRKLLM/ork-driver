@@ -349,3 +349,7 @@ fp16_check: tools/fp16_check.c $(CORE)
 # calibrate the fp16 fused SiLU (measure R/idx(gate), build curve, validate).
 silu_f16_calib: tools/silu_f16_calib.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# sweep the bounded-Gmax fp16 fused-SiLU builder across the in-model gate range (bulk vs full error).
+f16_gmax_sweep: tools/f16_gmax_sweep.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

@@ -3928,6 +3928,12 @@ static double silu_f(double x);   /* fwd decl (defined below near the other acti
 int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
     if(!ork_ppu_fuse_enabled(c) || Gmax<=0) return -2;
     const int Kp=512, Np=64;
+    /* Bound Gmax: S=296/Gmax, so a wide-range layer (large Gmax) drives S tiny and crushes the bulk of the
+     * gate distribution into a few LUT-index entries near the center -> the index mapping collapses (garbage).
+     * Cap the effective Gmax so S stays in the band where the fp16 index spreads; gates above the cap clamp to
+     * silu(cap) (~linear, so a small error on the rare large outliers). ORK_F16_GCAP overrides the ceiling. */
+    double gcap = getenv("ORK_F16_GCAP") ? atof(getenv("ORK_F16_GCAP")) : 40.0;
+    if(gcap>0 && Gmax>gcap) Gmax=gcap;
     double S = 296.0/Gmax;                                   /* acc = -S*gate spans ~[-296,296] (the spread band) */
     ork_f16 *A=malloc((size_t)8*Kp*2), *B=malloc((size_t)Kp*Np*2); float *C=malloc((size_t)8*Np*4);
     if(!A||!B||!C){ free(A);free(B);free(C); return -2; }
