@@ -3724,26 +3724,38 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     return rc_ret;
 }
 
-/* ⚠ WIP / DOES NOT WORK YET (2026-07-05): the int32-output + LUT-activation combo below WEDGES the NPU.
- * The output-precision is a field in reg 0x4010, but the MATMUL program's encoding for non-int8 output WITH
- * the activation/LUT stage enabled is undocumented and could not be captured (RKNN never fuses activation into
- * a non-int8-output matmul — it does activations as separate layers), so there's no known-good regcmd to copy.
- * Known encodings (0x4010): matmul int8+silu=0x44e0, matmul int32(no act)=0x80000000; standalone silu int8=
- * 0x2000, int16=0x24004401, fp16=0xa8000002 (a DIFFERENT program). Naive int32+act (0x800044e0) wedges. The
- * ablation (ORK_GATE_ABLATE) proved a non-int8 silu output would recover the FFN-chain quality gap (fp32 silu
- * = baseline PPL); this needs either a careful 0x4010 PREC-field sweep (wedge-prone) or an un-fused int32-matmul
- * -> standalone int16/fp16-silu path. NOT called by the chain (which still uses int8 ork_mm_run_i8_silu). ── */
+/* ⚠ CLOSED — the matmul-fused activation output is INT8-ONLY (2026-07-05 sweep). The output-precision is a
+ * PREC field in reg 0x4010 (int8=bits00, int16=01, fp16=10; bit31=int32 which BYPASSES the CVT the LUT needs).
+ * SWEPT PREC=1 (int16) across 3 output-stride configs (0x40c0/0x4050/0x4038) — ALL soft-reset the NPU + garbage.
+ * int32 (0x800044e0) also wedges (CVT bypass vs LUT conflict). So the MATMUL+LUT program only supports int8
+ * output; int16/fp16 output exists only in the STANDALONE silu program (0x50xx lane: int16=0x24004401,
+ * fp16=0xa8000002 — different regcfg). No RKNN capture possible (RKNN never fuses activation into non-int8
+ * matmul). CONCLUSION: higher-precision fused silu is not achievable in the matmul program. The ablation
+ * (ORK_GATE_ABLATE) proved int8 silu OUTPUT is the whole FFN-chain PPL gap, so the remaining route to parity
+ * is UN-FUSED: int32 matmul -> standalone int16/fp16 silu op (loses the silu-free-on-NPU fusion, adds a submit).
+ * Below is the sweep harness (env-configurable format regs), kept for the record; NOT called by the chain. ── */
 /* set_i8_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
  * synth_i8's default int32 output format (does NOT apply set_i8_out8's int8 override) and enables the SiLU
  * LUT with the int32-output bit (0x8000) set in 0x4010. out_i32 = R*V16[idx(acc)] + out_bias, unclamped —
  * with a fine-scale LUT that maps silu across ~±8000 (int16 V16 * R), that's ~13-14 bit silu instead of int8.
  * The ablation (ORK_GATE_ABLATE) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
  * = baseline PPL); this recovers it while keeping silu free on-NPU. Same LUT/config regs as set_i8_silu. */
-static void set_i8_silu32(uint32_t*rc,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+static void set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+    /* SWEEP knobs: output-format registers env-configurable to find the matmul+LUT non-int8 output encoding.
+     * PREC = bits[1:0] of 0x4010 (int8=0, int16=1, fp16=2; bit31=int32-bypass-CVT). int8+silu = 0x44e0. */
+    static uint32_t r4010=0,r40c0=0,r4050=0; static int div38=0,init=0;
+    if(!init){ init=1; const char*e;
+        e=getenv("ORK_SILU_4010"); r4010=e?(uint32_t)strtoul(e,0,0):0x000044e1u;   /* default: PREC=1 (int16), CVT kept */
+        e=getenv("ORK_SILU_40C0"); r40c0=e?(uint32_t)strtoul(e,0,0):0x40u;          /* 2-byte element (int8=0x20,int32=0x80) */
+        e=getenv("ORK_SILU_4050"); r4050=e?(uint32_t)strtoul(e,0,0):0x0124u;        /* row byte-stride (int8=0x124,int32=0x7fc) */
+        e=getenv("ORK_SILU_38DIV"); div38=e?atoi(e):8; }                            /* group stride divisor (int8=16,int32=4,int16=8) */
     setr(rc,REGCMD_I8_N,0x1001,0x4084,(uint32_t)r_mult);   /* R mantissa (acc->index step + LUT->output gain) */
     setr(rc,REGCMD_I8_N,0x1001,0x4088,(uint32_t)r_shift);  /* R shift */
     setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,0x800044e0);         /* int32 output (bit 31, per REGCMD_I8 template) + LUT/activation enable (0x44xx|0xe0) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,r4010);              /* output precision (PREC field) + LUT/activation enable */
+    setr(rc,REGCMD_I8_N,0x1001,0x40c0,r40c0);              /* output element size */
+    setr(rc,REGCMD_I8_N,0x1001,0x4050,r4050);              /* output row byte-stride config */
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((N/div38)-1)<<16)|((N/div38)-1)); /* output group stride */
     setr(rc,REGCMD_I8_N,0x1001,0x4060,0x00020040);
     setr(rc,REGCMD_I8_N,0x1001,0x4068,cfg4068);
     setr(rc,REGCMD_I8_N,0x1001,0x4070,0x00000302);
@@ -3794,13 +3806,16 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
             bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
             synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
-            set_i8_silu32(rc,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            set_i8_silu32(rc,Nc,r_mult,r_shift,out_bias,idx_off,cfg4068);
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
               bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
             if(submit1(c)){ rc_ret=-1; break; }
-            int32_t*cc=(int32_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
+            /* output element width from the sweep (int16=2,int32=4). Sign-extend to the int32 C[] the caller reads. */
+            static int obytes=0; if(!obytes){ const char*e=getenv("ORK_SILU_OBYTES"); obytes=e?atoi(e):2; }
+            if(obytes==2){ int16_t*cc=(int16_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
+            else         { int32_t*cc=(int32_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
         }
     }
     bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);

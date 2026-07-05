@@ -14,16 +14,16 @@ static double silu(double x){ return x/(1.0+exp(-x)); }
 
 int main(int argc,char**argv){
     int M=argc>1?atoi(argv[1]):64; const int K=512,N=64;
-    double in=argc>2?atof(argv[2]):1.0e-3;      /* gate preact scale: gate_real = acc*in */
+    double in=argc>2?atof(argv[2]):4.88e-4;     /* gate preact scale so the acc sweep spans x in [-8,8] (LUT range) */
     ork_npu*c=ork_npu_init(); if(!c){printf("no board\n");return 0;}
     int8_t*B=malloc((size_t)K*N),*A=malloc((size_t)M*K);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=1;                       /* A=1 -> acc[n]=sum_k B[k,n] = K*b[n] */
     int bcol[64];
-    for(int n=0;n<N;n++){ int b=(n-32)*4; if(b>127)b=127; if(b<-128)b=-128; bcol[n]=b;
+    for(int n=0;n<N;n++){ int b=(n-32); if(b>127)b=127; if(b<-128)b=-128; bcol[n]=b;  /* x = acc*in in ~[-8,8] */
         for(int k=0;k<K;k++)B[(size_t)k*N+n]=(int8_t)b; }
     ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
 
-    double xmax=(double)K*127*in; double smax=silu(xmax); double out=smax/8000.0;   /* fine out_scale: ~13-14 bit */
+    double xmax=(double)K*32*in; double smax=silu(xmax); double out=smax/30000.0;   /* fine out_scale: ~15-bit (int16 range) */
     const int RM=0x4000,RS=0x10; const unsigned OB=0,IO=0xffffc000u,C4=0x56391300u;
     int16_t lut[1030];
     if(ork_mm_silu_build_lut(c,in,out,RM,RS,C4,lut)){ printf("lut build fail\n"); return 1; }
