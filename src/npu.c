@@ -3837,7 +3837,7 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
      * under-sampled). Env-override to spread gate over the LUT (fp16 analog of the int8 acc->index R). */
     { const char*g=getenv("ORK_F16_R84"); if(g){ setr(rc,REGCMD_N,0x1001,0x4084,(uint32_t)strtoul(g,0,0));
         const char*s=getenv("ORK_F16_R88"); setr(rc,REGCMD_N,0x1001,0x4088,s?(uint32_t)strtoul(s,0,0):0); } }
-    setr(rc,REGCMD_N,0x1001,0x4060,0x00020040);   /* silu LUT-stage config (shared with the int8 fused path) */
+    { const char*e=getenv("ORK_F16_C4060"); setr(rc,REGCMD_N,0x1001,0x4060,e?(uint32_t)strtoul(e,0,0):0x00020040); }   /* silu LUT-stage config (shared with the int8 fused path) */
     /* 0x4064 = fp16 index-scale param. REGCMD's default gives a small gate-dependent spread; 0xffff7dc8
      * (standalone silu) COLLAPSES it. Keep REGCMD's default unless env-overridden (calibration RE). */
     { const char*e=getenv("ORK_F16_C4064"); if(e) setr(rc,REGCMD_N,0x1001,0x4064,(uint32_t)strtoul(e,0,0)); }
@@ -3848,8 +3848,8 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
     setr(rc,REGCMD_N,0x1001,0x4068,cfg4068);
     setr(rc,REGCMD_N,0x1001,0x4070,0x00000302);
     setr(rc,REGCMD_N,0x1001,0x4080,out_bias);
-    setr(rc,REGCMD_N,0x1001,0x4108,0x00000068);
-    setr(rc,REGCMD_N,0x1001,0x410c,0x00050500);
+    { const char*e=getenv("ORK_F16_C4108"); setr(rc,REGCMD_N,0x1001,0x4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
+    { const char*e=getenv("ORK_F16_C410C"); setr(rc,REGCMD_N,0x1001,0x410c,e?(uint32_t)strtoul(e,0,0):0x00050500); }
     setr(rc,REGCMD_N,0x1001,0x4110,idx_off);
     setr(rc,REGCMD_N,0x1001,0x411c,0x00004000);
     setr(rc,REGCMD_N,0x1001,0x4128,0x40320000);
@@ -3934,7 +3934,11 @@ int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_o
      * silu(cap) (~linear, so a small error on the rare large outliers). ORK_F16_GCAP overrides the ceiling. */
     double gcap = getenv("ORK_F16_GCAP") ? atof(getenv("ORK_F16_GCAP")) : 40.0;
     if(gcap>0 && Gmax>gcap) Gmax=gcap;
-    double S = 296.0/Gmax;                                   /* acc = -S*gate spans ~[-296,296] (the spread band) */
+    /* acc target: S = ATGT/Gmax maps the gate range onto acc~[-ATGT,0]. Too large over-spreads the fp16 index
+     * (gates near Gmax hit the clamp edge -> error at small-Gmax layers); too small wastes LUT resolution.
+     * ORK_F16_ATGT tunes it (see tools/f16_gmax_sweep). */
+    double atgt = getenv("ORK_F16_ATGT") ? atof(getenv("ORK_F16_ATGT")) : 150.0;
+    double S = atgt/Gmax;                                    /* acc = -S*gate spans ~[-ATGT,0] (the spread band) */
     ork_f16 *A=malloc((size_t)8*Kp*2), *B=malloc((size_t)Kp*Np*2); float *C=malloc((size_t)8*Np*4);
     if(!A||!B||!C){ free(A);free(B);free(C); return -2; }
     for(int i=0;i<8*Kp;i++)A[i]=(ork_f16)1.0f;

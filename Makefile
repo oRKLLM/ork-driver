@@ -353,3 +353,7 @@ silu_f16_calib: tools/silu_f16_calib.c $(CORE)
 # sweep the bounded-Gmax fp16 fused-SiLU builder across the in-model gate range (bulk vs full error).
 f16_gmax_sweep: tools/f16_gmax_sweep.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# probe whether the fp16 fused-SiLU index can reach the UPPER LUT bank (idx>514) under any register config.
+f16_bank_probe: tools/f16_bank_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
