@@ -21,6 +21,7 @@
 #include <time.h>
 #include <math.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -366,7 +367,11 @@ static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
     *base=c->wchunk_off; c->wchunk_off+=a;
     return ch;
 }
-static void act(int fd,uint32_t f,uint32_t v){struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
+static void act(int fd,uint32_t f,uint32_t v){
+    if(f==RKNPU_ACT_RESET){ static long n=0; if(getenv("ORK_DEBUG_RESET")){ void*ra=__builtin_return_address(0); Dl_info di;
+        if(dladdr(ra,&di)) fprintf(stderr,"[ork] ACT_RESET #%ld off=0x%lx obj=%s\n",++n,(unsigned long)((char*)ra-(char*)di.dli_fbase),di.dli_fname);
+        else fprintf(stderr,"[ork] ACT_RESET #%ld ra=%p\n",++n,ra); } }
+    struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
 
 /* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
  * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
@@ -4990,7 +4995,12 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
     struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    /* Prime against a fresh-buffer stale-read/wedge — but ONLY when the NPU isn't already int8-warm. The chain
+     * builds the fused-SiLU LUT via this probe once per layer during prep; an unconditional ~107ms ACT_RESET
+     * fired ~once/layer (28 cold resets on the first forward pass, hurting cold TTFT/pp128). When int8-live the
+     * probe's own 3-rep warmup (below) flushes stale reads, so the reset is redundant. ORK_PROBE_RESET=1 forces
+     * it (fallback). Standalone/cold callers still reset. LUT calibration is unaffected (validated bit-exact). */
+    if(!ORK_I8_LIVE(c->last_dt) || getenv("ORK_PROBE_RESET")) act(fd,RKNPU_ACT_RESET,0);
 
     /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) — streams the silu LUT into PPU SRAM ---- */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
