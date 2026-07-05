@@ -345,3 +345,7 @@ rr_experiment: tools/rr_experiment.c $(CORE)
 # RE: reproduce the fp16 layer/model failure at cbuf raise (multi-core fp16 matmul + CPU ref).
 fp16_check: tools/fp16_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+
+# calibrate the fp16 fused SiLU (measure R/idx(gate), build curve, validate).
+silu_f16_calib: tools/silu_f16_calib.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

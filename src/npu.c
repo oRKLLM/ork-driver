@@ -3833,7 +3833,18 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
  * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     setr(rc,REGCMD_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_N,0x2001,0x5004,0x0030); /* activation mode on */
+    /* index/output gain (0x4084/0x4088): REGCMD's default is ~1 -> gate barely moves the LUT index (curve
+     * under-sampled). Env-override to spread gate over the LUT (fp16 analog of the int8 acc->index R). */
+    { const char*g=getenv("ORK_F16_R84"); if(g){ setr(rc,REGCMD_N,0x1001,0x4084,(uint32_t)strtoul(g,0,0));
+        const char*s=getenv("ORK_F16_R88"); setr(rc,REGCMD_N,0x1001,0x4088,s?(uint32_t)strtoul(s,0,0):0); } }
     setr(rc,REGCMD_N,0x1001,0x4060,0x00020040);   /* silu LUT-stage config (shared with the int8 fused path) */
+    /* 0x4064 = fp16 index-scale param. REGCMD's default gives a small gate-dependent spread; 0xffff7dc8
+     * (standalone silu) COLLAPSES it. Keep REGCMD's default unless env-overridden (calibration RE). */
+    { const char*e=getenv("ORK_F16_C4064"); if(e) setr(rc,REGCMD_N,0x1001,0x4064,(uint32_t)strtoul(e,0,0)); }
+    /* 0x4044 = BS_ALU_OPERAND (za), a PRE-LUT bias on the accumulator. The fp16 index only spreads for
+     * NEGATIVE acc; setting za shifts the gate negative so positive gates fall into the spreading region
+     * (negatives then clamp ~0, ~= silu(neg)). Env-overridable for the calibration crack. */
+    { const char*e=getenv("ORK_F16_ZA"); if(e) setr(rc,REGCMD_N,0x1001,0x4044,(uint32_t)strtoul(e,0,0)); }
     setr(rc,REGCMD_N,0x1001,0x4068,cfg4068);
     setr(rc,REGCMD_N,0x1001,0x4070,0x00000302);
     setr(rc,REGCMD_N,0x1001,0x4080,out_bias);
@@ -3851,11 +3862,15 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
  * of the fp16 matmul (~3.3x int8, tools/f16_gate_bench) — a measured net-loss TODAY, so gated OFF, built out
  * for a future pipeline where it pays off. w = fp16 weight (ork_mm_pack), A = fp16 [M,K], C = fp32 [M,N] silu.
  * K%32, N<=nmax. fp16 M-tile kept <=16 (the validated fp16 tiling; larger fp16 tiles have a latent bug).
- * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): the pipeline RUNS on-NPU (no wedge — the all-fp16
- * graft works, unlike int8-in→fp16-out which wedges on proc mismatch), but does NOT yet produce correct silu
- * (tools/silu_f16_check: neg gates→garbage, pos→0). Needs a fp16-program LUT/idx(acc) CALIBRATION (measure
- * idx(acc) with a ramp + build the curve, like silu_native does for int8; the fp16 CVT gain/cfg4068 also need
- * fitting). Kept gated OFF (net-loss on speed anyway, fp16 mm ~3.3x int8) — built out for a future pipeline. */
+ * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): RUNS on-NPU (no wedge) AND now CALIBRATED accurate —
+ * tools/silu_f16_calib cracked it to mean|err|~0.08 / max 0.75 over silu[-8,8] (~1%, on par with int8 silu).
+ * CALIBRATION RECIPE (the fp16 program's index only spreads for NEGATIVE acc, so): (1) NEGATE the gate — pack
+ * the gate weight *(-S)* so a positive real gate becomes a negative accumulator that spreads across the LUT;
+ * negatives then clamp to ~0 (== silu(neg)). (2) scale S~24 (spreads [-8,8] over the ~513-entry negative half;
+ * larger S over-spreads/clamps). (3) idx_off=0xffffc000, cfg4068=0x56391100, DEFAULT 0x4064 (0xffff7dc8
+ * collapses it). (4) measure idx(acc) via a ramp LUT, build curve LUT[idx]=silu(-acc/S)/(R*out_scale). R
+ * (output gain) = 0x4084; 0x4044/za has NO index effect. TODO to enable: a build_f16_silu_lut() baking (1)-(4)
+ * + the negate/scale into the fp16 gate weight pack, then wire the gate. Kept gated OFF (fp16 mm ~3.3x int8). */
 int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,const int16_t *lut,int nlut){
     if(!ork_ppu_fuse_enabled(c)) return -3;
