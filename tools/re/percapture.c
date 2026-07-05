@@ -44,9 +44,10 @@ int main(int argc, char** argv) {
     rknn_quant_params qc; memset(&qc, 0, sizeof qc); strcpy(qc.name, "C"); qc.scale = &sC; qc.scale_len = 1;
     rknn_quant_params qb; memset(&qb, 0, sizeof qb); strcpy(qb.name, "B");
     qb.scale = sB; qb.scale_len = per_channel ? N : 1;
+    /* int8 inputs A/B always need scales (else "Unsupport type bits 0"); C-scale only for int8/int32 output */
     rknn_matmul_set_quant_params(ctx, &qa);
     rknn_matmul_set_quant_params(ctx, &qb);
-    rknn_matmul_set_quant_params(ctx, &qc);
+    if (mmtype == 2 || mmtype == 3) rknn_matmul_set_quant_params(ctx, &qc);
 
     printf("== run (capture shim dumps the regcmd here) ==\n");
     if (rknn_matmul_run(ctx)) { printf("run FAILED\n"); }
