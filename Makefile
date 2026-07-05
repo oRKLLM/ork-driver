@@ -71,6 +71,10 @@ fused_mtile_check: tools/fused_mtile_check.c $(CORE)
 silu32_check: tools/silu32_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# decide if a fused fp16 gate+SiLU beats baseline int8-gate + CPU-silu (validated ops, no wedge risk).
+f16_gate_bench: tools/f16_gate_bench.c $(CORE)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
