@@ -3590,15 +3590,11 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * ORK_NPU_MC. fp16/int4 M==1 keep single-core (budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
     int b=(M==1 && w->dtype==DT_I8) ? budget(c,2) : budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
-    /* IMPORTED weight in a NON-0 domain → force SINGLE-CORE. The spawned (non-primary) cores silently
-     * CORRUPT the output for an imported (dma-heap, foreign SG-list) weight on a non-0 IOMMU domain:
-     * measured C[last]=14336/16896 vs 18944 (dropped K-slice partials), NON-deterministic, C[0] (core 0)
-     * always correct — a cold-domain warmup race on the spawned cores' first multi-core submit to that
-     * domain (a native MC submit or a prime of the domain makes the SAME import work — see the
-     * >4GiB-streaming roadmap Tier 10). Core 0 is serial and correct, so single-core is safe. Native
-     * weights and domain-0 imports are unaffected and keep multi-core. ORK_MC_IMPORT=1 forces MC (debug/
-     * repro only — it corrupts). The >4GiB sliding-window path is import-heavy; correctness > the MC
-     * speedup here (the user accepted this trade). */
+    /* NOTE: imported weights on a non-0 IOMMU domain run MULTI-CORE safely — the per-domain native anchor
+     * (ork_dom_prime, called at import time) establishes the domain so the spawned cores read correct IOVAs.
+     * Before the anchor, multi-core imports non-deterministically corrupted output (C[last] wrong, dropped
+     * K-slices) — that was a fresh-domain establishment race, NOT a core issue (single-core corrupted too).
+     * No single-core gate is needed; see the >4GiB-import notes (wiki Tier 10 / NPU-Quirks). */
     /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
      * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
      * measuring chained-ork-1core vs rknn-1core apples-to-apples (rknn chains its M-tiles in 1 submit). */
