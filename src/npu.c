@@ -83,6 +83,14 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
     int dom_active; int dom_seen[ORK_MAXDOM];
+    /* Per-domain native "anchor": one small NATIVE bcreate per non-0 domain, allocated BEFORE any dma-buf
+     * import is mapped into that domain. The kernel rknpu driver sets up a domain's IOVA allocator / page
+     * table lazily on its FIRST buffer, and that path misbehaves when the first buffer is an IMPORTED
+     * dma-buf (SG-list) — the import's pages land on wrong/aliased IOVAs and the NPU reads garbage for some
+     * weight tiles (non-deterministic dropped-K corruption, affects single- AND multi-core; NATIVE weights
+     * are immune). A native alloc first establishes the domain correctly. Kept alive for the ctx lifetime
+     * so the domain stays anchored; freed at teardown. See ork_dom_prime(). */
+    struct buf dom_anchor[ORK_MAXDOM];
     struct ork_dom_scratch *dom_save;   /* [ORK_MAXDOM]; lazily allocated when multi-domain is first used */
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
@@ -109,7 +117,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* int16 variant: with the gain-1 index params (0x4068 low16=0x1000) idx = in + 512 (integer, no LUT
      * interpolation -> bit-exact), usable for |in| < 512. silu_idx16[in+512] = measured LUT index (-1 if none). */
     int silu_idx16_ok; short silu_idx16[4096]; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. own_bufs/n_own_bufs: the SIZE-BOUNDED variant (chunked consolidated import) — a weight's tiles are packed into a handful of moderate (ORK_IMPORT_CHUNK_MB, ~16MB) imported dma-buf chunks instead of one giant per-weight buffer (which hangs the DMA_HEAP_ALLOC) or one bimport per tile (which faults the chain-walk with too many foreign mappings); tiles are base+offset views into their chunk; ork_mm_free bdestroys every chunk. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -154,7 +162,16 @@ static int is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const st
     }
     return 0;
 }
+/* Last regcmd context (set by validate_regcmd) — dumped on a submit failure to PIN which weight/op/domain/
+ * import-status faulted (e.g. the multi-domain import scale-fault: errno=22). */
+static const char *g_last_op = "?"; static int g_last_K=0, g_last_N=0, g_last_wdom=-1, g_last_import=0;
 static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
+    /* stash context so a later submit failure can name the exact weight/op/domain/import-status that faulted */
+    g_last_op = op ? op : "?";
+    if (w) { g_last_K = w->K; g_last_N = w->N; g_last_wdom = w->domain;
+             g_last_import = (w->own_buf_valid && w->own_buf.heap_fd > 0) ||
+                             (w->own_bufs && w->n_own_bufs > 0 && w->own_bufs[0].heap_fd > 0) ||
+                             (w->Bb && w->Bb[0].heap_fd > 0) || (w->Bf && w->Bf[0].heap_fd > 0); }
     for (int k = 0; k + 1 < n; k += 2) {
         uint32_t offset = rc[k] & 0xffff;
         uint32_t block_id = rc[k+1] >> 16;
@@ -346,6 +363,19 @@ static struct buf bimport(int fd,size_t size,int domain){
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     return b;
 }
+/* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
+ * it. The kernel rknpu driver lazily sets up a domain's IOVA allocator / page table on its FIRST buffer;
+ * if that first buffer is an IMPORTED dma-buf, the import's SG-list pages get wrong/aliased IOVAs and the
+ * NPU reads garbage for some weight tiles (non-deterministic dropped-K corruption — reproduced with
+ * tools/mc_import_probe.c: import-first FAULTS, native-alloc-first is bit-exact; single- AND multi-core).
+ * One tiny native anchor per domain, kept resident for the ctx lifetime (freed at teardown). No-op for
+ * domain 0 (always established) and when already anchored. Call BEFORE the first bimport into `dom`. */
+static void ork_dom_prime(ork_npu *c, int dom){
+    int d = ork_dom(dom);
+    if(d<=0 || d>=ORK_MAXDOM) return;                 /* domain 0 never needs it */
+    if(c->dom_anchor[d].cpu) return;                  /* already anchored */
+    c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
+}
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
 static void bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
@@ -412,11 +442,10 @@ static void dom_activate(ork_npu *c,int dom){
 
 static struct ork_npu *g_npu_ctx = NULL;
 
-static void trace_submit(struct rknpu_submit *sub) {
-    if (!getenv("ORK_TRACE")) return;
-    fprintf(stderr, "[ork-trace] === SUBMIT flags=0x%x timeout=%u task_number=%u core=0x%x ===\n",
-            sub->flags, sub->timeout, sub->task_number, sub->core_mask);
-    
+static void dump_submit(struct rknpu_submit *sub) {
+    fprintf(stderr, "[ork-trace] === SUBMIT flags=0x%x timeout=%u task_number=%u core=0x%x domain=%u ===\n",
+            sub->flags, sub->timeout, sub->task_number, sub->core_mask, sub->iommu_domain_id);
+
     if (!g_npu_ctx) return;
     
     void *task_cpu = NULL;
@@ -473,6 +502,7 @@ static void trace_submit(struct rknpu_submit *sub) {
         }
     }
 }
+static void trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) dump_submit(sub); }
 
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
@@ -480,9 +510,14 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     trace_submit(sub);
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {
-        fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d). Triggering self-healing reset...\n", rc, errno);
+        int e = errno;
+        fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
+                rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
+                g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import);
+        if (getenv("ORK_DUMP_FAIL")) dump_submit(sub);   /* full failing regcmd on demand */
         struct rknpu_action a = { .flags = RKNPU_ACT_RESET, .value = 0 };
         ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+        errno = e;
     }
     return rc;
 }
@@ -858,6 +893,7 @@ void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
         for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&s->mrc[i]);bdestroy(fd,&s->mtk[i]);bdestroy(fd,&s->maf[i]);bdestroy(fd,&s->mcc[i]);} }
         free(c->dom_save); }
     for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
+    for(int d=0;d<ORK_MAXDOM;d++) if(c->dom_anchor[d].cpu) bdestroy(fd,&c->dom_anchor[d]);   /* per-domain native anchors */
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
@@ -876,6 +912,7 @@ void ork_dma_free(ork_npu *c, void *ptr){
  * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
 void *ork_dma_import(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
+    ork_dom_prime(c, c->pack_domain);   /* establish a non-0 domain before importing into it (see ork_dom_prime) */
     struct buf b=bimport(c->fd,size,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
@@ -1214,15 +1251,56 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
+    ork_dom_prime(c, w->domain);   /* establish a non-0 domain with a native anchor BEFORE importing into it */
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
-    size_t off=0;
-    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
-        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
-        memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc); off+=b->size;
-        dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    /* SIZE-BOUNDED CONSOLIDATED IMPORT (default on; ORK_NO_CONSOLIDATE_IMPORT disables): pack this weight's
+     * tiles into a HANDFUL of moderate (~ORK_IMPORT_CHUNK_MB, default 16MB) imported dma-buf CHUNKS; each tile
+     * is a page-aligned base+offset VIEW (chunk.dma+off) into its chunk, NOT one bimport per tile. This is the
+     * middle ground between the two extremes that both fail: (a) one bimport PER TILE — a PC-chained K-split
+     * submit (ffn_down, Sk up to 19) then walks Sk separate imported IOMMU mappings and the CDMA chain-walker
+     * TIMES OUT (errno=110) in a non-0 domain; (b) one GIANT per-weight bimport (~68MB) — 1 mapping (no chain
+     * fault) but the big DMA_HEAP_ALLOC HANGS. Bounded chunks give few mappings per chain (down-proj 68MB / 16MB
+     * -> ~3-5 chunks, within the 1.7B's proven-safe ~6) AND proven-safe alloc sizes (per-tile <=8MB never hung).
+     * Chunks are bump-filled in tile order (ns outer, ks inner) so a submit's K-slices land in adjacent chunks.
+     * ork_mm_free bdestroys every chunk (own_bufs[]). Falls back to per-tile bimport on any alloc failure. */
+    int consolidate = !getenv("ORK_NO_CONSOLIDATE_IMPORT");
+    if(consolidate){
+        size_t chunk_mb = 16; const char*cm=getenv("ORK_IMPORT_CHUNK_MB"); if(cm){ long v=atol(cm); if(v>0) chunk_mb=(size_t)v; }
+        size_t chunk_cap = chunk_mb<<20;
+        int ntiles=Sk*Sn, cap_chunks=ntiles+1;             /* worst case: one chunk per tile */
+        w->own_bufs=calloc(cap_chunks,sizeof(struct buf)); w->n_own_bufs=0;
+        struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
+        int ns,ks; size_t boff=0;                            /* offset into blob (matches need layout) */
+        for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+          for(ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; size_t ts=pgup((size_t)Kp*Nc);
+            if(!cur.cpu || coff+ts>csz){                    /* need a new chunk */
+                if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
+                csz = ts>chunk_cap ? ts : chunk_cap;        /* a single tile never exceeds cap in practice */
+                cur = bimport(c->fd,csz,w->domain);
+                if(!cur.cpu){ consolidate=0; break; }
+                dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+                w->own_bufs[w->n_own_bufs++]=cur; coff=0;
+            }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+            b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
+            memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); coff+=ts; boff+=ts;}}
+        if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
+        else { /* alloc failed mid-way: tear down the chunks we grabbed, fall back to per-tile below */
+            for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]);
+            free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0;
+            memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1;
+        }
+    }
+    if(!consolidate){
+        size_t off=0;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+          for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc); off+=b->size;
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    }
     /* Bf full-K rebuild (same envelope as ork_mm_load_i8): imported too, abandoned on failure. */
     if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
@@ -1230,12 +1308,15 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             if(!bf->cpu){ ok=0; break; }
             int8_t*fb=bf->cpu;
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
-            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32,kf0=k0/32;
                 const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
-                for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++){
-                    int ktf=(k0/32)+kt;
-                    fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
-                        sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
+                /* per (nt): this K-slice's KT k-tiles are CONTIGUOUS in both src (nt*KT*1024 + kt*1024) and
+                 * dst (nt*KTf*1024 + (kf0+kt)*1024) — so the whole [KT][32][32] run copies as ONE memcpy,
+                 * replacing the old 4-deep per-BYTE loop (~1M scalar stores/weight → NN vectorized memcpys). */
+                for(int nt=0;nt<NN;nt++)
+                    memcpy(fb + ((size_t)nt*KTf + kf0)*32*32,
+                           sb + (size_t)nt*KT*32*32,
+                           (size_t)KT*32*32);}
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
@@ -1784,6 +1865,7 @@ ork_w *ork_mm_load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
     w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
+    ork_dom_prime(c, w->domain);   /* establish a non-0 domain with a native anchor BEFORE importing (same quirk as i8) */
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;
@@ -2208,13 +2290,17 @@ void ork_mm_free(ork_npu *c, ork_w *w){
      * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
      * of a sub-pointer). Reclaims IOVA. */
     if(c && w->own_buf_valid) bdestroy(c->fd,&w->own_buf);
+    /* size-bounded consolidated import: Bb[] entries are views into own_bufs[] chunks — destroy each chunk. */
+    if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) bdestroy(c->fd,&w->own_bufs[i]);
+    free(w->own_bufs);
     free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
 size_t ork_w_bytes(const ork_w *w){
     if(!w) return 0; size_t t=0;
-    if(w->Bb) for(size_t i=0;i<(size_t)w->Sk*w->Sn;i++) t+=w->Bb[i].size;
+    if(w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) t+=w->own_bufs[i].size;   /* chunked import: real chunk allocs */
+    else if(w->Bb) for(size_t i=0;i<(size_t)w->Sk*w->Sn;i++) t+=w->Bb[i].size;
     if(w->Bf) for(int i=0;i<w->Sn;i++) t+=w->Bf[i].size;
     return t;
 }
@@ -3504,6 +3590,15 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * ORK_NPU_MC. fp16/int4 M==1 keep single-core (budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
     int b=(M==1 && w->dtype==DT_I8) ? budget(c,2) : budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
+    /* IMPORTED weight in a NON-0 domain → force SINGLE-CORE. The spawned (non-primary) cores silently
+     * CORRUPT the output for an imported (dma-heap, foreign SG-list) weight on a non-0 IOMMU domain:
+     * measured C[last]=14336/16896 vs 18944 (dropped K-slice partials), NON-deterministic, C[0] (core 0)
+     * always correct — a cold-domain warmup race on the spawned cores' first multi-core submit to that
+     * domain (a native MC submit or a prime of the domain makes the SAME import work — see the
+     * >4GiB-streaming roadmap Tier 10). Core 0 is serial and correct, so single-core is safe. Native
+     * weights and domain-0 imports are unaffected and keep multi-core. ORK_MC_IMPORT=1 forces MC (debug/
+     * repro only — it corrupts). The >4GiB sliding-window path is import-heavy; correctness > the MC
+     * speedup here (the user accepted this trade). */
     /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
      * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
      * measuring chained-ork-1core vs rknn-1core apples-to-apples (rknn chains its M-tiles in 1 submit). */
