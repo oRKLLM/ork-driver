@@ -6426,3 +6426,128 @@ void ork_fwht_norm(float *v, int n){
     float s=1.0f/sqrtf((float)n);
     for(int i=0;i<n;i++) v[i]*=s;
 }
+
+/* ==== CPU-side pack/dump helpers linked by the ggml-ork backend (no internal callers) ==== */
+/* SINGLE-THREADED int8 CPU dump — identical bytes to ork_w_dump_i8_cpu, but tiles inline on the calling
+ * thread (NO internal pool). For callers that ALREADY parallelize at a coarser grain (the .orkpack expert
+ * convert runs one whole expert per core); using the shared pthread pool there would nest/oversubscribe. */
+size_t ork_w_dump_i8_cpu_st(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    if(!c || !B || (K%32) || (N%32)) return 0;
+    int KS=int8_ks(c), NMAX=c->soc->nmax;
+    int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=pgup((size_t)Kp*Nc);
+        if(out){ if(off+tsz>cap) return 0;
+            int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);
+            struct tile_i8_arg ta={bb,B,KT,k0,n0,N}; tile_i8_range(0,NN,&ta); }   /* inline: no pool */
+        off+=tsz; }}
+    return off;
+}
+
+/* Pack int8 B[K,N] (row-major [k*N+n]) DIRECTLY into IMPORTED dma-buf chunks, tiled into the NPU layout —
+ * ork_mm_pack_i8's tiling into ork_mm_load_i8_import's chunked-import storage, with NO native bcreate, NO
+ * blob round-trip, NO free/churn. Purpose: a fused per-tensor weight (fc.wg) allocates as uniform ~16MB
+ * import chunks like every other weight, instead of a native-bcreate outlier that fragments the 32-bit
+ * domain's IOVA (the PRIME-ENOMEM-at-low-fill that blocked per-domain fusion). Mirrors load_i8_import
+ * (anchor + chunked own_bufs + full-K Bf rebuild); returns NULL if import is unavailable/fails. */
+ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
+    if(K%32 || N%32) return NULL;
+    if(dmaheap_open()<0) return NULL;
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
+    ork_dom_prime(c, w->domain);
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    int consolidate = !getenv("ORK_NO_CONSOLIDATE_IMPORT");
+    if(consolidate){
+        size_t chunk_mb = 16; const char*cm=getenv("ORK_IMPORT_CHUNK_MB"); if(cm){ long v=atol(cm); if(v>0) chunk_mb=(size_t)v; }
+        size_t chunk_cap = chunk_mb<<20;
+        int cap_chunks=Sk*Sn+1;
+        w->own_bufs=calloc(cap_chunks,sizeof(struct buf)); w->n_own_bufs=0;
+        struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
+        int ns,ks;
+        for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=pgup((size_t)Kp*Nc);
+            if(!cur.cpu || coff+ts>csz){
+                if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
+                csz = ts>chunk_cap ? ts : chunk_cap;
+                cur = bimport(c->fd,csz,w->domain);
+                if(!cur.cpu){ consolidate=0; break; }
+                dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+                w->own_bufs[w->n_own_bufs++]=cur; coff=0;
+            }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+            b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
+            int8_t*bb=b->cpu;
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
+            coff+=ts;}}
+        if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
+        else { for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]); free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0; memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1; }
+    }
+    if(!consolidate){
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
+          for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            int8_t*bb=b->cpu;
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    }
+    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;(void)n0;
+            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
+            if(!bf->cpu){ ok=0; break; }
+            int8_t*fb=bf->cpu;
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32,kf0=k0/32;
+                const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
+                for(int nt=0;nt<NN;nt++)
+                    memcpy(fb + ((size_t)nt*KTf + kf0)*32*32, sb + (size_t)nt*KT*32*32, (size_t)KT*32*32);}
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    return w;
+}
+
+/* CPU-ONLY int4 pack straight to the compact .orkpack blob (header + bscale[N] + Bi4[K*N/2]) — byte-
+ * identical to ork_mm_pack_i4a8_im() + ork_w_dump_i4a8(), but with NO bcreate/IOMMU/tiling. The per-tile
+ * bcreate in the NPU int4 packer is the serial single-stream consumer that bottlenecks .orkpack conversion;
+ * a WRITE only needs the compact nibbles + scales on disk (ork_mm_load_i4a8 re-tiles at load). This
+ * replicates the EXACT per-channel quant of ork_mm_pack_i4a8_im (absmax/7 uniform or NF4 codebook, optional
+ * imatrix clip-grid, SR with a per-call seed) so the bytes match. Single-threaded (caller parallelizes over
+ * experts). out=NULL → required size. K%32,N%32. */
+size_t ork_pack_i4a8_cpu_blob(ork_npu *c, int K, int N, const float *f32, const float *imatrix, void *out, size_t cap){
+    (void)c;
+    if(K%32 || N%32 || !f32) return 0;
+    size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nibsz=(size_t)K*N/2, need=hdr+sc+nibsz;
+    if(!out) return need;
+    if(cap<need) return 0;
+    int nf4 = getenv("ORK_NF4")!=NULL;
+    int sr  = getenv("ORK_SR")!=NULL; uint32_t seed=0x2545F491u;   /* per-call seed matches ork_mm_pack_i4a8_im */
+    struct ork_i4a8_hdr h={ORK_I4A8_MAGIC, ORK_I4A8_VER, K, N, (uint32_t)(nf4?ORK_QK_CODEBOOK_NF4:ORK_QK_UNIFORM)};
+    char    *p=(char*)out;
+    float   *bscale=(float*)(p+hdr);
+    uint8_t *Bi4   =(uint8_t*)(p+hdr+sc);
+    float   *qf32=malloc((size_t)K*sizeof(float));       /* quant_chan_i4 code byproduct; reused per channel */
+    uint8_t *qidx=nf4?malloc((size_t)K):NULL;
+    float   *imdq=imatrix?malloc((size_t)K*sizeof(float)):NULL;
+    if(!qf32 || (nf4&&!qidx) || (imatrix&&!imdq)){ free(qf32); free(qidx); free(imdq); return 0; }
+    for(int n=0;n<N;n++){
+        const float *fr=f32+(size_t)n*K; float mx=1e-9f; int k=0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        float32x4_t vmx=vdupq_n_f32(1e-9f);
+        for(;k<=K-4;k+=4) vmx=vmaxq_f32(vmx,vabsq_f32(vld1q_f32(fr+k)));
+        float m[4]; vst1q_f32(m,vmx); float a=m[0]>m[1]?m[0]:m[1], bb=m[2]>m[3]?m[2]:m[3]; mx=a>bb?a:bb;
+#endif
+        for(;k<K;k++){ float v=fabsf(fr[k]); if(v>mx) mx=v; }
+        if(imatrix) mx=wq_best_absmax(fr,K,mx,nf4,imatrix,imdq);
+        uint8_t *nib=Bi4+(size_t)n*(K/2);
+        if(nf4){ bscale[n]=mx/127.0f; quant_chan_nf4(fr,K,mx,sr,&seed,nib,qidx); }
+        else   { float scale=mx/7.0f; bscale[n]=scale; quant_chan_i4(fr,K,scale,sr,&seed,nib,qf32); }
+    }
+    memcpy(p,&h,hdr);   /* header last: bscale/Bi4 already in place */
+    free(qf32); free(qidx); free(imdq);
+    return need;
+}

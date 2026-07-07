@@ -250,6 +250,18 @@ ork_w       *ork_mm_load_i4a8(ork_npu *ctx, int K, int N, const void *blob, size
  * ork_mm_load_i4a8) or on a malformed blob / shape mismatch. */
 ork_w       *ork_mm_load_i4a8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
+/* CPU-side pack/dump helpers linked by the ggml-ork backend (defined at the end of npu.c; no internal
+ * callers). ork_w_dump_i8_cpu_st: single-threaded int8 CPU tile — for callers that parallelize at a
+ * coarser grain (one whole tensor per core) so the internal pool wouldn't nest/oversubscribe; byte-
+ * identical to ork_w_dump_i8_cpu. ork_pack_i4a8_cpu_blob: CPU int4 pack straight to the compact .orkpack
+ * blob (bit-identical to ork_mm_pack_i4a8_im + ork_w_dump_i4a8) with NO bcreate/IOMMU/tiling.
+ * ork_mm_pack_i8_import: tile int8 B[K,N] directly into IMPORTED dma-buf chunks (uniform ~16MB chunks,
+ * no native-alloc outlier — for co-resident fused per-tensor weights). K%32,N%32; dump/pack out=NULL ->
+ * required byte size. */
+size_t       ork_w_dump_i8_cpu_st(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
+size_t       ork_pack_i4a8_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, void *out, size_t cap);
+ork_w       *ork_mm_pack_i8_import(ork_npu *ctx, int K, int N, const int8_t *B);
+
 /* ---- Streaming weight pool: a RAM-resident inflated-int8 cache with CHEAP map/unmap ----
  * For models too big to keep resident in the ~4 GiB NPU IOVA window. The caller (e.g. a layer/expert LRU)
  * keeps a set of ALREADY-INFLATED int8 weights resident in CPU RAM (budget by RAM — much larger than the
