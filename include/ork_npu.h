@@ -27,7 +27,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  * a short git hash ("MAJOR.MINOR.PATCH+g<hash>") when built with -DORK_GIT_HASH (the Makefile injects
  * it where git is available).
  */
-#define ORK_NPU_VERSION "0.6.44"
+#define ORK_NPU_VERSION "0.6.45"
 /** @brief Runtime library version. @return "MAJOR.MINOR.PATCH" or "MAJOR.MINOR.PATCH+g<hash>". */
 const char  *ork_npu_version(void);
 
