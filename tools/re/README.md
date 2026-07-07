@@ -62,6 +62,10 @@ As more NPUs are added to the platform, everything needed to onboard one lives h
   smoke test (prints the generated text). This is the canonical open-stack bench, not `llama-bench`.
 - `rkllm_bench.cpp` — the closed-baseline mirror: same prompt/shape via the public `librkllmrt` API, reporting
   the runtime's own prefill/decode tok/s. Same model on both runtimes = the AGENTS apples-to-apples rule.
+- `ork_ppl.cpp` — the QUALITY companion to `ork_bench`: teacher-forced perplexity via the llama.cpp C API
+  (ggml-ork engaged, reads the same `ORK_*` knobs), so any q4/int4/int8 matmul-path change gets a PPL number
+  next to the tok/s. One all-position-logits decode over a text window; `PPL = exp(mean NLL)`. Compare
+  `ORK_OFF=1 ork_ppl …` (CPU baseline) vs the NPU config. `ork_ppl <model.gguf> <textfile> [window=256] [ubatch]`.
 
 ## Benchmarking (open vs closed)
 
