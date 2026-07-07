@@ -80,6 +80,15 @@ ork_npu     *ork_npu_init(void);
 /** @brief Power off the NPU and free a context obtained from ork_npu_init(). */
 void         ork_npu_free(ork_npu *ctx);
 
+/**
+ * @brief Dump (and reset) the ORK_LOAD_PROF phase breakdown of the .orkpack import load path
+ *        (dma-heap alloc / mmap / PRIME_FD / MEM_CREATE / Bb memcpy / Bf re-tile), to stderr.
+ *
+ * No-op unless ORK_LOAD_PROF is set. Called automatically at ork_npu_free(); also callable directly
+ * to profile a load in isolation (e.g. a standalone convert+reload driver). Diagnostic, like ORK_PROFILE.
+ */
+void         ork_load_prof_dump(void);
+
 /* SoC introspection */
 /** @brief SoC name detected from the device tree, e.g. "rk3588", "rk3576". */
 const char  *ork_npu_soc(const ork_npu *ctx);

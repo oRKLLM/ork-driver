@@ -47,6 +47,11 @@ enum { DT_F16=0, DT_I8=1, DT_I4=2 };
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
 static double ork_now_us(void);
 static int    g_ork_prof = 0;
+/* ORK_LOAD_PROF: per-phase breakdown of the .orkpack import path — where load time actually goes.
+ * Accumulated across every bimport()/load; dumped (and reset) at teardown by ork_load_prof_dump(). */
+static int    g_load_prof = 0;   /* set from ORK_LOAD_PROF in ork_npu_init, like g_ork_prof */
+static double g_lp_alloc=0, g_lp_mmap=0, g_lp_prime=0, g_lp_create=0, g_lp_memcpy=0, g_lp_bf=0;
+static long   g_lp_nchunk=0; static size_t g_lp_bytes=0;
 static long   g_prof_i8_calls = 0, g_prof_i4_calls = 0;
 static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
 /* RKNPU_SUBMIT ioctl counter (ORK_PROFILE). g_prof_submits = total ioctls; the run path tags each
@@ -348,17 +353,23 @@ static void dmabuf_sync(int heap_fd,uint64_t flags){
 static struct buf bimport(int fd,size_t size,int domain){
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
     size_t sz=pgup(size);
+    double _t = g_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
     if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC"); return (struct buf){0}; }
+    if(g_load_prof){ g_lp_alloc += ork_now_us()-_t; _t=ork_now_us(); }
     int dbuf=(int)a.fd;
     void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
+    if(g_load_prof){ g_lp_mmap += ork_now_us()-_t; }
     int dom=ork_dom(domain);
     if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
+    if(g_load_prof) _t=ork_now_us();
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    if(g_load_prof){ g_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
+    if(g_load_prof){ g_lp_create += ork_now_us()-_t; g_lp_nchunk++; g_lp_bytes+=sz; }
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     return b;
@@ -858,6 +869,7 @@ ork_npu *ork_npu_init(void){
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();
     g_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
+    g_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
@@ -870,7 +882,18 @@ ork_npu *ork_npu_init(void){
     g_npu_ctx = c;
     return c;
 }
-void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd;
+/* ORK_LOAD_PROF: print (and reset) the per-phase import breakdown. Called at teardown. No-op unless set. */
+void ork_load_prof_dump(void){
+    if(!g_load_prof) return;
+    double tot=g_lp_alloc+g_lp_mmap+g_lp_prime+g_lp_create+g_lp_memcpy+g_lp_bf; if(tot<=0) tot=1;
+    fprintf(stderr,"[ork LOAD_PROF] %ld chunks, %.2f GiB imported, %.2f s in import path:\n",
+            g_lp_nchunk, g_lp_bytes/(1024.0*1024.0*1024.0), tot/1e6);
+    fprintf(stderr,"  dma_heap_alloc %.2fs (%.0f%%) | mmap %.2fs (%.0f%%) | prime_fd %.2fs (%.0f%%) | mem_create %.2fs (%.0f%%) | memcpy(Bb) %.2fs (%.0f%%) | retile(Bf) %.2fs (%.0f%%)\n",
+            g_lp_alloc/1e6,100*g_lp_alloc/tot, g_lp_mmap/1e6,100*g_lp_mmap/tot, g_lp_prime/1e6,100*g_lp_prime/tot,
+            g_lp_create/1e6,100*g_lp_create/tot, g_lp_memcpy/1e6,100*g_lp_memcpy/tot, g_lp_bf/1e6,100*g_lp_bf/tot);
+    g_lp_alloc=g_lp_mmap=g_lp_prime=g_lp_create=g_lp_memcpy=g_lp_bf=0; g_lp_nchunk=0; g_lp_bytes=0;
+}
+void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump();
     if(g_ork_prof){
         if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
                                     g_prof_i8_calls, g_prof_i8_us/1e3, g_prof_i8_us/g_prof_i8_calls);
@@ -1283,7 +1306,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             }
             struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
             b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
-            memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); coff+=ts; boff+=ts;}}
+            double _m=g_load_prof?ork_now_us():0; memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); if(g_load_prof) g_lp_memcpy+=ork_now_us()-_m; coff+=ts; boff+=ts;}}
         if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
         else { /* alloc failed mid-way: tear down the chunks we grabbed, fall back to per-tile below */
             for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]);
@@ -1306,7 +1329,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
             struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
-            int8_t*fb=bf->cpu;
+            int8_t*fb=bf->cpu; double _bf=g_load_prof?ork_now_us():0;
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32,kf0=k0/32;
                 const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
@@ -1317,7 +1340,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
                     memcpy(fb + ((size_t)nt*KTf + kf0)*32*32,
                            sb + (size_t)nt*KT*32*32,
                            (size_t)KT*32*32);}
-            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}
+            dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); if(g_load_prof) g_lp_bf+=ork_now_us()-_bf;}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
