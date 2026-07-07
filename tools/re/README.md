@@ -56,6 +56,24 @@ As more NPUs are added to the platform, everything needed to onboard one lives h
 - `decode_reg.c` — decode a regcmd dump into (domain, addr, value); diff two dumps to isolate op-specific regs.
 - `silu_std_probe.c` — RE/calibration harness for the standalone SiLU activation op (ramp-measure idx, build curve).
 - `models/build_act.py` — build a single-op activation `.rknn` (silu/sigmoid/gelu/relu/tanh; i8/fp16/i16).
+- `ork_bench.cpp` — open-stack perf harness. Drives the llama.cpp C API directly (the `ggml-ork` backend
+  intercepts `MUL_MAT`, so `ORK_FFN_CHAIN`/`ORK_PERSIST`/`ORK_PROFILE`/… all apply), exposing the exact
+  levers `llama-bench` hides: prefill batch size (`n_ubatch`), warmup, and one-clock timing. Also a coherency
+  smoke test (prints the generated text). This is the canonical open-stack bench, not `llama-bench`.
+- `rkllm_bench.cpp` — the closed-baseline mirror: same prompt/shape via the public `librkllmrt` API, reporting
+  the runtime's own prefill/decode tok/s. Same model on both runtimes = the AGENTS apples-to-apples rule.
+
+## Benchmarking (open vs closed)
+
+`ork_bench` / `rkllm_bench` are built out-of-tree against their respective runtimes (they need the llama.cpp
+C API / `librkllmrt`, so they are NOT `ork-driver` Makefile targets — same boundary as the capture tools):
+
+```sh
+# open stack (built alongside the ggml-ork llama.cpp build; run against its libs):
+LD_LIBRARY_PATH=<llama-build>/bin ORK_PROFILE=1 ./ork_bench model.gguf prompt.txt 128 64 [ubatch=P]
+# closed baseline (same prompt, matching .rkllm):
+g++ -O2 -I. -o rkllm_bench rkllm_bench.cpp -L. -lrkllmrt && ./rkllm_bench model.rkllm 64 prompt.txt
+```
 
 ## Board/container notes
 - The RKNN toolkit runs in an x86 Ubuntu docker container (`rkllm-converter`); `docker cp` models in/out.
