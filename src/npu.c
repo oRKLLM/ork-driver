@@ -53,12 +53,16 @@ enum { DT_F16=0, DT_I8=1, DT_I4=2 };
 static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
 static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
-/* ORK_I4_MSCHED: resurrect the native int4 multi-M scheduler (Exp-2026-06-19) — one submit computes
- * a whole M-tile with resident weights (batch mode: mc_phys=2*H, 0x405c=0, stride-2 output → read
- * physical row 2m for logical m), instead of the per-row PC-chain that re-streams the weight per row
- * (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default OFF until board-validated; 0=off,
- * 1=on. See src/npu.c synth_i4 mc>1 block + i4_mcworker, and the NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy. */
-static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }  /* default ON (bit-exact validated ./i4; per-row fallback where batch doesn't fit) */
+/* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
+ * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
+ * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the
+ * weight every row (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default ON (bit-exact
+ * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + i4_mcworker
+ * + stream_worker_i4; NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy.
+ *   PRESERVED as a distinct, named strategy — the multi-task-submit batch (many 1-row tasks per submit, the
+ *   vendor's int4 approach; task_number=rows) is a SEPARATE path and must NOT overwrite/conflate with this.
+ *   Env var kept as ORK_I4_MSCHED for back-compat (0=off, 1=on). */
+static int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_I4_NSUB: N-subslice the batch path so wide-N (Ncore*K > 131072 weight budget) still batches — split N
  * into ≤131072/K-column chunks, one batch submit each, instead of falling back to per-row. Default OFF until
  * board-validated; when off, msched keeps the weight-fit guard (whole-Ncore batch or per-row). */
@@ -3422,7 +3426,7 @@ static void *i4_mcworker(void *vp){
              * elsewhere (wide-N large-K) fall through to per-row, which is optimal there. */
             int nsub_max = (131072 / Kp) & ~63;                 /* max 64-block-aligned cols per weight-budget submit */
             int nsub_ok = ork_i4_nsub() && nsub_max >= 128;     /* >=2 blocks/submit => net win */
-            int msched_k = ork_i4_msched() && Hcap_ok && M >= 2 && (wfit || nsub_ok);
+            int msched_k = ork_i4_batch() && Hcap_ok && M >= 2 && (wfit || nsub_ok);
             int chunk_M = msched_k ? Hcap : 16;
             for (int m0 = 0; m0 < M; m0 += chunk_M) {
                 int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
@@ -3628,7 +3632,7 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
-    if(ork_i4_msched()){ size_t mo=(size_t)c->soc->nmax*64*2; if(osz<mo)osz=mo; }  /* batch de-tile: physrow up to 4*HCAP(=16)*NB = 64*Ncore int16 */
+    if(ork_i4_batch()){ size_t mo=(size_t)c->soc->nmax*64*2; if(osz<mo)osz=mo; }  /* batch de-tile: physrow up to 4*HCAP(=16)*NB = 64*Ncore int16 */
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
     size_t asz=(size_t)M*ORK_I4_KS/2;
     if(asz < (size_t)4*32768*2) asz=(size_t)4*32768*2;
@@ -6485,7 +6489,7 @@ static void *stream_worker_i4(void *vp) {
          * (N*K<=131072), batch its M rows in H-row submits (mc=2H, stride-2 A at slot 2j, de-tile 4j+4H*b) —
          * one core batches a whole small matmul, round-robin, no barrier. Else fall through to per-row. */
         int Hcap = 16384 / K; if (Hcap > 16) Hcap = 16; if (Hcap < 1) Hcap = 1;
-        if (ork_i4_msched() && Hcap >= 2 && M >= 2 && (size_t)N * K <= 131072) {
+        if (ork_i4_batch() && Hcap >= 2 && M >= 2 && (size_t)N * K <= 131072) {
             int NBc = N / 64;
             for (int m0 = 0; m0 < M; m0 += Hcap) {
                 int H = (M - m0 < Hcap) ? (M - m0) : Hcap;
@@ -6576,7 +6580,7 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 2;
         /* batch (msched) output spans up to 4*HCAP(=16)*N int16 = 128*N bytes; only for tasks that FIT the
          * weight budget (N*K<=131072, i.e. small N), so the bump is small. */
-        if(ork_i4_msched() && (size_t)w->N*w->K<=131072){ size_t bn=(size_t)128*w->N; if(bn>mn)mn=bn; }
+        if(ork_i4_batch() && (size_t)w->N*w->K<=131072){ size_t bn=(size_t)128*w->N; if(bn>mn)mn=bn; }
         if (mk > maxMK) maxMK = mk; if (mn > maxMN2) maxMN2 = mn;
     }
     int fd = c->fd;
