@@ -6467,6 +6467,83 @@ cleanup:
     return ok;
 }
 
+/* read a register value out of a built regcmd by (block,offset) — for the incremental-task builder */
+static uint32_t regcmd_getv(const uint32_t*rc,int n,uint32_t blk,uint32_t off){
+    for(int k=0;k+1<n;k+=2) if((rc[k]&0xffff)==off && (rc[k+1]>>16)==blk) return ((rc[k+1]&0xffff)<<16)|(rc[k]>>16);
+    return 0;
+}
+
+/* EXPERIMENTAL — int4 incremental-task batch (STRATEGY C: the vendor's task_number=N pattern, decoded
+ * from a librknnrt w4a4 capture 2026-07-08). ONE resident int4 weight, M rows; task[0]=full synth_i4(mc=1),
+ * task[1..M-1]=12-CONFIG incremental regcmd that advances ONLY the A input (0x1070) and C output (0x4020)
+ * addresses — the weight IOVA (0x1110) stays CONSTANT, so the weight is loaded ONCE and reused across all
+ * M rows in ONE submit (task_number=M). Unlike ork_i4_batch (STRATEGY A: stride-2 in-task), this is NOT
+ * capped by the 0x107c activation budget (Hcap=16384/K) — it batches arbitrary M with a single weight load.
+ * Output = M contiguous [N] int16 rows -> widened to int32. Scratch buffers cached across calls (grow-only)
+ * so repeated calls don't re-alloc. 2s submit timeout = fast-fail (never a long wedge). Board-experimental. */
+int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C){
+    if(!c||!w||w->dtype!=DT_I4||M<1||!A||!C) return -1;
+    int fd=c->fd, K=w->K, N=w->N;
+    uint32_t wdma=(uint32_t)w->Bb[0].dma;
+    static struct buf sA={0}, sC={0}, sRC={0}, sTK={0}; static int cap_M=0,cap_K=0,cap_N=0;
+    if(M>cap_M||K>cap_K||N>cap_N){
+        if(sA.cpu)bdestroy(fd,&sA); if(sC.cpu)bdestroy(fd,&sC); if(sRC.cpu)bdestroy(fd,&sRC); if(sTK.cpu)bdestroy(fd,&sTK);
+        size_t need_rc=((size_t)REGCMD_I4_N+(size_t)(M>1?M-1:0)*32)*4;
+        sA =bcreate(fd,(size_t)M*(K/2),0x403,c->dom_active);
+        sC =bcreate(fd,(size_t)M*N*2, 0x403,c->dom_active);
+        sRC=bcreate(fd,need_rc,        0x403,c->dom_active);
+        sTK=bcreate(fd,(size_t)M*sizeof(struct rknpu_task),0x40b,c->dom_active);
+        if(!sA.cpu||!sC.cpu||!sRC.cpu||!sTK.cpu) return -2;
+        cap_M=M;cap_K=K;cap_N=N;
+    }
+    /* pack each int8 A row -> K/2 int4 nibbles (the layout synth_i4/run_i4 expect), contiguous by row */
+    for(int j=0;j<M;j++) tile_i4_Aslice((uint8_t*)sA.cpu+(size_t)j*(K/2), A+(size_t)j*K, 0, K);
+    bsync(fd,&sA,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* task[0]: full synth_i4 regcmd (configures the pipeline + loads the weight) */
+    uint32_t rc0[REGCMD_I4_N];
+    synth_i4(rc0,1,K,N,(uint32_t)sA.dma,wdma,(uint32_t)sC.dma);
+    uint32_t inc1=(uint32_t)(sRC.dma+REGCMD_I4_N*4);
+    /* chain amount = 0x0007 (the vendor uses 0x0007 for EVERY chain transition into a compact task —
+     * full->compact AND compact->compact; the 0x0037 used by run_chain_i4 is for full->full and would
+     * make the walker over-read our 32-word compact buffer => errno 110). */
+    if(M>1){ rc0[216]=0x0010|((inc1&0xffff)<<16); rc0[217]=(0x0101<<16)|((inc1>>16)&0xffff);
+             rc0[218]=0x0014|(0x0007<<16); rc0[219]=(0x0101<<16)|0; }
+    else   { rc0[216]=0; rc0[217]=0; rc0[218]=0x00000014; rc0[219]=0x01010000; }
+    memcpy(sRC.cpu,rc0,REGCMD_I4_N*4);
+    uint32_t v1040=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x1040);
+    uint32_t v100c=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x100c);
+    /* task[1..M-1]: 12-config incremental (advance only A@0x1070, C@0x4020) + PC-chain + core-ctrl */
+    for(int j=1;j<M;j++){
+        uint32_t*ic=(uint32_t*)((char*)sRC.cpu+REGCMD_I4_N*4+(size_t)(j-1)*32*4);
+        uint32_t aA=(uint32_t)sA.dma+(uint32_t)j*(K/2);
+        uint32_t aC=(uint32_t)sC.dma+(uint32_t)j*N*2;
+        int last=(j==M-1);
+        uint32_t nx=(uint32_t)(sRC.dma+REGCMD_I4_N*4+(size_t)j*32*4);
+        #define SP(i,off,blk,val) do{ic[2*(i)]=(off)|(((uint32_t)(val)&0xffff)<<16); ic[2*(i)+1]=((uint32_t)(blk)<<16)|(((uint32_t)(val)>>16)&0xffff);}while(0)
+        SP(0,0x1040,0x0201,v1040); SP(1,0x1104,0x0201,0); SP(2,0x1100,0x0201,0); SP(3,0x100c,0x0201,v100c);
+        SP(4,0x4004,0x1001,0x0e);  SP(5,0x1070,0x0201,aA); SP(6,0x1084,0x0201,0x00010001); SP(7,0x1088,0x0201,(uint32_t)K);
+        SP(8,0x1110,0x0201,wdma);  SP(9,0x4020,0x1001,aC); SP(10,0x4058,0x1001,(uint32_t)(N-1)); SP(11,0x405c,0x1001,0);
+        if(last){ SP(12,0x0010,0x0101,0); SP(13,0x0014,0x0101,0); } else { SP(12,0x0010,0x0101,nx); SP(13,0x0014,0x0101,0x0007); }
+        SP(14,0x0000,0x0041,0); SP(15,0x0008,0x0081,0x000d);
+        #undef SP
+    }
+    bsync(fd,&sRC,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task*t=(struct rknpu_task*)sTK.cpu; memset(t,0,(size_t)M*sizeof*t);
+    for(int j=0;j<M;j++){ t[j].enable_mask=0xd;t[j].int_mask=0x300;t[j].int_clear=0x1ffff;
+        t[j].regcfg_amount=(j==0)?116:12;
+        t[j].regcmd_addr=(j==0)?sRC.dma:(sRC.dma+REGCMD_I4_N*4+(uint64_t)(j-1)*32*4); }
+    bsync(fd,&sTK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);
+    sub.flags=0x5;sub.task_number=(uint32_t)M;sub.task_obj_addr=sTK.obj;sub.fence_fd=-1;sub.core_mask=1u;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)M};
+    sub.timeout=2000;
+    if(rknpu_submit_ioctl(fd,&sub,w->domain)) return -3;
+    bsync(fd,&sC,RKNPU_MEM_SYNC_FROM_DEVICE);
+    int16_t*o=(int16_t*)sC.cpu;
+    for(int j=0;j<M;j++) for(int n=0;n<N;n++) C[(size_t)j*N+n]=o[(size_t)j*N+n];
+    return 0;
+}
+
 /* ---- ASYNC ROUND-ROBIN STREAM, int4 (ork_mm_run_stream_i4) ----
  * int4 analog of ork_mm_run_stream_i8: dispatch S independent W4A4 matmuls to per-core pool workers that
  * PULL the next task dynamically (atomic counter, no barrier), each running it as a single-core submit on

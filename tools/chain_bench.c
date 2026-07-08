@@ -37,9 +37,14 @@ int main(int argc, char **argv) {
         ork_w *w = ork_mm_pack_i8(c, K, N, B);
         free(B);
         if (!w) { fprintf(stderr, "pack_i8 failed at %d (K=%d N=%d)\n", i, K, N); return 1; }
-        int8_t  *A  = malloc((size_t)M * K);
+        /* A/C in DMA buffers (ork_dma_alloc) so run_chain_i8 AND run_i8 use them IN-PLACE (dma_find hits)
+         * — this removes run_chain's per-call bcreate/bdestroy of staging buffers, the confound that made
+         * the first measurement time buffer-churn instead of the submit mechanism. Fallback to malloc if
+         * the dma-heap is full. Set ORK_NO_DMA=1 to force the old malloc path (re-introduces the confound). */
+        int use_dma = !getenv("ORK_NO_DMA");
+        int8_t  *A  = use_dma ? ork_dma_alloc(c, (size_t)M * K)     : NULL; if (!A)  A  = malloc((size_t)M * K);
         for (size_t j = 0; j < (size_t)M * K; j++) A[j] = (int8_t)rnd8();
-        int32_t *Cc = malloc((size_t)M * N * 4);
+        int32_t *Cc = use_dma ? ork_dma_alloc(c, (size_t)M * N * 4) : NULL; if (!Cc) Cc = malloc((size_t)M * N * 4);
         tasks[i].w = w; tasks[i].M = M; tasks[i].A = A; tasks[i].C = Cc;
     }
 
@@ -72,9 +77,30 @@ int main(int argc, char **argv) {
           if (t->C[n] != ref) { printf("  WARM-CHECK MISMATCH col %d: got %d exp %d\n", n, t->C[n], ref); bad++; } }
       free(Bref); if (!bad) printf("  warm-check OK (task0 row0)\n"); }
 
+    double chain_us_mm = dt / iters / S;
     printf("chain S=%d K=%d N=%d M=%d iters=%d  [%s]  %.1f us/chain  (%.1f us/matmul)\n",
            S, K, N, M, iters, stream ? "STREAM-mc" : (getenv("ORK_CHAIN_MC") ? "MULTI-core" : "single-core"),
-           dt / iters, dt / iters / S);
+           dt / iters, chain_us_mm);
+
+    /* BASELINE: the SAME S matmuls as S SEPARATE submits (the current decode / per-expert-MoE path).
+     * The delta vs the chain above = the multi-task-submit amortization of the per-submit floor — the
+     * whole point of packing many GEMVs into one submit (proven possible by the vendor's task_number=96).
+     * Skip with ORK_NO_SEP=1. */
+    if (!getenv("ORK_NO_SEP")) {
+        for (int i = 0; i < S; i++)   /* warm each weight on the single-submit path */
+            ork_mm_run_i8(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
+        double s0 = now_us();
+        for (int it = 0; it < iters; it++)
+            for (int i = 0; i < S; i++) {
+                rc = ork_mm_run_i8(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
+                if (rc) { fprintf(stderr, "separate run failed rc=%d (i=%d)\n", rc, i); return 1; }
+            }
+        double sdt = now_us() - s0;
+        double sep_us_mm = sdt / iters / S;
+        printf("separate  S=%d (S submits/iter)  %.1f us/matmul\n", S, sep_us_mm);
+        printf("MULTI-TASK SUBMIT AMORTIZATION: %.2fx  (separate %.1f -> chain %.1f us/matmul; floor saved %.1f us)\n",
+               sep_us_mm / chain_us_mm, sep_us_mm, chain_us_mm, sep_us_mm - chain_us_mm);
+    }
 
     ork_npu_free(c);
     return 0;
