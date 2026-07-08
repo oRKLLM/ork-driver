@@ -59,6 +59,10 @@ static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  * (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default OFF until board-validated; 0=off,
  * 1=on. See src/npu.c synth_i4 mc>1 block + i4_mcworker, and the NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy. */
 static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }  /* default ON (bit-exact validated ./i4; per-row fallback where batch doesn't fit) */
+/* ORK_I4_NSUB: N-subslice the batch path so wide-N (Ncore*K > 131072 weight budget) still batches — split N
+ * into ≤131072/K-column chunks, one batch submit each, instead of falling back to per-row. Default OFF until
+ * board-validated; when off, msched keeps the weight-fit guard (whole-Ncore batch or per-row). */
+static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=e?(atoi(e)?1:0):1;} return v; }  /* default ON; engages only where Nsub_max>=128 (Kp<=1024), a measured net win */
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -3400,8 +3404,14 @@ static void *i4_mcworker(void *vp){
              * that the far N-blocks silently don't compute, so fall back to the per-row path (still correct).
              * A future N-subslice loop would keep batch mode for wide N at large K (roadmap). */
             int Hcap_ok = Hcap >= 2;
-            int wfit = ((size_t)Ncore * Kp) <= 131072;
-            int msched_k = ork_i4_msched() && Hcap_ok && wfit && M >= 2;
+            int wfit = ((size_t)Ncore * Kp) <= 131072;          /* whole N-slice weight fits in one submit */
+            /* N-subslice only pays off when each submit covers >=2 blocks (Nsub_max>=128, i.e. Kp<=1024):
+             * at Kp=2048 only 1 block fits per submit, so wide-N becomes submit-bound and LOSES to per-row
+             * (bench 2026-07-08: K512 1.10x, K1024 1.19x, K2048 0.66x). So sub-slice only where it wins;
+             * elsewhere (wide-N large-K) fall through to per-row, which is optimal there. */
+            int nsub_max = (131072 / Kp) & ~63;                 /* max 64-block-aligned cols per weight-budget submit */
+            int nsub_ok = ork_i4_nsub() && nsub_max >= 128;     /* >=2 blocks/submit => net win */
+            int msched_k = ork_i4_msched() && Hcap_ok && M >= 2 && (wfit || nsub_ok);
             int chunk_M = msched_k ? Hcap : 16;
             for (int m0 = 0; m0 < M; m0 += chunk_M) {
                 int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
@@ -3425,23 +3435,53 @@ static void *i4_mcworker(void *vp){
                  * the weight every row. mc=cur_chunk -> synth_i4 sets mc_phys=2*cur_chunk + 0x405c=0, and
                  * the output DMA writes logical row m to PHYSICAL row 2m (int16 result in an int32-stepped
                  * buffer). A is cur_chunk consecutive single-row tiles (already laid out above). */
-                int use_msched = msched_k;
-                int ntask = use_msched ? 1 : cur_chunk;
-                if (use_msched) {
-                    uint32_t rc[REGCMD_I4_N];
-                    synth_i4(rc, 2 * cur_chunk, Kp, Ncore, (uint32_t)AF->dma, (uint32_t)wbase, (uint32_t)O->dma);  /* mc=2H (stride-2 input) */
-                    if (validate_regcmd("i4_mcworker_msched", c, rc, REGCMD_I4_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
+                if (msched_k) {
+                    /* Self-contained native BATCH path, N-subsliced. Compute cur_chunk (H) rows with the weight
+                     * streamed once per N-sub-slice. mc=2H (HW reads A at stride-2, row j -> A-slot 2j); output
+                     * row j of 64-block b at physrow (4j + 4H*b). Nsub_max caps each submit's weight to the
+                     * 131072-int4 budget; = whole Ncore when it already fits (single iteration = pre-nsub path). */
+                    int H = cur_chunk, Nsub_max = Ncore;
+                    if (nsub_ok) { Nsub_max = nsub_max; if (Nsub_max > Ncore) Nsub_max = Ncore; }  /* sub-slice to the weight budget */
+                    for (int nc0 = 0; nc0 < Ncore && !c->mc_error; nc0 += Nsub_max) {
+                        int Nsub = (Ncore - nc0 < Nsub_max) ? (Ncore - nc0) : Nsub_max;
+                        uint64_t wbase_sub = wbase + (uint64_t)(nc0 / 64) * Kp * 32;   /* Kp*32 B per 64-block */
+                        uint32_t rc[REGCMD_I4_N];
+                        synth_i4(rc, 2 * H, Kp, Nsub, (uint32_t)AF->dma, (uint32_t)wbase_sub, (uint32_t)O->dma);
+                        if (validate_regcmd("i4_mcworker_msched", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; c->mc_error = 1; break; }
+                        rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;  /* single task, no chain */
+                        memcpy(RC->cpu, rc, sizeof(rc));
+                        struct rknpu_task *tk = c->mtk[i].cpu;
+                        memset(tk, 0, sizeof(struct rknpu_task));
+                        tk[0].enable_mask = 0xd; tk[0].int_mask = 0x300; tk[0].int_clear = 0x1ffff;
+                        tk[0].regcfg_amount = 116; tk[0].regcmd_addr = c->mrc[i].dma;
+                        bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
+                        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+                        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+                        sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.fence_fd = -1;
+                        sub.core_mask = 1u << i;
+                        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+                        int reps = c->mwarm[i] ? 1 : 2;
+                        for (int rep = 0; rep < reps; rep++) {
+                            int last = (rep == reps - 1); sub.timeout = 60000;
+                            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) { a->rc = -1; c->mc_error = 1; break; } continue; }
+                            bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
+                        }
+                        c->mwarm[i] = 1;
+                        if (active && acc) {   /* de-tile: o[(4j+4H*b)*64 + c] -> C[row m0+j][nc0 + b*64 + c] */
+                            int16_t *o = O->cpu; int NBc = Nsub / 64;
+                            for (int j = 0; j < H; j++)
+                                for (int b = 0; b < NBc; b++) {
+                                    size_t base = (size_t)(4 * j + 4 * H * b) * 64;
+                                    int32_t *ap = &acc[(size_t)(m0 + j) * Ncore + nc0 + b * 64];
+                                    for (int cc = 0; cc < 64; cc++) ap[cc] += o[base + cc];
+                                }
+                        }
                     }
-                    rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;  /* single task, no chain */
-                    memcpy(RC->cpu, rc, sizeof(rc));
-                    memset(tk_arr, 0, sizeof(struct rknpu_task));
-                    tk_arr[0].enable_mask = 0xd;
-                    tk_arr[0].int_mask = 0x300;
-                    tk_arr[0].int_clear = 0x1ffff;
-                    tk_arr[0].regcfg_amount = 116;
-                    tk_arr[0].regcmd_addr = c->mrc[i].dma;
-                } else {
+                    if (c->mc_error) { a->rc = -1; free(acc); return NULL; }
+                    continue;   /* skip the per-row submit/accumulate below */
+                }
+                int ntask = cur_chunk;
+                {
                 memset(tk_arr, 0, cur_chunk * sizeof(struct rknpu_task));
                 for(int m=0; m<cur_chunk; m++) {
                     uint32_t rc[REGCMD_I4_N];
@@ -3502,18 +3542,7 @@ static void *i4_mcworker(void *vp){
                 c->mwarm[i]=1;
                 if (active && acc) {
                     int16_t*o=O->cpu;
-                    if(use_msched) {
-                        /* native batch de-tile: output row j of 64-block b is at physrow (4j + 4H*b),
-                         * i.e. o[(4j + 4H*b)*64 + c] = C[row j][b*64 + c]. H = cur_chunk. */
-                        int H = cur_chunk, NBc = Ncore / 64;
-                        for(int j=0;j<H;j++){
-                            for(int b=0;b<NBc;b++){
-                                size_t base = (size_t)(4*j + 4*H*b) * 64;
-                                int32_t*ap = &acc[(size_t)(m0+j)*Ncore + b*64];
-                                for(int c=0;c<64;c++) ap[c] += o[base + c];
-                            }
-                        }
-                    } else if(cur_chunk>1) {
+                    if(cur_chunk>1) {
                         /* per-row PC-chain: rows written contiguously */
                         for(int m=0;m<cur_chunk;m++){
                             for(int col=0;col<Ncore;col++){

@@ -98,6 +98,11 @@ static int score_rows(const int16_t*raw,const int32_t*ref,int M,int N){
         for(int n=0;n<N&&ok;n++) if(raw[(size_t)(2*m)*N+n]!=ref[(size_t)m*N+n]) ok=0;
         if(ok) hit++; } return hit;
 }
+/* is a 64-wide vector present contiguously anywhere in raw? (collision-proof block-presence test) */
+static int vec_in_raw(const int16_t*raw,size_t rawlen,const int32_t*want){
+    for(size_t off=0; off+64<=rawlen; off++){ int ok=1;
+        for(int c=0;c<64&&ok;c++) if(raw[off+c]!=want[c]) ok=0; if(ok) return 1; } return 0;
+}
 static int blacklisted(uint32_t b,uint32_t r){ FILE*f=fopen("i4_fuzz_blacklist.txt","r"); if(!f)return 0;
     unsigned fb,fr; int bad=0; while(fscanf(f,"%x %x",&fb,&fr)==2) if(fb==b&&fr==r){bad=1;break;} fclose(f); return bad; }
 static void blacklist(uint32_t b,uint32_t r){ if(blacklisted(b,r))return; FILE*f=fopen("i4_fuzz_blacklist.txt","a");
@@ -127,6 +132,31 @@ int main(int argc,char**argv){
     ork_i4_fuzz_clear();
     int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
     if(!strcmp(mode,"base")){ printf("K=%d M=%d N=%d -> rows %d\n",K,M,N,base); ork_npu_free(ctx); return 0; }
+    /* wtest <blk> <reg>: hunt a WEIGHT-bank register that lifts the 131072 weight budget. At K (large) + N=128
+     * (2 blocks), the batch computes blk0 but drops blk1 (weight Ncore*K > 131072). If a reg value makes blk1
+     * appear, it enlarged the weight budget → wide-N would batch in ONE submit (no N-subslice). */
+    if(!strcmp(mode,"wtest") && argc>5){
+        uint32_t vb=(uint32_t)strtoul(argv[4],0,0), vr=(uint32_t)strtoul(argv[5],0,0);
+        int WN=128;
+        int8_t*B2=malloc((size_t)K*WN); int32_t*ref2=malloc((size_t)M*WN*4); int16_t*raw2=malloc((size_t)2*M*WN*2);
+        for(size_t i=0;i<(size_t)K*WN;i++)B2[i]=r4();
+        for(int m=0;m<M;m++)for(int n=0;n<WN;n++){int s=0;for(int k=0;k<K;k++)s+=A[(size_t)m*K+k]*B2[(size_t)k*WN+n];ref2[(size_t)m*WN+n]=s;}
+        int32_t blk1[64]; for(int c=0;c<64;c++) blk1[c]=ref2[64+c];   /* row0, block1 (n=64..127) */
+        setenv("ORK_I4_ALAY","1",1);
+        ork_i4_fuzz_clear(); ork_npu_probe_i4_mm(ctx,M,K,WN,A,B2,raw2);
+        int base_b1=vec_in_raw(raw2,(size_t)2*M*WN,blk1);
+        printf("[wtest] reg %x/%x @ K=%d M=%d WN=128: baseline blk1 present=%d (hunting lift to 1)\n",vb,vr,K,M,base_b1);
+        uint32_t vals[]={0,1,2,4,8,16,32,64,128,256,512,(uint32_t)(K/16),(uint32_t)(K/8),(uint32_t)(K/4),
+                         (uint32_t)(K*WN/2),(uint32_t)(K*WN),0xff,0x100,0x200,0x400};
+        for(unsigned i=0;i<sizeof vals/sizeof*vals;i++){
+            ork_i4_fuzz_clear(); ork_i4_fuzz_add(vb,vr,vals[i]);
+            ork_npu_probe_i4_mm(ctx,M,K,WN,A,B2,raw2);
+            int b1=vec_in_raw(raw2,(size_t)2*M*WN,blk1);
+            if(b1>base_b1) printf("  0x%-6x -> blk1=%d  <<< WEIGHT-BANK LEVER\n",vals[i],b1);
+        }
+        printf("[wtest] done\n");
+        free(B2);free(ref2);free(raw2); ork_npu_free(ctx); return 0;
+    }
     /* vsweep <blk> <reg>: characterize one register — sweep its value 0..0x200, print rows-matched for
      * each (not just HITs). Reveals the value->rows law of a candidate budget reg (e.g. 0x201/0x107c). */
     if(!strcmp(mode,"vsweep") && argc>5){

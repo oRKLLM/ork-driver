@@ -81,6 +81,12 @@ int main(void){
       ork_npu_set_core_budget(c,1);
       fail|=test(c,8,512,256);    /* int4 1-core M=8 (chained rows) */
       fail|=test(c,4,2048,256);   /* int4 1-core M=4, K-split + accumulate */
+      /* BUDGET-COUPLING probe (single-core so Ncore=N): both the activation budget (rows*K<=16384) and the
+       * weight budget (Ncore*K<=131072) are AT their limits simultaneously. If these pass bit-exact, the two
+       * CBUF budgets are independent (separate weight/data banks) — the N-subslice loop can set H and Nsub
+       * freely. If they miscompute, the budgets are coupled and the msched weight-fit guard must be tightened. */
+      fail|=test(c,32,1024,128);  /* K=1024: H=16 act=16384 (=limit) x Ncore=128 wt=131072 (=limit) */
+      fail|=test(c,64,512,256);   /* K=512:  H=16 x Ncore=256 wt=131072 (=limit) */
       ork_npu_set_core_budget(c,cores); }
     printf("per-group W4A4 (fp32 -> int4 group-quant -> NPU dequant) vs fp32:\n");
     fail|=gtest(c,1,2048,256,128);    /* decode, group_size 128 (16 groups) */
