@@ -357,3 +357,39 @@ f16_gmax_sweep: tools/f16_gmax_sweep.c $(CORE)
 # probe whether the fp16 fused-SiLU index can reach the UPPER LUT bank (idx>514) under any register config.
 f16_bank_probe: tools/f16_bank_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# --- RE tooling for cross-NPU bring-up (board-only diagnostics; not in all/test) ---
+# NPU on-chip SRAM: total/free size query + allocation-usability probe. See README
+# "Enabling the NPU on-chip SRAM" and wiki NPU-on-chip-SRAM.
+sram_probe: tools/sram_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+sram_alloc_probe: tools/sram_alloc_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+sram_query: tools/sram_query.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+# constraint-guided template-preserving fuzzer for norm ops (standalone regcmd).
+test_norm: examples/test_norm.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+# round-robin cross-core decode probe.
+rr_decode_probe: tools/rr_decode_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# IOMMU-domain concurrency probe (NPU || CPU overlap).
+domain_concur_probe: tools/domain_concur_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# layer-pipeline probe.
+layer_pipeline_probe: tools/layer_pipeline_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# on-die fused-activation harness (PPU/SDP chain RE).
+test_fused_activation: tests/test_fused_activation.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
+dom_switch_probe: tools/re/dom_switch_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i4cpu_check: tools/re/i4cpu_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
