@@ -93,6 +93,10 @@ int main(int argc,char**argv){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A[(size_t)m*K+k]*B[(size_t)k*N+n];ref[(size_t)m*N+n]=s;}
 
     setenv("ORK_I4_ALAY","1",1);   /* per-row contiguous A (Exp-2026-06-19); ork_npu_probe_i4_mm honors it */
+    /* short submit timeout so a wedging candidate fails FAST in-process (kernel times out the job, ~1.5s)
+     * and the next probe's ACT_RESET recovers the NPU — the whole sweep runs in one process, no external
+     * kill needed. Overridable; the external `timeout -s INT` is only a backstop for a true hard hang. */
+    if(!getenv("ORK_I4_PROBE_TO_MS")) setenv("ORK_I4_PROBE_TO_MS","1500",1);
 
     ork_i4_fuzz_clear();
     int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;

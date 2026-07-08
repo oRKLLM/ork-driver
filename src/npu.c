@@ -5607,8 +5607,12 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     if (validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    /* ORK_I4_PROBE_TO_MS: submit timeout (default 60s). The fuzzer sets this low (e.g. 1500) so a wedging
+     * candidate has the KERNEL time out the job fast and return an error in-process — the fuzzer blacklists
+     * it and continues, with no external SIGINT-during-submit (the documented wedge/corruption risk). */
+    uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v) to_ms=v; } }
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*2);   /* caller supplies a 2*M*N int16 buffer (stride-2) */
     bdestroy(fd,&W);bdestroy(fd,&O);
