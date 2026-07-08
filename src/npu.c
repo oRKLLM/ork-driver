@@ -6665,39 +6665,32 @@ static int run_i4_incr_mc(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
  * every batch-task (STRATEGY C's amortization). M/H batch-tasks vs STRATEGY C's M single-row tasks and vs
  * default's M/H weight-reloads. Single-core (core 0). A packed stride-2 per batch; de-tile mirrors the
  * validated stream path. Returns -4 (fallback) on K/N not fitting the batch, -1 on submit error. */
-static int run_i4_bchain(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C){
-    if(w->Sk!=1 || w->Sn!=1 || (w->N%64)) return -4;
-    int fd=c->fd, K=w->K, N=w->N, i=0;
-    int H=16384/K; if(H>16)H=16; { const char*e=getenv("ORK_I4_BCH_H"); if(e){int v=atoi(e); if(v>=1)H=v;} } if(H<2) return -4;  /* per-submit row batch; ORK_I4_BCH_H overrides for RE */
-    /* Multi-M native batch is valid only WITHIN one weight bank (64KB int4 = 131072/K columns): no D_BANK to
-     * hold >1 bank, and in-task multi-M across >1 bank hits the 0x1040 K-schedule wall (only row 0 computes).
-     * So tile N into bank-width chunks (Wb = 131072/K, mult of 64) — each chunk is a wall-free single-bank
-     * batch (proven bit-exact); chain H-row batches across ALL (M-group x N-chunk) tasks in one submit. */
-    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; { const char*e=getenv("ORK_I4_BCH_W"); if(e){int v=atoi(e); if(v>=64)Wb=v&~63;} } if(Wb>N)Wb=N;
-    int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, NT=NC*NG, Wmax=Wb/64;   /* N-chunks x M-groups chained batch-tasks */
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt);
-        if(!keepwarm){ act(fd,RKNPU_ACT_RESET,0); for(int q=0;q<ORK_MAXCORE;q++)c->mwarm[q]=0; } c->last_dt=DT_I4; }
-    if(mc_ensure(c,1)) return -1;
-    size_t need_rc=(size_t)NT*REGCMD_I4_N*4;
-    size_t need_af=(size_t)NG*(size_t)(2*H)*(K/2);           /* A per M-group (shared across N-chunks) */
-    size_t need_o =(size_t)NT*(size_t)(4*H*Wmax)*64*2;       /* output surface per task */
-    size_t need_tk=(size_t)NT*sizeof(struct rknpu_task);
+/* Per-core worker: N-chunk range [c0,c1) on core `core`. Chains this range's H-row batch-tasks
+ * (M-group inner) in one core_mask=1<<core submit; packs its own A copy into maf[core]. */
+struct i4bchw { ork_npu *c; int core, nc, M, H, Wb, NG, Wmax, c0, c1; ork_w *w; const int8_t *A; int32_t *C; int rc; };
+static void *i4_bchain_worker(void *vp){
+    struct i4bchw *a=vp; ork_npu *c=a->c; int i=a->core, fd=c->fd; pin_big_core(i);
+    ork_w *w=a->w; int K=w->K, N=w->N, M=a->M, H=a->H, Wb=a->Wb, NG=a->NG, Wmax=a->Wmax, c0=a->c0, c1=a->c1;
+    a->rc=0; if(c1<=c0) return NULL;
+    int myNC=c1-c0, NT=myNC*NG;
+    size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
+    size_t need_o =(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
     if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
     if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,need_af,0x403,c->dom_active); }
     if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,need_tk,0x40b,c->dom_active); }
     if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
-    if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -2;
-    uint8_t *abase=c->maf[i].cpu; memset(abase,0,need_af);   /* pack A once per M-group (stride-2), shared over N-chunks */
+    if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu){ a->rc=-2; c->mc_error=1; return NULL; }
+    uint8_t *abase=c->maf[i].cpu; memset(abase,0,need_af);   /* A packed once per M-group (stride-2), reused over this core's chunks */
     for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-        for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), A+(size_t)(g*H+j)*K, 0, K); }
+        for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
     bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    int tk=0;                                               /* build NT chained tasks: N-chunk (outer) x M-group (inner) */
-    for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
-        uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);   /* this chunk's first 64-block weight */
+    int tk=0;
+    for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
+        uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
             uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-            synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);        /* single-bank H-row batch (Wc<=Wb columns) */
+            synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
             if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
                 rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
                 rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
@@ -6713,16 +6706,40 @@ static int run_i4_bchain(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
     sub.timeout=3000;
     int reps=c->mwarm[i]?1:2;
-    for(int r=0;r<reps;r++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)) return -1;
+    for(int r=0;r<reps;r++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ a->rc=-1; c->mc_error=1; break; }
         bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->mwarm[i]=1;
-    int16_t *o=c->mcc[i].cpu; tk=0;                          /* de-tile: o[(4j+4Hg*b)*64+cc] -> C[(g*H+j)][n0+b*64+cc] */
-    for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
+    int16_t *o=c->mcc[i].cpu; tk=0;
+    for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; int16_t *og=o+(size_t)tk*(4*H*Wmax)*64;
             for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;
-                int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64;
+                int32_t *crow=a->C+(size_t)(g*H+j)*N+n0+b*64;
                 for(int cc=0;cc<64;cc++) crow[cc]=og[base+cc]; }
             tk++; } }
+    a->rc = c->mc_error ? -1 : 0; return NULL;
+}
+/* MULTI-CORE batch×chain: tile N by weight-bank width (131072/K), split the N-chunks across the cores;
+ * each core chains its chunks' H-row batches in one core_mask=1<<i submit (weight resident per chunk),
+ * writing disjoint output columns. Composes STRATEGY-A H-row batching + STRATEGY-C weight-load-once
+ * chaining + 3-core N-parallelism. Bit-exact; single-bank chunks avoid the 0x1040 multi-block wall. */
+static int run_i4_bchain(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C){
+    if(w->Sk!=1 || w->Sn!=1 || (w->N%64)) return -4;
+    int K=w->K, N=w->N;
+    int H=16384/K; if(H>16)H=16; { const char*e=getenv("ORK_I4_BCH_H"); if(e){int v=atoi(e); if(v>=1)H=v;} } if(H<2) return -4;
+    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; { const char*e=getenv("ORK_I4_BCH_W"); if(e){int v=atoi(e); if(v>=64)Wb=v&~63;} } if(Wb>N)Wb=N;
+    int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
+    int nc=budget(c,M); if(nc>NC)nc=NC; if(nc<1)nc=1; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt);
+        if(!keepwarm){ act(c->fd,RKNPU_ACT_RESET,0); for(int q=0;q<ORK_MAXCORE;q++)c->mwarm[q]=0; } c->last_dt=DT_I4; }
+    if(mc_ensure(c,nc)) return -1;
+    c->mc_error=0;
+    struct i4bchw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
+    for(int i=0;i<nc;i++){ int a0=(int)((long)i*NC/nc), a1=(int)((long)(i+1)*NC/nc);
+        args[i]=(struct i4bchw){c,i,nc,M,H,Wb,NG,Wmax,a0,a1,w,A,C,0}; }
+    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_bchain_worker,&args[i]);
+    i4_bchain_worker(&args[0]);
+    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
     return 0;
 }
 
