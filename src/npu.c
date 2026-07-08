@@ -51,6 +51,8 @@ enum { DT_F16=0, DT_I8=1, DT_I4=2 };
  * (ORK_I8_LIVE). Off by default (validate on silicon before promoting). */
 #define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)
 static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
+/* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
+static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -131,7 +133,13 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* int16 variant: with the gain-1 index params (0x4068 low16=0x1000) idx = in + 512 (integer, no LUT
      * interpolation -> bit-exact), usable for |in| < 512. silu_idx16[in+512] = measured LUT index (-1 if none). */
     int silu_idx16_ok; short silu_idx16[4096]; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; };  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. own_bufs/n_own_bufs: the SIZE-BOUNDED variant (chunked consolidated import) — a weight's tiles are packed into a handful of moderate (ORK_IMPORT_CHUNK_MB, ~16MB) imported dma-buf chunks instead of one giant per-weight buffer (which hangs the DMA_HEAP_ALLOC) or one bimport per tile (which faults the chain-walk with too many foreign mappings); tiles are base+offset views into their chunk; ork_mm_free bdestroys every chunk. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
+/* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
+ * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
+ * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
+ * words (slot = core*Sn+ns); pcrc_meta holds 6 words/slot {valid,K,Nc,aA,aB,aC} — the reuse is address-
+ * validated (a buffer realloc / dtype thrash changes an addr => miss => re-synth), so it is safe even
+ * without ORK_MIXED_NOTHRASH. Allocated lazily on first decode; freed in ork_w_free. rkllm's static-regcmd lever. */  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. own_bufs/n_own_bufs: the SIZE-BOUNDED variant (chunked consolidated import) — a weight's tiles are packed into a handful of moderate (ORK_IMPORT_CHUNK_MB, ~16MB) imported dma-buf chunks instead of one giant per-weight buffer (which hangs the DMA_HEAP_ALLOC) or one bimport per tile (which faults the chain-walk with too many foreign mappings); tiles are base+offset views into their chunk; ork_mm_free bdestroys every chunk. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
 static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
@@ -2304,7 +2312,7 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
     if (w->K != K || w->N != N) return -2;
     return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
 }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w->pcrc); free(w->pcrc_meta); free(w); }   /* device buffers freed at ctx teardown */
 /* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
  * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
  * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; weights whose tiles
@@ -2588,10 +2596,20 @@ static void *mcworker(void *vp){
             } else {
                 int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
                 double _tp0=ork_now_us();   /* Tier 2a teardown: copy=regcmd-prep, submit=ioctl+result-sync, acc=writeout */
-                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF,0);
-                setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
-                if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) {
-                    a->rc = -1; c->mc_error = 1;
+                uint32_t rc[REGCMD_N];
+                /* PRECOMPILED REGCMD (ORK_PRECOMP_RC): the M=1 decode regcmd is fixed across tokens; synth once
+                 * per (core,ns), reuse the bytes (skip ~20 setr scans + validate). Address-validated => safe. */
+                uint32_t aA=(uint32_t)AF->dma, aB=(uint32_t)wbase, aC=(uint32_t)CC->dma;
+                int slot = i*w->Sn + ns;   /* pcrc allocated single-threaded in run_multicore; each core owns disjoint slots */
+                uint32_t *mt = (w->pcrc && slot<w->pcrc_slots) ? w->pcrc_meta+(size_t)slot*6 : NULL;
+                if(mt && mt[0]==1 && mt[1]==(uint32_t)K && mt[2]==(uint32_t)Ncore && mt[3]==aA && mt[4]==aB && mt[5]==aC){
+                    memcpy(rc, w->pcrc+(size_t)slot*REGCMD_N, sizeof rc);   /* cache hit: reuse precompiled regcmd */
+                } else {
+                    synth_i8(rc,1,K,Ncore,aA,aB,aC,1,CBUF,0);
+                    setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
+                    if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) {
+                        a->rc = -1; c->mc_error = 1;
+                    } else if(mt){ memcpy(w->pcrc+(size_t)slot*REGCMD_N, rc, sizeof rc); mt[1]=K;mt[2]=Ncore;mt[3]=aA;mt[4]=aB;mt[5]=aC; mt[0]=1; }
                 }
                 if (!c->mc_error) {
                     memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -3131,6 +3149,13 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc<1) nc=1;
     if(dt!=c->last_dt){ int keepwarm=ork_nothrash()&&ORK_INT_DT(dt)&&ORK_INT_DT(c->last_dt); if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt) && !keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=dt; }
     if(mc_ensure(c,nc)) return -1;
+
+    /* PRECOMPILED REGCMD cache: allocate SINGLE-THREADED here (mcworker runs on nc threads concurrently, so a
+     * lazy alloc inside it races and use-after-frees). One slot per (core,ns); mcworker only READS/patches its
+     * own disjoint slots. */
+    if(ork_precomp() && w->Bf && !w->pcrc){ w->pcrc_slots=ORK_MAXCORE*w->Sn;
+        w->pcrc=calloc((size_t)w->pcrc_slots*REGCMD_N,4); w->pcrc_meta=calloc((size_t)w->pcrc_slots*6,4);
+        if(!w->pcrc||!w->pcrc_meta){ free(w->pcrc); free(w->pcrc_meta); w->pcrc=NULL; w->pcrc_meta=NULL; w->pcrc_slots=0; } }
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
     int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
