@@ -58,7 +58,7 @@ static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  * physical row 2m for logical m), instead of the per-row PC-chain that re-streams the weight per row
  * (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default OFF until board-validated; 0=off,
  * 1=on. See src/npu.c synth_i4 mc>1 block + i4_mcworker, and the NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy. */
-static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=(e&&atoi(e))?1:0;} return v; }
+static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }  /* default ON (bit-exact validated ./i4; per-row fallback where batch doesn't fit) */
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -3390,11 +3390,26 @@ static void *i4_mcworker(void *vp){
         if(acc) memset(acc, 0, (size_t)M*Ncore*4);
         for(int ks=0;ks<w->Sk;ks++){
             int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int chunk_M = 16;
+            /* Native multi-M batch (ORK_I4_MSCHED): H = min(16384/Kp, HCAP) rows/submit — the int4 CBUF
+             * activation-cube budget (Exp-2026-07-07, 0x107c=K/16 sets it). HW reads A at stride-2 (real row
+             * j -> A-slot 2j, so mc=2H) and writes output row j of 64-block b at physrow (4j + 4H*b). Engaged
+             * only when H>=2 (else the per-row PC-chain, since a 1-row batch = per-row). HCAP bounds buffers. */
+            int Hcap = 16384 / Kp; if (Hcap > 16) Hcap = 16; if (Hcap < 1) Hcap = 1;
+            /* Batch mode also needs this core's N-slice WEIGHT resident: Ncore*Kp int4 must fit the weight
+             * CBUF budget (~131072 int4, Exp-2026-07-07: K=2048 1 block ok / 2 blocks drops blk1). Beyond
+             * that the far N-blocks silently don't compute, so fall back to the per-row path (still correct).
+             * A future N-subslice loop would keep batch mode for wide N at large K (roadmap). */
+            int Hcap_ok = Hcap >= 2;
+            int wfit = ((size_t)Ncore * Kp) <= 131072;
+            int msched_k = ork_i4_msched() && Hcap_ok && wfit && M >= 2;
+            int chunk_M = msched_k ? Hcap : 16;
             for (int m0 = 0; m0 < M; m0 += chunk_M) {
                 int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
                 if (!c->mc_error) {
-                    if (cur_chunk > 1) {
+                    if (msched_k) {
+                        for (int j = 0; j < cur_chunk; j++)   /* real row j at A-slot 2j (stride-2 input) */
+                            tile_i4_Aslice((uint8_t*)AF->cpu + (size_t)(2 * j) * (Kp / 2), a->A + (size_t)(m0 + j) * K, k0, Kp);
+                    } else if (cur_chunk > 1) {
                         for (int m = 0; m < cur_chunk; m++) {
                             tile_i4_Aslice((uint8_t*)AF->cpu + (size_t)m * (Kp / 2), a->A + (size_t)(m0 + m) * K, k0, Kp);
                         }
@@ -3410,11 +3425,11 @@ static void *i4_mcworker(void *vp){
                  * the weight every row. mc=cur_chunk -> synth_i4 sets mc_phys=2*cur_chunk + 0x405c=0, and
                  * the output DMA writes logical row m to PHYSICAL row 2m (int16 result in an int32-stepped
                  * buffer). A is cur_chunk consecutive single-row tiles (already laid out above). */
-                int use_msched = ork_i4_msched() && cur_chunk > 1;
+                int use_msched = msched_k;
                 int ntask = use_msched ? 1 : cur_chunk;
                 if (use_msched) {
                     uint32_t rc[REGCMD_I4_N];
-                    synth_i4(rc, cur_chunk, Kp, Ncore, (uint32_t)AF->dma, (uint32_t)wbase, (uint32_t)O->dma);
+                    synth_i4(rc, 2 * cur_chunk, Kp, Ncore, (uint32_t)AF->dma, (uint32_t)wbase, (uint32_t)O->dma);  /* mc=2H (stride-2 input) */
                     if (validate_regcmd("i4_mcworker_msched", c, rc, REGCMD_I4_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     }
@@ -3487,13 +3502,22 @@ static void *i4_mcworker(void *vp){
                 c->mwarm[i]=1;
                 if (active && acc) {
                     int16_t*o=O->cpu;
-                    if(cur_chunk>1) {
-                        /* multi-M: logical row m is at PHYSICAL row 2m (stride-2); per-row PC-chain: contiguous */
-                        int rowstep = use_msched ? 2 : 1;
+                    if(use_msched) {
+                        /* native batch de-tile: output row j of 64-block b is at physrow (4j + 4H*b),
+                         * i.e. o[(4j + 4H*b)*64 + c] = C[row j][b*64 + c]. H = cur_chunk. */
+                        int H = cur_chunk, NBc = Ncore / 64;
+                        for(int j=0;j<H;j++){
+                            for(int b=0;b<NBc;b++){
+                                size_t base = (size_t)(4*j + 4*H*b) * 64;
+                                int32_t*ap = &acc[(size_t)(m0+j)*Ncore + b*64];
+                                for(int c=0;c<64;c++) ap[c] += o[base + c];
+                            }
+                        }
+                    } else if(cur_chunk>1) {
+                        /* per-row PC-chain: rows written contiguously */
                         for(int m=0;m<cur_chunk;m++){
                             for(int col=0;col<Ncore;col++){
-                                size_t o_idx = (size_t)(rowstep * m) * Ncore + col;
-                                acc[(m0 + m)*Ncore + col] += o[o_idx];
+                                acc[(m0 + m)*Ncore + col] += o[(size_t)m * Ncore + col];
                             }
                         }
                     } else {
@@ -3551,6 +3575,7 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
+    if(ork_i4_msched()){ size_t mo=(size_t)c->soc->nmax*64*2; if(osz<mo)osz=mo; }  /* batch de-tile: physrow up to 4*HCAP(=16)*NB = 64*Ncore int16 */
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
     size_t asz=(size_t)M*ORK_I4_KS/2;
     if(asz < (size_t)4*32768*2) asz=(size_t)4*32768*2;
