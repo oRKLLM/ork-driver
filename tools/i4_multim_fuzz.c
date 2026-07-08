@@ -118,6 +118,7 @@ int main(int argc,char**argv){
     setbuf(stdout, NULL);   /* unbuffered: output survives a timeout -s INT kill mid-sweep (piped stdout is block-buffered) */
     int K=argc>1?atoi(argv[1]):512, M=argc>2?atoi(argv[2]):8; const char*mode=argc>3?argv[3]:"sched";
     int N=NN, mc_phys=2*M;
+    { const char*e=getenv("ORK_FUZZ_N"); if(e){int v=atoi(e); if(v>=64 && v%64==0) N=v;} }  /* bank-count probe: N=64*banks */
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
 
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*ref=malloc((size_t)M*N*4);
