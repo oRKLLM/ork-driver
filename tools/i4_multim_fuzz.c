@@ -144,8 +144,11 @@ int main(int argc,char**argv){
         /* the int8-stream schedule value for this K (synth_i8 mg formula): base = 177 - 15*(K/512 - 1) */
         int i8base = 177 - 15*((K/512) - 1); if(i8base<0x1b) i8base=0x1b;
         uint32_t cand[]={0x1b,0x40,0x60,(uint32_t)i8base-4,(uint32_t)i8base,(uint32_t)i8base+4,0x90,0xa0,0xb1,0xc0,0xd0,0xff,0x100,0x120};
-        printf("[stream] int8 mg value for K=%d ~= 0x%x; testing candidates:\n",K,i8base);
+        printf("[stream] int8 mg value for K=%d ~= 0x%x; testing candidates x A-layout {per-row,interleaved}:\n",K,i8base);
         int best=0;
+      for(int alay=1; alay>=0; alay--){    /* test BOTH int4 A layouts (per-row=1, interleaved cube=0) */
+        char av[2]={(char)('0'+alay),0}; setenv("ORK_I4_ALAY",av,1);
+        printf("  --- ORK_I4_ALAY=%d ---\n",alay);
         for(unsigned ci=0; ci<sizeof cand/sizeof*cand; ci++){ uint32_t sch=cand[ci];
             ork_i4_fuzz_clear();
             ork_i4_fuzz_add(0x201,0x1020,0x10000u|M); ork_i4_fuzz_add(0x201,0x1084,0x10000u|M); ork_i4_fuzz_add(0x201,0x102c,(uint32_t)M);
@@ -158,6 +161,7 @@ int main(int argc,char**argv){
             printf("  0x1040=0x%03x -> %d contiguous rows (rc=%d)%s\n",sch,hit,rc, hit>cap?"  <<< STREAMING!":"");
             if(hit>best) best=hit;
         }
+      }   /* end A-layout loop */
         printf("[stream] best %d contiguous rows (cap %d) — %s\n", best, cap, best>cap?"STREAMING FOUND":"no streaming (capped)");
         ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
     }
