@@ -89,17 +89,19 @@ int main(void){
     fail|=gtest(c,8,1024,256,64);     /* regression: grouped prefill M=8 multi-core */
     printf("%s\n", fail?"SOME TESTS FAILED":"ALL W4A4 API TESTS PASSED");
 
-    if(getenv("ORK_I4_BENCH")){   /* decode-shape throughput: M=1, time R runs */
-        int K=2048,N=2048,R=100;
+    if(getenv("ORK_I4_BENCH")){   /* throughput: time R runs at (M,K,N). ORK_BENCH_M>1 = prefill (msched). */
+        int K=2048,N=2048,R=100,M=1;
         if(getenv("ORK_BENCH_K")) K=atoi(getenv("ORK_BENCH_K"));
         if(getenv("ORK_BENCH_N")) N=atoi(getenv("ORK_BENCH_N"));
-        signed char*A=malloc(K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)N*4);
-        for(int i=0;i<K;i++) A[i]=(i%15)-7;
+        if(getenv("ORK_BENCH_M")) M=atoi(getenv("ORK_BENCH_M"));
+        signed char*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int)(i%15)-7;
         for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int)(i%15)-7;
         ork_w*w=ork_mm_pack_i4(c,K,N,B);
-        if(w){ ork_mm_run_i4(c,w,1,A,C); ork_mm_run_i4(c,w,1,A,C);   /* warm */
-            double t0=ms(); for(int r=0;r<R;r++) ork_mm_run_i4(c,w,1,A,C); double dt=(ms()-t0)/R;
-            printf("decode bench M=1 K=%d N=%d: %.3f ms/matmul (%.0f matmul/s)  cores=auto\n",K,N,dt,1000.0/dt);
+        if(w){ ork_mm_run_i4(c,w,M,A,C); ork_mm_run_i4(c,w,M,A,C);   /* warm */
+            double t0=ms(); for(int r=0;r<R;r++) ork_mm_run_i4(c,w,M,A,C); double dt=(ms()-t0)/R;
+            printf("bench M=%d K=%d N=%d: %.3f ms/matmul (%.1f Mrow/s, %.0f matmul/s)  msched=%s\n",
+                   M,K,N,dt, (M*1e-3)/dt, 1000.0/dt, getenv("ORK_I4_MSCHED")?getenv("ORK_I4_MSCHED"):"default");
             ork_w_free(w); }
         free(A);free(B);free(C);
     }
