@@ -838,6 +838,12 @@ static void set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,u
  * The precision regs (0x100c=0x360, 0x1080, 0x3010=0x601, 0x4010) stay as captured; K, N (≤nmax),
  * and the A/B/C addresses are parameterized. The captured program is M=1 (each task of the closed
  * runtime's M-tiling), so callers M-tile by looping rows. See ROADMAP. */
+/* RE fuzzer hook (tools/i4_multim_fuzz.c): up to 16 (block,reg,val) overrides applied at the very END of
+ * synth_i4 (win over the K/N/mc-derived regs). Inert by default (n_on=0) — production is unaffected. Only
+ * the fuzzer flips these on, so it can sweep the int4 regcmd space to crack the multi-M K-schedule wall. */
+static struct { uint32_t blk, reg, val; } g_i4_fovr[16]; static int g_i4_fovr_n=0;
+void ork_i4_fuzz_clear(void){ g_i4_fovr_n=0; }
+void ork_i4_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i4_fovr_n<16){ g_i4_fovr[g_i4_fovr_n].blk=blk; g_i4_fovr[g_i4_fovr_n].reg=reg; g_i4_fovr[g_i4_fovr_n].val=val; g_i4_fovr_n++; } }
 static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     setr(rc,REGCMD_I4_N,0x201,0x1024,((K-1)<<16)|K);       /* K range (element count) */
@@ -890,6 +896,7 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
         { const char*e=getenv("ORK_I4_1010"); if(e) setr(rc,REGCMD_I4_N,0x201,0x1010,(uint32_t)strtoul(e,0,0)); }
     }
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
+    for(int i=0;i<g_i4_fovr_n;i++) setr(rc,REGCMD_I4_N,g_i4_fovr[i].blk,g_i4_fovr[i].reg,g_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
 /* Read-only sanity check: the benchmark methodology requires the DDR (dmc) governor at 'performance'

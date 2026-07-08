@@ -577,6 +577,10 @@ int          ork_npu_probe_i4(ork_npu *ctx, int M, int K, int N, int nibB, int n
  * See tools/i4_multim_probe.c. */
 int          ork_npu_probe_i4_mm(ork_npu *ctx, int M, int K, int N,
                                  const signed char *A, const signed char *B, short *raw);
+/* RE fuzzer hooks (tools/i4_multim_fuzz.c): queue arbitrary (block,reg,val) overrides applied at the end of
+ * every synth_i4 (int4 regcmd). Inert until added; clear before each probe. Sweep the multi-M K-schedule space. */
+void         ork_i4_fuzz_clear(void);
+void         ork_i4_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
 
 /* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
 int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,
