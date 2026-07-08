@@ -6485,10 +6485,11 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
     if(!c||!w||w->dtype!=DT_I4||M<1||!A||!C) return -1;
     int fd=c->fd, K=w->K, N=w->N;
     uint32_t wdma=(uint32_t)w->Bb[0].dma;
-    static struct buf sA={0}, sC={0}, sRC={0}, sTK={0}; static int cap_M=0,cap_K=0,cap_N=0;
+    static struct buf sA={0}, sC={0}, sRC={0}, sTK={0}; static int cap_M=0,cap_K=0,cap_N=0, warm=0;
     if(M>cap_M||K>cap_K||N>cap_N){
+        warm=0;   /* fresh output buffer -> first submit reads stale; needs a warmup rep (AGENTS cold-start) */
         if(sA.cpu)bdestroy(fd,&sA); if(sC.cpu)bdestroy(fd,&sC); if(sRC.cpu)bdestroy(fd,&sRC); if(sTK.cpu)bdestroy(fd,&sTK);
-        size_t need_rc=((size_t)REGCMD_I4_N+(size_t)(M>1?M-1:0)*32)*4;
+        size_t need_rc=((size_t)2*REGCMD_I4_N+(size_t)M*32)*4;   /* 2 full priming tasks + M compact slots (generous) */
         sA =bcreate(fd,(size_t)M*(K/2),0x403,c->dom_active);
         sC =bcreate(fd,(size_t)M*N*2, 0x403,c->dom_active);
         sRC=bcreate(fd,need_rc,        0x403,c->dom_active);
@@ -6499,26 +6500,34 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
     /* pack each int8 A row -> K/2 int4 nibbles (the layout synth_i4/run_i4 expect), contiguous by row */
     for(int j=0;j<M;j++) tile_i4_Aslice((uint8_t*)sA.cpu+(size_t)j*(K/2), A+(size_t)j*K, 0, K);
     bsync(fd,&sA,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* task[0]: full synth_i4 regcmd (configures the pipeline + loads the weight) */
-    uint32_t rc0[REGCMD_I4_N];
-    synth_i4(rc0,1,K,N,(uint32_t)sA.dma,wdma,(uint32_t)sC.dma);
-    uint32_t inc1=(uint32_t)(sRC.dma+REGCMD_I4_N*4);
-    /* chain amount = 0x0007 (the vendor uses 0x0007 for EVERY chain transition into a compact task —
-     * full->compact AND compact->compact; the 0x0037 used by run_chain_i4 is for full->full and would
-     * make the walker over-read our 32-word compact buffer => errno 110). */
-    if(M>1){ rc0[216]=0x0010|((inc1&0xffff)<<16); rc0[217]=(0x0101<<16)|((inc1>>16)&0xffff);
-             rc0[218]=0x0014|(0x0007<<16); rc0[219]=(0x0101<<16)|0; }
-    else   { rc0[216]=0; rc0[217]=0; rc0[218]=0x00000014; rc0[219]=0x01010000; }
-    memcpy(sRC.cpu,rc0,REGCMD_I4_N*4);
-    uint32_t v1040=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x1040);
-    uint32_t v100c=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x100c);
-    /* task[1..M-1]: 12-config incremental (advance only A@0x1070, C@0x4020) + PC-chain + core-ctrl */
-    for(int j=1;j<M;j++){
-        uint32_t*ic=(uint32_t*)((char*)sRC.cpu+REGCMD_I4_N*4+(size_t)(j-1)*32*4);
-        uint32_t aA=(uint32_t)sA.dma+(uint32_t)j*(K/2);
-        uint32_t aC=(uint32_t)sC.dma+(uint32_t)j*N*2;
+    /* Mirror the vendor EXACTLY: NFULL full priming tasks (rows 0..NFULL-1) then compact tasks (rows
+     * NFULL..M-1). The vendor always emits 2 full tasks before compacts; chaining a full task straight
+     * into a compact one (NFULL=1) returned errno 110. Chain-amount (0x0014) encodes the TARGET size:
+     * 0x0037 into a full task, 0x0007 into a compact task. */
+    int NFULL = M>=2 ? 2 : 1;
+    size_t comp_base = (size_t)NFULL*REGCMD_I4_N*4;   /* byte offset of the first compact regcmd */
+    uint32_t rc0[REGCMD_I4_N], v1040=0, v100c=0;
+    for(int j=0;j<NFULL;j++){
+        synth_i4(rc0,1,K,N,(uint32_t)sA.dma+(uint32_t)j*(K/2),wdma,(uint32_t)sC.dma+(uint32_t)j*N*2);
+        if(j==0){ v1040=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x1040); v100c=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x100c); }
+        if(j==M-1){ rc0[216]=0; rc0[217]=0; rc0[218]=0x00000014; rc0[219]=0x01010000; }   /* last task: terminate */
+        else {
+            int nxt_full = (j+1 < NFULL);
+            uint32_t nxt = nxt_full ? (uint32_t)(sRC.dma+(uint64_t)(j+1)*REGCMD_I4_N*4)
+                                    : (uint32_t)(sRC.dma+comp_base);
+            uint32_t amt = nxt_full ? 0x0037 : 0x0007;
+            rc0[216]=0x0010|((nxt&0xffff)<<16); rc0[217]=(0x0101<<16)|((nxt>>16)&0xffff);
+            rc0[218]=0x0014|(amt<<16); rc0[219]=(0x0101<<16)|0;
+        }
+        memcpy((char*)sRC.cpu+(size_t)j*REGCMD_I4_N*4, rc0, REGCMD_I4_N*4);
+    }
+    /* compact tasks (rows NFULL..M-1): 12-config incremental, advance only A@0x1070 & C@0x4020 */
+    for(int j=NFULL;j<M;j++){
+        int ci=j-NFULL;
+        uint32_t*ic=(uint32_t*)((char*)sRC.cpu+comp_base+(size_t)ci*32*4);
+        uint32_t aA=(uint32_t)sA.dma+(uint32_t)j*(K/2), aC=(uint32_t)sC.dma+(uint32_t)j*N*2;
         int last=(j==M-1);
-        uint32_t nx=(uint32_t)(sRC.dma+REGCMD_I4_N*4+(size_t)j*32*4);
+        uint32_t nx=(uint32_t)(sRC.dma+comp_base+(size_t)(ci+1)*32*4);
         #define SP(i,off,blk,val) do{ic[2*(i)]=(off)|(((uint32_t)(val)&0xffff)<<16); ic[2*(i)+1]=((uint32_t)(blk)<<16)|(((uint32_t)(val)>>16)&0xffff);}while(0)
         SP(0,0x1040,0x0201,v1040); SP(1,0x1104,0x0201,0); SP(2,0x1100,0x0201,0); SP(3,0x100c,0x0201,v100c);
         SP(4,0x4004,0x1001,0x0e);  SP(5,0x1070,0x0201,aA); SP(6,0x1084,0x0201,0x00010001); SP(7,0x1088,0x0201,(uint32_t)K);
@@ -6530,15 +6539,17 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
     bsync(fd,&sRC,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=(struct rknpu_task*)sTK.cpu; memset(t,0,(size_t)M*sizeof*t);
     for(int j=0;j<M;j++){ t[j].enable_mask=0xd;t[j].int_mask=0x300;t[j].int_clear=0x1ffff;
-        t[j].regcfg_amount=(j==0)?116:12;
-        t[j].regcmd_addr=(j==0)?sRC.dma:(sRC.dma+REGCMD_I4_N*4+(uint64_t)(j-1)*32*4); }
+        if(j<NFULL){ t[j].regcfg_amount=116; t[j].regcmd_addr=sRC.dma+(uint64_t)j*REGCMD_I4_N*4; }
+        else { t[j].regcfg_amount=12; t[j].regcmd_addr=sRC.dma+comp_base+(uint64_t)(j-NFULL)*32*4; } }
     bsync(fd,&sTK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);
     sub.flags=0x5;sub.task_number=(uint32_t)M;sub.task_obj_addr=sTK.obj;sub.fence_fd=-1;sub.core_mask=1u;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)M};
     sub.timeout=2000;
-    if(rknpu_submit_ioctl(fd,&sub,w->domain)) return -3;
-    bsync(fd,&sC,RKNPU_MEM_SYNC_FROM_DEVICE);
+    int reps = warm?1:2;   /* cold buffer: run twice, discard the stale first result */
+    for(int r=0;r<reps;r++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)) return -3;
+        bsync(fd,&sC,RKNPU_MEM_SYNC_FROM_DEVICE); }
+    warm=1;
     int16_t*o=(int16_t*)sC.cpu;
     for(int j=0;j<M;j++) for(int n=0;n<N;n++) C[(size_t)j*N+n]=o[(size_t)j*N+n];
     return 0;
