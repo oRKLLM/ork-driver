@@ -167,6 +167,37 @@ int main(int argc,char**argv){
         printf("[stream] best %d contiguous rows (cap %d) — %s\n", best, cap, best>cap?"STREAMING FOUND":"no streaming (capped)");
         ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
     }
+    /* stream2: BROADENED int4-streaming sweep. `stream` used int4's precision config (0x1044=ceil(K/128),
+     * 0x107c=K/16) + int8's contiguous row-encoding + a 0x1040 sweep -> <=1 row. Per NVDLA (unified datapath,
+     * precision-SCALED parallelism), int4 streaming may need a different residency/pass sizing than int4-batch.
+     * This sweeps the two registers `stream` held FIXED: 0x107c (entries-per-slice = activation-residency/Hcap
+     * source) and 0x1044 (K-passes/parallelism), x a couple 0x1040, with int8's streaming row-encoding.
+     * >cap contiguous rows = we escaped residency = STREAMING FOUND. */
+    if(!strcmp(mode,"stream2")){
+        int cap = 16384 / K; if(cap<1)cap=1;
+        int best=0; uint32_t bcfg[4]={0,0,0,0};
+        uint32_t es[]={ (uint32_t)(K/32), (uint32_t)(K/16), (uint32_t)(K/8), (uint32_t)(K/4) };                 /* 0x107c */
+        uint32_t kp[]={ (uint32_t)((K+255)/256),(uint32_t)((K+127)/128),(uint32_t)((K+63)/64),(uint32_t)((K+31)/32) }; /* 0x1044 */
+        int i8base=177-15*((K/512)-1); if(i8base<0x1b)i8base=0x1b;
+        uint32_t sc[]={ 0xb1u, (uint32_t)i8base };                                                             /* 0x1040 */
+        printf("[stream2] K=%d M=%d N=%d cap=%d: sweep 0x107c x 0x1044 x 0x1040 (int8 stream row-encoding), both A-layouts:\n",K,M,N,cap);
+        for(int alay=1;alay>=0;alay--){ char av[2]={(char)('0'+alay),0}; setenv("ORK_I4_ALAY",av,1);
+          for(unsigned a=0;a<4;a++)for(unsigned b2=0;b2<4;b2++)for(unsigned cc=0;cc<2;cc++){
+            ork_i4_fuzz_clear();
+            ork_i4_fuzz_add(0x201,0x1020,0x10000u|M); ork_i4_fuzz_add(0x201,0x1084,0x10000u|M); ork_i4_fuzz_add(0x201,0x102c,(uint32_t)M);
+            ork_i4_fuzz_add(0x1001,0x4034,(uint32_t)(M-1)); ork_i4_fuzz_add(0x801,0x3014,(uint32_t)(M-1)<<16);
+            ork_i4_fuzz_add(0x1001,0x405c,(uint32_t)(M-1)<<16); ork_i4_fuzz_add(0x1001,0x4038,(uint32_t)((((N/4)-1)<<16)|((N/4)-1)));
+            ork_i4_fuzz_add(0x201,0x107c,es[a]); ork_i4_fuzz_add(0x201,0x1044,kp[b2]); ork_i4_fuzz_add(0x201,0x1040,sc[cc]);
+            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int hit=0; if(rc==0) for(int m=0;m<M;m++){int ok=1; for(int n=0;n<N&&ok;n++) if(raw[(size_t)m*N+n]!=ref[(size_t)m*N+n])ok=0; if(ok)hit++;}
+            if(hit>cap) printf("  0x107c=%u 0x1044=%u 0x1040=0x%x alay=%d -> %d rows (rc=%d)  <<< STREAMING!\n",es[a],kp[b2],sc[cc],alay,hit,rc);
+            if(hit>best){best=hit;bcfg[0]=es[a];bcfg[1]=kp[b2];bcfg[2]=sc[cc];bcfg[3]=(uint32_t)alay;}
+          }
+        }
+        printf("[stream2] best %d contiguous rows (cap %d) at 0x107c=%u 0x1044=%u 0x1040=0x%x alay=%u — %s\n",
+               best,cap,bcfg[0],bcfg[1],bcfg[2],bcfg[3], best>cap?"STREAMING FOUND":"no streaming (capped)");
+        ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
     /* i8batch: the controlled A/B. Run int8 STREAM (baseline, contiguous) then apply the int4 BATCH trigger
      * (0x405c=0 + mc_phys=2M encoding) to int8 and map where each row's output lands — does int8 flip from
      * contiguous stream to a batch layout? If so, 0x405c (± the mc encoding) IS the stream/batch selector. */
