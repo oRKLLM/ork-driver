@@ -249,6 +249,11 @@ ork_w       *ork_mm_load_i4a8(ork_npu *ctx, int K, int N, const void *blob, size
  * blob, same tiled bytes, same re-dump). Returns NULL if import is unavailable (caller falls back to
  * ork_mm_load_i4a8) or on a malformed blob / shape mismatch. */
 ork_w       *ork_mm_load_i4a8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+/* Reload a pre-tiled NATIVE-W4A4 weight (ork_w_dump of a DT_I4 ork_mm_pack_i4 weight) straight into NPU DMA —
+ * NO dequant/FWHT-rotate/int4-quant/tile (the cold-pack fix for the mul_mat_i4/_hadamard/group_i4 path). blob =
+ * this weight's Bb dump (Kp*Nc/2 int4 bytes/tile, pgup'd, pack order). The per-channel bscale is persisted by
+ * the caller and re-attached separately. Returns a DT_I4 weight (run with ork_mm_run_i4) or NULL on mismatch. */
+ork_w       *ork_mm_load_i4(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
 /* CPU-side pack/dump helpers linked by the ggml-ork backend (defined at the end of npu.c; no internal
  * callers). ork_w_dump_i8_cpu_st: single-threaded int8 CPU tile — for callers that parallelize at a

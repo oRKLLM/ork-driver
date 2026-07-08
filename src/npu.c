@@ -2411,6 +2411,30 @@ ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
     }
     return w;
 }
+/* Reload pre-tiled NATIVE-W4A4 weight bytes (from ork_w_dump of a DT_I4 weight / a .orkpack native-W4A4
+ * tier) straight into NPU DMA — NO dequant / FWHT-rotate / int4-quant / tile. The cold-pack fix for the
+ * native W4A4 path (mul_mat_i4 / _hadamard / group_i4): the rotated+int4-tiled bytes are persisted once at
+ * convert and reloaded as a plain DMA copy. `blob`/`n` = this exact (K,N) DT_I4 weight's Bb dump, pack
+ * order (Kp*Nc/2 int4 bytes/tile, pgup'd). The per-channel bscale is persisted SEPARATELY by the caller and
+ * re-attached (ork_w_bscale). Returns NULL on shape/size mismatch (caller falls back to packing). K%32, N%64. */
+ork_w *ork_mm_load_i4(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K%32||N%64) return NULL;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1; w->domain=ork_dom(c->pack_domain);
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return w;
+}
 /* grouped pack: K split into groups of G (each its own resident slice) for per-group scales. G%32,
  * K%G, G<=10752. Sk = K/G groups; run_i4_grouped scales each group's partial before accumulating. */
 ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
