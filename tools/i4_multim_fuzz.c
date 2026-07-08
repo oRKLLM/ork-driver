@@ -113,6 +113,7 @@ static void write_state(int done,int inflight){ FILE*f=fopen("i4_fuzz_state.txt"
 static void write_done(void){ FILE*f=fopen("i4_fuzz_state.txt","w"); if(f){fprintf(f,"DONE\n"); fclose(f);} }
 
 int main(int argc,char**argv){
+    setbuf(stdout, NULL);   /* unbuffered: output survives a timeout -s INT kill mid-sweep (piped stdout is block-buffered) */
     int K=argc>1?atoi(argv[1]):512, M=argc>2?atoi(argv[2]):8; const char*mode=argc>3?argv[3]:"sched";
     int N=NN, mc_phys=2*M;
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
@@ -132,6 +133,62 @@ int main(int argc,char**argv){
     ork_i4_fuzz_clear();
     int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
     if(!strcmp(mode,"base")){ printf("K=%d M=%d N=%d -> rows %d\n",K,M,N,base); ork_npu_free(ctx); return 0; }
+    /* stream: attempt int4 STREAMING by applying int8-stream's config to int4 (from the synth_i8 vs synth_i4
+     * diff): contiguous output-stride (0x405c=(M-1)<<16), M-count=M (not 2M), 0x4038 out-width, and sweep the
+     * K-reduction schedule 0x1040. Score CONTIGUOUS rows (raw[m*N+n]); >16384/K (the batch CBUF cap, =8 @K2048)
+     * means we escaped residency = STREAMING. The batch mismatch (schedule w/ batch output) is why 0x1040
+     * poisoned before; here we pair it with the streaming output. */
+    if(!strcmp(mode,"stream")){
+        int cap = 16384 / K; if(cap<1)cap=1;
+        printf("[stream] K=%d M=%d N=%d: batch stride-2 baseline=%d rows, CBUF cap=%d; sweeping 0x1040 for CONTIGUOUS rows>%d (=streaming)\n",K,M,N,base,cap,cap);
+        /* the int8-stream schedule value for this K (synth_i8 mg formula): base = 177 - 15*(K/512 - 1) */
+        int i8base = 177 - 15*((K/512) - 1); if(i8base<0x1b) i8base=0x1b;
+        uint32_t cand[]={0x1b,0x40,0x60,(uint32_t)i8base-4,(uint32_t)i8base,(uint32_t)i8base+4,0x90,0xa0,0xb1,0xc0,0xd0,0xff,0x100,0x120};
+        printf("[stream] int8 mg value for K=%d ~= 0x%x; testing candidates:\n",K,i8base);
+        int best=0;
+        for(unsigned ci=0; ci<sizeof cand/sizeof*cand; ci++){ uint32_t sch=cand[ci];
+            ork_i4_fuzz_clear();
+            ork_i4_fuzz_add(0x201,0x1020,0x10000u|M); ork_i4_fuzz_add(0x201,0x1084,0x10000u|M); ork_i4_fuzz_add(0x201,0x102c,(uint32_t)M);
+            ork_i4_fuzz_add(0x1001,0x4034,(uint32_t)(M-1)); ork_i4_fuzz_add(0x801,0x3014,(uint32_t)(M-1)<<16);
+            ork_i4_fuzz_add(0x1001,0x405c,(uint32_t)(M-1)<<16);                          /* contiguous M-stride (stream) */
+            ork_i4_fuzz_add(0x1001,0x4038,(uint32_t)((((N/4)-1)<<16)|((N/4)-1)));
+            ork_i4_fuzz_add(0x201,0x1040,sch);                                           /* K-reduction schedule */
+            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int hit=0; if(rc==0) for(int m=0;m<M;m++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw[(size_t)m*N+n]!=ref[(size_t)m*N+n]) ok=0; if(ok) hit++; }
+            printf("  0x1040=0x%03x -> %d contiguous rows (rc=%d)%s\n",sch,hit,rc, hit>cap?"  <<< STREAMING!":"");
+            if(hit>best) best=hit;
+        }
+        printf("[stream] best %d contiguous rows (cap %d) — %s\n", best, cap, best>cap?"STREAMING FOUND":"no streaming (capped)");
+        ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
+    /* i8batch: the controlled A/B. Run int8 STREAM (baseline, contiguous) then apply the int4 BATCH trigger
+     * (0x405c=0 + mc_phys=2M encoding) to int8 and map where each row's output lands — does int8 flip from
+     * contiguous stream to a batch layout? If so, 0x405c (± the mc encoding) IS the stream/batch selector. */
+    if(!strcmp(mode,"i8batch")){
+        int8_t*A8=malloc((size_t)M*K),*B8=malloc((size_t)K*N); int32_t*ref8=malloc((size_t)M*N*4);
+        int32_t*raw8=malloc((size_t)2*M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++)A8[i]=r4();
+        for(size_t i=0;i<(size_t)K*N;i++)B8[i]=r4();
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A8[(size_t)m*K+k]*B8[(size_t)k*N+n];ref8[(size_t)m*N+n]=s;}
+        printf("[i8batch] K=%d M=%d N=%d\n",K,M,N);
+        /* helper: for each row, find its physical location (row-major offset/N) in raw8, contiguous match */
+        #define ROWMAP(tag) do{ printf("  %s row->physrow:",tag); for(int m=0;m<M;m++){ long at=-1; \
+            for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw8[off+n]!=ref8[(size_t)m*N+n]) ok=0; if(ok){at=(long)off;break;} } \
+            printf(" %d:%s%ld", m, at<0?"X":"", at<0?0:at/N); } printf("\n"); }while(0)
+        ork_i8_fuzz_clear();
+        int rc1=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        printf("  STREAM (baseline, rc=%d):\n",rc1); if(rc1==0) ROWMAP("stream");
+        ork_i8_fuzz_clear();
+        ork_i8_fuzz_add(0x1001,0x405c,0);                                         /* the batch trigger */
+        ork_i8_fuzz_add(0x201,0x1020,0x10000u|(2*M)); ork_i8_fuzz_add(0x201,0x1084,0x10000u|(2*M)); ork_i8_fuzz_add(0x201,0x102c,(uint32_t)(2*M));
+        ork_i8_fuzz_add(0x1001,0x4034,(uint32_t)(2*M-1)); ork_i8_fuzz_add(0x801,0x3014,(uint32_t)(2*M-1)<<16);
+        setenv("ORK_I8_PROBE_SCHED","0",1);                                       /* no 0x1040 streaming schedule (batch) */
+        int rc2=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        printf("  BATCH (0x405c=0 + mc_phys=2M + NO sched, rc=%d):\n",rc2); if(rc2==0) ROWMAP("batch");
+        unsetenv("ORK_I8_PROBE_SCHED");
+        printf("[i8batch] done — physrow=m means contiguous(stream); physrow=2m means stride-2(batch); X=not found\n");
+        free(A8);free(B8);free(ref8);free(raw8); ork_i8_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
     /* wtest <blk> <reg>: hunt a WEIGHT-bank register that lifts the 131072 weight budget. At K (large) + N=128
      * (2 blocks), the batch computes blk0 but drops blk1 (weight Ncore*K > 131072). If a reg value makes blk1
      * appear, it enlarged the weight budget → wide-N would batch in ONE submit (no N-subslice). */

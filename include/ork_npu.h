@@ -581,6 +581,12 @@ int          ork_npu_probe_i4_mm(ork_npu *ctx, int M, int K, int N,
  * every synth_i4 (int4 regcmd). Inert until added; clear before each probe. Sweep the multi-M K-schedule space. */
 void         ork_i4_fuzz_clear(void);
 void         ork_i4_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
+/* int8 analogs (batch-mode RE): overrides applied at the end of synth_i8; raw int32 multi-M output probe
+ * (2*M*N int32, room for a stride-2 batch layout). See tools/i4_multim_fuzz.c int8 modes. */
+void         ork_i8_fuzz_clear(void);
+void         ork_i8_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
+int          ork_npu_probe_i8_mm(ork_npu *ctx, int M, int K, int N,
+                                 const signed char *A, const signed char *B, int *raw);
 
 /* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
 int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,
