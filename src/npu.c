@@ -2546,6 +2546,7 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
 static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* defined below */
 static int run_i4_incr_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* STRATEGY C multi-core, defined below */
 static int run_i4_bchain(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: chain H-row batches, one weight load */
+static int run_i4_cbatch(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: compact-task batch (CBATCH) */
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
@@ -2560,6 +2561,8 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * H-row batch) with STRATEGY C (task chaining, weight loaded once). Single-core; falls back (-4). */
     static int bchain=-1; if(bchain<0){const char*e=getenv("ORK_I4_BCHAIN"); bchain=(e&&atoi(e))?1:0;}
     if(bchain && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_bchain(c,w,M,A,C); if(r!=-4) return r; }
+    static int cbatch=-1; if(cbatch<0){const char*e=getenv("ORK_I4_CBATCH"); cbatch=(e&&atoi(e))?1:0;}
+    if(cbatch && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_cbatch(c,w,M,A,C); if(r!=-4) return r; }
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -6740,6 +6743,106 @@ static int run_i4_bchain(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *
     i4_bchain_worker(&args[0]);
     for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
     for(int i=0;i<nc;i++) if(args[i].rc) return -1;
+    return 0;
+}
+
+/* EXPERIMENTAL (ORK_I4_CBATCH): the "batching-chains" dual of BCHAIN. Per bank-width N-chunk, one FULL
+ * synth_i4 H-row batch primes weight+config; each subsequent M-group is a LEAN COMPACT batch task that
+ * REPLAYS the priming full's batch/config register VALUES (captured via regcmd_getv — no mc_phys guessing)
+ * and only advances A/C, NOT re-issuing the weight-DMA config -> weight resident. ~19 regcfg vs full 116.
+ * Single-core. -4 fallback.
+ *
+ * *** RK3588: NOT VIABLE — kept gated (default off) for other NPUs. *** A multi-row (mc_phys>1) compact
+ * returns errno-110 (chain-walk timeout) for EVERY register config swept (ORK_I4_CB_REGS bitmask over the
+ * batch regs + ORK_I4_CB_AMT chain-amount), while the same base format at mc=1 (the proven STRATEGY-C 1-row
+ * compact) works. RK3588's compact incremental task is single-row-only — a batch needs the full task's
+ * weight-DMA context (the vendor confirms: int4 batch = task_number=96 of 1-row compacts). So on RK3588
+ * BCHAIN's full-task-per-batch is REQUIRED; CBATCH is retained only in case another NPU (e.g. RK3576)
+ * accepts a multi-row compact. See wiki Exp-2026-07-08-INT4-BChain-Batch-Chain. */
+static int run_i4_cbatch(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C){
+    if(w->Sk!=1 || w->Sn!=1 || (w->N%64)) return -4;
+    int fd=c->fd, K=w->K, N=w->N, i=0;
+    int H=16384/K; if(H>16)H=16; { const char*e=getenv("ORK_I4_BCH_H"); if(e){int v=atoi(e); if(v>=1)H=v;} } if(H<2) return -4;
+    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; { const char*e=getenv("ORK_I4_BCH_W"); if(e){int v=atoi(e); if(v>=64)Wb=v&~63;} } if(Wb>N)Wb=N;
+    int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, NT=NC*NG, Wmax=Wb/64;
+    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt);
+        if(!keepwarm){ act(fd,RKNPU_ACT_RESET,0); for(int q=0;q<ORK_MAXCORE;q++)c->mwarm[q]=0; } c->last_dt=DT_I4; }
+    if(mc_ensure(c,1)) return -1;
+    size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
+    size_t need_o=(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
+    if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
+    if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,need_af,0x403,c->dom_active); }
+    if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,need_tk,0x40b,c->dom_active); }
+    if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+    if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -2;
+    uint8_t *abase=c->maf[i].cpu; memset(abase,0,need_af);
+    for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
+        for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), A+(size_t)(g*H+j)*K, 0, K); }
+    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
+    uint32_t cv[16]={0}; static const struct{unsigned blk,reg;} CAP[16]={  /* batch/config regs replayed in compacts */
+        {0x201,0x1040},{0x201,0x1104},{0x201,0x1100},{0x201,0x100c},{0x201,0x107c},{0x201,0x1020},{0x201,0x1084},
+        {0x201,0x102c},{0x201,0x1010},{0x201,0x1088},{0x1001,0x4004},{0x1001,0x4034},{0x1001,0x4038},
+        {0x1001,0x4058},{0x1001,0x405c},{0x801,0x3014} };
+    int tk=0, nfull=(NG>=2)?2:1;                   /* 2 priming full batches/chunk before compacts (errno-110 fix) */
+    for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
+        uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
+        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
+            uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
+            uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
+            uint32_t *slot=(uint32_t*)((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4);
+            int last=(tk==NT-1); uint32_t nx=last?0:(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
+            int next_full=(!last)&&(g+1<nfull || g==NG-1); uint32_t amt=next_full?0x0037:0x0007;
+            if(g<nfull){                              /* priming FULL batch (g==0 captures reg values) */
+                uint32_t rc[REGCMD_I4_N]; synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+                for(int q=0;q<16;q++) cv[q]=regcmd_getv(rc,REGCMD_I4_N,CAP[q].blk,CAP[q].reg);
+                if(last){ rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
+                else { rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+                    rc[218]=0x0014|(amt<<16); rc[219]=(0x0101<<16)|0; }
+                memcpy(slot, rc, REGCMD_I4_N*4); t[tk].regcfg_amount=116;
+            } else {                                  /* COMPACT batch: base-12 (STRATEGY-C order) + configurable extras */
+                uint32_t *ic=slot;
+                static int extra=-1, camt=-1;
+                if(extra<0){ const char*e=getenv("ORK_I4_CB_REGS"); extra=e?(int)strtoul(e,0,0):0x7f; }
+                if(camt<0){ const char*e=getenv("ORK_I4_CB_AMT"); camt=e?(int)strtoul(e,0,0):0x0007; }
+                uint32_t cam=next_full?0x0037:(uint32_t)camt;
+                #define SPC(ii,off,blk_,val) do{ic[2*(ii)]=(off)|(((uint32_t)(val)&0xffff)<<16); ic[2*(ii)+1]=((uint32_t)(blk_)<<16)|(((uint32_t)(val)>>16)&0xffff);}while(0)
+                int p=0;   /* base 12 (proven STRATEGY-C set/order), 0x1084=captured batch mc, 0x4058=Wc-1 */
+                SPC(p++,0x1040,0x0201,cv[0]); SPC(p++,0x1104,0x0201,0); SPC(p++,0x1100,0x0201,0); SPC(p++,0x100c,0x0201,cv[3]);
+                SPC(p++,0x4004,0x1001,0x0e); SPC(p++,0x1070,0x0201,aA); SPC(p++,0x1084,0x0201,cv[6]); SPC(p++,0x1088,0x0201,(uint32_t)K);
+                SPC(p++,0x1110,0x0201,wdma); SPC(p++,0x4020,0x1001,aC); SPC(p++,0x4058,0x1001,(uint32_t)(Wc-1)); SPC(p++,0x405c,0x1001,0);
+                if(extra&0x01) SPC(p++,0x107c,0x0201,cv[4]);   /* activation-cube size */
+                if(extra&0x02) SPC(p++,0x1020,0x0201,cv[5]);   /* M-count */
+                if(extra&0x04) SPC(p++,0x102c,0x0201,cv[7]);
+                if(extra&0x08) SPC(p++,0x1010,0x0201,cv[8]);   /* CNA hint */
+                if(extra&0x10) SPC(p++,0x4034,0x1001,cv[11]);  /* PPU rows */
+                if(extra&0x20) SPC(p++,0x4038,0x1001,cv[12]);  /* out width/4 */
+                if(extra&0x40) SPC(p++,0x3014,0x0801,cv[15]);  /* DPU rows */
+                int rega=p;
+                if(last){ SPC(p,0x0010,0x0101,0); SPC(p+1,0x0014,0x0101,0); } else { SPC(p,0x0010,0x0101,nx); SPC(p+1,0x0014,0x0101,cam); }
+                SPC(p+2,0x0000,0x0041,0); SPC(p+3,0x0008,0x0081,0x000d);
+                #undef SPC
+                t[tk].regcfg_amount=rega;
+            }
+            t[tk].enable_mask=0xd; t[tk].int_mask=0x300; t[tk].int_clear=0x1ffff; t[tk].regcmd_addr=c->mrc[i].dma+(uint64_t)tk*REGCMD_I4_N*4;
+            tk++; } }
+    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=0x5; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
+    sub.timeout=3000;
+    int reps=c->mwarm[i]?1:2;
+    for(int r=0;r<reps;r++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)) return -1;
+        bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+    c->mwarm[i]=1;
+    int16_t *o=c->mcc[i].cpu; tk=0;
+    for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
+        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; int16_t *og=o+(size_t)tk*(4*H*Wmax)*64;
+            for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;
+                int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64;
+                for(int cc=0;cc<64;cc++) crow[cc]=og[base+cc]; }
+            tk++; } }
     return 0;
 }
 
