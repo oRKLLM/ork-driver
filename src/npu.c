@@ -53,6 +53,12 @@ enum { DT_F16=0, DT_I8=1, DT_I4=2 };
 static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
 static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
+/* ORK_I4_MSCHED: resurrect the native int4 multi-M scheduler (Exp-2026-06-19) — one submit computes
+ * a whole M-tile with resident weights (batch mode: mc_phys=2*H, 0x405c=0, stride-2 output → read
+ * physical row 2m for logical m), instead of the per-row PC-chain that re-streams the weight per row
+ * (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default OFF until board-validated; 0=off,
+ * 1=on. See src/npu.c synth_i4 mc>1 block + i4_mcworker, and the NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy. */
+static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=(e&&atoi(e))?1:0;} return v; }
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -845,22 +851,43 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
      * (0x80/0x7fe — left at REGCMD_I4). */
     setr(rc,REGCMD_I4_N,0x1001,0x403c,((N-1)<<16)|(N-1));
     setr(rc,REGCMD_I4_N,0x1001,0x4058,N-1);
-    /* Multi-M scheduler (mc>1) — PROVEN INERT for int4 (kept runnable for re-test on future
-     * kernels/SoCs; see tools/i4_multim_probe.c + ROADMAP Tier 4b). Applying int8's full multi-M
-     * register set (M-count = mc, output M-stride = mc-1, CNA row-count 0x1010, schedule 0x1040,
-     * 0x4038 = (N/4-1)) to the int4 program does NOT make it compute rows >0: with per-row A, row 0 is
-     * bit-exact and rows 1..M-1 are computed NOWHERE in the output. The int4 datapath is structurally
-     * single-row on this NPU (the closed runtime tiled int4 M across 12 tasks, and task_number>1
-     * kernel-hangs this board). So int4 is 1-submit/row; this block stays for the record but is unused
-     * by production (all callers pass mc=1). */
+    /* Multi-M scheduler (mc>1) — native batch mode (NVDLA D_BATCH_NUMBER analog): one submit computes H
+     * rows with the weight streamed ONCE, output at stride-2 (logical row m -> physical row 2m; int16 result
+     * in an int32-stepped DMA). Reached only via ORK_I4_MSCHED (gated OFF; production callers pass mc=1 ->
+     * the proven per-row PC-chain in i4_mcworker). Exp-2026-07-07 (tools/i4_multim_probe.c) established:
+     *   - 0x1040 (K-reduction schedule) is DECISIVE, not the earlier-claimed inert set: the int8 FORMULA
+     *     for it corrupts int4 (188@K64/72@K2048); leaving it at the captured base 177 works but only for
+     *     the capture's K. -> ORK_I4_1040/ORK_I4_1010 overrides + ORK_I4_MREGS bitmask expose it for RE.
+     *   - With mregs=0x1f (all int8-ported regs EXCEPT 0x1040) the batch mode is BIT-EXACT at K=64 (the
+     *     capture K): all H rows land at stride-2, single 64-wide N-block. Verified M=2,4 @ K=64.
+     *   - REMAINING WALL: row count is capture-K-tuned (K=32->1 row, K=64->4, K=128->2, K=256->1, K>=512->1)
+     *     and multi-N-block output is a 2D surface (offsets (b*H+m)*2N at N=128), so at production K (2048)
+     *     only row 0 computes. Cracking it needs a systematic 0x1040 x K x mc x CNA/CBUF sweep (the batch
+     *     activation-cube budget reg) — see the wiki Exp-2026-07-07 log. Until then W4A4 stays 1-submit/row. */
     if(mc>1){
         int mc_phys = 2 * mc;
-        setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x102c,mc_phys);
-        setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);setr(rc,REGCMD_I4_N,0x1001,0x405c,0);setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);
-        setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-        setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc_phys+1));
-        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=mc_phys/64; if(mg<1)mg=1;
-        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v);
+        /* ORK_I4_MREGS bitmask — which regs unlock native multi-M. Default 0x1f = the full int8-ported set
+         * MINUS 0x1040. Fuzzing (Exp-2026-07-07, tools/i4_multim_probe.c) proved 0x1040 (the int8 K-reduction
+         * schedule) is the POISON PILL: every config that sets it corrupts row 0 and rows>0; every config
+         * without it computes bit-exact stride-2 (logical row m -> physical row 2m). int4's K-reduction uses
+         * the captured base 0x1040 (K-independent, unlike int8) — which the M=1 path already never overrides.
+         *   0x01 M-count 0x1020/0x1084/0x102c   0x02 0x4034(PPU rows)   0x04 0x3014(DPU)
+         *   0x08 0x4038(out width/4)            0x10 0x1010(CNA hint)   0x20 0x1040(K-schedule=POISON) */
+        static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x1f;}
+        setr(rc,REGCMD_I4_N,0x1001,0x405c,0);                                   /* the trigger (always) */
+        if(mregs&0x01){ setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x102c,mc_phys); }
+        if(mregs&0x02) setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);
+        if(mregs&0x04) setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);
+        if(mregs&0x08) setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
+        if(mregs&0x10) setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc_phys+1));
+        if(mregs&0x20){ double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=mc_phys/64; if(mg<1)mg=1;
+            int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v); }
+        /* ORK_I4_1040: direct override of the K-reduction schedule reg (RE: find the int4 multi-row value —
+         * the int8 formula corrupts, omitting it leaves only row0 for K>64). Applied last, wins over mregs&0x20. */
+        { const char*e=getenv("ORK_I4_1040"); if(e) setr(rc,REGCMD_I4_N,0x201,0x1040,(uint32_t)strtoul(e,0,0)); }
+        /* ORK_I4_1010: override CNA row/activation-cube reg (RE: multi-M computes rows_computed*K=256 elems —
+         * a fixed activation-cube budget; find the reg that enlarges it so K=2048 gets >1 row). */
+        { const char*e=getenv("ORK_I4_1010"); if(e) setr(rc,REGCMD_I4_N,0x201,0x1010,(uint32_t)strtoul(e,0,0)); }
     }
     setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
 }
@@ -3366,6 +3393,28 @@ static void *i4_mcworker(void *vp){
                 }
                 uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)(active?b0:0)*Kp*32;  /* Kp*32 B per N-block */
                 struct rknpu_task *tk_arr = c->mtk[i].cpu;
+                /* Native multi-M (Exp-2026-06-19, NVDLA batch mode): ONE submit computes cur_chunk rows
+                 * with the weight streamed ONCE (resident), vs the per-row PC-chain below that re-fetches
+                 * the weight every row. mc=cur_chunk -> synth_i4 sets mc_phys=2*cur_chunk + 0x405c=0, and
+                 * the output DMA writes logical row m to PHYSICAL row 2m (int16 result in an int32-stepped
+                 * buffer). A is cur_chunk consecutive single-row tiles (already laid out above). */
+                int use_msched = ork_i4_msched() && cur_chunk > 1;
+                int ntask = use_msched ? 1 : cur_chunk;
+                if (use_msched) {
+                    uint32_t rc[REGCMD_I4_N];
+                    synth_i4(rc, cur_chunk, Kp, Ncore, (uint32_t)AF->dma, (uint32_t)wbase, (uint32_t)O->dma);
+                    if (validate_regcmd("i4_mcworker_msched", c, rc, REGCMD_I4_N, w, NULL, 0)) {
+                        a->rc = -1; c->mc_error = 1;
+                    }
+                    rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;  /* single task, no chain */
+                    memcpy(RC->cpu, rc, sizeof(rc));
+                    memset(tk_arr, 0, sizeof(struct rknpu_task));
+                    tk_arr[0].enable_mask = 0xd;
+                    tk_arr[0].int_mask = 0x300;
+                    tk_arr[0].int_clear = 0x1ffff;
+                    tk_arr[0].regcfg_amount = 116;
+                    tk_arr[0].regcmd_addr = c->mrc[i].dma;
+                } else {
                 memset(tk_arr, 0, cur_chunk * sizeof(struct rknpu_task));
                 for(int m=0; m<cur_chunk; m++) {
                     uint32_t rc[REGCMD_I4_N];
@@ -3391,6 +3440,7 @@ static void *i4_mcworker(void *vp){
                     tk_arr[m].regcfg_amount = 116;
                     tk_arr[m].regcmd_addr = c->mrc[i].dma + m * REGCMD_I4_N * 4;
                 }
+                }
                 if (!c->mc_error) {
                     bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
                     bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -3404,11 +3454,11 @@ static void *i4_mcworker(void *vp){
                 struct rknpu_submit sub;
                 memset(&sub, 0, sizeof sub);
                 sub.flags = 0x5;
-                sub.task_number = cur_chunk;
+                sub.task_number = ntask;
                 sub.task_obj_addr = c->mtk[i].obj;
                 sub.fence_fd = -1;
                 sub.core_mask = 1u << i;
-                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, cur_chunk};
+                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, ntask};
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
                     sub.timeout = 60000;
@@ -3426,9 +3476,11 @@ static void *i4_mcworker(void *vp){
                 if (active && acc) {
                     int16_t*o=O->cpu;
                     if(cur_chunk>1) {
+                        /* multi-M: logical row m is at PHYSICAL row 2m (stride-2); per-row PC-chain: contiguous */
+                        int rowstep = use_msched ? 2 : 1;
                         for(int m=0;m<cur_chunk;m++){
                             for(int col=0;col<Ncore;col++){
-                                size_t o_idx = (size_t)m * Ncore + col;
+                                size_t o_idx = (size_t)(rowstep * m) * Ncore + col;
                                 acc[(m0 + m)*Ncore + col] += o[o_idx];
                             }
                         }
@@ -5534,7 +5586,7 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     struct buf W=bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;
     tile_i4_B(W.cpu,B,K,N,0);
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf O=bcreate(fd,(size_t)2*M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* 2x: stride-2 multi-M writes physical rows 0..2(M-1) */
     /* A layout selector via ORK_I4_ALAY: 0=(K/32,M,32) interleaved, 1=per-row contiguous (K/32,1,32)
      * x M (what the captured M=1 program reads). Lets the probe tell whether the program is single-row. */
     { int alay=getenv("ORK_I4_ALAY")?atoi(getenv("ORK_I4_ALAY")):0;
@@ -5551,7 +5603,7 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
-    if(ok==0) memcpy(raw,O.cpu,(size_t)M*N*2);
+    if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*2);   /* caller supplies a 2*M*N int16 buffer (stride-2) */
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
