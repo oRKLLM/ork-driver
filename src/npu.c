@@ -5768,6 +5768,11 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* Fill c->task with the INT4 regcfg count (116 = REGCMD_I4_N/2). init/reset stamp the shared c->task
+     * with the int8 count (108); a 108-reg task over a 116-reg int4 regcmd -> kernel EINVAL. Normal int4
+     * runs fill their own MC task bufs; the probe uses the legacy c->task, so it must set the int4 count. */
+    { struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=REGCMD_I4_N/2; t.regcmd_addr=c->regcmd.dma;
+      memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     /* ORK_I4_PROBE_TO_MS: submit timeout (default 60s). The fuzzer sets this low (e.g. 1500) so a wedging
      * candidate has the KERNEL time out the job fast and return an error in-process — the fuzzer blacklists
