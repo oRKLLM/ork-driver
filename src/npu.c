@@ -562,6 +562,10 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
 static void setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
+/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of synth(). Inert by default. */
+static struct { uint32_t blk, reg, val; } g_f16_fovr[16]; static int g_f16_fovr_n=0;
+void ork_f16_fuzz_clear(void){ g_f16_fovr_n=0; }
+void ork_f16_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_f16_fovr_n<16){ g_f16_fovr[g_f16_fovr_n].blk=blk; g_f16_fovr[g_f16_fovr_n].reg=reg; g_f16_fovr[g_f16_fovr_n].val=val; g_f16_fovr_n++; } }
 /* sched=1: single-submit internal M-scheduler (clean power-of-2 Kp); sched=0: one M-tile. */
 static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     memcpy(rc,REGCMD,REGCMD_N*4);
@@ -577,6 +581,7 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_N,0x201,0x1040,v);
     } else { setr(rc,REGCMD_N,0x201,0x1010,16*(mc+1)); }
     setr(rc,REGCMD_N,0x201,0x1070,aA);setr(rc,REGCMD_N,0x201,0x1110,aB);setr(rc,REGCMD_N,0x1001,0x4020,aC);
+    for(int i=0;i<g_f16_fovr_n;i++) setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides */
 }
 /* RE fuzzer hook for int8 (tools; batch-mode RE): (block,reg,val) overrides applied at the END of synth_i8.
  * Inert by default (n=0) — production unaffected. Mirrors the int4 g_i4_fovr hooks. */
@@ -4495,6 +4500,35 @@ int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,i8sched,CBUF,0);   /* ork_i8_fuzz overrides apply inside */
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_i8_mm", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*4);
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via synth(). Weight tile [NT][KT][16][32]
+ * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
+ * bit patterns (uint16). ork_f16_fuzz overrides apply inside synth(). 0/ok -1 wedged -2 dims. */
+int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,float *raw){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%16||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;   /* fp16 weight: 2 B/elem */
+    int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;      /* fp16 weight tile [Ntile=16][Ktile=32][16][32] */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)2*M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}   /* fp32 out, 2x */
+    uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_N];
+    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);   /* ork_f16_fuzz overrides apply inside */
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_f16_mm", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};

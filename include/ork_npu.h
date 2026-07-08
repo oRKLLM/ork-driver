@@ -587,6 +587,11 @@ void         ork_i8_fuzz_clear(void);
 void         ork_i8_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
 int          ork_npu_probe_i8_mm(ork_npu *ctx, int M, int K, int N,
                                  const signed char *A, const signed char *B, int *raw);
+/* fp16 analogs (batch-mode mapping): A/B are fp16 bit patterns (uint16), output raw fp32 (2*M*N floats). */
+void         ork_f16_fuzz_clear(void);
+void         ork_f16_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
+int          ork_npu_probe_f16_mm(ork_npu *ctx, int M, int K, int N,
+                                 const unsigned short *A, const unsigned short *B, float *raw);
 
 /* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
 int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,

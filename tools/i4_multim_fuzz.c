@@ -36,6 +36,7 @@
 #include "ork_npu.h"
 #include "regcmd_i4.h"      /* REGCMD_I4[] / REGCMD_I4_N — read-only, to enumerate present regs in "regs" mode */
 #include "regcmd_i8.h"      /* REGCMD_I8[] / REGCMD_I8_N — enumerate present int8 regs for the i8fuzz mode */
+#include "regcmd_array_4x32x16.h" /* REGCMD[] / REGCMD_N — fp16 template, for the f16fuzz mode */
 
 #define NN 64              /* single 64-wide N-block: the known-good granularity (skips the 2D N-surface) */
 /* [-2,2] keeps the int16 datapath output exact even at K=4096 (max |sum| = 4*K < 32767), so rows-matched
@@ -235,6 +236,63 @@ int main(int argc,char**argv){
             if((i%64)==0){ printf("  [..%d/%d]\n",i,nc8); }
         }
         write_done(); printf("[i8fuzz] complete\n");
+        free(A8);free(B8);free(ref8);free(raw8); ork_i8_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
+    /* f16fuzz: same as i8fuzz but for fp16 — hunt a fp16 batch toggle among present fp16 regs. Fills the last
+     * mode-matrix cell (fp16 batch). fp16 A/B via __fp16 (small ints, exact); output fp32 (tolerant match). */
+    if(!strcmp(mode,"f16fuzz")){
+        if(!getenv("ORK_I4_PROBE_TO_MS")) setenv("ORK_I4_PROBE_TO_MS","1500",1);
+        __fp16*A16=malloc((size_t)M*K*2),*B16=malloc((size_t)K*N*2);
+        float*reff=malloc((size_t)M*N*4),*rawf=malloc((size_t)2*M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++)A16[i]=(__fp16)(int)r4();
+        for(size_t i=0;i<(size_t)K*N;i++)B16[i]=(__fp16)(int)r4();
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float s=0; for(int k=0;k<K;k++) s+=(float)A16[(size_t)m*K+k]*(float)B16[(size_t)k*N+n]; reff[(size_t)m*N+n]=s; }
+        #define LAYSIGF(pmoved,pcont) do{ *(pmoved)=0; *(pcont)=0; for(int m=0;m<M;m++){ long at=-1; \
+            for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++){ float d=rawf[off+n]-reff[(size_t)m*N+n]; if(d<-0.5f||d>0.5f) ok=0; } if(ok){at=(long)off;break;} } \
+            if(at>=0){ if(at/N==m) (*(pcont))++; else (*(pmoved))++; } } }while(0)
+        #define ESSF(b,o) ((b==0x201&&(o==0x1024||o==0x1030||o==0x1034||o==0x1044||o==0x1070||o==0x1088||o==0x1110||o==0x1038||o==0x1020||o==0x1084||o==0x102c))||(b==0x1001&&(o==0x4020||o==0x403c||o==0x4058||o==0x4010))||(b==0x801&&(o==0x3018||o==0x3010)))
+        uint32_t vf[]={0,1,2,4,8,16,32,(uint32_t)N,(uint32_t)(2*N),(uint32_t)((N-1)<<16),0x20000001,0x20000002,0x20000004,0x2000,0x1000,0x100};
+        static struct cand csf[8192]; int ncf=0;
+        for(int k=0;k+1<REGCMD_N && ncf<8192;k+=2){ uint32_t o=REGCMD[k]&0xffff, b=REGCMD[k+1]>>16;
+            if(!b||ESSF(b,o)) continue;
+            for(unsigned v=0;v<sizeof vf/sizeof*vf && ncf<8192;v++) csf[ncf++]=(struct cand){b,o,vf[v],0,0,0}; }
+        int done,inflight; read_state(&done,&inflight);
+        if(done==-2){ printf("[f16fuzz] DONE (rm i4_fuzz_state.txt)\n"); return 0; }
+        if(inflight>=0 && inflight<ncf){ printf("[f16fuzz] cand %d (reg %x/%x) WEDGED -> blacklist\n",inflight,csf[inflight].blk,csf[inflight].reg); blacklist(csf[inflight].blk,csf[inflight].reg); if(done<=inflight)done=inflight+1; }
+        ork_f16_fuzz_clear(); ork_npu_probe_f16_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
+        int bmv,bct; LAYSIGF(&bmv,&bct);
+        printf("[f16fuzz] K=%d M=%d N=%d: baseline stream contig=%d moved=%d; %d cands from %d\n",K,M,N,bct,bmv,ncf,done);
+        for(int i=done;i<ncf;i++){
+            if(blacklisted(csf[i].blk,csf[i].reg)){ write_state(i+1,-1); continue; }
+            write_state(i,i);
+            ork_f16_fuzz_clear(); ork_f16_fuzz_add(csf[i].blk,csf[i].reg,csf[i].val);
+            int rc=ork_npu_probe_f16_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
+            write_state(i+1,-1);
+            if(rc==0){ int mv,ct; LAYSIGF(&mv,&ct); if(mv>0) printf("  LAYOUT reg %x/%x=0x%x -> contig=%d MOVED=%d  <<< batch-stride candidate\n",csf[i].blk,csf[i].reg,csf[i].val,ct,mv); }
+            if((i%64)==0) printf("  [..%d/%d]\n",i,ncf);
+        }
+        write_done(); printf("[f16fuzz] complete\n");
+        free(A16);free(B16);free(reff);free(rawf); ork_f16_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
+    /* i8map <reg>: characterize an int8 layout register — print the full row->physrow map for several values,
+     * to see if it's a COHERENT batch stride (physrow=f(m), e.g. 2m) or a scramble. (Found: 0x201/0x1068.) */
+    if(!strcmp(mode,"i8map") && argc>4){
+        uint32_t vr=(uint32_t)strtoul(argv[4],0,0);
+        int8_t*A8=malloc((size_t)M*K),*B8=malloc((size_t)K*N); int32_t*ref8=malloc((size_t)M*N*4);
+        int32_t*raw8=malloc((size_t)2*M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++)A8[i]=r4();
+        for(size_t i=0;i<(size_t)K*N;i++)B8[i]=r4();
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A8[(size_t)m*K+k]*B8[(size_t)k*N+n];ref8[(size_t)m*N+n]=s;}
+        uint32_t vals[]={0,1,2,3,4,8};
+        for(unsigned vi=0; vi<sizeof vals/sizeof*vals; vi++){
+            ork_i8_fuzz_clear(); if(vals[vi]) ork_i8_fuzz_add(0x201,vr,vals[vi]);
+            int rc=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+            printf("  0x%x=0x%x (rc=%d) row->physrow:",vr,vals[vi],rc);
+            if(rc==0) for(int m=0;m<M;m++){ long at=-1;
+                for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw8[off+n]!=ref8[(size_t)m*N+n]) ok=0; if(ok){at=(long)off;break;} }
+                printf(" %d:%s%ld",m,at<0?"X":"",at<0?0:at/N); }
+            printf("\n");
+        }
         free(A8);free(B8);free(ref8);free(raw8); ork_i8_fuzz_clear(); ork_npu_free(ctx); return 0;
     }
     /* wtest <blk> <reg>: hunt a WEIGHT-bank register that lifts the 131072 weight budget. At K (large) + N=128
