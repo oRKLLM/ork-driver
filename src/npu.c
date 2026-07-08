@@ -3473,7 +3473,20 @@ static void *i4_mcworker(void *vp){
                                 for (int b = 0; b < NBc; b++) {
                                     size_t base = (size_t)(4 * j + 4 * H * b) * 64;
                                     int32_t *ap = &acc[(size_t)(m0 + j) * Ncore + nc0 + b * 64];
-                                    for (int cc = 0; cc < 64; cc++) ap[cc] += o[base + cc];
+                                    const int16_t *op = &o[base];
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+                                    for (int cc = 0; cc < 64; cc += 16) {   /* widen-add 64 int16 -> int32 (4x int16x8) */
+                                        int32x4_t a0=vld1q_s32(&ap[cc]),    a1=vld1q_s32(&ap[cc+4]);
+                                        int32x4_t a2=vld1q_s32(&ap[cc+8]),  a3=vld1q_s32(&ap[cc+12]);
+                                        int16x8_t o0=vld1q_s16(&op[cc]),    o1=vld1q_s16(&op[cc+8]);
+                                        a0=vaddw_s16(a0,vget_low_s16(o0));  a1=vaddw_high_s16(a1,o0);
+                                        a2=vaddw_s16(a2,vget_low_s16(o1));  a3=vaddw_high_s16(a3,o1);
+                                        vst1q_s32(&ap[cc],a0);   vst1q_s32(&ap[cc+4],a1);
+                                        vst1q_s32(&ap[cc+8],a2); vst1q_s32(&ap[cc+12],a3);
+                                    }
+#else
+                                    for (int cc = 0; cc < 64; cc++) ap[cc] += op[cc];
+#endif
                                 }
                         }
                     }
