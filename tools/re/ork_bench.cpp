@@ -50,9 +50,11 @@ int main(int argc, char** argv){
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 
-    // WARMUP: one full prefill+decode of a tiny batch to trigger lazy weight-pack/import + NPU warm, so the
-    // timed passes measure steady state (the exact trap the AGENTS doc warns raw llama-cli falls into).
-    { llama_token w=toks[0]; llama_batch wb=llama_batch_get_one(&w,1); if(llama_decode(ctx,wb)!=0){ fprintf(stderr,"warmup decode FAILED\n"); return 3; } }
+    // WARMUP: a PREFILL-SHAPED batch (M>1, so supports_op routes it to the NPU — M=1 stays on CPU and would
+    // NOT warm the prefill path) to trigger lazy weight pack/import + wcache population + NPU warm, so the
+    // timed prefill measures STEADY STATE. A 1-token (M=1) warmup left the timed prefill cold — it paid the
+    // one-time weight-load from the .orkpack (~0.8s on Qwen3-1.7B int4), under-reporting warm prefill ~24%.
+    { int wn = nt < 32 ? nt : 32; llama_batch wb=llama_batch_get_one(toks.data(), wn); if(llama_decode(ctx,wb)!=0){ fprintf(stderr,"warmup decode FAILED\n"); return 3; } }
     llama_memory_clear(llama_get_memory(ctx), true);
 
     // PREFILL: decode the P-token prompt as one batch (ubatch UB), time it.
