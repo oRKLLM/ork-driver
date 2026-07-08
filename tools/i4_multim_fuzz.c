@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include "ork_npu.h"
 #include "regcmd_i4.h"      /* REGCMD_I4[] / REGCMD_I4_N — read-only, to enumerate present regs in "regs" mode */
+#include "regcmd_i8.h"      /* REGCMD_I8[] / REGCMD_I8_N — enumerate present int8 regs for the i8fuzz mode */
 
 #define NN 64              /* single 64-wide N-block: the known-good granularity (skips the 2D N-surface) */
 /* [-2,2] keeps the int16 datapath output exact even at K=4096 (max |sum| = 4*K < 32767), so rows-matched
@@ -191,6 +192,49 @@ int main(int argc,char**argv){
         printf("  BATCH (0x405c=0 + mc_phys=2M + NO sched, rc=%d):\n",rc2); if(rc2==0) ROWMAP("batch");
         unsetenv("ORK_I8_PROBE_SCHED");
         printf("[i8batch] done — physrow=m means contiguous(stream); physrow=2m means stride-2(batch); X=not found\n");
+        free(A8);free(B8);free(ref8);free(raw8); ork_i8_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
+    /* i8fuzz: hunt an int8 TRUE-BATCH toggle among the PRESENT int8 regs. Signal = the output LAYOUT changes
+     * from the stream baseline (row m at physrow m) to rows found at NON-contiguous physrows (a batch stride),
+     * WITHOUT going garbage. Fast-fail (ORK_I8_PROBE_TO_MS) + state-resume + blacklist. Present regs only —
+     * the 0x2001/0x50xx CDMA block (D_BATCH_NUMBER) is ABSENT from REGCMD_I8, so a mode toggle would be here. */
+    if(!strcmp(mode,"i8fuzz")){
+        if(!getenv("ORK_I4_PROBE_TO_MS")) setenv("ORK_I4_PROBE_TO_MS","1500",1);
+        int8_t*A8=malloc((size_t)M*K),*B8=malloc((size_t)K*N); int32_t*ref8=malloc((size_t)M*N*4);
+        int32_t*raw8=malloc((size_t)2*M*N*4);
+        for(size_t i=0;i<(size_t)M*K;i++)A8[i]=r4();
+        for(size_t i=0;i<(size_t)K*N;i++)B8[i]=r4();
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A8[(size_t)m*K+k]*B8[(size_t)k*N+n];ref8[(size_t)m*N+n]=s;}
+        /* layout signal: returns rows FOUND at a NON-contiguous physrow (moved) and rows contiguous */
+        #define LAYSIG(pmoved,pcont) do{ *(pmoved)=0; *(pcont)=0; for(int m=0;m<M;m++){ long at=-1; \
+            for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw8[off+n]!=ref8[(size_t)m*N+n]) ok=0; if(ok){at=(long)off;break;} } \
+            if(at>=0){ if(at/N==m) (*(pcont))++; else (*(pmoved))++; } } }while(0)
+        /* essential int8 regs (K/N/addr/M-count) — overriding just breaks the matmul */
+        #define ESS8(b,o) ((b==0x201&&(o==0x1024||o==0x1030||o==0x1034||o==0x1044||o==0x1070||o==0x1088||o==0x1110||o==0x1038||o==0x1020||o==0x1084||o==0x102c))||(b==0x1001&&(o==0x4020||o==0x403c||o==0x4058||o==0x4010))||(b==0x801&&(o==0x3018||o==0x3010)))
+        uint32_t v8[]={0,1,2,4,8,16,32,(uint32_t)N,(uint32_t)(2*N),(uint32_t)((N-1)<<16),0x20000001,0x20000002,0x20000004,0x2000,0x1000,0x100};
+        /* enumerate present int8 regs (non-essential) x palette */
+        static struct cand cs8[8192]; int nc8=0;
+        for(int k=0;k+1<REGCMD_I8_N && nc8<8192;k+=2){ uint32_t o=REGCMD_I8[k]&0xffff, b=REGCMD_I8[k+1]>>16;
+            if(!b||ESS8(b,o)) continue;
+            for(unsigned v=0;v<sizeof v8/sizeof*v8 && nc8<8192;v++) cs8[nc8++]=(struct cand){b,o,v8[v],0,0,0}; }
+        int done,inflight; read_state(&done,&inflight);
+        if(done==-2){ printf("[i8fuzz] DONE (rm i4_fuzz_state.txt)\n"); return 0; }
+        if(inflight>=0 && inflight<nc8){ printf("[i8fuzz] cand %d (reg %x/%x) WEDGED -> blacklist\n",inflight,cs8[inflight].blk,cs8[inflight].reg); blacklist(cs8[inflight].blk,cs8[inflight].reg); if(done<=inflight)done=inflight+1; }
+        /* baseline stream */
+        ork_i8_fuzz_clear(); ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        int bmoved,bcont; LAYSIG(&bmoved,&bcont);
+        printf("[i8fuzz] K=%d M=%d N=%d: baseline stream contig=%d moved=%d; %d candidates from %d — flag LAYOUT CHANGE (moved>0, not garbage)\n",K,M,N,bcont,bmoved,nc8,done);
+        for(int i=done;i<nc8;i++){
+            if(blacklisted(cs8[i].blk,cs8[i].reg)){ write_state(i+1,-1); continue; }
+            write_state(i,i);
+            ork_i8_fuzz_clear(); ork_i8_fuzz_add(cs8[i].blk,cs8[i].reg,cs8[i].val);
+            int rc=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+            write_state(i+1,-1);
+            if(rc==0){ int mv,ct; LAYSIG(&mv,&ct);
+                if(mv>0) printf("  LAYOUT reg %x/%x=0x%x -> contig=%d MOVED=%d  <<< batch-stride candidate\n",cs8[i].blk,cs8[i].reg,cs8[i].val,ct,mv); }
+            if((i%64)==0){ printf("  [..%d/%d]\n",i,nc8); }
+        }
+        write_done(); printf("[i8fuzz] complete\n");
         free(A8);free(B8);free(ref8);free(raw8); ork_i8_fuzz_clear(); ork_npu_free(ctx); return 0;
     }
     /* wtest <blk> <reg>: hunt a WEIGHT-bank register that lifts the 131072 weight budget. At K (large) + N=128
