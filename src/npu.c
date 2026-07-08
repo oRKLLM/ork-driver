@@ -42,6 +42,15 @@ enum { DT_F16=0, DT_I8=1, DT_I4=2 };
  * (QKV/gate-up) groups without a ~107ms NPU soft-reset at every matmul boundary. The cold 2-pass warmup
  * (fresh-output-buffer priming) is kept independently — see the reset sites. */
 #define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)
+/* Every int-datapath mode (int8 / int4 / chain=3). ORK_MIXED_NOTHRASH: when set, an int↔int dtype
+ * transition (e.g. the per-tensor mixed dispatch alternating W4A4 q4-tensors and W8A8 q6-tensors within a
+ * decode token) does NOT ACT_RESET + re-warm + realloc the per-core buffers. MEASURED: mixed W4A4 decode
+ * without this = 0.16 t/s (99% run_multicore SETUP = the per-switch reset/rewarm/realloc thrash); pure
+ * int4 (no switching) = 6.43 t/s. The reset is cold-entry wedge-protection (fp16→int, or first int); it is
+ * NOT needed BETWEEN already-warm int modes — exactly as int8↔chain already interleaves reset-free
+ * (ORK_I8_LIVE). Off by default (validate on silicon before promoting). */
+#define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)
+static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
@@ -3120,7 +3129,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
-    if(dt!=c->last_dt){ if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=dt; }
+    if(dt!=c->last_dt){ int keepwarm=ork_nothrash()&&ORK_INT_DT(dt)&&ORK_INT_DT(c->last_dt); if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt) && !keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=dt; }
     if(mc_ensure(c,nc)) return -1;
 
     /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
@@ -3426,7 +3435,7 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(nc>c->soc->cores)nc=c->soc->cores;
     if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
     if(nc<1)nc=1;
-    if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
+    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
@@ -3586,7 +3595,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
         fprintf(stderr, "[ork] ork_mm_run_i4_grouped: M=%d, N=%d, K=%d, nc=%d, NB=%d\n", M, w->N, w->K, nc, NB);
         logged = 1;
     }
-    if(c->last_dt!=DT_I4){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){c->mwarm[i]=0;c->mccsz[i]=0;} c->last_dt=DT_I4; }
+    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*2;
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate grouped multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
