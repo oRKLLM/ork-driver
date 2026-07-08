@@ -126,6 +126,7 @@ int main(int argc,char**argv){
 
     ork_i4_fuzz_clear();
     int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
+    if(!strcmp(mode,"base")){ printf("K=%d M=%d N=%d -> rows %d\n",K,M,N,base); ork_npu_free(ctx); return 0; }
     /* vsweep <blk> <reg>: characterize one register — sweep its value 0..0x200, print rows-matched for
      * each (not just HITs). Reveals the value->rows law of a candidate budget reg (e.g. 0x201/0x107c). */
     if(!strcmp(mode,"vsweep") && argc>5){
@@ -138,6 +139,30 @@ int main(int argc,char**argv){
             if(rows>base||rows<0||(v%64)==0) printf("  0x%03x -> rows %d%s\n",v,rows,rows>base?"  <<":"");
         }
         ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
+    /* bankprobe <blk> <reg>: value-level, wedge-RESUMABLE sweep of a suspected CBUF bank-partition register
+     * (one that BLACKLISTED wholesale after a single wedge — a bank reg hard-wedges on bad partitions but a
+     * specific value may enlarge the activation bank -> rows>base). State = i4_fuzz_state.txt (value index);
+     * on resume a still-inflight value is SKIPPED (not blacklisted — we're probing this reg). 0x107c=K/16
+     * stays active (synth default), so this co-varies with it. Run under the autonomous power-cycle loop. */
+    if(!strcmp(mode,"bankprobe") && argc>5){
+        uint32_t bb=(uint32_t)strtoul(argv[4],0,0), br=(uint32_t)strtoul(argv[5],0,0);
+        uint32_t bvals[]={1,2,3,4,6,8,12,16,24,32,48,64,0x80,0x100,0x200,0x400};
+        int nb=sizeof bvals/sizeof*bvals;
+        int done,inflight; read_state(&done,&inflight);
+        if(done==-2){ printf("[bankprobe] DONE (rm i4_fuzz_state.txt to re-run)\n"); ork_npu_free(ctx); return 0; }
+        if(inflight>=0 && inflight<nb){ printf("[bankprobe] value idx %d (0x%x) WEDGED -> skip\n",inflight,bvals[inflight]); if(done<=inflight)done=inflight+1; }
+        printf("[bankprobe] reg %x/%x @ K=%d M=%d, base rows %d, from idx %d/%d\n",bb,br,K,M,base,done,nb);
+        for(int i=done;i<nb;i++){
+            write_state(i,i); fflush(stdout);
+            ork_i4_fuzz_clear(); ork_i4_fuzz_add(bb,br,bvals[i]);
+            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
+            write_state(i+1,-1);
+            printf("  0x%-4x -> rows %d%s\n",bvals[i],rows,rows>base?"  <<< BANK LEVER":"");
+            if(rows>base){ FILE*hf=fopen("i4_fuzz_hits.txt","a"); if(hf){fprintf(hf,"BANK reg %x/%x=0x%x -> rows %d (base %d) K=%d M=%d\n",bb,br,bvals[i],rows,base,K,M); fclose(hf);} }
+        }
+        write_done(); printf("[bankprobe] complete\n"); ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
     }
     printf("[fuzz] K=%d M=%d (mc_phys=%d) N=%d mode=%s  baseline rows-matched = %d / %d\n",K,M,mc_phys,N,mode,base,M);
     if(base<0){printf("[fuzz] baseline submit failed (NPU wedged?) — aborting\n");return 1;}

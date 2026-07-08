@@ -67,6 +67,13 @@ int main(void){
     fail|=test(c,1,12288,64);     /* K-split (>10752) + accumulate */
     fail|=test(c,3,2048,256);     /* M + N tiling, mid K          */
     fail|=test(c,8,512,256);      /* regression: prefill M=8 multi-core */
+    /* native multi-M (ORK_I4_MSCHED) coverage: larger-M batches exercise the 0x107c=K/16 batch scheduler.
+     * These pass on the default per-row path today; `make test` also runs this example under
+     * ORK_I4_MSCHED=1 (once the wide-N tile-budget law is wired into i4_mcworker) to validate the native
+     * multi-M submit path bit-exact vs the CPU reference — see the wiki INT4 Multi-M RE log. */
+    fail|=test(c,16,512,64);      /* multi-M batch, single 64-wide N-block (the proven sweet spot) */
+    fail|=test(c,16,2048,64);     /* multi-M batch at production K */
+    fail|=test(c,16,2048,256);    /* multi-M batch, wide N (multi-block tile budget) */
     /* SINGLE-CORE int4 (budget=1): W4A4 is physically single-row (mc=1, captured regcmd) + PC-chained
      * for M>1 — no sched=1 M-scheduler/mg_max*64 tile (so the fp16/int8 large-tile bugs don't apply),
      * but this guards the 1-core M>1 chain path that the multi-core cases above don't exercise. */

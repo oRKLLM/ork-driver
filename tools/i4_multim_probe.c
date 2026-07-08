@@ -11,7 +11,7 @@
 #include <stdint.h>
 #include "ork_npu.h"
 
-static unsigned sd=99; static int8_t r4(void){sd=sd*1103515245+12345;return (int8_t)((int)((sd>>10)%15)-7);} /* [-7,7] */
+static unsigned sd=99; static int8_t r4(void){sd=sd*1103515245+12345;return (int8_t)((int)((sd>>10)%5)-2);} /* [-2,2]: exact int16 to K=4096 */
 
 /* candidate layouts: index of element (m,n) in the raw int16 buffer (M rows, N cols). */
 static size_t L_rowmajor(int m,int n,int M,int N){(void)M;return (size_t)m*N+n;}
@@ -83,18 +83,11 @@ static void test(ork_npu*ctx,int M,int K,int N){
 }
 int main(void){
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
-    test(ctx,8,32,64);     /* rows_computed*K=256 hypothesis: predicts 8 rows at K=32 */
-    test(ctx,4,64,64);     /* the capture's exact config */
-    test(ctx,2,64,64);
-    test(ctx,4,128,128);
-    test(ctx,8,256,256);
-    /* single 64-wide N-block at REAL K (the shippable per-block-multi-M granularity) */
-    test(ctx,8,2048,64);
-    test(ctx,16,2048,64);
-    test(ctx,16,512,64);
-    /* multi-block (N>64) at production K WITH 0x107c=K/16 now default — does the 4-row batch span blocks? */
-    test(ctx,4,512,128);
-    test(ctx,4,2048,128);
+    /* de-tile decode (fast, [-2,2] exact): confirm block-stride formula physrow = 2r + stride*b, and
+     * whether stride scales as 2*M, across M and N. K=512 (single K-slice, no accumulate confound). */
+    test(ctx,4,512,64);   test(ctx,4,512,128);   test(ctx,4,512,256);
+    test(ctx,8,512,64);   test(ctx,8,512,128);   test(ctx,8,512,256);
+    test(ctx,16,512,64);  test(ctx,16,512,128);
     ork_npu_free(ctx);
     return 0;
 }
