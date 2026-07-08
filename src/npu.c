@@ -879,8 +879,13 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
          * the captured base 0x1040 (K-independent, unlike int8) — which the M=1 path already never overrides.
          *   0x01 M-count 0x1020/0x1084/0x102c   0x02 0x4034(PPU rows)   0x04 0x3014(DPU)
          *   0x08 0x4038(out width/4)            0x10 0x1010(CNA hint)   0x20 0x1040(K-schedule=POISON) */
-        static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x1f;}
+        static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x5f;}
         setr(rc,REGCMD_I4_N,0x1001,0x405c,0);                                   /* the trigger (always) */
+        /* 0x107c = K/16 : the batch activation-cube-size reg (Exp-2026-07-07 fuzz). Captured as 4 (tuned to
+         * the M=4/K=64 capture); setting it to K/16 restores the native 4-ROW batch at ANY K — bit-exact at
+         * K=512/1024/2048 (0x20/0x40/0x80). This lifts multi-M from 1 row to 4 rows/submit at production K
+         * (4x fewer weight streams). Narrow: only K/16 gives 4 (neighbors give 2); 4 is the cap for this reg. */
+        if(mregs&0x40) setr(rc,REGCMD_I4_N,0x201,0x107c,(uint32_t)(K/16));
         if(mregs&0x01){ setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x102c,mc_phys); }
         if(mregs&0x02) setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);
         if(mregs&0x04) setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);

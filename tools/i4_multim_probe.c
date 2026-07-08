@@ -92,6 +92,9 @@ int main(void){
     test(ctx,8,2048,64);
     test(ctx,16,2048,64);
     test(ctx,16,512,64);
+    /* multi-block (N>64) at production K WITH 0x107c=K/16 now default — does the 4-row batch span blocks? */
+    test(ctx,4,512,128);
+    test(ctx,4,2048,128);
     ork_npu_free(ctx);
     return 0;
 }

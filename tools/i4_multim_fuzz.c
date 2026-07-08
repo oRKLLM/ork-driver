@@ -37,7 +37,9 @@
 #include "regcmd_i4.h"      /* REGCMD_I4[] / REGCMD_I4_N — read-only, to enumerate present regs in "regs" mode */
 
 #define NN 64              /* single 64-wide N-block: the known-good granularity (skips the 2D N-surface) */
-static unsigned sd=12345; static int8_t r4(void){sd=sd*1103515245+12345;return (int8_t)((int)((sd>>10)%15)-7);}
+/* [-2,2] keeps the int16 datapath output exact even at K=4096 (max |sum| = 4*K < 32767), so rows-matched
+ * stays a true bit-exact signal at production K (a [-7,7] range overflows int16 past K~512 and masks rows). */
+static unsigned sd=12345; static int8_t r4(void){sd=sd*1103515245+12345;return (int8_t)((int)((sd>>10)%5)-2);}
 
 struct cand { uint32_t blk, reg, val; uint32_t blk2, reg2, val2; };   /* blk2!=0 => 2-reg combo */
 
@@ -124,6 +126,19 @@ int main(int argc,char**argv){
 
     ork_i4_fuzz_clear();
     int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
+    /* vsweep <blk> <reg>: characterize one register — sweep its value 0..0x200, print rows-matched for
+     * each (not just HITs). Reveals the value->rows law of a candidate budget reg (e.g. 0x201/0x107c). */
+    if(!strcmp(mode,"vsweep") && argc>5){
+        uint32_t vb=(uint32_t)strtoul(argv[4],0,0), vr=(uint32_t)strtoul(argv[5],0,0);
+        printf("[vsweep] reg %x/%x @ K=%d M=%d (base rows %d):\n",vb,vr,K,M,base);
+        for(uint32_t v=0; v<=0x200; v++){
+            ork_i4_fuzz_clear(); ork_i4_fuzz_add(vb,vr,v);
+            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
+            if(rows>base||rows<0||(v%64)==0) printf("  0x%03x -> rows %d%s\n",v,rows,rows>base?"  <<":"");
+        }
+        ork_i4_fuzz_clear(); ork_npu_free(ctx); return 0;
+    }
     printf("[fuzz] K=%d M=%d (mc_phys=%d) N=%d mode=%s  baseline rows-matched = %d / %d\n",K,M,mc_phys,N,mode,base,M);
     if(base<0){printf("[fuzz] baseline submit failed (NPU wedged?) — aborting\n");return 1;}
 
