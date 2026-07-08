@@ -2544,15 +2544,16 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
     return ork_mm_pack_i8(c, K, N, B);
 }
 static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* defined below */
+static int run_i4_incr_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* STRATEGY C multi-core, defined below */
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(!w||w->dtype!=DT_I4) return -1;
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    /* ORK_I4_INCR: route M>1 single-slice int4 matmuls through the incremental-task batch (STRATEGY C:
-     * one weight load per N-block, amortized over all M rows; NOT Hcap-capped). Falls back (-4) otherwise. */
-    static int incr=-1; if(incr<0){const char*e=getenv("ORK_I4_INCR"); incr=(e&&atoi(e))?1:0;}
-    if(incr && M>=2 && w->Sk==1 && w->Sn==1){ int r=ork_mm_run_i4_incr(c,w,M,A,C); if(r!=-4) return r; }
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
+    /* ORK_I4_INCR: route M>1 single-slice int4 matmuls through the MULTI-CORE incremental-task batch
+     * (STRATEGY C: per-N-block weight-load amortization, N-blocks split across cores). Falls back (-4). */
+    static int incr=-1; if(incr<0){const char*e=getenv("ORK_I4_INCR"); incr=(e&&atoi(e))?1:0;}
+    if(incr && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_incr_mc(c,w,M,A,C,nc); if(r!=-4) return r; }
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -6559,6 +6560,96 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
         int16_t*o=(int16_t*)sC.cpu;
         for(int j=0;j<M;j++) for(int n=0;n<NBW;n++) C[(size_t)j*N+(size_t)blk*NBW+n]=o[(size_t)j*NBW+n];
     }
+    return 0;
+}
+
+/* ---- MULTI-CORE STRATEGY C: split the N-blocks across cores; each core runs incremental-task chains for
+ * its block range (core_mask=1<<i, per-core scratch mrc/maf/mcc/mtk). Composes STRATEGY C's per-block
+ * weight-load amortization with 3-core N-parallelism -> aims to beat multi-core STRATEGY A at wide N too.
+ * The N-blocks are independent (own weight tile, shared read-only A, disjoint output columns). ---- */
+struct i4incrw { ork_npu *c; int core, nc, M, b0, b1; ork_w *w; const int8_t *A; int32_t *C; int rc; };
+static void *i4_incr_mcworker(void *vp){
+    struct i4incrw *a=vp; ork_npu *c=a->c; int i=a->core, M=a->M, fd=c->fd;
+    pin_big_core(i);
+    ork_w *w=a->w; int K=w->K, N=w->N, b0=a->b0, b1=a->b1;
+    const int NBW=64;
+    if(b1<=b0){ a->rc=0; return NULL; }
+    struct buf *RC=&c->mrc[i], *AF=&c->maf[i], *O=&c->mcc[i], *TK=&c->mtk[i];
+    for(int j=0;j<M;j++) tile_i4_Aslice((uint8_t*)AF->cpu+(size_t)j*(K/2), a->A+(size_t)j*K, 0, K);  /* pack A once */
+    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+    int NFULL = M>=2 ? 2 : 1;
+    size_t comp_base=(size_t)NFULL*REGCMD_I4_N*4;
+    for(int blk=b0; blk<b1 && !c->mc_error; blk++){
+        uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)blk*K*32);
+        uint32_t rc0[REGCMD_I4_N], v1040=0, v100c=0;
+        for(int j=0;j<NFULL;j++){
+            synth_i4(rc0,1,K,NBW,(uint32_t)AF->dma+(uint32_t)j*(K/2),wdma,(uint32_t)O->dma+(uint32_t)j*NBW*2);
+            if(j==0){ v1040=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x1040); v100c=regcmd_getv(rc0,REGCMD_I4_N,0x0201,0x100c); }
+            if(j==M-1){ rc0[216]=0; rc0[217]=0; rc0[218]=0x00000014; rc0[219]=0x01010000; }
+            else {
+                int nxt_full=(j+1<NFULL);
+                uint32_t nxt = nxt_full ? (uint32_t)(RC->dma+(uint64_t)(j+1)*REGCMD_I4_N*4) : (uint32_t)(RC->dma+comp_base);
+                uint32_t amt = nxt_full?0x0037:0x0007;
+                rc0[216]=0x0010|((nxt&0xffff)<<16); rc0[217]=(0x0101<<16)|((nxt>>16)&0xffff);
+                rc0[218]=0x0014|(amt<<16); rc0[219]=(0x0101<<16)|0;
+            }
+            memcpy((char*)RC->cpu+(size_t)j*REGCMD_I4_N*4, rc0, REGCMD_I4_N*4);
+        }
+        for(int j=NFULL;j<M;j++){
+            int ci=j-NFULL;
+            uint32_t*ic=(uint32_t*)((char*)RC->cpu+comp_base+(size_t)ci*32*4);
+            uint32_t aA=(uint32_t)AF->dma+(uint32_t)j*(K/2), aC=(uint32_t)O->dma+(uint32_t)j*NBW*2;
+            int last=(j==M-1);
+            uint32_t nx=(uint32_t)(RC->dma+comp_base+(size_t)(ci+1)*32*4);
+            #define SP(ii,off,blk_,val) do{ic[2*(ii)]=(off)|(((uint32_t)(val)&0xffff)<<16); ic[2*(ii)+1]=((uint32_t)(blk_)<<16)|(((uint32_t)(val)>>16)&0xffff);}while(0)
+            SP(0,0x1040,0x0201,v1040); SP(1,0x1104,0x0201,0); SP(2,0x1100,0x0201,0); SP(3,0x100c,0x0201,v100c);
+            SP(4,0x4004,0x1001,0x0e);  SP(5,0x1070,0x0201,aA); SP(6,0x1084,0x0201,0x00010001); SP(7,0x1088,0x0201,(uint32_t)K);
+            SP(8,0x1110,0x0201,wdma);  SP(9,0x4020,0x1001,aC); SP(10,0x4058,0x1001,(uint32_t)(NBW-1)); SP(11,0x405c,0x1001,0);
+            if(last){ SP(12,0x0010,0x0101,0); SP(13,0x0014,0x0101,0); } else { SP(12,0x0010,0x0101,nx); SP(13,0x0014,0x0101,0x0007); }
+            SP(14,0x0000,0x0041,0); SP(15,0x0008,0x0081,0x000d);
+            #undef SP
+        }
+        bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task*t=(struct rknpu_task*)TK->cpu; memset(t,0,(size_t)M*sizeof*t);
+        for(int j=0;j<M;j++){ t[j].enable_mask=0xd;t[j].int_mask=0x300;t[j].int_clear=0x1ffff;
+            if(j<NFULL){ t[j].regcfg_amount=116; t[j].regcmd_addr=RC->dma+(uint64_t)j*REGCMD_I4_N*4; }
+            else { t[j].regcfg_amount=12; t[j].regcmd_addr=RC->dma+comp_base+(uint64_t)(j-NFULL)*32*4; } }
+        bsync(fd,TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub;memset(&sub,0,sizeof sub);
+        sub.flags=0x5;sub.task_number=(uint32_t)M;sub.task_obj_addr=TK->obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)M};
+        sub.timeout=2000;
+        int reps = c->mwarm[i]?1:2;
+        for(int r=0;r<reps;r++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ a->rc=-1; c->mc_error=1; break; }
+            bsync(fd,O,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        c->mwarm[i]=1;
+        int16_t*o=(int16_t*)O->cpu;
+        for(int j=0;j<M;j++) for(int n=0;n<NBW;n++) a->C[(size_t)j*N+(size_t)blk*NBW+n]=o[(size_t)j*NBW+n];
+    }
+    a->rc = c->mc_error ? -1 : 0;
+    return NULL;
+}
+static int run_i4_incr_mc(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+    int fd=c->fd, K=w->K, N=w->N, NBLK=N/64;
+    if(w->Sk!=1 || w->Sn!=1 || N%64) return -4;
+    if(nc<1)nc=1; if(nc>NBLK)nc=NBLK; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; } c->last_dt=DT_I4; }
+    if(mc_ensure(c,nc)) return -1;
+    size_t need_rc=((size_t)2*REGCMD_I4_N+(size_t)M*32)*4, need_af=(size_t)M*(K/2), need_o=(size_t)M*64*2, need_tk=(size_t)M*sizeof(struct rknpu_task);
+    for(int i=0;i<nc;i++){
+        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
+        if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,need_af,0x403,c->dom_active); }
+        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,need_tk,0x40b,c->dom_active); }
+        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+        if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -2;
+    }
+    c->mc_error=0;
+    struct i4incrw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
+    for(int i=0;i<nc;i++){ int b0=(int)((long)i*NBLK/nc), b1=(int)((long)(i+1)*NBLK/nc); args[i]=(struct i4incrw){c,i,nc,M,b0,b1,w,A,C,0}; }
+    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_incr_mcworker,&args[i]);
+    i4_incr_mcworker(&args[0]);
+    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
+    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
     return 0;
 }
 
