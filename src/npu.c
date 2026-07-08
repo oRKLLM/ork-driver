@@ -62,7 +62,7 @@ static int ork_i4_msched(void){ static int v=-1; if(v<0){const char*e=getenv("OR
 /* ORK_I4_NSUB: N-subslice the batch path so wide-N (Ncore*K > 131072 weight budget) still batches — split N
  * into ≤131072/K-column chunks, one batch submit each, instead of falling back to per-row. Default OFF until
  * board-validated; when off, msched keeps the weight-fit guard (whole-Ncore batch or per-row). */
-static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=e?(atoi(e)?1:0):1;} return v; }  /* default ON; engages only where Nsub_max>=128 (Kp<=1024), a measured net win */
+static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=(e&&atoi(e))?1:0;} return v; }  /* default OFF: under pinned-DDR benchmarking N-subslice is ~neutral (submit overhead cancels the weight-DMA saving); the "1.1-1.2x" seen earlier was an unpinned-governor artifact. Kept opt-in. */
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
