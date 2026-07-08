@@ -83,3 +83,31 @@ g++ -O2 -I. -o rkllm_bench rkllm_bench.cpp -L. -lrkllmrt && ./rkllm_bench model.
 - The RKNN toolkit runs in an x86 Ubuntu docker container (`rkllm-converter`); `docker cp` models in/out.
 - NPU is single-stream; never `kill -9` an in-flight submit. Use `timeout` and `ORK_EW_TIMEOUT` to fail fast.
 - A malformed task shows `task counter: 0x0` / `raw status: 0xc0000000` in `dmesg` (the CP rejected it).
+
+## Mode-mapping / batch / D_BANK RE (matmul-API + conv capture)
+
+Two capture surfaces beyond the single-op activation flow, used to map the NPU's precision/batch
+modes and the CBUF banking (2026-07; findings on the wiki `regcmd-ISA-Reference` +
+`Reverse-Engineering-Roadmap`):
+
+- **`mm_cap.c` — RKNN matmul-API enumeration** (no model file needed). Runs any `rknn_matmul_type`
+  at any `(M,K,N)` so you can capture + diff the emitted regcmd across dtype/shape:
+  ```sh
+  cc -O2 -I$RKNN_SDK -o mm_cap mm_cap.c -L$RKNN_SDK -lrknnrt
+  for M in 1 8 32 128; do
+    sudo env LD_PRELOAD=$PWD/rknpu_dump.so LD_LIBRARY_PATH=$RKNN_SDK RKDUMP_WORDS=0 \
+        ./mm_cap 2 $M 512 64 2> m$M.dump                       # int8, sweep batch M
+    ./decode_reg < <(awk '/regcmd \(/{f=1;next}/--- /{f=0}f&&/^  \[/' m$M.dump) > m$M.dec
+  done
+  diff m1.dec m128.dec        # regs that move with M => batch encoding (0x4034, 0x405c)
+  ```
+  Established: RK3588 matmul is symmetric-only (fp16/int8/int4; all mixed types reject at create);
+  `0x4010`=precision/mode; int8/fp16 batch in-task (=our M-scheduler), int4 batches multi-task
+  (`task_number`=rows) — which refuted the old `batch_probe` "kernel rejects task_number>1".
+
+- **`models/build_conv.py` — single-Conv `.rknn`** (build in the rknn-toolkit2 container, capture on
+  the board with `run_rknn`). Conv emits the domain-2001 (`0x50xx`) CDMA block the matmul path lacks.
+  Sweep Cout/Cin (weight) and H/W (data) and diff to hunt the CBUF bank-split. Finding so far: on
+  RK3588 every moving reg tracks a dimension linearly — no discrete bank-count register in-regcmd,
+  i.e. CBUF partitioning looks implicit/driver-computed (unlike NVDLA's explicit `D_BANK`); confirm
+  with int8 + a bank-crossing conv.
