@@ -39,7 +39,7 @@
 #define NN 64              /* single 64-wide N-block: the known-good granularity (skips the 2D N-surface) */
 static unsigned sd=12345; static int8_t r4(void){sd=sd*1103515245+12345;return (int8_t)((int)((sd>>10)%15)-7);}
 
-struct cand { uint32_t blk, reg, val; };
+struct cand { uint32_t blk, reg, val; uint32_t blk2, reg2, val2; };   /* blk2!=0 => 2-reg combo */
 
 /* regs that are K/N/address/M-count derived — overriding them just breaks the matmul, not informative. */
 static int essential(uint32_t b,uint32_t o){
@@ -49,20 +49,44 @@ static int essential(uint32_t b,uint32_t o){
     if(b==0x801) return (o==0x3018||o==0x3010);
     return 0;
 }
+/* DANGEROUS regs — writing them HARD-wedges the bus (kernel job-timeout can't recover; needs a power-cycle).
+ * The 0x201/0x11xx CNA scratch region (all zero in the capture) is the known hazard: 0x1104=0x80 hard-wedged
+ * the board 2026-07-07 (Exp log). Skip the whole 0x1100..0x1184 block. Extend as more are found. */
+static int dangerous(uint32_t b,uint32_t o){ return (b==0x201 && o>=0x1100 && o<=0x1184); }
 
-/* build the candidate list for the mode. cs is caller-allocated (cap entries). */
+/* wide value palette (thorough): counts, powers of two up to 1024, K-derived, byte-fills, budget candidates. */
+static const uint32_t WIDE[]={0,1,2,4,8,16,32,64,128,256,512,1024,0x1b,0x40,0x80,0xb1,0xff,0x100,0x200,0x400};
+/* build the candidate list for the mode. cs is caller-allocated (cap entries).
+ *   sched : 0x1040 value sweep 0..0x1ff.
+ *   regs  : non-essential present regs x WIDE, skipping the hard-wedge 0x11xx scratch (board-safe).
+ *   full  : EVERY present reg (incl essential+dangerous) x WIDE — thorough, risk authorized 2026-07-07.
+ *   combo : 0x1040 in {base/candidates} x every other non-essential present reg x a small palette (2-reg). */
 static int build_cands(struct cand*cs,int cap,const char*mode,int K,int mc_phys){
-    int n=0;
-    if(strcmp(mode,"regs")==0){
-        uint32_t vals[]={0,1,mc_phys,mc_phys-1,(uint32_t)(K/32),(uint32_t)(K/64),(uint32_t)(K/128),(uint32_t)K,
-                         0x1b,0x40,0x80,0xb1,0xff,0x100,((uint32_t)(K/32))<<16|(K/32)};
+    int n=0; (void)mc_phys;
+    if(strcmp(mode,"full")==0){
         for(int k=0;k+1<REGCMD_I4_N && n<cap;k+=2){
             uint32_t o=REGCMD_I4[k]&0xffff, b=REGCMD_I4[k+1]>>16;
-            if(essential(b,o)) continue;
-            for(unsigned v=0;v<sizeof vals/sizeof*vals && n<cap;v++) cs[n++]=(struct cand){b,o,vals[v]};
+            if(dangerous(b,o)) continue;   /* confirmed pure bus-lock hazard, no row-lever — skip (see Exp log) */
+            for(unsigned v=0;v<sizeof WIDE/sizeof*WIDE && n<cap;v++) cs[n++]=(struct cand){b,o,WIDE[v],0,0,0};
+        }
+    } else if(strcmp(mode,"combo")==0){
+        uint32_t sched[]={0x1b,0x40,0x80,0xb1,0xff,(uint32_t)(0xb1+K/32)};   /* co-varied 0x1040 values */
+        uint32_t v2[]={0,mc_phys,64,128,256,512};                             /* companion budget values */
+        for(unsigned s=0;s<sizeof sched/sizeof*sched;s++)
+          for(int k=0;k+1<REGCMD_I4_N && n<cap;k+=2){
+            uint32_t o=REGCMD_I4[k]&0xffff, b=REGCMD_I4[k+1]>>16;
+            if(essential(b,o)||dangerous(b,o)||(b==0x201&&o==0x1040)) continue;
+            for(unsigned v=0;v<sizeof v2/sizeof*v2 && n<cap;v++)
+                cs[n++]=(struct cand){0x201,0x1040,sched[s], b,o,v2[v]};
+          }
+    } else if(strcmp(mode,"regs")==0){
+        for(int k=0;k+1<REGCMD_I4_N && n<cap;k+=2){
+            uint32_t o=REGCMD_I4[k]&0xffff, b=REGCMD_I4[k+1]>>16;
+            if(essential(b,o)||dangerous(b,o)) continue;
+            for(unsigned v=0;v<sizeof WIDE/sizeof*WIDE && n<cap;v++) cs[n++]=(struct cand){b,o,WIDE[v],0,0,0};
         }
     } else { /* "sched": exhaustive value sweep of the K-reduction schedule reg */
-        for(uint32_t v=0; v<=0x1ff && n<cap; v++) cs[n++]=(struct cand){0x201,0x1040,v};
+        for(uint32_t v=0; v<=0x1ff && n<cap; v++) cs[n++]=(struct cand){0x201,0x1040,v,0,0,0};
     }
     return n;
 }
@@ -104,6 +128,10 @@ int main(int argc,char**argv){
     if(base<0){printf("[fuzz] baseline submit failed (NPU wedged?) — aborting\n");return 1;}
 
     static struct cand cs[8192]; int ncand=build_cands(cs,8192,mode,K,mc_phys);
+    { const char*ls=argc>4?argv[4]:0;   /* 4th arg "list" (or an index): print candidate mapping, no submits */
+      if(ls){ if(!strcmp(ls,"list")){ for(int i=0;i<ncand;i++) printf("cand %d: reg %x/%x = 0x%x\n",i,cs[i].blk,cs[i].reg,cs[i].val); }
+              else { int i=atoi(ls); if(i>=0&&i<ncand) printf("cand %d: reg %x/%x = 0x%x\n",i,cs[i].blk,cs[i].reg,cs[i].val); }
+              ork_npu_free(ctx); return 0; } }
     int done,inflight; read_state(&done,&inflight);
     if(done==-2){ printf("[fuzz] state = DONE (rm i4_fuzz_state.txt to re-run)\n"); return 0; }
     if(inflight>=0 && inflight<ncand){
@@ -118,14 +146,16 @@ int main(int argc,char**argv){
         if(blacklisted(cs[i].blk,cs[i].reg)){ write_state(i+1,-1); continue; }
         write_state(i,i); fflush(stdout);                       /* in-flight BEFORE submit (wedge trace) */
         ork_i4_fuzz_clear(); ork_i4_fuzz_add(cs[i].blk,cs[i].reg,cs[i].val);
+        if(cs[i].blk2) ork_i4_fuzz_add(cs[i].blk2,cs[i].reg2,cs[i].val2);
         int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
         int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
         write_state(i+1,-1);
-        if(rows>base){ printf("  HIT  reg %x/%x = 0x%-5x -> rows %d (base %d) %s\n",
-                              cs[i].blk,cs[i].reg,cs[i].val,rows,base,rows==M?"*** FULL ***":"");
-            FILE*hf=fopen("i4_fuzz_hits.txt","a"); if(hf){fprintf(hf,"reg %x/%x = 0x%x -> rows %d (base %d) K=%d M=%d\n",
-                              cs[i].blk,cs[i].reg,cs[i].val,rows,base,K,M); fclose(hf);} }
-        else if(rc!=0) printf("  .    reg %x/%x = 0x%-5x submit rc=%d\n",cs[i].blk,cs[i].reg,cs[i].val,rc);
+        if(rows>base){ printf("  HIT  reg %x/%x=0x%x %s -> rows %d (base %d) %s\n",
+                              cs[i].blk,cs[i].reg,cs[i].val, cs[i].blk2?"(+combo)":"",rows,base,rows==M?"*** FULL ***":"");
+            FILE*hf=fopen("i4_fuzz_hits.txt","a"); if(hf){fprintf(hf,"reg %x/%x=0x%x",cs[i].blk,cs[i].reg,cs[i].val);
+                              if(cs[i].blk2)fprintf(hf," + %x/%x=0x%x",cs[i].blk2,cs[i].reg2,cs[i].val2);
+                              fprintf(hf," -> rows %d (base %d) K=%d M=%d\n",rows,base,K,M); fclose(hf);} }
+        else if(rc!=0) printf("  .    reg %x/%x=0x%x submit rc=%d\n",cs[i].blk,cs[i].reg,cs[i].val,rc);
         if(rows>best)best=rows;
         if((i%64)==0){ printf("  [..%d/%d best=%d]\n",i,ncand,best); fflush(stdout); }
     }
