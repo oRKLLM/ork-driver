@@ -88,6 +88,8 @@ int main(void){
     test(ctx,4,512,64);   test(ctx,4,512,128);   test(ctx,4,512,256);
     test(ctx,8,512,64);   test(ctx,8,512,128);   test(ctx,8,512,256);
     test(ctx,16,512,64);  test(ctx,16,512,128);
+    /* K=2048 block-stride check (integration fails here at wide N): is block-stride still mc_phys? */
+    test(ctx,4,2048,128); test(ctx,8,2048,128);
     ork_npu_free(ctx);
     return 0;
 }
