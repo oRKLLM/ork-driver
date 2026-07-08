@@ -217,6 +217,71 @@ What's done (fp16/int8 matmul, multi-core, decode ≈ closed runtime, prefill fl
 what's left (int4/`w4a16`, llama.cpp integration, auto-tuner, more SoCs) — with the closed
 dead-ends — is tracked in **[ROADMAP.md](ROADMAP.md)**.
 
+## Enabling the NPU on-chip SRAM (optional, advanced)
+
+The RK35xx NPU can use a slice of the SoC's on-chip system SRAM as a fast, DMA-able buffer — a
+"second memory interface" alongside DRAM. On RK3588 that region (`sram@ff001000`) is ~956 KB.
+**Stock vendor kernels ship with it disabled for the NPU**: the driver's SRAM support is compiled
+out (`# CONFIG_ROCKCHIP_RKNPU_SRAM is not set`) *and* the device tree hands the system SRAM to the
+video decoder (`rkvdec`) instead of the NPU. So out of the box the NPU reports **0 bytes** of SRAM.
+Turning it on takes two changes — a kernel config flag and a device-tree edit — which means
+**rebuilding your board's kernel**. This is optional; the library works without it.
+
+> ⚠️ A bad kernel or DTB can leave the board unable to boot. Install the new kernel/DTB
+> **additively** (never overwrite the stock ones), keep the stock kernel as a bootable fallback,
+> and have a rescue boot (e.g. an SD card) ready before you reboot.
+
+1. **Get the kernel source** matching your running kernel (`uname -r`) — the vendor branch your
+   distro built from. For the RK35xx *vendor* kernel that both **DietPi and Armbian** ship, that is
+   the Armbian Rockchip vendor tree — [`armbian/linux-rockchip`](https://github.com/armbian/linux-rockchip),
+   branch **`rk-6.1-rkr5.1`** (Rockchip's `rk-6.1` BSP, = 6.1.115). DietPi does not maintain its own
+   kernel; its build system ([`MichaIng/build`](https://github.com/MichaIng/build)) pins exactly this —
+   `KERNELSOURCE=https://github.com/armbian/linux-rockchip`, `KERNELBRANCH=rk-6.1-rkr5.1`,
+   `KERNELPATCHDIR=rk35xx-vendor-6.1`. Match the branch to your `uname -r` (a different point release
+   uses a different `rkrX.Y` branch).
+2. **Seed the config from the running kernel** and flip one flag, using a distinct local version so
+   the result installs *alongside* the stock kernel:
+   ```sh
+   zcat /proc/config.gz > .config          # or: cp /boot/config-$(uname -r) .config
+   ./scripts/config --enable ROCKCHIP_RKNPU_SRAM
+   ./scripts/config --set-str LOCALVERSION -sram
+   make olddefconfig
+   ```
+   (The driver also needs `CONFIG_NO_GKI=y` — vendor kernels set it — and the NPU running in IOMMU
+   mode, which is the default.)
+3. **Wire the SRAM to the NPU in the device tree.** In the SoC `.dtsi`, give an SRAM region under
+   the `mmio-sram` controller to the `rknpu` node via a `rockchip,sram` phandle, and remove any
+   conflicting claim on that region. The simplest approach — if you don't need hardware video
+   decode — is to repurpose the region the decoder uses: assign the whole syssram region to one
+   child node, reference it from `rknpu`, and drop the `rockchip,sram` refs on the `rkvdec` nodes.
+   On RK3588 the region is `sram@ff001000` (size `0xef000` = 956 KB):
+   ```dts
+   &rknpu {
+       rockchip,sram = <&rknpu_sram>;   /* a region node under sram@ff001000 */
+   };
+   ```
+4. **Build** the kernel, modules, and device trees: `make Image modules dtbs`.
+5. **Install additively and flip the boot selection.** Install the kernel under a versioned name,
+   `make modules_install` (its `LOCALVERSION` dir won't collide with the stock modules), and place a
+   copy of the edited DTB. Point the bootloader (extlinux entry, `boot.scr`, or the `/boot` symlinks
+   your distro uses) at the new kernel + DTB, leaving the stock kernel + DTB entries intact as the
+   fallback.
+6. **Reboot and verify** with the SRAM probe, which calls the driver's `RKNPU_GET_TOTAL_SRAM_SIZE`
+   ioctl:
+   ```sh
+   cc -O2 -Isrc -o sram_probe tools/sram_probe.c && sudo ./sram_probe
+   # before:  NPU SRAM total=0 bytes
+   # after:   NPU SRAM total=978944 bytes (956.0 KB), free=978944 bytes
+   ```
+
+Once enabled, allocate an NPU buffer with the `RKNPU_MEM_TRY_ALLOC_SRAM` flag and the allocator
+places it in SRAM when it fits (falling back to normal DMA memory otherwise) — a small, fast,
+DMA-addressable on-chip region for the NPU. The mechanism (config flag + DT phandle) is the same
+across the RK35xx family; only the region name and size differ by SoC. Note: staging int8 matmul
+*weights* here showed no speedup on RK3588 — the weight-load bottleneck is the NPU's on-chip CDMA
+path, not DRAM bandwidth, and weights large enough to be DRAM-bound don't fit in 956 KB — so treat
+SRAM as a capability to build on (scratch, small hot buffers), not an automatic matmul win.
+
 ## Troubleshooting
 
 ### Board won't boot after a hard NPU wedge (solid-blue LED, no network)
