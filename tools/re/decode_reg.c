@@ -46,10 +46,11 @@ static int decode(uint32_t *w, int nw, struct reg *r, int max) {
         uint32_t w0 = w[k], w1 = w[k+1];
         unsigned addr = w0 & 0xffff, dom = w1 >> 16;
         if (addr == 0 && w1 == 0) break;        /* trailer / padding */
-        /* keep all known register blocks: 0101 PC, 0201 CNA, 0801 DPU, 1001 PPU/core, 2001 CDMA.
-         * (previously only 1001/2001 — which silently dropped the CNA/DPU blocks that carry K dims,
-         *  weight IOVA, and 0x107c CBUF entries-per-slice; do NOT re-narrow this filter.) */
-        if (dom != 0x0101 && dom != 0x0201 && dom != 0x0801 && dom != 0x1001 && dom != 0x2001) continue;
+        /* Keep any engine block. Block IDs are (2^k << 8)|1: 0101 PC, 0201 CNA, 0401 ?, 0801 DPU,
+         * 1001 PPU/core, 2001 CDMA, 4001 PDP(pooling), 8001 (pool output). Accept dom in [0x0101,0x8001]
+         * with low byte 0x01. (An earlier hard-coded 1001/2001-only filter silently dropped whole
+         * engines — CNA/DPU from matmul, and the pooling blocks entirely. Do NOT re-narrow this.) */
+        if ((dom & 0xff) != 0x01 || dom < 0x0101 || dom > 0x8001) continue;
         uint32_t val = ((w1 & 0xffff) << 16) | (w0 >> 16);
         r[n++] = (struct reg){ dom, addr, val };
     }
