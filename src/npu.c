@@ -6447,6 +6447,43 @@ static void *stream_worker_i4(void *vp) {
         ork_w *w = t->w; int M = t->M, K = w->K, N = w->N;
         uint32_t bdma = (uint32_t)w->Bb[0].dma;
         uint8_t *abase = c->maf[i].cpu;                       /* per-row stride K bytes (nibble-pack uses K/2) */
+        /* ROUND-ROBIN + BATCH: if the native batch scheduler is on and this task's weight fits resident
+         * (N*K<=131072), batch its M rows in H-row submits (mc=2H, stride-2 A at slot 2j, de-tile 4j+4H*b) —
+         * one core batches a whole small matmul, round-robin, no barrier. Else fall through to per-row. */
+        int Hcap = 16384 / K; if (Hcap > 16) Hcap = 16; if (Hcap < 1) Hcap = 1;
+        if (ork_i4_msched() && Hcap >= 2 && M >= 2 && (size_t)N * K <= 131072) {
+            int NBc = N / 64;
+            for (int m0 = 0; m0 < M; m0 += Hcap) {
+                int H = (M - m0 < Hcap) ? (M - m0) : Hcap;
+                for (int j = 0; j < H; j++)                   /* real row j at A-slot 2j (stride-2 input) */
+                    tile_i4_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
+                bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+                memset(rc, 0, sizeof rc);
+                synth_i4(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
+                rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;   /* single task */
+                memcpy(c->mrc[i].cpu, rc, REGCMD_I4_N * 4);
+                bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+                struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, sizeof *mt);
+                mt[0].enable_mask = 0xd; mt[0].int_mask = 0x300; mt[0].int_clear = 0x1ffff;
+                mt[0].regcfg_amount = 116; mt[0].regcmd_addr = c->mrc[i].dma;
+                bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+                struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+                sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+                int reps = c->mwarm[i] ? 1 : 2;
+                for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = 60000;
+                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
+                    bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE); }
+                c->mwarm[i] = 1;
+                int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;   /* de-tile: o[(4j+4H*b)*64+cc] -> C[m0+j][b*64+cc] */
+                for (int j = 0; j < H; j++) for (int b = 0; b < NBc; b++) {
+                    size_t base = (size_t)(4 * j + 4 * H * b) * 64;
+                    int32_t *crow = C + (size_t)(m0 + j) * N + b * 64;
+                    for (int cc = 0; cc < 64; cc++) crow[cc] = o[base + cc];
+                }
+            }
+            continue;   /* task done via batch; skip the per-row path below */
+        }
         for (int m = 0; m < M; m++) tile_i4_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
         for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
@@ -6503,6 +6540,9 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (w->Sn != 1 || w->Sk != 1) return -2;              /* single-slice weight only (no K/N split) */
         if (tasks[i].M > mrc_cap) return -2;                  /* M single-row regcmds must fit one mrc buffer */
         size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 2;
+        /* batch (msched) output spans up to 4*HCAP(=16)*N int16 = 128*N bytes; only for tasks that FIT the
+         * weight budget (N*K<=131072, i.e. small N), so the bump is small. */
+        if(ork_i4_msched() && (size_t)w->N*w->K<=131072){ size_t bn=(size_t)128*w->N; if(bn>mn)mn=bn; }
         if (mk > maxMK) maxMK = mk; if (mn > maxMN2) maxMN2 = mn;
     }
     int fd = c->fd;
