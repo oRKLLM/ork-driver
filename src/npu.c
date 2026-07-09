@@ -22,6 +22,7 @@
 #include <math.h>
 #include <errno.h>
 #include <dlfcn.h>
+#include <signal.h>
 #include "rknpu_ioctl.h"
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
@@ -329,6 +330,30 @@ static void ork_iova_release(int dom,size_t bytes){
     if(dom<0||dom>=ORK_IOVA_NDOM) return;
     g_iova_bytes[dom] = g_iova_bytes[dom]>bytes ? g_iova_bytes[dom]-bytes : 0;
 }
+/* ---- graceful-teardown live-buffer registry (SIGTERM/SIGINT) --------------------------------------
+ * A killed process (e.g. `timeout`) that skips MEM_DESTROY leaks its IOMMU domain/IOVA mappings — benign
+ * for a single domain, but a MULTI-DOMAIN run strands whole 4 GiB domains until reboot (the kernel's
+ * implicit fd-close cleanup doesn't reclaim the domain allocator state). So track every live handle
+ * (bcreate + bimport) and, on SIGTERM/SIGINT, MEM_DESTROY them all + ACT_RESET before re-raising the
+ * default disposition — the same reclaim a clean exit does. Disable with ORK_NO_SIGCLEAN=1. */
+struct ork_live_ent { uint32_t handle; uint64_t obj; };
+static struct ork_live_ent *g_live=NULL; static int g_live_n=0, g_live_cap=0; static int g_live_fd=-1;
+static pthread_mutex_t g_live_mu=PTHREAD_MUTEX_INITIALIZER;
+static void live_add(int fd, uint32_t h, uint64_t o){ pthread_mutex_lock(&g_live_mu); g_live_fd=fd;
+    if(g_live_n==g_live_cap){ int nc=g_live_cap?g_live_cap*2:256; void*p=realloc(g_live,(size_t)nc*sizeof*g_live); if(p){g_live=p;g_live_cap=nc;} }
+    if(g_live_n<g_live_cap) g_live[g_live_n++]=(struct ork_live_ent){h,o};
+    pthread_mutex_unlock(&g_live_mu); }
+static void live_del(uint32_t h){ pthread_mutex_lock(&g_live_mu);
+    for(int i=0;i<g_live_n;i++) if(g_live[i].handle==h){ g_live[i]=g_live[--g_live_n]; break; }
+    pthread_mutex_unlock(&g_live_mu); }
+static volatile sig_atomic_t g_sig_busy=0;
+static void ork_sig_teardown(int sig){
+    if(!g_sig_busy){ g_sig_busy=1; int fd=g_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
+        if(fd>=0){ int n=g_live_n;
+            for(int i=0;i<n;i++){ struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=g_live[i].handle; d.obj_addr=g_live[i].obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); }
+            struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); } }
+    signal(sig,SIG_DFL); raise(sig);
+}
 static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     int dom=ork_dom(domain); size_t need=pgup(size);
     if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
@@ -339,10 +364,12 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
     if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
     struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
+    live_add(fd,b.handle,b.obj);
     return b;
 }
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    live_del(b->handle);
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
 /* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
@@ -403,6 +430,7 @@ static struct buf bimport(int fd,size_t size,int domain){
     if(g_load_prof){ g_lp_create += ork_now_us()-_t; g_lp_nchunk++; g_lp_bytes+=sz; }
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
+    live_add(fd,b.handle,b.obj);
     return b;
 }
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
@@ -954,6 +982,11 @@ ork_npu *ork_npu_init(void){
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
+    /* graceful teardown: MEM_DESTROY all live mappings on SIGTERM/SIGINT so a killed run (e.g. `timeout`)
+     * releases its IOMMU domains instead of stranding them until reboot (see the live-buffer registry). */
+    { const char*e=getenv("ORK_NO_SIGCLEAN"); if(!(e&&atoi(e))){
+        struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=ork_sig_teardown; sigemptyset(&sa.sa_mask);
+        sigaction(SIGTERM,&sa,NULL); sigaction(SIGINT,&sa,NULL); } }
     g_npu_ctx = c;
     return c;
 }
