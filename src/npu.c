@@ -5358,6 +5358,32 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
      * the earlier hardware-chained (task_number=9 + 0101 chain) attempts stalled at the chained LUT load. */
     static const int ORDER[9]={0,1,2,3,4,5,6,7,8};   /* capture/dataflow order */
     int rc_ret=0; double t0=ork_now_us();
+    /* ORK_SM_1SUBMIT: the CHEAP form we WANT — ONE ioctl, task_number=9, one submit-floor cost instead of 9x.
+     * RESULT (2026-07-10): FAILS on the rknpu vendor driver (errno=110). Unlike mainline accel/rocket (which
+     * kernel-re-arms each task on its completion IRQ within one job), the rknpu driver does NOT kernel-iterate
+     * a task_number=N job from just the descriptor array — it relies on the hardware PC-chain (0101:0x0010),
+     * and that chain stalls at the LUT-load task (task4 DMA read error). So on rknpu the per-task loop below
+     * (9 separate ioctls, 9x floor ~2ms) is the only working form; the cheap single-submit needs the
+     * LUT-in-hardware-chain fix. Kept gated for the chaining-audit follow-up. */
+    if(getenv("ORK_SM_1SUBMIT")){
+        uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[10]; off[0]=0;
+        for(int t=0;t<9;t++) off[t+1]=off[t]+SM_TASK_WORDS[t];
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,9*sizeof *tk);
+        for(int j=0;j<9;j++){ int t=ORDER[j]; uint32_t *rc=rcbuf+off[j]; int nw=SM_TASK_WORDS[t];
+            memcpy(rc,SM_TASKS[t],(size_t)nw*4); SM_REBASE(rc,nw,0);   /* zero the 0101 chain */
+            tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
+            tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)off[j]*4;
+        }
+        bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        s.flags=0x5; s.task_number=9; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK;
+        s.fence_fd=-1; s.timeout=3000; s.subcore_task[0]=(struct rknpu_subcore_task){0,9};
+        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 1submit task_number=9 failed\n"); rc_ret=-1; }
+        if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+        bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+        return rc_ret;
+    }
     for(int j=0;j<9 && rc_ret==0;j++){ int t=ORDER[j]; int nw=SM_TASK_WORDS[t];
         uint32_t *rc=(uint32_t*)c->regcmd.cpu; memcpy(rc,SM_TASKS[t],(size_t)nw*4);
         SM_REBASE(rc,nw,0);                          /* addr remap only; nextdma=0 zeros the chain words */
