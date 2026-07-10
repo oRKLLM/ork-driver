@@ -1209,12 +1209,32 @@ static void tile_i8_range(int lo,int hi,void *a){
  * tile bytes are BIT-IDENTICAL to ork_mm_pack of the row-major dequantized weight. Emulated W8A16. */
 struct tile_i8f16_arg { f16 *bb; const int8_t *Bi; const float *bscale; int KT, k0, n0, N; };
 static void tile_i8_to_f16_range(int lo,int hi,void *a){
-    struct tile_i8f16_arg *t=a;
-    for(int nt=lo;nt<hi;nt++)for(int kt=0;kt<t->KT;kt++)for(int nl=0;nl<16;nl++){
-        int n=t->n0+nt*16+nl; float s=t->bscale?t->bscale[n]:1.0f;
-        for(int kk=0;kk<32;kk++)
-            t->bb[(size_t)nt*t->KT*16*32+(size_t)kt*16*32+(size_t)nl*32+kk]=
-                (f16)((float)t->Bi[(size_t)(t->k0+kt*32+kk)*t->N+n]*s);
+    struct tile_i8f16_arg *t=a; int KT=t->KT,N=t->N,k0=t->k0,n0=t->n0;
+    for(int nt=lo;nt<hi;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++){
+        int n=n0+nt*16+nl; float s=t->bscale?t->bscale[n]:1.0f;
+        f16 *dst=t->bb+((size_t)nt*KT*16*32+(size_t)kt*16*32+(size_t)nl*32);
+        const int8_t *src=t->Bi+(size_t)(k0+kt*32)*N+n;   /* src[kk*N] = element (k0+kt*32+kk, n) */
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        /* NEON: gather the 32 strided (by N) int8, then widen int8->int32->f32, x s (broadcast), ->f16.
+         * The scale is per-channel so constant across the 32 K-values -> a single vdup broadcast. Same ops
+         * (float mul then f16 RNE cast) as the scalar path => BIT-IDENTICAL (validated by jit_inflate_check). */
+        int8_t buf[32]; for(int kk=0;kk<32;kk++) buf[kk]=src[(size_t)kk*N];
+        float32x4_t vs=vdupq_n_f32(s);
+        for(int b=0;b<32;b+=8){
+            int16x8_t i16=vmovl_s8(vld1_s8(buf+b));
+            float32x4_t f0=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(i16))),vs);
+            float32x4_t f1=vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(i16))),vs);
+        #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+            vst1_f16((float16_t*)(dst+b),  vcvt_f16_f32(f0));
+            vst1_f16((float16_t*)(dst+b+4),vcvt_f16_f32(f1));
+        #else
+            float tmp[8]; vst1q_f32(tmp,f0); vst1q_f32(tmp+4,f1);
+            for(int j=0;j<8;j++) dst[b+j]=(f16)tmp[j];
+        #endif
+        }
+#else
+        for(int kk=0;kk<32;kk++) dst[kk]=(f16)((float)src[(size_t)kk*N]*s);
+#endif
     }
 }
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
