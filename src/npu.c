@@ -3381,8 +3381,12 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
                 int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
                 int rows=chunk<M?chunk:M;
-                size_t o=(size_t)rows*eff_cols*4; if(o>maxout)maxout=o;
-                size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
+                /* ORK_F16_CHAIN sizes CC/AF for the WHOLE (N-slice,K-slice) M-tile chain (all M rows staged
+                 * + all tiles' disjoint output blocks held at once), not one tile — mirrors int8's chain-prefill
+                 * sizing below. Harmless (scratch) for non-chained fp16. */
+                int crows = (dt==DT_F16 && getenv("ORK_F16_CHAIN")) ? M : rows;
+                size_t o=(size_t)crows*eff_cols*4; if(o>maxout)maxout=o;
+                size_t sz=(size_t)crows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
             }
         }
         if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
