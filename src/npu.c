@@ -4043,6 +4043,17 @@ static inline int fused_mtile(int K,int M){
     const char*e=getenv("ORK_FUSED_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }  /* A/B override (validation) */
     if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
 }
+/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (synth() uses scale=K/256, vs int8's K/512
+ * since int8 packs 2 rows per CBUF slot) gives the SAME bit-exact M-tile ceiling mg_max*64. The old
+ * ork_mm_run_f16_silu chunk=16 was a stale over-conservative cap far below this (64 @K2048, 320 @K512) —
+ * bit-exact validated (tools/silu_f16_check: M-tile 16==32==64 @K2048, 16==320 @K512, 384>ceil DIFFERS).
+ * ORK_F16_MTILE overrides (validation / probing above the ceiling). */
+static inline int f16_mtile(int K,int M){
+    double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale);
+    int mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0; int chunk = mg_max*64;
+    const char*e=getenv("ORK_F16_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }
+    if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
+}
 int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
                        int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                        const int16_t *lut,int nlut){
@@ -4241,7 +4252,8 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
  * "end-goal" precise on-NPU gate: recovers the full PPL gap the int8 silu output loses (ablation), at the cost
  * of the fp16 matmul (~3.3x int8, tools/f16_gate_bench) — a measured net-loss TODAY, so gated OFF, built out
  * for a future pipeline where it pays off. w = fp16 weight (ork_mm_pack), A = fp16 [M,K], C = fp32 [M,N] silu.
- * K%32, N<=nmax. fp16 M-tile kept <=16 (the validated fp16 tiling; larger fp16 tiles have a latent bug).
+ * K%32, N<=nmax. fp16 M-tile = f16_mtile(K) = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was a stale
+ * chunk=16; the real "latent bug" is only ABOVE that ceiling — bit-exact validated, see f16_mtile / silu_f16_check).
  * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): RUNS on-NPU (no wedge) AND now CALIBRATED accurate —
  * tools/silu_f16_calib cracked it to mean|err|~0.08 / max 0.75 over silu[-8,8] (~1%, on par with int8 silu).
  * CALIBRATION RECIPE (the fp16 program's index only spreads for NEGATIVE acc, so): (1) NEGATE the gate — pack
@@ -4262,7 +4274,7 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     if(DT_F16!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_F16; }
-    int chunk=16; if(chunk>M)chunk=M;                       /* fp16 M-tile <=16 (validated; larger has latent bug) */
+    int chunk=f16_mtile(K,M);   /* fp16 M-tile = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was hardcoded 16, ~4-20x too small); ORK_F16_MTILE overrides */
     size_t maxaf=(size_t)chunk*K*2, maxout=(size_t)chunk*NMAX*4;   /* A fp16 (2B), C fp32 (4B) */
     if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
     if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
