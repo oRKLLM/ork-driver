@@ -164,6 +164,19 @@ ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);
 /* re-tile int8 B into an existing same-shape ork_w (reuses its DMA; no alloc/free) — for pooling
  * reused weights (MoE experts) without churning/fragmenting the NPU IOMMU. 0 ok / -1 / -2 mismatch. */
 int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t *B);
+/* int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom). A gmax-selected "fp16" layer wants
+ * UNQUANTIZED fp16 activations (no act-quant error) but not fp16 WEIGHTS; residing fp16 weights doubles
+ * IOVA. Keep the weight host-side as compact int8 + per-channel bscale, and inflate it into ONE REUSED
+ * fp16 scratch per matmul: resident IOVA = a single scratch (reused across layers), so the fp16-path
+ * layer count is decoupled from the 4GiB IOVA cap and gmax becomes a pure coherence<->speed dial. The
+ * fp16 MAC then runs int8-precision weights against fp16 activations (RK3588 has no native W8A16). */
+/* Allocate a REUSABLE fp16 scratch weight (fp16 tile layout, sized K,N, no data). Run via ork_mm_run /
+ * ork_mm_run_f16_silu after filling; reclaim with ork_mm_free. K%32, N%16. NULL on bad dims / alloc. */
+ork_w       *ork_mm_f16_scratch(ork_npu *ctx, int K, int N);
+/* Fill an fp16 scratch (same K,N) with wf16[k,n]=(f16)((float)i8[k*N+n]*bscale[n]). i8 row-major [K,N];
+ * bscale per-output-channel [N] (NULL => scale 1). In place, no alloc. Tiled bytes are bit-identical to
+ * ork_mm_pack of the row-major dequantized weight. 0/ok, <0 on bad args. */
+int          ork_mm_inflate_i8_to_f16(ork_npu *ctx, ork_w *w, const int8_t *i8, const float *bscale, int K, int N);
 /* NEON-fused pack/repack DIRECTLY from f32[N][K] (n-major): per-channel symmetric int8 quant + tile in
  * one cache-friendly pass (no transpose scratch). Writes per-channel bscale[N]. For dequantizing weight
  * sources (e.g. Q4_K MoE experts via to_float) without the slow strided f32->int8 transpose. */

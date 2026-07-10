@@ -1203,6 +1203,20 @@ static void tile_i8_range(int lo,int hi,void *a){
         t->bb[(size_t)nt*t->KT*1024+(size_t)kt*1024+(size_t)nl*32+kk]=
             t->Bi[(size_t)(t->k0+kt*32+kk)*t->N+(t->n0+nt*32+nl)];
 }
+/* Inflate a contiguous [nt] range of int8 weight columns straight into the fp16 [Nt][Kt][16][32] tile
+ * layout, scaled per-output-channel: wf16 = (f16)((float)i8 * bscale[n]). Same mapping pack() uses for
+ * DT_F16, but the source element is a dequantized int8 code instead of a stored fp16 — so the resulting
+ * tile bytes are BIT-IDENTICAL to ork_mm_pack of the row-major dequantized weight. Emulated W8A16. */
+struct tile_i8f16_arg { f16 *bb; const int8_t *Bi; const float *bscale; int KT, k0, n0, N; };
+static void tile_i8_to_f16_range(int lo,int hi,void *a){
+    struct tile_i8f16_arg *t=a;
+    for(int nt=lo;nt<hi;nt++)for(int kt=0;kt<t->KT;kt++)for(int nl=0;nl<16;nl++){
+        int n=t->n0+nt*16+nl; float s=t->bscale?t->bscale[n]:1.0f;
+        for(int kk=0;kk<32;kk++)
+            t->bb[(size_t)nt*t->KT*16*32+(size_t)kt*16*32+(size_t)nl*32+kk]=
+                (f16)((float)t->Bi[(size_t)(t->k0+kt*32+kk)*t->N+n]*s);
+    }
+}
 static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
     int KS=dt ? int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
@@ -1271,6 +1285,51 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
+
+/* ---- int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom) ----
+ * A gmax-selected "fp16" layer wants UNQUANTIZED activations (fp16 A, no act-quant error) but does NOT
+ * need fp16 WEIGHTS — int8 weights are usually accurate enough, and residing fp16 weights doubles IOVA so
+ * only ~5 layers fit a 4GiB domain. Instead: keep the weight host-side as compact int8 + per-channel
+ * bscale, and inflate it into ONE REUSED fp16 scratch buffer per matmul. Resident IOVA cost = a single
+ * fp16 scratch (reused across all such layers), so the number of fp16-path layers is decoupled from the
+ * IOVA cap and gmax becomes a pure coherence<->speed dial. The fp16 MAC then runs int8-precision weights
+ * against fp16 activations = emulated W8A16 (RK3588 has no native W8A16 datapath). */
+
+/* Allocate a REUSABLE fp16 scratch weight: fp16 tile layout ([Nt][Kt][16][32], KS=soc->ks) sized for
+ * (K,N), buffers init-synced but carrying no data. Fill per-forward with ork_mm_inflate_i8_to_f16 and run
+ * via ork_mm_run / ork_mm_run_f16_silu. Reclaim with ork_mm_free like any packed weight. K%32, N%16.
+ * Returns NULL on bad dims / alloc failure. */
+ork_w *ork_mm_f16_scratch(ork_npu *c,int K,int N){
+    if(K%32||N%16) return NULL;
+    int KS=c->soc->ks, NMAX=c->soc->nmax;
+    int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_F16;w->owns=1;w->domain=ork_dom(c->pack_domain);
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){free(w);return NULL;}
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;(void)k0;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*2,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++)bdestroy(c->fd,&w->Bb[i]); free(w->Bb);free(w);return NULL; }
+        /* fresh buffers need the double init-sync (a single TO leaves the device side uninitialized). */
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return w;
+}
+/* Fill an fp16 scratch (from ork_mm_f16_scratch, same K,N) with wf16[k,n]=(f16)((float)i8[k*N+n]*bscale[n]).
+ * i8 is row-major [K,N]; bscale is per-output-channel [N] (NULL => scale 1). Re-tiles in place (no alloc);
+ * single TO_DEVICE sync per tile (buffers already inited by ork_mm_f16_scratch, like ork_mm_repack_i8).
+ * The tiled bytes are bit-identical to ork_mm_pack of the row-major dequantized weight. 0/ok, <0 on bad args. */
+int ork_mm_inflate_i8_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *bscale,int K,int N){
+    if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
+    if(w->K!=K || w->N!=N || !i8) return -2;
+    int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
+        struct tile_i8f16_arg ta={b->cpu,i8,bscale,KT,k0,n0,N};
+        ork_parallel_for(NN,tile_i8_to_f16_range,&ta);
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return 0;
+}
 
 /* PERSIST. Serialize a packed weight's resident tile bytes (Bb only; Bf is a regenerable decode-only
  * optimization) into `out` in tile order — the on-disk form for pre-packed (.orkpack) weights. Each

@@ -79,6 +79,10 @@ f16_gate_bench: tools/f16_gate_bench.c $(CORE)
 silu_f16_check: tools/silu_f16_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# validate int8 JIT-inflate to fp16 (emulated W8A16) is bit-exact vs a direct fp16 pack.
+jit_inflate_check: tools/jit_inflate_check.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
