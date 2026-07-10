@@ -5394,6 +5394,52 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
          * nextdma==0 (last/no-chain) -> zero both to terminate. cf. run_chain_i8 (0x0014=0x0037 for its 108s). */ \
         if(_d==0x0101&&_a==0x0010){ if(nextdma){ uint32_t _nx=(uint32_t)(nextdma); (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } \
         if(_d==0x0101&&_a==0x0014){ if(nextdma){ uint32_t _na=(uint32_t)(((nextamt)+3)/2); (rc)[k]=0x0014|((_na&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_na>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
+    /* ORK_SM_FULLIMG: FAITHFUL single-delta full-image hardware-chain replay. The vendor's 5 buffers are ONE
+     * contiguous IOVA image (0xfffae000 out, 0xfffb6000 in, 0xfffbe000 scratch, 0xffff8000 regcmd+weights),
+     * and task4's LUT-write (0x4020=0xffffab00) points INTO the regcmd region — a relationship my split
+     * IN/OUT/SCR/LUT/regcmd buffers destroy. Here: ONE big buffer covering the image, every task's regcmd at
+     * its captured offset, and EVERY address blanket-rebased by a SINGLE delta (BIG.dma - 0xfffae000) so all
+     * internal references (chain 0x0010, data addrs, weights, task4->regcmd write) stay consistent. 0x0014
+     * (amount, small) isn't in the addr range so it's preserved. Tasks laid out at the vendor's exact offsets
+     * (capture order), task_number=9, one submit — the maximally-faithful hardware chain. */
+    if(!getenv("ORK_SM_PERTASK")){   /* DEFAULT = single-submit hardware chain (contiguous image, ping-pong off) */
+        double t0=ork_now_us();
+        const uint32_t IB=0xfffae000u, IE=0xfffff000u; size_t ISZ=IE-IB;   /* out|in|scratch|regcmd+wt */
+        static const uint32_t TADDR[9]={0xffffab00u,0xffffad80u,0xffffb000u,0xffffb280u,0xffffb380u,0xffffd600u,0xffffd880u,0xffffdc00u,0xffffde40u};
+        struct buf BIG=bcreate(fd,ISZ,0x403,-1);
+        if(!BIG.cpu){ bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -2; }
+        memset(BIG.cpu,0,ISZ);
+        uint32_t delta=(uint32_t)BIG.dma - IB;
+        memcpy((char*)BIG.cpu + (0xfffb6000u-IB), in, 32768);                       /* input @ h4 */
+        memcpy((char*)BIG.cpu + (0xffffa280u-IB), SM_WT, (size_t)SM_WT_WORDS*4);     /* weights @ 0xffffa280 */
+        int NT=getenv("ORK_SM_NTASK")?atoi(getenv("ORK_SM_NTASK")):9; if(NT<1)NT=1; if(NT>9)NT=9;   /* RE: bisect */
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,(size_t)NT*sizeof *tk);
+        for(int j=0;j<NT;j++){ int t=j; uint32_t *rc=(uint32_t*)((char*)BIG.cpu + (TADDR[j]-IB));   /* capture order = identity */
+            int slot=(j<8)?(int)((TADDR[j+1]-TADDR[j])/4):SM_TASK_WORDS[t]; int nw=SM_TASK_WORDS[t]; if(nw>slot)nw=slot;
+            memcpy(rc,SM_TASKS[t],(size_t)nw*4);
+            for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16; uint32_t v=((rc[k+1]&0xffff)<<16)|(rc[k]>>16);
+                /* BLANKET single-delta rebase: shift EVERY reference into the vendor image by delta. In the
+                 * contiguous-image regime this is correct even for 1001:0x4110 (exp-LUT read ptr into the h2
+                 * staging area) — validated empirically: blanket reaches task5 (counter 5), whitelist only
+                 * task4 (counter 4). 0x0014 (amount, small) is out of [IB,IE) so it's untouched. */
+                if(v>=IB && v<IE){ uint32_t nv=v+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } }
+            tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
+            tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=(uint32_t)BIG.dma + (TADDR[j]-IB);
+        }
+        bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        /* flags=0x1 (RKNPU_JOB_PC only) — match the vendor softmax. The default 0x5 sets RKNPU_JOB_PINGPONG
+         * (0x4) too; ping-pong double-buffers the register banks across tasks, and its bank-swap racing the
+         * LUT-load commit is the flaky task4->task5 stall. The vendor runs softmax with ping-pong OFF. */
+        s.flags=0x1; s.task_number=(uint32_t)NT; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
+        s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT};
+        fprintf(stderr,"[softmax-replay] FULLIMG: %d-task chain, contiguous image, single-delta rebase, PINGPONG OFF (flags=0x1)\n",NT);
+        int r=rknpu_submit_ioctl(fd,&s,-1)?-1:0;
+        if(r==0){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,BIG.cpu,32768); if(us)*us=ork_now_us()-t0; }  /* output @ h5 = BIG+0 */
+        else fprintf(stderr,"[softmax-replay] FULLIMG chain failed\n");
+        bdestroy(fd,&BIG); bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+        return r;
+    }
     /* KERNEL-SEQUENCED (the accel/rocket model): submit each task as its OWN task_number=1 program, in
      * dataflow order 0..8 — one task per PC program, no in-regcmd PC-chain (0101:0x0010) rewriting. Each
      * task is the proven single-task submit path; intermediates persist in the resident SCR/IN/OUT/LUT
@@ -5408,37 +5454,61 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
      * next task (terminate the last), op_idx=0 (memset), and populate ALL THREE subcore_task[]={0,9} (the
      * single-subcore / chain-zeroed / op_idx=1 variants each failed differently). */
     if(getenv("ORK_SM_1SUBMIT")){
-        /* 2-SUBMIT softmax: (1) the LUT-load task4 STANDALONE (it hangs as a hardware-chain member, but
-         * loads the exp LUT into DPU SRAM which persists), then (2) HARDWARE-CHAIN the 8 compute tasks
-         * [0,1,2,3,5,6,7,8] in one submit — task5's exp uses the pre-loaded LUT. The chain works now that
-         * the 0101:0x0014 next-amount is preserved (the run_chain_i8 recipe). ~2 submits vs 9. */
-        static const int C8[8]={0,1,2,3,5,6,7,8};   /* dataflow order minus task4 (the LUT) */
-        /* submit A: LUT-load (task4) standalone */
-        { uint32_t *rc=(uint32_t*)c->regcmd.cpu; int nw=SM_TASK_WORDS[4]; memcpy(rc,SM_TASKS[4],(size_t)nw*4); SM_REBASE(rc,nw,0,0);
-          struct rknpu_task *t=(struct rknpu_task*)c->task.cpu; memset(t,0,sizeof *t);
-          t->enable_mask=SM_TASK_ENABLE[4]; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=SM_TASK_AMT[4]; t->regcmd_addr=c->regcmd.dma;
-          bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x5;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=3000;
-          s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] LUT-load standalone failed\n"); bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -1; } }
-        /* submit B: 8 compute tasks PC-chained (0101:0x0010 -> next, 0x0014 next-amount preserved) */
-        uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[9]; off[0]=0;
-        for(int j=0;j<8;j++) off[j+1]=off[j]+SM_TASK_WORDS[C8[j]];
-        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,8*sizeof *tk);
-        for(int j=0;j<8;j++){ int t=C8[j]; uint32_t *rc=rcbuf+off[j]; int nw=SM_TASK_WORDS[t];
+        /* ONE-submit hardware chain replaying the VENDOR'S EXACT TASK LAYOUT. The vendor places each task's
+         * regcmd at a 64-byte-ALIGNED offset (captured regcmd_addrs 0xffffab00,ad80,b000,b280,b380,d600,d880,
+         * dc00,de40 -> relative words below). My earlier TIGHT packing landed task4 misaligned (+80 mod 128)
+         * -> hung entering task4; the vendor's aligned layout is what the hardware chain-walk needs. Capture
+         * order (0,1,..,8) so 0x0014 next-amounts match; chain 0x0010 -> next task's aligned offset. */
+        static const int VOFF[9]={0,160,320,480,544,2752,2912,3136,3280};   /* vendor relative offsets (words) */
+        /* ORK_SM_SPLIT: TWO hardware-chained submits split at the task4->task5 wall (the LUT-load->exp
+         * transition that hangs in one chain): submit A = tasks [0..4] (loads the exp LUT into DPU SRAM),
+         * submit B = tasks [5..8] (exp uses the persisted LUT). The submit boundary lets the LUT SRAM commit
+         * and re-arms the PC cleanly for task5. Both chains use the vendor-aligned layout + 0x0014 recompute. */
+        if(getenv("ORK_SM_SPLIT")){
+            static const int SEG[2][2]={{0,5},{5,9}};   /* [start,end) task index ranges */
+            for(int seg=0; seg<2 && rc_ret==0; seg++){ int s0=SEG[seg][0], s1=SEG[seg][1], ntt=s1-s0;
+                uint32_t *rcb=(uint32_t*)c->regcmd.cpu;
+                /* SEGMENT-LOCAL offsets from 0 (each submit starts its regcmd at c->regcmd.dma+0, where task5
+                 * works in the per-task path), preserving the vendor SLOT sizes (=aligned spacing). */
+                int loc[6]={0}; for(int j=0;j<ntt;j++){ int gi=s0+j; int slot=(gi<8)?(VOFF[gi+1]-VOFF[gi]):SM_TASK_WORDS[ORDER[gi]]; loc[j+1]=loc[j]+slot; }
+                struct rknpu_task *tks=(struct rknpu_task*)c->task.cpu; memset(tks,0,(size_t)ntt*sizeof *tks);
+                for(int j=0;j<ntt;j++){ int gi=s0+j, t=ORDER[gi]; uint32_t *rc=rcb+loc[j];
+                    int slot=loc[j+1]-loc[j]; int nw=SM_TASK_WORDS[t]; if(nw>slot)nw=slot;
+                    memcpy(rc,SM_TASKS[t],(size_t)nw*4);
+                    uint32_t nextdma=(j<ntt-1)?(uint32_t)(c->regcmd.dma+(size_t)loc[j+1]*4):0u;
+                    SM_REBASE(rc,nw,nextdma,(j<ntt-1)?SM_TASK_AMT[ORDER[gi+1]]:0);
+                    tks[j].enable_mask=SM_TASK_ENABLE[t]; tks[j].int_mask=0x300; tks[j].int_clear=0x1ffff;
+                    tks[j].regcfg_amount=SM_TASK_AMT[t]; tks[j].regcmd_addr=c->regcmd.dma+(size_t)loc[j]*4;
+                }
+                bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                struct rknpu_submit s; memset(&s,0,sizeof s);
+                s.flags=0x5; s.task_number=(uint32_t)ntt; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
+                s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)ntt};
+                if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] SPLIT seg %d ([%d,%d)) failed\n",seg,s0,s1); rc_ret=-1; }
+            }
+            fprintf(stderr,"[softmax-replay] 2SUBMIT-SPLIT: chain [0..4] + chain [5..8] (vendor-aligned)\n");
+            if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+            bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+            return rc_ret;
+        }
+        int NT=getenv("ORK_SM_NTASK")?atoi(getenv("ORK_SM_NTASK")):9; if(NT<1)NT=1; if(NT>9)NT=9;  /* RE: bisect */
+        uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu;
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,(size_t)NT*sizeof *tk);
+        for(int j=0;j<NT;j++){ int t=ORDER[j]; uint32_t *rc=rcbuf+VOFF[j];
+            int slot=(j<8)?(VOFF[j+1]-VOFF[j]):SM_TASK_WORDS[t]; int nw=SM_TASK_WORDS[t]; if(nw>slot)nw=slot;  /* fit the slot */
             memcpy(rc,SM_TASKS[t],(size_t)nw*4);
-            uint32_t nextdma=(j<7)?(uint32_t)(c->regcmd.dma+(size_t)off[j+1]*4):0u;
-            SM_REBASE(rc,nw,nextdma,(j<7)?SM_TASK_AMT[C8[j+1]]:0);
+            uint32_t nextdma=(j<NT-1)?(uint32_t)(c->regcmd.dma+(size_t)VOFF[j+1]*4):0u;
+            SM_REBASE(rc,nw,nextdma,(j<NT-1)?SM_TASK_AMT[ORDER[j+1]]:0);
             tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
-            tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)off[j]*4;
+            tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)VOFF[j]*4;
         }
         bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
-        s.flags=0x5; s.task_number=8; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
-        s.subcore_task[0]=(struct rknpu_subcore_task){0,8};
-        fprintf(stderr,"[softmax-replay] 2SUBMIT: LUT standalone + 8-task compute chain\n");
-        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 8-task compute chain failed\n"); rc_ret=-1; }
+        s.flags=0x5; s.task_number=(uint32_t)NT; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
+        s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT};
+        fprintf(stderr,"[softmax-replay] 1SUBMIT: %d-task hardware chain, vendor-exact aligned layout\n",NT);
+        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 9-task chain failed\n"); rc_ret=-1; }
         if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
         bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
         return rc_ret;

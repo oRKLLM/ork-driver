@@ -184,6 +184,18 @@ Cross-referencing these three turned numeric RE into named, understood behavior 
 default move when a hardware question blocks progress. Findings from it belong on the wiki
 [regcmd ISA Reference](https://github.com/oRKLLM/ork-driver/wiki) / `NPU-Quirks`.
 
+**Multi-task hardware chaining (one submit, `task_number>1`).** The kernel programs the PC from the FIRST task
+only; the hardware then walks the chain per task via the in-regcmd descriptor `0101:0x0010` (next regcmd addr) +
+`0101:0x0014` (next register-amount `=(n+3)/2`). Rules for chaining a heterogeneous op-graph (softmax, fused
+attention, norms) — full write-up: wiki *Exp-2026-07-10 Forward Softmax and RKNPU Chaining*:
+- recompute `0x0014` for the actual next task (zeroing it hangs at transition 1);
+- task stride is content-driven (slot ≥ each task's regcmd), NOT fixed alignment;
+- replay a contiguous single-buffer image with a single-delta rebase (some ops write INTO the regcmd region);
+- **ping-pong OFF (`submit flags = RKNPU_JOB_PC = 0x1`, not `0x5`) for any chain with a LUT-load** — ping-pong
+  (`RKNPU_JOB_PINGPONG`, `1<<2`) swaps register banks the instant a task's *register config* is done, racing a
+  LUT-load's SRAM-commit side effect (non-deterministic stall). `run_chain_i8` keeps `0x5` only because uniform
+  int8-matmul tasks are register-config-only. See `NPU-Quirks` "Ping-pong races a chained task's side effect".
+
 ---
 
 ## 5. Constraints & scope
