@@ -4022,7 +4022,12 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
-    if(dt!=c->last_dt){ if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->ccsz=0; c->last_dt=dt; }
+    /* ORK_MIXED_NOTHRASH extended to fp16: don't ccsz=0 (which forces a Cc REALLOC) on a dtype switch — under
+     * near-full-domain IOVA pressure that per-layer realloc bcreate-FAILS -> run() returns -1 (single-core) or
+     * races the reset -> WEDGE (multi-core). Reusing the (per-domain, dom_activate-swapped) Cc when it still
+     * fits avoids both. warmed=0 still re-warms (handles the stale-first-output). The realloc guard below still
+     * reallocs on a genuine size grow. */
+    if(dt!=c->last_dt){ if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt)) act(fd,RKNPU_ACT_RESET,0); c->warmed=0; if(!ork_nothrash())c->ccsz=0; c->last_dt=dt; }
     size_t need=(size_t)M*N*4;                         /* output is fp32 or int32 (both 4 bytes) */
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;}
     memset(c->cres,0,need);
@@ -4421,7 +4426,7 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     if(K%32 || N%16 || N>NMAX) return -2;
     if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
-    if(DT_F16!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_F16; }
+    if(DT_F16!=c->last_dt){ c->warmed=0; if(!ork_nothrash())c->ccsz=0; c->last_dt=DT_F16; }   /* NOTHRASH: reuse Cc, no realloc under IOVA pressure (see run()) */
     int chunk=f16_mtile(K,M);   /* fp16 M-tile = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was hardcoded 16, ~4-20x too small); ORK_F16_MTILE overrides */
     size_t maxaf=(size_t)chunk*K*2, maxout=(size_t)chunk*NMAX*4;   /* A fp16 (2B), C fp32 (4B) */
     if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
