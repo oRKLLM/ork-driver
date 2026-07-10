@@ -4347,6 +4347,46 @@ static double f16lut_silu(double x, void *ctx){ (void)ctx; return silu_f(x); }
 struct f16lut_rsqrt_ctx { int n_feat; double eps; };
 static double f16lut_rsqrt(double x, void *ctx){ struct f16lut_rsqrt_ctx *p=ctx; return 1.0/sqrt(x/(double)p->n_feat + p->eps); }
 
+/* ---- FUSED matmul + output-stage activation: C = fn(A·B) in ONE submit (the "no-crossing chain") --------
+ * The activation rides the matmul's DPU output stage — no separate activation submit, no CPU<->NPU crossing,
+ * no mode-switch re-warm. This is the ONLY regime where an on-NPU non-matmul op beats CPU/NEON (a standalone
+ * op is submit-floor-bound; see RE-roadmap M4.6). Mechanism: build the fn PWL LUT over the matmul-output range
+ * [in_lo,in_hi] (ork_mm_build_f16_lut), pack the weight as -S*B so acc=-S*(A·B) lands in the fp16 index-spread
+ * band, run the fused-LUT matmul (ork_mm_run_f16_silu is fn-agnostic — it applies whatever LUT it's given),
+ * then recover fn(x)=C*out_scale. This is what realizes on-NPU softmax(exp)/RMSNorm(rsqrt)/SwiGLU(silu) as a
+ * fused output stage rather than a losing standalone op. The matmul output MUST fall in [in_lo,in_hi] (the
+ * LUT's calibrated band; values outside clamp to the edge). Single tile: K%32<=2048, N%16<=nmax. rk3588
+ * PPU-fuse-gated. 0/ok, -2 shape/SoC(PPU off), -1 wedge/alloc. `w_scratch` unused (kept for ABI clarity). */
+/* negate trampoline: build the LUT for g(u)=fn(-u) so a NEGATIVE-input range maps to positive u (the builder
+ * needs positive input, and the fp16 SDP index only spreads one sign). */
+struct f16act_neg { double (*fn)(double,void*); void *ctx; };
+static double f16act_negtramp(double u, void *p){ struct f16act_neg *q=p; return q->fn(-u,q->ctx); }
+
+int ork_mm_run_f16_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
+                       double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
+    if(!ork_ppu_fuse_enabled(c)) return -2;
+    if(!c||!B||!A||!C||!fn||K%32||N%16||M<1||in_hi<=in_lo) return -2;
+    /* SINGLE-SIGNED only: the fp16 SDP index spreads for negative acc only, so acc=scale*(A·B) must be kept
+     * negative across the whole output range. Positive-input fns (rsqrt of ss): pack -S*B (acc=-S*x<0).
+     * Negative-input fns (softmax exp of scores-max<=0): build g(u)=fn(-u) over positive u and pack +S*B
+     * (acc=+S*x<0). Mixed-sign output can't be served by one fp16 LUT (needs two) -> -2. */
+    double packsign, blo, bhi; double (*bfn)(double,void*); void *bctx; struct f16act_neg neg;
+    if(in_lo >= 0){ bfn=fn; bctx=fnctx; blo=in_lo; bhi=in_hi; packsign=-1.0; }
+    else if(in_hi <= 0){ neg.fn=fn; neg.ctx=fnctx; bfn=f16act_negtramp; bctx=&neg; blo=-in_hi; bhi=-in_lo; packsign=+1.0; }
+    else return -2;   /* mixed sign — unsupported by the single-signed fp16 index */
+    int16_t *lut=malloc(1030*sizeof(int16_t)); if(!lut) return -1;
+    double S=0,R=0,osc=0;
+    if(ork_mm_build_f16_lut(c,bfn,bctx,blo,bhi,lut,&S,&R,&osc)){ free(lut); return -2; }
+    ork_f16 *Bs=malloc((size_t)K*N*sizeof(ork_f16)); if(!Bs){ free(lut); return -1; }
+    for(size_t i=0;i<(size_t)K*N;i++) Bs[i]=(ork_f16)(packsign*S*(double)(float)B[i]);   /* acc = packsign*S*(A·B) < 0 */
+    ork_w *w=ork_mm_pack(c,K,N,Bs); free(Bs);
+    if(!w){ free(lut); return -1; }
+    int rc = ork_mm_run_f16_silu(c,w,M,A,C,0,0xffffc000u,0x56391100u,lut,1030);   /* matmul + fused LUT, 1 submit */
+    if(rc==0) for(size_t i=0;i<(size_t)M*N;i++) C[i]=(float)((double)C[i]*osc);   /* recover fn(A·B) */
+    ork_mm_free(c,w); free(lut);
+    return rc;
+}
+
 /* Thin wrapper: fused SiLU LUT for a gate spanning [-Gmax,Gmax]. Caps Gmax (ORK_F16_GCAP, default 40) so S
  * stays in the fp16 index-spread band (a wide range collapses the mapping), then defers to the generic
  * builder. silu(gate) = C_out*out_scale at runtime; pack the gate weight as -S*W. See Exp-2026-07-05. */
@@ -5358,27 +5398,33 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
      * the earlier hardware-chained (task_number=9 + 0101 chain) attempts stalled at the chained LUT load. */
     static const int ORDER[9]={0,1,2,3,4,5,6,7,8};   /* capture/dataflow order */
     int rc_ret=0; double t0=ork_now_us();
-    /* ORK_SM_1SUBMIT: the CHEAP form we WANT — ONE ioctl, task_number=9, one submit-floor cost instead of 9x.
-     * RESULT (2026-07-10): FAILS on the rknpu vendor driver (errno=110). Unlike mainline accel/rocket (which
-     * kernel-re-arms each task on its completion IRQ within one job), the rknpu driver does NOT kernel-iterate
-     * a task_number=N job from just the descriptor array — it relies on the hardware PC-chain (0101:0x0010),
-     * and that chain stalls at the LUT-load task (task4 DMA read error). So on rknpu the per-task loop below
-     * (9 separate ioctls, 9x floor ~2ms) is the only working form; the cheap single-submit needs the
-     * LUT-in-hardware-chain fix. Kept gated for the chaining-audit follow-up. */
+    /* ORK_SM_1SUBMIT: the CHEAP hardware-chained form — ONE ioctl, task_number=9, ~one submit-floor cost.
+     * The vendor runs softmax exactly this way (captured task_number=27), so it IS possible on rknpu. Replicate
+     * the PROVEN run_chain/run_multicore recipe EXACTLY: concat regcmds, REWRITE the 0101:0x0010 chain to the
+     * next task (terminate the last), op_idx=0 (memset), and populate ALL THREE subcore_task[]={0,9} (the
+     * single-subcore / chain-zeroed / op_idx=1 variants each failed differently). */
     if(getenv("ORK_SM_1SUBMIT")){
         uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[10]; off[0]=0;
         for(int t=0;t<9;t++) off[t+1]=off[t]+SM_TASK_WORDS[t];
         struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,9*sizeof *tk);
         for(int j=0;j<9;j++){ int t=ORDER[j]; uint32_t *rc=rcbuf+off[j]; int nw=SM_TASK_WORDS[t];
-            memcpy(rc,SM_TASKS[t],(size_t)nw*4); SM_REBASE(rc,nw,0);   /* zero the 0101 chain */
-            tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
+            memcpy(rc,SM_TASKS[t],(size_t)nw*4);
+            uint32_t nextdma=(j<8)?(uint32_t)(c->regcmd.dma+(size_t)off[j+1]*4):0u;   /* chain -> next, 0=terminate */
+            SM_REBASE(rc,nw,nextdma);
+            tk[j].enable_mask=SM_TASK_ENABLE[t];
+            /* int_mask = union of DPU completion (0x300) AND the LUT-load task's completion bits (0xc0000000).
+             * The kernel log showed task4 (LUT) signals raw_status 0xc0000000 (bits 30,31), NOT 0x300, so a
+             * 0x300-only wait misses it and the chain stalls at task4. Compute tasks never raise 30,31, so the
+             * union is safe. (This is the "per-task interrupt mask" the Feb-2026 rocket patch adds.) */
+            tk[j].int_mask=0xc0000300u; tk[j].int_clear=0x1ffff;
             tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)off[j]*4;
         }
         bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
         s.flags=0x5; s.task_number=9; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK;
-        s.fence_fd=-1; s.timeout=3000; s.subcore_task[0]=(struct rknpu_subcore_task){0,9};
+        s.fence_fd=-1; s.timeout=3000;
+        s.subcore_task[0]=(struct rknpu_subcore_task){0,9};   /* single subcore: all-three makes them contend on identical output */
         if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 1submit task_number=9 failed\n"); rc_ret=-1; }
         if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
         bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);

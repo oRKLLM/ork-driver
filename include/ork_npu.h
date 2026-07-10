@@ -341,6 +341,13 @@ int          ork_mm_run_f16_silu(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A
 int          ork_mm_build_f16_lut(ork_npu *ctx, double (*fn)(double, void *), void *fnctx,
                                   double in_lo, double in_hi, short *lut,
                                   double *S_out, double *R_out, double *out_scale_out);
+/* FUSED matmul + output-stage activation: C[M,N] = fn(A·B) in ONE submit — the activation rides the matmul's
+ * DPU output stage (no separate submit, no CPU<->NPU crossing). This is the "no-crossing chain" that makes an
+ * on-NPU non-matmul op (softmax exp / RMSNorm rsqrt / SwiGLU silu) a WIN instead of a submit-floor-bound loss.
+ * fn(x,ctx) is the activation; the matmul output must fall in [in_lo,in_hi] (the LUT band). K%32<=2048,
+ * N%16<=nmax. rk3588 PPU-fuse-gated. 0/ok, -2 shape/SoC(PPU off), -1 wedge/alloc. */
+int          ork_mm_run_f16_act(ork_npu *ctx, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
+                                double (*fn)(double, void *), void *fnctx, double in_lo, double in_hi);
 /* Calibrate the fp16 fused SiLU for a gate spanning [-Gmax,Gmax] (caps Gmax → the fp16 spread band, then
  * ork_mm_build_f16_lut). silu(gate)=C_out*out_scale; pack the gate weight as -S*W. See Exp-2026-07-05. */
 int          ork_mm_build_f16_silu_lut(ork_npu *ctx, double Gmax, short *lut,

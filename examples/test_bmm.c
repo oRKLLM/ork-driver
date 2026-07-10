@@ -196,6 +196,38 @@ static int test_attn_strided(ork_npu *npu, int is_i8, int H, int T, int D, int T
     return fail;
 }
 
+/* fused matmul+activation reference fns (ork_mm_run_f16_act signature: double fn(double,void*)) */
+static double fa_exp (double x,void*c){ (void)c; return exp(x); }
+static double fa_silu(double x,void*c){ (void)c; return x/(1.0+exp(-x)); }
+static double fa_gelu(double x,void*c){ (void)c; return 0.5*x*(1.0+erf(x/1.4142135623730951)); }
+extern int ork_mm_run_f16_act(ork_npu*,int,int,const ork_f16*,int,const ork_f16*,float*,double(*)(double,void*),void*,double,double);
+
+/* Fused matmul + output-stage activation: C = fn(A·B) in ONE submit (no CPU<->NPU crossing). Validates the
+ * no-crossing chain — the fused-output mechanism that makes on-NPU softmax(exp)/RMSNorm(rsqrt)/SwiGLU(silu)
+ * a win. Small A,B so A·B is bounded; the LUT band = the measured [min,max] of A·B. rk3588 PPU-fuse-gated. */
+static int test_fused_act(ork_npu *npu, int M, int K, int N, int which){
+    const char *nm = which==0?"fused-exp":which==1?"fused-silu":"fused-gelu";
+    double (*fn)(double,void*) = which==0?fa_exp:which==1?fa_silu:fa_gelu;
+    ork_f16 *A=malloc((size_t)M*K*2), *B=malloc((size_t)K*N*2);
+    float *C=calloc((size_t)M*N,4), *ref=malloc((size_t)M*N*sizeof(float));
+    /* single-signed A·B (< 0) — the fp16 fused output stage indexes one sign only; this matches softmax's
+     * exp(scores-max) with scores-max <= 0. A>=0, B<=0 => A·B <= 0. */
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=f2h((rand()/(float)RAND_MAX)*0.12f);
+    for(size_t i=0;i<(size_t)K*N;i++) B[i]=f2h(-(rand()/(float)RAND_MAX)*0.12f);
+    double lo=1e30,hi=-1e30, *acc=malloc((size_t)M*N*sizeof(double));
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double s=0; for(int k=0;k<K;k++) s+=h2f(A[(size_t)m*K+k])*h2f(B[(size_t)k*N+n]);
+        acc[(size_t)m*N+n]=s; if(s<lo)lo=s; if(s>hi)hi=s; }
+    for(size_t i=0;i<(size_t)M*N;i++) ref[i]=(float)fn(acc[i],NULL);
+    int rc=ork_mm_run_f16_act(npu,K,N,B,M,A,C,fn,NULL,lo,hi);
+    int fail=0;
+    if(rc==-2){ fprintf(stderr,"[%s] SKIP (PPU fuse off / shape)\n",nm); }
+    else if(rc){ fprintf(stderr,"[%s] rc=%d\n",nm,rc); fail=1; }
+    else { double maxrel=0; size_t worst=0; for(size_t i=0;i<(size_t)M*N;i++){ double d=fabs((double)C[i]-ref[i]); double r=d/(fabs(ref[i])+1e-2); if(r>maxrel){maxrel=r;worst=i;} }
+        if(maxrel>0.06){ fprintf(stderr,"[%s] MISMATCH maxrel=%.4f at %zu (got %.4f want %.4f, A·B∈[%.2f,%.2f])\n",nm,maxrel,worst,C[worst],ref[worst],lo,hi); fail=1; }
+        else fprintf(stderr,"[%s] OK M=%d K=%d N=%d (maxrel=%.4f, 1-submit fused, A·B∈[%.2f,%.2f])\n",nm,M,K,N,maxrel,lo,hi); }
+    free(A);free(B);free(C);free(ref);free(acc); return fail;
+}
+
 int main(void){
     srand(1234);
     ork_npu *npu = ork_npu_init();
@@ -215,6 +247,9 @@ int main(void){
     fail |= test_attn_strided(npu, 1, 8, 16, 64, 32);   /* strided QKᵀ i8:  permuted-Q + KV-cache view, head_dim=64 */
     fail |= test_attn_strided(npu, 0, 8, 16, 64, 32);   /* strided QKᵀ f16: 8 heads T=16 head_dim=64 Tkv=32 */
     fail |= test_attn_strided(npu, 0, 4, 16, 128, 32);  /* strided QKᵀ f16: head_dim=128 */
+    fail |= test_fused_act(npu, 8, 512, 64, 0);         /* C=exp(A·B) fused in the matmul output stage (softmax) */
+    fail |= test_fused_act(npu, 8, 512, 64, 1);         /* C=silu(A·B) fused (SwiGLU) */
+    fail |= test_fused_act(npu, 8, 512, 64, 2);         /* C=gelu(A·B) fused */
     ork_npu_free(npu);
     fprintf(stderr, fail ? "\nTEST_BMM: FAIL\n" : "\nTEST_BMM: PASS\n");
     return fail ? 1 : 0;
