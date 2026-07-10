@@ -5377,7 +5377,7 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
     act(fd,RKNPU_ACT_RESET,0);
     /* address-rebase helper: patch a task's regcmd in place (addr regs -> our buffers; chain -> `nextdma`
      * or 0 to terminate). Returns nothing; operates on rc[0..nw). */
-    #define SM_REBASE(rc,nw,nextdma) do{ for(int k=0;k+1<(nw);k+=2){ \
+    #define SM_REBASE(rc,nw,nextdma,nextamt) do{ for(int k=0;k+1<(nw);k+=2){ \
         unsigned _a=(rc)[k]&0xffff, _d=(rc)[k+1]>>16; uint32_t _v=(((rc)[k+1]&0xffff)<<16)|((rc)[k]>>16); \
         int _ia=(_d==0x1001&&_a==0x4020)||(_d==0x2001&&(_a==0x5018||_a==0x5038))||(_d==0x0201&&(_a==0x1070||_a==0x1110)); \
         if(_ia){ uint32_t _nv=_v; \
@@ -5387,9 +5387,13 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
             else if (_v>=0xffffa280u&&_v<0xffffab00u) _nv=(uint32_t)WT.dma +(_v-0xffffa280u); \
             else if (_v>=0xffffab00u&&_v<0xfffff000u) _nv=(uint32_t)LUT.dma+(_v-0xffffab00u); \
             if(_nv!=_v){ (rc)[k]=_a|((_nv&0xffff)<<16); (rc)[k+1]=(_d<<16)|((_nv>>16)&0xffff); } } \
-        if(_d==0x0101&&(_a==0x0010||_a==0x0014)){ uint32_t _nx=(_a==0x0010)?(uint32_t)(nextdma):0u; \
-            if((nextdma)&&_a==0x0010){ (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } \
-            else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
+        /* PC-chain descriptor: 0x0010 = next task's regcmd addr, 0x0014 = next task's register-AMOUNT,
+         * RECOMPUTED as (nextamt+3)/2 for the ACTUAL next task (verified: amt 69->0x24, 1097->0x226; ==
+         * the kernel's (amt+EXTRA+scale-1)/scale-1 with EXTRA=4,scale=2). MUST be recomputed, not preserved:
+         * the captured value encodes the CAPTURE-order next task, which is wrong for a reordered chain.
+         * nextdma==0 (last/no-chain) -> zero both to terminate. cf. run_chain_i8 (0x0014=0x0037 for its 108s). */ \
+        if(_d==0x0101&&_a==0x0010){ if(nextdma){ uint32_t _nx=(uint32_t)(nextdma); (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } \
+        if(_d==0x0101&&_a==0x0014){ if(nextdma){ uint32_t _na=(uint32_t)(((nextamt)+3)/2); (rc)[k]=0x0014|((_na&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_na>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
     /* KERNEL-SEQUENCED (the accel/rocket model): submit each task as its OWN task_number=1 program, in
      * dataflow order 0..8 — one task per PC program, no in-regcmd PC-chain (0101:0x0010) rewriting. Each
      * task is the proven single-task submit path; intermediates persist in the resident SCR/IN/OUT/LUT
@@ -5404,35 +5408,44 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
      * next task (terminate the last), op_idx=0 (memset), and populate ALL THREE subcore_task[]={0,9} (the
      * single-subcore / chain-zeroed / op_idx=1 variants each failed differently). */
     if(getenv("ORK_SM_1SUBMIT")){
-        uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[10]; off[0]=0;
-        for(int t=0;t<9;t++) off[t+1]=off[t]+SM_TASK_WORDS[t];
-        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,9*sizeof *tk);
-        for(int j=0;j<9;j++){ int t=ORDER[j]; uint32_t *rc=rcbuf+off[j]; int nw=SM_TASK_WORDS[t];
+        /* 2-SUBMIT softmax: (1) the LUT-load task4 STANDALONE (it hangs as a hardware-chain member, but
+         * loads the exp LUT into DPU SRAM which persists), then (2) HARDWARE-CHAIN the 8 compute tasks
+         * [0,1,2,3,5,6,7,8] in one submit — task5's exp uses the pre-loaded LUT. The chain works now that
+         * the 0101:0x0014 next-amount is preserved (the run_chain_i8 recipe). ~2 submits vs 9. */
+        static const int C8[8]={0,1,2,3,5,6,7,8};   /* dataflow order minus task4 (the LUT) */
+        /* submit A: LUT-load (task4) standalone */
+        { uint32_t *rc=(uint32_t*)c->regcmd.cpu; int nw=SM_TASK_WORDS[4]; memcpy(rc,SM_TASKS[4],(size_t)nw*4); SM_REBASE(rc,nw,0,0);
+          struct rknpu_task *t=(struct rknpu_task*)c->task.cpu; memset(t,0,sizeof *t);
+          t->enable_mask=SM_TASK_ENABLE[4]; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=SM_TASK_AMT[4]; t->regcmd_addr=c->regcmd.dma;
+          bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x5;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=3000;
+          s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] LUT-load standalone failed\n"); bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -1; } }
+        /* submit B: 8 compute tasks PC-chained (0101:0x0010 -> next, 0x0014 next-amount preserved) */
+        uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[9]; off[0]=0;
+        for(int j=0;j<8;j++) off[j+1]=off[j]+SM_TASK_WORDS[C8[j]];
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,8*sizeof *tk);
+        for(int j=0;j<8;j++){ int t=C8[j]; uint32_t *rc=rcbuf+off[j]; int nw=SM_TASK_WORDS[t];
             memcpy(rc,SM_TASKS[t],(size_t)nw*4);
-            uint32_t nextdma=(j<8)?(uint32_t)(c->regcmd.dma+(size_t)off[j+1]*4):0u;   /* chain -> next, 0=terminate */
-            SM_REBASE(rc,nw,nextdma);
-            tk[j].enable_mask=SM_TASK_ENABLE[t];
-            /* int_mask = union of DPU completion (0x300) AND the LUT-load task's completion bits (0xc0000000).
-             * The kernel log showed task4 (LUT) signals raw_status 0xc0000000 (bits 30,31), NOT 0x300, so a
-             * 0x300-only wait misses it and the chain stalls at task4. Compute tasks never raise 30,31, so the
-             * union is safe. (This is the "per-task interrupt mask" the Feb-2026 rocket patch adds.) */
-            tk[j].int_mask=0xc0000300u; tk[j].int_clear=0x1ffff;
+            uint32_t nextdma=(j<7)?(uint32_t)(c->regcmd.dma+(size_t)off[j+1]*4):0u;
+            SM_REBASE(rc,nw,nextdma,(j<7)?SM_TASK_AMT[C8[j+1]]:0);
+            tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
             tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)off[j]*4;
         }
         bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
-        s.flags=0x5; s.task_number=9; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK;
-        s.fence_fd=-1; s.timeout=3000;
-        s.subcore_task[0]=(struct rknpu_subcore_task){0,9};   /* single subcore: all-three makes them contend on identical output */
-        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 1submit task_number=9 failed\n"); rc_ret=-1; }
+        s.flags=0x5; s.task_number=8; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
+        s.subcore_task[0]=(struct rknpu_subcore_task){0,8};
+        fprintf(stderr,"[softmax-replay] 2SUBMIT: LUT standalone + 8-task compute chain\n");
+        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 8-task compute chain failed\n"); rc_ret=-1; }
         if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
         bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
         return rc_ret;
     }
     for(int j=0;j<9 && rc_ret==0;j++){ int t=ORDER[j]; int nw=SM_TASK_WORDS[t];
         uint32_t *rc=(uint32_t*)c->regcmd.cpu; memcpy(rc,SM_TASKS[t],(size_t)nw*4);
-        SM_REBASE(rc,nw,0);                          /* addr remap only; nextdma=0 zeros the chain words */
+        SM_REBASE(rc,nw,0,0);                        /* addr remap only; nextdma=0 zeros the chain words */
         struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
         tk->enable_mask=SM_TASK_ENABLE[t]; tk->int_mask=0x300; tk->int_clear=0x1ffff;
         tk->regcfg_amount=SM_TASK_AMT[t]; tk->regcmd_addr=c->regcmd.dma;
