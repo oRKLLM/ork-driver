@@ -3113,7 +3113,7 @@ static void *mcworker(void *vp){
         int Ncore = active ? (t1-t0)*nt_sz : nt_sz;
         int coff = active ? t0*nt_sz : 0;
         for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }   /* ORK_F16_HISCHED: extend the fp16 sched window to include Kp=2048 -> chunk=mg_max*64=64 (not 8), streaming the weight ONCE per 64 rows instead of 8x. The silu path already runs sched=1 at Kp=2048 bit-exact (validated). Validate the PLAIN matmul via test_matmul before default-on. */
             double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
             struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)(active?t0:0)*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
@@ -3376,7 +3376,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             int eff_cols = active ? cols : nt_sz;
             for(int k0=0;k0<K;k0+=KS){
                 int Kp=(K-k0<KS)?(K-k0):KS;
-                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
+                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048));   /* match the ORK_F16_HISCHED chunk window so maxout sizing tracks the larger fp16 M-tile */
                 int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
                 double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
                 int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
@@ -3950,7 +3950,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t maxout=0, maxaf=0;
     for(int k0=0;k0<K;k0+=KS){
         int Kp=(K-k0<KS)?(K-k0):KS;
-        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
+        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048));
         int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
@@ -4042,7 +4042,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
+        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
  * extrapolates too HIGH for small Kp (K=64->0x1040=188, K=32->190) and miscomputes (constant-garbage output),
  * and at Kp>=2048 it miscomputes >8 rows (mc<=8 OK / mc>=9 garbage). Outside the window, sched=0 (the general
  * path, no 0x1040 override) is correct — e.g. non-pow2 K=96 already took sched=0. Gates: Kp>=128 (low, fixes
