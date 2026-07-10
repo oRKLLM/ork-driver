@@ -40,7 +40,7 @@ int main(void){
     }
     printf("nonzero=%d/%d  near(1/64=%.5f)=%d  maxerr(nonzero)=%.5f\n", nz,total, want, near, maxerr);
     int ok = near > total/4;   /* a good chunk should be ~1/64 (padding positions may be 0) */
-    printf("SOFTMAX_REPLAY: %s\n", ok?"PASS (forward softmax drives on-NPU, PC-chained)":"CHECK (see distribution)");
+    printf("SOFTMAX_REPLAY: %s\n", ok?"PASS (forward softmax drives on-NPU, kernel-sequenced 9-task graph)":"CHECK (see distribution)");
     ork_npu_free(c);
     return ok?0:1;
 }

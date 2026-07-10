@@ -5350,33 +5350,28 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
         if(_d==0x0101&&(_a==0x0010||_a==0x0014)){ uint32_t _nx=(_a==0x0010)?(uint32_t)(nextdma):0u; \
             if((nextdma)&&_a==0x0010){ (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } \
             else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
-    /* ONE submit, all 9 tasks PC-chained in capture order (vendor-faithful — the LUT load is task4 IN the
-     * chain, NOT a separate submit): 0,1=max 2=bcast 3=x-max 4=expLUT 5=exp 6=Sum(=exp.ones, MATMUL right
-     * after the exp SDP op) 7=1/S 8=out. Proves the activation->matmul asymmetry is a per-submit-boundary
-     * effect. Every register VALUE is vendor-validated; only DATA addresses + the 0101 chain are rebased. */
-    uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[10]; off[0]=0;
-    for(int t=0;t<9;t++) off[t+1]=off[t]+SM_TASK_WORDS[t];
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,9*sizeof *tk);
-    for(int t=0;t<9;t++){ uint32_t *rc=rcbuf+off[t]; int nw=SM_TASK_WORDS[t];
-        memcpy(rc,SM_TASKS[t],(size_t)nw*4);
-        uint32_t nextdma=(t<8)?(uint32_t)(c->regcmd.dma+(size_t)off[t+1]*4):0u;
-        SM_REBASE(rc,nw,nextdma);
-        /* NOTE: op_idx=0 (matching the working run_chain scaffold) gets furthest (task counter 4). op_idx=1
-         * — though the vendor DUMP shows it — REGRESSED to counter 1, so the chain semantics are NOT a naive
-         * field match to the capture (see FWD_SOFTMAX_RE_WIP.md "EMIT ATTEMPT"). */
-        tk[t].enable_mask=SM_TASK_ENABLE[t]; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
-        tk[t].regcfg_amount=SM_TASK_AMT[t]; tk[t].regcmd_addr=c->regcmd.dma+(size_t)off[t]*4;
+    /* KERNEL-SEQUENCED (the accel/rocket model): submit each task as its OWN task_number=1 program, in
+     * dataflow order 0..8 — one task per PC program, no in-regcmd PC-chain (0101:0x0010) rewriting. Each
+     * task is the proven single-task submit path; intermediates persist in the resident SCR/IN/OUT/LUT
+     * buffers between submits, and NO reset happens between them (act(RESET) ran once above), so the exp
+     * LUT that task4 loads into DPU SRAM survives for task5's exp. This is the correct sequencing model:
+     * the earlier hardware-chained (task_number=9 + 0101 chain) attempts stalled at the chained LUT load. */
+    static const int ORDER[9]={0,1,2,3,4,5,6,7,8};   /* capture/dataflow order */
+    int rc_ret=0; double t0=ork_now_us();
+    for(int j=0;j<9 && rc_ret==0;j++){ int t=ORDER[j]; int nw=SM_TASK_WORDS[t];
+        uint32_t *rc=(uint32_t*)c->regcmd.cpu; memcpy(rc,SM_TASKS[t],(size_t)nw*4);
+        SM_REBASE(rc,nw,0);                          /* addr remap only; nextdma=0 zeros the chain words */
+        struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+        tk->enable_mask=SM_TASK_ENABLE[t]; tk->int_mask=0x300; tk->int_clear=0x1ffff;
+        tk->regcfg_amount=SM_TASK_AMT[t]; tk->regcmd_addr=c->regcmd.dma;
+        bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        s.flags=0x5; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK;
+        s.fence_fd=-1; s.timeout=3000;
+        s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] task %d (enable=0x%x amt=%d) submit failed\n",t,SM_TASK_ENABLE[t],SM_TASK_AMT[t]); rc_ret=-1; }
     }
-    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-    sub.flags=0x5; sub.task_number=9; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
-    sub.fence_fd=-1; sub.timeout=3000;               /* short timeout: soft-wedge safety on a bad chain */
-    /* single subcore: subcore[0]={0,9} gets furthest (tasks 0-3 run); populating all three {0,9} makes the
-     * 3 subcores contend on the single-buffer chain (regresses to task 1). The chained LUT load (task4) is
-     * the remaining stall — works standalone, hangs mid-chain (WIP: LUT-in-chain state, not yet resolved). */
-    sub.subcore_task[0]=(struct rknpu_subcore_task){0,9};
-    double t0=ork_now_us(); int rc_ret=rknpu_submit_ioctl(fd,&sub,-1)?-1:0;
     if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
     #undef SM_REBASE
     bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
