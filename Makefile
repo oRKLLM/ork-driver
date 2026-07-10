@@ -83,6 +83,14 @@ silu_f16_check: tools/silu_f16_check.c $(CORE)
 jit_inflate_check: tools/jit_inflate_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# accuracy of the fp16 gate+SiLU (fused-LUT vs plain-matmul+CPU-silu) vs a CPU fp32 reference.
+f16_gate_acc: tools/f16_gate_acc.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# reproduce the int8<->fp16 mode-switch instability (blocker b) in isolation, up an M ladder.
+mode_switch_probe: tools/mode_switch_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
