@@ -55,6 +55,7 @@ static void run_gmax(ork_npu*c,int K,int M,double gmax){
 int main(int argc,char**argv){
     int K=argc>1?atoi(argv[1]):2048, M=argc>2?atoi(argv[2]):8;
     ork_npu*c=ork_npu_init(); if(!c){printf("no board\n");return 0;}
+    ork_npu_set_core_budget(c,1);   /* single-core: plain fp16 ork_mm_run EINVALs on the COLD multi-core path */
     printf("f16_gate_acc K=%d M=%d  (silu(gate) error vs CPU fp32 ref)\n",K,M);
     double gmaxes[]={8,16,30,64,132}; for(int i=0;i<5;i++) run_gmax(c,K,M,gmaxes[i]);
     printf("VERDICT: PLAIN (fp16 gate + CPU silu) should be ~fp16-precision; FUSED (per-tensor LUT) error grows with gmax.\n");
