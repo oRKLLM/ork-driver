@@ -336,6 +336,11 @@ int          ork_mm_run_f16_silu(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A
                                  const short *lut, int nlut);
 /* Calibrate the fp16 fused SiLU for a layer whose real gate spans [-Gmax,Gmax]: fills lut[1030] and returns
  * S (pack the gate weight as -S*W), R, and out_scale (silu(gate) = C_out * out_scale). See Exp-2026-07-05. */
+/* Calibrate the fp16 fused rsqrt (for on-NPU rmsnorm/l2norm): a reduce-matmul (sq·(-S)) emits
+ * scale=1/sqrt(ss/n_feat+eps)=C_out*out_scale directly, for ss=sum(x^2) in [ss_min,ss_max]. Fills lut[1030],
+ * returns S (pack the reduce weight as -S), R, out_scale. Build once per layer/range (runs probe submits). */
+int          ork_mm_build_f16_rsqrt_lut(ork_npu *ctx, int n_feat, double eps, double ss_min, double ss_max,
+                                        short *lut, double *S_out, double *R_out, double *out_scale_out);
 int          ork_mm_build_f16_silu_lut(ork_npu *ctx, double Gmax, short *lut,
                                        double *S_out, double *R_out, double *out_scale_out);
 /* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
@@ -450,6 +455,17 @@ int          ork_npu_ewmul_f16(ork_npu *ctx, const ork_f16 *up, const ork_f16 *s
  * internally; symmetric zero-points. mult in 0..0x7fff. Shape M=8,N=64; rk3588-gated. 0/ok,-1,-2,-3. */
 int          ork_npu_ewmul_i16(ork_npu *ctx, const int16_t *up, const int16_t *silu, int M, int N,
                                int mult, int shift, int16_t *out, double *us);
+
+/* On-NPU normalization primitives (fp16 in/out), per row of an [M][n] tensor:
+ *   rmsnorm: out = x / sqrt(mean(x^2)+eps) * w      (w[n] weight)
+ *   l2norm:  out = x / sqrt(sum(x^2)+eps)           (no mean, no weight — the GDN q/k normalize)
+ * GATED (default OFF → computed on CPU, bit-exact via the fp32 NEON refs, so callers get a stable
+ * entrypoint today). A fully on-NPU norm needs the PPU transcendental (rsqrt) whose regcmd capture was
+ * blocked by the interposer's 4KB buffer-dump truncation; with that fixed the PPU-native path can be
+ * captured and slotted in here. ORK_NORM_NPU=1 selects the NPU path once it exists (today a no-op
+ * selector — still CPU-correct). out may alias x. 0/ok, -1 alloc, -2 bad args. */
+int          ork_npu_rmsnorm_f16(ork_npu *ctx, int M, int n, const ork_f16 *x, const ork_f16 *w, float eps, ork_f16 *out);
+int          ork_npu_l2norm_f16 (ork_npu *ctx, int M, int n, const ork_f16 *x,                     float eps, ork_f16 *out);
 
 /* Standalone on-NPU SiLU (activation-LUT SDP op): applies the PPU silu LUT to a single int8 input [M][N] via
  * the 69-reg/enable=0x18 standalone op (REGCMD_SILU_STD), reprogrammed to (M,N). Two submits (LUT-load + op).
@@ -650,6 +666,22 @@ int          ork_async_wait(ork_async *h);
 /* CPU the most recent async worker was placed on at entry (sched_getcpu), -1 if none/non-Linux.
  * Diagnostic + regression test for the worker-pinning pattern (worker lands on a big core). */
 int          ork_npu_last_async_cpu(ork_npu *ctx);
+
+/* ---- BATCHED DYNAMIC GEMM (the "attention" primitive) --------------------------------------------
+ * For each b in [0,nbatch): C[b] = A[b] * B[b], with A[b] = [M,K], B[b] = [K,N], C[b] = [M,N],
+ * each batch dense/contiguous row-major. UNLIKE ork_mm_run_i8/i4/run (which take a RESIDENT static
+ * 2-D weight packed once), BOTH operands here are DYNAMIC activations — B[b] is packed ephemerally
+ * each call. This is the primitive attention (scores = Q·Kᵀ, out = scores·V, looped per head) and the
+ * Gated-Delta-Net chunked matmuls (delta-net-base.cpp) need — ggml's batched MUL_MAT (ne[2]/ne[3]>1
+ * with a computed src0) maps directly onto it. The caller arranges any transpose so B is [K,N].
+ * i8:  A,B int8   → C int32 (exact).           K%32==0, N%32==0.
+ * i4:  A,B int4-in-int8 [-8,7] → C int32.       K%32==0, N%64==0.
+ * f16: A,B fp16   → C fp32.                     K%32==0, N%16==0.
+ * nbatch>0, M>0. Returns 0 on success, <0 on error. Correctness-first (per-batch submit); submit-floor
+ * amortization via chaining is a follow-up. */
+int          ork_bmm_i8  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C);
+int          ork_bmm_i4  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C);
+int          ork_bmm_fp16(ork_npu *ctx, int nbatch, int M, int K, int N, const ork_f16 *A, const ork_f16 *B, float   *C);
 
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);

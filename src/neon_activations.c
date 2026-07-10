@@ -56,6 +56,26 @@ void ork_rmsnorm_f32(float *o, const float *x, const float *w, int n, float eps)
     for (; i < n; i++) o[i] = x[i] * scale * w[i];
 }
 
+void ork_l2norm_f32(float *o, const float *x, int n, float eps) {
+    /* L2 normalize a row: o = x / sqrt(sum(x^2) + eps). No mean, no weight (cf. rmsnorm) — this is the
+     * q/k normalization the Gated-Delta-Net path uses (GGML_OP_L2_NORM). */
+    float32x4_t a0 = vdupq_n_f32(0), a1 = a0, a2 = a0, a3 = a0;
+    int i = 0;
+    for (; i + 16 <= n; i += 16) {
+        __builtin_prefetch(x + i + 64, 0, 0);
+        float32x4_t v0 = vld1q_f32(x + i),     v1 = vld1q_f32(x + i + 4);
+        float32x4_t v2 = vld1q_f32(x + i + 8), v3 = vld1q_f32(x + i + 12);
+        a0 = vfmaq_f32(a0, v0, v0); a1 = vfmaq_f32(a1, v1, v1);
+        a2 = vfmaq_f32(a2, v2, v2); a3 = vfmaq_f32(a3, v3, v3);
+    }
+    float ss = vaddvq_f32(vaddq_f32(vaddq_f32(a0, a1), vaddq_f32(a2, a3)));
+    for (; i < n; i++) ss += x[i] * x[i];
+    float scale = 1.0f / sqrtf(ss + eps);
+    float32x4_t vs = vdupq_n_f32(scale);
+    for (i = 0; i + 4 <= n; i += 4) vst1q_f32(o + i, vmulq_f32(vld1q_f32(x + i), vs));
+    for (; i < n; i++) o[i] = x[i] * scale;
+}
+
 void ork_silu_mul_f32(float *g, const float *u, int n) {
     int i = 0;
     for (; i + 4 <= n; i += 4) {
@@ -108,6 +128,7 @@ void ork_softmax_f32(float *x, int n) {
 
 #else  /* portable scalar fallback (non-ARM builds: workstation/CI) */
 void ork_rmsnorm_f32(float *o, const float *x, const float *w, int n, float eps) { ork_rmsnorm_f32_ref(o, x, w, n, eps); }
+void ork_l2norm_f32(float *o, const float *x, int n, float eps) { ork_l2norm_f32_ref(o, x, n, eps); }
 void ork_silu_mul_f32(float *g, const float *u, int n) { ork_silu_mul_f32_ref(g, u, n); }
 void ork_silu_mul_to_f32(float *out, const float *g, const float *u, int n) { for (int i = 0; i < n; i++) { float x = g[i]; out[i] = (x / (1.0f + expf(-x))) * u[i]; } }
 void ork_silu_f32(float *x, int n) { for (int i = 0; i < n; i++) { float v = x[i]; x[i] = v / (1.0f + expf(-v)); } }
@@ -123,6 +144,11 @@ void ork_rmsnorm_f32_ref(float *o, const float *x, const float *w, int n, float 
     float s = 0; for (int i = 0; i < n; i++) s += x[i] * x[i];
     s = 1.0f / sqrtf(s / (float) n + eps);
     for (int i = 0; i < n; i++) o[i] = x[i] * s * w[i];
+}
+void ork_l2norm_f32_ref(float *o, const float *x, int n, float eps) {
+    float s = 0; for (int i = 0; i < n; i++) s += x[i] * x[i];
+    s = 1.0f / sqrtf(s + eps);
+    for (int i = 0; i < n; i++) o[i] = x[i] * s;
 }
 void ork_silu_mul_f32_ref(float *g, const float *u, int n) {
     for (int i = 0; i < n; i++) { float x = g[i]; g[i] = (x / (1.0f + expf(-x))) * u[i]; }
