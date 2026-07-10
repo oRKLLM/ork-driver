@@ -3117,6 +3117,61 @@ static void *mcworker(void *vp){
             double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
             struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)(active?t0:0)*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
+            /* ORK_F16_CHAIN (default OFF): PC-chain THIS (N-slice,K-slice)'s fp16 M-tiles into ONE
+             * task_number>1 submit instead of one ioctl per M-tile. fp16 K>=2048 takes sched=0 -> chunk=8
+             * (an 8-row correctness limit, NOT enlargeable), so at prefill M there are M/8 M-tiles each a
+             * separate ioctl (the 34-ioctls/matmul explosion vs int8's chained 3.6). Chaining keeps each
+             * task <=8 rows (bit-exact) but collapses the ioctls ~M/8x. Mirrors the int8 chain-prefill
+             * (~2760): fp16 matmul uses the SAME 108-reg format (regcfg_amount=108, enable 0xd, chain slot
+             * word 216, next-amount 0x37), so only synth()+Bb differ. Chain stays WITHIN Bb (one buffer =
+             * no cross-buffer CDMA-walker wedge, errno110). M-tiles have disjoint output rows -> no dep.
+             * Guarded: falls back to the per-tile loop if buffers are too small. */
+            static int f16ch=-1; if(f16ch<0){const char*e=getenv("ORK_F16_CHAIN"); f16ch=e?atoi(e):0;}
+            if(dt==DT_F16 && f16ch && active && !c->mc_error){
+                int nmt=(M+chunk-1)/chunk;
+                size_t needaf=(size_t)M*Kp*2, needrc=(size_t)nmt*REGCMD_N*4, needcc=(size_t)M*Ncore*4;
+                if(nmt>1 && needaf<=AF->size && needrc<=RC->size && needcc<=CC->size){
+                    /* stage ALL M rows of this K-slice into AF once */
+                    { f16*ad=AF->cpu; const f16*Af=A; for(int r=0;r<M;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)r*K+k0+j]; }
+                    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+                    struct rknpu_task*tk=(struct rknpu_task*)c->mtk[i].cpu;
+                    int p=0; size_t cc_off=0; int bad=0;
+                    for(int m0=0;m0<M && !bad;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                        uint32_t rc[REGCMD_N];
+                        synth(rc,mco,Kp,Ncore,(uint32_t)(AF->dma+(uint64_t)m0*Kp*2),(uint32_t)wbase,(uint32_t)(CC->dma+cc_off),sched,CBUF);
+                        if(validate_regcmd("mcworker_f16_chain",c,rc,REGCMD_N,w,NULL,0)){bad=1;break;}
+                        uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_N*4;   /* PC-chain to next program (slot word 216, amt 0x37 — same as int8) */
+                        rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101u<<16)|((nx>>16)&0xffff);
+                        rc[218]=0x0014|(0x0037u<<16);      rc[219]=(0x0101u<<16)|0;
+                        memcpy((char*)RC->cpu+(size_t)p*REGCMD_N*4,rc,REGCMD_N*4);
+                        struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108; t.regcmd_addr=RC->dma+(size_t)p*REGCMD_N*4;
+                        tk[p]=t;
+                        cc_off+=(size_t)mco*Ncore*4; p++;
+                    }
+                    if(!bad && p>=1){
+                        { uint32_t*l=(uint32_t*)((char*)RC->cpu+(size_t)(p-1)*REGCMD_N*4); l[216]=l[217]=l[218]=l[219]=0; }  /* terminate chain */
+                        bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+                        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                        int reps=c->mwarm[i]?1:2;
+                        for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
+                            struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=0x5; sub.task_number=(uint32_t)p; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1; sub.core_mask=1u<<i;
+                            sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)p};
+                            sub.timeout=60000;
+                            if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
+                            bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
+                        }
+                        c->mwarm[i]=1;
+                        if(!bad && a->rc!=-1){ float*cr=a->cres; size_t off=0;   /* scatter+accumulate the p disjoint-row blocks */
+                            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
+                                float*cc=(float*)((char*)CC->cpu+off);
+                                for(int r=0;r<mco;r++)for(int n=0;n<Ncore;n++) cr[(size_t)(m0+r)*N+(n0+coff+n)]+=cc[(size_t)r*Ncore+n];
+                                off+=(size_t)mco*Ncore*4; }
+                            continue;   /* this K-slice fully handled by the chained submit */
+                        }
+                    }
+                    /* bad/failure -> fall through to the per-tile loop (rewrites the same rows/cols) */
+                }
+            }
             for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
                 if(!active){
                     uint32_t rc[REGCMD_N];
