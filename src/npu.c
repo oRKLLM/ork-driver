@@ -29,6 +29,8 @@
 #include "regcmd_i4.h"
 #include "regcmd_silu.h"
 #include "regcmd_ewmul.h"
+#include "regcmd_softmax_f16.h"   /* RE: captured vendor forward-softmax 9-task graph (replay) */
+#include "regcmd_softmax_wt.h"    /* RE: its matmul weight blobs (verbatim) */
 #include "ork_npu.h"
 #include "soc.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -3111,7 +3113,7 @@ static void *mcworker(void *vp){
         int Ncore = active ? (t1-t0)*nt_sz : nt_sz;
         int coff = active ? t0*nt_sz : 0;
         for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
             double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
             int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
             struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)(active?t0:0)*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
@@ -3319,7 +3321,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             int eff_cols = active ? cols : nt_sz;
             for(int k0=0;k0<K;k0+=KS){
                 int Kp=(K-k0<KS)?(K-k0):KS;
-                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
+                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
                 int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
                 double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
                 int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
@@ -3889,7 +3891,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t maxout=0, maxaf=0;
     for(int k0=0;k0<K;k0+=KS){
         int Kp=(K-k0<KS)?(K-k0):KS;
-        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048);
+        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
         int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
         int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
@@ -3981,7 +3983,11 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp<2048), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) miscomputes >8 rows at Kp>=2048 (validated mc<=8 OK / mc>=9 garbage) — gate it OFF for Kp>=2048 (mc=(RB/2)/Kp=8, correct), matching mcworker. Was missing the Kp<2048 guard -> fp16 single-core K>=2048 produced garbage for M>8. */
+        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
+ * extrapolates too HIGH for small Kp (K=64->0x1040=188, K=32->190) and miscomputes (constant-garbage output),
+ * and at Kp>=2048 it miscomputes >8 rows (mc<=8 OK / mc>=9 garbage). Outside the window, sched=0 (the general
+ * path, no 0x1040 override) is correct — e.g. non-pow2 K=96 already took sched=0. Gates: Kp>=128 (low, fixes
+ * fp16 attention at head_dim=32/64) and Kp<2048 (high). Validated in test_bmm (K-sweep 32..256). */
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             double _tc0=ork_now_us();
@@ -4293,43 +4299,39 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
 }
 
 static double silu_f(double x);   /* fwd decl (defined below near the other activation refs) */
-/* ork_mm_build_f16_silu_lut — calibrate the fp16 fused SiLU for a layer whose real gate spans [-Gmax,Gmax].
- * The fp16 SDP index only spreads for NEGATIVE acc, so the recipe (see Exp-2026-07-05) is: pack the gate
- * weight as -S*W (S returned here) so a positive gate -> negative acc that spreads across the LUT. This does
- * the 2-pass measure-then-build on a self-contained probe and returns the LUT + S (bake into the pack) + R +
- * out_scale (silu = C_out * out_scale). Runtime: acc=-S*gate -> C=R*LUT[idx(acc)] -> silu(gate)=C*out_scale.
- * One idx(acc) measurement covers the acc range S produces. 0/ok, -1/-2 fail. */
-int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
-    if(!ork_ppu_fuse_enabled(c) || Gmax<=0) return -2;
+/* ork_mm_build_f16_lut — GENERIC fp16 fused-output PWL LUT builder (the fp16 twin of the int8/int16
+ * act_lut_i8/i16(fn,...) path). Bakes an arbitrary scalar fn(x) into the SDP output-stage LUT for inputs
+ * x in [in_lo,in_hi]. The fp16 SDP index only spreads for NEGATIVE acc, so a reduce/gate matmul packed as
+ * -S*W (S returned) drives acc=-S*x into the spread band; runtime C_out = R*LUT[idx(acc)] and the caller
+ * recovers fn(x) = C_out*out_scale. 2-pass self-contained probe: measure R/bias, then idx(acc), then fill
+ * LUT[idx] with fn at the sample points + interpolate. S = ATGT/max|in| (ORK_F16_ATGT); out_scale =
+ * max_n|fn(sample_n)|/8000. fn(x,ctx) carries params via ctx (e.g. {n_feat,eps} for rsqrt; NULL for silu).
+ * 0/ok, -2 fail. Consolidates the former ork_mm_build_f16_silu_lut + _rsqrt_lut (now thin wrappers). */
+int ork_mm_build_f16_lut(ork_npu *c, double (*fn)(double,void*), void *fnctx,
+                         double in_lo, double in_hi, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
+    if(!ork_ppu_fuse_enabled(c) || in_hi<=in_lo || !fn) return -2;
     const int Kp=512, Np=64;
-    /* Bound Gmax: S=296/Gmax, so a wide-range layer (large Gmax) drives S tiny and crushes the bulk of the
-     * gate distribution into a few LUT-index entries near the center -> the index mapping collapses (garbage).
-     * Cap the effective Gmax so S stays in the band where the fp16 index spreads; gates above the cap clamp to
-     * silu(cap) (~linear, so a small error on the rare large outliers). ORK_F16_GCAP overrides the ceiling. */
-    double gcap = getenv("ORK_F16_GCAP") ? atof(getenv("ORK_F16_GCAP")) : 40.0;
-    if(gcap>0 && Gmax>gcap) Gmax=gcap;
-    /* acc target: S = ATGT/Gmax maps the gate range onto acc~[-ATGT,0]. Too large over-spreads the fp16 index
-     * (gates near Gmax hit the clamp edge -> error at small-Gmax layers); too small wastes LUT resolution.
-     * ORK_F16_ATGT tunes it (see tools/f16_gmax_sweep). */
     double atgt = getenv("ORK_F16_ATGT") ? atof(getenv("ORK_F16_ATGT")) : 150.0;
-    double S = atgt/Gmax;                                    /* acc = -S*gate spans ~[-ATGT,0] (the spread band) */
+    double amax = fabs(in_lo)>fabs(in_hi) ? fabs(in_lo) : fabs(in_hi); if(amax<=0) return -2;
+    double S = atgt/amax;                                    /* acc=-S*x lands in the fp16 negative spread band */
     ork_f16 *A=malloc((size_t)8*Kp*2), *B=malloc((size_t)Kp*Np*2); float *C=malloc((size_t)8*Np*4);
     if(!A||!B||!C){ free(A);free(B);free(C); return -2; }
     for(int i=0;i<8*Kp;i++)A[i]=(ork_f16)1.0f;
     double tru[64];
-    for(int n=0;n<Np;n++){ tru[n]=Gmax*(n-32)/32.0; double b=(-S*tru[n])/(double)Kp; for(int k=0;k<Kp;k++)B[(size_t)k*Np+n]=(ork_f16)b; }
+    for(int n=0;n<Np;n++){ tru[n]=in_lo+(in_hi-in_lo)*n/(double)(Np-1); double b=(-S*tru[n])/(double)Kp; for(int k=0;k<Kp;k++)B[(size_t)k*Np+n]=(ork_f16)b; }
     ork_w *w=ork_mm_pack(c,Kp,Np,B); if(!w){ free(A);free(B);free(C); return -2; }
-    #define F16RUN() ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
+    #define F16LRUN() ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
     int rc=-2;
-    for(int i=0;i<1030;i++)lut[i]=1000; if(F16RUN()){goto done;} double o1=C[32];
-    for(int i=0;i<1030;i++)lut[i]=3000; if(F16RUN()){goto done;} double o2=C[32];
+    for(int i=0;i<1030;i++)lut[i]=1000; if(F16LRUN()){goto done;} double o1=C[32];
+    for(int i=0;i<1030;i++)lut[i]=3000; if(F16LRUN()){goto done;} double o2=C[32];
     double R=(o2-o1)/2000.0, bias=o1-R*1000.0; if(fabs(R)<1e-9){goto done;}
-    for(int i=0;i<1030;i++)lut[i]=(int16_t)(i-512); if(F16RUN()){goto done;}
+    for(int i=0;i<1030;i++)lut[i]=(int16_t)(i-512); if(F16LRUN()){goto done;}
     int idx[64]; for(int n=0;n<Np;n++) idx[n]=(int)lround((C[n]-bias)/R)+512;
-    double out_scale = silu_f(Gmax)/8000.0; if(out_scale<=0) out_scale=1e-3;
+    double omax=0; for(int n=0;n<Np;n++){ double f=fabs(fn(tru[n],fnctx)); if(f>omax)omax=f; }
+    double out_scale = omax/8000.0; if(out_scale<=0) out_scale=1e-3;
     int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
     for(int n=0;n<Np;n++){ int i=idx[n]; if(i<0||i>1029)continue;
-        double v=(silu_f(tru[n])/out_scale - bias)/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[i]=(int16_t)q; set[i]=1; }
+        double v=(fn(tru[n],fnctx)/out_scale - bias)/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[i]=(int16_t)q; set[i]=1; }
     int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
     if(lo<0)goto done;
     for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
@@ -4337,51 +4339,34 @@ int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_o
         lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
     if(S_out)*S_out=S; if(R_out)*R_out=R; if(out_scale_out)*out_scale_out=out_scale; rc=0;
 done:
-    #undef F16RUN
+    #undef F16LRUN
     ork_mm_free(c,w); free(A);free(B);free(C); return rc;
 }
+/* fn adapters for ork_mm_build_f16_lut (silu takes no params; rsqrt carries n_feat/eps in ctx) */
+static double f16lut_silu(double x, void *ctx){ (void)ctx; return silu_f(x); }
+struct f16lut_rsqrt_ctx { int n_feat; double eps; };
+static double f16lut_rsqrt(double x, void *ctx){ struct f16lut_rsqrt_ctx *p=ctx; return 1.0/sqrt(x/(double)p->n_feat + p->eps); }
 
-/* ork_mm_build_f16_rsqrt_lut — the norm twin of the SiLU LUT builder. Bakes f(ss)=1/sqrt(ss/n_feat+eps)
- * into the fp16 fused-output PWL LUT so a reduce-matmul (sq · weight) emits the rmsnorm/l2norm SCALE
- * directly. ss=sum(x^2) is POSITIVE, so we pack the reduce weight as -S (acc=-S*ss lands in the fp16
- * NEGATIVE index-spread band, same trick as silu's -S*W). Calibrated per-layer to the ss range
- * [ss_min,ss_max]. Runtime: acc=-S*ss -> C=R*LUT[idx(acc)] -> scale = C*out_scale. Build ONCE per (layer,
- * range) and cache — it runs probe submits, so it is NOT a per-call op. 0/ok, -2 fail. */
+/* Thin wrapper: fused SiLU LUT for a gate spanning [-Gmax,Gmax]. Caps Gmax (ORK_F16_GCAP, default 40) so S
+ * stays in the fp16 index-spread band (a wide range collapses the mapping), then defers to the generic
+ * builder. silu(gate) = C_out*out_scale at runtime; pack the gate weight as -S*W. See Exp-2026-07-05. */
+int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
+    if(Gmax<=0) return -2;
+    double gcap = getenv("ORK_F16_GCAP") ? atof(getenv("ORK_F16_GCAP")) : 40.0;
+    if(gcap>0 && Gmax>gcap) Gmax=gcap;
+    return ork_mm_build_f16_lut(c, f16lut_silu, NULL, -Gmax, Gmax, lut, S_out, R_out, out_scale_out);
+}
+/* Thin wrapper: fused rsqrt LUT baking 1/sqrt(ss/n_feat+eps) over ss in [ss_min,ss_max] — for on-NPU
+ * rmsnorm (n_feat=n) / l2norm (n_feat=1). A reduce-matmul packed as -S*W emits the norm SCALE directly.
+ * PRECISION VARIANTS: this is the fp16, fused-into-the-reduce rsqrt. The int8/int16 STANDALONE rsqrt of a
+ * tensor is ork_npu_rsqrt_i8/i16 (built via act_lut_i8/i16 with the same rsqrt_f). Same op, different
+ * precision + fusion regime — keep both. Build once per (layer,range) + cache (it runs probe submits). */
 int ork_mm_build_f16_rsqrt_lut(ork_npu *c, int n_feat, double eps, double ss_min, double ss_max,
                                int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
-    if(!ork_ppu_fuse_enabled(c) || ss_max<=0 || n_feat<1) return -2;
+    if(n_feat<1) return -2;
     if(ss_min<0) ss_min=0;
-    const int Kp=512, Np=64;
-    double atgt = getenv("ORK_F16_ATGT") ? atof(getenv("ORK_F16_ATGT")) : 150.0;
-    double S = atgt/ss_max;                                  /* acc=-S*ss spans ~[-atgt, -atgt*ss_min/ss_max] */
-    ork_f16 *A=malloc((size_t)8*Kp*2), *B=malloc((size_t)Kp*Np*2); float *C=malloc((size_t)8*Np*4);
-    if(!A||!B||!C){ free(A);free(B);free(C); return -2; }
-    for(int i=0;i<8*Kp;i++)A[i]=(ork_f16)1.0f;
-    double tru[64];
-    for(int n=0;n<Np;n++){ tru[n]=ss_min+(ss_max-ss_min)*n/(double)(Np-1); double b=(-S*tru[n])/(double)Kp; for(int k=0;k<Kp;k++)B[(size_t)k*Np+n]=(ork_f16)b; }
-    ork_w *w=ork_mm_pack(c,Kp,Np,B); if(!w){ free(A);free(B);free(C); return -2; }
-    #define RSRUN() ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
-    #define RSQF(ss) (1.0/sqrt((double)(ss)/(double)n_feat+eps))
-    int rc=-2;
-    for(int i=0;i<1030;i++)lut[i]=1000; if(RSRUN()){goto done;} double o1=C[32];
-    for(int i=0;i<1030;i++)lut[i]=3000; if(RSRUN()){goto done;} double o2=C[32];
-    double R=(o2-o1)/2000.0, bias=o1-R*1000.0; if(fabs(R)<1e-9){goto done;}
-    for(int i=0;i<1030;i++)lut[i]=(int16_t)(i-512); if(RSRUN()){goto done;}
-    int idx[64]; for(int n=0;n<Np;n++) idx[n]=(int)lround((C[n]-bias)/R)+512;
-    double out_scale = RSQF(ss_min)/8000.0; if(out_scale<=0) out_scale=1e-3;   /* max rsqrt is at ss_min */
-    int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
-    for(int n=0;n<Np;n++){ int i=idx[n]; if(i<0||i>1029)continue;
-        double v=(RSQF(tru[n])/out_scale - bias)/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[i]=(int16_t)q; set[i]=1; }
-    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
-    if(lo<0)goto done;
-    for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
-    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
-        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
-    if(S_out)*S_out=S; if(R_out)*R_out=R; if(out_scale_out)*out_scale_out=out_scale; rc=0;
-done:
-    #undef RSRUN
-    #undef RSQF
-    ork_mm_free(c,w); free(A);free(B);free(C); return rc;
+    struct f16lut_rsqrt_ctx ctx = { n_feat, eps };
+    return ork_mm_build_f16_lut(c, f16lut_rsqrt, &ctx, ss_min, ss_max, lut, S_out, R_out, out_scale_out);
 }
 
 /* Resident-weight fused UP matmul + element-wise MULTIPLY by G (=silu(gate)) in the SDP output stage:
@@ -5323,6 +5308,79 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     #undef SUBMIT1
     #undef EWCUBEH
     return 0;
+}
+
+/* ---- FORWARD-SOFTMAX REPLAY (RE) --------------------------------------------------------------------
+ * Replay the captured vendor forward-softmax 9-task PC-chained graph VERBATIM at its capture geometry
+ * (reduction N=64, 256 rows). Proves the activation->matmul asymmetry (NPU-Quirks) is resolved by
+ * PC-chaining all 9 tasks in ONE submit: max -> broadcast -> x-max -> exp(LUT) -> Sum(=exp.ones, a MATMUL
+ * right after the exp SDP op) -> 1/Sum -> exp*(1/Sum). Every register VALUE is vendor-validated; we only
+ * rebase DATA addresses (0x4020/0x5018/0x5038/0x1070/0x1110) + the 0101:0x0010 chain to our buffers, so
+ * hard-wedge risk is low (a bad address soft-times-out). `in`/`out` are raw 32768-byte buffer images (the
+ * captured h4/h5); fill `in` uniformly and expect softmax=1/64 everywhere (layout-agnostic). Buffers:
+ *   IN  [0xfffb6000,+0x8000)  OUT [0xfffae000,+0x8000)  SCR [0xfffbe000,+0x3a000)  WT [0xffffa280,+..)
+ *   LUT scratch [0xffffab00,..) = task4's throwaway output (the exp LUT itself loads to DPU SRAM).
+ * 0/ok, -1 wedge/submit-fail, -2 alloc, -3 SoC. */
+int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    struct buf IN=bcreate(fd,32768,0x403,-1), OUT=bcreate(fd,32768,0x403,-1),
+               SCR=bcreate(fd,237568,0x403,-1), LUT=bcreate(fd,65536,0x403,-1),
+               WT=bcreate(fd,(size_t)(SM_WT_WORDS+64)*4,0x403,-1);
+    if(!IN.cpu||!OUT.cpu||!SCR.cpu||!LUT.cpu||!WT.cpu){
+        bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -2; }
+    memcpy(IN.cpu,in,32768); memset(OUT.cpu,0,32768); memset(SCR.cpu,0,237568); memset(LUT.cpu,0,65536);
+    memcpy(WT.cpu,SM_WT,(size_t)SM_WT_WORDS*4);
+    bsync(fd,&IN,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&SCR,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&LUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&WT,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    /* address-rebase helper: patch a task's regcmd in place (addr regs -> our buffers; chain -> `nextdma`
+     * or 0 to terminate). Returns nothing; operates on rc[0..nw). */
+    #define SM_REBASE(rc,nw,nextdma) do{ for(int k=0;k+1<(nw);k+=2){ \
+        unsigned _a=(rc)[k]&0xffff, _d=(rc)[k+1]>>16; uint32_t _v=(((rc)[k+1]&0xffff)<<16)|((rc)[k]>>16); \
+        int _ia=(_d==0x1001&&_a==0x4020)||(_d==0x2001&&(_a==0x5018||_a==0x5038))||(_d==0x0201&&(_a==0x1070||_a==0x1110)); \
+        if(_ia){ uint32_t _nv=_v; \
+            if      (_v>=0xfffb6000u&&_v<0xfffbe000u) _nv=(uint32_t)IN.dma +(_v-0xfffb6000u); \
+            else if (_v>=0xfffae000u&&_v<0xfffb6000u) _nv=(uint32_t)OUT.dma+(_v-0xfffae000u); \
+            else if (_v>=0xfffbe000u&&_v<0xffff8000u) _nv=(uint32_t)SCR.dma+(_v-0xfffbe000u); \
+            else if (_v>=0xffffa280u&&_v<0xffffab00u) _nv=(uint32_t)WT.dma +(_v-0xffffa280u); \
+            else if (_v>=0xffffab00u&&_v<0xfffff000u) _nv=(uint32_t)LUT.dma+(_v-0xffffab00u); \
+            if(_nv!=_v){ (rc)[k]=_a|((_nv&0xffff)<<16); (rc)[k+1]=(_d<<16)|((_nv>>16)&0xffff); } } \
+        if(_d==0x0101&&(_a==0x0010||_a==0x0014)){ uint32_t _nx=(_a==0x0010)?(uint32_t)(nextdma):0u; \
+            if((nextdma)&&_a==0x0010){ (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } \
+            else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
+    /* ONE submit, all 9 tasks PC-chained in capture order (vendor-faithful — the LUT load is task4 IN the
+     * chain, NOT a separate submit): 0,1=max 2=bcast 3=x-max 4=expLUT 5=exp 6=Sum(=exp.ones, MATMUL right
+     * after the exp SDP op) 7=1/S 8=out. Proves the activation->matmul asymmetry is a per-submit-boundary
+     * effect. Every register VALUE is vendor-validated; only DATA addresses + the 0101 chain are rebased. */
+    uint32_t *rcbuf=(uint32_t*)c->regcmd.cpu; int off[10]; off[0]=0;
+    for(int t=0;t<9;t++) off[t+1]=off[t]+SM_TASK_WORDS[t];
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,9*sizeof *tk);
+    for(int t=0;t<9;t++){ uint32_t *rc=rcbuf+off[t]; int nw=SM_TASK_WORDS[t];
+        memcpy(rc,SM_TASKS[t],(size_t)nw*4);
+        uint32_t nextdma=(t<8)?(uint32_t)(c->regcmd.dma+(size_t)off[t+1]*4):0u;
+        SM_REBASE(rc,nw,nextdma);
+        /* NOTE: op_idx=0 (matching the working run_chain scaffold) gets furthest (task counter 4). op_idx=1
+         * — though the vendor DUMP shows it — REGRESSED to counter 1, so the chain semantics are NOT a naive
+         * field match to the capture (see FWD_SOFTMAX_RE_WIP.md "EMIT ATTEMPT"). */
+        tk[t].enable_mask=SM_TASK_ENABLE[t]; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+        tk[t].regcfg_amount=SM_TASK_AMT[t]; tk[t].regcmd_addr=c->regcmd.dma+(size_t)off[t]*4;
+    }
+    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=0x5; sub.task_number=9; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
+    sub.fence_fd=-1; sub.timeout=3000;               /* short timeout: soft-wedge safety on a bad chain */
+    /* single subcore: subcore[0]={0,9} gets furthest (tasks 0-3 run); populating all three {0,9} makes the
+     * 3 subcores contend on the single-buffer chain (regresses to task 1). The chained LUT load (task4) is
+     * the remaining stall — works standalone, hangs mid-chain (WIP: LUT-in-chain state, not yet resolved). */
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,9};
+    double t0=ork_now_us(); int rc_ret=rknpu_submit_ioctl(fd,&sub,-1)?-1:0;
+    if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+    #undef SM_REBASE
+    bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+    return rc_ret;
 }
 
 /* int16 (w16a16i) standalone activation-LUT op — RE probe. Same requant-LUT math as the int8 op
@@ -7192,50 +7250,108 @@ int ork_npu_last_async_cpu(ork_npu *c){ return c ? c->last_async_cpu : -1; }
  * B[b] is packed fresh each batch (unlike the resident-weight ork_mm_run* paths). Correctness-first:
  * one submit per batch. i8 reuses a single packed buffer via repack (no per-batch alloc); i4/fp16 have
  * no repack path yet, so they pack+free per batch. Chaining (fewer submits) is a follow-up. */
-int ork_bmm_i8(ork_npu *c, int nbatch, int M, int K, int N,
-               const int8_t *A, const int8_t *B, int32_t *C){
-    if(!c||!A||!B||!C) return -1;
+/* Gather a strided 2-D operand src[r,c] = src + r*sr + c*sc (element strides) into contiguous
+ * row-major dst[r*cols+c]. The stride-1 inner dim (the common attention case: contraction dim
+ * contiguous) hits a memcpy fast path; a strided inner dim falls back to an element loop. */
+#define ORK_BMM_GATHER(NAME,T) \
+static void NAME(T *dst, const T *src, int rows, int cols, long sr, long sc){ \
+    for(int r=0;r<rows;r++){ const T *p=src+(long)r*sr; T *d=dst+(size_t)r*cols; \
+        if(sc==1) memcpy(d,p,(size_t)cols*sizeof(T)); \
+        else for(int cc=0;cc<cols;cc++) d[cc]=p[(long)cc*sc]; } }
+ORK_BMM_GATHER(bmm_gather_i8, int8_t)
+ORK_BMM_GATHER(bmm_gather_f16, f16)
+/* scatter contiguous src[r*cols+c] -> strided dst[r,c] = dst + r*sr + c*sc (C output; int32/float share size) */
+static void bmm_scatter_i32(int32_t *dst, const int32_t *src, int rows, int cols, long sr, long sc){
+    for(int r=0;r<rows;r++){ int32_t *d=dst+(long)r*sr; const int32_t *s=src+(size_t)r*cols;
+        if(sc==1) memcpy(d,s,(size_t)cols*sizeof(int32_t)); else for(int cc=0;cc<cols;cc++) d[(long)cc*sc]=s[cc]; } }
+
+/* natural (dense row-major) strides for the M×K/K×N/M×N batched operands */
+static ork_bmm_strides bmm_natural(int M,int K,int N){
+    return (ork_bmm_strides){ .as_m=K,.as_k=1,.bs_k=N,.bs_n=1,.cs_m=N,.cs_n=1,
+                              .abs=(long)M*K,.bbs=(long)K*N,.cbs=(long)M*N }; }
+/* C output is contiguous per batch iff the natural row-major layout — then run writes into C directly. */
+static int bmm_c_dense(const ork_bmm_strides *s,int N){ return s->cs_n==1 && s->cs_m==N; }
+
+int ork_bmm_i8_strided(ork_npu *c, int nbatch, int M, int K, int N,
+                       const int8_t *A, const int8_t *B, int32_t *C, const ork_bmm_strides *s){
+    if(!c||!A||!B||!C||!s) return -1;
     if(nbatch<1||M<1||K<1||N<1) return -2;
     if(K%32||N%32) return -2;
-    ork_w *w = ork_mm_pack_i8(c, K, N, B);   /* pack batch 0 */
-    if(!w) return -3;
-    int rc = 0;
-    for(int b=0;b<nbatch;b++){
-        if(b>0 && ork_mm_repack_i8(c, w, K, N, B + (size_t)b*K*N)){ rc=-4; break; }
-        if(ork_mm_run_i8(c, w, M, A + (size_t)b*M*K, C + (size_t)b*M*N)){ rc=-5; break; }
+    int8_t *Ac=malloc((size_t)M*K), *Bc=malloc((size_t)K*N);
+    int cdense=bmm_c_dense(s,N); int32_t *Cc = cdense?NULL:malloc((size_t)M*N*sizeof(int32_t));
+    if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
+    bmm_gather_i8(Bc,B+s->abs*0+s->bbs*0,K,N,s->bs_k,s->bs_n); /* batch-0 B for the pack */
+    ork_w *w = ork_mm_pack_i8(c, K, N, Bc);
+    int rc=0;
+    if(!w) rc=-3;
+    for(int b=0;!rc&&b<nbatch;b++){
+        if(b>0){ bmm_gather_i8(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+                 if(ork_mm_repack_i8(c,w,K,N,Bc)){ rc=-4; break; } }
+        bmm_gather_i8(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        int32_t *Cout = cdense ? C+(long)b*s->cbs : Cc;
+        if(ork_mm_run_i8(c,w,M,Ac,Cout)){ rc=-5; break; }
+        if(!cdense) bmm_scatter_i32(C+(long)b*s->cbs,Cc,M,N,s->cs_m,s->cs_n);
     }
-    ork_mm_free(c, w);
+    if(w) ork_mm_free(c,w);
+    free(Ac);free(Bc);free(Cc);
     return rc;
+}
+int ork_bmm_i4_strided(ork_npu *c, int nbatch, int M, int K, int N,
+                       const int8_t *A, const int8_t *B, int32_t *C, const ork_bmm_strides *s){
+    if(!c||!A||!B||!C||!s) return -1;
+    if(nbatch<1||M<1||K<1||N<1) return -2;
+    if(K%32||N%64) return -2;
+    int8_t *Ac=malloc((size_t)M*K), *Bc=malloc((size_t)K*N);
+    int cdense=bmm_c_dense(s,N); int32_t *Cc = cdense?NULL:malloc((size_t)M*N*sizeof(int32_t));
+    if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
+    int rc=0;
+    for(int b=0;b<nbatch;b++){
+        bmm_gather_i8(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+        bmm_gather_i8(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        ork_w *w=ork_mm_pack_i4(c,K,N,Bc); if(!w){ rc=-3; break; }
+        int32_t *Cout = cdense ? C+(long)b*s->cbs : Cc;
+        int r=ork_mm_run_i4(c,w,M,Ac,Cout);
+        ork_mm_free(c,w);
+        if(r){ rc=-5; break; }
+        if(!cdense) bmm_scatter_i32(C+(long)b*s->cbs,Cc,M,N,s->cs_m,s->cs_n);
+    }
+    free(Ac);free(Bc);free(Cc);
+    return rc;
+}
+int ork_bmm_fp16_strided(ork_npu *c, int nbatch, int M, int K, int N,
+                         const f16 *A, const f16 *B, float *C, const ork_bmm_strides *s){
+    if(!c||!A||!B||!C||!s) return -1;
+    if(nbatch<1||M<1||K<1||N<1) return -2;
+    if(K%32||N%16) return -2;
+    f16 *Ac=malloc((size_t)M*K*sizeof(f16)), *Bc=malloc((size_t)K*N*sizeof(f16));
+    int cdense=bmm_c_dense(s,N); float *Cc = cdense?NULL:malloc((size_t)M*N*sizeof(float));
+    if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
+    int rc=0;
+    for(int b=0;b<nbatch;b++){
+        bmm_gather_f16(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+        bmm_gather_f16(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        ork_w *w=ork_mm_pack(c,K,N,Bc); if(!w){ rc=-3; break; }
+        float *Cout = cdense ? C+(long)b*s->cbs : Cc;
+        int r=ork_mm_run(c,w,M,Ac,Cout);
+        ork_mm_free(c,w);
+        if(r){ rc=-5; break; }
+        if(!cdense) bmm_scatter_i32((int32_t*)(C+(long)b*s->cbs),(const int32_t*)Cc,M,N,s->cs_m,s->cs_n);
+    }
+    free(Ac);free(Bc);free(Cc);
+    return rc;
+}
+
+int ork_bmm_i8(ork_npu *c, int nbatch, int M, int K, int N,
+               const int8_t *A, const int8_t *B, int32_t *C){
+    ork_bmm_strides s=bmm_natural(M,K,N); return ork_bmm_i8_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
 int ork_bmm_i4(ork_npu *c, int nbatch, int M, int K, int N,
                const int8_t *A, const int8_t *B, int32_t *C){
-    if(!c||!A||!B||!C) return -1;
-    if(nbatch<1||M<1||K<1||N<1) return -2;
-    if(K%32||N%64) return -2;
-    int rc = 0;
-    for(int b=0;b<nbatch;b++){
-        ork_w *w = ork_mm_pack_i4(c, K, N, B + (size_t)b*K*N);   /* no repack_i4 yet: pack+free per batch */
-        if(!w){ rc=-3; break; }
-        int r = ork_mm_run_i4(c, w, M, A + (size_t)b*M*K, C + (size_t)b*M*N);
-        ork_mm_free(c, w);
-        if(r){ rc=-5; break; }
-    }
-    return rc;
+    ork_bmm_strides s=bmm_natural(M,K,N); return ork_bmm_i4_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
 int ork_bmm_fp16(ork_npu *c, int nbatch, int M, int K, int N,
                  const f16 *A, const f16 *B, float *C){
-    if(!c||!A||!B||!C) return -1;
-    if(nbatch<1||M<1||K<1||N<1) return -2;
-    if(K%32||N%16) return -2;
-    int rc = 0;
-    for(int b=0;b<nbatch;b++){
-        ork_w *w = ork_mm_pack(c, K, N, B + (size_t)b*K*N);   /* no repack for fp16: pack+free per batch */
-        if(!w){ rc=-3; break; }
-        int r = ork_mm_run(c, w, M, A + (size_t)b*M*K, C + (size_t)b*M*N);
-        ork_mm_free(c, w);
-        if(r){ rc=-5; break; }
-    }
-    return rc;
+    ork_bmm_strides s=bmm_natural(M,K,N); return ork_bmm_fp16_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
 
 /* ---- On-NPU normalization primitives (GATED behind ORK_NORM_NPU; default = CPU) ------------------
@@ -7337,7 +7453,43 @@ int ork_npu_l2norm_f16(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
         else { double sumsq; if(have_ss) sumsq=(double)ss[m]; else { sumsq=0; for(int i=0;i<n;i++){ double v=(double)xr[i]; sumsq+=v*v; } }
                s=(float)(1.0/sqrt(sumsq+(double)eps)); }
         for(int i=0;i<n;i++) o[i]=(f16)((float)xr[i]*s); }
-    free(ss); return 0;
+    free(ss); free(sc); return 0;
+}
+
+/* On-NPU composed softmax over each row of [M][n]: y = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU.
+ * The per-row max and the final normalize (÷Σ) are CPU (cheap per-row scalars); the heavy parts run on the
+ * NPU: exp via ork_npu_exp_i16 (int16 SDP LUT; x-max quantized to a shared in_scale so exp maps in*in_scale
+ * -> exp(x-max)), Σ via the reduction-as-matmul (e·ones[n,16], reusing the norm reduce weight). Like the
+ * norm this is submit-floor-bound standalone (gated off; the win is fusing into the attention chain). Any
+ * NPU-path failure (PPU-fuse off, n%32!=0, exp/reduce error) falls back to the full CPU softmax. 0/ok,-2. */
+static int ork_softmax_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_SOFTMAX_NPU")?1:0; return v; }
+int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
+    if(!c||!x||!out||M<1||n<1) return -2;
+    float *mx=malloc((size_t)M*sizeof(float)), *e=malloc((size_t)M*n*sizeof(float)), *s=malloc((size_t)M*sizeof(float));
+    if(!mx||!e||!s){ free(mx);free(e);free(s); return -1; }
+    for(int m=0;m<M;m++){ float mv=(float)x[(size_t)m*n]; for(int j=1;j<n;j++){ float v=(float)x[(size_t)m*n+j]; if(v>mv)mv=v; } mx[m]=mv; }
+    int have_npu=0;
+    /* Composition: max (CPU) -> exp(x-max) on the NPU (SDP act-LUT, int16) -> Sum + scale on CPU.
+     * The Sum is intentionally NOT a reduce-matmul here: an activation(exp)->matmul(reduce) submit
+     * reliably ETIMEDOUTs on the stateful activation->matmul mode-switch (the reverse order,
+     * matmul->activation, is fine — cf. the rsqrt path), and self-healing per row-batch just discards
+     * the good NPU exp. So exp rides the NPU (the transcendental win) and the cheap Sigma stays on CPU. */
+    if(ork_softmax_npu_enabled() && n%32==0){
+        float lo=0; for(int m=0;m<M;m++){ float mv=mx[m]; for(int j=0;j<n;j++){ float d=(float)x[(size_t)m*n+j]-mv; if(d<lo)lo=d; } }
+        double in_scale=(-lo)/32000.0; if(in_scale<=0) in_scale=1e-6; double out_scale=1.0/32000.0;
+        int16_t *xi=malloc((size_t)M*n*2), *ei=malloc((size_t)M*n*2);
+        if(xi&&ei){
+            for(int m=0;m<M;m++) for(int j=0;j<n;j++){ long q=lround(((double)((float)x[(size_t)m*n+j]-mx[m]))/in_scale); if(q<-32768)q=-32768; if(q>32767)q=32767; xi[(size_t)m*n+j]=(int16_t)q; }
+            if(ork_npu_exp_i16(c,xi,M,n,in_scale,out_scale,ei,NULL)==0){                 /* exp(x-max) on NPU */
+                for(int m=0;m<M;m++){ double sm=0; for(int j=0;j<n;j++){ double d=(double)ei[(size_t)m*n+j]*out_scale; e[(size_t)m*n+j]=(float)d; sm+=d; } s[m]=(float)sm; }
+                have_npu=1;
+            }
+        }
+        free(xi);free(ei);
+    }
+    if(!have_npu){ for(int m=0;m<M;m++){ double sm=0; for(int j=0;j<n;j++){ float d=expf((float)x[(size_t)m*n+j]-mx[m]); e[(size_t)m*n+j]=d; sm+=d; } s[m]=(float)sm; } }
+    for(int m=0;m<M;m++){ float inv=1.0f/s[m]; for(int j=0;j<n;j++) out[(size_t)m*n+j]=(f16)(e[(size_t)m*n+j]*inv); }
+    free(mx);free(e);free(s); return 0;
 }
 
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */

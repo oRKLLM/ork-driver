@@ -162,6 +162,28 @@ validating a SoC is one file + a regression run — see [`docs/ADDING_AN_SOC.md`
 RK3588 is hardware-validated; RK3576 shares the code path with inherited (untested) params and
 `ork_npu_init` warns until `validated=1`.
 
+### Open-source reference: the mainline `accel/rocket` driver (consult when stuck on HW semantics)
+
+The RK3588 NPU is **NVDLA-derived**, and there is now a clean, mainline, **open-source** kernel driver for
+this exact hardware: **`drivers/accel/rocket`** (Tomeu Vizoso) + its userspace in Mesa3D, documented at
+[docs.kernel.org/accel/rocket](https://docs.kernel.org/accel/rocket/). **When stuck on a register meaning, a
+submit/interrupt/DMA behavior, or "why does the hardware do X" — consult it FIRST**, before guessing on-board
+(each wrong guess is a wedge-risk board run). It is the authoritative open cross-reference:
+
+- **`rocket_registers.h`** — names our numeric registers (built from the RK3588 TRM ch.36 + NVDLA). Our DPU
+  output-stage `0x40xx`, the PC block `0x00xx`, CNA `0x10xx`, CDMA `0x50xx` all map to named macros there.
+- **`rocket_job.c`** — the real job-submission ABI: the NPU runs **one task per PC program** (`TASK_CON` /
+  `OPERATION_ENABLE`), and the **kernel IRQ handler re-arms the next task** — sequencing is kernel-driven via
+  completion interrupts (`PC_INTERRUPT_*_DPU_0/DPU_1`), NOT hardware-chained through a concatenated regcmd
+  buffer. DMA faults surface as `PC_INTERRUPT_RAW_STATUS_DMA_READ_ERROR`. (This is how the multi-task
+  softmax-replay hang was diagnosed — see `FWD_SOFTMAX_RE_WIP.md`.)
+- **NVDLA docs** (nvdla.org) — the fixed pipeline (Conv/MAC → SDP → PDP → CDP), fused vs independent mode,
+  and the fixed-function unit limits (e.g. CDP LRN reduction window n≤9).
+
+Cross-referencing these three turned numeric RE into named, understood behavior repeatedly; make it the
+default move when a hardware question blocks progress. Findings from it belong on the wiki
+[regcmd ISA Reference](https://github.com/oRKLLM/ork-driver/wiki) / `NPU-Quirks`.
+
 ---
 
 ## 5. Constraints & scope

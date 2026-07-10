@@ -334,15 +334,24 @@ int          ork_mm_run_i8_silu32(ork_npu *ctx, ork_w *w, int M, const int8_t *A
 int          ork_mm_run_f16_silu(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float *C,
                                  unsigned out_bias, unsigned idx_off, unsigned cfg4068,
                                  const short *lut, int nlut);
-/* Calibrate the fp16 fused SiLU for a layer whose real gate spans [-Gmax,Gmax]: fills lut[1030] and returns
- * S (pack the gate weight as -S*W), R, and out_scale (silu(gate) = C_out * out_scale). See Exp-2026-07-05. */
-/* Calibrate the fp16 fused rsqrt (for on-NPU rmsnorm/l2norm): a reduce-matmul (sq·(-S)) emits
- * scale=1/sqrt(ss/n_feat+eps)=C_out*out_scale directly, for ss=sum(x^2) in [ss_min,ss_max]. Fills lut[1030],
- * returns S (pack the reduce weight as -S), R, out_scale. Build once per layer/range (runs probe submits). */
-int          ork_mm_build_f16_rsqrt_lut(ork_npu *ctx, int n_feat, double eps, double ss_min, double ss_max,
-                                        short *lut, double *S_out, double *R_out, double *out_scale_out);
+/* GENERIC fp16 fused-output PWL LUT builder (fp16 twin of the int8/int16 act_lut_i8/i16(fn,...)): bakes an
+ * arbitrary fn(x) into the SDP output-stage LUT for x in [in_lo,in_hi]. Pack the reduce/gate weight as -S*W
+ * (S returned); runtime C_out=R*LUT[idx(-S*x)] and fn(x)=C_out*out_scale. fn(x,ctx) carries params via ctx
+ * (NULL for parameter-free fns). Fills lut[1030]. 0/ok, -2 fail. The silu/rsqrt builders below are wrappers. */
+int          ork_mm_build_f16_lut(ork_npu *ctx, double (*fn)(double, void *), void *fnctx,
+                                  double in_lo, double in_hi, short *lut,
+                                  double *S_out, double *R_out, double *out_scale_out);
+/* Calibrate the fp16 fused SiLU for a gate spanning [-Gmax,Gmax] (caps Gmax → the fp16 spread band, then
+ * ork_mm_build_f16_lut). silu(gate)=C_out*out_scale; pack the gate weight as -S*W. See Exp-2026-07-05. */
 int          ork_mm_build_f16_silu_lut(ork_npu *ctx, double Gmax, short *lut,
                                        double *S_out, double *R_out, double *out_scale_out);
+/* Calibrate the fp16 fused rsqrt for on-NPU rmsnorm(n_feat=n)/l2norm(n_feat=1): a reduce-matmul packed as
+ * -S*W emits scale=1/sqrt(ss/n_feat+eps)=C_out*out_scale for ss=sum(x^2) in [ss_min,ss_max]. Build once per
+ * layer/range + cache (runs probe submits). PRECISION VARIANTS: this is the fp16, fused-into-the-reduce
+ * rsqrt; the int8/int16 STANDALONE rsqrt of a tensor is ork_npu_rsqrt_i8/i16 (act_lut_i8/i16, same rsqrt_f).
+ * Same op, different precision + fusion regime — both kept. */
+int          ork_mm_build_f16_rsqrt_lut(ork_npu *ctx, int n_feat, double eps, double ss_min, double ss_max,
+                                        short *lut, double *S_out, double *R_out, double *out_scale_out);
 /* FUSED SwiGLU up matmul: C = clamp_i8(round( (A·W_up) * G * gain )) as int8 [M*N], the element-wise
  * multiply by G (= silu(gate) from ork_mm_run_i8_silu) applied IN the up matmul's SDP output stage.
  * gain = mult/2^shift = s_up*s_silu/s_out. G is dense int8 [M*N]. Resident full-K int8 weight
@@ -480,6 +489,9 @@ int          ork_npu_probe_silu_std(ork_npu *ctx, const signed char *in, int M, 
 /* Faithful fp16 replay: run RKNN's fp16 LUT-load program (`loader`/`ln`) + the fp16 compute op verbatim,
  * patching only I/O + M/N. Uses the fp16 (LE-table) loader, not the int8 LO loader. in/out fp16 [M*N], N%8==0. */
 int          ork_npu_replay_full_f16(ork_npu *ctx, const unsigned *loader, int ln, const ork_f16 *in, int M, int N, ork_f16 *out, double *us);
+/* RE: replay the captured vendor forward-softmax 9-task PC-chained graph verbatim (capture geometry:
+ * reduction=64, 256 rows). in/out = raw 32768-byte buffer images; fill `in` uniform -> softmax=1/64. */
+int          ork_npu_replay_softmax_f16(ork_npu *ctx, const void *in, void *out, double *us);
 
 /* fp16 standalone activation-LUT op — RE probe. Applies the PPU LUT to a single fp16 input [M][N] via
  * REGCMD_SILU_STD_F16. Two submits (LUT-load + op). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
@@ -537,6 +549,10 @@ int          ork_npu_rsqrt_i16(ork_npu *ctx, const short *in, int M, int N, doub
 /* On-NPU exp (int8/int16) — softmax building block, activation-LUT (exp curve): out=clamp(round(exp(in*is)/os)). */
 int          ork_npu_exp_i8(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, signed char *out, double *us);
 int          ork_npu_exp_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
+/* Composed fused softmax over each row of [M][n] (fp16): out = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU:
+ * exp (ork_npu_exp_i16) + the Σ reduction (reduce-matmul) run on the NPU, max + normalize on CPU; falls back
+ * to a full CPU softmax when the gate/PPU-fuse is off or n%32!=0. 0/ok, -2 bad args. */
+int          ork_npu_softmax_f16(ork_npu *ctx, int M, int n, const ork_f16 *x, ork_f16 *out);
 
 /* On-NPU int16 element-wise ADD — EXPERIMENTAL, not bit-exact over the signed range: the SRDMA/X1 operand halves
  * negative values (int16-specific SDP X1 sign/shift behavior not yet decoded); positive is exact. out =
@@ -682,6 +698,24 @@ int          ork_npu_last_async_cpu(ork_npu *ctx);
 int          ork_bmm_i8  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C);
 int          ork_bmm_i4  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C);
 int          ork_bmm_fp16(ork_npu *ctx, int nbatch, int M, int K, int N, const ork_f16 *A, const ork_f16 *B, float   *C);
+
+/* Strided batched GEMM — the SAME batched primitive, but each operand is addressed by explicit
+ * ELEMENT strides instead of assuming dense row-major, so a permuted / view operand offloads WITHOUT
+ * the caller first materializing a contiguous copy (ggml_cont). This is what real attention needs:
+ * QKᵀ/AV read a permuted-Q ([d,H,T]→[d,T,H]) and a KV-cache view (rows strided by the cache's padded
+ * head layout), which ggml_is_contiguous rejects — so those ops were declined and stayed on CPU.
+ *   A[m,k] = A + b*abs + m*as_m + k*as_k
+ *   B[k,n] = B + b*bbs + k*bs_k + n*bs_n
+ *   C[m,n] = C + b*cbs + m*cs_m + n*cs_n
+ * All strides are in ELEMENTS (not bytes). Set the natural values (as_m=K,as_k=1,bs_k=N,bs_n=1,
+ * cs_m=N,cs_n=1, abs=M*K,bbs=K*N,cbs=M*N) to reproduce the dense ork_bmm_* above. The contraction dim
+ * (k) is typically stride-1 in attention; strided-k is supported (gathered) but slower. Each batch's
+ * strided operands are gathered into contiguous scratch, then the dense pack/run path runs unchanged —
+ * so numerics are identical to ork_bmm_*. Same dtype/shape rules. Returns 0/ok, <0 on error. */
+typedef struct { long as_m, as_k, bs_k, bs_n, cs_m, cs_n, abs, bbs, cbs; } ork_bmm_strides;
+int          ork_bmm_i8_strided  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C, const ork_bmm_strides *s);
+int          ork_bmm_i4_strided  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C, const ork_bmm_strides *s);
+int          ork_bmm_fp16_strided(ork_npu *ctx, int nbatch, int M, int K, int N, const ork_f16 *A, const ork_f16 *B, float   *C, const ork_bmm_strides *s);
 
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);

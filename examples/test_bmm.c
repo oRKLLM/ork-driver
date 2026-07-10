@@ -139,6 +139,63 @@ static int test_rsqrt(ork_npu *npu, int M, int n){
     free(x);free(sref);free(ss); return fail;
 }
 
+/* composed softmax (max→exp→sum→normalize) vs a double-precision per-row reference. CPU path by default;
+ * ORK_SOFTMAX_NPU routes exp+sum to the NPU (int16 exp → looser tolerance). */
+static int test_softmax(ork_npu *npu, int M, int n){
+    ork_f16 *x=malloc((size_t)M*n*2), *o=malloc((size_t)M*n*2);
+    for(size_t i=0;i<(size_t)M*n;i++) x[i]=f2h((rand()/(float)RAND_MAX)*8.f-4.f);   /* ~[-4,4] */
+    if(ork_npu_softmax_f16(npu,M,n,x,o)){ fprintf(stderr,"[softmax] rc!=0\n"); free(x);free(o); return 1; }
+    double maxrel=0;
+    for(int m=0;m<M;m++){ double mx=h2f(x[(size_t)m*n]); for(int j=1;j<n;j++){ double v=h2f(x[(size_t)m*n+j]); if(v>mx)mx=v; }
+        double sm=0; for(int j=0;j<n;j++) sm+=exp(h2f(x[(size_t)m*n+j])-mx);
+        for(int j=0;j<n;j++){ double ref=exp(h2f(x[(size_t)m*n+j])-mx)/sm; double r=fabs(h2f(o[(size_t)m*n+j])-ref)/(fabs(ref)+1e-4); if(r>maxrel)maxrel=r; } }
+    free(x);free(o);
+    if(maxrel>0.05){ fprintf(stderr,"[softmax] MISMATCH maxrel=%.4f\n",maxrel); return 1; }
+    fprintf(stderr,"[softmax] OK M=%d n=%d (maxrel=%.4f)\n",M,n,maxrel); return 0;
+}
+
+/* Strided batched GEMM as REAL attention QKᵀ: per head b, C[m,n] = Σ_k Q[m,k]·K[n,k].
+ * Q lives permuted as [head_dim, n_head, n_tokens] (the [d,H,T] layout after permute), K as a KV-cache
+ * view [head_dim, n_head, n_kv] — exactly the non-contiguous operands ggml_is_contiguous declines.
+ * Both stride: contraction dim (head_dim) is stride-1, the token dim strides by n_head*head_dim, the
+ * head (batch) strides by head_dim. C is contiguous per head. i8 exact; fp16 within tolerance. */
+static int test_attn_strided(ork_npu *npu, int is_i8, int H, int T, int D, int Tkv){
+    const char *nm = is_i8 ? "attn-i8" : "attn-f16";
+    long tok_stride=(long)H*D;                         /* [d,H,T]/[d,H,Tkv]: token stride = n_head*head_dim */
+    ork_bmm_strides s = { .as_m=tok_stride,.as_k=1, .bs_k=1,.bs_n=tok_stride, .cs_m=Tkv,.cs_n=1,
+                          .abs=D,.bbs=D,.cbs=(long)T*Tkv };   /* per-head base = head_dim; C dense per head */
+    size_t qn=(size_t)tok_stride*T, kn=(size_t)tok_stride*Tkv, cn=(size_t)H*T*Tkv;
+    int fail=0;
+    if(is_i8){
+        int8_t *Q=malloc(qn), *Kc=malloc(kn); int32_t *C=calloc(cn,4), *Cref=calloc(cn,4);
+        for(size_t i=0;i<qn;i++) Q[i]=(int8_t)rint8(-127,127);
+        for(size_t i=0;i<kn;i++) Kc[i]=(int8_t)rint8(-127,127);
+        for(int b=0;b<H;b++)for(int m=0;m<T;m++)for(int n=0;n<Tkv;n++){ int32_t acc=0;
+            for(int k=0;k<D;k++) acc+=(int32_t)Q[(long)b*D+(long)m*tok_stride+k]*(int32_t)Kc[(long)b*D+(long)n*tok_stride+k];
+            Cref[((size_t)b*T+m)*Tkv+n]=acc; }
+        int rc=ork_bmm_i8_strided(npu,H,T,D,Tkv,Q,Kc,C,&s);
+        if(rc){ fprintf(stderr,"[%s] rc=%d\n",nm,rc); fail=1; }
+        else { size_t bad=0,first=(size_t)-1; for(size_t i=0;i<cn;i++) if(C[i]!=Cref[i]){ if(first==(size_t)-1)first=i; bad++; }
+            if(bad){ fprintf(stderr,"[%s] MISMATCH %zu/%zu (first %zu: got %d want %d)\n",nm,bad,cn,first,C[first],Cref[first]); fail=1; }
+            else fprintf(stderr,"[%s] OK H=%d T=%d D=%d Tkv=%d (exact)\n",nm,H,T,D,Tkv); }
+        free(Q);free(Kc);free(C);free(Cref);
+    } else {
+        ork_f16 *Q=malloc(qn*2), *Kc=malloc(kn*2); float *C=calloc(cn,4), *Cref=calloc(cn,4);
+        for(size_t i=0;i<qn;i++) Q[i]=f2h((rand()/(float)RAND_MAX)*2.f-1.f);
+        for(size_t i=0;i<kn;i++) Kc[i]=f2h((rand()/(float)RAND_MAX)*2.f-1.f);
+        for(int b=0;b<H;b++)for(int m=0;m<T;m++)for(int n=0;n<Tkv;n++){ float acc=0;
+            for(int k=0;k<D;k++) acc+=h2f(Q[(long)b*D+(long)m*tok_stride+k])*h2f(Kc[(long)b*D+(long)n*tok_stride+k]);
+            Cref[((size_t)b*T+m)*Tkv+n]=acc; }
+        int rc=ork_bmm_fp16_strided(npu,H,T,D,Tkv,Q,Kc,C,&s);
+        if(rc){ fprintf(stderr,"[%s] rc=%d\n",nm,rc); fail=1; }
+        else { double maxrel=0; size_t worst=0; for(size_t i=0;i<cn;i++){ double d=fabs((double)C[i]-Cref[i]); double r=d/(fabs(Cref[i])+1e-3); if(r>maxrel){maxrel=r;worst=i;} }
+            if(maxrel>0.03){ fprintf(stderr,"[%s] MISMATCH maxrel=%.4f at %zu (got %.4f want %.4f)\n",nm,maxrel,worst,C[worst],Cref[worst]); fail=1; }
+            else fprintf(stderr,"[%s] OK H=%d T=%d D=%d Tkv=%d (maxrel=%.4f)\n",nm,H,T,D,Tkv,maxrel); }
+        free(Q);free(Kc);free(C);free(Cref);
+    }
+    return fail;
+}
+
 int main(void){
     srand(1234);
     ork_npu *npu = ork_npu_init();
@@ -153,6 +210,11 @@ int main(void){
     fail |= test_norm(npu, 4, 4096);
     fail |= test_l2norm_f32(4096);               /* CPU/NEON l2norm primitive */
     fail |= test_rsqrt(npu, 8, 2048);            /* fused on-NPU reduce+rsqrt (rsqrt-LUT); skips if no PPU-fuse */
+    fail |= test_softmax(npu, 8, 128);           /* composed softmax (CPU default; exp+sum on NPU under ORK_SOFTMAX_NPU) */
+    fail |= test_softmax(npu, 4, 4096);
+    fail |= test_attn_strided(npu, 1, 8, 16, 64, 32);   /* strided QKᵀ i8:  permuted-Q + KV-cache view, head_dim=64 */
+    fail |= test_attn_strided(npu, 0, 8, 16, 64, 32);   /* strided QKᵀ f16: 8 heads T=16 head_dim=64 Tkv=32 */
+    fail |= test_attn_strided(npu, 0, 4, 16, 128, 32);  /* strided QKᵀ f16: head_dim=128 */
     ork_npu_free(npu);
     fprintf(stderr, fail ? "\nTEST_BMM: FAIL\n" : "\nTEST_BMM: PASS\n");
     return fail ? 1 : 0;
