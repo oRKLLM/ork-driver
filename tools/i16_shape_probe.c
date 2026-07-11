@@ -31,8 +31,8 @@ static int try_shape(ork_npu *c, int M, int N){
 /* Reproduce the chain context: pack a gate-like int8 weight, run a matmul on `nc` cores, then the int16
  * silu at the chain shape. keep_w!=NULL returns the packed weight resident (caller frees) to test whether
  * a RESIDENT weight (not just the matmul) is what wedges the following silu. */
-static int matmul_then_silu(ork_npu *c, int nc, ork_w **keep_w){
-    const int Km=2048, Nm=6144, Mm=128;   /* FFN gate-like */
+static int matmul_then_silu_kn(ork_npu *c, int nc, ork_w **keep_w, int Km, int Nm){
+    const int Mm=128;
     int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
     for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
     ork_w *w = ork_mm_pack_i8(c, Km, Nm, B); free(B);
@@ -47,6 +47,8 @@ static int matmul_then_silu(ork_npu *c, int nc, ork_w **keep_w){
     if(keep_w) *keep_w = w; else ork_mm_free(c, w);
     return rc;
 }
+/* gate-like K=2048,N=6144 wrapper (the original) */
+static int matmul_then_silu(ork_npu *c, int nc, ork_w **keep_w){ return matmul_then_silu_kn(c,nc,keep_w,2048,6144); }
 
 /* [D] like matmul_then_silu but the weight is IMPORTED (dma-buf), matching the orkpack chain path (the
  * recent int16 chain wedges all showed imported=1). pack -> dump -> reload-as-import -> matmul -> silu. */
@@ -146,6 +148,16 @@ int main(void){
     matmul_then_silu_dom(c, 1);
     printf("  [H] weight+matmul in DOMAIN 2, then int16 silu (dom0 buffers):\n");
     matmul_then_silu_dom(c, 2);
+
+    printf("-- (5) REGISTER-INHERITANCE repro (a preceding op the simple matmul doesn't do) --\n");
+    printf("  [I] K-SPLIT matmul (K=6144 ffn_down, K>4096 -> different regcmd path) then silu:\n");
+    matmul_then_silu_kn(c, cores, NULL, 6144, 2048);
+    printf("  [J] up(K=2048,N=6144)+gate(2048,6144)+down(6144,2048) sequence then silu (full FFN op mix):\n");
+    { ork_w *wu=NULL, *wg=NULL, *wd=NULL;
+      matmul_then_silu_kn(c, cores, &wu, 2048, 6144);     /* up (silu after each — the last is the real test) */
+      matmul_then_silu_kn(c, cores, &wg, 2048, 6144);     /* gate */
+      matmul_then_silu_kn(c, cores, &wd, 6144, 2048);     /* down (K-split) — silu right after this */
+      if(wu)ork_mm_free(c,wu); if(wg)ork_mm_free(c,wg); if(wd)ork_mm_free(c,wd); }
 
     ork_npu_free(c);
     return 0;

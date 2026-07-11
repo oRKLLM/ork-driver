@@ -5463,7 +5463,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
-    int dom=c->dom_active;
+    int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
     struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
     struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
@@ -5771,7 +5771,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
-    int dom=c->dom_active;
+    int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
     struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
     struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
@@ -5810,7 +5810,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * (int8-only, ⚠ note below), so the standalone op is the only int16 path. => int16 silu NOT viable
      * in-chain with current NPU understanding — needs kernel-level reset or a deeper pipeline fix. Left as
      * the RE artifact (ORK_FFN_SILU_I16). Shipped coherent path is all-CPU-silu. ping-pong OFF (LUT-op). */
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!getenv("ORK_I16_NORESET")) act(fd,RKNPU_ACT_RESET,0);   /* ORK_I16_NORESET: A/B — is the reset load-bearing for dom>0? */
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -5842,7 +5842,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
-    int dom=c->dom_active;
+    int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
     struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
     struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
