@@ -312,6 +312,7 @@ static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
  * DMA-allocating path (weights, scratch, PPU-op buffers, zero-copy imports), not just one op. */
 #define ORK_IOVA_NDOM 64
 static size_t g_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
+static long g_bcreate_n, g_bimport_n, g_bdestroy_n;   /* cumulative alloc/free counts (ORK_PRESUBMIT_TRACE leak diag) */
 static size_t ork_iova_ceiling(void){
     static size_t v=0;
     if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):3900; if(mb<=0)mb=3900; v=(size_t)mb*1024u*1024u; }
@@ -367,11 +368,13 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
     struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
     live_add(fd,b.handle,b.obj);
+    g_bcreate_n++;
     return b;
 }
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
     live_del(b->handle);
+    g_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
 /* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
@@ -433,6 +436,7 @@ static struct buf bimport(int fd,size_t size,int domain){
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     live_add(fd,b.handle,b.obj);
+    g_bimport_n++;
     return b;
 }
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
@@ -580,6 +584,21 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
     if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
+    /* PRE-SUBMIT fsync'd trace (ORK_PRESUBMIT_TRACE=<path>): write this submit's full context to disk AND
+     * fsync it BEFORE the ioctl — so if the ioctl HARD-WEDGES the NPU/board (no self-heal, needs power-cycle),
+     * the last line on disk is the exact submit that wedged. Survives the wedge (unlike stderr/page-cache logs
+     * lost on the lockup). One line/submit; the tail after a wedge pins op/weight/domain/tasks/addrs. */
+    if (getenv("ORK_PRESUBMIT_TRACE")) {
+        static FILE *tf=NULL; static long sn=0;
+        if(!tf){ tf=fopen(getenv("ORK_PRESUBMIT_TRACE"),"w"); }
+        if(tf){ size_t iov=0; for(int d=0;d<ORK_IOVA_NDOM;d++) iov+=g_iova_bytes[d];
+            fprintf(tf,"#%ld op=%s K=%d N=%d wdom=%d imported=%d | submit_dom=%u tasks=%u core=0x%x | iova_total=%zuMiB dom[0]=%zu dom[1]=%zu dom[2]=%zu | crt=%ld imp=%ld dst=%ld live=%ld\n",
+                    ++sn, g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import,
+                    sub->iommu_domain_id, sub->task_number, sub->core_mask, iov>>20,
+                    g_iova_bytes[0]>>20, g_iova_bytes[1]>>20, g_iova_bytes[2]>>20,
+                    g_bcreate_n, g_bimport_n, g_bdestroy_n, g_bcreate_n+g_bimport_n-g_bdestroy_n);
+            fflush(tf); fsync(fileno(tf)); }
+    }
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     if (rc < 0) {
         int e = errno;
