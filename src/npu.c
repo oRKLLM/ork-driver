@@ -5810,7 +5810,11 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * (int8-only, ⚠ note below), so the standalone op is the only int16 path. => int16 silu NOT viable
      * in-chain with current NPU understanding — needs kernel-level reset or a deeper pipeline fix. Left as
      * the RE artifact (ORK_FFN_SILU_I16). Shipped coherent path is all-CPU-silu. ping-pong OFF (LUT-op). */
-    if(!getenv("ORK_I16_NORESET")) act(fd,RKNPU_ACT_RESET,0);   /* ORK_I16_NORESET: A/B — is the reset load-bearing for dom>0? */
+    /* #35 RESOLVED: the per-call ACT_RESET was pure OVERHEAD, not a wedge guard. The in-chain "wedge" was a
+     * MISREAD — dmesg "RKNPU: soft reset" counts the DELIBERATE ACT_RESET (ORK_DEBUG_RESET: 23 act calls ->
+     * 27 dmesg entries), not hardware wedges (errno=110 count = 0 in a full chain run). Removing it: int16
+     * chain prefill 28->68 tok/s, PPL 19.02 unchanged, 0 real wedges. Default OFF; ORK_I16_RESET re-enables. */
+    if(getenv("ORK_I16_RESET")) act(fd,RKNPU_ACT_RESET,0);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -5821,6 +5825,15 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    /* ORK_I16_DUMP: dump the exact submit context so the WEDGING chain submit can be diffed byte-for-byte
+     * against the CLEAN probe submit of the same shape (in-model instrumentation, #35). */
+    if(getenv("ORK_I16_DUMP")){ static long n=0;
+        fprintf(stderr,"[i16dump #%ld] M=%d N=%d dom=%d dom_active=%d core=0x%x | A.dma=0x%llx A.dom=%d O.dma=0x%llx O.dom=%d Lrc.dma=0x%llx(d%d) Lsc.dma=0x%llx(d%d) | regcmd.dma=0x%llx regcfg=%u task.obj=0x%llx last_dt=%d warmed=%d\n",
+            ++n,M,N,dom,c->dom_active,sub.core_mask,
+            (unsigned long long)A.dma,A.domain,(unsigned long long)O.dma,O.domain,
+            (unsigned long long)Lrc.dma,Lrc.domain,(unsigned long long)Lsc.dma,Lsc.domain,
+            (unsigned long long)c->regcmd.dma,tk->regcfg_amount,(unsigned long long)c->task.obj,c->last_dt,c->warmed);
+        fflush(stderr); }
     if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
@@ -5879,6 +5892,15 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
+    /* ORK_I16_DUMP: dump the exact submit context so the WEDGING chain submit can be diffed byte-for-byte
+     * against the CLEAN probe submit of the same shape (in-model instrumentation, #35). */
+    if(getenv("ORK_I16_DUMP")){ static long n=0;
+        fprintf(stderr,"[i16dump #%ld] M=%d N=%d dom=%d dom_active=%d core=0x%x | A.dma=0x%llx A.dom=%d O.dma=0x%llx O.dom=%d Lrc.dma=0x%llx(d%d) Lsc.dma=0x%llx(d%d) | regcmd.dma=0x%llx regcfg=%u task.obj=0x%llx last_dt=%d warmed=%d\n",
+            ++n,M,N,dom,c->dom_active,sub.core_mask,
+            (unsigned long long)A.dma,A.domain,(unsigned long long)O.dma,O.domain,
+            (unsigned long long)Lrc.dma,Lrc.domain,(unsigned long long)Lsc.dma,Lsc.domain,
+            (unsigned long long)c->regcmd.dma,tk->regcfg_amount,(unsigned long long)c->task.obj,c->last_dt,c->warmed);
+        fflush(stderr); }
     if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
