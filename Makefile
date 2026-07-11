@@ -91,6 +91,10 @@ f16_gate_acc: tools/f16_gate_acc.c $(CORE)
 mode_switch_probe: tools/mode_switch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# RE the CNA precision field (0x100c): map INT8/INT16/FP16 encoding by fuzzing proc/in precision bits.
+i16_precision_probe: tools/i16_precision_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
 silu_native: tools/silu_native.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
