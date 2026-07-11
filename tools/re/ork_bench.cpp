@@ -16,6 +16,7 @@
  */
 #include "llama.h"
 #include "ggml-backend.h"
+#include "ggml-ork.h"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -186,6 +187,16 @@ int main(int argc, char** argv){
     std::vector<char> ptxt(fn+1); size_t rd=fread(ptxt.data(),1,fn,f); ptxt[rd]=0; fclose(f);
 
     llama_backend_init();
+
+    // TEST HOOK (harness only): exercise the product load-config API instead of env knobs.
+    //   ORK_BENCH_CFG=int16  -> ggml_backend_ork_set_load_config(dflash, silu_int8_cpu=false)  [default path]
+    //   ORK_BENCH_CFG=int8cpu -> ...(silu_int8_cpu=true);  ORK_BENCH_DFLASH=1 sets dflash on.
+    if (const char* cfg = getenv("ORK_BENCH_CFG")) {
+        bool int8cpu = strcmp(cfg,"int8cpu")==0;
+        bool dflash  = getenv("ORK_BENCH_DFLASH")!=nullptr;
+        ggml_backend_ork_set_load_config(dflash, int8cpu);
+        fprintf(stderr,"[ork_bench] set_load_config(dflash=%d, silu=%s)\n", dflash, int8cpu?"int8cpu":"int16");
+    }
 
     // DFlash operating mode: a co-resident draft speculates a block, the target verifies M=B on the NPU.
     if (const char* draft = getenv("ORK_DFLASH_DRAFT")) {

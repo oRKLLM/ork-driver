@@ -731,6 +731,23 @@ static void set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
     setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);                              /* requant multiplier */
     setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);                             /* requant shift (>>) */
 }
+/* PHASE 1 (#35 chained FFN): INT16 matmul output stage — requant int32 acc -> int16 (scale mult/2^shift),
+ * 2-byte elements. Between int8 (0x40c0=0x20,0x4050=0x0124) and int32 (0x40c0=0x80,0x4050=0x07fc); int16 is
+ * the 2x-denser-than-int32 midpoint. THESE ARE BEST-GUESS and env-overridable (ORK_I16OUT_*) so the encoding
+ * can be SWEPT on-board (like i16_matmul_test did for the fp16/int16 output regs). This is the RE crux: the
+ * on-NPU int32->int16 requant that lets the matmul feed the int16 silu inside one chain. */
+static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
+    int s=stride>0?stride:N;
+    unsigned r10=getenv("ORK_I16OUT_4010")?strtoul(getenv("ORK_I16OUT_4010"),0,0):0x0000;   /* int16 precision (int8=0, int32=0x8000) */
+    unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0248;   /* int16 row byte-stride (int8 0x0124, int32 0x07fc) */
+    unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;   /* element size = 2 bytes (int8 0x20, int32 0x80) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,r10);
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/8)-1)<<16)|((N/16)-1));                          /* int16 group stride: 2x denser than int32 (N/8) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4050,r50);
+    setr(rc,REGCMD_I8_N,0x1001,0x40c0,rc0);
+    setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);
+    setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);
+}
 
 /* Runtime gate for the PPU fused-output path. Gated on the DETECTED SoC: the fused output stage (int8
  * requantize, SiLU LUT, dual-input EW-mul) is reverse-engineered and validated against the RK3588 PPU
