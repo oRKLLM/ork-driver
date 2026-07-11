@@ -5790,15 +5790,14 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4068,cfg4068);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
 
-    /* #35 (2026-07-11): the int16 silu is a STANDALONE pure-SDP op (enable_mask 0x18). IN A CHAIN, its
-     * submit right after a MULTI-CORE matmul wedges on the CNA/DPU -> pure-SDP PIPELINE TRANSITION. A
-     * userspace ACT_RESET does NOT clear the matmul pipeline state (a 2-attempt reset+retry made resets
-     * WORSE: 171 vs 80 — BOTH attempts wedge); only the kernel soft-reset (timeout self-heal) clears it.
-     * And the FUSED int16 output is CLOSED (int8-only, see the ⚠ note below), so there's no fused
-     * alternative. => int16 silu is NOT viable in-chain with current NPU understanding; the run limps
-     * through via the higher-level self-heal (correct output, but ~1 soft-reset/layer). Single-pass here;
-     * ping-pong OFF (LUT-op). Left in place (ORK_FFN_SILU_I16) as the RE artifact for a future kernel-
-     * reset-exposing or pipeline-drain fix. Shipped coherent path is all-CPU-silu. */
+    /* #35: the int16 silu is a STANDALONE pure-SDP op (enable_mask 0x18). IN A CHAIN, its submit wedges in
+     * the chain CONTEXT (works standalone at every shape, i16_shape_probe). NO userspace mitigation fixes
+     * it: ping-pong OFF, ACT_RESET, a pipeline-DRAIN (tiny single-core matmul first), and reset+retry ALL
+     * fail — even the calib's 64x64 probe wedges on every attempt after soft-resets. Only the kernel
+     * self-heal limps it through (correct output, ~1 reset/layer). And the FUSED int16 output is CLOSED
+     * (int8-only, ⚠ note below), so the standalone op is the only int16 path. => int16 silu NOT viable
+     * in-chain with current NPU understanding — needs kernel-level reset or a deeper pipeline fix. Left as
+     * the RE artifact (ORK_FFN_SILU_I16). Shipped coherent path is all-CPU-silu. ping-pong OFF (LUT-op). */
     act(fd,RKNPU_ACT_RESET,0);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
@@ -6070,6 +6069,9 @@ static int silu_calibrate_idx16(ork_npu *c){
     static int16_t in[SILU16_NS],out[SILU16_NS]; int16_t lut[1030];
     for(int s=0;s<SILU16_NS;s++) in[s]=(int16_t)(-32768 + s*SILU16_QSTEP);
     for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
+    /* NB: runs LAZILY on the first silu call — in the FFN chain that's right after a MULTI-CORE matmul,
+     * so this pure-SDP probe hits the chain-context wedge (retry does NOT help — it wedges every attempt
+     * even after soft-resets). See ork_npu_probe_silu_std_i16 (#35). Standalone it's clean. */
     if(ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
     for(int s=0;s<SILU16_NS;s++){ int o=out[s]; c->silu_idx16[s]=(o>-490&&o<510)?(short)(o+512):(short)-32768; }
     c->silu_idx16_ok=1; return 0;
