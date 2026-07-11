@@ -586,6 +586,10 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
                 rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
                 g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import);
+        /* live per-domain IOVA usage AT THE FAILURE POINT: shows whether the domain overflowed (size/pressure)
+         * vs a non-size DMA-walk stall. g_iova_bytes counts resident tiles + imports + transient scratch. */
+        { size_t tot=0; for(int d=0; d<ORK_IOVA_NDOM; d++) if(g_iova_bytes[d]){ fprintf(stderr,"  [iova@fail] domain %d live=%zu MiB (ceil %zu MiB)\n", d, g_iova_bytes[d]>>20, ork_iova_ceiling()>>20); tot+=g_iova_bytes[d]; }
+          fprintf(stderr,"  [iova@fail] total live=%zu MiB\n", tot>>20); }
         if (getenv("ORK_DUMP_FAIL")) dump_submit(sub);   /* full failing regcmd on demand */
         struct rknpu_action a = { .flags = RKNPU_ACT_RESET, .value = 0 };
         ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
