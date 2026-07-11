@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 static int try_shape(ork_npu *c, int M, int N){
     int16_t *in = calloc((size_t)M*N, 2), *out = calloc((size_t)M*N, 2);
@@ -70,6 +71,23 @@ static int matmul_then_silu_imported(ork_npu *c, int nc){
     return rc;
 }
 
+/* [E]/[F] threading repro: ggml runs the FFN handler (matmul + silu) on a WORKER thread, while
+ * ork_npu_init ran on the main thread. Mimic that: do the matmul+silu (or just the silu) on a spawned
+ * pthread. If THIS wedges (but the main-thread version doesn't), the wedge is a thread/fd/context issue,
+ * not the hardware path. */
+struct targ { ork_npu *c; int mode; int rc; };   /* mode 0 = matmul+silu, 1 = silu-only */
+static void *thread_fn(void *p){
+    struct targ *a = p;
+    if(a->mode==0) a->rc = matmul_then_silu(a->c, ork_npu_cores(a->c), NULL);
+    else           a->rc = try_shape(a->c, 128, 6144);
+    return NULL;
+}
+static int on_thread(ork_npu *c, int mode){
+    struct targ a={c,mode,0}; pthread_t th;
+    if(pthread_create(&th,NULL,thread_fn,&a)){ printf("    pthread_create fail\n"); return -99; }
+    pthread_join(th,NULL); return a.rc;
+}
+
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c = ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
@@ -92,6 +110,12 @@ int main(void){
       if(w) ork_mm_free(c, w); }
     printf("  [D] IMPORTED (dma-buf) weight matmul then silu (matches the orkpack chain path):\n");
     matmul_then_silu_imported(c, cores);
+
+    printf("-- (3) THREADING repro (init on main; work on a spawned worker, like ggml) --\n");
+    printf("  [E] silu-ONLY on a spawned thread:\n");
+    on_thread(c, 1);
+    printf("  [F] matmul+silu on a spawned thread (closest to the ggml FFN handler):\n");
+    on_thread(c, 0);
 
     ork_npu_free(c);
     return 0;
