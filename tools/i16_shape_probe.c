@@ -88,6 +88,30 @@ static int on_thread(ork_npu *c, int mode){
     pthread_join(th,NULL); return a.rc;
 }
 
+/* [G] MULTI-DOMAIN: pack the weight in a NON-0 domain (wdom), run the matmul there (dom_activate(wdom)),
+ * THEN the int16 silu — whose op ALWAYS bcreate's its buffers in the DEFAULT domain (dom0) and submits
+ * iommu_domain_id=0. So the silu runs in dom0 while c->dom_active=wdom -> the domain MISMATCH the full
+ * chain had (weights in dom>0, silu in dom0). This is the condition the earlier probes did NOT replicate. */
+static int matmul_then_silu_dom(ork_npu *c, int wdom){
+    const int Km=2048, Nm=6144, Mm=128;
+    int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
+    for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
+    ork_npu_set_pack_domain(c, wdom);
+    ork_w *w = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    ork_npu_set_pack_domain(c, -1);
+    if(!w){ printf("    pack fail (dom%d)\n", wdom); return -2; }
+    printf("    [weight domain = %d]\n", ork_w_domain(w));
+    int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
+    for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
+    ork_npu_set_core_budget(c, ork_npu_cores(c));
+    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    printf("    [matmul in dom%d -> rc=%d]\n", wdom, mrc);
+    free(A); free(C);
+    int rc = try_shape(c, 128, 6144);   /* silu buffers in dom0 while dom_active=wdom */
+    ork_mm_free(c, w);
+    return rc;
+}
+
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c = ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
@@ -116,6 +140,12 @@ int main(void){
     on_thread(c, 1);
     printf("  [F] matmul+silu on a spawned thread (closest to the ggml FFN handler):\n");
     on_thread(c, 0);
+
+    printf("-- (4) MULTI-DOMAIN repro (weight+matmul in dom>0, silu buffers in dom0) --\n");
+    printf("  [G] weight+matmul in DOMAIN 1, then int16 silu (dom0 buffers):\n");
+    matmul_then_silu_dom(c, 1);
+    printf("  [H] weight+matmul in DOMAIN 2, then int16 silu (dom0 buffers):\n");
+    matmul_then_silu_dom(c, 2);
 
     ork_npu_free(c);
     return 0;
