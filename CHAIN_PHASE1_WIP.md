@@ -46,7 +46,33 @@ the chain tolerates fp16-matmul cost on the gate op only, this is a drop-in cohe
 - Board 10.3.0.236 clean (0 real wedges from Phase-1 probes — int16 wedged but self-healed).
 - Product config API (2-option, fork d7a2fcdc0) unaffected — this is orthogonal RE.
 
-## Next concrete step
-Path A: read the int16-silu op's input surface regs (0x5018/0x5034/0x5040 + input PREC), build a
-int32-input variant, and test matmul-int32 → silu-reads-int32 as a 2-task chain (extend chain_probe).
-Coherence gate: PPL via ork_ppl once wired into ggml-ork.
+## Path A RESULT (2026-07-11): literal int32-handoff is HARDWARE-CLOSED
+GROUNDED in NVDLA SDP docs (nvdla.org unit_description): **the SDP reads only INT8/INT16/FP16 from
+memory; INT32 is an internal accumulator precision, NEVER a memory feature-map input format.** So
+"silu reads the matmul's native int32 output from memory" is impossible on this hardware — matches
+the CVT-bypass note (npu.c:4347). The memory-handoff intermediate MUST be int8/int16/fp16:
+  - int8 : matmul writes ✓ (set_i8_out8), silu reads ✓ — but per-tensor requant floor = PPL 55.
+  - int16: silu reads ✓, matmul writes ✗ (int16-matmul-output CLOSED). DEAD for handoff.
+  - fp16 : silu reads ✓, matmul writes = INT8_TO_FP16 (the ONE open lead) — runs no-wedge but zeros.
+
+INT8_TO_FP16 crack attempt: swept 0x4010 (DATA_FORMAT) out-precision field {0x2,0x8002,0x08000002,
+0x28000002} keeping fp16 gain 0x00010001 — ALL HANG (61s job-timeout, soft-reset, NPU self-healed,
+test_matmul clean after). This is bitfield-guessing that wedges — STOP guessing on-board (AGENTS.md).
+The right way to crack INT8_TO_FP16 DATA_FORMAT = CAPTURE it from RKNN (regcmd_capture toolkit on
+.239), not board sweeps.
+
+## Where Path A leaves us — the coherent on-NPU silu needs the ACC ON-CHIP (fused), not a mem handoff
+The memory-format wall means a 2-task chain can't carry a lossless intermediate the silu can read
+(int16 uncomposable, int32 unreadable, fp16 needs a capture). The config that ALREADY WORKS coherent
+is the FUSED path — accumulator flows conv→LUT on-chip, no memory round-trip:
+  - set_f16_silu (fp16 matmul + fused SiLU, fp16 acc→LUT): WORKS, ~1% err, gated off for fp16-mm 3.3x.
+  - TASK #35 PRIZE (uncracked): int8 matmul FUSED with an int16-RESOLUTION LUT index (widen the
+    acc→index map beyond the int8 requant that causes PPL 55). Fast int8 matmul + coherent silu, one
+    task, no memory intermediate. This sidesteps the entire memory-format wall.
+
+## Next concrete step (fork)
+(1) FUSED int8+int16-index (task #35 proper): in set_i8_silu, widen the acc->LUT-index precision
+    (the int16 standalone silu proves the LUT is coherent at int16 input res). No memory handoff.
+(2) Bank fp16-fused-silu as the coherent gate op now (works today; costs fp16-mm on that op).
+(3) Unlock the fast fp16 memory-chain LATER via an RKNN INT8_TO_FP16 capture (.239 toolkit) — no
+    more board bitfield-guessing.
