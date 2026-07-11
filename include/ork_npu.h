@@ -418,6 +418,12 @@ int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A
 int          ork_npu_probe_i8_out8(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
                                    int mult, int shift, int8_t *C, double *us);
 
+/* PHASE 1 (#35 chained FFN): int8 matmul with the INT16-requantized output stage (set_i16_out).
+ * out_i16 = clamp_i16(round(acc_i32 * mult / 2^shift)); identity = (0x4000,14). C[M*N] int16 out
+ * (raw device layout). The RE crux for the on-NPU matmul->int16-silu handoff. 0/ok, -1 wedged, -2 dims. */
+int          ork_npu_probe_i16_out(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
+                                   int mult, int shift, short *C, double *us);
+
 /* ork-NATIVE fused-SiLU LUT generator: build ork's OWN silu LUT for the fused-output path (no RKNN
  * dependence). Measures ork's index(acc) for (r_mult,r_shift,cfg4068) via one calibration submit, then
  * builds lut[1030] = silu curve matched to ork's mapping for (in_scale,out_scale). Do this ONCE per

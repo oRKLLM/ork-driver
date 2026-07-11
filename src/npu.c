@@ -749,6 +749,33 @@ static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
     setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);
 }
 
+/* PHASE 1 (#35 chained FFN) — the SHIM the user asked for: instead of the CLOSED int16-matmul-output,
+ * graft the fp16 REGCMD template's fp16 OUT_CVT (0x4010=0xa8000002, 0x40c0=0x40=2-byte, 0x4050=0x36e,
+ * gain 0x4084=1/shift 0) onto an INT8 matmul's output stage — INT8_TO_FP16. If the int32 accumulator
+ * survives the fp16 CVT this yields a fast int8 matmul writing a COHERENT fp16 intermediate (no
+ * per-tensor requant floor) for the fp16 silu. WEDGE-PRONE (proc-precision mismatch, per set_f16_silu
+ * warning); env-overridable for the sweep. N-derived geometry, constants from regcmd_array_4x32x16.h. */
+static void set_f16_out(uint32_t*rc,int N,int stride){
+    int s=stride>0?stride:N; (void)s;
+    unsigned r04=getenv("ORK_F16OUT_4004")?strtoul(getenv("ORK_F16OUT_4004"),0,0):0x0000000e;
+    unsigned r10=getenv("ORK_F16OUT_4010")?strtoul(getenv("ORK_F16OUT_4010"),0,0):0xa8000002; /* fp16 OUT_CVT */
+    unsigned r50=getenv("ORK_F16OUT_4050")?strtoul(getenv("ORK_F16OUT_4050"),0,0):0x0000036e;
+    unsigned rc0=getenv("ORK_F16OUT_40c0")?strtoul(getenv("ORK_F16OUT_40c0"),0,0):0x00000040; /* 2-byte elem */
+    unsigned r84=getenv("ORK_F16OUT_4084")?strtoul(getenv("ORK_F16OUT_4084"),0,0):0x00000001; /* gain */
+    unsigned r88=getenv("ORK_F16OUT_4088")?strtoul(getenv("ORK_F16OUT_4088"),0,0):0x00000000; /* shift */
+    setr(rc,REGCMD_I8_N,0x1001,0x4004,r04);
+    setr(rc,REGCMD_I8_N,0x1001,0x4010,r10);
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
+    setr(rc,REGCMD_I8_N,0x1001,0x403c,((N-1)<<16)|(N-1));
+    setr(rc,REGCMD_I8_N,0x1001,0x4050,r50);
+    setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);
+    setr(rc,REGCMD_I8_N,0x1001,0x4080,0);
+    setr(rc,REGCMD_I8_N,0x1001,0x4084,r84);
+    setr(rc,REGCMD_I8_N,0x1001,0x4088,r88);
+    setr(rc,REGCMD_I8_N,0x1001,0x40c0,rc0);
+    setr(rc,REGCMD_I8_N,0x1001,0x40c4,0);
+}
+
 /* Runtime gate for the PPU fused-output path. Gated on the DETECTED SoC: the fused output stage (int8
  * requantize, SiLU LUT, dual-input EW-mul) is reverse-engineered and validated against the RK3588 PPU
  * register layout; on any other chip the layout may differ, so we fall back to the portable, known-good
@@ -4821,6 +4848,43 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
+    bdestroy(fd,&W);bdestroy(fd,&O);
+    return ok;
+}
+
+/* PHASE 1 (#35 chained FFN) — RE crux: run one int8 matmul with the INT16-requantized output stage
+ * (set_i16_out) and return C[M*N] as int16. Clone of probe_i8_out8 (weight [NT][KT][32][32], A->Af,
+ * one submit) with a 2-byte output surface. Isolates whether the int16 output encoding produces the
+ * correct VALUES (out_i16 = clamp_i16(round(acc_i32 * mult / 2^shift))); the caller compares vs the
+ * CPU model. C is written as raw M*N*2 bytes (layout TBD — a varying-value pass follows to map it).
+ * 0/ok, -1 wedged, -2 dims. */
+int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+                          int mult,int shift,int16_t *C,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 output: M*N*2 bytes */
+    memset(O.cpu,0,(size_t)M*N*2); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N];
+    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    if(getenv("ORK_MM_F16OUT")) set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
+    else                        set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
+    struct buf extra[2] = {W, O};
+    if (validate_regcmd("probe_i16_out", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    int ok=-1; double t1=0;
+    for(int rep=0;rep<3;rep++){ sub.timeout=60000;
+        double t0=ork_now_us();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }

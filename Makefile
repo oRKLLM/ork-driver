@@ -429,3 +429,7 @@ i16_shape_probe: tools/i16_shape_probe.c $(CORE)
 # PHASE 0 chained-FFN: does the NPU walk a heterogeneous matmul(0xd)->int16-silu(0x18) 2-task chain in one submit?
 chain_probe: tools/chain_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# PHASE 1 chained-FFN RE: does an int8 matmul emit correct int16 via set_i16_out (the on-NPU requant handoff)?
+i16out_probe: tools/i16out_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
