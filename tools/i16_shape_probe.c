@@ -1,9 +1,13 @@
-/* tools/i16_shape_probe.c — localize the shape at which the on-NPU int16 activation op (ork_npu_silu_i16,
- * i.e. act_lut_i16 -> ork_npu_probe_silu_std_i16) wedges. The standalone op is bit-accurate at M=8,N=64 but
- * SOFT-RESETS the NPU inside the FFN chain at M=128,N=6144. This sweeps (M,N) to find whether the limit is
- * on M, on N, or on M*N — so the fix (internal tiling in act_lut_i16) can tile the right dimension.
+/* tools/i16_shape_probe.c — reproduce + localize the on-NPU int16 activation op (ork_npu_silu_i16 ->
+ * act_lut_i16 -> ork_npu_probe_silu_std_i16) IN-CHAIN wedge, in isolation (no full model load).
+ *
+ * The op is bit-accurate STANDALONE at every shape, but SOFT-RESETS the NPU when run inside the FFN chain
+ * (after a matmul, with resident weights). This tool (1) sweeps shapes standalone to confirm they're clean,
+ * then (2) reproduces the chain CONTEXT — a preceding matmul (single- vs multi-core) + a RESIDENT weight —
+ * THEN the silu, to separate the hypotheses: is it the multi-core matmul PIPELINE TRANSITION, or the
+ * RESIDENT weights / CBUF-MAC state that needs cleaning between the CNA/DPU matmul and the pure-SDP op?
  *   make i16_shape_probe && sudo ./i16_shape_probe        (board only; each wedge soft-resets + recovers)
- * rc: 0=ok, -1=wedge/timeout, -2=bad shape, -3=non-rk3588.
+ * rc: 0=ok, -1=wedge/timeout, -2=bad shape/pack, -3=non-rk3588.
  */
 #define _GNU_SOURCE
 #include "ork_npu.h"
@@ -16,31 +20,79 @@ static int try_shape(ork_npu *c, int M, int N){
     if(!in||!out){ free(in); free(out); return -99; }
     for(size_t i=0;i<(size_t)M*N;i++) in[i]=(int16_t)((i%201)-100);   /* small dummy gate values */
     double us=0; int rc = ork_npu_silu_i16(c, in, M, N, 0.01, 0.01, out, &us);
-    printf("  M=%5d N=%5d (M*N=%8zu)  -> rc=%d %s   (%.0f us)\n",
-           M, N, (size_t)M*N, rc, rc==0?"OK":(rc==-1?"WEDGE":"shape/soc"), us);
+    printf("    silu M=%d N=%d -> rc=%d %s (%.0f us)\n",
+           M, N, rc, rc==0?"OK":(rc==-1?"WEDGE":"shape/soc"), us);
     fflush(stdout);
     free(in); free(out);
+    return rc;
+}
+
+/* Reproduce the chain context: pack a gate-like int8 weight, run a matmul on `nc` cores, then the int16
+ * silu at the chain shape. keep_w!=NULL returns the packed weight resident (caller frees) to test whether
+ * a RESIDENT weight (not just the matmul) is what wedges the following silu. */
+static int matmul_then_silu(ork_npu *c, int nc, ork_w **keep_w){
+    const int Km=2048, Nm=6144, Mm=128;   /* FFN gate-like */
+    int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
+    for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
+    ork_w *w = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    if(!w){ printf("    pack fail\n"); return -2; }
+    int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
+    for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
+    ork_npu_set_core_budget(c, nc);
+    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    printf("    [matmul K=%d N=%d M=%d nc=%d -> rc=%d]\n", Km, Nm, Mm, nc, mrc);
+    free(A); free(C);
+    int rc = try_shape(c, 128, 6144);
+    if(keep_w) *keep_w = w; else ork_mm_free(c, w);
+    return rc;
+}
+
+/* [D] like matmul_then_silu but the weight is IMPORTED (dma-buf), matching the orkpack chain path (the
+ * recent int16 chain wedges all showed imported=1). pack -> dump -> reload-as-import -> matmul -> silu. */
+static int matmul_then_silu_imported(ork_npu *c, int nc){
+    const int Km=2048, Nm=6144, Mm=128;
+    int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
+    for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
+    ork_w *wp = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    if(!wp){ printf("    pack fail\n"); return -2; }
+    size_t nb = ork_w_dump(wp, NULL, 0); void *blob = malloc(nb); ork_w_dump(wp, blob, nb);
+    ork_mm_free(c, wp);
+    ork_w *w = ork_mm_load_i8_import(c, Km, Nm, blob, nb); free(blob);
+    if(!w){ printf("    import fail (no dma-heap?)\n"); return -2; }
+    int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
+    for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
+    ork_npu_set_core_budget(c, nc);
+    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    printf("    [IMPORTED matmul K=%d N=%d M=%d nc=%d -> rc=%d]\n", Km, Nm, Mm, nc, mrc);
+    free(A); free(C);
+    int rc = try_shape(c, 128, 6144);
+    ork_mm_free(c, w);
     return rc;
 }
 
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c = ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
-    printf("i16_shape_probe: find the wedge boundary of the on-NPU int16 activation op\n");
-    /* vary N at small M (isolate N) */
-    printf("-- sweep N (M=8) --\n");
-    int Ns[] = {64, 512, 1024, 2048, 4096, 6144, 8192};
-    for(int i=0;i<7;i++) try_shape(c, 8, Ns[i]);
-    /* vary M at small N (isolate M) */
-    printf("-- sweep M (N=64) --\n");
-    int Ms[] = {8, 32, 64, 128, 256, 512};
-    for(int i=0;i<6;i++) try_shape(c, Ms[i], 64);
-    /* the chain's actual shape + tiled candidates */
-    printf("-- chain shape + candidates --\n");
-    try_shape(c, 128, 6144);
-    try_shape(c, 64, 6144);
-    try_shape(c, 32, 6144);
-    try_shape(c, 8, 6144);
+    int cores = ork_npu_cores(c);
+    printf("i16_shape_probe: reproduce the int16-silu in-chain wedge in isolation (cores=%d)\n", cores);
+
+    printf("-- (1) STANDALONE sweep (expect all OK) --\n");
+    int Ns[] = {64, 2048, 6144, 8192};
+    for(int i=0;i<4;i++) try_shape(c, 8, Ns[i]);
+    try_shape(c, 128, 6144);   /* the chain shape, standalone */
+
+    printf("-- (2) CHAIN CONTEXT repro --\n");
+    printf("  [A] SINGLE-core matmul then silu (isolates: does ANY matmul wedge it?):\n");
+    matmul_then_silu(c, 1, NULL);
+    printf("  [B] MULTI-core matmul (nc=%d) then silu (isolates: is it the multi->single transition?):\n", cores);
+    matmul_then_silu(c, cores, NULL);
+    printf("  [C] MULTI-core matmul + weight kept RESIDENT, then silu x2 (isolates: resident-weight state?):\n");
+    { ork_w *w=NULL; matmul_then_silu(c, cores, &w);
+      try_shape(c, 128, 6144);            /* 2nd silu with the weight still resident, no fresh matmul */
+      if(w) ork_mm_free(c, w); }
+    printf("  [D] IMPORTED (dma-buf) weight matmul then silu (matches the orkpack chain path):\n");
+    matmul_then_silu_imported(c, cores);
+
     ork_npu_free(c);
     return 0;
 }
