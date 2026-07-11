@@ -421,3 +421,7 @@ i16_matmul_test: tools/i16_matmul_test.c $(CORE)
 # is the on-NPU int16 SiLU accurate enough to fix the gmax-gate coherence (vs CPU fp32 silu)?
 i16_silu_acc: tools/i16_silu_acc.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# where does the on-NPU int16 activation op wedge (M vs N vs M*N)? — to size act_lut_i16 internal tiling
+i16_shape_probe: tools/i16_shape_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
