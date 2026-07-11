@@ -5478,7 +5478,11 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
+       * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
+       * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
+       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -5754,6 +5758,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
+    g_last_op="silu_i16_op"; g_last_K=M; g_last_N=N; g_last_wdom=0; g_last_import=0;   /* accurate wedge telemetry (no validate_regcmd here) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* int16 atom-8, 2-byte, surf_stride=M*16 */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
     struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
@@ -5775,7 +5780,11 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
+       * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
+       * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
+       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -5832,7 +5841,11 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
+       * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
+       * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
+       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
