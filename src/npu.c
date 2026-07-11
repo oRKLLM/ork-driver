@@ -617,6 +617,17 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
     setr(rc,REGCMD_N,0x201,0x1070,aA);setr(rc,REGCMD_N,0x201,0x1110,aB);setr(rc,REGCMD_N,0x1001,0x4020,aC);
     for(int i=0;i<g_f16_fovr_n;i++) setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides */
 }
+/* synth_i16 — int16 matmul regcmd (emulated W16A16 coherence layer). Same 2-BYTE geometry as the fp16 synth
+ * (int16 tiles are byte-identical layout to fp16), but the CNA precision (REG_CNA_CONV_CON1 @ 0x100c) is
+ * flipped FP16(proc=in=2, 0x20000120) -> INT16(proc=in=1, 0x20000090). CONFIRMED on-board: proc=1 runs on the
+ * 2-byte geometry (hangs on int8's 1-byte). Integer datapath => NOTHRASH-stable with int8 layers, rides the
+ * fp16 matmul scaffolding. Output stage: start with the fp16 template's (empirical), refine to integer if the
+ * accumulate/convert needs it. ORK_I16_CON1 overrides 0x100c for on-board RE of the exact int16 encoding. */
+static void synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
+    synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
+    uint32_t con1=0x20000090u; const char*e=getenv("ORK_I16_CON1"); if(e) con1=(uint32_t)strtoul(e,NULL,0);
+    setr(rc,REGCMD_N,0x201,0x100c,con1);                  /* FP16(2)->INT16(1) precision */
+}
 /* RE fuzzer hook for int8 (tools; batch-mode RE): (block,reg,val) overrides applied at the END of synth_i8.
  * Inert by default (n=0) — production unaffected. Mirrors the int4 g_i4_fovr hooks. */
 static struct { uint32_t blk, reg, val; } g_i8_fovr[16]; static int g_i8_fovr_n=0;

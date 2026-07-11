@@ -413,3 +413,11 @@ dom_switch_probe: tools/re/dom_switch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 i4cpu_check: tools/re/i4cpu_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# first real int16 matmul via the fp16 run path + 0x100c=INT16 fuzz-override, vs a CPU int16 reference.
+i16_matmul_test: tools/i16_matmul_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# is the on-NPU int16 SiLU accurate enough to fix the gmax-gate coherence (vs CPU fp32 silu)?
+i16_silu_acc: tools/i16_silu_acc.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
