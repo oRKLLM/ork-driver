@@ -758,7 +758,10 @@ static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
 static void set_f16_out(uint32_t*rc,int N,int stride){
     int s=stride>0?stride:N; (void)s;
     unsigned r04=getenv("ORK_F16OUT_4004")?strtoul(getenv("ORK_F16OUT_4004"),0,0):0x0000000e;
-    unsigned r10=getenv("ORK_F16OUT_4010")?strtoul(getenv("ORK_F16OUT_4010"),0,0):0xa8000002; /* fp16 OUT_CVT */
+    /* 0x4010 DATA_FORMAT fields (rocket registers.xml, confirmed by our ewmul fp16=0x48000002):
+     * OUT_PRECISION[31:29] | IN_PRECISION[28:26] | PROC_PRECISION[2:0], precision enum int8=0/int16=1/fp16=2.
+     * INT8->FP16 = OUT=fp16(2)<<29 | IN=int8(0)<<26 | PROC=int8(0) = 0x40000000. */
+    unsigned r10=getenv("ORK_F16OUT_4010")?strtoul(getenv("ORK_F16OUT_4010"),0,0):0x40000000;
     unsigned r50=getenv("ORK_F16OUT_4050")?strtoul(getenv("ORK_F16OUT_4050"),0,0):0x0000036e;
     unsigned rc0=getenv("ORK_F16OUT_40c0")?strtoul(getenv("ORK_F16OUT_40c0"),0,0):0x00000040; /* 2-byte elem */
     unsigned r84=getenv("ORK_F16OUT_4084")?strtoul(getenv("ORK_F16OUT_4084"),0,0):0x00000001; /* gain */

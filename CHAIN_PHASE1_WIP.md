@@ -70,6 +70,33 @@ is the FUSED path — accumulator flows conv→LUT on-chip, no memory round-trip
     acc→index map beyond the int8 requant that causes PPL 55). Fast int8 matmul + coherent silu, one
     task, no memory intermediate. This sidesteps the entire memory-format wall.
 
+## PRIOR-ART SEARCH for INT8→FP16 fused transition (2026-07-11) — the transition is NOT a supported datapath
+Searched every authoritative source for "int8-input MAC → fp16-output in one fused layer":
+- **NVDLA hw issue #140 "Support for mixed data type"** asks EXACTLY this (can INT8 mix with FP16, or
+  must mixed types share bit-width e.g. INT16+FP16) — UNANSWERED by maintainers upstream.
+- **mesa rocket driver** (our exact silicon, Teflon/TFLite): INT8-ONLY. Emits `REG_DPU_DATA_FORMAT,0`
+  (all precision fields=int8), all uint8 zero-points. Never emits fp16 output. Not prior art for it.
+- **rocket registers.xml (AUTHORITATIVE reg spec)** — decoded the 0x4010 DATA_FORMAT field layout, and
+  CONFIRMED it against our own ewmul capture:
+    0x4010 DATA_FORMAT = OUT_PRECISION[31:29] | IN_PRECISION[28:26] | PROC_PRECISION[2:0]
+    precision enum: int8=0, int16=1, fp16=2.   (our ewmul fp16 0x48000002 = (2<<29)|(2<<26)|2 ✓)
+  => my FIRST board sweep was wrong at bit level (set PROC low-nibble, not OUT[31:29]).
+- **Retested with CORRECT field positions:** OUT=fp16(2<<29), IN=int8(0) → 0x40000000 and 0x40000002
+  both RUN (no wedge) but emit ZEROS. The int8-MAC's int32 accumulator never reaches the fp16 output
+  formatter — there is NO int→fp16 cast in the integer datapath.
+- **NVDLA precision doc**: PROC_PRECISION is effectively pipeline-wide; "for FP16 the convertor and
+  shifter are not implemented" (no int→fp scale in the fp16 path). INT and FP16 are distinct pathways.
+
+VERDICT: **int8-input → fp16-output fused is NOT a supported RK3588/NVDLA datapath.** The DATA_FORMAT
+field lets you REQUEST it, but an integer MAC pipeline yields an integer result; fp16 OUTPUT requires
+the fp16 (float) MAC pipeline, which needs fp16 INPUTS (the ~3.3x-slow fp16 matmul). No int8-speed
+shortcut to a fp16 memory intermediate exists. (VALUABLE artifact: the 0x4010 field layout → wiki.)
+
+So Path A is closed in ALL three intermediates. The coherent on-NPU silu options that remain:
+- fp16-FUSED (set_f16_silu): fp16 matmul (3.3x) + coherent silu, accumulator on-chip. WORKS today.
+- TASK #35 (uncracked): fused int8 matmul with the LUT indexed at int16 resolution (requant acc→int16
+  as an INTERNAL LUT-index precision, NOT a memory write) — the only fast+coherent hope, all on-chip.
+
 ## Next concrete step (fork)
 (1) FUSED int8+int16-index (task #35 proper): in set_i8_silu, widen the acc->LUT-index precision
     (the int16 standalone silu proves the LUT is coherent at int16 input res). No memory handoff.
