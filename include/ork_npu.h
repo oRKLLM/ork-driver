@@ -543,6 +543,11 @@ int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn
  * index model is approximate pending an int16-op gain sweep. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int          ork_npu_silu_i16(ork_npu *ctx, const short *in, int M, int N,
                               double in_scale, double out_scale, short *out, double *us);
+/* PHASE 0 chained-FFN probe: a heterogeneous 2-task PC-chain (int8 matmul -> int16 silu) in ONE submit,
+ * to prove the hardware walks the matmul->pure-SDP transition without a per-op host round-trip. `out` gets
+ * silu(in) (verifies the silu task ran); *mm_ran is set if the chained matmul task also ran. 0/ok,-1,-2,-3. */
+int          ork_npu_chain_mm_silu_i16(ork_npu *ctx, const short *in, int M, int N,
+                              double in_scale, double out_scale, short *out, int *mm_ran, double *us);
 
 /* On-NPU element-wise ADD (int8): out = clamp_i8(round( (a*a_scale + b*b_scale)/out_scale )) via the 2-input SDP
  * ALU=add op. Symmetric quant. Residual add (a_scale==b_scale==out_scale) => out=clamp_i8(a+b), bit-exact.

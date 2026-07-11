@@ -425,3 +425,7 @@ i16_silu_acc: tools/i16_silu_acc.c $(CORE)
 # where does the on-NPU int16 activation op wedge (M vs N vs M*N)? — to size act_lut_i16 internal tiling
 i16_shape_probe: tools/i16_shape_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# PHASE 0 chained-FFN: does the NPU walk a heterogeneous matmul(0xd)->int16-silu(0x18) 2-task chain in one submit?
+chain_probe: tools/chain_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

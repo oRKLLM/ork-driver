@@ -6117,6 +6117,96 @@ static int silu_calibrate_idx16(ork_npu *c){
     c->silu_idx16_ok=1; return 0;
 }
 
+/* PHASE 0 (#35 chained-FFN): a HETEROGENEOUS 2-task PC-chain in ONE submit — task0 = a tiny int8 matmul
+ * (enable 0xd), task1 = the int16 silu SDP LUT-op (enable 0x18) — to prove the hardware walks the
+ * CNA/DPU(matmul)->pure-SDP(silu) transition WITHOUT a per-op host round-trip/reset (the FFN-chain-critical
+ * transition). Data handoff is NOT wired yet: the matmul writes a scratch (verifies task0 ran via Cd), the
+ * silu reads a real int16 `in` (verifies task1 ran via `out`). Both correct + rc=0 => the heterogeneous
+ * chain walked. Descriptor format mirrors the mcworker PC-chain (rc[216..219], 0x0101 next-addr/regamt).
+ * in/out int16 [M*N], N%8==0. 0/ok, -1 wedge/timeout, -2 shape/alloc, -3 non-rk3588. */
+int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,
+                              int16_t *out,int *mm_ran,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(silu_calibrate_idx16(c)) return -1;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    /* build the int16 silu LUT curve for (in_scale,out_scale) — same as act_lut_i16 */
+    static double qsum[1030]; static int qn[1030];
+    for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
+    for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
+    int16_t lut[1030]; int lo=-1,hi=-1;
+    for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k; double q_in=qsum[k]/qn[k]; double val=silu_f(q_in*in_scale)/out_scale;
+        long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
+    if(lo<0) return -1;
+    for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
+    for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
+        lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
+
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
+    struct buf Wd=bcreate(fd,32*32,0x403,dom), Ad=bcreate(fd,32,0x403,dom), Cd=bcreate(fd,32*4,0x403,dom);
+    if(!A.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu||!Wd.cpu||!Ad.cpu||!Cd.cpu){ goto fail; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(Cd.cpu,0,32*4);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
+    { int8_t*wd=Wd.cpu,*ad=Ad.cpu; for(int i=0;i<32*32;i++)wd[i]=1; for(int i=0;i<32;i++)ad[i]=1; }   /* all-1s -> C[n]=32 iff task0 matmul ran */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
+
+    /* submit 1: LUT-load (separate; loads the silu LUT into SDP SRAM, ping-pong OFF) */
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
+        lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&s,dom)) goto fail; }
+
+    /* build the 2-task chain in c->regcmd: [0]=matmul (32x32) with descriptor -> [1]=silu */
+    { uint32_t *mm=(uint32_t*)c->regcmd.cpu;                  /* task0 regcmd at word 0 */
+      uint32_t *si=(uint32_t*)((char*)c->regcmd.cpu + (size_t)REGCMD_I8_N*4);   /* task1 regcmd */
+      memset(mm,0,REGCMD_I8_N*4);
+      synth_i8(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,1,CBUF,0);
+      uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;         /* next = silu regcmd addr */
+      mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
+      mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;   /* next register-amount = (silu regcfg+3)/2 */
+      memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
+      set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
+      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0);
+      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+      bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+      struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
+      tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
+      tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=nx;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=2;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();
+      s.subcore_task[0]=(struct rknpu_subcore_task){0,2};
+      double t0=ork_now_us();
+      if(rknpu_submit_ioctl(fd,&s,dom)) goto fail;
+      bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE);
+      if(us)*us=ork_now_us()-t0;
+    }
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n));
+    if(mm_ran){ int32_t*cd=Cd.cpu; int nz=0; for(int i=0;i<32;i++) if(cd[i]!=0) nz=1; *mm_ran=nz; }   /* did task0 (matmul) run? */
+    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    #undef EWCUBEH
+    return 0;
+fail:
+    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    #undef EWCUBEH
+    return -1;
+}
+
 /* Public on-NPU SiLU (int16 / w16a16i): out = clamp_i16(round( silu(in*in_scale)/out_scale )) via the standalone
  * int16 activation-LUT op, using RKNN's captured index params (full-range coverage). Builds the LUT the way RKNN
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
