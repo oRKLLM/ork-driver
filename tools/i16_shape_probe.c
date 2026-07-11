@@ -114,6 +114,30 @@ static int matmul_then_silu_dom(ork_npu *c, int wdom){
     return rc;
 }
 
+/* [M] the FULL blk.0 pre-FFN-silu on-NPU weight-projection sequence (Qwen3-1.7B: 16 q-heads, 8 kv-heads,
+ * head_dim 128 -> q/o=2048x2048, k/v=2048x1024 GQA; then ffn up/gate=2048x6144), all resident, then silu.
+ * This is the exact op mix + order the NPU sees before the chain's first int16 silu. */
+static int attn_ffn_seq_then_silu(ork_npu *c){
+    struct { int K,N; const char*nm; } sh[] = {
+        {2048,2048,"q"},{2048,1024,"k"},{2048,1024,"v"},{2048,2048,"o"},{2048,6144,"up"},{2048,6144,"gate"} };
+    ork_w *w[6]={0};
+    ork_npu_set_core_budget(c, ork_npu_cores(c));
+    for(int i=0;i<6;i++){
+        int K=sh[i].K,N=sh[i].N;
+        int8_t*B=calloc((size_t)K*N,1); if(!B) continue;
+        for(size_t j=0;j<(size_t)K*N;j++) B[j]=(int8_t)((j%7)-3);
+        w[i]=ork_mm_pack_i8(c,K,N,B); free(B);
+        if(!w[i]){ printf("    pack fail %s\n",sh[i].nm); continue; }
+        int8_t*A=calloc((size_t)128*K,1); int32_t*C=malloc((size_t)128*N*4);
+        for(size_t j=0;j<(size_t)128*K;j++) A[j]=(int8_t)((j%5)-2);
+        ork_mm_run_i8(c,w[i],128,A,C); free(A); free(C);
+    }
+    printf("    [ran q/k/v/o/up/gate matmuls, all resident]\n");
+    int rc = try_shape(c,128,6144);
+    for(int i=0;i<6;i++) if(w[i]) ork_mm_free(c,w[i]);
+    return rc;
+}
+
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c = ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
@@ -158,6 +182,14 @@ int main(void){
       matmul_then_silu_kn(c, cores, &wg, 2048, 6144);     /* gate */
       matmul_then_silu_kn(c, cores, &wd, 6144, 2048);     /* down (K-split) — silu right after this */
       if(wu)ork_mm_free(c,wu); if(wg)ork_mm_free(c,wg); if(wd)ork_mm_free(c,wd); }
+
+    printf("-- (6) ATTENTION shapes (the last un-replicated on-NPU ops before the chain's first FFN silu) --\n");
+    printf("  [K] q/o-proj shape (K=2048 N=2048) matmul then silu:\n");
+    matmul_then_silu_kn(c, cores, NULL, 2048, 2048);
+    printf("  [L] k/v-proj GQA shape (K=2048 N=1024) matmul then silu:\n");
+    matmul_then_silu_kn(c, cores, NULL, 2048, 1024);
+    printf("  [M] FULL blk.0 pre-silu sequence q/k/v/o/up/gate then silu:\n");
+    attn_ffn_seq_then_silu(c);
 
     ork_npu_free(c);
     return 0;
