@@ -2698,10 +2698,15 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * core_mask=1<<core selects a single NPU core (0x1/0x2/0x4 = core 0/1/2 — exactly what librkllmrt
  * round-robins). ALL THREE subcore_task[] must be populated even for a single core: leaving the
  * non-target entries zero NULL-derefs rknpu_job_subcore_commit (the earlier kernel Oops). */
+/* Submit flags: 0x5 = RKNPU_JOB_PC | RKNPU_JOB_PINGPONG (default). ORK_NO_PINGPONG=1 -> 0x1 (PC only, ping-pong
+ * OFF) — ping-pong swaps register banks the instant a task's register config is done, which can race a task's
+ * SRAM/side-effect commit and STALL (errno 110), esp. in mixed/chained programs. RE knob to test whether a
+ * chain stall is the ping-pong race (vs IOVA). Default unchanged (0x5). */
+static uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO_PINGPONG"); v=(e&&atoi(e))?1:5;} return (uint32_t)v; }
 static int submit1(ork_npu *c){
     int fd=c->fd;
     static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
     sub.core_mask=1u<<tc;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
@@ -2774,7 +2779,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
     }
     for(int rep=0;rep<reps;rep++){
         int last=(rep==reps-1);
-        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;
+        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;
         sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=60000;
@@ -2966,7 +2971,7 @@ static void *mcworker(void *vp){
                     int reps=c->mwarm[i]?1:2;
                     for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
                         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-                        sub.flags=0x5; sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
+                        sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
                         sub.core_mask=1u<<i;
                         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
                         sub.timeout=60000;
@@ -3149,7 +3154,7 @@ static void *mcworker(void *vp){
                 double _tsub0=ork_now_us();
                 for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
                     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-                    sub.flags=0x5; sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
+                    sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
                     sub.core_mask=1u<<i;
                     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
                     sub.timeout=60000;
@@ -3244,7 +3249,7 @@ static void *mcworker(void *vp){
                         bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
                         int reps=c->mwarm[i]?1:2;
                         for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
-                            struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=0x5; sub.task_number=(uint32_t)p; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1; sub.core_mask=1u<<i;
+                            struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)p; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1; sub.core_mask=1u<<i;
                             sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)p};
                             sub.timeout=60000;
                             if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
@@ -3670,7 +3675,7 @@ static void *i4_mcworker(void *vp){
                         bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
                         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
                         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-                        sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.fence_fd = -1;
+                        sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.fence_fd = -1;
                         sub.core_mask = 1u << i;
                         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                         int reps = c->mwarm[i] ? 1 : 2;
@@ -3746,7 +3751,7 @@ static void *i4_mcworker(void *vp){
                 }
                 struct rknpu_submit sub;
                 memset(&sub, 0, sizeof sub);
-                sub.flags = 0x5;
+                sub.flags = ork_ppflags();
                 sub.task_number = ntask;
                 sub.task_obj_addr = c->mtk[i].obj;
                 sub.fence_fd = -1;
@@ -3895,7 +3900,7 @@ static void *i4_mcworker_g(void *vp){
                 }
                 struct rknpu_submit sub;
                 memset(&sub, 0, sizeof sub);
-                sub.flags = 0x5;
+                sub.flags = ork_ppflags();
                 sub.task_number = 1;
                 sub.task_obj_addr = c->mtk[i].obj;
                 sub.fence_fd = -1;
@@ -4707,7 +4712,7 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_mtile_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
@@ -4735,7 +4740,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;   /* rep0 warmup (cold buffer stale), rep1 real */
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
@@ -4768,7 +4773,7 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_i8_out8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
@@ -4802,7 +4807,7 @@ int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     if (validate_regcmd("probe_i8_mm", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
@@ -4831,7 +4836,7 @@ int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const ui
     if (validate_regcmd("probe_f16_mm", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
@@ -4884,7 +4889,7 @@ int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const in
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
     uint32_t saved=tk->regcfg_amount, saved_en=tk->enable_mask;
     tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=ew_timeout_ms();
         double t0=ork_now_us();
@@ -4935,7 +4940,7 @@ int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,i
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
     tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms();
     double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -5010,7 +5015,7 @@ int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const 
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
     tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5058,7 +5063,7 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5105,7 +5110,7 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5142,7 +5147,7 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5184,7 +5189,7 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5227,7 +5232,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5281,7 +5286,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5337,7 +5342,7 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5385,7 +5390,7 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) WEDGED\n"); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
       if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) ok\n");
     }
@@ -5408,7 +5413,7 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
@@ -5449,7 +5454,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -5467,7 +5472,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
@@ -5500,7 +5505,7 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
         struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk); \
         tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(RA); tk->regcmd_addr=c->regcmd.dma; \
         bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); \
-        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; \
+        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; \
         if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }while(0)
     /* submit 1: fp16 LUT-load (verbatim; patch only the scratch out addr) — uses Lrc not c->regcmd (2210 words) */
     memcpy(Lrc.cpu,loader,(size_t)ln*4);
@@ -5509,7 +5514,7 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
     /* submit 2: stage-1 (REGCMD_SILU_STD_F16, sigmoid via LE-LUT) VERBATIM, x@A -> sigmoid@S */
@@ -5746,7 +5751,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -5767,7 +5772,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
@@ -5803,7 +5808,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
@@ -5815,7 +5820,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(uint32_t)(rn/2-4); tk->regcmd_addr=c->regcmd.dma;
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
@@ -5870,7 +5875,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -5885,7 +5890,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       int ok=-1; double t1=0;
       for(int rep=0;rep<3;rep++){ sub.timeout=60000; double t0=ork_now_us();
           if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
@@ -6100,7 +6105,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     for(int i=0;i<ntask;i++){memset(&t[i],0,sizeof t[i]);t[i].flags=0;t[i].op_idx=i;t[i].enable_mask=0xd;t[i].int_mask=0x300;t[i].int_clear=0x1ffff;t[i].regcfg_amount=108;t[i].regcmd_addr=c->regcmd.dma + i * sizeof(rc);}
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
@@ -6139,7 +6144,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_slice_f16", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=60000;
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
@@ -6189,7 +6194,7 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
     uint8_t*ad=c->Af.cpu;
     for(int m=0;m<M;m++) tile_i4_A(ad+(size_t)m*(K/2), A+(size_t)m*K, 1, K, nibA);
     bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=0;
     for(int m=0;m<M && ok==0;m++){
         act(fd,RKNPU_ACT_RESET,0);
@@ -6238,7 +6243,7 @@ int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
      * runs fill their own MC task bufs; the probe uses the legacy c->task, so it must set the int4 count. */
     { struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=REGCMD_I4_N/2; t.regcmd_addr=c->regcmd.dma;
       memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x5;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     /* ORK_I4_PROBE_TO_MS: submit timeout (default 60s). The fuzzer sets this low (e.g. 1500) so a wedging
      * candidate has the KERNEL time out the job fast and return an error in-process — the fuzzer blacklists
      * it and continues, with no external SIGINT-during-submit (the documented wedge/corruption risk). */
@@ -6412,7 +6417,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     
     act(fd, RKNPU_ACT_RESET, 0);
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
-    sub.flags = 0x5;
+    sub.flags = ork_ppflags();
     sub.task_number = S;
     sub.task_obj_addr = task_chain.obj;
     sub.core_mask = RKNPU_CORE0_MASK;
@@ -6660,7 +6665,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     static int tc = -2;
     if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
-    sub.flags = 0x5; sub.task_number = P; sub.task_obj_addr = c->task.obj;
+    sub.flags = ork_ppflags(); sub.task_number = P; sub.task_obj_addr = c->task.obj;
     sub.core_mask = 1u << tc; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
     int reps = c->warmed ? 1 : 2;
@@ -6734,7 +6739,7 @@ static void *stream_worker(void *vp) {
         }
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-        sub.flags = 0x5; sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+        sub.flags = ork_ppflags(); sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
         sub.timeout = 60000;
         /* A freshly-allocated NPU output buffer returns stale on its FIRST write, so prime THIS core's
@@ -6903,7 +6908,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
 
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = 0x5; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
+    sub.flags = ork_ppflags(); sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
     sub.core_mask = 1u << tc;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
 
@@ -7029,7 +7034,7 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
             else { t[j].regcfg_amount=12; t[j].regcmd_addr=sRC.dma+comp_base+(uint64_t)(j-NFULL)*32*4; } }
         bsync(fd,&sTK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub;memset(&sub,0,sizeof sub);
-        sub.flags=0x5;sub.task_number=(uint32_t)M;sub.task_obj_addr=sTK.obj;sub.fence_fd=-1;sub.core_mask=1u;
+        sub.flags=ork_ppflags();sub.task_number=(uint32_t)M;sub.task_obj_addr=sTK.obj;sub.fence_fd=-1;sub.core_mask=1u;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)M};
         sub.timeout=2000;
         int reps = warm?1:2;   /* cold buffer: run twice, discard the stale first result */
@@ -7095,7 +7100,7 @@ static void *i4_incr_mcworker(void *vp){
             else { t[j].regcfg_amount=12; t[j].regcmd_addr=RC->dma+comp_base+(uint64_t)(j-NFULL)*32*4; } }
         bsync(fd,TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub;memset(&sub,0,sizeof sub);
-        sub.flags=0x5;sub.task_number=(uint32_t)M;sub.task_obj_addr=TK->obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
+        sub.flags=ork_ppflags();sub.task_number=(uint32_t)M;sub.task_obj_addr=TK->obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)M};
         sub.timeout=2000;
         int reps = c->mwarm[i]?1:2;
@@ -7175,7 +7180,7 @@ static void *i4_bchain_worker(void *vp){
         t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
     bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-    sub.flags=0x5; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+    sub.flags=ork_ppflags(); sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
     sub.timeout=3000;
     int reps=c->mwarm[i]?1:2;
@@ -7299,7 +7304,7 @@ static int run_i4_cbatch(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *
     bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-    sub.flags=0x5; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+    sub.flags=ork_ppflags(); sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
     sub.timeout=3000;
     int reps=c->mwarm[i]?1:2;
@@ -7355,7 +7360,7 @@ static void *stream_worker_i4(void *vp) {
                 mt[0].regcfg_amount = 116; mt[0].regcmd_addr = c->mrc[i].dma;
                 bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
                 struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-                sub.flags = 0x5; sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+                sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                 int reps = c->mwarm[i] ? 1 : 2;
                 for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = 60000;
@@ -7392,7 +7397,7 @@ static void *stream_worker_i4(void *vp) {
         }
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-        sub.flags = 0x5; sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+        sub.flags = ork_ppflags(); sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
         /* Prime THIS core's buffers on its first use (mwarm[i]): a freshly-allocated NPU output buffer
          * returns stale on its first write, so the first task to land on a core does a throwaway warmup
