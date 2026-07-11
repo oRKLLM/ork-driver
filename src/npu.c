@@ -1304,7 +1304,7 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
      * K-split path (correct, just slower). No crash, no ceiling guess. */
-    if(dt==DT_I8 && K<=10752 && !(int8_ks(c)<K && getenv("ORK_KTILE"))){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(dt==DT_I8 && K<=10752 && !getenv("ORK_NO_BF") && !(int8_ks(c)<K && getenv("ORK_KTILE"))){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
             struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
@@ -1444,7 +1444,7 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
      * run() / run_chain_i8 use. Outside it (e.g. K=1792 ffn_down experts) Bf would never be read and just
      * doubles resident NPU bytes, exhausting the 4 GiB IOMMU window when many experts are loaded. Those
      * weights run via the K-split Bb path (run_i8), which doesn't need Bf. */
-    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
             struct buf*bf=&w->Bf[ns]; *bf=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain);
             if(!bf->cpu){ ok=0; break; }                /* IOVA full → give up on Bf */
@@ -1525,7 +1525,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
     }
     /* Bf full-K rebuild (same envelope as ork_mm_load_i8): imported too, abandoned on failure. */
-    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
             struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
@@ -2020,7 +2020,7 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
         struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
-    if(K<=10752){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(K<=10752 && !getenv("ORK_NO_BF")){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             struct buf *b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
@@ -2094,7 +2094,7 @@ ork_w *ork_mm_load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
         if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
-    if(K%512==0 && K<=4096){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             struct buf*b=&w->Bf[ns]; *b=bimport(c->fd,(size_t)K*Nc,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
@@ -7906,7 +7906,7 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
                 bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
     }
-    if(K%512==0 && K<=4096){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;(void)n0;
             struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
