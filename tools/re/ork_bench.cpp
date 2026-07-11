@@ -189,13 +189,14 @@ int main(int argc, char** argv){
     llama_backend_init();
 
     // TEST HOOK (harness only): exercise the product load-config API instead of env knobs.
-    //   ORK_BENCH_CFG=int16  -> ggml_backend_ork_set_load_config(dflash, silu_int8_cpu=false)  [default path]
-    //   ORK_BENCH_CFG=int8cpu -> ...(silu_int8_cpu=true);  ORK_BENCH_DFLASH=1 sets dflash on.
+    //   ORK_BENCH_CFG=int16    -> set_load_config(dflash, silu_int8_fused=false) [DEFAULT: int16 coherent]
+    //   ORK_BENCH_CFG=int8fused -> ...(silu_int8_fused=true) [int8 fully fused through-and-through]
+    //   ORK_BENCH_DFLASH=1 sets dflash on.
     if (const char* cfg = getenv("ORK_BENCH_CFG")) {
-        bool int8cpu = strcmp(cfg,"int8cpu")==0;
-        bool dflash  = getenv("ORK_BENCH_DFLASH")!=nullptr;
-        ggml_backend_ork_set_load_config(dflash, int8cpu);
-        fprintf(stderr,"[ork_bench] set_load_config(dflash=%d, silu=%s)\n", dflash, int8cpu?"int8cpu":"int16");
+        bool int8fused = strcmp(cfg,"int8fused")==0;
+        bool dflash    = getenv("ORK_BENCH_DFLASH")!=nullptr;
+        ggml_backend_ork_set_load_config(dflash, int8fused);
+        fprintf(stderr,"[ork_bench] set_load_config(dflash=%d, silu=%s)\n", dflash, int8fused?"int8-fused":"int16-coherent");
     }
 
     // DFlash operating mode: a co-resident draft speculates a block, the target verifies M=B on the NPU.
