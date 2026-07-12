@@ -6801,15 +6801,16 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
-    // 2. State transition reset for int8 mode
-    // We must ALWAYS reset the NPU before chained execution, because previous
-    // single-submit (non-chained) int8 runs leave the NPU in a state that corrupts
-    // the first chained task's output if reps=1.
+    // 2. State transition for int8 mode. DT_I8 <-> DT_I8_CHAIN is NOT a hardware mode change (see line 42),
+    // so under ORK_MIXED_NOTHRASH we KEEP the warm state across the transition — mirroring the mcworker
+    // keepwarm (line 3501). Without this, entering the chain from a plain int8 op re-warmed every call
+    // (reps=2), which is the per-layer thrash that made HW-chaining the FFN a net loss. Only a NON-int8
+    // predecessor (fp16/int4) needs the reset+re-warm.
     if (c->last_dt != 3 /* DT_I8_CHAIN */) {
-        if (!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);   /* reset only entering int8; warmup handles int8->chain */
-        c->warmed = 0;
+        int keepwarm = ork_nothrash() && ORK_I8_LIVE(c->last_dt);
+        if (!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);   /* reset only entering int8 from a real mode change */
+        if (!keepwarm) { c->warmed = 0; c->ccsz = 0; }
         c->last_dt = 3; // DT_I8_CHAIN
-        c->ccsz = 0; // invalidate Cc size
     }
 
     // 3. Resolve buffers and cache coherency
