@@ -211,6 +211,97 @@ weight from DRAM — so the kernel picks the **largest M-tile the `0x1040` sched
 (`mg_max*64`) to amortize that weight stream over as many activation rows as possible (~2× single-core
 vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for the full account.
 
+## Environment variables (gates & knobs)
+
+The default path uses **no environment variables** — `ork_npu_init` → `pack` → `run` just works, and
+the ggml-ork backend's product surface is the 2-option load-time config
+(`ggml_backend_ork_set_load_config(dflash, silu_int8_fused)`), not env vars. Everything below is for
+development, A/B measurement, and reverse-engineering. Gates live in **two** places: the ork-driver
+library (`src/`) and the ggml-ork backend (in the `llama.cpp-rockchip` fork); both are listed.
+
+Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
+
+### On-NPU op placement (which ops run on the NPU)
+| var | effect |
+|---|---|
+| `ORK_ATTN` | attention QKᵀ·V matmuls on the NPU via the fp16 batched path (prefill M>1 only; decode stays CPU) |
+| `ORK_SOFTMAX_NPU` | softmax `exp()` on the NPU (int16 SDP act-LUT); max/sum/÷ stay on CPU |
+| `ORK_NORM_NPU` | RMSNorm on the NPU (rsqrt act-LUT) |
+| `ORK_FFN_CHAIN` | run the SwiGLU FFN inner (gate·SiLU → up → glu → down) as one round-trip-free on-NPU chain |
+| `ORK_FFN_SILU_I16` | FFN SiLU as the coherent standalone int16 SDP op (PPL ~19) |
+| `ORK_FFN_FUSED_SILU` | FFN SiLU fused into the gate matmul (all-int8; lower coherence) |
+| `ORK_FFN_SILU_CPU_GMAX=<thr>` | per-layer: CPU fp32 SiLU only where gate-|max| > `thr`, else fused |
+| `ORK_FFN_F16`, `ORK_FFN_GATE_F16`, `ORK_FFN_F16_CPUSILU`, `ORK_FFN_F16_JIT` | fp16 FFN / fp16 gate variants |
+| `ORK_GU_CHAIN` | HW-chain gate+up into one `run_chain_i8` submit (DMA-resident shared input) |
+| `ORK_FUSE`, `ORK_NO_FUSE`, `ORK_FUSE_MINM=<M>` | group-fuse independent same-input matmuls (q/k/v, gate/up); min-M to fuse |
+| `ORK_PPU_SILU`/`_GELU`/`_GLU`/`_ADD`/`_OPS`/`_MINM` | route these activation/elementwise ops to the PPU |
+| `ORK_OFF` | force **everything** to CPU (`supports_op`→false) — the same-binary CPU baseline |
+
+### Quantization / precision
+| var | effect |
+|---|---|
+| `ORK_QUANT=4` | int4 W4A4 instead of int8 W8A8 |
+| `ORK_HADAMARD` | int4 per-channel + block-Hadamard (FWHT) rotation |
+| `ORK_HYBRID` | hybrid: FFN 4-bit, attention 8-bit |
+| `ORK_MIXED_DISPATCH`, `ORK_MIXED_W4A4` | per-tensor tier dispatch from the GGUF's own precision; opt the 4-bit tier into native W4A4 |
+| `ORK_NF4`, `ORK_SR` | NF4 codebook; stochastic rounding |
+
+### Performance / runtime
+| var | effect |
+|---|---|
+| `ORK_MIXED_NOTHRASH` | keep NPU warm across int8↔int4↔chain transitions (no per-op re-warm) |
+| `ORK_NO_AFFINITY` | don't pin NPU-driver threads to the big cores |
+| `ORK_ZC_OUT` | output zero-copy (matmul writes C in place; off by default — see AGENTS.md) |
+| `ORK_PRECOMP_RC` | cache the M=1 decode regcmd |
+| `ORK_DECODE_MC` | split M=1 decode N-tiles across all cores |
+| `ORK_I4_MSCHED`, `ORK_I4_INCR`, `ORK_I4_BCHAIN` | int4 batch strategies (in-task batch / incremental+multicore / bank-chain) |
+| `ORK_NPU_MC=<n>`, `ORK_MCAP=<M>`, `ORK_KTILE`, `ORK_RCAP` | core count / M-tile / K-tile / residency caps (override the SoC defaults) |
+| `ORK_NO_BF`, `ORK_KEEP_BF` | drop / keep the full-K `Bf` weight buffer (compact footprint vs fused-silu need) |
+
+### orkpack / streaming / multi-domain (ggml-ork)
+| var | effect |
+|---|---|
+| `ORK_PERSIST=<path>` | load the `.orkpack` if present, else build it on first run and cache |
+| `ORK_ORKPACK_TIERMAP`, `ORK_ORKPACK_I4_FFN`, `ORK_ORKPACK_I4_ABOVE_MB`, `ORK_ORKPACK_TIER_FROM_SRC`, `ORK_ORKPACK_CPU` | per-tensor tier selection when converting an orkpack |
+| `ORK_DOMAINS=<n>`, `ORK_DOMAIN_LAYERS` | IOMMU-domain layout for >4 GiB residency |
+| `ORK_WCACHE_BUDGET_MB`, `ORK_STREAM_RAM_BUDGET_MB` | resident-weight / RAM streaming LRU budgets |
+| `ORK_EVICT_SRC`, `ORK_NO_IMPORT`, `ORK_IMPORT_CHUNK_MB`, `ORK_NO_CONSOLIDATE_IMPORT` | zero-copy import controls |
+
+### MoE (ggml-ork)
+| var | effect |
+|---|---|
+| `ORK_MOE_NPU` | offload MoE experts (MUL_MAT_ID) to the NPU (experimental; off by default) |
+| `ORK_MOE_HOT`, `ORK_MOE_HOT_GIB`, `ORK_MOE_BATCH_MINM`, `ORK_MOE_PHASE_EVICT`, `ORK_MOE_STREAM`, `ORK_MOE_PATHB*`, `ORK_MOE_ALL_ACTIVE`, `ORK_MOE_*_THREADS` | hot-expert residency, batched regime, phase-evict, PATH-b sub-graph, CPU threading |
+
+### Profiling / debug / tracing
+| var | effect |
+|---|---|
+| `ORK_PROFILE` | per-section timing (quant / NPU run / dequant; run_multicore phases) |
+| `ORK_SEG_TIME` | per-op-category NPU-handler wall time (QKV / QKᵀ / softmax / A·V / O / FFN) |
+| `ORK_VERBOSE` | per-node dispatch log (which compute fn each op hits) |
+| `ORK_TRACE`, `ORK_PRESUBMIT_TRACE`, `ORK_DUMP_GRAPH`, `ORK_ATTN_TRACE` | submit / pre-submit / graph-node / attention-bmm traces |
+| `ORK_DEBUG_RESET`, `ORK_DUMP_FAIL`, `ORK_LOAD_PROF`, `ORK_BUFPROBE` | reset accounting, dump the failing regcmd, load-time profile, buffer probe |
+
+### Board / device
+| var | effect |
+|---|---|
+| `ORK_NPU_CARD=<n>` | pick `/dev/dri/cardN` |
+| `ORK_DMA_HEAP`, `ORK_IOMMU_DOMAIN`, `ORK_IOVA_CEIL_MB` | dma-heap name, forced domain id, IOVA ceiling |
+| `ORK_NO_SIGCLEAN` | disable the graceful SIGTERM IOMMU teardown |
+| `ORK_NO_GOV_WARN` | silence the CPU/DDR governor warning |
+
+### Internal RE / calibration register probes (advanced — not for normal use)
+These override individual regcmd registers or op params to sweep hardware behaviour on-board during
+reverse-engineering; each is read by a specific `tools/re/*` probe. Not needed to *use* the library.
+Families: `ORK_SILU_40xx` / `ORK_SILU_OBYTES` / `ORK_SILU_38DIV` (fused-SiLU output stage),
+`ORK_I16OUT_*` / `ORK_F16OUT_*` (int16/fp16 matmul output-stage encoding), `ORK_F16_C*` / `ORK_F16_R*` /
+`ORK_F16_ZA` / `ORK_F16_MTILE` / `ORK_F16_GCAP` (fp16 fused-SiLU calibration), `ORK_ADD16_R*` (int16 add),
+`ORK_EW_*` (element-wise-mul RE), `ORK_SM_*` (softmax-replay layout), `ORK_I4_1010`/`_1040`/`_CB_*`/`_ALAY`/
+`_NSUB`/`_MREGS` (int4 scheduler/bank RE), `ORK_R1040`, `ORK_MC1`, `ORK_SMALLTILE*`, `ORK_*_PROBE_*`,
+`ORK_CHAIN_KSPLIT*`, `ORK_CONSOLIDATE_I8`, `ORK_DIRECT_I4`, `ORK_I16_DOM0`/`_RESET`/`_CON1`/`_DUMP`,
+`ORK_PROBE_RESET`, `ORK_NPU_TESTCORE`, `ORK_FUSED_DUMP`/`_MTILE`, `ORK_GATE_ABLATE`, `ORK_IMATRIX`.
+Grep `ORK_` in `src/` and the ggml-ork backend for the exhaustive list.
+
 ## Status & roadmap
 
 What's done (fp16/int8 matmul, multi-core, decode ≈ closed runtime, prefill flash attention) and
