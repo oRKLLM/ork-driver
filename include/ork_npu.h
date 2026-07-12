@@ -706,6 +706,13 @@ typedef struct {
 } ork_mm_task_i4;
 
 int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+/* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
+ * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before
+ * the chain. Chains [gate*silu -> up -> ...] in ONE submit. lut/params as ork_mm_run_i8_silu (build with
+ * ork_mm_silu_build_lut). Single M-tile per task for now (M <= chain mcap). 0/ok,-1 wedge,-2 dims. */
+int          ork_mm_run_chain_i8_gsilu(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int gate_task,
+                                       int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
+                                       unsigned cfg4068, const short *lut, int nlut);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

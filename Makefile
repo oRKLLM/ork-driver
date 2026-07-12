@@ -437,6 +437,10 @@ chain_probe: tools/chain_probe.c $(CORE)
 chain_gatesilu_probe: tools/chain_gatesilu_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# CHAIN ASSEMBLER increment 1 (corrected): [gate*silu -> up] one submit via run_chain_i8 + set_i8_silu
+chain_gu_silu_probe: tools/chain_gu_silu_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # PHASE 1 chained-FFN RE: does an int8 matmul emit correct int16 via set_i16_out (the on-NPU requant handoff)?
 i16out_probe: tools/i16out_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

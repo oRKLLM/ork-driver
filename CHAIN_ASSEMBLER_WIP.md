@@ -112,6 +112,24 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## run_chain_i8_gsilu built (extends the proven base) -- FIRST RUN WEDGED (2026-07-12)
+Refactored run_chain_i8 -> static run_chain_i8_impl(...,ss) + public ork_mm_run_chain_i8 (ss=NULL, IDENTICAL
+behavior, plain path preserved) + new ork_mm_run_chain_i8_gsilu(ss): the gate task's regcmd gets set_i8_silu
+(int8 silu-out), + the silu LUT streamed to SDP SRAM once before the chain. Probe chain_gu_silu_probe:
+[gate*silu(int8) -> up(int32)] one submit, all-ones (gate=up=K), K=512 (run_chain_i8 envelope K%512, <=4096).
+FIRST RUN: WEDGED (no output, gsilu hung; board self-healed, load 0.63). NOT the plain path (ss=NULL untouched).
+Suspects for the fused-silu-in-chain wedge (NEXT):
+ - the "hand-rolled submit to a FRESH buffer gives bias-only output" warning (ork_mm_run_i8_silu ~4313): the
+   fused-silu matmul may REQUIRE the warmed c->Cc buffer, but run_chain_i8 writes fresh tmp_C. Try routing the
+   gate task's output through c->Cc, or warming tmp_C first.
+ - LUT-load-in-chain ordering vs the warm block's act(RESET): my LUT-load runs AFTER the build loop but the
+   warm block's act(RESET) ran at entry -- confirm the LUT survives into the chain submit (it should; single
+   submit gap). vs ork_mm_run_i8_silu which does LUT-load then per-tile matmul via submit1.
+ - mixed int8(gate)+int32(up) output in one chain -- untested combination.
+ - reps=2 warm-up re-running the chain (incl the silu task) -- fine for output, but interacts with LUT state?
+De-risk: first confirm ss=NULL (plain run_chain_i8) still works post-refactor (it's byte-identical, but
+verify via ORK_GU_CHAIN or a plain 2-matmul run). Then bisect the silu wedge (drop the LUT-load; drop set_i8_silu).
+
 ## chain_progs is a DEAD END -- extend the PROVEN run_chain_i8 instead (2026-07-12)
 Built a self-test (ork_npu_chain_selftest): chain 2 plain int8 matmuls (all-ones -> every out == K) via
 ork_npu_chain_progs. RESULT: EMPTY output (C0/C1 all 0) even at **n=1** (single task, no chaining) -- the

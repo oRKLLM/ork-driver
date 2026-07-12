@@ -6900,7 +6900,26 @@ static int chain_fullk_mcap_i8(ork_npu *c, int K) {
     return chunk;
 }
 
-int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+/* Optional fused-SiLU output stage for ONE task in a chain (the gate): that task's regcmd gets set_i8_silu
+ * (int8 silu(gate) output instead of int32), and the silu LUT is streamed to SDP SRAM once before the chain.
+ * Reuses run_chain_i8's proven warm/buffer/submit machinery. NULL = plain int32 chain (original behavior). */
+struct chain_silu_spec { int task; int r_mult, r_shift; uint32_t out_bias, idx_off, cfg4068; const int16_t *lut; int nlut; };
+
+static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss);
+int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) { return run_chain_i8_impl(c, S, tasks, NULL); }
+
+/* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
+ * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
+ * (build via ork_mm_silu_build_lut). Single M-tile per task for now (M<=chain mcap). 0/ok,-1 wedge,-2 dims. */
+int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int gate_task,
+                              int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off, uint32_t cfg4068,
+                              const int16_t *lut, int nlut) {
+    if (gate_task < 0 || gate_task >= S || !lut) return -2;
+    struct chain_silu_spec ss = { gate_task, r_mult, r_shift, out_bias, idx_off, cfg4068, lut, nlut };
+    return run_chain_i8_impl(c, S, tasks, &ss);
+}
+
+static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
@@ -6951,6 +6970,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     // 3. Resolve buffers and cache coherency
     struct buf tmp_A[1024];
     struct buf tmp_C[1024];
+    struct buf Lrc = {0}, Lsc = {0};   /* fused-SiLU LUT buffers (only used when ss != NULL); zero so cleanup is safe on early goto */
     memset(tmp_A, 0, sizeof(tmp_A));
     memset(tmp_C, 0, sizeof(tmp_C));
 
@@ -7038,6 +7058,10 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             // first 64-group against the wrong K-partition — same class as the full-K prefill bug).
             synth_i8(rc, mc, K, N, act_dma[i] + (uint32_t)((size_t)m0 * K),
                      bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+            // FUSED SiLU on the gate task: rewrite its output stage to int8 silu(gate) (set_i8_silu). Output
+            // is int8 (1 B/elem); single M-tile assumed for the silu task (m0==0), so the int32 out offset
+            // above is 0 and harmless. The silu LUT is streamed to SDP SRAM once (below, before the submit).
+            if (ss && i == ss->task) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
             if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
                 uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
@@ -7050,6 +7074,27 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         }
     }
     bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+
+    // FUSED-SiLU LUT-load: stream the gate task's silu LUT into SDP SRAM ONCE before the chain (enable 0x18,
+    // ping-pong OFF). It persists into the chain submit; the gate task's set_i8_silu output stage reads it.
+    if (ss) {
+        Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
+        Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
+        if (!Lrc.cpu || !Lsc.cpu) { ok = -2; goto cleanup; }
+        memcpy(Lrc.cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
+        setr((uint32_t*)Lrc.cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)Lsc.dma);
+        { uint32_t *lr=(uint32_t*)Lrc.cpu; int j=0;
+          for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
+              int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
+              lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
+        bsync(fd, &Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
+        { struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
+          lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=Lrc.dma;
+          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
+          ls.core_mask=RKNPU_CORE0_MASK; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; } }
+    }
 
     // One rknpu_task per program (P total, PC-chained), one single-core submit.
     int submit_ok = 0;
@@ -7094,6 +7139,7 @@ cleanup:
         bdestroy(fd, &tmp_A[i]);
         bdestroy(fd, &tmp_C[i]);
     }
+    bdestroy(fd, &Lrc); bdestroy(fd, &Lsc);   /* fused-SiLU LUT buffers (no-op when ss==NULL: {0}) */
     return ok;
 }
 
