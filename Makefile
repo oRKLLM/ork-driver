@@ -411,6 +411,9 @@ test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(CORE)
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+softmax_replay: tools/re/softmax_replay.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 i4cpu_check: tools/re/i4cpu_check.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
