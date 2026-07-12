@@ -112,6 +112,24 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## ANSWER: how ORK_FFN_CHAIN bridges matmul->silu (read ggml-ork.cpp 3975-4112)
+Three paths; only ONE is pure-NPU:
+1. **FUSED int8 (pure-NPU, round-trip-free): `ork_mm_run_i8_silu`** (npu.c 4286). Loads the SiLU LUT into SDP
+   SRAM once (enable 0x18, ping-pong OFF), then the gate matmul applies silu+requant IN ITS OUTPUT STAGE via
+   **`set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068)`** -> int8 out. THIS is the working
+   "fuse into the SDP output stage" mechanism. Coarse (PPL 55) from int8-out + per-tensor scale, NOT a broken
+   mechanism. Variant **`ork_mm_run_i8_silu32`** (4395) emits INT32 (fine precision). A fused SwiGLU already
+   exists (4671): gate-silu -> G, then up's SDP ewmul fetches G as its 2nd operand -> glu on-NPU.
+2. int16 (higher accuracy, NOT pure-NPU): gate matmul -> NATIVE int32 -> **CPU** dequant(per-row x per-chan)
+   + requant->int16 -> ork_npu_silu_i16 (NPU) -> **CPU** dequant. Two CPU steps between the NPU ops. This is
+   why set_i16_out was never load-bearing (confirmed: the production int16 path requants on CPU).
+3. CPU silu (shipped default): int32 matmul -> CPU fp32 silu.
+
+**=> set_i16_out is a DEAD END. The working matmul->silu primitive is the output-stage fused LUT (set_i8_silu),
+which is exactly the SDP-output-stage fusion the user flagged for the residual.** The assembler should chain
+the EXISTING fused ops (ork_mm_run_i8_silu / _silu32 + the fused-SwiGLU ewmul), and the residual fuses into
+the SAME output stage (set_i8_silu / down-proj output: accumulator + residual before the requant/LUT).
+
 ## STRATEGIC PIVOT (recommended): reuse ggml-ork's EXISTING working matmul->silu bridge
 ggml-ork's on-NPU int16-silu FFN chain WORKS today (coherent PPL 19.02, [[int16-silu-pipeline-transition-wedge]]).
 It must bridge matmul->silu somehow (likely int32-matmul-out + a CPU or on-NPU int32->int16 requant, since
