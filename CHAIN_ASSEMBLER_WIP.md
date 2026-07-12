@@ -112,6 +112,22 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## ★ OPTION B WORKS (2026-07-12): one-submit [gate matmul(int8-out) -> silu-SDP] coherent
+ork_mm_run_chain_i8_sdpsilu: task[sdp_task] is a STANDALONE int8 silu-SDP op (REGCMD_SILU_STD, 0x18/69)
+reading task[sdp_task-1]'s output via ALIASED buffers; the gate matmul gets set_i8_out8 (plain int8 output);
+silu LUT built internally (silu_build_curve, same as ork_npu_silu_i8); ping-pong OFF for the chain.
+RESULT (chain_gu_silu_probe ORK_GSILU_SDP, K=512 all-ones):
+  rc=0  task0 gate int8 = 32 (512*R=1/16) 512/512  |  task1 silu int8 = 61 (~silu(3.0)/os=60) 512/512
+  => ONE SUBMIT, no wedge, BIT-COHERENT. The vendor matmul->SDP pattern works for our int8 FFN.
+PROVES: (1) a matmul with int8 output (set_i8_out8) DOES chain as a non-last task -> the earlier wedge was
+specifically the FUSED-ACTIVATION output stage (set_i8_silu), not int8-output; (2) a standalone silu-SDP task
+chains + reads the gate's output via address aliasing (the decoded vendor mechanism); (3) the int8 matmul
+output cube MATCHES the silu-SDP EWCUBE input -> the bridge is coherent.
+=> The assembler foundation is VALIDATED. Build out the full FFN inner as separate chained tasks:
+   [gate matmul(int8) -> silu-SDP -> up matmul(int8) -> glu-ewmul-SDP -> down matmul]. Each is a plain matmul
+   or a standalone SDP op (both proven to chain), data via aliased buffers. NEXT: add up + glu-ewmul (the
+   ewmul SDP op reads silu-out AND up-out as its two operands -> 0x5018/0x5038 aliased), then down (K-split).
+
 ## BISECTION RESULT (2026-07-12): the fused-silu OUTPUT STAGE won't survive run_chain_i8's chain submit
 3-way bisection of run_chain_i8_gsilu [gate*silu -> up] via chain_gu_silu_probe env gates:
 - (1) PLAIN ss=NULL (ork_mm_run_chain_i8): rc=0, gate 512/512, up 512/512 -> **PLAIN PATH OK** (refactor clean;

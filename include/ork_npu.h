@@ -713,6 +713,12 @@ int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *task
 int          ork_mm_run_chain_i8_gsilu(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int gate_task,
                                        int r_mult, int r_shift, unsigned out_bias, unsigned idx_off,
                                        unsigned cfg4068, const short *lut, int nlut);
+/* OPTION B: task[sdp_task] is a STANDALONE int8 silu-SDP op reading task[sdp_task-1]'s (gate) output via
+ * aliased buffers (the vendor matmul->SDP pattern); the gate task emits int8 (set_i8_out8, requant
+ * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_npu_silu_i8).
+ * tasks[sdp_task].C gets int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
+int          ork_mm_run_chain_i8_sdpsilu(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int sdp_task,
+                                         int gate_mult, int gate_shift, double in_scale, double out_scale);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

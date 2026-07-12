@@ -24,6 +24,25 @@ int main(void){
     ork_w *wg=ork_mm_pack_i8(c,K,N,Wg), *wu=ork_mm_pack_i8(c,K,N,Wu);
     if(!wg||!wu){ printf("pack failed\n"); ork_npu_free(c); return 1; }
 
+    if(getenv("ORK_GSILU_SDP")){   /* OPTION B: [gate matmul(int8-out) -> silu-SDP] one submit (vendor matmul->SDP) */
+        int Cg[8*64], Cs[8*64]; for(int i=0;i<M*N;i++){ Cg[i]=0; Cs[i]=0; }
+        ork_mm_task_i8 t[2] = { { wg, M, A, Cg }, { wg, M, A, Cs } };   /* task0=gate(int8-out); task1=silu-SDP reads Cg */
+        double is = 3.0/32.0, os = siluf(3.0)/60.0;   /* gate_i8~32 (gate R=0x4000>>18=1/16 * K=512), silu(3)/os~60 */
+        int r=ork_mm_run_chain_i8_sdpsilu(c,2,t,1, 0x4000,18, is,os);
+        printf("chain_gu_silu[SDP-silu]: [gate(int8-out) -> silu-SDP(int8)] ONE submit  (M=%d K=%d N=%d)\n",M,K,N);
+        printf("  rc=%d\n", r);
+        if(r==0){ signed char *cg=(signed char*)Cg,*cs=(signed char*)Cs; int wg8=32, ws=(int)lround(siluf(32*is)/os);
+            int ng=0,gmn=127,gmx=-128,ns=0,smn=127,smx=-128;
+            for(int i=0;i<M*N;i++){ int g=cg[i],s=cs[i]; if(abs(g-wg8)<=3)ng++; if(g<gmn)gmn=g; if(g>gmx)gmx=g;
+                if(abs(s-ws)<=4)ns++; if(s<smn)smn=s; if(s>smx)smx=s; }
+            printf("  [task0 gate int8~%d] %d/%d range[%d,%d]\n", wg8,ng,M*N,gmn,gmx);
+            printf("  [task1 silu int8~%d] %d/%d range[%d,%d]\n", ws,ns,M*N,smn,smx);
+            printf("  VERDICT: %s\n", (ng>0&&ns>0)?"ONE-SUBMIT [gate -> silu-SDP] WORKS (vendor matmul->SDP pattern)":
+                                      (ng>0)?"gate ran but silu-SDP empty/wrong":"chain did not execute"); }
+        else printf("  VERDICT: %s\n", r==-1?"WEDGED":"error");
+        ork_npu_free(c); return (r==0)?0:1;
+    }
+
     /* fused-SiLU LUT for (in_scale,out_scale): real_gate = acc*in_scale; int8_out = silu(real_gate)/out_scale.
      * acc=K; pick in_scale so real_gate~3.0, out_scale so int8_out~60 (well inside int8, avoids saturation). */
     const double is = 3.0/(double)K, os = siluf(3.0)/60.0;
