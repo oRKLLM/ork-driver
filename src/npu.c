@@ -6985,6 +6985,45 @@ cleanup:
     return ok;
 }
 
+/* CHAIN ASSEMBLER CORE: submit N pre-built HETEROGENEOUS programs as ONE PC-chain (task_number=N, one ioctl).
+ * Packs the programs contiguously into c->regcmd (content-driven stride, per AGENTS.md); for each non-last
+ * program it LOCATES that program's PC next-descriptor slot — the word where reg==0x0010 paired with domain
+ * 0x0101 — and points it at the next program's regcmd dma + sets the next register-amount ((next
+ * regcfg_amount+3)/2 at the following 0x0014 word). One rknpu_task per program (its own enable_mask +
+ * regcfg_amount), ping-pong OFF (flags=0x1, LUT-safe). Generalizes run_chain_i8 (matmul-only, task-strided)
+ * and the Phase-0 matmul->silu chain into an arbitrary op sequence — the core the FFN / attention-block
+ * static chains build on. Caller pre-builds each program's regcmd (with its own buffer addresses) and any
+ * LUT-loads are submitted separately first. Returns 0/ok, -2 bad args or a middle program lacks a descriptor
+ * slot (can't be chained as non-last), -1 submit wedge. dom = submit IOMMU domain. */
+int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom){
+    if(!c||!progs||n<1||n>1024) return -2;
+    int fd=c->fd;
+    size_t off[1024], total=0;
+    for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; off[i]=total; total+=(size_t)progs[i].nwords; }
+    if(total*4 > c->regcmd.size || (size_t)n*sizeof(struct rknpu_task) > c->task.size) return -2;
+    uint32_t *base=(uint32_t*)c->regcmd.cpu;
+    for(int i=0;i<n;i++){
+        memcpy(base+off[i], progs[i].rc, (size_t)progs[i].nwords*4);
+        if(i<n-1){
+            uint32_t *rc=base+off[i]; int slot=-1;
+            for(int k=0;k+1<progs[i].nwords;k+=2) if((rc[k]&0xffff)==0x0010 && (rc[k+1]>>16)==0x0101){ slot=k; break; }
+            if(slot<0) return -2;   /* this op cannot be a MIDDLE program (no PC next-descriptor slot in its regcmd) */
+            uint64_t nx=(uint64_t)c->regcmd.dma + off[i+1]*4; int nreg=(progs[i+1].regcfg_amount+3)/2;
+            rc[slot]=0x0010 | ((uint32_t)(nx&0xffff)<<16); rc[slot+1]=(0x0101u<<16) | (uint32_t)((nx>>16)&0xffff);
+            if(slot+3<progs[i].nwords && (rc[slot+2]&0xffff)==0x0014){ rc[slot+2]=0x0014 | ((uint32_t)nreg<<16); rc[slot+3]=(0x0101u<<16); }
+        }
+    }
+    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,(size_t)n*sizeof(struct rknpu_task));
+    for(int i=0;i<n;i++){ t[i].enable_mask=progs[i].enable_mask; t[i].int_mask=0x300; t[i].int_clear=0x1ffff;
+        t[i].regcfg_amount=progs[i].regcfg_amount; t[i].regcmd_addr=(uint32_t)((uint64_t)c->regcmd.dma + off[i]*4); }
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit s; memset(&s,0,sizeof s);
+    s.flags=0x1; s.task_number=(uint32_t)n; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1;
+    s.timeout=ew_timeout_ms(); s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)n};
+    return rknpu_submit_ioctl(fd,&s,dom)?-1:0;
+}
+
 /* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
  * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
  * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool

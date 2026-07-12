@@ -507,6 +507,15 @@ int          ork_npu_rmsnorm_f16(ork_npu *ctx, int M, int n, const ork_f16 *x, c
 int          ork_npu_rope_neox_f16(ork_npu *ctx, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out);
 int          ork_npu_l2norm_f16 (ork_npu *ctx, int M, int n, const ork_f16 *x,                     float eps, ork_f16 *out);
 
+/* CHAIN ASSEMBLER: one pre-built program in a heterogeneous PC-chain (see ork_npu_chain_progs).
+ * rc/nwords = the program's regcmd words (caller-built, with its own buffer addresses); enable_mask/
+ * regcfg_amount = its rknpu_task fields (matmul 0xd/108, SDP 0x18/varies). */
+typedef struct { const uint32_t *rc; int nwords; unsigned enable_mask; int regcfg_amount; } ork_chain_prog;
+/* Submit N pre-built programs as ONE PC-chain (task_number=N, single ioctl) — chains a whole NPU-only
+ * run (attention block / FFN inner) into one submit. Non-last programs need a PC next-descriptor slot in
+ * their regcmd (matmul has one; a program lacking it can only be last). 0/ok, -2 bad-args/no-slot, -1 wedge. */
+int          ork_npu_chain_progs(ork_npu *ctx, int n, const ork_chain_prog *progs, int dom);
+
 /* Standalone on-NPU SiLU (activation-LUT SDP op): applies the PPU silu LUT to a single int8 input [M][N] via
  * the 69-reg/enable=0x18 standalone op (REGCMD_SILU_STD), reprogrammed to (M,N). Two submits (LUT-load + op).
  * SDP: idx=(in*R)>>6 + C0; out=clamp_i8(R*LUT-interp(idx) + out_bias), R=r_mult/2^r_shift. Caller supplies the
