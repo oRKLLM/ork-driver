@@ -112,6 +112,29 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## ggml-ork INTEGRATION + ork_bench (2026-07-12): CHAIN5 engages on the real model; bench blocked by IOVA footprint
+Landed the chain assembler to ork-driver main (pushed) + bumped both fork submodules (local feat/ork-static-graph
++ board ~/llama-q4-v0659). Wired ggml-ork ORK_FFN_CHAIN5: prep packs per-tensor fc.wu/fc.wd (+ rough scales
+s_up/s_glu); the handler calls ork_mm_run_chain_i8_ffn for [gate->silu->up->glu->down(K-split)] one submit.
+Also fixed a PRE-EXISTING ORK_FFN_CHAIN decode bug (GLU supports_op claimed at M>=1 but the handler declines
+M<32 -> claimed-but-uncomputed -> graph_compute -1; gated the GLU claim on M>=32).
+RESULTS (Qwen3-1.7B-Q8_K_XL, orkpack, P=256):
+- BASELINE all-int8 per-op (ORK_FFN_CHAIN+FUSED_SILU): prefill **76.86 tok/s** (decode fails separately -
+  a distinct pre-existing decode issue; prefill is the valid number).
+- CHAIN5: **ENGAGES + runs the real full-width FFN inner (Nff=6144 Kd=2048) in ONE submit on silicon**
+  ("[ORK FFN-CHAIN5] one-submit FFN inner ok" per layer, confirmed). BUT no stable clean prefill number:
+  the extra per-tensor fc.wu/fc.wd packs push the IOVA footprint over -> intermittent then consistent
+  warmup-decode graph_compute -1 / soft-reset. This is the documented FFN-chain footprint / multi-domain
+  non-determinism ([[ffn-chain-footprint-one-domain]], [[multi-domain-runtime]]), NOT the chain assembler.
+CONCLUSION: integration DONE (CHAIN5 wired + demonstrably running the real FFN inner one-submit). A clean
+CHAIN5 speed number needs a footprint workstream (compact orkpack + PRE-PACKED chain weights so fc.wu/wd
+aren't live-packed on top of the resident model + domain sizing). AND the expected speed is ~NEUTRAL anyway:
+prefill is CPU-bound (act-quant + attention compute; NPU ~17-83% idle - established) and run_chain_i8 is
+SINGLE-CORE, so collapsing the FFN's NPU submits doesn't move the CPU-bound prefill wall-clock (exactly what
+the prior static-graph work found: matmul chaining is coherent-but-neutral on CPU-bound prefill).
+NEXT (for a real speed win): the lever is CPU-side (act-quant/attention on NPU or overlap), not FFN submit
+count. The chain assembler is the validated primitive for when the NPU slice becomes the bottleneck.
+
 ## ★★★ FULL FFN INNER CHAIN WORKS (2026-07-12): [gate->silu->up->glu->down] ONE submit, bit-exact
 FFN5 (chain_gu_silu_probe ORK_GSILU_FFN5, M=8 K=512 Nff=512, all-ones): rc=0, gate=32, silu=61, up=32,
 glu=61, **down=31232 = glu(61)*512 EXACT** (all 4096/4096, no wedge). All FIVE ops chained in ONE submit:
