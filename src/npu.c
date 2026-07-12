@@ -5265,6 +5265,29 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     return ok;
 }
 
+/* NEOX RoPE on the NPU (Qwen3 rope type 2). x[nrow][hd] fp16 row-major — nrow = (heads*tokens) flattened, each
+ * row is one (head,token)'s head_dim vector; pos[nrow] = that row's token position. NEOX rotates pairs
+ * (i, i+hd/2): out[i]=x[i]cosθ - x[i+hd/2]sinθ, out[i+hd/2]=x[i]sinθ + x[i+hd/2]cosθ, θ_i=pos*freq_base^(-2i/hd).
+ * Composed on-NPU as x⊙COS + rot_half(x)⊙SIN — 2 ewmul + 1 add (COS/SIN tables + the half-swap built on CPU;
+ * the transcendental-free EW math runs on the NPU). hd even, hd multiple of 8. 0/ok, <0 on primitive failure. */
+int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out){
+    if(!c||!x||!pos||!out||hd<2||(hd&7)||nrow<1) return -2;
+    int hd2=hd/2; size_t sz=(size_t)nrow*hd*sizeof(ork_f16);
+    ork_f16 *cosT=malloc(sz),*sinT=malloc(sz),*xr=malloc(sz),*t1=malloc(sz),*t2=malloc(sz);
+    if(!cosT||!sinT||!xr||!t1||!t2){ free(cosT);free(sinT);free(xr);free(t1);free(t2); return -1; }
+    for(int r=0;r<nrow;r++){ double p=(double)pos[r];
+        for(int i=0;i<hd2;i++){ double th=p*pow(freq_base,-2.0*(double)i/(double)hd); float cc=(float)cos(th), ss=(float)sin(th);
+            cosT[(size_t)r*hd+i]=(ork_f16)cc; cosT[(size_t)r*hd+i+hd2]=(ork_f16)cc;
+            sinT[(size_t)r*hd+i]=(ork_f16)(-ss); sinT[(size_t)r*hd+i+hd2]=(ork_f16)ss; }
+        for(int i=0;i<hd2;i++){ xr[(size_t)r*hd+i]=x[(size_t)r*hd+i+hd2]; xr[(size_t)r*hd+i+hd2]=x[(size_t)r*hd+i]; } }
+    int rc=0;
+    if(ork_npu_ewmul_f16(c,x,cosT,nrow,hd,t1,NULL)) rc=-1;
+    else if(ork_npu_ewmul_f16(c,xr,sinT,nrow,hd,t2,NULL)) rc=-1;
+    else if(ork_npu_add_f16(c,t1,t2,nrow,hd,out,NULL)) rc=-1;
+    free(cosT);free(sinT);free(xr);free(t1);free(t2);
+    return rc;
+}
+
 /* int16 element-wise MULTIPLY: out[m][n] = clamp_i16(round(up[m][n]*silu[m][n] * mult/2^shift)) on the NPU
  * (standalone SDP int16 op). The w4a4 path's EW precision (ork's int4 matmul outputs int16). 2-byte operands,
  * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. GENERALIZED to arbitrary

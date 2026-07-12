@@ -439,3 +439,6 @@ bmm_probe: tools/bmm_probe.c $(CORE)
 
 softmax_probe: tools/softmax_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+rope_probe: tools/rope_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

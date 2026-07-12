@@ -500,6 +500,11 @@ int          ork_npu_ewmul_i16(ork_npu *ctx, const int16_t *up, const int16_t *s
  * captured and slotted in here. ORK_NORM_NPU=1 selects the NPU path once it exists (today a no-op
  * selector — still CPU-correct). out may alias x. 0/ok, -1 alloc, -2 bad args. */
 int          ork_npu_rmsnorm_f16(ork_npu *ctx, int M, int n, const ork_f16 *x, const ork_f16 *w, float eps, ork_f16 *out);
+
+/* NEOX RoPE on the NPU (rope type 2). x[nrow][hd] fp16 row-major (nrow = heads*tokens; each row a head_dim
+ * vector); pos[nrow] = per-row token position. Composed as x⊙COS + rot_half(x)⊙SIN (2 ewmul + 1 add on NPU).
+ * hd even + multiple of 8. 0/ok, <0 on failure. Keeps Q/K rotation on the NPU data path (attention chaining). */
+int          ork_npu_rope_neox_f16(ork_npu *ctx, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out);
 int          ork_npu_l2norm_f16 (ork_npu *ctx, int M, int n, const ork_f16 *x,                     float eps, ork_f16 *out);
 
 /* Standalone on-NPU SiLU (activation-LUT SDP op): applies the PPU silu LUT to a single int8 input [M][N] via
