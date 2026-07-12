@@ -7123,7 +7123,12 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                     setr(rc, tn, 0x1001, 0x4080, 0); setr(rc, tn, 0x1001, 0x4044, 0); setr(rc, tn, 0x1001, 0x4074, 0);
                 }
             } else {
-                synth_i8(rc, mc, K, N, act_dma[i] + (uint32_t)((size_t)m0 * K),
+                // activation source: ops[i].in0 >= 0 -> a PRIOR task's output (aliased, e.g. down reads glu);
+                // else tasks[i].A (the normal external activation). SDP-output->matmul-input is the vendor pattern.
+                uint32_t a_dma = (ss && ss->ops && ss->ops[i].in0 >= 0)
+                               ? out_dma[ss->ops[i].in0]
+                               : act_dma[i] + (uint32_t)((size_t)m0 * K);
+                synth_i8(rc, mc, K, N, a_dma,
                          bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
                 if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
                 else if (kind == OP_MM8) set_i8_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)

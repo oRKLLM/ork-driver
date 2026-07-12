@@ -24,14 +24,45 @@ int main(void){
     ork_w *wg=ork_mm_pack_i8(c,K,N,Wg), *wu=ork_mm_pack_i8(c,K,N,Wu);
     if(!wg||!wu){ printf("pack failed\n"); ork_npu_free(c); return 1; }
 
+    if(getenv("ORK_GSILU_FFN5")){   /* FULL FFN inner: [gate -> silu -> up -> glu -> down] 5-task one submit */
+        enum { Mf=8, Kf=512, Nf=512 };   /* Nf=512 so down's contraction (=glu width) satisfies K%512, <=4096 */
+        static signed char A5[Mf*Kf], W5[Kf*Nf];
+        for(int i=0;i<Mf*Kf;i++) A5[i]=1; for(int i=0;i<Kf*Nf;i++) W5[i]=1;
+        ork_w *w5=ork_mm_pack_i8(c,Kf,Nf,W5);   /* one all-ones [512,512] weight reused for gate/up/down */
+        if(!w5){ printf("pack5 failed\n"); ork_npu_free(c); return 1; }
+        static int Cg[Mf*Nf],Cs[Mf*Nf],Cu[Mf*Nf],Ch[Mf*Nf],Cd[Mf*Nf];
+        for(int i=0;i<Mf*Nf;i++){ Cg[i]=Cs[i]=Cu[i]=Ch[i]=Cd[i]=0; }
+        ork_mm_task_i8 t[5] = { {w5,Mf,A5,Cg}, {w5,Mf,A5,Cs}, {w5,Mf,A5,Cu}, {w5,Mf,A5,Ch}, {w5,Mf,A5,Cd} };
+        ork_chain_op ops[5] = {
+            { 1, -1,0, 0x4000,18 },  /* gate MM8 (reads A) 512->32 */
+            { 2, 0,0, 0,0 },         /* silu(gate) */
+            { 1, -1,0, 0x4000,18 },  /* up MM8 (reads A) 512->32 */
+            { 3, 1,2, 0x4000,19 },   /* glu = silu*up (1/32) -> ~61 */
+            { 0, 3,0, 0,0 },         /* down MM32, reads glu(t3): out = 61*512 = 31232 (int32) */
+        };
+        double is = 3.0/32.0, os = siluf(3.0)/60.0;
+        int r=ork_mm_run_chain_i8_ffn(c,5,t,ops,is,os);
+        printf("chain_gu_silu[FFN5]: [gate -> silu -> up -> glu -> down] ONE submit  (M=%d K=%d N=%d)\n",Mf,Kf,Nf);
+        printf("  rc=%d\n", r);
+        if(r==0){ signed char *cg=(signed char*)Cg,*cs=(signed char*)Cs,*cu=(signed char*)Cu,*ch=(signed char*)Ch;
+            int g=cg[0],s=cs[0],u=cu[0],h=ch[0],d=Cd[0], glu=61, wantd=glu*Kf;   /* down = glu*512 */
+            int ng=0,ns=0,nu=0,nh=0,nd=0; for(int i=0;i<Mf*Nf;i++){ if(cg[i]==g)ng++; if(cs[i]==s)ns++; if(cu[i]==u)nu++; if(ch[i]==h)nh++; if(Cd[i]==d)nd++; }
+            printf("  gate=%d(%d) silu=%d(%d) up=%d(%d) glu=%d(%d) down=%d(%d)/%d  [down want ~glu*512=%d]\n",
+                   g,ng,s,ns,u,nu,h,nh,d,nd,Mf*Nf,wantd);
+            int ok = (g==32 && s>0 && u==32 && h!=0 && d!=0);
+            printf("  VERDICT: %s\n", ok?"FULL FFN INNER CHAIN WORKS (gate,silu,up,glu,down all ran, ONE submit)":
+                                        "some task empty/wrong -- see values"); }
+        else printf("  VERDICT: %s\n", r==-1?"WEDGED":"error");
+        ork_npu_free(c); return (r==0)?0:1;
+    }
     if(getenv("ORK_GSILU_FFN4")){   /* [gate -> silu -> up -> glu] 4-task one submit (matmul/SDP mix, aliased) */
         static int Cg[8*64], Cs[8*64], Cu[8*64], Ch[8*64];
         for(int i=0;i<M*N;i++){ Cg[i]=Cs[i]=Cu[i]=Ch[i]=0; }
         ork_mm_task_i8 t[4] = { {wg,M,A,Cg}, {wg,M,A,Cs}, {wu,M,A,Cu}, {wg,M,A,Ch} };   /* SDP tasks reuse wg for N sizing */
-        ork_chain_op ops[4] = {   /* kind: 1=matmul int8-out, 2=silu-SDP, 3=ewmul-SDP */
-            { 1, 0,0, 0x4000,18 },   /* t0 gate: int8 out, requant 1/16 (512->32) */
+        ork_chain_op ops[4] = {   /* kind: 1=matmul int8-out, 2=silu-SDP, 3=ewmul-SDP; matmul in0=-1 -> reads A */
+            { 1, -1,0, 0x4000,18 },  /* t0 gate: int8 out, requant 1/16 (512->32), reads A */
             { 2, 0,0, 0,0 },         /* t1 silu(in0=gate) */
-            { 1, 0,0, 0x4000,18 },   /* t2 up: int8 out (512->32) */
+            { 1, -1,0, 0x4000,18 },  /* t2 up: int8 out (512->32), reads A */
             { 3, 1,2, 0x4000,19 },   /* t3 glu = silu(t1) * up(t2), gain 1/32 */
         };
         double is = 3.0/32.0, os = siluf(3.0)/60.0;

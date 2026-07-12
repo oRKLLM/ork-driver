@@ -112,6 +112,25 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## ★★★ FULL FFN INNER CHAIN WORKS (2026-07-12): [gate->silu->up->glu->down] ONE submit, bit-exact
+FFN5 (chain_gu_silu_probe ORK_GSILU_FFN5, M=8 K=512 Nff=512, all-ones): rc=0, gate=32, silu=61, up=32,
+glu=61, **down=31232 = glu(61)*512 EXACT** (all 4096/4096, no wedge). All FIVE ops chained in ONE submit:
+matmul -> SDP -> matmul -> SDP -> matmul.
+- Added: a MATMUL task can read a PRIOR task's output as its activation (ops[i].in0>=0 -> out_dma[in0];
+  -1 -> tasks[i].A). down reads glu (task3) -> validates the SDP-output -> matmul-activation-input bridge
+  (down=31232 exact). BOTH directions of matmul<->SDP aliasing now proven.
+- The general assembler ork_mm_run_chain_i8_ffn(S, tasks, ops[], in_scale, out_scale) handles the full mixed
+  chain from a per-task op list. This is the FFN assembler.
+REMAINING for production:
+  1. K-SPLIT down for real Nff=6144 (down contraction 6144 > 4096; test used Nff=512, single program). run_chain
+     needs to K-split a single matmul task into accumulate-programs WITHIN the chain (methodology "internal
+     K-split != boundary"). Currently a task with K>4096 returns -3.
+  2. Wire into ggml-ork: replace the per-node FFN inner with one ork_mm_run_chain_i8_ffn call; per-row/per-channel
+     scales (not the test's per-tensor); measure prefill vs baseline + ork_ppl coherence.
+  3. Fused RESIDUAL on down's output stage (user): add the residual to down's accumulator before requant
+     (set_i8_out8-stage add / SDP EW-add) -> keeps the residual in the chain, precision-preserving.
+  4. Attention block chain [QK^T -> softmax-SDP -> A.V] as the second assembled unit (same primitives).
+
 ## ★★ 4-TASK FFN CHAIN WORKS (2026-07-12): [gate -> silu -> up -> glu] one submit, bit-coherent
 General per-task-op assembler `ork_mm_run_chain_i8_ffn(S, tasks, ops[], in_scale, out_scale)`: ops[i].kind =
 OP_MM32/OP_MM8/OP_SILU/OP_EWMUL; SDP tasks read prior outputs by index (in0/in1), aliased. Chains
