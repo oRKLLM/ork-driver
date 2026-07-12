@@ -517,6 +517,9 @@ typedef struct { const uint32_t *rc; int nwords; unsigned enable_mask; int regcf
  * run (attention block / FFN inner) into one submit. Non-last programs need a PC next-descriptor slot in
  * their regcmd (matmul has one; a program lacking it can only be last). 0/ok, -2 bad-args/no-slot, -1 wedge. */
 int          ork_npu_chain_progs(ork_npu *ctx, int n, const ork_chain_prog *progs, int dom);
+/* Self-test: chain 2 plain int8 matmuls (all-ones) and verify BOTH tasks execute. *t0_cnt/*t1_cnt = count
+ * of M*N int32 slots == K or 2K (near M*N => that task ran). Validates chain_progs w/ a real task0. */
+int          ork_npu_chain_selftest(ork_npu *ctx, int *t0_cnt, int *t1_cnt);
 
 /* CHAIN ASSEMBLER increment-1: data-connected int8-matmul(int16-out) -> int16-silu in ONE PC-chain (the
  * matmul's int16 output buffer IS the silu's input). Validates the intermediate-buffer bridge. Computes

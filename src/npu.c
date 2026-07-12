@@ -7111,6 +7111,14 @@ cleanup:
 int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom){
     if(!c||!progs||n<1||n>1024) return -2;
     int fd=c->fd;
+    /* warm-state management (mirror run_chain_i8): entering a chain from a non-int8-live mode resets +
+     * unwarms so the WARM-UP reps below fire; DT_I8<->DT_I8_CHAIN is not a real mode change (keepwarm). */
+    if(c->last_dt != 3 /* DT_I8_CHAIN */){
+        int keepwarm = ork_nothrash() && ORK_I8_LIVE(c->last_dt);
+        if(!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);
+        if(!keepwarm){ c->warmed = 0; c->ccsz = 0; }
+        c->last_dt = 3;
+    }
     size_t off[1024], total=0;
     for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; off[i]=total; total+=(size_t)progs[i].nwords; }
     if(total*4 > c->regcmd.size || (size_t)n*sizeof(struct rknpu_task) > c->task.size) return -2;
@@ -7135,10 +7143,62 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
     for(int i=0;i<n;i++){ t[i].enable_mask=progs[i].enable_mask; t[i].int_mask=0x300; t[i].int_clear=0x1ffff;
         t[i].regcfg_amount=progs[i].regcfg_amount; t[i].regcmd_addr=(uint32_t)((uint64_t)c->regcmd.dma + off[i]*4); }
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    /* ping-pong (ork_ppflags, typically 0x5) is safe ONLY for register-config-only chains (all int8 matmul
+     * tasks, like run_chain_i8); ANY SDP/LUT task (enable != 0xd) needs ping-pong OFF (0x1) so a bank swap
+     * doesn't race a LUT SRAM commit (AGENTS.md "ping-pong OFF for LUT chains"). */
+    int has_sdp=0; for(int i=0;i<n;i++) if(progs[i].enable_mask!=0xd) has_sdp=1;
     struct rknpu_submit s; memset(&s,0,sizeof s);
-    s.flags=0x1; s.task_number=(uint32_t)n; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1;
-    s.timeout=ew_timeout_ms(); s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)n};
-    return rknpu_submit_ioctl(fd,&s,dom)?-1:0;
+    s.flags = has_sdp ? 0x1 : ork_ppflags(); s.task_number=(uint32_t)n; s.task_obj_addr=c->task.obj;
+    s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=ew_timeout_ms();
+    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)n};
+    /* WARM-UP: a COLD int8-matmul chain submit yields EMPTY output (run_chain_i8 reps=2 cold). Submit reps
+     * times; the last produces the result. c->warmed is managed by the DT_I8_CHAIN block at entry. */
+    int reps = c->warmed ? 1 : 2, rr=0;
+    if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] n=%d dom=%d flags=0x%x warmed(pre)=%d reps=%d regcmd.dma=0x%llx task.obj=0x%llx | "
+        "t0{en=0x%x rcfg=%d addr=0x%x} t%d{en=0x%x rcfg=%d addr=0x%x}\n", n,dom,s.flags,reps,reps,(unsigned long long)c->regcmd.dma,(unsigned long long)c->task.obj,
+        t[0].enable_mask,t[0].regcfg_amount,t[0].regcmd_addr, n-1,t[n-1].enable_mask,t[n-1].regcfg_amount,t[n-1].regcmd_addr);
+    for(int rep=0; rep<reps; rep++){ int e=rknpu_submit_ioctl(fd,&s,dom); rr = e?-1:0;
+        if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] submit rep %d -> %d (errno=%d)\n",rep,e,errno); }
+    c->warmed = 1;
+    return rr;
+}
+
+/* CHAIN ASSEMBLER self-test: chain TWO plain int8 matmuls via ork_npu_chain_progs and verify BOTH tasks
+ * EXECUTE + produce output -- the exact thing Phase-0 could not (an early task0 that actually runs). Uses
+ * WORKING primitives only (synth_i8 native int32 output; no set_i16_out). Layout-agnostic: A=all-1, W0=all-1,
+ * W1=all-2 -> every C0 element == K, every C1 element == 2K, regardless of output tiling. Fills *t0_cnt/
+ * *t1_cnt = count of the M*N int32 slots matching K / 2K (near M*N => that task ran; 0 => it didn't).
+ * 0/ok, -1 wedge, -2 dims/alloc. rk3588. */
+int ork_npu_chain_selftest(ork_npu *c, int *t0_cnt, int *t1_cnt){
+    /* dom=-1 (default domain) to match the WORKING raw-submit paths (probe_i8_mm, softmax_replay); the init
+     * buffers c->Af/c->regcmd/c->task live in the default domain, so a domain-0 submit mismatches them. */
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=-1;
+    const int M=8, K=64, N=64;
+    struct buf W0=bcreate(fd,(size_t)K*N,0x403,dom), W1=bcreate(fd,(size_t)K*N,0x403,dom);
+    struct buf C0=bcreate(fd,(size_t)M*N*4,0x403,dom), C1=bcreate(fd,(size_t)M*N*4,0x403,dom);
+    if(!W0.cpu||!W1.cpu||!C0.cpu||!C1.cpu){ bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1); return -2; }
+    { int8_t*b0=W0.cpu,*b1=W1.cpu; for(size_t i=0;i<(size_t)K*N;i++){ b0[i]=1; b1[i]=2; } }   /* uniform -> tile layout irrelevant */
+    memset(C0.cpu,0,(size_t)M*N*4); memset(C1.cpu,0,(size_t)M*N*4);
+    { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; }
+    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&C0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&C1,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    static uint32_t r0[REGCMD_I8_N], r1[REGCMD_I8_N];
+    synth_i8(r0,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)C0.dma,1,CBUF,0);
+    synth_i8(r1,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)C1.dma,1,CBUF,0);
+    ork_chain_prog progs[2]={ {r0,REGCMD_I8_N,0xd,108,216}, {r1,REGCMD_I8_N,0xd,108,-1} };
+    int nprog = getenv("ORK_GS_N1") ? 1 : 2;   /* ORK_GS_N1: single-task chain_progs (isolate chaining from the matmul itself) */
+    int crc=ork_npu_chain_progs(c,nprog,progs,dom);
+    if(crc){ bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1); return crc==-1?-1:-2; }
+    bsync(fd,&C0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&C1,RKNPU_MEM_SYNC_FROM_DEVICE);
+    int n0=0,n1=0; int32_t*c0=C0.cpu,*c1=C1.cpu;
+    int32_t mx0=0,mx1=0; for(int i=0;i<M*N;i++){ if(c0[i]==K)n0++; if(c1[i]==2*K)n1++;
+        if(c0[i]>mx0)mx0=c0[i]; if(c1[i]>mx1)mx1=c1[i]; }
+    fprintf(stderr,"[selftest] K=%d 2K=%d | C0 max=%d first=[%d %d %d %d] | C1 max=%d first=[%d %d %d %d]\n",
+            K,2*K,mx0,c0[0],c0[1],c0[2],c0[3],mx1,c1[0],c1[1],c1[2],c1[3]);
+    if(t0_cnt)*t0_cnt=n0; if(t1_cnt)*t1_cnt=n1;
+    bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1);
+    return 0;
 }
 
 /* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----

@@ -112,6 +112,22 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## chain_progs is a DEAD END -- extend the PROVEN run_chain_i8 instead (2026-07-12)
+Built a self-test (ork_npu_chain_selftest): chain 2 plain int8 matmuls (all-ones -> every out == K) via
+ork_npu_chain_progs. RESULT: EMPTY output (C0/C1 all 0) even at **n=1** (single task, no chaining) -- the
+submit returns rc=0 (no WARNING, no wedge; errno=22 is stale) but the matmul computes nothing. Ruled out:
+warm-up (reps=2 mirror of run_chain_i8), all-3 subcore_task, ppflags (0x5), dom (-1 and 0 both empty). The
+bug is subtle and unfound -- my from-scratch raw-submit deviates from run_chain_i8 in some way I can't see.
+=> STOP debugging chain_progs. **run_chain_i8 ALREADY chains N int8 matmuls in one submit and WORKS**
+   (ggml-ork ORK_GU_CHAIN chains gate+up via ork_mm_run_chain_i8, line ~4013). It correctly warms, resolves
+   buffers (tmp_A/dma_find + w->Bf/Bb), submits, and produces output. The assembler must be built by
+   EXTENDING run_chain_i8 to heterogeneous tasks (apply set_i8_silu to the gate task + load the silu LUT),
+   NOT on the parallel chain_progs. chain_progs kept (gated/probe-only) but superseded.
+
+CONCRETE increment (corrected): a run_chain_i8 variant / option where task[i] carries an optional silu-LUT
+flag -> that task's regcmd gets set_i8_silu (fused gate*silu, int8 out) instead of the plain int32 output.
+Chain [gate*silu -> up] in one submit reusing run_chain_i8's proven machinery. Then glu-ewmul + down.
+
 ## ANSWER: how ORK_FFN_CHAIN bridges matmul->silu (read ggml-ork.cpp 3975-4112)
 Three paths; only ONE is pure-NPU:
 1. **FUSED int8 (pure-NPU, round-trip-free): `ork_mm_run_i8_silu`** (npu.c 4286). Loads the SiLU LUT into SDP

@@ -18,6 +18,15 @@ static int clampi16(long q){ if(q>32767)q=32767; if(q<-32768)q=-32768; return (i
 int main(void){
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c=ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
+    if(getenv("ORK_GS_SELFTEST")){
+        int t0=-1,t1=-1; int r=ork_npu_chain_selftest(c,&t0,&t1);
+        printf("chain_selftest: 2 plain int8 matmuls via ork_npu_chain_progs (all-ones, MN=%d)\n", 8*64);
+        printf("  rc=%d  task0 slots==K: %d/512  task1 slots==2K: %d/512\n", r, t0, t1);
+        printf("  VERDICT: %s\n", (r==0&&t0>0&&t1>0) ? "CHAIN CORE WORKS -- both tasks execute + produce output"
+                                : (r==0&&t1>0&&t0==0) ? "task1 ran but task0 EMPTY (the Phase-0 problem persists in chain_progs)"
+                                : (r==-1) ? "WEDGED" : "check counts");
+        ork_npu_free(c); return (r==0&&t0>0&&t1>0)?0:2;
+    }
     const int M=8, K=32, N=64;
     int mult=1, shift=0;                         /* identity requant: gate_i16 = clamp_i16(acc) */
     signed char A[M*K], B[K*N];
