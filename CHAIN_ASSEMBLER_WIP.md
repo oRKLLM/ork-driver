@@ -98,6 +98,28 @@ plain task_number=1 op -- NOT a chain-walk issue. Isolation:
    all-ones/layout-independent and may never have exercised a clean submit). The int16 DATA BRIDGE premise
    (matmul writes int16 directly for the silu to read) is blocked by a broken int16-output matmul.
 
+## RE(A) RESULT: set_i16_out is broken in MULTIPLE output-stage regs, no int16 reference exists
+Diffed the DPU output-stage 0x40xx regs: int32 base (REGCMD_I8, works) vs vendor CNA producers t2/t6
+(0xd -> feed SDP, work, but FP16) vs set_i16_out. Deviations in set_i16_out:
+- **0x4010 (DATA_FORMAT)**: set to 0x0000 = OUT_PRECISION[31:29]=int8(!), NOT int16(0x20000000). Real bug
+  (int32 base=0x80000000=int32; vendor fp16 t6=0x48000002=fp16). Precision said int8 while strides said 2-byte.
+- 0x40c0: set_i16_out=0x40; vendor 2-byte producer=0x2000; int32 base=0x80. set value matches neither.
+- 0x4050: set_i16_out=0x248; vendor 2-byte=0x126; int32=0x7fc. Geometry-dependent, unmatched.
+- 0x4038/0x4058/0x405c/0x4034 also differ from the vendor producer.
+TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0=0x2000 -> STILL wedges.
+=> Multi-register-broken. And there is NO captured int8->int16-output reference (the only working 2-byte
+   producer is fp16 + different geometry). Making int8-matmul->int16-output work is a REFERENCE-LESS full
+   output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
+CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
+
+## STRATEGIC PIVOT (recommended): reuse ggml-ork's EXISTING working matmul->silu bridge
+ggml-ork's on-NPU int16-silu FFN chain WORKS today (coherent PPL 19.02, [[int16-silu-pipeline-transition-wedge]]).
+It must bridge matmul->silu somehow (likely int32-matmul-out + a CPU or on-NPU int32->int16 requant, since
+set_i16_out doesn't work). NEXT: read how ORK_FFN_CHAIN in ggml-ork.cpp actually does the gate-matmul ->
+silu handoff -- that IS the proven bridge to build the assembler on, instead of the broken int16-out matmul.
+If it's a CPU requant, the "one-submit FFN chain" needs the requant folded into an on-NPU task (option C) or
+the whole FFN kept fp16 (vendor pattern, ~3.3x matmul cost). Decide after reading the working path.
+
 ## BRIDGE FORK (needs a call) -- how the FFN matmul feeds the silu without the int16-out matmul
 - A. RE-fix set_i16_out: why does int8-matmul + int16-output wedge? Suspects: 0x4010 precision value,
      fixed 0x4050=0x0248 row-stride (not N-derived), 0x4038 group stride. Deep output-stage RE.
