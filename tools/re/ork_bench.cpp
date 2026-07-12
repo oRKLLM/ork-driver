@@ -249,11 +249,13 @@ int main(int argc, char** argv){
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 
-    // WARMUP: a PREFILL-SHAPED batch (M>1, so supports_op routes it to the NPU — M=1 stays on CPU and would
-    // NOT warm the prefill path) to trigger lazy weight pack/import + wcache population + NPU warm, so the
-    // timed prefill measures STEADY STATE. A 1-token (M=1) warmup left the timed prefill cold — it paid the
-    // one-time weight-load from the .orkpack (~0.8s on Qwen3-1.7B int4), under-reporting warm prefill ~24%.
-    { int wn = nt < 32 ? nt : 32; llama_batch wb=llama_batch_get_one(toks.data(), wn); if(llama_decode(ctx,wb)!=0){ fprintf(stderr,"warmup decode FAILED\n"); return 3; } }
+    // MODEL PRE-LOAD / WARMUP: run a warmup decode at the EXACT prefill shape (full nt tokens) BEFORE timing,
+    // so ork-driver loads ALL weights resident from the .orkpack AND warms the NPU at the M=nt schedule the
+    // timed prefill will use. ork-driver resolves weights + the NPU M-tile schedule lazily on first use and
+    // they are SHAPE-DEPENDENT: a smaller-M warmup (the old min(nt,32)) loaded the weights but left the M=nt
+    // prefill paying a schedule re-warm. Warming at the identical shape makes the timed prefill true steady
+    // state (no .orkpack load, no re-warm in the measurement). Not timed; KV is cleared after.
+    { llama_batch wb=llama_batch_get_one(toks.data(), nt); if(llama_decode(ctx,wb)!=0){ fprintf(stderr,"warmup decode FAILED\n"); return 3; } }
     llama_memory_clear(llama_get_memory(ctx), true);
 
     // PREFILL: decode the P-token prompt as one batch (ubatch UB), time it.
