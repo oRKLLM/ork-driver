@@ -448,6 +448,11 @@ i16out_probe: tools/i16out_probe.c $(CORE)
 bmm_probe: tools/bmm_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# Phase-1 GATE G1: decisive fusion micro-bench — fused mixed chunk chain (1 submit) vs the same ops as
+# N separate submits, at a floor-dominated shape. Proves fusion clears the submit floor before the big build.
+ssd_fusion_bench: tools/ssd_fusion_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 softmax_probe: tools/softmax_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
