@@ -719,6 +719,14 @@ int          ork_mm_run_chain_i8_gsilu(ork_npu *ctx, int S, const ork_mm_task_i8
  * tasks[sdp_task].C gets int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int          ork_mm_run_chain_i8_sdpsilu(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int sdp_task,
                                          int gate_mult, int gate_shift, double in_scale, double out_scale);
+
+/* GENERAL heterogeneous FFN chain. Per-task op: kind 0=matmul(int32 out) 1=matmul(int8 out, requant
+ * mult/shift) 2=silu-SDP 3=ewmul-SDP; SDP tasks read prior tasks' outputs by index in0/in1 (aliased). Chains
+ * e.g. [gate(1) -> silu(2,in0=gate) -> up(1) -> glu(3,in0=silu,in1=up) -> down(0)] in ONE submit. Silu LUT for
+ * (in_scale,out_scale) built internally. tasks[i].C gets that op's output. Single M-tile/task. 0/ok,-1,-2,-3. */
+typedef struct { int kind; int in0, in1; int mult, shift; } ork_chain_op;
+int          ork_mm_run_chain_i8_ffn(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
+                                     const ork_chain_op *ops, double in_scale, double out_scale);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

@@ -24,6 +24,31 @@ int main(void){
     ork_w *wg=ork_mm_pack_i8(c,K,N,Wg), *wu=ork_mm_pack_i8(c,K,N,Wu);
     if(!wg||!wu){ printf("pack failed\n"); ork_npu_free(c); return 1; }
 
+    if(getenv("ORK_GSILU_FFN4")){   /* [gate -> silu -> up -> glu] 4-task one submit (matmul/SDP mix, aliased) */
+        static int Cg[8*64], Cs[8*64], Cu[8*64], Ch[8*64];
+        for(int i=0;i<M*N;i++){ Cg[i]=Cs[i]=Cu[i]=Ch[i]=0; }
+        ork_mm_task_i8 t[4] = { {wg,M,A,Cg}, {wg,M,A,Cs}, {wu,M,A,Cu}, {wg,M,A,Ch} };   /* SDP tasks reuse wg for N sizing */
+        ork_chain_op ops[4] = {   /* kind: 1=matmul int8-out, 2=silu-SDP, 3=ewmul-SDP */
+            { 1, 0,0, 0x4000,18 },   /* t0 gate: int8 out, requant 1/16 (512->32) */
+            { 2, 0,0, 0,0 },         /* t1 silu(in0=gate) */
+            { 1, 0,0, 0x4000,18 },   /* t2 up: int8 out (512->32) */
+            { 3, 1,2, 0x4000,19 },   /* t3 glu = silu(t1) * up(t2), gain 1/32 */
+        };
+        double is = 3.0/32.0, os = siluf(3.0)/60.0;
+        int r=ork_mm_run_chain_i8_ffn(c,4,t,ops,is,os);
+        printf("chain_gu_silu[FFN4]: [gate -> silu -> up -> glu] ONE submit  (M=%d K=%d N=%d)\n",M,K,N);
+        printf("  rc=%d\n", r);
+        if(r==0){ signed char *cg=(signed char*)Cg,*cs=(signed char*)Cs,*cu=(signed char*)Cu,*ch=(signed char*)Ch;
+            int g=cg[0],s=cs[0],u=cu[0],h=ch[0];
+            int ng=0,ns=0,nu=0,nh=0; for(int i=0;i<M*N;i++){ if(cg[i]==g)ng++; if(cs[i]==s)ns++; if(cu[i]==u)nu++; if(ch[i]==h)nh++; }
+            printf("  t0 gate=%d (%d/%d)  t1 silu=%d (%d/%d)  t2 up=%d (%d/%d)  t3 glu=%d (%d/%d)\n",
+                   g,ng,M*N, s,ns,M*N, u,nu,M*N, h,nh,M*N);
+            int ok = (g==32 && s>0 && u==32 && h!=0);
+            printf("  VERDICT: %s\n", ok?"FULL FFN-INNER-MINUS-DOWN CHAIN WORKS (gate,silu,up,glu all ran, one submit)":
+                                        "some task empty/wrong -- see values"); }
+        else printf("  VERDICT: %s\n", r==-1?"WEDGED":"error");
+        ork_npu_free(c); return (r==0)?0:1;
+    }
     if(getenv("ORK_GSILU_SDP")){   /* OPTION B: [gate matmul(int8-out) -> silu-SDP] one submit (vendor matmul->SDP) */
         int Cg[8*64], Cs[8*64]; for(int i=0;i<M*N;i++){ Cg[i]=0; Cs[i]=0; }
         ork_mm_task_i8 t[2] = { { wg, M, A, Cg }, { wg, M, A, Cs } };   /* task0=gate(int8-out); task1=silu-SDP reads Cg */

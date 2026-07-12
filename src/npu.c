@@ -6903,11 +6903,15 @@ static int chain_fullk_mcap_i8(ork_npu *c, int K) {
 /* Optional fused-SiLU output stage for ONE task in a chain (the gate): that task's regcmd gets set_i8_silu
  * (int8 silu(gate) output instead of int32), and the silu LUT is streamed to SDP SRAM once before the chain.
  * Reuses run_chain_i8's proven warm/buffer/submit machinery. NULL = plain int32 chain (original behavior). */
-/* task     = fused gate*silu task (set_i8_silu on the matmul output) -- KNOWN to wedge in a chain, kept for A/B.
- * sdp_task = OPTION B: this task is a STANDALONE int8 silu-SDP op (REGCMD_SILU_STD, enable 0x18, regcfg 69)
- *            reading the PREVIOUS task's output buffer (aliased); the previous (gate) matmul gets set_i8_out8
- *            (plain int8 output, NO activation) so the silu reads int8. -1 = not used. */
-struct chain_silu_spec { int task; int sdp_task; int r_mult, r_shift; int gate_mult, gate_shift; uint32_t out_bias, idx_off, cfg4064, cfg4068; const int16_t *lut; int nlut; };
+/* Per-task op kind for a heterogeneous chain (the general OPTION-B path). SDP tasks (SILU/EWMUL) read prior
+ * tasks' OUTPUT buffers by index (in0/in1), aliased -- the vendor matmul->SDP pattern. Matmul tasks emit int32
+ * (MM32) or plain int8 (MM8, set_i8_out8 requant mult/shift) -- use MM8 when the output feeds an SDP task. */
+enum { OP_MM32=0, OP_MM8=1, OP_SILU=2, OP_EWMUL=3 };   /* ork_chain_op.kind values (struct is in ork_npu.h) */
+
+/* ops     = per-task op array (the general path; NULL -> legacy task/sdp_task below).
+ * task     = fused gate*silu task (set_i8_silu on the matmul output) -- KNOWN to wedge in a chain, kept for A/B.
+ * sdp_task = single standalone int8 silu-SDP op reading the PREVIOUS task's output (legacy 2-task path). -1=off. */
+struct chain_silu_spec { const ork_chain_op *ops; int task; int sdp_task; int r_mult, r_shift; int gate_mult, gate_shift; uint32_t out_bias, idx_off, cfg4064, cfg4068; const int16_t *lut; int nlut; };
 
 static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss);
 int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) { return run_chain_i8_impl(c, S, tasks, NULL); }
@@ -6919,7 +6923,7 @@ int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, in
                               int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off, uint32_t cfg4068,
                               const int16_t *lut, int nlut) {
     if (gate_task < 0 || gate_task >= S || !lut) return -2;
-    struct chain_silu_spec ss = { gate_task, -1, r_mult, r_shift, 0, 0, out_bias, idx_off, 0, cfg4068, lut, nlut };
+    struct chain_silu_spec ss = { NULL, gate_task, -1, r_mult, r_shift, 0, 0, out_bias, idx_off, 0, cfg4068, lut, nlut };
     return run_chain_i8_impl(c, S, tasks, &ss);
 }
 
@@ -6934,7 +6938,23 @@ int ork_mm_run_chain_i8_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (silu_calibrate_idx(c)) return -1;
     static int16_t lut[1030]; silu_build_curve(c, silu_f, in_scale, out_scale, lut);   /* same curve as act_lut_i8 */
-    struct chain_silu_spec ss = { -1, sdp_task, 0x4000, 14, gate_mult, gate_shift, 0,
+    struct chain_silu_spec ss = { NULL, -1, sdp_task, 0x4000, 14, gate_mult, gate_shift, 0,
+                                  ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    return run_chain_i8_impl(c, S, tasks, &ss);
+}
+
+/* GENERAL heterogeneous FFN chain: per-task ops[] (OP_MM32/OP_MM8/OP_SILU/OP_EWMUL); SDP tasks read prior
+ * outputs by index (ops[i].in0/in1), aliased. The silu LUT for (in_scale,out_scale) is built internally.
+ * Chains e.g. [gate(MM8) -> silu(SDP,in0=gate) -> up(MM8) -> glu(EWMUL,in0=silu,in1=up) -> down(MM32)] in ONE
+ * submit. tasks[i].C receives that op's output (int8 for MM8/SDP, int32 for MM32). Single M-tile per task.
+ * 0/ok,-1 wedge,-2 dims,-3 SoC. */
+int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+                            const ork_chain_op *ops, double in_scale, double out_scale) {
+    if (S < 1 || !ops) return -2;
+    if (!ork_ppu_fuse_enabled(c)) return -3;
+    if (silu_calibrate_idx(c)) return -1;
+    static int16_t lut[1030]; silu_build_curve(c, silu_f, in_scale, out_scale, lut);
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     return run_chain_i8_impl(c, S, tasks, &ss);
 }
@@ -7063,6 +7083,9 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // run_chain_i8 is SINGLE-CORE: it PC-chains all P programs into ONE submit (low latency, one ioctl
     // for S matmuls — e.g. decode QKV/gate-up sharing an input). Cross-core throughput is now served by
     // ork_mm_run_stream_i8 (async round-robin, ~3x); the old barrier fan-out here was superseded (~1.3x).
+    // task op kind: ops[] path, else legacy (silu-SDP at sdp_task; everything else matmul). SDP-containing
+    // chains assume single M-tile per task (P==S, program p == task p) so this program<->task map holds.
+    #define CHAIN_KIND(ii) (ss ? (ss->ops ? ss->ops[ii].kind : ((ii)==ss->sdp_task ? OP_SILU : OP_MM32)) : OP_MM32)
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -7077,39 +7100,49 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             // Let synth_i8(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
             // Do NOT hardcode it (the old 0xb1 was an M=1 value; for mc>16 it computes rows past the
             // first 64-group against the wrong K-partition — same class as the full-K prefill bug).
-            int is_sdp = (ss && i == ss->sdp_task);
-            if (is_sdp) {
-                // OPTION B: STANDALONE int8 silu-SDP op (REGCMD_SILU_STD, enable 0x18/regcfg 69) reading the
-                // PREVIOUS (gate) task's output buffer via aliasing (out_dma[i-1]) and writing out_dma[i].
-                // This is the vendor's matmul->SDP pattern (data via shared addresses), NOT a fused output stage.
-                memcpy(rc, REGCMD_SILU_STD, (size_t)REGCMD_SILU_STD_N * 4);
-                set_mul_geom(rc, REGCMD_SILU_STD_N, mc, N);
-                setr(rc, REGCMD_SILU_STD_N, 0x2001, 0x5040, 0);
-                setr(rc, REGCMD_SILU_STD_N, 0x2001, 0x5038, 0);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4020, out_dma[i]);          // output
-                setr(rc, REGCMD_SILU_STD_N, 0x2001, 0x5018, out_dma[i-1]);        // input = prev (gate) output, ALIASED
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4084, (uint32_t)ss->r_mult);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4088, (uint32_t)ss->r_shift);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4080, ss->out_bias);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4110, ss->idx_off);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4064, ss->cfg4064);
-                setr(rc, REGCMD_SILU_STD_N, 0x1001, 0x4068, ss->cfg4068);
+            int kind = CHAIN_KIND(i);
+            if (kind == OP_SILU || kind == OP_EWMUL) {
+                // STANDALONE SDP op (REGCMD_SILU_STD / REGCMD_MUL, enable 0x18/regcfg 69) reading prior tasks'
+                // output buffers via ALIASING -- the vendor matmul->SDP pattern (data via shared addresses).
+                int in0 = ss->ops ? ss->ops[i].in0 : (i - 1);          // legacy silu reads task i-1
+                const uint32_t *tmpl = (kind == OP_SILU) ? REGCMD_SILU_STD : REGCMD_MUL;
+                int tn = (kind == OP_SILU) ? REGCMD_SILU_STD_N : REGCMD_MUL_N;
+                memcpy(rc, tmpl, (size_t)tn * 4);
+                set_mul_geom(rc, tn, mc, N);
+                setr(rc, tn, 0x1001, 0x4020, out_dma[i]);              // output
+                setr(rc, tn, 0x2001, 0x5018, out_dma[in0]);            // operand a = prior output, ALIASED
+                if (kind == OP_SILU) {
+                    setr(rc, tn, 0x2001, 0x5040, 0); setr(rc, tn, 0x2001, 0x5038, 0);   // single-input
+                    setr(rc, tn, 0x1001, 0x4084, (uint32_t)ss->r_mult); setr(rc, tn, 0x1001, 0x4088, (uint32_t)ss->r_shift);
+                    setr(rc, tn, 0x1001, 0x4080, ss->out_bias);
+                    setr(rc, tn, 0x1001, 0x4110, ss->idx_off); setr(rc, tn, 0x1001, 0x4064, ss->cfg4064); setr(rc, tn, 0x1001, 0x4068, ss->cfg4068);
+                } else {   // OP_EWMUL: out = a (*) b ; b = second prior output (silu*up for glu)
+                    int in1 = ss->ops[i].in1;
+                    setr(rc, tn, 0x2001, 0x5038, out_dma[in1]);        // operand b, ALIASED
+                    setr(rc, tn, 0x1001, 0x4084, (uint32_t)ss->ops[i].mult); setr(rc, tn, 0x1001, 0x4088, (uint32_t)ss->ops[i].shift);
+                    setr(rc, tn, 0x1001, 0x4080, 0); setr(rc, tn, 0x1001, 0x4044, 0); setr(rc, tn, 0x1001, 0x4074, 0);
+                }
             } else {
                 synth_i8(rc, mc, K, N, act_dma[i] + (uint32_t)((size_t)m0 * K),
                          bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
-                if (ss && i == ss->task && !getenv("ORK_GSILU_NOSILU")) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
-                // OPTION B: the gate task feeding the silu-SDP emits plain int8 (set_i8_out8, no activation).
-                if (ss && ss->sdp_task >= 1 && i == ss->sdp_task - 1) set_i8_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);
+                if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
+                else if (kind == OP_MM8) set_i8_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)
+                else if (ss && !ss->ops && ss->sdp_task >= 1 && i == ss->sdp_task - 1) set_i8_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);   // legacy gate->silu
                 if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
                 uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
-                int next_is_sdp = (ss && (i + 1) == ss->sdp_task);   // next program's regcfg: silu-SDP=69 -> amt 36; matmul=108 -> amt 55
+                int nk = CHAIN_KIND(i + 1);
+                int next_is_sdp = (nk == OP_SILU || nk == OP_EWMUL);   // next program's regcfg: SDP=69 -> amt 36; matmul=108 -> amt 55
                 uint32_t namt = next_is_sdp ? (uint32_t)((69 + 3) / 2) : 0x0037;
-                rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
-                rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-                rc[218] = 0x0014 | (namt << 16);
-                rc[219] = (0x0101 << 16) | (0);
+                // THIS program's PC next-descriptor lives at word 2*regcfg (matmul 108 -> 216; SDP 69 -> 138).
+                // The PC reads regcfg reg-pairs then the descriptor; a middle SDP task needs it at 138, not 216.
+                int cur_sdp = (kind == OP_SILU || kind == OP_EWMUL);
+                int dw = cur_sdp ? (69 * 2) : (108 * 2);
+                rc[dw]   = 0x0010 | ((next_dma & 0xffff) << 16);
+                rc[dw+1] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+                rc[dw+2] = 0x0014 | (namt << 16);
+                rc[dw+3] = (0x0101 << 16) | (0);
             }
             memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
@@ -7141,12 +7174,14 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int submit_ok = 0;
     struct rknpu_task *t = c->task.cpu;
     memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
-    int sdp_prog = (ss && ss->sdp_task >= 0) ? prog_off[ss->sdp_task] : -1;   // OPTION B: this program is the silu-SDP op
-    for (int p = 0; p < P; p++) {
-        int is_sdp = (p == sdp_prog);
-        t[p].enable_mask = is_sdp ? 0x18 : 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
-        t[p].regcfg_amount = is_sdp ? 69 : 108;
+    for (int p = 0; p < P; p++) {   // default: matmul task
+        t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
+        t[p].regcfg_amount = 108;
         t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
+    }
+    for (int i = 0; i < S; i++) {   // SDP tasks (silu/ewmul): enable 0x18, regcfg 69 (single program at prog_off[i])
+        int k = CHAIN_KIND(i);
+        if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
     }
     bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     static int tc = -2;

@@ -112,6 +112,20 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## ★★ 4-TASK FFN CHAIN WORKS (2026-07-12): [gate -> silu -> up -> glu] one submit, bit-coherent
+General per-task-op assembler `ork_mm_run_chain_i8_ffn(S, tasks, ops[], in_scale, out_scale)`: ops[i].kind =
+OP_MM32/OP_MM8/OP_SILU/OP_EWMUL; SDP tasks read prior outputs by index (in0/in1), aliased. Chains
+`[gate(MM8) -> silu(SDP,in0=gate) -> up(MM8) -> glu(EWMUL,in0=silu,in1=up)]` in ONE submit.
+RESULT (chain_gu_silu_probe ORK_GSILU_FFN4, K=512 all-ones): rc=0, gate=32, silu=61, up=32, glu=61 — all
+512/512, no wedge. FOUR heterogeneous ops (matmul->SDP->matmul->SDP) chained coherently.
+KEY FIX: the PC next-descriptor of a MIDDLE task lives at word **2*regcfg** (matmul 108 -> 216; SDP 69 -> 138),
+NOT always 216. The 2-task chain worked only because the silu was last (no descriptor); a middle SDP task's
+forward-descriptor must be written at 138. (This is the general rule for chaining any regcfg-N task.)
+=> The FFN inner minus down is a working one-submit chain. REMAINING: add **down** (task4, MM32, reads glu;
+   K-split since down K = Nff = 6144 > 4096 -> multiple chained programs + accumulate). Then wire into ggml-ork
+   + measure prefill vs baseline + coherence (ork_ppl). The fused residual (user) = a set_i8_out8-stage add on
+   down's output.
+
 ## ★ OPTION B WORKS (2026-07-12): one-submit [gate matmul(int8-out) -> silu-SDP] coherent
 ork_mm_run_chain_i8_sdpsilu: task[sdp_task] is a STANDALONE int8 silu-SDP op (REGCMD_SILU_STD, 0x18/69)
 reading task[sdp_task-1]'s output via ALIASED buffers; the gate matmul gets set_i8_out8 (plain int8 output);
