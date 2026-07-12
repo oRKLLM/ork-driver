@@ -112,6 +112,23 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## FOOTPRINT FIX done (2026-07-12) -> exposes the IMPORTED-WEIGHT-in-chain root blocker (task #36)
+Did the footprint fix: CHAIN5 now reuses the RESIDENT per-channel owu/owd (from the orkpack) for up/down +
+keeps only fc.wg (gate) -- NO extra fc.wu/fc.wd packs. RESULT: the IOVA overflow (bcreate-fail) is GONE; the
+chain now SUBMITS the full [gate->silu->up->glu->down(K-split)] and reaches the down. Baseline all-int8 prefill
+= 72.22 tok/s (the reference).
+BUT CHAIN5 now WEDGES (errno=110) on the DOWN: "run_chain_i8 weight[K=6144 N=2048 imported=1]". The orkpack
+weights are ZERO-COPY IMPORTS (imported=1); ork_mm_run_chain_i8_ffn's K-split reads owd.w->Bb[ks] assuming
+freshly-PACKED per-slice buffers, but an imported weight is ONE contiguous import -> the K-slice Bb[ks].dma
+addresses are wrong -> submit wedge. This is the documented imported-weight / multi-domain submit ROOT BLOCKER
+([[multi-domain-runtime]], [[multidomain-import-anchor]]; ork-driver task #36). Freshly-PACKED weights chain
+fine (the FFN6K probe proved it); the wedge is specific to IMPORTED weights in the chain K-split.
+=> Two exclusive walls for the full-chain bench: fresh-pack fc.wu/wd (IOVA overflow) OR imported owu/owd
+   (imported-in-chain wedge, task #36). Resolving either is a separate hard workstream (compact PRE-PACKED
+   chain orkpack, or K-split support for imported/contiguous weights). AND expected speed is neutral anyway
+   (baseline 72.22, CPU-bound prefill, single-core chain). The chain assembler itself is validated + correct
+   with packed weights; the integration blocker is the orkpack's zero-copy-import layout vs the chain K-split.
+
 ## ggml-ork INTEGRATION + ork_bench (2026-07-12): CHAIN5 engages on the real model; bench blocked by IOVA footprint
 Landed the chain assembler to ork-driver main (pushed) + bumped both fork submodules (local feat/ork-static-graph
 + board ~/llama-q4-v0659). Wired ggml-ork ORK_FFN_CHAIN5: prep packs per-tensor fc.wu/fc.wd (+ rough scales
