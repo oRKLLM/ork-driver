@@ -6314,6 +6314,96 @@ fail:
     return -1;
 }
 
+/* CHAIN ASSEMBLER increment-1: DATA-CONNECTED int8-matmul(int16-out) -> int16-silu in ONE PC-chain via the
+ * general ork_npu_chain_progs core. Unlike ork_npu_chain_mm_silu_i16 (which only proves the chain WALKS --
+ * its matmul output and silu input are SEPARATE buffers), here the gate matmul's int16 output buffer G IS
+ * the silu's input, so it validates the INTERMEDIATE-BUFFER BRIDGE (the crux of the FFN chain): does the
+ * matmul set_i16_out layout match the silu's 0x5018 EWCUBEH cube input layout. Computes
+ *   out = clamp_i16( silu( gate_i16 * in_scale ) / out_scale ),  gate_i16 = requant_i16(A[M,K] x B[K,N]).
+ * A int8 [M*K] row-major, B int8 [K*N] row-major (de-tiled here); mult/shift = the int32->int16 requant.
+ * gate_out (nullable) returns G read back via EWCUBEH so a caller can localize a mismatch to the matmul
+ * stage vs the silu stage. Small-shape validated regime (probe_i16_out N range). 0/ok,-1 wedge,-2 dims,-3 SoC. */
+int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+                               int mult,int shift,double in_scale,double out_scale,
+                               int16_t *gate_out,int16_t *out,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    if(silu_calibrate_idx16(c)) return -1;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    /* silu LUT for (in_scale,out_scale) -- same construction as act_lut_i16 / Phase-0 */
+    static double qsum[1030]; static int qn[1030];
+    for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
+    for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
+    int16_t lut[1030]; int lo=-1,hi=-1;
+    for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k; double q_in=qsum[k]/qn[k]; double val=silu_f(q_in*in_scale)/out_scale;
+        long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
+    if(lo<0) return -1;
+    for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
+    for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
+        lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
+
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom);
+    struct buf G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);       /* G = matmul int16 out = silu in */
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
+    if(!W.cpu||!G.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu){ fprintf(stderr,"[gatesilu] buffer alloc failed\n"); goto gfail; }
+    { int NN=N/32,KT=K/32; int8_t*bb=W.cpu;                                  /* int8 weight tile [Nt][Kt][32][32] */
+      for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
+    memset(G.cpu,0,sz); memset(O.cpu,0,sz);
+    { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+
+    /* submit 1: silu LUT-load (separate, ping-pong off) */
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
+        lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu] LUT-load submit failed (errno=%d)\n",errno); goto gfail; } }
+
+    /* build the 2 chained programs: [0] matmul int16-out -> G ; [1] silu G -> O */
+    static uint32_t mm[REGCMD_I8_N], si[REGCMD_SILU_STD_I16_N];
+    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);
+    set_i16_out(mm,N,0,mult,shift);
+    memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
+    set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
+    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0);
+    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)G.dma);            /* silu INPUT = matmul OUTPUT */
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064);
+    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+
+    ork_chain_prog progs[2] = { { mm, REGCMD_I8_N, 0xd, 108, 216 }, { si, REGCMD_SILU_STD_I16_N, 0x18, 69, -1 } };
+    double t0=ork_now_us();
+    int crc=ork_npu_chain_progs(c,2,progs,dom);
+    if(crc){ fprintf(stderr,"[gatesilu] chain_progs rc=%d (errno=%d) — -2 no-descriptor-slot/bad-args, -1 submit wedge\n",crc,errno); goto gfail; }
+    bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(us)*us=ork_now_us()-t0;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){
+        if(gate_out) gate_out[m*N+n]=*(int16_t*)((char*)G.cpu+EWCUBEH(m,n));
+        out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n));
+    }
+    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef EWCUBEH
+    return 0;
+gfail:
+    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    #undef EWCUBEH
+    return -1;
+}
+
 /* Public on-NPU SiLU (int16 / w16a16i): out = clamp_i16(round( silu(in*in_scale)/out_scale )) via the standalone
  * int16 activation-LUT op, using RKNN's captured index params (full-range coverage). Builds the LUT the way RKNN
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
@@ -6987,9 +7077,10 @@ cleanup:
 
 /* CHAIN ASSEMBLER CORE: submit N pre-built HETEROGENEOUS programs as ONE PC-chain (task_number=N, one ioctl).
  * Packs the programs contiguously into c->regcmd (content-driven stride, per AGENTS.md); for each non-last
- * program it LOCATES that program's PC next-descriptor slot — the word where reg==0x0010 paired with domain
- * 0x0101 — and points it at the next program's regcmd dma + sets the next register-amount ((next
- * regcfg_amount+3)/2 at the following 0x0014 word). One rknpu_task per program (its own enable_mask +
+ * program it WRITES that program's PC next-descriptor at its designated desc_slot (word index, e.g. matmul
+ * =216 like run_chain_i8) — reg 0x0010/0x0101 = next program's regcmd dma + the 0x0014 next register-amount
+ * ((next regcfg_amount+3)/2). The slot is created by the chaining code, not a pre-existing template pattern.
+ * One rknpu_task per program (its own enable_mask +
  * regcfg_amount), ping-pong OFF (flags=0x1, LUT-safe). Generalizes run_chain_i8 (matmul-only, task-strided)
  * and the Phase-0 matmul->silu chain into an arbitrary op sequence — the core the FFN / attention-block
  * static chains build on. Caller pre-builds each program's regcmd (with its own buffer addresses) and any
@@ -7005,12 +7096,16 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
     for(int i=0;i<n;i++){
         memcpy(base+off[i], progs[i].rc, (size_t)progs[i].nwords*4);
         if(i<n-1){
-            uint32_t *rc=base+off[i]; int slot=-1;
-            for(int k=0;k+1<progs[i].nwords;k+=2) if((rc[k]&0xffff)==0x0010 && (rc[k+1]>>16)==0x0101){ slot=k; break; }
-            if(slot<0) return -2;   /* this op cannot be a MIDDLE program (no PC next-descriptor slot in its regcmd) */
+            /* WRITE this program's PC next-descriptor at its designated slot (like run_chain_i8's word 216).
+             * The slot is not a pre-existing pattern in the template -- the chaining code creates it. */
+            int slot=progs[i].desc_slot;
+            if(slot<0 || slot+3>=progs[i].nwords) return -2;   /* this op can't be a MIDDLE program */
+            uint32_t *rc=base+off[i];
             uint64_t nx=(uint64_t)c->regcmd.dma + off[i+1]*4; int nreg=(progs[i+1].regcfg_amount+3)/2;
-            rc[slot]=0x0010 | ((uint32_t)(nx&0xffff)<<16); rc[slot+1]=(0x0101u<<16) | (uint32_t)((nx>>16)&0xffff);
-            if(slot+3<progs[i].nwords && (rc[slot+2]&0xffff)==0x0014){ rc[slot+2]=0x0014 | ((uint32_t)nreg<<16); rc[slot+3]=(0x0101u<<16); }
+            rc[slot]  =0x0010 | ((uint32_t)(nx&0xffff)<<16);
+            rc[slot+1]=(0x0101u<<16) | (uint32_t)((nx>>16)&0xffff);
+            rc[slot+2]=0x0014 | ((uint32_t)nreg<<16);
+            rc[slot+3]=(0x0101u<<16);
         }
     }
     bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);

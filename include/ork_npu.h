@@ -509,12 +509,22 @@ int          ork_npu_l2norm_f16 (ork_npu *ctx, int M, int n, const ork_f16 *x,  
 
 /* CHAIN ASSEMBLER: one pre-built program in a heterogeneous PC-chain (see ork_npu_chain_progs).
  * rc/nwords = the program's regcmd words (caller-built, with its own buffer addresses); enable_mask/
- * regcfg_amount = its rknpu_task fields (matmul 0xd/108, SDP 0x18/varies). */
-typedef struct { const uint32_t *rc; int nwords; unsigned enable_mask; int regcfg_amount; } ork_chain_prog;
+ * regcfg_amount = its rknpu_task fields (matmul 0xd/108, SDP 0x18/varies); desc_slot = the word index of
+ * this program's PC next-descriptor (where 0x0010/0x0101 next-addr is WRITTEN — matmul=216); -1 if the op
+ * carries no descriptor slot (then it can only be the LAST program). */
+typedef struct { const uint32_t *rc; int nwords; unsigned enable_mask; int regcfg_amount; int desc_slot; } ork_chain_prog;
 /* Submit N pre-built programs as ONE PC-chain (task_number=N, single ioctl) — chains a whole NPU-only
  * run (attention block / FFN inner) into one submit. Non-last programs need a PC next-descriptor slot in
  * their regcmd (matmul has one; a program lacking it can only be last). 0/ok, -2 bad-args/no-slot, -1 wedge. */
 int          ork_npu_chain_progs(ork_npu *ctx, int n, const ork_chain_prog *progs, int dom);
+
+/* CHAIN ASSEMBLER increment-1: data-connected int8-matmul(int16-out) -> int16-silu in ONE PC-chain (the
+ * matmul's int16 output buffer IS the silu's input). Validates the intermediate-buffer bridge. Computes
+ * out = clamp_i16(silu(requant_i16(A[M,K]xB[K,N])*in_scale)/out_scale). gate_out (nullable) = the matmul
+ * int16 output read back via EWCUBEH, to localize a mismatch. 0/ok,-1 wedge,-2 dims,-3 SoC. rk3588-gated. */
+int          ork_npu_chain_gatesilu_i16(ork_npu *ctx, int M, int K, int N, const signed char *A, const signed char *B,
+                                        int mult, int shift, double in_scale, double out_scale,
+                                        short *gate_out, short *out, double *us);
 
 /* Standalone on-NPU SiLU (activation-LUT SDP op): applies the PPU silu LUT to a single int8 input [M][N] via
  * the 69-reg/enable=0x18 standalone op (REGCMD_SILU_STD), reprogrammed to (M,N). Two submits (LUT-load + op).
