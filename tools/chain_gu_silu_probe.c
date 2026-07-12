@@ -33,7 +33,30 @@ int main(void){
     int Cg[M*N]; int Cu[M*N];              /* Cg holds int8 silu in its first M*N bytes; Cu = int32 up */
     for(int i=0;i<M*N;i++){ Cg[i]=0; Cu[i]=0; }
     ork_mm_task_i8 tasks[2] = { { wg, M, A, Cg }, { wu, M, A, Cu } };
-    int r=ork_mm_run_chain_i8_gsilu(c,2,tasks,0, 0x4000,0x10,0,0xffffc000u,0x56391300u, lut,1030);
+    int r;
+    if(getenv("ORK_GSILU_LAST")){     /* fused gate*silu as the LAST task: [up(plain,task0) -> gate*silu(task1)] */
+        ork_mm_task_i8 t[2] = { { wu, M, A, Cu }, { wg, M, A, Cg } };   /* up first, gate*silu last (gate_task=1) */
+        r=ork_mm_run_chain_i8_gsilu(c,2,t,1, 0x4000,0x10,0,0xffffc000u,0x56391300u, lut,1030);
+        printf("chain_gu_silu[SILU-LAST]: [up(int32) -> gate*silu(int8)] ONE submit  (M=%d K=%d N=%d)\n",M,K,N);
+        printf("  rc=%d\n", r);
+        if(r==0){ int nup=0,upmax=0; for(int i=0;i<M*N;i++){ if(Cu[i]==K)nup++; if(Cu[i]>upmax)upmax=Cu[i]; }
+            signed char *g8=(signed char*)Cg; int want=(int)lround(siluf(K*is)/os); int ng=0,gmn=127,gmx=-128;
+            for(int i=0;i<M*N;i++){ int v=g8[i]; if(abs(v-want)<=3)ng++; if(v<gmn)gmn=v; if(v>gmx)gmx=v; }
+            printf("  [task0 up] int32==K: %d/%d (max=%d)\n", nup,M*N,upmax);
+            printf("  [task1 gate*silu] int8~%d: %d/%d (range [%d,%d])\n", want,ng,M*N,gmn,gmx);
+            printf("  VERDICT: %s\n", (nup>0&&ng>0)?"ONE-SUBMIT [up -> gate*silu] WORKS (fused silu as LAST task)":"still wrong"); }
+        else printf("  VERDICT: %s\n", r==-1?"WEDGED":"error");
+        ork_npu_free(c); return (r==0)?0:1;
+    }
+    if(getenv("ORK_GSILU_PLAIN")){    /* bisection: ss=NULL plain chain (both int32) -- verify refactor didn't break run_chain_i8 */
+        r=ork_mm_run_chain_i8(c,2,tasks);
+        printf("chain_gu_silu[PLAIN ss=NULL]: [gate -> up] both int32, ONE submit  (M=%d K=%d N=%d)\n",M,K,N);
+        printf("  rc=%d\n",r);
+        if(r==0){ int ng=0,nu=0; for(int i=0;i<M*N;i++){ if(Cg[i]==K)ng++; if(Cu[i]==K)nu++; }
+            printf("  gate int32==K: %d/%d  up int32==K: %d/%d  VERDICT: %s\n", ng,M*N, nu,M*N, (ng>0&&nu>0)?"PLAIN PATH OK":"PLAIN PATH BROKEN"); }
+        ork_npu_free(c); return 0;
+    }
+    r=ork_mm_run_chain_i8_gsilu(c,2,tasks,0, 0x4000,0x10,0,0xffffc000u,0x56391300u, lut,1030);
     printf("chain_gu_silu: [gate*silu(int8) -> up(int32)] ONE submit  (M=%d K=%d N=%d)\n",M,K,N);
     printf("  rc=%d (0=ran, -1=wedge, -2=dims)\n", r);
     if(r){ printf("  VERDICT: %s\n", r==-1?"WEDGED":"error"); ork_npu_free(c); return r==-1?1:0; }

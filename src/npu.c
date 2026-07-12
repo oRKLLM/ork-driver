@@ -6971,6 +6971,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     struct buf tmp_A[1024];
     struct buf tmp_C[1024];
     struct buf Lrc = {0}, Lsc = {0};   /* fused-SiLU LUT buffers (only used when ss != NULL); zero so cleanup is safe on early goto */
+    int do_lut = ss && !getenv("ORK_GSILU_NOLUT");   /* bisection: ORK_GSILU_NOLUT drops the LUT-load submit */
     memset(tmp_A, 0, sizeof(tmp_A));
     memset(tmp_C, 0, sizeof(tmp_C));
 
@@ -7061,7 +7062,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             // FUSED SiLU on the gate task: rewrite its output stage to int8 silu(gate) (set_i8_silu). Output
             // is int8 (1 B/elem); single M-tile assumed for the silu task (m0==0), so the int32 out offset
             // above is 0 and harmless. The silu LUT is streamed to SDP SRAM once (below, before the submit).
-            if (ss && i == ss->task) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
+            if (ss && i == ss->task && !getenv("ORK_GSILU_NOSILU")) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
             if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
                 uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
@@ -7077,7 +7078,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
 
     // FUSED-SiLU LUT-load: stream the gate task's silu LUT into SDP SRAM ONCE before the chain (enable 0x18,
     // ping-pong OFF). It persists into the chain submit; the gate task's set_i8_silu output stage reads it.
-    if (ss) {
+    if (do_lut) {
         Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
         Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
         if (!Lrc.cpu || !Lsc.cpu) { ok = -2; goto cleanup; }

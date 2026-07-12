@@ -112,6 +112,30 @@ TESTED (env overrides, no recompile): 0x4010=0x20000000 -> STILL wedges; +0x40c0
    output-stage RE -- high cost, uncertain payoff. set_i16_out was an incomplete experiment, not a primitive.
 CONCLUSION: do NOT resurrect set_i16_out for the bridge. Pivot to a bridge with a WORKING reference.
 
+## BISECTION RESULT (2026-07-12): the fused-silu OUTPUT STAGE won't survive run_chain_i8's chain submit
+3-way bisection of run_chain_i8_gsilu [gate*silu -> up] via chain_gu_silu_probe env gates:
+- (1) PLAIN ss=NULL (ork_mm_run_chain_i8): rc=0, gate 512/512, up 512/512 -> **PLAIN PATH OK** (refactor clean;
+  run_chain_i8 executes BOTH chained tasks -> chain_progs's empty-output bug was its own, not run_chain_i8).
+- (2) NOSILU (LUT-load ON, set_i8_silu OFF): rc=0, up 512/512, gate ran as plain int32 -> **LUT-load-in-chain OK**.
+- (3) NOLUT (set_i8_silu ON, LUT-load OFF): **WEDGED**.  + FULL (both): WEDGED.  + SILU-LAST ([up -> gate*silu],
+  silu as the last task): **WEDGED** too.
+=> The wedge is the **set_i8_silu fused-activation output stage on ANY task in a run_chain_i8 chain** (non-last
+   OR last), independent of the LUT-load. Yet it works STANDALONE via ork_mm_run_i8_silu. The difference:
+   ork_mm_run_i8_silu submits via **submit1() with the WARMED c->Cc buffer** ("a hand-rolled submit to a fresh
+   buffer gives bias-only output" ~npu.c 4313); run_chain_i8 writes each task to a FRESH tmp_C via the chain
+   submit path. The fused-silu output stage requires submit1/warmed-c->Cc; the chain submit path can't drive it.
+
+## NEXT (fix options for the fused gate*silu in a chain)
+- A. Route the gate task's output through the warmed c->Cc inside run_chain_i8_impl when ss (mirror
+     ork_mm_run_i8_silu's submit1 buffer handling) -- may require submit1-style warming, not the chain submit.
+- B. VENDOR PATTERN (cleaner): don't fuse silu into the matmul output at all -- make silu its OWN SDP task in
+     the chain (like the softmax t4/t5). I.e. chain [gate matmul(int32/int8) -> silu-SDP -> up ...] with silu
+     as a standalone 0x18 task. But a standalone int8 silu SDP reading the gate's chained output = the
+     matmul->SDP data bridge (address aliasing, decoded above) -- which is what the assembler needs anyway.
+     This sidesteps the "fused output stage won't chain" wall entirely and matches how the vendor does it.
+- Recommend B: it's the vendor-proven structure (matmul and activation are SEPARATE chained tasks, data via
+  aliased buffers) and avoids the fused-output-stage-vs-chain-submit incompatibility.
+
 ## run_chain_i8_gsilu built (extends the proven base) -- FIRST RUN WEDGED (2026-07-12)
 Refactored run_chain_i8 -> static run_chain_i8_impl(...,ss) + public ork_mm_run_chain_i8 (ss=NULL, IDENTICAL
 behavior, plain path preserved) + new ork_mm_run_chain_i8_gsilu(ss): the gate task's regcmd gets set_i8_silu
