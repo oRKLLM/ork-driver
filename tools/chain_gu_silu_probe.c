@@ -24,6 +24,37 @@ int main(void){
     ork_w *wg=ork_mm_pack_i8(c,K,N,Wg), *wu=ork_mm_pack_i8(c,K,N,Wu);
     if(!wg||!wu){ printf("pack failed\n"); ork_npu_free(c); return 1; }
 
+    if(getenv("ORK_GSILU_FFN6K")){   /* REAL-WIDTH FFN inner: Nff=6144 -> down K-splits (Sk=6) IN the chain */
+        enum { Mf=8, Kf=512, Nff=6144, Kd=512 };
+        static signed char A6[Mf*Kf], Wg6[Kf*Nff], Wd6[Nff*Kd];
+        for(int i=0;i<Mf*Kf;i++) A6[i]=1; for(int i=0;i<Kf*Nff;i++) Wg6[i]=1; for(int i=0;i<Nff*Kd;i++) Wd6[i]=1;
+        ork_w *wg6=ork_mm_pack_i8(c,Kf,Nff,Wg6);   /* gate/up [512,6144] */
+        ork_w *wd6=ork_mm_pack_i8(c,Nff,Kd,Wd6);   /* down [6144,512], Sk=6 */
+        if(!wg6||!wd6){ printf("pack6k failed\n"); ork_npu_free(c); return 1; }
+        static int Cg[Mf*Nff],Cs[Mf*Nff],Cu[Mf*Nff],Ch[Mf*Nff],Cd[Mf*Kd];
+        for(int i=0;i<Mf*Nff;i++){ Cg[i]=Cs[i]=Cu[i]=Ch[i]=0; } for(int i=0;i<Mf*Kd;i++) Cd[i]=0;
+        ork_mm_task_i8 t[5] = { {wg6,Mf,A6,Cg}, {wg6,Mf,A6,Cs}, {wg6,Mf,A6,Cu}, {wg6,Mf,A6,Ch}, {wd6,Mf,A6,Cd} };
+        ork_chain_op ops[5] = {
+            { 1, -1,0, 0x4000,18 },  /* gate MM8 (reads A) 512->32 */
+            { 2, 0,0, 0,0 },         /* silu(gate) */
+            { 1, -1,0, 0x4000,18 },  /* up MM8 (reads A) */
+            { 3, 1,2, 0x4000,19 },   /* glu = silu*up -> ~61 */
+            { 0, 3,0, 0,0 },         /* down MM32 reads glu(t3), K-split Sk=6: out = 61*6144 = 374784 */
+        };
+        double is = 3.0/32.0, os = siluf(3.0)/60.0;
+        int r=ork_mm_run_chain_i8_ffn(c,5,t,ops,is,os);
+        printf("chain_gu_silu[FFN6K]: [gate->silu->up->glu->down(K-split Sk=6)] ONE submit  (M=%d K=%d Nff=%d Kd=%d)\n",Mf,Kf,Nff,Kd);
+        printf("  rc=%d\n", r);
+        if(r==0){ signed char *cg=(signed char*)Cg,*cs=(signed char*)Cs,*cu=(signed char*)Cu,*ch=(signed char*)Ch;
+            int g=cg[0],s=cs[0],u=cu[0],h=ch[0],d=Cd[0]; int glu=61, wantd=glu*Nff;
+            int nd=0; for(int i=0;i<Mf*Kd;i++) if(Cd[i]==d)nd++;
+            printf("  gate=%d silu=%d up=%d glu=%d | down=%d (%d/%d) [want glu*%d=%d]\n", g,s,u,h,d,nd,Mf*Kd,Nff,wantd);
+            int ok = (g==32 && s>0 && u==32 && h!=0 && d==wantd);
+            printf("  VERDICT: %s\n", ok?"REAL-WIDTH FFN INNER (down K-split IN chain) WORKS, ONE submit, EXACT":
+                                        "check values (down K-split may need layout fix)"); }
+        else printf("  VERDICT: %s\n", r==-1?"WEDGED":"error");
+        ork_npu_free(c); return (r==0)?0:1;
+    }
     if(getenv("ORK_GSILU_FFN5")){   /* FULL FFN inner: [gate -> silu -> up -> glu -> down] 5-task one submit */
         enum { Mf=8, Kf=512, Nf=512 };   /* Nf=512 so down's contraction (=glu width) satisfies K%512, <=4096 */
         static signed char A5[Mf*Kf], W5[Kf*Nf];

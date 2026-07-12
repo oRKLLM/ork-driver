@@ -6973,7 +6973,8 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     if (S == 1) return ork_mm_run_i8(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
-    
+    int KS_CHAIN = int8_ks(c);   // K-slice size for the FFN chain down projection (default 1024)
+
     // 1. Validate all tasks
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -6985,6 +6986,11 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         // the whole K) or a Bf full-K buffer (K<=10752; built by pack/repack for the MoE experts).
         // K=2048 experts pack Sk=2 but carry Bf — use it so they can chain. N must be a single slice.
         if (w->Sn != 1) return -2;
+        // FFN chain down (K-split): a matmul task reading a prior output (in0>=0) with K=Nff>4096 is chained
+        // as w->Sk K-slice programs (Bb[ks], glu K-slice activation) writing partials, host-summed after.
+        int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
+                         (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && w->K > 4096;
+        if (ffn_ksplit) { if (w->K % KS_CHAIN != 0 || !w->Bb) return -2; continue; }
         if (w->Sk != 1 && !w->Bf) return -2;
         // The full-K Bf submit uses synth_i8(sched=1), whose 0x1040 K-reduction schedule is only valid for
         // K%512==0 && K<=4096 (same envelope as run()'s M>1 Bf path; 512/1024 are covered, 1536-4096 too).
@@ -7054,7 +7060,11 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
         } else {
-            tmp_C[i] = bcreate(fd, (size_t)M * N * 4, 0x403, c->dom_active);
+            // FFN chain down-K-split task: needs Sk partial buffers [Sk][M][N] int32 (host-summed after).
+            int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
+                             (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && K > 4096;
+            size_t osz = ffn_ksplit ? (size_t)(K / KS_CHAIN) * M * N * 4 : (size_t)M * N * 4;
+            tmp_C[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!tmp_C[i].cpu) { ok = -1; goto cleanup; }
             bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_TO_DEVICE);
             out_dma[i] = (uint32_t)tmp_C[i].dma;
@@ -7074,8 +7084,11 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int prog_off[1025];   // prog_off[i] = first program index of task i (S<=1024)
     int P = 0;
     for (int i = 0; i < S; i++) {
-        int mcap = chain_fullk_mcap_i8(c, tasks[i].w->K);
         prog_off[i] = P;
+        int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
+                         (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && tasks[i].w->K > 4096;
+        if (ffn_ksplit) { P += tasks[i].w->K / KS_CHAIN; continue; }   // down: one program per K-slice
+        int mcap = chain_fullk_mcap_i8(c, tasks[i].w->K);
         P += (tasks[i].M + mcap - 1) / mcap;
     }
     if (P > 1024) { ok = -2; goto cleanup; }   // too many M-tiles for the chain regcmd/task buffers
@@ -7094,6 +7107,29 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         // else Bb[0] (which holds the whole K only when Sk==1). Both are the synth_i8 tile layout.
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         int p = prog_off[i];
+        // FFN chain down-K-split: emit w->Sk K-slice matmul programs (each Bb[ks], reading the glu K-slice
+        // glu[:,ks*KS:(ks+1)*KS] -- a contiguous EWCUBE sub-range at ks*KS*M bytes -- into partial ks). All
+        // chained; the Sk int32 partials are host-summed after the submit into tasks[i].C.
+        if (ss && ss->ops && ss->ops[i].in0 >= 0 && (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && K > 4096) {
+            int Sk = K / KS_CHAIN;
+            uint32_t glu_dma = out_dma[ss->ops[i].in0];
+            for (int ks = 0; ks < Sk; ks++, p++) {
+                memset(rc, 0, sizeof(rc));
+                bsync(fd, &w->Bb[ks], RKNPU_MEM_SYNC_TO_DEVICE);
+                synth_i8(rc, M, KS_CHAIN, N, glu_dma + (uint32_t)((size_t)ks * KS_CHAIN * M),
+                         (uint32_t)w->Bb[ks].dma, out_dma[i] + (uint32_t)((size_t)ks * M * N * 4), 1, CBUF, 0);
+                if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
+                if (p < P - 1) {   // chain to the next K-slice (or terminate on the last)
+                    uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                    rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
+                    rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+                    rc[218] = 0x0014 | (0x0037u << 16);   // next = matmul K-slice (108 regs)
+                    rc[219] = (0x0101 << 16);
+                }
+                memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+            }
+            continue;
+        }
         for (int m0 = 0; m0 < M; m0 += mcap, p++) {
             int mc = (M - m0 < mcap) ? (M - m0) : mcap;
             memset(rc, 0, sizeof(rc));
@@ -7213,7 +7249,16 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         } else {
             bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_FROM_DEVICE);
             if (submit_ok == 0) {
-                memcpy(tasks[i].C, tmp_C[i].cpu, (size_t)tasks[i].M * tasks[i].w->N * 4);
+                int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
+                                 (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && tasks[i].w->K > 4096;
+                size_t mn = (size_t)tasks[i].M * tasks[i].w->N;
+                if (ffn_ksplit) {   // host-sum the Sk int32 K-slice partials -> tasks[i].C
+                    int Sk = tasks[i].w->K / KS_CHAIN;
+                    const int32_t *pp = (const int32_t *)tmp_C[i].cpu; int32_t *dst = tasks[i].C;
+                    for (size_t e = 0; e < mn; e++) { int32_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += pp[(size_t)ks*mn + e]; dst[e] = acc; }
+                } else {
+                    memcpy(tasks[i].C, tmp_C[i].cpu, mn * 4);
+                }
             }
         }
     }
