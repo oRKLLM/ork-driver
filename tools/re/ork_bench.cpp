@@ -188,6 +188,26 @@ int main(int argc, char** argv){
 
     llama_backend_init();
 
+    // GUARD: refuse to run without a prebuilt .orkpack — JIT-packing weights on first use pads the
+    // measured prefill (weight resolve/pack counted in the timed forward), so a run without ORK_PERSIST
+    // reports misleading numbers. Require ORK_PERSIST to point at an EXISTING orkpack; ORK_ALLOW_JIT=1
+    // overrides (for the initial build-the-orkpack run, which legitimately JIT-packs then caches).
+    if (!getenv("ORK_ALLOW_JIT")) {
+        const char* pp = getenv("ORK_PERSIST");
+        if (!pp || !*pp) {
+            fprintf(stderr, "[ork_bench] ERROR: ORK_PERSIST=<model.orkpack> is required (refusing to report JIT-pack-padded runtimes).\n"
+                            "            Set ORK_PERSIST to a prebuilt orkpack, or ORK_ALLOW_JIT=1 to build/JIT-pack.\n");
+            return 3;
+        }
+        FILE* pf = fopen(pp, "rb");
+        if (!pf) {
+            fprintf(stderr, "[ork_bench] ERROR: orkpack not found at '%s' (ORK_PERSIST). Build it first (ORK_ALLOW_JIT=1) or fix the path.\n", pp);
+            return 3;
+        }
+        fclose(pf);
+        fprintf(stderr, "[ork_bench] orkpack: %s\n", pp);
+    }
+
     // TEST HOOK (harness only): exercise the product load-config API instead of env knobs.
     //   ORK_BENCH_CFG=int16    -> set_load_config(dflash, silu_int8_fused=false) [DEFAULT: int16 coherent]
     //   ORK_BENCH_CFG=int8fused -> ...(silu_int8_fused=true) [int8 fully fused through-and-through]
