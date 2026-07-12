@@ -433,3 +433,6 @@ chain_probe: tools/chain_probe.c $(CORE)
 # PHASE 1 chained-FFN RE: does an int8 matmul emit correct int16 via set_i16_out (the on-NPU requant handoff)?
 i16out_probe: tools/i16out_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+bmm_probe: tools/bmm_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
