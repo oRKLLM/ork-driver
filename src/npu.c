@@ -6824,6 +6824,13 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     memset(cbufs, 0, sizeof(cbufs));
 
     int ok = 0;
+    /* STATIC-GRAPH ioctl reduction: dedup the TO_DEVICE bsync of DMA buffers SHARED across chained tasks.
+     * A segment's independent matmuls (Q/K/V, gate/up) read the SAME input activation; if it lives in one
+     * resident DMA buffer (dma_find hits), sync it ONCE for the whole segment instead of once per task.
+     * (No-op until the caller quantizes the shared input into a DMA buffer — the ggml-ork segment path.) */
+    struct buf *dsynced[1024]; int ndsynced = 0;
+    #define ALREADY_SYNCED(B) ({ int _hit=0; for(int _j=0;_j<ndsynced;_j++) if(dsynced[_j]==(B)){_hit=1;break;} \
+                                 if(!_hit && ndsynced<1024) dsynced[ndsynced++]=(B); _hit; })
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         int M = tasks[i].M;
@@ -6833,7 +6840,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve input activations buffer
         struct buf *abuf = dma_find(c, tasks[i].A);
         if (abuf) {
-            bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);
+            if (!ALREADY_SYNCED(abuf)) bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared input: sync once
             act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
         } else {
             tmp_A[i] = bcreate(fd, (size_t)M * K, 0x403, c->dom_active);
@@ -6846,7 +6853,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // Resolve output buffer
         struct buf *cbuf = dma_find(c, tasks[i].C);
         if (cbuf) {
-            bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+            if (!ALREADY_SYNCED(cbuf)) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared output region: sync once
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
         } else {
