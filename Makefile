@@ -436,3 +436,6 @@ i16out_probe: tools/i16out_probe.c $(CORE)
 
 bmm_probe: tools/bmm_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+softmax_probe: tools/softmax_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
