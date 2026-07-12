@@ -6357,7 +6357,9 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
     bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
 
-    /* submit 1: silu LUT-load (separate, ping-pong off) */
+    /* submit 1: silu LUT-load (separate, ping-pong off). ORK_GS_NOLUT skips it -> matmul becomes the FIRST
+     * NPU op after act(RESET) (diagnostic: does a preceding SDP LUT-load poison the following int8 matmul?). */
+    if(!getenv("ORK_GS_NOLUT")){
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
     setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
@@ -6367,6 +6369,7 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu] LUT-load submit failed (errno=%d)\n",errno); goto gfail; } }
+    }
 
     /* build the 2 chained programs: [0] matmul int16-out -> G ; [1] silu G -> O */
     static uint32_t mm[REGCMD_I8_N], si[REGCMD_SILU_STD_I16_N];
@@ -6385,10 +6388,29 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
     setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064);
     setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
 
-    ork_chain_prog progs[2] = { { mm, REGCMD_I8_N, 0xd, 108, 216 }, { si, REGCMD_SILU_STD_I16_N, 0x18, 69, -1 } };
     double t0=ork_now_us();
-    int crc=ork_npu_chain_progs(c,2,progs,dom);
-    if(crc){ fprintf(stderr,"[gatesilu] chain_progs rc=%d (errno=%d) — -2 no-descriptor-slot/bad-args, -1 submit wedge\n",crc,errno); goto gfail; }
+    if(getenv("ORK_GS_SEQ")){
+        /* KERNEL-SEQUENCED bridge (the accel/rocket model): matmul(->G) and silu(<-G) as TWO separate
+         * task_number=1 submits, no reset between (act RESET ran above). Isolates the int16 DATA bridge
+         * (does the matmul int16 output layout match the silu EWCUBEH input?) from the HW chain-walk. */
+        fprintf(stderr,"[gatesilu-seq] submitting matmul (int16-out) task_number=1...\n");
+        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma;
+          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] matmul submit failed errno=%d\n",errno); goto gfail; } }
+        fprintf(stderr,"[gatesilu-seq] matmul OK; submitting silu task_number=1...\n");
+        bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);   /* keep G resident for the silu */
+        memcpy(c->regcmd.cpu,si,REGCMD_SILU_STD_I16_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=69; t->regcmd_addr=(uint32_t)c->regcmd.dma;
+          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] silu submit failed errno=%d\n",errno); goto gfail; } }
+    } else {
+        ork_chain_prog progs[2] = { { mm, REGCMD_I8_N, 0xd, 108, 216 }, { si, REGCMD_SILU_STD_I16_N, 0x18, 69, -1 } };
+        int crc=ork_npu_chain_progs(c,2,progs,dom);
+        if(crc){ fprintf(stderr,"[gatesilu] chain_progs rc=%d (errno=%d) — -2 no-descriptor-slot/bad-args, -1 submit wedge\n",crc,errno); goto gfail; }
+    }
     bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(us)*us=ork_now_us()-t0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){

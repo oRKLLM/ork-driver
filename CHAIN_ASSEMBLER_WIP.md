@@ -85,6 +85,30 @@ stalls the DPU in-chain. NEXT: (a) verify/fix set_i16_out output stride is N-cor
 buffers. Cheapest decisive test: kernel-sequenced 2-submit bridge (matmul->G, then silu<-G, separate submits,
 no reset) to confirm the int16 bridge data is coherent BEFORE fighting the HW-chain walk.
 
+## ROOT CAUSE of increment-1 (2026-07-12): the int16-OUTPUT matmul (set_i16_out) WEDGES
+Kernel-sequenced bridge test (ORK_GS_SEQ) pinned it: the **matmul submit itself wedges (errno=110)** as a
+plain task_number=1 op -- NOT a chain-walk issue. Isolation:
+- ORK_GS_NOLUT (matmul is the FIRST op after act RESET, no silu LUT-load before it): STILL wedges -> not a
+  mode/ordering poison from the LUT-load.
+- Ran the PROVEN i16out_probe (ork_npu_probe_i16_out) directly at BOTH 8x32x64 and 8x512x64: BOTH hang
+  (~60s submit timeout). So set_i16_out int16-output matmul wedges regardless of my code / K.
+- NPU is HEALTHY: softmax_replay PASSES (1/64 exact) + plain int8 test_matmul runs clean (mism=0) in the
+  same session. So it's specifically the int8-matmul-with-int16-output stage that wedges, not the board.
+=> The summary's "ork_npu_probe_i16_out validated int16 output" does NOT hold on silicon now (its Test1 is
+   all-ones/layout-independent and may never have exercised a clean submit). The int16 DATA BRIDGE premise
+   (matmul writes int16 directly for the silu to read) is blocked by a broken int16-output matmul.
+
+## BRIDGE FORK (needs a call) -- how the FFN matmul feeds the silu without the int16-out matmul
+- A. RE-fix set_i16_out: why does int8-matmul + int16-output wedge? Suspects: 0x4010 precision value,
+     fixed 0x4050=0x0248 row-stride (not N-derived), 0x4038 group stride. Deep output-stage RE.
+- B. int32-native bridge: matmul writes its NATIVE int32 output (proven to work); the silu/SDP consumes int32
+     and requants internally (does the SDP int16-silu accept an int32 input surface + scale? -> RE 0x5xxx).
+- C. requant task in-chain: matmul(int32) -> tiny requant op (int32->int16) -> silu. One extra task, all-NPU.
+- D. vendor pattern is FP16 intermediates (softmax t2->t3 is fp16, works) BUT int8-MAC->fp16-out is NOT a
+     datapath ([[int8-fp16-fused-not-a-datapath]]) -> not available for w8a8. Only a full fp16 matmul path.
+Note: ggml-ork's working on-NPU int16 silu ([[int16-silu-pipeline-transition-wedge]]) likely requants
+int32->int16 on CPU between matmul and silu (NOT a pure-NPU bridge) -- consistent with set_i16_out not working.
+
 ## RESIDUAL via SDP OUTPUT-STAGE FUSION (user direction, 2026-07-12) -- supersedes CPU-seam residual
 Precision-preserving on-NPU residual = FUSE the add INTO the matmul's SDP output stage (accumulator +
 residual BEFORE the int16/fp16 cast), NOT a separate ewmul/add op. The int32 accumulator + residual add
