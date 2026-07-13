@@ -7527,6 +7527,71 @@ done:
     return ret;
 }
 
+/* (b) FUSED-MM probe: one fp16 matmul via the fused-chain synth mechanism, but B is PACKED with
+ * ork_mm_pack (→ the tiled Bb layout synth actually reads, same as run()) and A is staged ROW-MAJOR,
+ * C read DENSE. Determines whether the real-operand fused SSD chain can reuse ork_mm_pack for B + a
+ * row-major A (vs needing to hand-tile A). Single-slice only (K<=ks, N<=nmax). C[M,N] fp32. 0/ok,<0. */
+int ork_ssd_probe_fusedmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
+    if(!c||M<1||K<1||N<1||K%32||N%16) return -2;
+    ork_w *w=ork_mm_pack(c,K,N,B); if(!w) return -3;
+    if(w->Sk!=1||w->Sn!=1){ ork_mm_free(c,w); return -2; }   /* probe: single tile only */
+    int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=w->domain,ret=0;
+    struct buf Ab=bcreate(fd,(size_t)M*K*2,0x403,dom), Cb=bcreate(fd,(size_t)M*N*4,0x403,dom);
+    if(!Ab.cpu||!Cb.cpu){ ret=-3; goto done2; }
+    memcpy(Ab.cpu,A,(size_t)M*K*2); memset(Cb.cpu,0,(size_t)M*N*4);
+    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
+    { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done2; }
+      synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)w->Bb[0].dma,(uint32_t)Cb.dma,1,CBUF);
+      ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
+      ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
+    if(ret) goto done2;
+    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
+done2:
+    bdestroy(fd,&Ab);bdestroy(fd,&Cb); ork_mm_free(c,w);
+    return ret;
+}
+
+/* FUSED batched fp16 GEMM: like ork_bmm_fp16 (nbatch matmuls C[b]=A[b]*B[b], both operands dynamic), but
+ * chains ALL nbatch matmuls into ONE PC-chained submit instead of one submit per batch — amortizing the
+ * ~48us/submit NPU floor across the batch (the SSD scan's per-stage H-batch = the target). Each B is packed
+ * via ork_mm_pack (its tiled Bb is what synth reads); A staged row-major; C dense. A[nb*M*K], B[nb*K*N],
+ * C[nb*M*N] fp32. Single-slice only (K<=ks, N<=nmax) — the scan's small shapes qualify; nb<=64. 0/ok,<0.
+ * Numerically identical to ork_bmm_fp16 (same synth matmul, same fp16 operands) — just one ioctl. */
+int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
+    if(!c||nb<1||nb>64||M<1||K<1||N<1||K%32||N%16) return -2;
+    int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=-1,ret=0;
+    ork_w **w=calloc(nb,sizeof(ork_w*));
+    struct buf Ab=bcreate(fd,(size_t)nb*M*K*2,0x403,dom), Cb=bcreate(fd,(size_t)nb*M*N*4,0x403,dom);
+    uint32_t *rcs=calloc((size_t)nb*REGCMD_I8_N,4);
+    ork_chain_prog *progs=malloc((size_t)nb*sizeof(ork_chain_prog));
+    if(!w||!Ab.cpu||!Cb.cpu||!rcs||!progs){ ret=-3; goto done3; }
+    memcpy(Ab.cpu,A,(size_t)nb*M*K*2); memset(Cb.cpu,0,(size_t)nb*M*N*4);
+    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(c->last_dt!=DT_F16){ act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16; }
+    /* fp16 SCHED (root-caused 2026-07-12, wiki regcmd-ISA-Reference "shape boundaries"): bare synth() with
+     * sched=1 formerly ZEROED the output for K<96 (K=32/64) — the sched=1 0x201:0x1040 K-reduction-schedule
+     * formula (base=177-15*(K/256-1)) OVERSHOOTS the template default (0xB1) as K drops below 256 (0xBC@K64,
+     * 0xBE@K32) and selects an invalid K-reduction atom -> zero/garbage. run()/mcworker avoid it by only
+     * using sched=1 for pow2 K in [128,2048); below that sched=0 keeps the template 0x1040 (correct for
+     * K<=256, bit-exact validated). Match that predicate here so the scan's K=64 stages compute correctly.
+     * (Single M-tile: mc=M; the SSD scan is M<=64 <= the K-dependent chunk, so no M-tiling needed.) */
+    int sched = (K&(K-1))==0 && K>=128 && K<2048;
+    for(int b=0;b<nb;b++){
+        w[b]=ork_mm_pack(c,K,N,B+(size_t)b*K*N);
+        if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done3; }
+        uint32_t *rc=rcs+(size_t)b*REGCMD_I8_N;
+        synth(rc,M,K,N,(uint32_t)(Ab.dma+(size_t)b*M*K*2),(uint32_t)w[b]->Bb[0].dma,(uint32_t)(Cb.dma+(size_t)b*M*N*4),sched,CBUF);
+        progs[b]=(ork_chain_prog){rc,REGCMD_I8_N,0xd,108,216};
+    }
+    ret=ork_npu_chain_progs(c,nb,progs,dom);
+    if(!ret){ bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)nb*M*N*4); }
+done3:
+    if(w) for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
+    bdestroy(fd,&Ab);bdestroy(fd,&Cb); free(w);free(rcs);free(progs);
+    return ret;
+}
+
 /* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
  * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
  * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool

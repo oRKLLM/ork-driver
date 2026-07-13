@@ -15,6 +15,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
+static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
 
 typedef struct { int H,P,Nst,G,CS,NC; } ssd_dims;
 #define IX_XHP(t,h,p)  (((size_t)(t)*d->H + (h))*d->P + (p))
@@ -96,6 +98,10 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
                            double *y, int mode){
     const int H=d->H,CS=d->CS,NC=d->NC,P=d->P,Nst=d->Nst;
     const int Ncol=((H+15)/16)*16;                          /* cumsum head-batch width (bmm N%16) */
+    /* mode: 0=matmul spine (elementwise CPU), 1=+exp NPU, 2=+cumsum/ewmul NPU, 3=FUSED matmuls (each stage's
+     * H matmuls in ONE chained submit; elementwise CPU like mode 0) — the submit-floor speed layer. */
+    const int expnpu=(mode==1||mode==2), ewnpu=(mode==2), fused=(mode==3);
+    #define BMM(...) (fused?ork_bmm_fp16_fused:ork_bmm_fp16)(ctx,__VA_ARGS__)
     double *Acs=malloc((size_t)H*CS*sizeof(double)),*Acs_last=malloc((size_t)H*sizeof(double));
     double *Acs_last_prev=calloc(H,sizeof(double));
     ork_f16 *aS=malloc((size_t)H*CS*Nst*sizeof(ork_f16)),*bS=malloc((size_t)H*Nst*CS*sizeof(ork_f16));
@@ -121,7 +127,7 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
     for(int c=0;c<NC && rc==0;c++){ int base=c*CS;
         for(int h=0;h<H;h++) for(int l=0;l<CS;l++){ double dtv=dt[IX_DT(base+l,h)];
             for(int p=0;p<P;p++) xbar[((size_t)h*CS+l)*P+p]=dtv*x[IX_XHP(base+l,h,p)]; }   /* xbar (input discretization) */
-        if(mode>=2){ /* CumBA: Acs[l,h] = (tril_ones · Abar)[l,h], head-batched */
+        if(ewnpu){ /* CumBA: Acs[l,h] = (tril_ones · Abar)[l,h], head-batched */
             for(int s=0;s<CS;s++){ for(int h=0;h<H;h++) abarP[(size_t)s*Ncol+h]=(ork_f16)(dt[IX_DT(base+s,h)]*A[h]);
                 for(int h=H;h<Ncol;h++) abarP[(size_t)s*Ncol+h]=(ork_f16)0.0f; }
             if((rc=ork_bmm_fp16(ctx,1,CS,CS,Ncol,tri,abarP,acsout))) break;
@@ -133,7 +139,7 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
             for(int l=0;l<CS;l++) for(int s=0;s<CS;s++) Larg[((size_t)h*CS+l)*CS+s]=(s<=l)?(Ah[l]-Ah[s]):0.0;
             for(int l=0;l<CS;l++) sarg[(size_t)h*CS+l]=Ah[l];
             for(int s=0;s<CS;s++) darg[(size_t)h*CS+s]=Ah[CS-1]-Ah[s]; }
-        if(mode>=1){ npu_exp_i16_calib(ctx,Larg,H*CS,CS,Lexp); npu_exp_i16_calib(ctx,sarg,H,CS,sexp); npu_exp_i16_calib(ctx,darg,H,CS,dexp); }
+        if(expnpu){ npu_exp_i16_calib(ctx,Larg,H*CS,CS,Lexp); npu_exp_i16_calib(ctx,sarg,H,CS,sexp); npu_exp_i16_calib(ctx,darg,H,CS,dexp); }
         else { for(size_t i=0;i<(size_t)H*CS*CS;i++)Lexp[i]=exp(Larg[i]); for(size_t i=0;i<(size_t)H*CS;i++){sexp[i]=exp(sarg[i]);dexp[i]=exp(darg[i]);} }
         for(int h=0;h<H;h++) for(int l=0;l<CS;l++) for(int s=0;s<CS;s++) if(s>l) Lexp[((size_t)h*CS+l)*CS+s]=0.0; /* causal mask */
         if(c>0) for(int h=0;h<H;h++){ double dp=exp(Acs_last_prev[h]);
@@ -147,23 +153,23 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
             for(int l=0;l<CS;l++) for(int p=0;p<P;p++) bD[((size_t)h*CS+l)*P+p]=(ork_f16)xbar[((size_t)h*CS+l)*P+p];
             for(int n=0;n<Nst;n++) for(int p=0;p<P;p++) bO[((size_t)h*Nst+n)*P+p]=(ork_f16)state_in[((size_t)h*P+p)*Nst+n];
         }
-        if((rc=ork_bmm_fp16(ctx,H,CS,Nst,CS,aS,bS,G))) break;
-        if(mode>=2){ for(size_t i=0;i<(size_t)H*CS*CS;i++){ e1[i]=G[i]; e2[i]=Lexp[i]; }
+        if((rc=BMM(H,CS,Nst,CS,aS,bS,G))) break;
+        if(ewnpu){ for(size_t i=0;i<(size_t)H*CS*CS;i++){ e1[i]=G[i]; e2[i]=Lexp[i]; }
             npu_ewmul_f16(ctx,e1,e2,H*CS,CS,e3);
             for(size_t i=0;i<(size_t)H*CS*CS;i++) aD[i]=(ork_f16)e3[i]; }
         else for(size_t i=0;i<(size_t)H*CS*CS;i++) aD[i]=(ork_f16)((double)G[i]*Lexp[i]);
-        if((rc=ork_bmm_fp16(ctx,H,CS,CS,P,aD,bD,Yd))) break;
+        if((rc=BMM(H,CS,CS,P,aD,bD,Yd))) break;
         /* ---- Bdec = dexp ⊙ B  (feeds cstate matmul) ---- */
-        if(mode>=2){ for(int h=0;h<H;h++){ int g=h%d->G; for(int s=0;s<CS;s++) for(int n=0;n<Nst;n++){
+        if(ewnpu){ for(int h=0;h<H;h++){ int g=h%d->G; for(int s=0;s<CS;s++) for(int n=0;n<Nst;n++){
                 e1[((size_t)h*CS+s)*Nst+n]=dexp[(size_t)h*CS+s]; e2[((size_t)h*CS+s)*Nst+n]=B[IX_BC(base+s,g,n)]; } }
             npu_ewmul_f16(ctx,e1,e2,H*CS,Nst,e3);
             for(size_t i=0;i<(size_t)H*CS*Nst;i++) bC[i]=(ork_f16)e3[i]; }
         else for(int h=0;h<H;h++){ int g=h%d->G; for(int s=0;s<CS;s++){ double ds=dexp[(size_t)h*CS+s];
                 for(int n=0;n<Nst;n++) bC[((size_t)h*CS+s)*Nst+n]=(ork_f16)(ds*B[IX_BC(base+s,g,n)]); } }
-        if((rc=ork_bmm_fp16(ctx,H,P,CS,Nst,aC,bC,cs))) break;
-        if((rc=ork_bmm_fp16(ctx,H,CS,Nst,P,aO,bO,tmp))) break;
+        if((rc=BMM(H,P,CS,Nst,aC,bC,cs))) break;
+        if((rc=BMM(H,CS,Nst,P,aO,bO,tmp))) break;
         /* ---- Yoff = tmp ⊙ sdo, then y = Yd + Yoff + D*x (add on CPU) ---- */
-        if(mode>=2){ for(int h=0;h<H;h++) for(int l=0;l<CS;l++) for(int p=0;p<P;p++){
+        if(ewnpu){ for(int h=0;h<H;h++) for(int l=0;l<CS;l++) for(int p=0;p<P;p++){
                 e1[((size_t)h*CS+l)*P+p]=tmp[((size_t)h*CS+l)*P+p]; e2[((size_t)h*CS+l)*P+p]=sexp[(size_t)h*CS+l]; }
             npu_ewmul_f16(ctx,e1,e2,H*CS,P,e3);
             for(int h=0;h<H;h++) for(int l=0;l<CS;l++){ int t=base+l; for(int p=0;p<P;p++)
@@ -196,7 +202,7 @@ static int run_case(ork_npu *ctx, const char *tag, ssd_dims d, int mode, double 
     for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){ B[i]=frand_sym(); C[i]=frand_sym(); }
     ssd_chunked_ref(&d,x,dt,A,B,C,D,yr);
     int rc=ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,mode);
-    const char*mn[3]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU"};
+    const char*mn[4]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU","FUSED matmuls (1 submit/stage)"};
     int fail;
     if(rc){ fprintf(stderr,"[%s] NPU op failed rc=%d\n",tag,rc); fail=1; }
     else { double e=rel_l2(&d,yn,yr); fail=!(e<=tol);
@@ -217,6 +223,22 @@ int main(void){
     fail|=run_case(ctx,"exp-G1",   g1,1,3e-2);
     fail|=run_case(ctx,"full-G1",  g1,2,4e-2);
     fail|=run_case(ctx,"full-G2",  g2,2,4e-2);
+    /* FUSED matmul spine (mode 3): each stage's H matmuls in ONE chained submit. Same numerics as mode 0
+     * (CPU elementwise), validating the fused batched-GEMM primitive on the real scan. */
+    fail|=run_case(ctx,"fused-G1", g1,3,3e-2);
+    fail|=run_case(ctx,"fused-G2", g2,3,3e-2);
+    /* Timing: per-op (mode 0, H submits/stage) vs fused (mode 3, 1 submit/stage), warm. */
+    { ssd_dims d=g2; int L=d.NC*d.CS;
+      double *x=malloc((size_t)L*d.H*d.P*8),*dt=malloc((size_t)L*d.H*8),*A=malloc(d.H*8),*B=malloc((size_t)L*d.G*d.Nst*8),
+             *Cm=malloc((size_t)L*d.G*d.Nst*8),*D=malloc(d.H*8),*yo=malloc((size_t)L*d.H*d.P*8);
+      for(size_t i=0;i<(size_t)L*d.H*d.P;i++)x[i]=frand_sym(); for(int h=0;h<d.H;h++){A[h]=-1;D[h]=frand();}
+      for(size_t i=0;i<(size_t)L*d.H;i++)dt[i]=0.1+0.35*frand(); for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){B[i]=frand_sym();Cm[i]=frand_sym();}
+      ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,0); ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,3);  /* warm both */
+      double t0=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,0); double per=(now_us()-t0)/5;
+      double t1=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,3); double fus=(now_us()-t1)/5;
+      fprintf(stderr,"\n[timing G2 L=%d] per-op(mode0) %.2f ms | fused(mode3) %.2f ms | %.2fx  (matmul-submit amortization; CPU elementwise shared)\n",
+              L,per/1000,fus/1000, per>0?per/fus:0);
+      free(x);free(dt);free(A);free(B);free(Cm);free(D);free(yo); }
     ork_npu_free(ctx);
     fprintf(stderr, fail? "\nTEST_SSD_CHUNK_NPU: FAIL\n":"\nTEST_SSD_CHUNK_NPU: PASS\n");
     return fail?1:0;

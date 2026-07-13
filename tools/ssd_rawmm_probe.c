@@ -21,13 +21,17 @@ int main(int argc,char**argv){
     for(int m=0;m<M;m++) for(int n=0;n<N;n++){ double a=0;
         for(int k=0;k<K;k++) a+=(double)A[(size_t)m*K+k]*(double)B[(size_t)k*N+n];
         ref[(size_t)m*N+n]=(float)a; }
-    int rc=ork_ssd_probe_rawmm_f16(c,M,K,N,A,B,C);
+    int fused = argc>4 && argv[4][0]=='f';   /* "f" -> fused (packed-B + row-major-A); else raw row-major */
+    int rc = fused ? ork_ssd_probe_fusedmm_f16(c,M,K,N,A,B,C) : ork_ssd_probe_rawmm_f16(c,M,K,N,A,B,C);
     int fail;
     if(rc){ fprintf(stderr,"probe rc=%d\n",rc); fail=1; }
     else { double num=0,den=0; for(size_t i=0;i<(size_t)M*N;i++){ double e=C[i]-ref[i]; num+=e*e; den+=ref[i]*ref[i]; }
         double rl2=den>0?sqrt(num/den):sqrt(num);
-        fprintf(stderr,"[rawmm] M=%d K=%d N=%d  C[0]=%.4f ref[0]=%.4f  rel-L2=%.3e  %s\n",
-                M,K,N,C[0],ref[0],rl2, rl2>3e-2?"FAIL(row-major NOT read -> needs tiling)":"OK(row-major works)");
+        const char *tag = fused?"fusedmm":"rawmm";
+        const char *ok  = fused?"OK(packed-B + row-major-A works in fused chain)":"OK(row-major works)";
+        const char *bad = fused?"FAIL(packed-B + row-major-A wrong -> A needs tiling)":"FAIL(row-major NOT read -> needs tiling)";
+        fprintf(stderr,"[%s] M=%d K=%d N=%d  C[0]=%.4f ref[0]=%.4f  rel-L2=%.3e  %s\n",
+                tag,M,K,N,C[0],ref[0],rl2, rl2>3e-2?bad:ok);
         fail=(rl2>3e-2); }
     free(A);free(B);free(C);free(ref); ork_npu_free(c);
     fprintf(stderr, fail?"\nSSD_RAWMM_PROBE: FAIL\n":"\nSSD_RAWMM_PROBE: PASS\n");

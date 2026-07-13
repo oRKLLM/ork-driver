@@ -828,6 +828,14 @@ void         ork_npu_mode_reset(ork_npu *ctx);
  * A[M,K],B[K,N]->C[M,N] fp32 — decides if a real-operand fused SSD scan can stage row-major directly.
  * K%32,N%16. 0/ok,<0. rk3588 diagnostic. */
 int          ork_ssd_probe_rawmm_f16(ork_npu *c,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
+/* (b) fused-mm probe: one fp16 matmul via the fused-chain mechanism with B PACKED (ork_mm_pack tiling) +
+ * A row-major + C dense — tests whether the real-operand fused SSD chain can reuse ork_mm_pack for B. 0/ok,<0. */
+int          ork_ssd_probe_fusedmm_f16(ork_npu *c,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
+/* FUSED batched fp16 GEMM: drop-in for ork_bmm_fp16 (nbatch matmuls, both operands dynamic) but chains all
+ * nbatch matmuls into ONE PC-chained submit — amortizes the ~48us/submit floor across the batch (the SSD
+ * scan per-stage H-batch). Packed-B (ork_mm_pack) + row-major-A + dense-C; numerically identical to
+ * ork_bmm_fp16. Single-slice (K<=ks, N<=nmax), nb<=64. 0/ok,<0. */
+int          ork_bmm_fp16_fused(ork_npu *c,int nb,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
 int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
                                       double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
 
