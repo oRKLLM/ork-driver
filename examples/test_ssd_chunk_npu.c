@@ -297,6 +297,45 @@ int main(void){
     fprintf(stderr,"[test_ssd_chunk_npu] SoC=%s cores=%d\n",ork_npu_soc(ctx),ork_npu_cores(ctx));
     srand(20260712);
     int fail=0;
+    /* Crossover sweep (ORK_SSD_SWEEP): time mode-5 (NPU pooled stream) vs mode-7 (CPU) as scan dims vary,
+     * to locate where (if anywhere) the NPU scan beats the CPU scan. Axes: H=n_head (grows with model
+     * size — Mamba-2 130m..2.7b = 24..80), NC=chunks (seq len / 64), Nst=d_state, P=head_dim. The last two
+     * are the per-head matmul size (the hypothesized real lever); H/NC only add submit count. */
+    if(getenv("ORK_SSD_SWEEP")){
+        ssd_dims cfgs[]={
+            {.H=24,.P=64,.Nst=128,.G=1,.CS=64,.NC=2},   /* mamba2-130m prefill-128 (baseline shape) */
+            {.H=48,.P=64,.Nst=128,.G=1,.CS=64,.NC=2},   /* ~780m heads */
+            {.H=80,.P=64,.Nst=128,.G=1,.CS=64,.NC=2},   /* ~2.7b heads */
+            {.H=24,.P=64,.Nst=128,.G=1,.CS=64,.NC=8},   /* longer seq (512) */
+            {.H=24,.P=64,.Nst=128,.G=1,.CS=64,.NC=16},  /* seq 1024 */
+            {.H=24,.P=64,.Nst=256,.G=1,.CS=64,.NC=2},   /* 2x state */
+            {.H=24,.P=64,.Nst=512,.G=1,.CS=64,.NC=2},   /* 4x state */
+            {.H=24,.P=128,.Nst=128,.G=1,.CS=64,.NC=2},  /* 2x head_dim */
+            {.H=24,.P=256,.Nst=256,.G=1,.CS=64,.NC=2},  /* big per-head matmul */
+            {.H=8,.P=256,.Nst=512,.G=1,.CS=64,.NC=2},   /* few heads, large matmul */
+        };
+        int ncfg=(int)(sizeof cfgs/sizeof cfgs[0]);
+        fprintf(stderr,"[SWEEP] cfg: H P N NC  ->  NPU(mode5) ms  CPU(mode7) ms  speedup(CPU/NPU)\n");
+        for(int c=0;c<ncfg;c++){ ssd_dims d=cfgs[c]; int L=d.NC*d.CS;
+            double *x=malloc((size_t)L*d.H*d.P*sizeof(double)),*dt=malloc((size_t)L*d.H*sizeof(double));
+            double *A=malloc(d.H*sizeof(double)),*B=malloc((size_t)L*d.G*d.Nst*sizeof(double));
+            double *C=malloc((size_t)L*d.G*d.Nst*sizeof(double)),*D=malloc(d.H*sizeof(double));
+            double *yn=malloc((size_t)L*d.H*d.P*sizeof(double));
+            for(size_t i=0;i<(size_t)L*d.H*d.P;i++) x[i]=frand_sym();
+            for(int h=0;h<d.H;h++){ A[h]=-1.0; D[h]=frand(); }
+            for(size_t i=0;i<(size_t)L*d.H;i++) dt[i]=0.1+0.35*frand();
+            for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){ B[i]=frand_sym(); C[i]=frand_sym(); }
+            const int REP=3; double t5=0,t7=0;
+            ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,5);              /* warm */
+            double a=now_us(); for(int r=0;r<REP;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,5); t5=(now_us()-a)/REP/1000.0;
+            ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,7);              /* warm */
+            a=now_us(); for(int r=0;r<REP;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,7); t7=(now_us()-a)/REP/1000.0;
+            fprintf(stderr,"[SWEEP] H=%d P=%d N=%d NC=%d  ->  NPU %8.2f ms  CPU %8.2f ms  %.2fx\n",
+                    d.H,d.P,d.Nst,d.NC,t5,t7,t5>0?t7/t5:0.0);
+            free(x);free(dt);free(A);free(B);free(C);free(D);free(yn);
+        }
+        ork_npu_free(ctx); return 0;
+    }
     ssd_dims g1={.H=4,.P=64,.Nst=128,.G=1,.CS=64,.NC=2}, g2={.H=8,.P=64,.Nst=128,.G=2,.CS=64,.NC=3};
     fail|=run_case(ctx,"matmul-G1",g1,0,3e-2);
     fail|=run_case(ctx,"exp-G1",   g1,1,3e-2);
