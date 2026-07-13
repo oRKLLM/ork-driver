@@ -6377,6 +6377,80 @@ fail:
     return -1;
 }
 
+/* (b) MIXED-PRECISION CHAIN probe: chain a FP16 matmul task (synth) + an INT16 silu-SDP task in ONE submit
+ * and validate BOTH — the exact fp16-matmul + int16-elementwise mix the fused SSD scan needs. Confirms that
+ * fp16 and int16 tasks coexist in one PC-chain (precision is per-task regcmd on the shared 2-byte datapath;
+ * no inter-task reset). Mirrors chain_mm_silu_i16 but task0 is fp16 (all-1s 32x32 -> C=32.0) instead of int8.
+ * Sets *mm_ok (fp16 matmul C≈32 in-chain), *silu_ok (int16 silu vs CPU). 0/ok,-1 fail,-2 bad,-3 SoC. */
+int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    const int M=8,N=64; const double in_scale=8.0/32000.0, out_scale=1.0/32000.0;
+    if(silu_calibrate_idx16(c)) return -1;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    static double qsum[1030]; static int qn[1030];
+    for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
+    for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
+    int16_t lut[1030]; int lo=-1,hi=-1;
+    for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k; double q_in=qsum[k]/qn[k]; double val=silu_f(q_in*in_scale)/out_scale;
+        long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
+    if(lo<0) return -1;
+    for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
+    for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
+        lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
+    struct buf Wd=bcreate(fd,32*32*2,0x403,dom), Ad=bcreate(fd,32*2,0x403,dom), Cd=bcreate(fd,32*4,0x403,dom); /* fp16 A/W, fp32 C */
+    int ret=-1; int16_t *inb=malloc((size_t)M*N*2);
+    if(!A.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu||!Wd.cpu||!Ad.cpu||!Cd.cpu||!inb){ goto mfail; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(Cd.cpu,0,32*4);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int16_t v=(int16_t)((m*N+n)%20000-8000); inb[m*N+n]=v; *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=v; }
+    { uint16_t*wd=Wd.cpu,*ad=Ad.cpu; for(int i=0;i<32*32;i++)wd[i]=0x3c00; for(int i=0;i<32;i++)ad[i]=0x3c00; } /* fp16 1.0 -> C=32 */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
+        lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      if(rknpu_submit_ioctl(fd,&s,dom)) goto mfail; }
+    /* chain: [0]=FP16 matmul (synth) -> [1]=int16 silu */
+    { uint32_t *mm=(uint32_t*)c->regcmd.cpu, *si=(uint32_t*)((char*)c->regcmd.cpu+(size_t)REGCMD_I8_N*4);
+      memset(mm,0,REGCMD_I8_N*4);
+      synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,0,CBUF);   /* FP16 matmul task0 (sched=0: K=32<96 small-K 0x1040 fix) */
+      uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;
+      mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
+      mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;
+      memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
+      set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
+      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0); setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma); setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
+      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+      bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+      struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
+      tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
+      tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=nx;
+      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=2;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,2};
+      double t0=ork_now_us();
+      for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&s,dom)) goto mfail;   /* rep0 primes fresh buffers */
+          bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE); }
+      if(us)*us=ork_now_us()-t0; }
+    { float *cd=Cd.cpu; int ok=1; for(int i=0;i<32;i++) if(fabs(cd[i]-32.0)>0.5) ok=0; if(mm_ok)*mm_ok=ok; }   /* fp16 matmul: C=32 */
+    { int ok=1,bad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double ref=silu_f(inb[m*N+n]*in_scale)/out_scale;
+        double got=(double)*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(fabs(got-ref)>0.03*fabs(ref)+3) bad++; }
+      ok=(bad<=(M*N)/20); if(silu_ok)*silu_ok=ok; }
+    ret=0;
+mfail:
+    free(inb); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    #undef EWCUBEH
+    return ret;
+}
+
 /* CHAIN ASSEMBLER increment-1: DATA-CONNECTED int8-matmul(int16-out) -> int16-silu in ONE PC-chain via the
  * general ork_npu_chain_progs core. Unlike ork_npu_chain_mm_silu_i16 (which only proves the chain WALKS --
  * its matmul output and silu input are SEPARATE buffers), here the gate matmul's int16 output buffer G IS

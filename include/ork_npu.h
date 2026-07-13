@@ -848,6 +848,9 @@ int          ork_bmm_fp16_fused(ork_npu *c,int nb,int M,int K,int N,const ork_f1
 typedef struct { ork_w *w; int M; const ork_f16 *A; float *C; } ork_mm_task_f16;
 int          ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks);
 int          ork_bmm_fp16_stream(ork_npu *c,int nb,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
+/* (b) mixed-precision chain probe: FP16 matmul task + INT16 silu-SDP task in ONE submit, both validated —
+ * confirms fp16 & int16 tasks coexist in a PC-chain (the fused SSD scan's matmul+elementwise mix). 0/ok,<0. */
+int          ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us);
 int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
                                       double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
 
