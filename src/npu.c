@@ -1123,7 +1123,8 @@ void ork_load_prof_dump(void){
     g_lp_alloc=g_lp_mmap=g_lp_prime=g_lp_create=g_lp_memcpy=g_lp_bf=0; g_lp_nchunk=0; g_lp_bytes=0;
 }
 static void ssm_pool_free(ork_npu *c);   /* fwd: defined near ork_ssm_scan_f32 */
-void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump();
+void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
+void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump();
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
     if(g_ork_prof){
         if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
@@ -7947,6 +7948,83 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     c->warmed=1;
     return rc;
 }
+/* ---- CHAINED-MULTICORE fp16 stream (ork_mm_run_stream_f16_chain) ----
+ * Combines the two half-wins: PC-chaining (task_number>1, one submit amortizes the ~48us submit floor over
+ * many programs — like run_chain_i8) AND 3-core parallelism (like run_stream_f16). Static strided partition:
+ * core i owns tasks {i, i+nc, ...}; it synths all of them into ITS mrc[i] (each program's PC next-descriptor
+ * at word 216 -> 0x0010/0x0014 links to the next), builds a cnt-entry task-descriptor array in mtk[i], and
+ * issues ONE task_number=cnt submit on core i. This is the fused graph the scan wanted: N submits -> nc.
+ * Matmul-only chain (register-config, no LUT) -> ping-pong safe. Escapes the per-matmul submit floor. */
+struct streamw_f16ch { ork_npu *c; int core; int ncore; int S; const ork_mm_task_f16 *tasks; int rc; };
+static void *stream_worker_f16ch(void *vp){
+    struct streamw_f16ch *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, ncore=a->ncore, S=a->S, CBUF=c->soc->cbuf_elems;
+    if(CBUF>32768) CBUF=32768;
+    pin_big_core(i);
+    a->rc=0;
+    int cnt=0; for(int k=i;k<S;k+=ncore) cnt++;
+    if(cnt==0) return NULL;
+    uint32_t rc[REGCMD_I8_N];
+    struct rknpu_task *mt=c->mtk[i].cpu;
+    int p=0;
+    for(int k=i;k<S;k+=ncore,p++){
+        const ork_mm_task_f16 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
+        int sched=(K&(K-1))==0 && K>=128 && K<2048;
+        memcpy((char*)c->maf[i].cpu + (size_t)p*M*K*2, t->A, (size_t)M*K*2);
+        memset(rc,0,REGCMD_I8_N*4);
+        synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
+              (uint32_t)(c->mcc[i].dma + (size_t)p*M*N*4), sched, CBUF);
+        if(p<cnt-1){ uint64_t next=c->mrc[i].dma + (size_t)(p+1)*REGCMD_I8_N*4;   /* PC-chain to next program */
+            rc[216]=0x0010|((next&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(next>>16)&0xffff); rc[218]=0x0014|(0x0037u<<16); }
+        memcpy((char*)c->mrc[i].cpu + (size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
+        memset(&mt[p],0,sizeof mt[p]); mt[p].enable_mask=0xd; mt[p].int_mask=0x300; mt[p].int_clear=0x1ffff;
+        mt[p].regcfg_amount=108; mt[p].regcmd_addr=c->mrc[i].dma + (size_t)p*REGCMD_I8_N*4;
+    }
+    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=ork_ppflags(); sub.task_number=cnt; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)cnt};
+    sub.timeout=mm_timeout_ms();
+    int reps=c->mwarm[i]?1:2;
+    for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,a->tasks[i].w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+    c->mwarm[i]=1;
+    p=0; for(int k=i;k<S;k+=ncore,p++){ const ork_mm_task_f16 *t=&a->tasks[k]; int M=t->M,N=t->w->N;
+        memcpy(t->C, (char*)c->mcc[i].cpu + (size_t)p*M*N*4, (size_t)M*N*4); }
+    return NULL;
+}
+int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
+    if(!c||S<1||!tasks) return -2;
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
+        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
+        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;
+        if(w->K%32||w->N%16) return -2; }
+    int fd=c->fd;
+    if(c->last_dt!=DT_F16){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++){ if(!kw)c->mwarm[i]=0; } c->last_dt=DT_F16; }
+    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(mc_ensure(c,nc)) return -1;
+    int per=(S+nc-1)/nc;                                   /* max programs a single core owns */
+    size_t needrc=(size_t)per*REGCMD_I8_N*4, needtk=(size_t)per*sizeof(struct rknpu_task);
+    size_t maxMK=(size_t)per*tasks[0].M*tasks[0].w->K*2, maxMN4=(size_t)per*tasks[0].M*tasks[0].w->N*4;
+    for(int i=0;i<nc;i++){
+        if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active); if(!c->mrc[i].cpu)return -1; c->mwarm[i]=0; }
+        if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active); if(!c->mtk[i].cpu)return -1; }
+        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+    int rc=0; npu_pool_ensure(c);
+    struct streamw_f16ch sw[ORK_MAXCORE];
+    for(int i=0;i<nc;i++) sw[i]=(struct streamw_f16ch){c,i,nc,S,tasks,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=sw; c->pjob_nc=nc; c->pjob_fn=stream_worker_f16ch; c->pjob_stride=sizeof(struct streamw_f16ch);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    stream_worker_f16ch(&sw[0]);
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    for(int i=0;i<nc;i++) if(sw[i].rc) rc=-1;
+    c->warmed=1;
+    return rc;
+}
 /* STREAMED batched fp16 GEMM — pack each B (fp16), dispatch the nb matmuls round-robin across cores. */
 int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||nb<1||M<1||K<1||N<1||K%32||N%16) return -2;
@@ -7976,6 +8054,17 @@ static inline double ork_softplus(double v){ return v>20.0 ? v : log1p(exp(v)); 
  * risk coherence; keep the recurrent-state stages (pC) fp16. Needs ORK_SSM_KEEPWARM=1 or the intra-scan
  * int8<->fp16 stage transitions re-introduce the mode-switch churn. */
 static int ork_ssm_i8_mask(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_I8_MASK"); v=e?atoi(e):0;} return v; }
+/* ORK_SSM_CHAIN: route the fp16 scan stages through the chained-multicore stream (one task_number>1 submit
+ * per core, PC-chaining the core's heads) instead of run_stream_f16 (one submit per head). Escapes the
+ * per-matmul submit floor while keeping 3-core parallelism. Off by default. */
+static int ork_ssm_chain(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_CHAIN"); v=e?atoi(e):0;} return v; }
+/* ORK_SSM_PROF: per-section accounting for ork_ssm_scan_f32 (accumulated across calls, dumped at teardown). */
+static int g_ssm_prof=-1;
+static double g_ssm_prep,g_ssm_stage,g_ssm_repack,g_ssm_npu,g_ssm_post; static long g_ssm_calls;
+void ork_ssm_prof_dump(void){ if(g_ssm_prof<=0||!g_ssm_calls) return;
+    double t=g_ssm_prep+g_ssm_stage+g_ssm_repack+g_ssm_npu+g_ssm_post; if(t<=0)t=1;
+    fprintf(stderr,"[ork SSM_PROF] %ld calls, %.1f ms | prep(softplus+cumsum+xbar) %.1f (%.0f%%) | stage(fp16 operand cast) %.1f (%.0f%%) | repack(NPU tile) %.1f (%.0f%%) | NPU(matmul submit) %.1f (%.0f%%) | post(y-assembly) %.1f (%.0f%%)\n",
+        g_ssm_calls,t/1e3, g_ssm_prep/1e3,100*g_ssm_prep/t, g_ssm_stage/1e3,100*g_ssm_stage/t, g_ssm_repack/1e3,100*g_ssm_repack/t, g_ssm_npu/1e3,100*g_ssm_npu/t, g_ssm_post/1e3,100*g_ssm_post/t); }
 /* int8 variant of one scan STG stage: per-col-quant the weight (Bop) via repack_i8_f32, per-row-quant the
  * activation (Aop), batched int8 stream, then dequant int32->Cop by ascale[row]*bscale[col]. Same operand
  * layout/offsets as the fp16 STG macro. Uses the persistent int8 scratch + quant temps on the ctx. */
@@ -8072,18 +8161,22 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
     double *Acs=c->ssm_Acs,*xbar=c->ssm_xbar,*Acl=c->ssm_Acl,*Aclp=c->ssm_Aclp;
     ork_mm_task_f16 *tk=c->ssm_tk;
     int ret=0;
-    #define STG(pool,M,K,N,Aop,Bop,Cop) do{ for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pool[h],K,N,(Bop)+(size_t)h*(size_t)(K)*(N))){ret=-1;goto done2;} \
-        tk[h]=(ork_mm_task_f16){pool[h],M,(Aop)+(size_t)h*(size_t)(M)*(K),(Cop)+(size_t)h*(size_t)(M)*(N)}; } if(ork_mm_run_stream_f16(c,nh,tk)){ret=-1;goto done2;} }while(0)
+    #define _NOW (g_ssm_prof?ork_now_us():0.0)
+    #define STG(pool,M,K,N,Aop,Bop,Cop) do{ double _r=_NOW; for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pool[h],K,N,(Bop)+(size_t)h*(size_t)(K)*(N))){ret=-1;goto done2;} \
+        tk[h]=(ork_mm_task_f16){pool[h],M,(Aop)+(size_t)h*(size_t)(M)*(K),(Cop)+(size_t)h*(size_t)(M)*(N)}; } g_ssm_repack+=_NOW-_r; double _q=_NOW; \
+        if((ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,nh,tk)){ret=-1;goto done2;} g_ssm_npu+=_NOW-_q; }while(0)
+    if(g_ssm_prof<0)g_ssm_prof=getenv("ORK_SSM_PROF")?1:0; g_ssm_calls++;
     for(int seq=0; seq<ns && !ret; seq++){
         for(size_t i=0;i<(size_t)nh*nr*nc;i++) state[i]=s0[(size_t)seq*nh*nr*nc+i];
         memset(stp,0,(size_t)nh*nr*nc*4); memset(Aclp,0,nh*8);
-        for(int cc=0;cc<NC;cc++){ int base=cc*CS;
+        for(int cc=0;cc<NC;cc++){ int base=cc*CS; double _t=_NOW;
             for(int h=0;h<nh;h++){ double run=0,ah=A[h];
                 for(int l=0;l<CS;l++){ int t=base+l; double dtv=(t<nt)?ork_softplus(dt[(size_t)(seq*nt+t)*nh+h]):0.0;
                     run+=dtv*ah; Acs[(size_t)h*CS+l]=run;
                     for(int i1=0;i1<nr;i1++) xbar[((size_t)h*CS+l)*nr+i1]=(t<nt)?dtv*x[((size_t)(seq*nt+t)*nh+h)*nr+i1]:0.0; }
                 Acl[h]=Acs[(size_t)h*CS+CS-1]; }
             if(cc>0) for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; state[j]=(float)(dp*state[j]+stp[j]); } }
+            g_ssm_prep+=_NOW-_t; _t=_NOW;
             for(int h=0;h<nh;h++){ int g=h/hpg;
                 for(int l=0;l<CS;l++){ int t=base+l; const float *Cc=(t<nt)?C+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
                     for(int n=0;n<nc;n++){ ork_f16 v=Cc?(ork_f16)Cc[n]:(ork_f16)0.0f; aS[((size_t)h*CS+l)*nc+n]=v; aO[((size_t)h*CS+l)*nc+n]=v; } }
@@ -8091,23 +8184,29 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
                 for(int i1=0;i1<nr;i1++)for(int sp=0;sp<CS;sp++) aC[((size_t)h*nr+i1)*CS+sp]=(ork_f16)xbar[((size_t)h*CS+sp)*nr+i1];
                 for(int l=0;l<CS;l++)for(int i1=0;i1<nr;i1++) bD[((size_t)h*CS+l)*nr+i1]=(ork_f16)xbar[((size_t)h*CS+l)*nr+i1];
                 for(int n=0;n<nc;n++)for(int i1=0;i1<nr;i1++) bO[((size_t)h*nc+n)*nr+i1]=(ork_f16)state[((size_t)h*nr+i1)*nc+n]; }
-            if((c->ssm_i8&1) && c->ssm_pSi8){ if(ssm_stg_i8(c,c->ssm_pSi8,CS,nc,CS,aS,bS,G,nh)){ret=-1;goto done2;} }
+            g_ssm_stage+=_NOW-_t;
+            if((c->ssm_i8&1) && c->ssm_pSi8){ double _p=_NOW; if(ssm_stg_i8(c,c->ssm_pSi8,CS,nc,CS,aS,bS,G,nh)){ret=-1;goto done2;} g_ssm_npu+=_NOW-_p; }
             else STG(pS,CS,nc,CS,aS,bS,G);
+            _t=_NOW;
             for(int h=0;h<nh;h++){ int g=h/hpg; const double *Ah=Acs+(size_t)h*CS;
                 for(int l=0;l<CS;l++)for(int sp=0;sp<CS;sp++){ double m=(sp<=l)?(double)G[((size_t)h*CS+l)*CS+sp]*exp(Ah[l]-Ah[sp]):0.0; aD[((size_t)h*CS+l)*CS+sp]=(ork_f16)m; }
                 for(int sp=0;sp<CS;sp++){ int t=base+sp; double ds=exp(Ah[CS-1]-Ah[sp]); const float *Bc=(t<nt)?B+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
                     for(int n=0;n<nc;n++) bC[((size_t)h*CS+sp)*nc+n]=(ork_f16)(Bc?ds*Bc[n]:0.0); } }
+            g_ssm_stage+=_NOW-_t;
             STG(pD,CS,CS,nr,aD,bD,Yd);
             STG(pC,nr,CS,nc,aC,bC,cs);
             STG(pO,CS,nc,nr,aO,bO,tmp);
+            _t=_NOW;
             for(int h=0;h<nh;h++){ const double *Ah=Acs+(size_t)h*CS;
                 for(int l=0;l<CS;l++){ int t=base+l; if(t>=nt)continue; double sdo=exp(Ah[l]);
                     for(int i1=0;i1<nr;i1++) y[((size_t)(seq*nt+t)*nh+h)*nr+i1]=Yd[((size_t)h*CS+l)*nr+i1]+tmp[((size_t)h*CS+l)*nr+i1]*sdo; } }
+            g_ssm_post+=_NOW-_t;
             memcpy(stp,cs,(size_t)nh*nr*nc*4); memcpy(Aclp,Acl,nh*8);
         }
         for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; s_new[(size_t)seq*nh*nr*nc+j]=(float)(dp*state[j]+stp[j]); } }
     }
     #undef STG
+    #undef _NOW
 done2:
     if(ret) ssm_pool_free(c);   /* on error drop the cache so the next call re-allocs clean; on success KEEP it warm */
     return ret;

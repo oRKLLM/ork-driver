@@ -851,6 +851,10 @@ int          ork_bmm_fp16_fused(ork_npu *c,int nb,int M,int K,int N,const ork_f1
  * numerically identical to ork_bmm_fp16. Single-slice, nb>=1. 0/ok,<0. */
 typedef struct { ork_w *w; int M; const ork_f16 *A; float *C; } ork_mm_task_f16;
 int          ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks);
+/* CHAINED-MULTICORE fp16 stream: PC-chains each core's round-robin-assigned matmuls into ONE task_number>1
+ * submit (amortizes the ~48us submit floor over many programs) while keeping 3-core parallelism. Same
+ * task/operand semantics as run_stream_f16; single-slice fp16 (K%32,N%16). For the on-NPU SSM scan stages. */
+int          ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks);
 int          ork_bmm_fp16_stream(ork_npu *c,int nb,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
 /* (b) mixed-precision chain probe: FP16 matmul task + INT16 silu-SDP task in ONE submit, both validated —
  * confirms fp16 & int16 tasks coexist in a PC-chain (the fused SSD scan's matmul+elementwise mix). 0/ok,<0. */
