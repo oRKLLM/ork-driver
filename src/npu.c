@@ -180,7 +180,11 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     double *ssm_Acs,*ssm_xbar,*ssm_Acl,*ssm_Aclp; ork_mm_task_f16 *ssm_tk;
     /* per-stage int8 path (ORK_SSM_I8_MASK): int8 scratch weights + quant/dequant temps, allocated only when
      * the mask selects at least one int8 stage. Sized generously (nh*CS*nc) to cover any single stage. */
-    int ssm_i8; ork_w **ssm_pSi8; int8_t *ssm_ai8; int32_t *ssm_ci32; float *ssm_ascale,*ssm_bscale,*ssm_f32t; ork_mm_task_i8 *ssm_tki8; };
+    int ssm_i8; ork_w **ssm_pSi8; int8_t *ssm_ai8; int32_t *ssm_ci32; float *ssm_ascale,*ssm_bscale,*ssm_f32t; ork_mm_task_i8 *ssm_tki8;
+    /* persistent little-core (A55) marshalling helper (ORK_SSM_PIPELINE): spawned once, condvar-signalled
+     * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
+     * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
+    pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
@@ -1124,7 +1128,9 @@ void ork_load_prof_dump(void){
 }
 static void ssm_pool_free(ork_npu *c);   /* fwd: defined near ork_ssm_scan_f32 */
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
+void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump();
+    ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
     if(g_ork_prof){
         if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
@@ -3524,6 +3530,20 @@ static void pin_big_core(int id){
      * to oversubscribe and CRATER decode at -t 8 (9.3 -> 2.3 tok/s) while not helping -t 4. The big-core
      * win for the CPU side comes from running with -t = big-core-count (e.g. -t 4 on RK3588), which is a
      * user/serving choice, not something to force here. See the Thread-Count wiki experiment. */
+}
+/* Pin the calling thread to a LITTLE core (low-numbered: A55 0-3 on RK3588). For off-critical-path /
+ * IO-bound / memory-bound work (e.g. the SSM double-buffer marshalling helper) that should run on the
+ * idle little cluster WHILE the big cores are saturated by ggml's threadpool + the NPU pool. The A55 is
+ * ~2x slower but it's free time overlapped with the NPU submit. Honors ORK_NO_AFFINITY. */
+static void pin_little_core(int id){
+    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
+    if(off) return;
+#if defined(__linux__)
+    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return;
+    int cpu=id; if(cpu>=ncpu) cpu=0;           /* low index = little cluster */
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
+    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
+#endif
 }
 static void *npu_pool_worker(void *vp){
     struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
@@ -8081,6 +8101,31 @@ static void *ssm_marshal_gi(void *vp){   /* G-independent operand build (aC,bD,b
             for(int n=0;n<nc;n++) m->bC[((size_t)h*CS+sp)*nc+n]=(ork_f16)(Bc?ds*Bc[n]:0.0); } }
     return NULL;
 }
+/* persistent little-core marshalling helper: spawned once, condvar-signalled per chunk. */
+static void *ssm_helper_worker(void *vp){
+    ork_npu *c=vp; pin_little_core(0);                 /* live on an idle A55 for the whole run */
+    pthread_mutex_lock(&c->ssm_hmu);
+    for(;;){ while(!c->ssm_hgen && !c->ssm_hstop) pthread_cond_wait(&c->ssm_hgo,&c->ssm_hmu);  /* hgen = pending flag */
+        if(c->ssm_hstop){ pthread_mutex_unlock(&c->ssm_hmu); return NULL; }
+        c->ssm_hgen=0; void *job=c->ssm_hjob; pthread_mutex_unlock(&c->ssm_hmu);
+        ssm_marshal_gi(job);
+        pthread_mutex_lock(&c->ssm_hmu); c->ssm_hdone=1; pthread_cond_signal(&c->ssm_hdn); }
+}
+static int ssm_helper_ensure(ork_npu *c){
+    if(c->ssm_hspawn) return 1;
+    pthread_mutex_init(&c->ssm_hmu,NULL); pthread_cond_init(&c->ssm_hgo,NULL); pthread_cond_init(&c->ssm_hdn,NULL);
+    c->ssm_hgen=0; c->ssm_hstop=0; c->ssm_hdone=1;
+    c->ssm_hspawn=(pthread_create(&c->ssm_hth,NULL,ssm_helper_worker,c)==0);
+    return c->ssm_hspawn;
+}
+static void ssm_helper_fire(ork_npu *c, void *job){    /* non-blocking dispatch */
+    pthread_mutex_lock(&c->ssm_hmu); c->ssm_hjob=job; c->ssm_hdone=0; c->ssm_hgen=1; pthread_cond_signal(&c->ssm_hgo); pthread_mutex_unlock(&c->ssm_hmu); }
+static void ssm_helper_join(ork_npu *c){               /* wait for the fired job */
+    pthread_mutex_lock(&c->ssm_hmu); while(!c->ssm_hdone) pthread_cond_wait(&c->ssm_hdn,&c->ssm_hmu); pthread_mutex_unlock(&c->ssm_hmu); }
+void ork_ssm_helper_stop(ork_npu *c){                  /* teardown: called from ork_npu_free */
+    if(!c->ssm_hspawn) return;
+    pthread_mutex_lock(&c->ssm_hmu); c->ssm_hstop=1; pthread_cond_signal(&c->ssm_hgo); pthread_mutex_unlock(&c->ssm_hmu);
+    pthread_join(c->ssm_hth,NULL); c->ssm_hspawn=0; }
 /* ORK_SSM_PROF: per-section accounting for ork_ssm_scan_f32 (accumulated across calls, dumped at teardown). */
 static int g_ssm_prof=-1;
 static double g_ssm_prep,g_ssm_stage,g_ssm_repack,g_ssm_npu,g_ssm_post,g_ssm_stg[4]; static long g_ssm_calls;
@@ -8260,15 +8305,15 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
                 for(int n=0;n<nc;n++)for(int sp=0;sp<CS;sp++){ int t=base+sp; bS[((size_t)h*nc+n)*CS+sp]=(t<nt)?(ork_f16)B[((size_t)(seq*nt+t)*ng+g)*nc+n]:(ork_f16)0.0f; } }
             g_ssm_stage+=_NOW-_t;
             struct ssm_marshal_arg ha={aC,bD,bO,bC,xbar,Acs,state,B,nh,nr,nc,CS,ng,hpg,base,nt,seq};   /* helper: G-independent operands */
-            pthread_t ht; int hstarted=(pthread_create(&ht,NULL,ssm_marshal_gi,&ha)==0);
-            if(!hstarted) ssm_marshal_gi(&ha);
+            int hstarted=ssm_helper_ensure(c);                                  /* persistent little-core helper */
+            if(hstarted) ssm_helper_fire(c,&ha); else ssm_marshal_gi(&ha);
             double _r=_NOW;                                                     /* pS dispatch (inline; join helper before any error) */
-            for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pS[h],nc,CS,bS+(size_t)h*nc*CS)){ if(hstarted)pthread_join(ht,NULL); ret=-1; goto done2; }
+            for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pS[h],nc,CS,bS+(size_t)h*nc*CS)){ if(hstarted)ssm_helper_join(c); ret=-1; goto done2; }
                 tk[h]=(ork_mm_task_f16){pS[h],CS,aS+(size_t)h*CS*nc,G+(size_t)h*CS*CS}; }
             double _q=_NOW; g_ssm_repack+=_q-_r;
             int prc=(ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,nh,tk);
             double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[0]+=_e-_r;
-            if(hstarted)pthread_join(ht,NULL);
+            if(hstarted)ssm_helper_join(c);
             if(prc){ret=-1;goto done2;}
             _t=_NOW;
             for(int h=0;h<nh;h++){ const double *Ah=Acs+(size_t)h*CS;           /* aD (needs G) serial */
