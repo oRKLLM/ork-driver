@@ -851,6 +851,13 @@ int          ork_bmm_fp16_stream(ork_npu *c,int nb,int M,int K,int N,const ork_f
 /* (b) mixed-precision chain probe: FP16 matmul task + INT16 silu-SDP task in ONE submit, both validated —
  * confirms fp16 & int16 tasks coexist in a PC-chain (the fused SSD scan's matmul+elementwise mix). 0/ok,<0. */
 int          ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us);
+/* SSM_SCAN (Mamba-2) on the NPU — the ggml-ork GGML_OP_SSM_SCAN kernel. Chunked mode-5 scan (matmul spine
+ * on the NPU pooled 3-core stream, elementwise on CPU). Matches ggml_compute_forward_ssm_scan_f32:
+ * softplus(dt), scalar decay A{nh}, NO D skip, output y (x-shaped) + s_new. Contiguous ggml layout:
+ * s/s_new{nc,nr,nh,ns} x/y{nr,nh,nt,ns} dt{nh,nt,ns} A{nh} B/C{nc,ng,nt,ns}. nc%32,nr%16,nh%ng==0. 0/ok,<0. */
+int          ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
+                              const float *s0,const float *x,const float *dt,const float *A,
+                              const float *B,const float *C,float *y,float *s_new);
 int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
                                       double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
 

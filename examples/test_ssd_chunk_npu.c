@@ -255,6 +255,42 @@ static int run_case(ork_npu *ctx, const char *tag, ssd_dims d, int mode, double 
     return fail;
 }
 
+/* ggml-semantics sequential SSM_SCAN reference (mirrors ggml_compute_forward_ssm_scan_f32 scalar branch),
+ * contiguous layout — the correctness target for ork_ssm_scan_f32. softplus(dt), no D, y + s_new. */
+static double sp_ref(double v){ return v>20.0?v:log1p(exp(v)); }
+static void ssm_scan_ggml_ref(int nc,int nr,int nh,int ng,int nt,int ns,
+        const float*s0,const float*x,const float*dt,const float*A,const float*B,const float*C,float*y,float*s_new){
+    int hpg=nh/ng; float *st=malloc((size_t)nh*nr*nc*4);
+    for(int seq=0;seq<ns;seq++){
+        for(size_t i=0;i<(size_t)nh*nr*nc;i++) st[i]=s0[(size_t)seq*nh*nr*nc+i];
+        for(int t=0;t<nt;t++) for(int h=0;h<nh;h++){ int g=h/hpg; double dtsp=sp_ref(dt[(size_t)(seq*nt+t)*nh+h]); double dA=exp(dtsp*A[h]);
+            const float *Bt=B+((size_t)(seq*nt+t)*ng+g)*nc, *Ct=C+((size_t)(seq*nt+t)*ng+g)*nc;
+            for(int i1=0;i1<nr;i1++){ double xdt=x[((size_t)(seq*nt+t)*nh+h)*nr+i1]*dtsp, sumf=0; float *sp=st+((size_t)h*nr+i1)*nc;
+                for(int n=0;n<nc;n++){ double v=sp[n]*dA+Bt[n]*xdt; sp[n]=(float)v; sumf+=Ct[n]*v; }
+                y[((size_t)(seq*nt+t)*nh+h)*nr+i1]=(float)sumf; } }
+        for(size_t i=0;i<(size_t)nh*nr*nc;i++) s_new[(size_t)seq*nh*nr*nc+i]=st[i];
+    }
+    free(st);
+}
+static int run_ssm(ork_npu *ctx,const char*tag,int nc,int nr,int nh,int ng,int nt,int ns,double tol){
+    size_t sx=(size_t)nr*nh*nt*ns, sst=(size_t)nc*nr*nh*ns, sbc=(size_t)nc*ng*nt*ns, sdt=(size_t)nh*nt*ns;
+    float *s0=malloc(sst*4),*x=malloc(sx*4),*dt=malloc(sdt*4),*A=malloc(nh*4),*B=malloc(sbc*4),*C=malloc(sbc*4);
+    float *yr=malloc(sx*4),*sr=malloc(sst*4),*yn=malloc(sx*4),*sn=malloc(sst*4);
+    for(size_t i=0;i<sst;i++)s0[i]=frand_sym()*0.1f; for(size_t i=0;i<sx;i++)x[i]=frand_sym();
+    for(size_t i=0;i<sdt;i++)dt[i]=(float)(frand_sym()*0.5-1.0); for(int h=0;h<nh;h++)A[h]=(float)(-exp(frand()));
+    for(size_t i=0;i<sbc;i++){B[i]=frand_sym();C[i]=frand_sym();}
+    ssm_scan_ggml_ref(nc,nr,nh,ng,nt,ns,s0,x,dt,A,B,C,yr,sr);
+    int rc=ork_ssm_scan_f32(ctx,nc,nr,nh,ng,nt,ns,s0,x,dt,A,B,C,yn,sn);
+    int fail;
+    if(rc){ fprintf(stderr,"[%s] ork_ssm_scan_f32 rc=%d\n",tag,rc); fail=1; }
+    else { double ny=0,dy=0,nsr=0,dsr=0; for(size_t i=0;i<sx;i++){double e=yn[i]-yr[i];ny+=e*e;dy+=yr[i]*yr[i];}
+        for(size_t i=0;i<sst;i++){double e=sn[i]-sr[i];nsr+=e*e;dsr+=sr[i]*sr[i];}
+        double ey=dy>0?sqrt(ny/dy):0, es=dsr>0?sqrt(nsr/dsr):0; fail=!(ey<=tol&&es<=tol);
+        fprintf(stderr,"[%s] nc=%d nr=%d nh=%d ng=%d nt=%d  y rel-L2=%.3e  state rel-L2=%.3e  %s\n",tag,nc,nr,nh,ng,nt,ey,es,fail?"FAIL":"OK"); }
+    free(s0);free(x);free(dt);free(A);free(B);free(C);free(yr);free(sr);free(yn);free(sn);
+    return fail;
+}
+
 int main(void){
     ork_npu *ctx=ork_npu_init();
     if(!ctx){ fprintf(stderr,"[test_ssd_chunk_npu] no NPU — skipping\n"); return 0; }
@@ -277,6 +313,10 @@ int main(void){
     fail|=run_case(ctx,"pool-G1",  g1,5,3e-2);
     fail|=run_case(ctx,"pool-G2",  g2,5,3e-2);
     fail|=run_case(ctx,"cpu-G2",   g2,7,3e-2);   /* pure-CPU baseline (matmul on 4 big cores) */
+    /* ork_ssm_scan_f32 (the ggml-ork GGML_OP_SSM_SCAN kernel) vs ggml-semantics reference, mamba2-130m dims. */
+    fail|=run_ssm(ctx,"ssm-1chunk", 128,64,24,1, 64,1, 3e-2);
+    fail|=run_ssm(ctx,"ssm-2chunk", 128,64,24,1,128,1, 3e-2);
+    fail|=run_ssm(ctx,"ssm-partial",128,64,24,1,100,1, 3e-2);   /* nt%CS!=0 -> internal chunk padding */
     /* mode 6 (FULL on-NPU: elementwise on NPU + pooled stream) is CORRECT but a MEASURED DEAD-END: ~97x
      * slower (973ms vs 10ms) — the tiny elementwise ops each pay the NPU submit floor + int16<->fp16
      * mode-switch reset churn (968ms elementwise vs 5ms on CPU). The elementwise belongs on the CPU;

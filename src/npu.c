@@ -7878,6 +7878,72 @@ done:
     return ret;
 }
 
+static inline double ork_softplus(double v){ return v>20.0 ? v : log1p(exp(v)); }
+/* SSM_SCAN (Mamba-2) via the chunked mode-5 scan: matmul spine on the NPU (persistent weight pool +
+ * 3-core round-robin stream), elementwise on the CPU. Matches ggml_compute_forward_ssm_scan_f32:
+ * dt_soft_plus=softplus(dt), scalar decay A{1,nh}, NO D skip (applied elsewhere in the graph), output
+ * y (x-shaped) + s_new (updated state). Contiguous ggml layout:
+ *   s/s_new {nc=d_state, nr=dim, nh, ns}   x/y {nr, nh, nt, ns}   dt {nh, nt, ns}   A {nh}   B/C {nc, ng, nt, ns}
+ * nt is internally chunk-padded (pad tokens: dt=-inf -> softplus~0 -> zero contribution). Requires
+ * nc%32, nr%16, nh%ng==0. 0/ok, <0. rk3588. */
+int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
+                     const float *s0,const float *x,const float *dt,const float *A,
+                     const float *B,const float *C,float *y,float *s_new){
+    if(!c||nc<1||nr<1||nh<1||ng<1||nt<1||ns<1) return -2;
+    if(nc%32||nr%16||nc%16||nh%ng) return -2;
+    const int CS=64, NC=(nt+CS-1)/CS, hpg=nh/ng;
+    ork_w **pS=calloc(nh,sizeof(ork_w*)),**pD=calloc(nh,sizeof(ork_w*)),**pC=calloc(nh,sizeof(ork_w*)),**pO=calloc(nh,sizeof(ork_w*));
+    for(int h=0;h<nh;h++){ pS[h]=ork_mm_f16_scratch(c,nc,CS); pD[h]=ork_mm_f16_scratch(c,CS,nr); pC[h]=ork_mm_f16_scratch(c,CS,nc); pO[h]=ork_mm_f16_scratch(c,nc,nr); }
+    ork_f16 *aS=malloc((size_t)nh*CS*nc*2),*bS=malloc((size_t)nh*nc*CS*2); float *G=malloc((size_t)nh*CS*CS*4);
+    ork_f16 *aD=malloc((size_t)nh*CS*CS*2),*bD=malloc((size_t)nh*CS*nr*2); float *Yd=malloc((size_t)nh*CS*nr*4);
+    ork_f16 *aC=malloc((size_t)nh*nr*CS*2),*bC=malloc((size_t)nh*CS*nc*2); float *cs=malloc((size_t)nh*nr*nc*4);
+    ork_f16 *aO=malloc((size_t)nh*CS*nc*2),*bO=malloc((size_t)nh*nc*nr*2); float *tmp=malloc((size_t)nh*CS*nr*4);
+    double *Acs=malloc((size_t)nh*CS*8),*xbar=malloc((size_t)nh*CS*nr*8);
+    float *state=calloc((size_t)nh*nr*nc,4),*stp=calloc((size_t)nh*nr*nc,4);
+    double *Acl=malloc(nh*8),*Aclp=calloc(nh,8); ork_mm_task_f16 *tk=malloc((size_t)nh*sizeof(ork_mm_task_f16));
+    int ret=0;
+    #define STG(pool,M,K,N,Aop,Bop,Cop) do{ for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pool[h],K,N,(Bop)+(size_t)h*(size_t)(K)*(N))){ret=-1;goto done2;} \
+        tk[h]=(ork_mm_task_f16){pool[h],M,(Aop)+(size_t)h*(size_t)(M)*(K),(Cop)+(size_t)h*(size_t)(M)*(N)}; } if(ork_mm_run_stream_f16(c,nh,tk)){ret=-1;goto done2;} }while(0)
+    for(int seq=0; seq<ns && !ret; seq++){
+        for(size_t i=0;i<(size_t)nh*nr*nc;i++) state[i]=s0[(size_t)seq*nh*nr*nc+i];
+        memset(stp,0,(size_t)nh*nr*nc*4); memset(Aclp,0,nh*8);
+        for(int cc=0;cc<NC;cc++){ int base=cc*CS;
+            for(int h=0;h<nh;h++){ double run=0,ah=A[h];
+                for(int l=0;l<CS;l++){ int t=base+l; double dtv=(t<nt)?ork_softplus(dt[(size_t)(seq*nt+t)*nh+h]):0.0;
+                    run+=dtv*ah; Acs[(size_t)h*CS+l]=run;
+                    for(int i1=0;i1<nr;i1++) xbar[((size_t)h*CS+l)*nr+i1]=(t<nt)?dtv*x[((size_t)(seq*nt+t)*nh+h)*nr+i1]:0.0; }
+                Acl[h]=Acs[(size_t)h*CS+CS-1]; }
+            if(cc>0) for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; state[j]=(float)(dp*state[j]+stp[j]); } }
+            for(int h=0;h<nh;h++){ int g=h/hpg;
+                for(int l=0;l<CS;l++){ int t=base+l; const float *Cc=(t<nt)?C+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
+                    for(int n=0;n<nc;n++){ ork_f16 v=Cc?(ork_f16)Cc[n]:(ork_f16)0.0f; aS[((size_t)h*CS+l)*nc+n]=v; aO[((size_t)h*CS+l)*nc+n]=v; } }
+                for(int n=0;n<nc;n++)for(int sp=0;sp<CS;sp++){ int t=base+sp; bS[((size_t)h*nc+n)*CS+sp]=(t<nt)?(ork_f16)B[((size_t)(seq*nt+t)*ng+g)*nc+n]:(ork_f16)0.0f; }
+                for(int i1=0;i1<nr;i1++)for(int sp=0;sp<CS;sp++) aC[((size_t)h*nr+i1)*CS+sp]=(ork_f16)xbar[((size_t)h*CS+sp)*nr+i1];
+                for(int l=0;l<CS;l++)for(int i1=0;i1<nr;i1++) bD[((size_t)h*CS+l)*nr+i1]=(ork_f16)xbar[((size_t)h*CS+l)*nr+i1];
+                for(int n=0;n<nc;n++)for(int i1=0;i1<nr;i1++) bO[((size_t)h*nc+n)*nr+i1]=(ork_f16)state[((size_t)h*nr+i1)*nc+n]; }
+            STG(pS,CS,nc,CS,aS,bS,G);
+            for(int h=0;h<nh;h++){ int g=h/hpg; const double *Ah=Acs+(size_t)h*CS;
+                for(int l=0;l<CS;l++)for(int sp=0;sp<CS;sp++){ double m=(sp<=l)?(double)G[((size_t)h*CS+l)*CS+sp]*exp(Ah[l]-Ah[sp]):0.0; aD[((size_t)h*CS+l)*CS+sp]=(ork_f16)m; }
+                for(int sp=0;sp<CS;sp++){ int t=base+sp; double ds=exp(Ah[CS-1]-Ah[sp]); const float *Bc=(t<nt)?B+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
+                    for(int n=0;n<nc;n++) bC[((size_t)h*CS+sp)*nc+n]=(ork_f16)(Bc?ds*Bc[n]:0.0); } }
+            STG(pD,CS,CS,nr,aD,bD,Yd);
+            STG(pC,nr,CS,nc,aC,bC,cs);
+            STG(pO,CS,nc,nr,aO,bO,tmp);
+            for(int h=0;h<nh;h++){ const double *Ah=Acs+(size_t)h*CS;
+                for(int l=0;l<CS;l++){ int t=base+l; if(t>=nt)continue; double sdo=exp(Ah[l]);
+                    for(int i1=0;i1<nr;i1++) y[((size_t)(seq*nt+t)*nh+h)*nr+i1]=Yd[((size_t)h*CS+l)*nr+i1]+tmp[((size_t)h*CS+l)*nr+i1]*sdo; } }
+            memcpy(stp,cs,(size_t)nh*nr*nc*4); memcpy(Aclp,Acl,nh*8);
+        }
+        for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; s_new[(size_t)seq*nh*nr*nc+j]=(float)(dp*state[j]+stp[j]); } }
+    }
+    #undef STG
+done2:
+    for(int h=0;h<nh;h++){ if(pS[h])ork_mm_free(c,pS[h]); if(pD[h])ork_mm_free(c,pD[h]); if(pC[h])ork_mm_free(c,pC[h]); if(pO[h])ork_mm_free(c,pO[h]); }
+    free(pS);free(pD);free(pC);free(pO);free(aS);free(bS);free(G);free(aD);free(bD);free(Yd);free(aC);free(bC);free(cs);free(aO);free(bO);free(tmp);
+    free(Acs);free(xbar);free(state);free(stp);free(Acl);free(Aclp);free(tk);
+    return ret;
+}
+
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
