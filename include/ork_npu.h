@@ -799,4 +799,36 @@ int          ork_bmm_fp16_strided(ork_npu *ctx, int nbatch, int M, int K, int N,
 /* Math utilities for caller-driven quantization/transformations */
 void         ork_fwht_norm(float *v, int n);
 
+/* ---- FLOOR-DECOMP diagnostics (submit-floor RE) --------------------------------------------------
+ * Decompose the per-submit floor. ork_npu_floor_timing returns, accumulated since the last reset:
+ *   ioctl_us    = total wall-clock time spent INSIDE the blocking SUBMIT ioctl (kernel job setup +
+ *                 register programming + NPU execution + completion-wait).
+ *   hw_us       = SUM of the kernel-reported sub.hw_elapse_time across those ioctls (the hardware's own
+ *                 NPU-busy view). Comparing hw_us to ioctl_us splits real-NPU-compute from driver
+ *                 dispatch/wait overhead — the core of the poll-granularity hypothesis.
+ *   hw_raw_last = the last raw sub.hw_elapse_time value (to infer whether the kernel reports ns or us).
+ *   n           = number of SUBMIT ioctls counted. */
+void         ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n);
+void         ork_npu_floor_reset(void);
+
+/* ---- MODE-TRANSITION RE hooks (tools/mode_probe.c) -----------------------------------------------
+ * Standalone SDP ops (ork_npu_ewmul_f16/_i16, ork_npu_exp_i16/silu_i16/…) reprogram the NPU pipeline but
+ * do NOT update the driver's cached matmul mode state (last_dt/warmed), so a following same-dtype matmul
+ * skips its reset/re-warm and can wedge (errno=110). These expose the two candidate mitigations:
+ *   ork_npu_mode_invalidate — clear the cached mode state only (next matmul re-warms itself; no HW reset).
+ *   ork_npu_mode_reset      — explicit HW ACT_RESET + invalidate (heavyweight, always safe). */
+void         ork_npu_mode_invalidate(ork_npu *ctx);
+void         ork_npu_mode_reset(ork_npu *ctx);
+
+/* FUSED SSD-SCAN MATMUL BENCH (SSM-on-NPU RE): chain one Mamba-2/SSD layer's group-batched scan matmuls
+ * into ONE PC-chained submit with resident all-ones operands, vs the same matmuls as N separate submits.
+ * Measures the per-submit-floor amortization of the fused on-NPU scan. fused_us/persub_us = per-iter wall;
+ * ok_out=1 if the fused chain is bit-correct (every output==K). Returns 0/ok, <0 error. Board only. */
+/* (b) layout probe: one fp16 matmul via the raw-synth fused-chain mechanism with ROW-MAJOR operands
+ * A[M,K],B[K,N]->C[M,N] fp32 — decides if a real-operand fused SSD scan can stage row-major directly.
+ * K%32,N%16. 0/ok,<0. rk3588 diagnostic. */
+int          ork_ssd_probe_rawmm_f16(ork_npu *c,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
+int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
+                                      double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
+
 #endif

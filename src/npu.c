@@ -88,6 +88,16 @@ static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
 static long   g_prof_submits = 0;       /* total RKNPU_SUBMIT ioctls */
 static long   g_prof_submit_progs = 0;  /* total PC-chained programs across all submits (>= submits) */
 static long   g_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
+/* FLOOR-DECOMP instrumentation (always-on, ~40ns/submit): decompose the per-submit floor.
+ * g_fd_ioctl_us = wall time inside the SUBMIT ioctl (kernel job setup + NPU + completion-wait, blocking).
+ * g_fd_hw_us    = SUM of the kernel-reported sub->hw_elapse_time (the HW's own NPU-busy view) — ork never
+ * read this field before. Comparing the two splits the ioctl wall into real-NPU vs driver-wait/dispatch.
+ * Read via ork_npu_floor_timing(); reset via ork_npu_floor_reset(). Raw units of hw_elapse are captured
+ * separately (g_fd_hw_raw) so the probe can infer ns-vs-us. */
+static double g_fd_ioctl_us = 0;   /* sum wall-us inside the SUBMIT ioctl */
+static double g_fd_hw_us = 0;      /* sum of sub->hw_elapse_time (as reported) */
+static long long g_fd_hw_raw_last = 0; /* last raw hw_elapse_time value (for unit inference) */
+static long   g_fd_n = 0;          /* number of SUBMIT ioctls timed */
 #define ORK_MAXCORE 4   /* RK3576=2, RK3588=3; headroom for future parts. Actual = soc->cores. */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; int domain; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. domain: the iommu domain this buffer's IOVA was reserved in (for the IOVA wedge-guard accounting; set by bcreate/bimport, released by bdestroy). */
@@ -599,7 +609,10 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
                     g_bcreate_n, g_bimport_n, g_bdestroy_n, g_bcreate_n+g_bimport_n-g_bdestroy_n);
             fflush(tf); fsync(fileno(tf)); }
     }
+    double _fd_t0 = ork_now_us();
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
+    { double _fd_dt = ork_now_us() - _fd_t0; g_fd_ioctl_us += _fd_dt; g_fd_hw_raw_last = (long long)sub->hw_elapse_time;
+      g_fd_hw_us += (double)sub->hw_elapse_time; g_fd_n++; }
     if (rc < 0) {
         int e = errno;
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
@@ -848,6 +861,10 @@ static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
 /* EW-mul RE submit timeout (ms). ORK_EW_TIMEOUT lets the wedge-search fail fast (~1-2s) instead of 60s —
  * a working op completes in ~100us, so a short guard is safe; the kernel soft-resets on timeout either way. */
 static unsigned ew_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_EW_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
+/* Matmul-path submit timeout (ms). ORK_MM_TIMEOUT lets a mode-transition wedge-search fail fast (~1-2s)
+ * instead of the 60s job timeout — the kernel soft-resets on timeout either way, so a short guard is safe
+ * for RE. Default 60000 (unchanged production behavior). Mirrors ew_timeout_ms for the run/chain paths. */
+static unsigned mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_MM_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
 
 /* Generalize the standalone element-wise MUL op (REGCMD_MUL{,_F16,_I16}) from the captured M=8,N=64 geometry
  * to arbitrary (M tokens = RDMA width, N channels). Derived by capturing the op at N=128 and M=16 and diffing:
@@ -2782,7 +2799,7 @@ static int submit1(ork_npu *c){
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
-    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=60000;
+    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
         if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
         bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
@@ -2852,7 +2869,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
         struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;
         sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        sub.timeout=60000;
+        sub.timeout=mm_timeout_ms();
         if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){ a->rc=-1; return; } }
         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
     }
@@ -3044,7 +3061,7 @@ static void *mcworker(void *vp){
                         sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
                         sub.core_mask=1u<<i;
                         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
-                        sub.timeout=60000;
+                        sub.timeout=mm_timeout_ms();
                         if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
                         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                     }
@@ -3227,7 +3244,7 @@ static void *mcworker(void *vp){
                     sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
                     sub.core_mask=1u<<i;
                     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
-                    sub.timeout=60000;
+                    sub.timeout=mm_timeout_ms();
                     if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
                     bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                 }
@@ -3321,7 +3338,7 @@ static void *mcworker(void *vp){
                         for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
                             struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)p; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1; sub.core_mask=1u<<i;
                             sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)p};
-                            sub.timeout=60000;
+                            sub.timeout=mm_timeout_ms();
                             if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
                             bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
                         }
@@ -3491,6 +3508,22 @@ static double ork_now_us(void);   /* defined below */
  * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
 static double g_rt_setup=0, g_rt_submit=0, g_rt_copy=0; static long g_rt_n=0;
 void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n){ if(setup)*setup=g_rt_setup; if(submit)*submit=g_rt_submit; if(copy)*copy=g_rt_copy; if(n)*n=g_rt_n; }
+/* FLOOR-DECOMP accessors: ioctl_us = total wall inside SUBMIT ioctls; hw_us = total sub->hw_elapse_time as
+ * reported by the kernel (raw units — see hw_raw_last); n = count. See globals near g_fd_ioctl_us. */
+void ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n){
+    if(ioctl_us)*ioctl_us=g_fd_ioctl_us; if(hw_us)*hw_us=g_fd_hw_us; if(hw_raw_last)*hw_raw_last=g_fd_hw_raw_last; if(n)*n=g_fd_n; }
+void ork_npu_floor_reset(void){ g_fd_ioctl_us=0; g_fd_hw_us=0; g_fd_hw_raw_last=0; g_fd_n=0; }
+/* MODE-TRANSITION RE hooks (mode_probe.c). The standalone SDP ops (ork_npu_ewmul_*, act_lut_i16 →
+ * exp/silu/…) reprogram the pipeline (their own ACT_RESET + SDP regcmd) but leave c->last_dt / c->warmed
+ * untouched, so a following SAME-dtype matmul sees dt==last_dt and SKIPS its reset/re-warm — running a
+ * matmul regcmd on an SDP-configured pipeline. These expose the two candidate fixes so the probe can
+ * measure which is sufficient:
+ *   _invalidate: clear the cached mode state ONLY (last_dt=-1, warmed=0, per-core mwarm=0) — the next
+ *                matmul then takes its own reset/re-warm path (fp16 entry = warmed=0 re-warm, int8 entry =
+ *                ACT_RESET). No explicit HW reset here. Tests whether re-warm alone clears the wedge.
+ *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
+void ork_npu_mode_invalidate(ork_npu *c){ if(!c) return; c->last_dt=-1; c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++) c->mwarm[i]=0; }
+void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0); ork_npu_mode_invalidate(c); }
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     const double ts=ork_now_us();
@@ -3750,7 +3783,7 @@ static void *i4_mcworker(void *vp){
                         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                         int reps = c->mwarm[i] ? 1 : 2;
                         for (int rep = 0; rep < reps; rep++) {
-                            int last = (rep == reps - 1); sub.timeout = 60000;
+                            int last = (rep == reps - 1); sub.timeout = mm_timeout_ms();
                             if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) { a->rc = -1; c->mc_error = 1; break; } continue; }
                             bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
                         }
@@ -3829,7 +3862,7 @@ static void *i4_mcworker(void *vp){
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, ntask};
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
-                    sub.timeout = 60000;
+                    sub.timeout = mm_timeout_ms();
                     if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
                         if (last) {
                             a->rc = -1;
@@ -3978,7 +4011,7 @@ static void *i4_mcworker_g(void *vp){
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
-                    sub.timeout = 60000;
+                    sub.timeout = mm_timeout_ms();
                     if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
                         if (last) {
                             a->rc = -1;
@@ -4785,7 +4818,7 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
+    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -4813,7 +4846,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=60000;   /* rep0 warmup (cold buffer stale), rep1 real */
+    for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();   /* rep0 warmup (cold buffer stale), rep1 real */
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
@@ -4846,7 +4879,7 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=60000;   /* rep0/1 warmup, rep2 timed */
+    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -4883,7 +4916,7 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=60000;
+    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();
         double t0=ork_now_us();
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -5922,11 +5955,23 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * 27 dmesg entries), not hardware wedges (errno=110 count = 0 in a full chain run). Removing it: int16
      * chain prefill 28->68 tok/s, PPL 19.02 unchanged, 0 real wedges. Default OFF; ORK_I16_RESET re-enables. */
     if(getenv("ORK_I16_RESET")) act(fd,RKNPU_ACT_RESET,0);
+    /* MODE-TRANSITION FIX (mode_probe RE): this LUT op memsets the SHARED c->task to its own SDP descriptor
+     * (regcfg_amount 1097 then 69, enable_mask 0x18) and previously left it that way. The single-core matmul
+     * path (run()/submit1) does NOT rebuild c->task — it relies on the init value (regcfg_amount=108,
+     * enable_mask=0xd, regcmd_addr=c->regcmd.dma) persisting. So a later SINGLE-CORE matmul (e.g. the SSD
+     * CumBA bmm, N=16) submitted a 108-word matmul regcmd under this stale 69-reg/0x18 SDP task -> the NPU
+     * dispatched no task (task counter 0x0) -> errno=110 wedge that ACT_RESET can't clear (poisoned software
+     * descriptor, not HW state). The plain 2-input SDP ops (ewmul/add) never wedged because they already
+     * save+restore these fields. Save them here and restore on every exit, exactly like ewmul. */
+    struct rknpu_task *tk0=(struct rknpu_task*)c->task.cpu;
+    uint32_t sv_amt=tk0->regcfg_amount, sv_en=tk0->enable_mask; uint64_t sv_addr=tk0->regcmd_addr;
+    #define SILU_RESTORE_TASK() do{ tk0->regcfg_amount=sv_amt; tk0->enable_mask=sv_en; tk0->regcmd_addr=sv_addr; \
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }
+      if(rknpu_submit_ioctl(fd,&sub,dom)){ SILU_RESTORE_TASK(); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -5943,8 +5988,10 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
         fflush(stderr); }
     if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
+    SILU_RESTORE_TASK();     /* leave the shared c->task as the matmul path expects (see save above) */
     bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
     #undef EWCUBEH
+    #undef SILU_RESTORE_TASK
     return ok;
 }
 
@@ -6061,7 +6108,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -6078,7 +6125,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       int ok=-1; double t1=0;
-      for(int rep=0;rep<3;rep++){ sub.timeout=60000; double t0=ork_now_us();
+      for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms(); double t0=ork_now_us();
           if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
           bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
       if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
@@ -6496,7 +6543,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     for(int i=0;i<ntask;i++){memset(&t[i],0,sizeof t[i]);t[i].flags=0;t[i].op_idx=i;t[i].enable_mask=0xd;t[i].int_mask=0x300;t[i].int_clear=0x1ffff;t[i].regcfg_amount=108;t[i].regcmd_addr=c->regcmd.dma + i * sizeof(rc);}
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=60000;
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
@@ -6537,7 +6584,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=60000;
+    for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
@@ -6595,7 +6642,7 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
         struct buf extra[2] = {W, O};
         if (validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        sub.timeout=60000; ok=-1;
+        sub.timeout=mm_timeout_ms(); ok=-1;
         for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
             bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
@@ -6714,7 +6761,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     
     int ok = -1;
     for (int rep = 0; rep < 2; rep++) {
-        sub.timeout = 60000;
+        sub.timeout = mm_timeout_ms();
         if (rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
         bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         for (int i = 0; i < S; i++) {
@@ -6814,7 +6861,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     sub.core_mask = RKNPU_CORE0_MASK;
     sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
-    sub.timeout = 60000;
+    sub.timeout = mm_timeout_ms();
     if (rknpu_submit_ioctl(fd, &sub, -1)) {
         perror("Warmup failed");
     }
@@ -7236,7 +7283,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int reps = c->warmed ? 1 : 2;
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
-        sub.timeout = 60000;
+        sub.timeout = mm_timeout_ms();
         if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
     }
@@ -7377,6 +7424,109 @@ int ork_npu_chain_selftest(ork_npu *c, int *t0_cnt, int *t1_cnt){
     return 0;
 }
 
+/* FUSED SSD-SCAN MATMUL BENCH: chain ALL grouped-scan matmuls of ONE Mamba-2/SSD layer into a SINGLE
+ * PC-chained submit with RESIDENT all-ones operands (no per-batch repack), vs the SAME matmuls as N
+ * separate submits (each paying the ~48µs per-submit floor). Isolates the floor-amortization the fused
+ * on-NPU scan graph would get. All-ones int8 => every output element == its own K, so a fused-chain
+ * output that differs signals a wedge/miscompute. Group-batched shapes (L-factorization; Y_diag grouped):
+ *   scores  [CS, Nst]x[Nst, CS]      cstate  [HG*P, CS]x[CS, Nst]
+ *   Ydiag_g [CS, CS]x[CS, HG*P]      Y_off   [HG*P, Nst]x[Nst, CS]
+ * each x (G*NC) batches. M<=HG*P fits ONE M-tile at these K (mcap(K=64)=10496). Returns 0/ok, <0 on
+ * error; fills *fused_us/*persub_us (per-iter wall) and *ok_out (1 = fused chain bit-correct). Board only. */
+int ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
+                             double *fused_us,double *persub_us,int *ok_out){
+    if(!c) return -1; if(iters<1) iters=1;
+    int HG=H/G; if(HG<1)HG=1;
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=-1;
+    int f16 = (dtype==DT_F16);
+    int esz = f16 ? 2 : 1;                 /* A/B element size (fp16=2B, int8=1B); C is 4B either way */
+    int gb=G*NC;
+    /* per-stage (nb, M, K, N). scores/cstate/Y_off group-batched (fp16-stable). Y_diag: perhead=1 uses
+     * the fp16-STABLE bounded per-head form (nb=H*NC, [CS,CS]x[CS,P]); perhead=0 uses the fast group-
+     * batched L-factored form (nb=G*NC, [CS,CS]x[CS,HG*P]) — faster but OVERFLOWS fp16 at large chunk decay. */
+    int snb[4]={gb, gb, gb, perhead?H*NC:gb};
+    int sM[4] ={CS, HG*P, HG*P, CS};
+    int sK[4] ={Nst, CS,  Nst,  CS};
+    int sN[4] ={CS, Nst,  CS,   perhead?P:HG*P};
+    /* TILE cap: a single synth program mis-writes some dims at width==1024 (power-of-2 ISA quirk in the raw
+     * synth path — run_i8 avoids it via its own tiling). Cap per-program M and N at TILE, M/N-tiled programs. */
+    int TILE=512;
+    int np=0; for(int s=0;s<4;s++){ int nm=(sM[s]+TILE-1)/TILE, nn=(sN[s]+TILE-1)/TILE; np+=nm*nn*snb[s]; }
+    if(np<1||np>1024) return -2;
+    int *tM=malloc(np*sizeof(int)),*tK=malloc(np*sizeof(int)),*tN=malloc(np*sizeof(int));
+    size_t *cOff=malloc(np*sizeof(size_t));
+    if(!tM||!tK||!tN||!cOff){ free(tM);free(tK);free(tN);free(cOff); return -3; }
+    size_t maxA=0,maxB=0,totC=0; int t=0;
+    for(int s=0;s<4;s++) for(int b=0;b<snb[s];b++){
+        int fullM=sM[s], fullN=sN[s];
+        for(int m0=0;m0<fullM;m0+=TILE) for(int n0=0;n0<fullN;n0+=TILE){
+            int Mc=(fullM-m0<TILE)?(fullM-m0):TILE, Nc=(fullN-n0<TILE)?(fullN-n0):TILE;
+            tM[t]=Mc; tK[t]=sK[s]; tN[t]=Nc;
+            cOff[t]=totC; totC+=(size_t)Mc*Nc;                 /* each tile -> its own dense [Mc,Nc] region */
+            size_t a=(size_t)Mc*sK[s], bb=(size_t)sK[s]*Nc;
+            if(a>maxA)maxA=a; if(bb>maxB)maxB=bb; t++;
+        }
+    }
+    struct buf Ab=bcreate(fd,maxA*esz,0x403,dom), Bb=bcreate(fd,maxB*esz,0x403,dom), Cb=bcreate(fd,totC*4,0x403,dom);
+    uint32_t *rcs=malloc((size_t)np*REGCMD_I8_N*4);
+    ork_chain_prog *progs=malloc(np*sizeof(ork_chain_prog));
+    int ret=0;
+    if(!Ab.cpu||!Bb.cpu||!Cb.cpu||!rcs||!progs){ ret=-3; goto done; }
+    if(f16){ uint16_t*pa=Ab.cpu,*pb=Bb.cpu; for(size_t i=0;i<maxA;i++)pa[i]=0x3c00; for(size_t i=0;i<maxB;i++)pb[i]=0x3c00; }  /* fp16 1.0 */
+    else   { memset(Ab.cpu,1,maxA); memset(Bb.cpu,1,maxB); }
+    memset(Cb.cpu,0,totC*4);
+    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    for(int i=0;i<np;i++){
+        uint32_t *rc=rcs+(size_t)i*REGCMD_I8_N;
+        uint32_t aC=(uint32_t)(Cb.dma+cOff[i]*4);
+        if(f16) synth   (rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF);      /* fp16, dense [M,Nc] out */
+        else    synth_i8(rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF,0);    /* int8, dense [M,Nc] out */
+        progs[i]=(ork_chain_prog){rc,REGCMD_I8_N,0xd,108,216};
+    }
+    /* fp16 needs the NPU in fp16 mode: force a reset on entry (the int8-oriented chain assembler keeps
+     * warm across ORK_I8_LIVE markers, so an int8->fp16 switch would otherwise skip the reset). */
+    if(f16){ act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16; }
+    /* FUSED: one chained submit of all np matmul programs */
+    int rc1=ork_npu_chain_progs(c,np,progs,dom);   /* warm + wedge-check */
+    if(rc1){ ret=rc1; goto done; }
+    { double f0=ork_now_us(); for(int it=0;it<iters;it++) ork_npu_chain_progs(c,np,progs,dom); *fused_us=(ork_now_us()-f0)/iters; }
+    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE);
+    { int okc=1; int32_t*Ci=(int32_t*)Cb.cpu; float*Cf=(float*)Cb.cpu;
+      for(int i=0;i<np&&okc;i++){ size_t mn=(size_t)tM[i]*tN[i];
+        for(size_t e=0;e<mn;e++){ double got = f16 ? (double)Cf[cOff[i]+e] : (double)Ci[cOff[i]+e];
+          if(got!=(double)tK[i]){ if(getenv("ORK_SSD_DBG")) fprintf(stderr,"[ssd_fused] mismatch prog %d/%d M=%d K=%d N=%d elem %zu: got %g exp %d\n",i,np,tM[i],tK[i],tN[i],e,got,tK[i]); okc=0;break; } } }
+      if(ok_out)*ok_out=okc; }
+    /* PER-SUBMIT: the SAME programs as np separate single-task submits (each pays the floor) */
+    { double p0=ork_now_us(); for(int it=0;it<iters;it++) for(int i=0;i<np;i++) ork_npu_chain_progs(c,1,&progs[i],dom); *persub_us=(ork_now_us()-p0)/iters; }
+done:
+    bdestroy(fd,&Ab);bdestroy(fd,&Bb);bdestroy(fd,&Cb);
+    free(rcs);free(progs);free(tM);free(tK);free(tN);free(cOff);
+    return ret;
+}
+
+/* (b) LAYOUT PROBE: run ONE fp16 matmul through the exact fused-chain mechanism (raw synth + a single
+ * ork_npu_chain_progs task) with ROW-MAJOR resident operands A[M,K],B[K,N] → C[M,N] fp32. Decides
+ * whether a real-operand fused SSD scan can stage row-major operands directly, or must replicate the
+ * ork_mm_pack 32x32-block tiling. K%32,N%16. 0/ok,<0 err. rk3588. Diagnostic — not a production path. */
+int ork_ssd_probe_rawmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
+    if(!c||M<1||K<1||N<1||K%32||N%16) return -2;
+    int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=-1,ret=0;
+    struct buf Ab=bcreate(fd,(size_t)M*K*2,0x403,dom),Bb=bcreate(fd,(size_t)K*N*2,0x403,dom),Cb=bcreate(fd,(size_t)M*N*4,0x403,dom);
+    if(!Ab.cpu||!Bb.cpu||!Cb.cpu){ ret=-3; goto done; }
+    memcpy(Ab.cpu,A,(size_t)M*K*2); memcpy(Bb.cpu,B,(size_t)K*N*2); memset(Cb.cpu,0,(size_t)M*N*4);
+    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
+    { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done; }
+      synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)Bb.dma,(uint32_t)Cb.dma,1,CBUF);
+      ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
+      ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
+    if(ret) goto done;
+    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
+done:
+    bdestroy(fd,&Ab);bdestroy(fd,&Bb);bdestroy(fd,&Cb);
+    return ret;
+}
+
 /* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
  * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
  * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool
@@ -7420,7 +7570,7 @@ static void *stream_worker(void *vp) {
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
         sub.flags = ork_ppflags(); sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
-        sub.timeout = 60000;
+        sub.timeout = mm_timeout_ms();
         /* A freshly-allocated NPU output buffer returns stale on its FIRST write, so prime THIS core's
          * output buffer with a throwaway submit on its first use (mirror mcworker's reps=c->mwarm[i]?1:2).
          * Per-core + deterministic: the old coarse whole-stream 2-pass could miss a core whose buffer the
@@ -7594,7 +7744,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     int reps = c->warmed ? 1 : 2;
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
-        sub.timeout = 60000;
+        sub.timeout = mm_timeout_ms();
         if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { ok = -1; goto cleanup; } continue; }
         bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
@@ -8042,7 +8192,7 @@ static void *stream_worker_i4(void *vp) {
                 sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                 int reps = c->mwarm[i] ? 1 : 2;
-                for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = 60000;
+                for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = mm_timeout_ms();
                     if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
                     bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE); }
                 c->mwarm[i] = 1;
@@ -8086,7 +8236,7 @@ static void *stream_worker_i4(void *vp) {
         int reps = c->mwarm[i] ? 1 : 2;
         for (int rep = 0; rep < reps; rep++) {
             int last = (rep == reps - 1);
-            sub.timeout = 60000;
+            sub.timeout = mm_timeout_ms();
             if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
             bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         }
