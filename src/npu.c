@@ -8065,6 +8065,22 @@ static int ork_ssm_cs(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_S
  * dispatch of nh*NC matmuls (instead of nh, NC times). Only the CPU inter-chunk carry stays sequential.
  * Cuts NPU dispatches from 4*NC to 4 (fewer pool wake-ups, better floor amortization). fp16-only. */
 static int ork_ssm_batch(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_BATCH"); v=e?atoi(e):0;} return v; }
+/* ORK_SSM_PIPELINE: double-buffer the scan — the G-independent operands (aC/bD/bO/bC, for pD/pC/pO) are
+ * marshalled on a helper thread (free 4th big core) WHILE the pS matmul runs on cores 0-2, so the ~47% CPU
+ * marshalling hides behind the NPU submit instead of adding to it. Only aD (needs pS's G) stays serial. */
+static int ork_ssm_pipeline(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_PIPELINE"); v=e?atoi(e):0;} return v; }
+struct ssm_marshal_arg { ork_f16 *aC,*bD,*bO,*bC; const double *xbar,*Acs; const float *state,*B;
+                         int nh,nr,nc,CS,ng,hpg,base,nt,seq; };
+static void *ssm_marshal_gi(void *vp){   /* G-independent operand build (aC,bD,bO,bC); runs during the pS submit */
+    struct ssm_marshal_arg *m=vp; int nh=m->nh,nr=m->nr,nc=m->nc,CS=m->CS,hpg=m->hpg,base=m->base,nt=m->nt,seq=m->seq,ng=m->ng;
+    for(int h=0;h<nh;h++){ int g=h/hpg; const double *Ah=m->Acs+(size_t)h*CS;
+        for(int i1=0;i1<nr;i1++)for(int sp=0;sp<CS;sp++) m->aC[((size_t)h*nr+i1)*CS+sp]=(ork_f16)m->xbar[((size_t)h*CS+sp)*nr+i1];
+        for(int l=0;l<CS;l++)for(int i1=0;i1<nr;i1++) m->bD[((size_t)h*CS+l)*nr+i1]=(ork_f16)m->xbar[((size_t)h*CS+l)*nr+i1];
+        for(int n=0;n<nc;n++)for(int i1=0;i1<nr;i1++) m->bO[((size_t)h*nc+n)*nr+i1]=(ork_f16)m->state[((size_t)h*nr+i1)*nc+n];
+        for(int sp=0;sp<CS;sp++){ int t=base+sp; double ds=exp(Ah[CS-1]-Ah[sp]); const float *Bc=(t<nt)?m->B+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
+            for(int n=0;n<nc;n++) m->bC[((size_t)h*CS+sp)*nc+n]=(ork_f16)(Bc?ds*Bc[n]:0.0); } }
+    return NULL;
+}
 /* ORK_SSM_PROF: per-section accounting for ork_ssm_scan_f32 (accumulated across calls, dumped at teardown). */
 static int g_ssm_prof=-1;
 static double g_ssm_prep,g_ssm_stage,g_ssm_repack,g_ssm_npu,g_ssm_post,g_ssm_stg[4]; static long g_ssm_calls;
@@ -8225,6 +8241,51 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
         g_ssm_post+=_NOW-_t;
       }
       #undef STGB
+    } else if(ork_ssm_pipeline()){
+      /* DOUBLE-BUFFERED per-chunk: helper thread marshals aC/bD/bO/bC during the pS submit. */
+      for(int seq=0; seq<ns && !ret; seq++){
+        for(size_t i=0;i<(size_t)nh*nr*nc;i++) state[i]=s0[(size_t)seq*nh*nr*nc+i];
+        memset(stp,0,(size_t)nh*nr*nc*4); memset(Aclp,0,nh*8);
+        for(int cc=0;cc<NC;cc++){ int base=cc*CS; double _t=_NOW;
+            for(int h=0;h<nh;h++){ double run=0,ah=A[h];
+                for(int l=0;l<CS;l++){ int t=base+l; double dtv=(t<nt)?ork_softplus(dt[(size_t)(seq*nt+t)*nh+h]):0.0;
+                    run+=dtv*ah; Acs[(size_t)h*CS+l]=run;
+                    for(int i1=0;i1<nr;i1++) xbar[((size_t)h*CS+l)*nr+i1]=(t<nt)?dtv*x[((size_t)(seq*nt+t)*nh+h)*nr+i1]:0.0; }
+                Acl[h]=Acs[(size_t)h*CS+CS-1]; }
+            if(cc>0) for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; state[j]=(float)(dp*state[j]+stp[j]); } }
+            g_ssm_prep+=_NOW-_t; _t=_NOW;
+            for(int h=0;h<nh;h++){ int g=h/hpg;                                 /* pS operands only (serial) */
+                for(int l=0;l<CS;l++){ int t=base+l; const float *Cc=(t<nt)?C+((size_t)(seq*nt+t)*ng+g)*nc:NULL;
+                    for(int n=0;n<nc;n++){ ork_f16 v=Cc?(ork_f16)Cc[n]:(ork_f16)0.0f; aS[((size_t)h*CS+l)*nc+n]=v; aO[((size_t)h*CS+l)*nc+n]=v; } }
+                for(int n=0;n<nc;n++)for(int sp=0;sp<CS;sp++){ int t=base+sp; bS[((size_t)h*nc+n)*CS+sp]=(t<nt)?(ork_f16)B[((size_t)(seq*nt+t)*ng+g)*nc+n]:(ork_f16)0.0f; } }
+            g_ssm_stage+=_NOW-_t;
+            struct ssm_marshal_arg ha={aC,bD,bO,bC,xbar,Acs,state,B,nh,nr,nc,CS,ng,hpg,base,nt,seq};   /* helper: G-independent operands */
+            pthread_t ht; int hstarted=(pthread_create(&ht,NULL,ssm_marshal_gi,&ha)==0);
+            if(!hstarted) ssm_marshal_gi(&ha);
+            double _r=_NOW;                                                     /* pS dispatch (inline; join helper before any error) */
+            for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pS[h],nc,CS,bS+(size_t)h*nc*CS)){ if(hstarted)pthread_join(ht,NULL); ret=-1; goto done2; }
+                tk[h]=(ork_mm_task_f16){pS[h],CS,aS+(size_t)h*CS*nc,G+(size_t)h*CS*CS}; }
+            double _q=_NOW; g_ssm_repack+=_q-_r;
+            int prc=(ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,nh,tk);
+            double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[0]+=_e-_r;
+            if(hstarted)pthread_join(ht,NULL);
+            if(prc){ret=-1;goto done2;}
+            _t=_NOW;
+            for(int h=0;h<nh;h++){ const double *Ah=Acs+(size_t)h*CS;           /* aD (needs G) serial */
+                for(int l=0;l<CS;l++)for(int sp=0;sp<CS;sp++){ double m=(sp<=l)?(double)G[((size_t)h*CS+l)*CS+sp]*exp(Ah[l]-Ah[sp]):0.0; aD[((size_t)h*CS+l)*CS+sp]=(ork_f16)m; } }
+            g_ssm_stage+=_NOW-_t;
+            STG(1,pD,CS,CS,nr,aD,bD,Yd);
+            STG(2,pC,nr,CS,nc,aC,bC,cs);
+            STG(3,pO,CS,nc,nr,aO,bO,tmp);
+            _t=_NOW;
+            for(int h=0;h<nh;h++){ const double *Ah=Acs+(size_t)h*CS;
+                for(int l=0;l<CS;l++){ int t=base+l; if(t>=nt)continue; double sdo=exp(Ah[l]);
+                    for(int i1=0;i1<nr;i1++) y[((size_t)(seq*nt+t)*nh+h)*nr+i1]=Yd[((size_t)h*CS+l)*nr+i1]+tmp[((size_t)h*CS+l)*nr+i1]*sdo; } }
+            g_ssm_post+=_NOW-_t;
+            memcpy(stp,cs,(size_t)nh*nr*nc*4); memcpy(Aclp,Acl,nh*8);
+        }
+        for(int h=0;h<nh;h++){ double dp=exp(Aclp[h]); for(size_t i=0;i<(size_t)nr*nc;i++){ size_t j=(size_t)h*nr*nc+i; s_new[(size_t)seq*nh*nr*nc+j]=(float)(dp*state[j]+stp[j]); } }
+      }
     } else {
     for(int seq=0; seq<ns && !ret; seq++){
         for(size_t i=0;i<(size_t)nh*nr*nc;i++) state[i]=s0[(size_t)seq*nh*nr*nc+i];
