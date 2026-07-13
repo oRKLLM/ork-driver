@@ -7885,6 +7885,68 @@ int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     c->warmed=1;
     return rc;
 }
+/* ---- SMALL-K int8 ROUND-ROBIN STREAM (ork_mm_run_stream_i8_sk) — int8 twin of run_stream_f16 ----
+ * run_stream_i8 is full-K only (K%512, 0x1040 schedule); this handles the scan's small single-slice int8
+ * matmuls (K%32,N%16) with the SAME 3-core round-robin batching the fp16 scan uses. Per-core: memcpy int8
+ * A -> maf, synth_i8, submit on core i, copy int32 C out. Caller quantizes A + dequants int32. */
+struct streamw_i8sk { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
+static void *stream_worker_i8sk(void *vp){
+    struct streamw_i8sk *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, CBUF=c->soc->cbuf_elems;
+    pin_big_core(i);
+    int k; a->rc=0;
+    uint32_t rc[REGCMD_I8_N];
+    while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->S){
+        const ork_mm_task_i8 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
+        int sched=(K&(K-1))==0 && K>=256 && K<2048;   /* int8 0x1040 sched zeros output for K<256 -> off at small K */
+        memcpy(c->maf[i].cpu, t->A, (size_t)M*K); bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(rc,0,REGCMD_I8_N*4);
+        synth_i8(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
+        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
+        mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
+        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+        sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        sub.timeout=mm_timeout_ms();
+        int reps=c->mwarm[i]?1:2;
+        for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+        c->mwarm[i]=1;
+        memcpy(t->C, c->mcc[i].cpu, (size_t)M*N*4);   /* int32 output */
+    }
+    return NULL;
+}
+int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+    if(!c||S<1||!tasks) return -2;
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    size_t maxMK=0, maxMN4=0;
+    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
+        if(!w||w->dtype!=DT_I8||tasks[i].M<=0) return -2;
+        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice int8 (K<=ks,N<=nmax) */
+        if(w->K%32||w->N%16) return -2;
+        size_t mk=(size_t)tasks[i].M*w->K, mn=(size_t)tasks[i].M*w->N*4;
+        if(mk>maxMK)maxMK=mk; if(mn>maxMN4)maxMN4=mn; }
+    int fd=c->fd;
+    /* int8-live entry (last_dt=3); keep-warm across int8<->fp16 stage transitions under ORK_SSM_KEEPWARM */
+    if(c->last_dt!=3){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++){ if(!kw)c->mwarm[i]=0; } c->last_dt=3; }
+    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(mc_ensure(c,nc)) return -1;
+    for(int i=0;i<nc;i++){
+        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+    int rc=0; npu_pool_ensure(c);
+    struct streamw_i8sk sw[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) sw[i]=(struct streamw_i8sk){c,i,S,tasks,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=sw; c->pjob_nc=nc; c->pjob_fn=stream_worker_i8sk; c->pjob_stride=sizeof(struct streamw_i8sk);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    stream_worker_i8sk(&sw[0]);                    /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    for(int i=0;i<nc;i++) if(sw[i].rc) rc=-1;
+    c->warmed=1;
+    return rc;
+}
 /* STREAMED batched fp16 GEMM — pack each B (fp16), dispatch the nb matmuls round-robin across cores. */
 int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||nb<1||M<1||K<1||N<1||K%32||N%16) return -2;
@@ -7935,11 +7997,16 @@ static int ssm_stg_i8(ork_npu *c, ork_w **pool, int M,int K,int N,
             for(int k=0;k<K;k++){ float v=fabsf((float)r[k]); if(v>mx)mx=v; }
             as[m]=mx/127.0f; float inv=127.0f/mx; int8_t *o=Ai+(size_t)m*K;
             for(int k=0;k<K;k++){ int q=(int)lrintf((float)r[k]*inv); if(q>127)q=127; if(q<-127)q=-127; o[k]=(int8_t)q; } }
+        c->ssm_tki8[h]=(ork_mm_task_i8){pool[h],M,Ai,ci32+(size_t)h*M*N};
     }
-    /* run_stream_i8 is full-K only (K%512); scan K is tiny -> per-head single-core run_i8 (coherence test).
-     * A small-K int8 batched-multicore stream (int8 twin of run_stream_f16) is the speed follow-up. */
-    for(int h=0;h<nh;h++){ int rr=ork_mm_run_i8(c,pool[h],M,ai8+(size_t)h*M*K,ci32+(size_t)h*M*N);
-        if(rr){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] run_i8 h=%d rc=%d\n",h,rr); ret=-1; goto done; } }
+    /* small-K int8 batched 3-core stream (ORK_SSM_I8_PERHEAD=1 forces the per-head single-core path for A/B) */
+    if(getenv("ORK_SSM_I8_PERHEAD")){
+        for(int h=0;h<nh;h++){ int rr=ork_mm_run_i8(c,pool[h],M,ai8+(size_t)h*M*K,ci32+(size_t)h*M*N);
+            if(rr){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] run_i8 h=%d rc=%d\n",h,rr); ret=-1; goto done; } }
+    } else {
+        int rr=ork_mm_run_stream_i8_sk(c,nh,c->ssm_tki8);
+        if(rr){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] run_stream_i8_sk nh=%d M=%d K=%d N=%d rc=%d\n",nh,M,K,N,rr); ret=-1; goto done; }
+    }
     for(int h=0;h<nh;h++){ const int32_t *ci=ci32+(size_t)h*M*N; const float *as=ascale+(size_t)h*M,*bs=bscale+(size_t)h*N; float *co=Cop+(size_t)h*M*N;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) co[(size_t)m*N+n]=(float)ci[(size_t)m*N+n]*as[m]*bs[n]; }
 done:

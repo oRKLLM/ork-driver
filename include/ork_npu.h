@@ -739,6 +739,10 @@ int          ork_mm_run_i4_incr(ork_npu *ctx, ork_w *w, int M, const int8_t *A, 
 /* Async round-robin stream: S independent int8 matmuls dispatched dynamically across NPU cores (pull
  * model, no barrier). For batches of independent matmuls (e.g. EAGLE-3 verification). 0/ok, -1/-2 err. */
 int          ork_mm_run_stream_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+/* SMALL-K int8 round-robin stream (int8 twin of run_stream_f16): S single-slice int8 matmuls (K%32,N%16,
+ * NOT the K%512 full-K path) across NPU cores; A int8 [M,K] per task, C int32 [M,N]. For the on-NPU SSM
+ * scan's per-head gram/output stages (tiny K) with 3-core batching. Caller quantizes A + dequants int32. */
+int          ork_mm_run_stream_i8_sk(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
 /* int4 (W4A4) async round-robin stream: S independent matmuls across NPU cores (a task's M rows become M
  * single-row regcmds PC-chained on its core). Weights single-slice (Sn==1 && Sk==1). 0/ok, -1/-2 err. */
 int          ork_mm_run_stream_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
