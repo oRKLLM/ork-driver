@@ -1653,6 +1653,22 @@ int ork_mm_repack_i8(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
+/* Re-tile fp16 B[K,N] (row-major) into an EXISTING fp16 ork_w (from ork_mm_f16_scratch/ork_mm_pack, same
+ * K,N) — no bcreate/bdestroy. The fp16 twin of ork_mm_repack_i8: lets a caller keep a persistent weight
+ * POOL and refresh its data per chunk (kills the per-matmul IOMMU alloc/free churn). fp16 tile layout
+ * [Nt][Kt][16][32] (KS=soc->ks). Bb only (the scan is single-slice small-K; no full-K Bf). 0/ok,<0. */
+int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
+    if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
+    if(w->K!=K || w->N!=N) return -2;
+    int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1; f16*bb=b->cpu;
+        for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+            bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    return 0;
+}
 /* ---- Diagnostic only (tools/dmabuf_fill_probe.c): a load_i8 variant whose resident Bb tiles are
  * allocated with a CALLER-CHOSEN rknpu mem flag (0x401 WC vs 0x403 cacheable), so the probe can A/B
  * the weight-fill bandwidth AND the NPU read correctness for each flag. Allocates + leaves the blob
@@ -7568,7 +7584,11 @@ int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*
     if(!w||!Ab.cpu||!Cb.cpu||!rcs||!progs){ ret=-3; goto done3; }
     memcpy(Ab.cpu,A,(size_t)nb*M*K*2); memset(Cb.cpu,0,(size_t)nb*M*N*4);
     bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(c->last_dt!=DT_F16){ act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16; }
+    /* Reset/warm is OWNED by ork_npu_chain_progs (ACT_RESETs on entry from a non-chain state, keeps
+     * last_dt=DT_I8_CHAIN + warmed across calls). A redundant per-call reset here was the ~100x slowdown:
+     * it set last_dt=DT_F16 so chain_progs re-ACT_RESET + did 2 warmup reps EVERY call. Dropping it lets
+     * subsequent fp16 chains stay warm (reps=1, no reset). Caveat: assumes any prior chain was also fp16
+     * (true for the all-fp16 SSD scan); a genuine int8->fp16 chain switch would still need a reset. */
     /* fp16 SCHED (root-caused 2026-07-12, wiki regcmd-ISA-Reference "shape boundaries"): bare synth() with
      * sched=1 formerly ZEROED the output for K<96 (K=32/64) — the sched=1 0x201:0x1040 K-reduction-schedule
      * formula (base=177-15*(K/256-1)) OVERSHOOTS the template default (0xB1) as K drops below 256 (0xBC@K64,
@@ -7701,6 +7721,87 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
     c->warmed = 1;
     return rc;
+}
+
+/* ---- fp16 ROUND-ROBIN STREAM (ork_mm_run_stream_f16) — fp16 twin of the int8 stream above ----
+ * Dynamic·dynamic (both operands activations): weight is pre-packed per task (ork_w, fp16 Bb tiled), A/C
+ * copied via per-core staging. Each worker pulls the next task and runs a SINGLE-CORE submit on its own
+ * core (core_mask=1<<i) — so nbatch independent matmuls spread across all cores. Single M-tile (the SSD
+ * scan is M<=64 <= one tile); K<96 uses sched=0 (the small-K 0x1040 fix). */
+struct streamw_f16 { ork_npu *c; int core; int S; const ork_mm_task_f16 *tasks; int *ctr; int rc; };
+static void *stream_worker_f16(void *vp){
+    struct streamw_f16 *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, CBUF=c->soc->cbuf_elems;
+    if(CBUF>32768) CBUF=32768;                     /* fp16 M-scheduler validated to the 32768-tile */
+    pin_big_core(i);
+    int k; a->rc=0;
+    uint32_t rc[REGCMD_I8_N];
+    while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->S){
+        const ork_mm_task_f16 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
+        int sched=(K&(K-1))==0 && K>=128 && K<2048;
+        memcpy(c->maf[i].cpu, t->A, (size_t)M*K*2); bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(rc,0,REGCMD_I8_N*4);
+        synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
+        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
+        mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
+        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+        sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        sub.timeout=mm_timeout_ms();
+        int reps=c->mwarm[i]?1:2;
+        for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+        c->mwarm[i]=1;
+        memcpy(t->C, c->mcc[i].cpu, (size_t)M*N*4);
+    }
+    return NULL;
+}
+int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
+    if(!c||S<1||!tasks) return -2;
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    size_t maxMK=0, maxMN4=0;
+    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
+        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
+        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
+        if(w->K%32||w->N%16) return -2;
+        size_t mk=(size_t)tasks[i].M*w->K*2, mn=(size_t)tasks[i].M*w->N*4;
+        if(mk>maxMK)maxMK=mk; if(mn>maxMN4)maxMN4=mn; }
+    int fd=c->fd;
+    /* fp16 entry: ACT_RESET ONCE on a mode change into fp16, then stay warm across stream calls (last_dt
+     * stays DT_F16 as long as only fp16 stream runs) — no per-call reset churn. */
+    if(c->last_dt!=DT_F16){ act(fd,RKNPU_ACT_RESET,0); c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; c->last_dt=DT_F16; }
+    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(mc_ensure(c,nc)) return -1;
+    for(int i=0;i<nc;i++){
+        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+    int rc=0; npu_pool_ensure(c);
+    struct streamw_f16 sw[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) sw[i]=(struct streamw_f16){c,i,S,tasks,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=sw; c->pjob_nc=nc; c->pjob_fn=stream_worker_f16; c->pjob_stride=sizeof(struct streamw_f16);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    stream_worker_f16(&sw[0]);                     /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    for(int i=0;i<nc;i++) if(sw[i].rc) rc=-1;
+    c->warmed=1;
+    return rc;
+}
+/* STREAMED batched fp16 GEMM — pack each B (fp16), dispatch the nb matmuls round-robin across cores. */
+int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
+    if(!c||nb<1||M<1||K<1||N<1||K%32||N%16) return -2;
+    ork_w **w=calloc(nb,sizeof(ork_w*)); ork_mm_task_f16 *tk=malloc((size_t)nb*sizeof(ork_mm_task_f16));
+    if(!w||!tk){ free(w);free(tk); return -3; }
+    int ret=0;
+    for(int b=0;b<nb;b++){ w[b]=ork_mm_pack(c,K,N,B+(size_t)b*K*N);
+        if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done; }
+        tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N}; }
+    ret=ork_mm_run_stream_f16(c,nb,tk);
+done:
+    for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
+    free(w);free(tk);
+    return ret;
 }
 
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {

@@ -177,6 +177,10 @@ ork_w       *ork_mm_f16_scratch(ork_npu *ctx, int K, int N);
  * bscale per-output-channel [N] (NULL => scale 1). In place, no alloc. Tiled bytes are bit-identical to
  * ork_mm_pack of the row-major dequantized weight. 0/ok, <0 on bad args. */
 int          ork_mm_inflate_i8_to_f16(ork_npu *ctx, ork_w *w, const int8_t *i8, const float *bscale, int K, int N);
+/* Re-tile fp16 B[K,N] into an EXISTING fp16 weight (ork_mm_f16_scratch/ork_mm_pack, same K,N) — no
+ * bcreate/free. fp16 twin of ork_mm_repack_i8: refresh a persistent weight POOL's data per use (kills
+ * per-matmul IOMMU alloc/free churn in a dynamic-operand loop like the SSD scan). 0/ok,<0. */
+int          ork_mm_repack_f16(ork_npu *ctx, ork_w *w, int K, int N, const ork_f16 *B);
 /* NEON-fused pack/repack DIRECTLY from f32[N][K] (n-major): per-channel symmetric int8 quant + tile in
  * one cache-friendly pass (no transpose scratch). Writes per-channel bscale[N]. For dequantizing weight
  * sources (e.g. Q4_K MoE experts via to_float) without the slow strided f32->int8 transpose. */
@@ -834,8 +838,16 @@ int          ork_ssd_probe_fusedmm_f16(ork_npu *c,int M,int K,int N,const ork_f1
 /* FUSED batched fp16 GEMM: drop-in for ork_bmm_fp16 (nbatch matmuls, both operands dynamic) but chains all
  * nbatch matmuls into ONE PC-chained submit — amortizes the ~48us/submit floor across the batch (the SSD
  * scan per-stage H-batch). Packed-B (ork_mm_pack) + row-major-A + dense-C; numerically identical to
- * ork_bmm_fp16. Single-slice (K<=ks, N<=nmax), nb<=64. 0/ok,<0. */
+ * ork_bmm_fp16. SINGLE-CORE (a PC chain runs on one core). Single-slice (K<=ks, N<=nmax), nb<=64. 0/ok,<0. */
 int          ork_bmm_fp16_fused(ork_npu *c,int nb,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
+/* STREAMED batched fp16 GEMM: drop-in for ork_bmm_fp16 but dispatches the nbatch INDEPENDENT matmuls
+ * round-robin across ALL NPU cores (fp16 twin of ork_mm_run_stream_i8) — each core pulls the next matmul
+ * and runs a single-core submit on itself (no barrier; CPU-prep of op N+1 overlaps NPU of op N). For the
+ * SSD scan's per-stage H independent matmuls: ~3-5x the single-core chain. Packed-B + row-major-A + dense-C,
+ * numerically identical to ork_bmm_fp16. Single-slice, nb>=1. 0/ok,<0. */
+typedef struct { ork_w *w; int M; const ork_f16 *A; float *C; } ork_mm_task_f16;
+int          ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks);
+int          ork_bmm_fp16_stream(ork_npu *c,int nb,int M,int K,int N,const ork_f16 *A,const ork_f16 *B,float *C);
 int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
                                       double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
 

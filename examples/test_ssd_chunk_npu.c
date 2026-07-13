@@ -93,6 +93,16 @@ static void ssd_chunked_ref(const ssd_dims *d, const double *x, const double *dt
     free(Acs);free(xbar);free(state_in);free(cstate);
 }
 
+static double g_ssd_mm_us, g_ssd_tot_us;   /* ORK_SSD_PROF breakdown: matmul vs elementwise+glue */
+/* pooled 3-core stream stage (mode 5): repack each of H B-operands into the PERSISTENT pool (no
+ * bcreate/free — kills the per-matmul pack churn), then round-robin the H matmuls across cores. */
+static int stage_stream(ork_npu *ctx, ork_w **pool, int H, int M, int K, int N,
+                        const ork_f16 *A, const ork_f16 *B, float *C){
+    ork_mm_task_f16 tk[128]; if(H>128) return -2;
+    for(int h=0;h<H;h++){ if(ork_mm_repack_f16(ctx,pool[h],K,N,B+(size_t)h*K*N)) return -1;
+        tk[h]=(ork_mm_task_f16){pool[h],M,A+(size_t)h*M*K,C+(size_t)h*M*N}; }
+    return ork_mm_run_stream_f16(ctx,H,tk);
+}
 static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, const double *dt,
                            const double *A, const double *B, const double *C, const double *D,
                            double *y, int mode){
@@ -100,8 +110,14 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
     const int Ncol=((H+15)/16)*16;                          /* cumsum head-batch width (bmm N%16) */
     /* mode: 0=matmul spine (elementwise CPU), 1=+exp NPU, 2=+cumsum/ewmul NPU, 3=FUSED matmuls (each stage's
      * H matmuls in ONE chained submit; elementwise CPU like mode 0) — the submit-floor speed layer. */
-    const int expnpu=(mode==1||mode==2), ewnpu=(mode==2), fused=(mode==3);
-    #define BMM(...) (fused?ork_bmm_fp16_fused:ork_bmm_fp16)(ctx,__VA_ARGS__)
+    const int expnpu=(mode==1||mode==2), ewnpu=(mode==2), fused=(mode==3), strm=(mode==4), strm5=(mode==5);
+    #define BMM(...) (strm?ork_bmm_fp16_stream:fused?ork_bmm_fp16_fused:ork_bmm_fp16)(ctx,__VA_ARGS__)
+    /* MM: timed matmul dispatch. mode 5 = pooled 3-core stream (repack into persistent pool); else BMM. */
+    #define MM(pool,...) ({ double _mt=now_us(); int _r=strm5?stage_stream(ctx,pool,__VA_ARGS__):BMM(__VA_ARGS__); g_ssd_mm_us+=now_us()-_mt; _r; })
+    ork_w *pl_sc[128]={0},*pl_cs[128]={0},*pl_yo[128]={0},*pl_yd[128]={0};
+    if(strm5) for(int h=0;h<H;h++){ pl_sc[h]=ork_mm_f16_scratch(ctx,Nst,CS); pl_cs[h]=ork_mm_f16_scratch(ctx,CS,Nst);
+        pl_yo[h]=ork_mm_f16_scratch(ctx,Nst,P); pl_yd[h]=ork_mm_f16_scratch(ctx,CS,P); }
+    g_ssd_mm_us=0; double _tot0=now_us();
     double *Acs=malloc((size_t)H*CS*sizeof(double)),*Acs_last=malloc((size_t)H*sizeof(double));
     double *Acs_last_prev=calloc(H,sizeof(double));
     ork_f16 *aS=malloc((size_t)H*CS*Nst*sizeof(ork_f16)),*bS=malloc((size_t)H*Nst*CS*sizeof(ork_f16));
@@ -153,12 +169,12 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
             for(int l=0;l<CS;l++) for(int p=0;p<P;p++) bD[((size_t)h*CS+l)*P+p]=(ork_f16)xbar[((size_t)h*CS+l)*P+p];
             for(int n=0;n<Nst;n++) for(int p=0;p<P;p++) bO[((size_t)h*Nst+n)*P+p]=(ork_f16)state_in[((size_t)h*P+p)*Nst+n];
         }
-        if((rc=BMM(H,CS,Nst,CS,aS,bS,G))) break;
+        if((rc=MM(pl_sc,H,CS,Nst,CS,aS,bS,G))) break;
         if(ewnpu){ for(size_t i=0;i<(size_t)H*CS*CS;i++){ e1[i]=G[i]; e2[i]=Lexp[i]; }
             npu_ewmul_f16(ctx,e1,e2,H*CS,CS,e3);
             for(size_t i=0;i<(size_t)H*CS*CS;i++) aD[i]=(ork_f16)e3[i]; }
         else for(size_t i=0;i<(size_t)H*CS*CS;i++) aD[i]=(ork_f16)((double)G[i]*Lexp[i]);
-        if((rc=BMM(H,CS,CS,P,aD,bD,Yd))) break;
+        if((rc=MM(pl_yd,H,CS,CS,P,aD,bD,Yd))) break;
         /* ---- Bdec = dexp ⊙ B  (feeds cstate matmul) ---- */
         if(ewnpu){ for(int h=0;h<H;h++){ int g=h%d->G; for(int s=0;s<CS;s++) for(int n=0;n<Nst;n++){
                 e1[((size_t)h*CS+s)*Nst+n]=dexp[(size_t)h*CS+s]; e2[((size_t)h*CS+s)*Nst+n]=B[IX_BC(base+s,g,n)]; } }
@@ -166,8 +182,8 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
             for(size_t i=0;i<(size_t)H*CS*Nst;i++) bC[i]=(ork_f16)e3[i]; }
         else for(int h=0;h<H;h++){ int g=h%d->G; for(int s=0;s<CS;s++){ double ds=dexp[(size_t)h*CS+s];
                 for(int n=0;n<Nst;n++) bC[((size_t)h*CS+s)*Nst+n]=(ork_f16)(ds*B[IX_BC(base+s,g,n)]); } }
-        if((rc=BMM(H,P,CS,Nst,aC,bC,cs))) break;
-        if((rc=BMM(H,CS,Nst,P,aO,bO,tmp))) break;
+        if((rc=MM(pl_cs,H,P,CS,Nst,aC,bC,cs))) break;
+        if((rc=MM(pl_yo,H,CS,Nst,P,aO,bO,tmp))) break;
         /* ---- Yoff = tmp ⊙ sdo, then y = Yd + Yoff + D*x (add on CPU) ---- */
         if(ewnpu){ for(int h=0;h<H;h++) for(int l=0;l<CS;l++) for(int p=0;p<P;p++){
                 e1[((size_t)h*CS+l)*P+p]=tmp[((size_t)h*CS+l)*P+p]; e2[((size_t)h*CS+l)*P+p]=sexp[(size_t)h*CS+l]; }
@@ -181,6 +197,10 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
     free(Acs);free(Acs_last);free(Acs_last_prev);free(aS);free(bS);free(G);free(aD);free(bD);free(Yd);
     free(aC);free(bC);free(cs);free(cs_prev);free(aO);free(bO);free(tmp);free(state_in);free(xbar);
     free(Larg);free(Lexp);free(sarg);free(sexp);free(darg);free(dexp);free(tri);free(abarP);free(acsout);free(e1);free(e2);free(e3);
+    if(strm5) for(int h=0;h<H;h++){ if(pl_sc[h])ork_mm_free(ctx,pl_sc[h]); if(pl_cs[h])ork_mm_free(ctx,pl_cs[h]); if(pl_yo[h])ork_mm_free(ctx,pl_yo[h]); if(pl_yd[h])ork_mm_free(ctx,pl_yd[h]); }
+    g_ssd_tot_us=now_us()-_tot0;
+    if(getenv("ORK_SSD_PROF")&&g_ssd_tot_us>0) fprintf(stderr,"  [prof mode %d] total %.2f ms | matmul %.2f ms (%.0f%%) | elementwise+glue %.2f ms (%.0f%%)\n",
+        mode, g_ssd_tot_us/1000, g_ssd_mm_us/1000, 100*g_ssd_mm_us/g_ssd_tot_us, (g_ssd_tot_us-g_ssd_mm_us)/1000, 100*(g_ssd_tot_us-g_ssd_mm_us)/g_ssd_tot_us);
     return rc;
 }
 
@@ -202,7 +222,7 @@ static int run_case(ork_npu *ctx, const char *tag, ssd_dims d, int mode, double 
     for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){ B[i]=frand_sym(); C[i]=frand_sym(); }
     ssd_chunked_ref(&d,x,dt,A,B,C,D,yr);
     int rc=ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,mode);
-    const char*mn[4]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU","FUSED matmuls (1 submit/stage)"};
+    const char*mn[6]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU","FUSED matmuls (1 submit/stage)","STREAM matmuls (3-core round-robin)","POOLED stream (3-core, pre-packed B)"};
     int fail;
     if(rc){ fprintf(stderr,"[%s] NPU op failed rc=%d\n",tag,rc); fail=1; }
     else { double e=rel_l2(&d,yn,yr); fail=!(e<=tol);
@@ -227,17 +247,25 @@ int main(void){
      * (CPU elementwise), validating the fused batched-GEMM primitive on the real scan. */
     fail|=run_case(ctx,"fused-G1", g1,3,3e-2);
     fail|=run_case(ctx,"fused-G2", g2,3,3e-2);
+    /* STREAM matmul spine (mode 4): scan's independent stage matmuls round-robin across 3 cores. */
+    fail|=run_case(ctx,"stream-G1",g1,4,3e-2);
+    fail|=run_case(ctx,"stream-G2",g2,4,3e-2);
+    /* POOLED stream (mode 5): pre-packed persistent B pool (repack per chunk) + 3-core round-robin. */
+    fail|=run_case(ctx,"pool-G1",  g1,5,3e-2);
+    fail|=run_case(ctx,"pool-G2",  g2,5,3e-2);
     /* Timing: per-op (mode 0, H submits/stage) vs fused (mode 3, 1 submit/stage), warm. */
     { ssd_dims d=g2; int L=d.NC*d.CS;
       double *x=malloc((size_t)L*d.H*d.P*8),*dt=malloc((size_t)L*d.H*8),*A=malloc(d.H*8),*B=malloc((size_t)L*d.G*d.Nst*8),
              *Cm=malloc((size_t)L*d.G*d.Nst*8),*D=malloc(d.H*8),*yo=malloc((size_t)L*d.H*d.P*8);
       for(size_t i=0;i<(size_t)L*d.H*d.P;i++)x[i]=frand_sym(); for(int h=0;h<d.H;h++){A[h]=-1;D[h]=frand();}
       for(size_t i=0;i<(size_t)L*d.H;i++)dt[i]=0.1+0.35*frand(); for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){B[i]=frand_sym();Cm[i]=frand_sym();}
-      ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,0); ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,3);  /* warm both */
+      for(int m=0;m<=5;m++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,m); /* warm all */
       double t0=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,0); double per=(now_us()-t0)/5;
       double t1=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,3); double fus=(now_us()-t1)/5;
-      fprintf(stderr,"\n[timing G2 L=%d] per-op(mode0) %.2f ms | fused(mode3) %.2f ms | %.2fx  (matmul-submit amortization; CPU elementwise shared)\n",
-              L,per/1000,fus/1000, per>0?per/fus:0);
+      double t2=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,4); double stm=(now_us()-t2)/5;
+      double t3=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,5); double pool=(now_us()-t3)/5;
+      fprintf(stderr,"\n[timing G2 L=%d] per-op %.2f | fused-1core %.2f | stream-3core %.2f | POOL-3core %.2f ms | pool vs per-op %.2fx\n",
+              L,per/1000,fus/1000,stm/1000,pool/1000, pool>0?per/pool:0);
       free(x);free(dt);free(A);free(B);free(Cm);free(D);free(yo); }
     ork_npu_free(ctx);
     fprintf(stderr, fail? "\nTEST_SSD_CHUNK_NPU: FAIL\n":"\nTEST_SSD_CHUNK_NPU: PASS\n");
