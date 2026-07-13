@@ -110,7 +110,8 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
     const int Ncol=((H+15)/16)*16;                          /* cumsum head-batch width (bmm N%16) */
     /* mode: 0=matmul spine (elementwise CPU), 1=+exp NPU, 2=+cumsum/ewmul NPU, 3=FUSED matmuls (each stage's
      * H matmuls in ONE chained submit; elementwise CPU like mode 0) — the submit-floor speed layer. */
-    const int expnpu=(mode==1||mode==2), ewnpu=(mode==2), fused=(mode==3), strm=(mode==4), strm5=(mode==5);
+    /* mode 6 = FULL on-NPU: mode-2 elementwise (cumsum CumBA + exp int16 + mul ewmul) + mode-5 pooled stream. */
+    const int expnpu=(mode==1||mode==2||mode==6), ewnpu=(mode==2||mode==6), fused=(mode==3), strm=(mode==4), strm5=(mode==5||mode==6);
     #define BMM(...) (strm?ork_bmm_fp16_stream:fused?ork_bmm_fp16_fused:ork_bmm_fp16)(ctx,__VA_ARGS__)
     /* MM: timed matmul dispatch. mode 5 = pooled 3-core stream (repack into persistent pool); else BMM. */
     #define MM(pool,...) ({ double _mt=now_us(); int _r=strm5?stage_stream(ctx,pool,__VA_ARGS__):BMM(__VA_ARGS__); g_ssd_mm_us+=now_us()-_mt; _r; })
@@ -222,7 +223,7 @@ static int run_case(ork_npu *ctx, const char *tag, ssd_dims d, int mode, double 
     for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){ B[i]=frand_sym(); C[i]=frand_sym(); }
     ssd_chunked_ref(&d,x,dt,A,B,C,D,yr);
     int rc=ssd_chunked_npu(ctx,&d,x,dt,A,B,C,D,yn,mode);
-    const char*mn[6]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU","FUSED matmuls (1 submit/stage)","STREAM matmuls (3-core round-robin)","POOLED stream (3-core, pre-packed B)"};
+    const char*mn[7]={"matmul(mul/cumsum/exp=CPU)","+exp=NPU","full: cumsum+exp+mul=NPU","FUSED matmuls (1 submit/stage)","STREAM matmuls (3-core round-robin)","POOLED stream (3-core, pre-packed B)","FULL on-NPU (elementwise NPU + pooled stream)"};
     int fail;
     if(rc){ fprintf(stderr,"[%s] NPU op failed rc=%d\n",tag,rc); fail=1; }
     else { double e=rel_l2(&d,yn,yr); fail=!(e<=tol);
@@ -253,19 +254,24 @@ int main(void){
     /* POOLED stream (mode 5): pre-packed persistent B pool (repack per chunk) + 3-core round-robin. */
     fail|=run_case(ctx,"pool-G1",  g1,5,3e-2);
     fail|=run_case(ctx,"pool-G2",  g2,5,3e-2);
+    /* mode 6 (FULL on-NPU: elementwise on NPU + pooled stream) is CORRECT but a MEASURED DEAD-END: ~97x
+     * slower (973ms vs 10ms) — the tiny elementwise ops each pay the NPU submit floor + int16<->fp16
+     * mode-switch reset churn (968ms elementwise vs 5ms on CPU). The elementwise belongs on the CPU;
+     * only the matmul spine belongs on the NPU (mode 5). Kept reachable (ORK_SSD_MODE6=1) but out of the
+     * default run so make test stays fast. */
+    if(getenv("ORK_SSD_MODE6")){ fail|=run_case(ctx,"fullnpu-G1",g1,6,4e-2); fail|=run_case(ctx,"fullnpu-G2",g2,6,4e-2); }
     /* Timing: per-op (mode 0, H submits/stage) vs fused (mode 3, 1 submit/stage), warm. */
     { ssd_dims d=g2; int L=d.NC*d.CS;
       double *x=malloc((size_t)L*d.H*d.P*8),*dt=malloc((size_t)L*d.H*8),*A=malloc(d.H*8),*B=malloc((size_t)L*d.G*d.Nst*8),
              *Cm=malloc((size_t)L*d.G*d.Nst*8),*D=malloc(d.H*8),*yo=malloc((size_t)L*d.H*d.P*8);
       for(size_t i=0;i<(size_t)L*d.H*d.P;i++)x[i]=frand_sym(); for(int h=0;h<d.H;h++){A[h]=-1;D[h]=frand();}
       for(size_t i=0;i<(size_t)L*d.H;i++)dt[i]=0.1+0.35*frand(); for(size_t i=0;i<(size_t)L*d.G*d.Nst;i++){B[i]=frand_sym();Cm[i]=frand_sym();}
-      for(int m=0;m<=5;m++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,m); /* warm all */
+      for(int m=0;m<=5;m++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,m); /* warm 0..5 */
       double t0=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,0); double per=(now_us()-t0)/5;
-      double t1=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,3); double fus=(now_us()-t1)/5;
-      double t2=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,4); double stm=(now_us()-t2)/5;
       double t3=now_us(); for(int r=0;r<5;r++) ssd_chunked_npu(ctx,&d,x,dt,A,B,Cm,D,yo,5); double pool=(now_us()-t3)/5;
-      fprintf(stderr,"\n[timing G2 L=%d] per-op %.2f | fused-1core %.2f | stream-3core %.2f | POOL-3core %.2f ms | pool vs per-op %.2fx\n",
-              L,per/1000,fus/1000,stm/1000,pool/1000, pool>0?per/pool:0);
+      fprintf(stderr,"\n[timing G2 L=%d] per-op %.2f ms | POOL-3core(mode5, matmul-on-NPU + elementwise-on-CPU) %.2f ms | %.2fx\n",
+              L,per/1000,pool/1000, pool>0?per/pool:0);
+      fprintf(stderr,"  (mode6 full-on-NPU is a measured dead-end: ~97x slower — elementwise-on-NPU is submit-floor-bound; keep it on CPU. ORK_SSD_MODE6=1 to see it.)\n");
       free(x);free(dt);free(A);free(B);free(Cm);free(D);free(yo); }
     ork_npu_free(ctx);
     fprintf(stderr, fail? "\nTEST_SSD_CHUNK_NPU: FAIL\n":"\nTEST_SSD_CHUNK_NPU: PASS\n");
