@@ -2,6 +2,12 @@
 # Build on a Rockchip board (needs /dev/dri/cardN + the in-tree rknpu DRM driver), or
 # cross-compile for aarch64. No external dependencies (libc + the kernel DRM uABI only).
 CC      ?= cc
+# Use ccache when present: CORE is compiled once into shared .o objects (below), so ccache
+# content-hashes them — clean builds, branch switches, and the board's several ork-driver
+# checkouts all hit the cache instead of recompiling the ~9.7k-line npu.c. Disable: NO_CCACHE=1.
+ifndef NO_CCACHE
+CC := $(strip $(shell command -v ccache 2>/dev/null) $(CC))
+endif
 AR      ?= ar
 CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
 
@@ -13,16 +19,20 @@ CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
 CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c
+# Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
+# The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
+# special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
+COBJ    := $(CORE:.c=.o)
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused
 TESTS    :=
 
 all: $(EXAMPLES) $(TESTS)
 
-$(EXAMPLES): %: examples/%.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+$(EXAMPLES): %: examples/%.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-$(TESTS): %: %.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+$(TESTS): %: %.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE diagnostic (NOT in `make test`): probes whether the captured PPU LUT/PWL regcmd can be
 # driven STANDALONE. NEGATIVE RESULT on RK3588 — the PPU does not activate from an isolated
@@ -34,12 +44,12 @@ test_ppu_lut: examples/test_ppu_lut.c $(CORE)
 # --- library for embedding in other projects (e.g. llama.cpp-rockchip, FFI bindings) ---
 lib: libork_npu.a libork_npu.so
 
-libork_npu.a: $(CORE:.c=.o)              # static — link directly, no runtime .so dependency
+libork_npu.a: $(COBJ)                    # static — link directly, no runtime .so dependency
 	$(AR) rcs $@ $^
-libork_npu.so: $(CORE)                   # shared — dynamic link / FFI from Python, Node, Rust, ...
-	$(CC) $(CFLAGS) -fPIC -shared -o $@ $(CORE)
-%.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+libork_npu.so: $(COBJ)                   # shared — dynamic link / FFI from Python, Node, Rust, ...
+	$(CC) $(CFLAGS) -shared -o $@ $^
+%.o: %.c                                 # CORE objects are -fPIC so one set serves executables + the .so
+	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
 
 # comparison tool: benchmark the closed librkllmrt (dlopen'd at runtime, no build dep).
 # Not in `all`/`test` — it needs a .rkllm model + the runtime present on the board.
@@ -456,11 +466,11 @@ ssd_fusion_bench: tools/ssd_fusion_bench.c $(CORE)
 floor_decomp: tools/floor_decomp.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
-mode_probe: tools/mode_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+mode_probe: tools/mode_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
-chain_xition_probe: tools/chain_xition_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+chain_xition_probe: tools/chain_xition_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 ssd_layer_bench: tools/ssd_layer_bench.c $(CORE)
 	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(CORE) -lm -lpthread
