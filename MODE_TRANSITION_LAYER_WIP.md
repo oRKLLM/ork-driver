@@ -35,7 +35,16 @@ flag (`XP_I4_INCR`'s `warm`, `XP_I4_STREAM`'s `cold`) stay byte-identical.
 ## Guiding principle — discerning the CORRECT version (Phase 2)
 
 The tests all passed *even with the drifted glue*, so correctness cannot tell us which version of a
-transition is right. Tiebreakers, in order:
+transition is right.
+
+**The drift itself is the bug.** When two paths do the *same logical transition* differently, that
+divergence is a defect to fix even if all versions are correct — converge to a single best-performing
+version (single source of truth), whether or not the diverging path is currently exercised. Correctness
+parity doesn't excuse drift; it just means perf + clarity decide the survivor. (First confirm they truly
+are the same transition — item 1 was an apparent "drift" that turned out to be correct, distinct
+behavior, not a divergent copy.)
+
+Tiebreakers for picking the surviving version, in order:
 1. **If the candidates are otherwise byte-identical (same correctness), prefer the best-performing
    version** — bench it and let perf decide.
 2. **Use the experiment logs + board-quirks data** (wiki Experiment Log / NPU-Quirks) to discern or
@@ -44,6 +53,31 @@ transition is right. Tiebreakers, in order:
 4. **When a contradiction shows a wiki entry is wrong, FIX or flag it** — edit the entry to be correct
    once the error is understood (or add a dated "this is wrong because…" note if not yet certain), so
    the wiki stays self-correcting and doesn't mislead the next agent.
+
+## Phase-2 progress (2026-07-14)
+
+**Chaining mechanism is now explicit transition state.** `ork_npu_enter` takes a 4th arg
+`chain` (`enum ork_chain_kind`: `OCK_NONE`/`OCK_SW`/`OCK_HW`/`OCK_FUSED`), recorded as `c->last_chain`,
+so the policy can branch on the mechanism where it genuinely matters. Threaded from all 16 call sites
+(streams→`OCK_SW`, `run_chain_i8`/`chain_progs`→`OCK_HW`, `run_chain_i8_impl` with a silu spec→`OCK_FUSED`,
+per-matmul/int4-batch→`OCK_NONE`). **Behavior-preserving** (records state only; no `switch(chain)`
+branch yet) — validated `make test` byte-identical. The hook is documented in `ork_npu_enter`.
+
+**Real-pipeline mechanism bench (ork_bench, RK3588, my refactored ork-driver, governors perf):**
+- qwen3-1.7b-q8_0 default: prefill **59.99** / decode **5.89** tok/s, coherent. XPROF: `MC_MM` only.
+- qwen3-1.7b `ORK_FUSE=1`: 63.01 / 5.87, coherent, `MC_MM` only (fusion neutral, confirmed).
+- qwen3-1.7b `ORK_FFN_CHAIN=1`: **broke** (`PRIME_FD` domain-alloc, decode 0), died before `CHAIN_NT`.
+- `ORK_VERBOSE`: `ork_dispatch_i8` **never fired** → sw/hw chain grouping does not trigger.
+
+**Finding: the sw/hw/fused chain profiles are DORMANT in a real dense pipeline.** The ggml graph
+interleaves rope/norm between mul_mats so the chain-walk never reaches ≥2 consecutive independent int8
+nodes; MoE experts run on CPU by default (`ORK_MOE_NPU` off); `ORK_FFN_CHAIN` fails on this model's
+footprint. So `XP_CHAIN_NT`/`XP_STREAM_*` are exercised only by `mode_probe`/`test_ssd_chunk_npu` and
+narrow configs (MoE-on-NPU, cross-domain, FFN-chain-compact). **The user's hunch is confirmed for the
+fused static graph** — it chains differently (in-chain SDP/LUT, heavy footprint, fragile) and must not
+be blindly converged with the pure-matmul hw chain; hence `OCK_FUSED` is distinguished. Items 2/3 below
+therefore validate on **correctness** (mode_probe/test_ssd), not a real-pipeline speed bench that can't
+trigger them; convergence of the sw/hw keep-warm predicates is the remaining open decision.
 
 ## Phase-2 catalogue — sites/behaviors LEFT for 1-by-1 evaluation
 

@@ -202,7 +202,7 @@ The NPU's regcmd datapath is **stateful**: a "mode" (precision/schedule) is trac
 `c->last_dt` plus warm flags (`warmed`, `mwarm[]`) and buffer-size caches (`ccsz`, `mccsz[]`). Moving
 between modes may need an `RKNPU_ACT_RESET`, a cold 2-pass re-warm, and/or a buffer realloc. That
 policy used to be **copy-pasted inline into ~16 run/stream/chain/int4 entrypoints**, each drifted.
-It is now owned by **one function**, `ork_npu_enter(c, to_marker, profile)` in `src/npu.c`, driven by
+It is now owned by **one function**, `ork_npu_enter(c, to_marker, profile, chain)` in `src/npu.c`, driven by
 the **`XSPEC[]` policy table** (one row per historical transition site). Every run path calls it first;
 the drift is now visible **as data** (e.g. the nothrash-keyed chain profile ignores `ORK_SSM_KEEPWARM`
 where the matmul/stream profiles honor it). See the big comment above `XSPEC[]` for the exhaustive
@@ -216,10 +216,21 @@ or both) + *clear-condition* (`WC_*`) selectors, and whether it writes `last_dt`
 chains to hunt down.
 
 **To ADD a new op/dtype transition:** (1) pick/define its `last_dt` marker; (2) add a `XP_*` profile to
-the enum and a matching `XSPEC[]` row; (3) call `ork_npu_enter(c, marker, XP_*)` at the site (it
+the enum and a matching `XSPEC[]` row; (3) call `ork_npu_enter(c, marker, XP_*, chain)` at the site (it
 returns 1 iff a real transition fired — use that to drive any caller-local warmup flag, as
 `XP_I4_INCR`/`XP_I4_STREAM` do). If none of the existing `KWP_*`/`RC_*`/`WC_*` selectors express the
 behavior, add a selector value and its `case` in `ork_npu_enter` (each `case` is a literal predicate).
+
+**The `chain` arg (`ork_chain_kind`)** names the chaining mechanism in effect — `OCK_NONE` (plain
+`run`/`run_multicore`/int4 batch), `OCK_SW` (`run_stream_*` round-robin), `OCK_HW` (`run_chain_i8` PC-chain),
+`OCK_FUSED` (`run_chain_i8_ffn` static regcmd graph, which carries in-chain SDP/LUT). It is recorded as
+transition state (`c->last_chain`) so the policy can branch on the mechanism for the *few* handoffs where
+it genuinely matters. **For the common case it has NO bearing** on the precision-mode reset (the `XSPEC`
+row is mechanism-agnostic), and that is fine — verified by `mode_probe` + `test_ssd_chunk_npu` that no
+entry-transition currently needs it (`OCK_FUSED`'s specialness — ping-pong-off, LUT-commit — lives in
+`run_chain_i8_impl`'s submit flags, not the entry reset). When you find a transition that does need
+mechanism-specific handling, branch on `chain` at the documented hook in `ork_npu_enter`. Pass the
+mechanism that actually applies at each call site; **don't** default everything to `OCK_NONE`.
 
 **To TEST a transition change — MANDATORY, on the board (RK3588):**
 - `make test` — the primary gate. It exercises every mode: `test_matmul`/`layer`/`decode`/`model`
