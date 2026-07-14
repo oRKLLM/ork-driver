@@ -196,6 +196,51 @@ attention, norms) — full write-up: wiki *Exp-2026-07-10 Forward Softmax and RK
   LUT-load's SRAM-commit side effect (non-deterministic stall). `run_chain_i8` keeps `0x5` only because uniform
   int8-matmul tasks are register-config-only. See `NPU-Quirks` "Ping-pong races a chained task's side effect".
 
+### Mode-transition layer (`ork_npu_enter`)
+
+The NPU's regcmd datapath is **stateful**: a "mode" (precision/schedule) is tracked in software via
+`c->last_dt` plus warm flags (`warmed`, `mwarm[]`) and buffer-size caches (`ccsz`, `mccsz[]`). Moving
+between modes may need an `RKNPU_ACT_RESET`, a cold 2-pass re-warm, and/or a buffer realloc. That
+policy used to be **copy-pasted inline into ~16 run/stream/chain/int4 entrypoints**, each drifted.
+It is now owned by **one function**, `ork_npu_enter(c, to_marker, profile)` in `src/npu.c`, driven by
+the **`XSPEC[]` policy table** (one row per historical transition site). Every run path calls it first;
+the drift is now visible **as data** (e.g. the nothrash-keyed chain profile ignores `ORK_SSM_KEEPWARM`
+where the matmul/stream profiles honor it). See the big comment above `XSPEC[]` for the exhaustive
+`from→to` matrix and the modes `{ COLD(-1), F16(0), I8(1), I4(2), I8_CHAIN(3), I4_CHAIN(4),
+I4_STREAM(5) }` plus the transient `SDP` (activation/ewmul).
+
+**To CHANGE a transition's policy:** edit that profile's **one row** in `XSPEC[]`. A row is
+`{ kwp, rst, wtg, wc, stg, sc, setdt }` — a keep-warm predicate selector (`KWP_*`), a reset condition
+(`RC_*`), and warm/size *clear-target* (`TG_*`: scalar `warmed`/`ccsz`, per-core `mwarm[]`/`mccsz[]`,
+or both) + *clear-condition* (`WC_*`) selectors, and whether it writes `last_dt` (`setdt`). No `if`
+chains to hunt down.
+
+**To ADD a new op/dtype transition:** (1) pick/define its `last_dt` marker; (2) add a `XP_*` profile to
+the enum and a matching `XSPEC[]` row; (3) call `ork_npu_enter(c, marker, XP_*)` at the site (it
+returns 1 iff a real transition fired — use that to drive any caller-local warmup flag, as
+`XP_I4_INCR`/`XP_I4_STREAM` do). If none of the existing `KWP_*`/`RC_*`/`WC_*` selectors express the
+behavior, add a selector value and its `case` in `ork_npu_enter` (each `case` is a literal predicate).
+
+**To TEST a transition change — MANDATORY, on the board (RK3588):**
+- `make test` — the primary gate. It exercises every mode: `test_matmul`/`layer`/`decode`/`model`
+  (fp16+int8), `i4`/`test_chain_i4`/`perplexity_i4` (int4), `test_stream_interleave` (stream),
+  `test_ssd_chunk_npu` (int8↔fp16 SSM), the SDP ops (`test_ewmul_{i8,f16,i16}`/`test_silu`/`test_gelu`/
+  `test_add`), and **`test_mode_transition`**. A *behavior-preserving* refactor must pass **byte-identical**.
+- Run it once **per keep-warm knob** too: default, then `ORK_SSM_KEEPWARM=0` and `ORK_MIXED_NOTHRASH=1`
+  (the profiles differ only at non-default knobs).
+- `make mode_probe && sudo env ORK_MM_TIMEOUT=2500 timeout 300 ./mode_probe` — the op→op transition
+  matrix; confirm which pairs reset/wedge is unchanged.
+- `ORK_DEBUG_RESET=1` — logs every `ACT_RESET` with a counter + caller; diff the count/sites before vs
+  after (the "28→1" keep-warm behavior must be intact).
+
+**Phase status.** The consolidation landed **behavior-preserving** (Phase 1). Sites that do **not** map
+cleanly (drifted or specially-motivated) are **left as-is and catalogued in `MODE_TRANSITION_LAYER_WIP.md`** for a
+Phase-2 1-by-1 evaluation — that is where behavior changes (e.g. flipping `XP_SDP.setdt=1` to fix the
+fp16-mm→SDP→fp16-mm wedge, or making the chain profiles honor `ORK_SSM_KEEPWARM`) happen, each a
+one-row edit re-validated by `make test` + bench. **Do not conflate** the precision-mode reset (which
+the layer owns) with the `c->task` LUT-descriptor axis (`Exp-2026-07-12`): `ACT_RESET` does not fix the
+latter, and it stays an op responsibility.
+
 ---
 
 ## 5. Constraints & scope

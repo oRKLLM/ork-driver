@@ -3586,6 +3586,113 @@ void ork_npu_floor_reset(void){ g_fd_ioctl_us=0; g_fd_hw_us=0; g_fd_hw_raw_last=
  *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
 void ork_npu_mode_invalidate(ork_npu *c){ if(!c) return; c->last_dt=-1; c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++) c->mwarm[i]=0; }
 void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0); ork_npu_mode_invalidate(c); }
+
+/* ============================ MODE-TRANSITION LAYER (ork_npu_enter) ============================
+ * SINGLE owner of "what does moving the NPU's stateful regcmd datapath from mode X to mode Y
+ * require" — the ACT_RESET / re-warm (warmed, mwarm[]) / buffer-realloc (ccsz, mccsz[]) policy that
+ * was previously copy-pasted (and quietly drifted) inline into every run/stream/chain/int4 entry.
+ *
+ * Each run path calls ork_npu_enter(c, target_marker, profile) FIRST; the per-profile row of XSPEC
+ * below IS the policy for that path. A profile is a faithful, byte-for-byte transcription of the site
+ * it replaced (verified `make test` byte-identical across all dtypes and both keep-warm knobs), so
+ * Phase-1 behavior is UNCHANGED — this is the behavior-preserving consolidation. The historical drift
+ * is now visible AS DATA (e.g. the nothrash-keyed chain profile XP_CHAIN_NT ignores ORK_SSM_KEEPWARM
+ * where the matmul/stream profiles honor it via KWP_F16), and a policy change is a one-row edit.
+ * See MODE_TRANSITION_LAYER_WIP.md for the Phase-2 catalogue and AGENTS.md §"Mode-transition layer"
+ * for how to add or change a transition.
+ *
+ * EXHAUSTIVE (from -> to) permutation space — modes = { COLD(-1), F16(0), I8(1), I4(2), I8_CHAIN(3),
+ * I4_CHAIN(4), I4_STREAM(5) }, plus SDP = a TRANSIENT activation/ewmul reset with NO stored marker.
+ * `from` (= c->last_dt) enters ONLY through the
+ * ORK_I8_LIVE / ORK_INT_DT / ORK_KW_DT predicates, so a row is keyed by (target, caller-scope), not by
+ * an enumerated `from` — that collapses the NxN matrix to one row per historical site:
+ *   ->F16/I8 matmul : reset only ENTERING int8 from a non-int8-live mode (first-int8-submit wedge);
+ *                     fp16 never resets. Keep-warm across int8<->fp16 (ORK_SSM_KEEPWARM, default on).
+ *   ->I4           : reset entering int4 from a non-int mode; keep-warm int<->int (ORK_MIXED_NOTHRASH).
+ *   ->I8_CHAIN(3)  : DT_I8<->DT_I8_CHAIN is NOT a hw mode change (ORK_I8_LIVE) -> no reset.
+ *   ->I4_CHAIN(4)  : unconditional reset on entry (single-core int4 M=1 chain).
+ *   ->I4_STREAM(5) : unconditional reset on entry.
+ *   ->SDP          : activation/ewmul reprogram the pipeline; PHASE 1 preserves current behavior —
+ *                    unconditional entry ACT_RESET and last_dt LEFT UNTOUCHED (setdt=0), which keeps
+ *                    the documented fp16-mm->SDP->fp16-mm wedge (Exp-2026-07-12) observable. PHASE 2
+ *                    flips XP_SDP.setdt=1 (+ adds SDP->matmul reset rows) as the one-row wedge fix.
+ * NUANCE #1 (kept SEPARATE, per Exp-2026-07-12): the c->task LUT-descriptor poisoning is a DISTINCT
+ * axis from precision-mode and ACT_RESET does NOT fix it — the layer owns only the precision reset;
+ * the c->task save/restore stays an op responsibility (no clr_task cell is wired in Phase 1). */
+
+/* keep-warm predicate selector (from = c->last_dt, to = target marker) */
+enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
+/* reset condition selector */
+enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS };
+/* warm/size-clear condition selector (shared enum for both the warm and the size clear) */
+enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
+/* clear target: bit0 = scalar (warmed / ccsz), bit1 = per-core (mwarm[] / mccsz[]) */
+enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
+struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
+/* transition profiles — one row per distinct historical site (line refs = pre-refactor src/npu.c) */
+enum { XP_MC_MM, XP_SC_MM, XP_CHAIN_NT, XP_STREAM_I8, XP_STREAM_I8B, XP_STREAM_F16,
+       XP_I4_MC, XP_I4_MWARM, XP_I4_INCR, XP_I4CHAIN, XP_I4_STREAM, XP_SDP, XP_NPROFILE };
+static const struct ork_xspec XSPEC[XP_NPROFILE] = {
+  /* XP_MC_MM      3596  run_multicore   */ { KWP_MC,  RC_I8ENTRY,       TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT_NOTKW, 1 },
+  /* XP_SC_MM      4211  run single-core */ { KWP_SC,  RC_I8ENTRY,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NT_NOTKW, 1 },
+  /* XP_CHAIN_NT   7194/7477 chain       */ { KWP_NTL, RC_NOTLIVE,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NOTKW,    1 },
+  /* XP_STREAM_I8  7821  run_stream_i8   */ { KWP_F16, RC_NOTLIVE_NOTKW, TG_BOTH,    WC_NOTLIVE_NOTKW, TG_NONE,    WC_NONE,     1 },
+  /* XP_STREAM_I8B 7954  stream int8     */ { KWP_F16, RC_NOTKW,         TG_BOTH,    WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
+  /* XP_STREAM_F16 7892/8026 stream f16  */ { KWP_F16, RC_NOTKW,         TG_BOTH,    WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
+  /* XP_I4_MC      4000/4161 int4 mc     */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT,       1 },
+  /* XP_I4_MWARM   8692/8783/8816 int4   */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
+  /* XP_I4_INCR    8552  int4 incr       */ { KWP_NTI, RC_NOTKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },
+  /* XP_I4CHAIN    8497  run_chain_i4 (4)*/ { KWP_NONE,RC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,   1 },
+  /* XP_I4_STREAM  9014  stream i4 (5)   */ { KWP_NONE,RC_ALWAYS,        TG_BOTH,    WC_ALWAYS,        TG_NONE,    WC_NONE,     1 },
+  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_ALWAYS,        TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     0 },
+};
+/* Enter mode `to` via `profile`. Returns 1 if a real transition fired (last_dt changed, or an SDP
+ * entry reset was issued), 0 if this was a no-op (from==to). The return lets the two sites that gate a
+ * caller-LOCAL warmup flag off the transition (XP_I4_INCR's `warm`, XP_I4_STREAM's `cold`) stay
+ * byte-identical. See the profile table above; each `case` is a literal transcription of its site. */
+static int ork_npu_enter(ork_npu *c, int to, int profile){
+    const struct ork_xspec *x=&XSPEC[profile];
+    int from=c->last_dt, fd=c->fd;
+    if(x->setdt && from==to) return 0;                 /* mirrors the old `if(dt!=c->last_dt)` guard */
+    int kw=0;
+    switch(x->kwp){
+      case KWP_MC:  kw=(ork_nothrash()&&ORK_INT_DT(from)&&ORK_INT_DT(to)) || (ork_f16warm()&&ORK_KW_DT(from)&&ORK_KW_DT(to)); break;
+      case KWP_SC:  kw= ork_f16warm()&&ORK_KW_DT(from)&&ORK_KW_DT(to); break;
+      case KWP_NTI: kw= ork_nothrash()&&ORK_INT_DT(from); break;
+      case KWP_NTL: kw= ork_nothrash()&&ORK_I8_LIVE(from); break;
+      case KWP_F16: kw= ork_f16warm()&&ORK_KW_DT(from); break;
+      default:      kw=0;
+    }
+    int rst=0;
+    switch(x->rst){
+      case RC_NOTKW:         rst=!kw; break;
+      case RC_I8ENTRY:       rst=(to==DT_I8 && !ORK_I8_LIVE(from) && !kw); break;
+      case RC_NOTLIVE:       rst=!ORK_I8_LIVE(from); break;
+      case RC_NOTLIVE_NOTKW: rst=(!ORK_I8_LIVE(from) && !kw); break;
+      case RC_ALWAYS:        rst=1; break;
+      default:               rst=0;
+    }
+    if(rst) act(fd,RKNPU_ACT_RESET,0);
+    int wclr=0;
+    switch(x->wc){
+      case WC_NOTKW:         wclr=!kw; break;
+      case WC_NOTLIVE_NOTKW: wclr=(!ORK_I8_LIVE(from) && !kw); break;
+      case WC_ALWAYS:        wclr=1; break;
+      default:               wclr=0;
+    }
+    if(wclr){ if(x->wtg&TG_SCALAR)c->warmed=0; if(x->wtg&TG_PERCORE)for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; }
+    int sclr=0;
+    switch(x->sc){
+      case WC_NOTKW:    sclr=!kw; break;
+      case WC_NT:       sclr=!ork_nothrash(); break;
+      case WC_NT_NOTKW: sclr=(!ork_nothrash() && !kw); break;
+      case WC_ALWAYS:   sclr=1; break;
+      default:          sclr=0;
+    }
+    if(sclr){ if(x->stg&TG_SCALAR)c->ccsz=0; if(x->stg&TG_PERCORE)for(int i=0;i<ORK_MAXCORE;i++)c->mccsz[i]=0; }
+    if(x->setdt) c->last_dt=to;
+    return 1;
+}
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     const double ts=ork_now_us();
@@ -3593,7 +3700,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
-    if(dt!=c->last_dt){ int keepwarm=(ork_nothrash()&&ORK_INT_DT(dt)&&ORK_INT_DT(c->last_dt)) || (ork_f16warm()&&ORK_KW_DT(dt)&&ORK_KW_DT(c->last_dt)); if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt) && !keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash()&&!keepwarm)c->mccsz[i]=0; } c->last_dt=dt; }
+    ork_npu_enter(c,dt,XP_MC_MM);
     if(mc_ensure(c,nc)) return -1;
 
     /* PRECOMPILED REGCMD cache: allocate SINGLE-THREADED here (mcworker runs on nc threads concurrently, so a
@@ -3997,7 +4104,7 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
     if(nc>c->soc->cores)nc=c->soc->cores;
     if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
     if(nc<1)nc=1;
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
+    ork_npu_enter(c,DT_I4,XP_I4_MC);
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
     if(ork_i4_batch()){ size_t mo=(size_t)c->soc->nmax*64*2; if(osz<mo)osz=mo; }  /* batch de-tile: physrow up to 4*HCAP(=16)*NB = 64*Ncore int16 */
@@ -4158,7 +4265,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
         fprintf(stderr, "[ork] ork_mm_run_i4_grouped: M=%d, N=%d, K=%d, nc=%d, NB=%d\n", M, w->N, w->K, nc, NB);
         logged = 1;
     }
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ if(!keepwarm)c->mwarm[i]=0; if(!ork_nothrash())c->mccsz[i]=0; } c->last_dt=DT_I4; }
+    ork_npu_enter(c,DT_I4,XP_I4_MC);
     if(mc_ensure(c,nc)) return -1;
     size_t osz=(size_t)c->soc->nmax*2;
     for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate grouped multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
@@ -4208,7 +4315,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * races the reset -> WEDGE (multi-core). Reusing the (per-domain, dom_activate-swapped) Cc when it still
      * fits avoids both. warmed=0 still re-warms (handles the stale-first-output). The realloc guard below still
      * reallocs on a genuine size grow. */
-    if(dt!=c->last_dt){ int kw=ork_f16warm()&&ORK_KW_DT(dt)&&ORK_KW_DT(c->last_dt); if(dt==DT_I8 && !ORK_I8_LIVE(c->last_dt) && !kw) act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; if(!ork_nothrash()&&!kw)c->ccsz=0; c->last_dt=dt; }
+    ork_npu_enter(c,dt,XP_SC_MM);
     size_t need=(size_t)M*N*4;                         /* output is fp32 or int32 (both 4 bytes) */
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;}
     memset(c->cres,0,need);
@@ -7189,12 +7296,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // keepwarm (line 3501). Without this, entering the chain from a plain int8 op re-warmed every call
     // (reps=2), which is the per-layer thrash that made HW-chaining the FFN a net loss. Only a NON-int8
     // predecessor (fp16/int4) needs the reset+re-warm.
-    if (c->last_dt != 3 /* DT_I8_CHAIN */) {
-        int keepwarm = ork_nothrash() && ORK_I8_LIVE(c->last_dt);
-        if (!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);   /* reset only entering int8 from a real mode change */
-        if (!keepwarm) { c->warmed = 0; c->ccsz = 0; }
-        c->last_dt = 3; // DT_I8_CHAIN
-    }
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT);
 
     // 3. Resolve buffers and cache coherency
     struct buf tmp_A[1024];
@@ -7472,12 +7574,7 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
     int fd=c->fd;
     /* warm-state management (mirror run_chain_i8): entering a chain from a non-int8-live mode resets +
      * unwarms so the WARM-UP reps below fire; DT_I8<->DT_I8_CHAIN is not a real mode change (keepwarm). */
-    if(c->last_dt != 3 /* DT_I8_CHAIN */){
-        int keepwarm = ork_nothrash() && ORK_I8_LIVE(c->last_dt);
-        if(!ORK_I8_LIVE(c->last_dt)) act(fd, RKNPU_ACT_RESET, 0);
-        if(!keepwarm){ c->warmed = 0; c->ccsz = 0; }
-        c->last_dt = 3;
-    }
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT);
     size_t off[1024], total=0;
     for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; off[i]=total; total+=(size_t)progs[i].nwords; }
     if(total*4 > c->regcmd.size || (size_t)n*sizeof(struct rknpu_task) > c->task.size) return -2;
@@ -7818,7 +7915,7 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     // with run_stream groups without a ~107ms soft-reset per matmul. Freshly-allocated per-core output
     // buffers are primed deterministically by stream_worker's reps=2-on-first-use (mwarm[i]); a reset
     // here clears every core's mwarm so they re-prime.
-    if (c->last_dt != 3) { int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if (!ORK_I8_LIVE(c->last_dt) && !kw) { act(fd, RKNPU_ACT_RESET, 0); c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; } c->last_dt = 3; }
+    ork_npu_enter(c, 3, XP_STREAM_I8);
     // Core count is caller-configurable up to the SoC max: budget() honors ork_npu_set_core_budget()
     // and the ORK_NPU_MC env (both capped to soc->cores). Capped to S (no more cores than tasks).
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
@@ -7889,7 +7986,7 @@ int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     int fd=c->fd;
     /* fp16 entry: ACT_RESET ONCE on a mode change into fp16, then stay warm across stream calls (last_dt
      * stays DT_F16 as long as only fp16 stream runs) — no per-call reset churn. */
-    if(c->last_dt!=DT_F16){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++){ if(!kw)c->mwarm[i]=0; } c->last_dt=DT_F16; }
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16);
     int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
     if(mc_ensure(c,nc)) return -1;
     for(int i=0;i<nc;i++){
@@ -7951,7 +8048,7 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
         if(mk>maxMK)maxMK=mk; if(mn>maxMN4)maxMN4=mn; }
     int fd=c->fd;
     /* int8-live entry (last_dt=3); keep-warm across int8<->fp16 stage transitions under ORK_SSM_KEEPWARM */
-    if(c->last_dt!=3){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++){ if(!kw)c->mwarm[i]=0; } c->last_dt=3; }
+    ork_npu_enter(c,3,XP_STREAM_I8B);
     int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
     if(mc_ensure(c,nc)) return -1;
     for(int i=0;i<nc;i++){
@@ -8023,7 +8120,7 @@ int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks)
         if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;
         if(w->K%32||w->N%16) return -2; }
     int fd=c->fd;
-    if(c->last_dt!=DT_F16){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)act(fd,RKNPU_ACT_RESET,0); if(!kw)c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++){ if(!kw)c->mwarm[i]=0; } c->last_dt=DT_F16; }
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16);
     int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
     if(mc_ensure(c,nc)) return -1;
     int per=(S+nc-1)/nc;                                   /* max programs a single core owns */
@@ -8401,12 +8498,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (check_overlap("ork_mm_run_chain_i4", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
-    if (c->last_dt != 4 /* DT_I4_CHAIN */) {
-        act(fd, RKNPU_ACT_RESET, 0);
-        c->warmed = 0;
-        c->last_dt = 4;
-        c->ccsz = 0;
-    }
+    ork_npu_enter(c, 4 /* DT_I4_CHAIN */, XP_I4CHAIN);
 
     int ok = 0;
     int max_K = 0, max_N = 0;
@@ -8549,7 +8641,7 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
     const int NBW=64;                                 /* per-N-block matmul width (the vendor-validated case) */
     static struct buf sA={0}, sC={0}, sRC={0}, sTK={0}; static int cap_M=0,cap_K=0, warm=0;
     /* int4 regcmd mode is stateful: reset when entering int4 from another dtype (mirrors run_i4_mc) */
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm) act(fd,RKNPU_ACT_RESET,0); c->last_dt=DT_I4; warm=0; }
+    if(ork_npu_enter(c,DT_I4,XP_I4_INCR)) warm=0;
     if(M>cap_M||K>cap_K){
         warm=0;   /* fresh output buffer -> first submit reads stale; needs a warmup rep (AGENTS cold-start) */
         if(sA.cpu)bdestroy(fd,&sA); if(sC.cpu)bdestroy(fd,&sC); if(sRC.cpu)bdestroy(fd,&sRC); if(sTK.cpu)bdestroy(fd,&sTK);
@@ -8689,7 +8781,7 @@ static int run_i4_incr_mc(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     int fd=c->fd, K=w->K, N=w->N, NBLK=N/64;
     if(w->Sk!=1 || w->Sn!=1 || N%64) return -4;
     if(nc<1)nc=1; if(nc>NBLK)nc=NBLK; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt); if(!keepwarm){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; } c->last_dt=DT_I4; }
+    ork_npu_enter(c,DT_I4,XP_I4_MWARM);
     if(mc_ensure(c,nc)) return -1;
     size_t need_rc=((size_t)2*REGCMD_I4_N+(size_t)M*32)*4, need_af=(size_t)M*(K/2), need_o=(size_t)M*64*2, need_tk=(size_t)M*sizeof(struct rknpu_task);
     for(int i=0;i<nc;i++){
@@ -8779,8 +8871,7 @@ static int run_i4_bchain(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; { const char*e=getenv("ORK_I4_BCH_W"); if(e){int v=atoi(e); if(v>=64)Wb=v&~63;} } if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     int nc=budget(c,M); if(nc>NC)nc=NC; if(nc<1)nc=1; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt);
-        if(!keepwarm){ act(c->fd,RKNPU_ACT_RESET,0); for(int q=0;q<ORK_MAXCORE;q++)c->mwarm[q]=0; } c->last_dt=DT_I4; }
+    ork_npu_enter(c,DT_I4,XP_I4_MWARM);
     if(mc_ensure(c,nc)) return -1;
     c->mc_error=0;
     struct i4bchw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
@@ -8812,8 +8903,7 @@ static int run_i4_cbatch(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *
     int H=16384/K; if(H>16)H=16; { const char*e=getenv("ORK_I4_BCH_H"); if(e){int v=atoi(e); if(v>=1)H=v;} } if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; { const char*e=getenv("ORK_I4_BCH_W"); if(e){int v=atoi(e); if(v>=64)Wb=v&~63;} } if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, NT=NC*NG, Wmax=Wb/64;
-    if(c->last_dt!=DT_I4){ int keepwarm=ork_nothrash()&&ORK_INT_DT(c->last_dt);
-        if(!keepwarm){ act(fd,RKNPU_ACT_RESET,0); for(int q=0;q<ORK_MAXCORE;q++)c->mwarm[q]=0; } c->last_dt=DT_I4; }
+    ork_npu_enter(c,DT_I4,XP_I4_MWARM);
     if(mc_ensure(c,1)) return -1;
     size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
     size_t need_o=(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
@@ -9011,7 +9101,7 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     }
     int fd = c->fd;
     int cold = 0;   /* warmup pass needed on a fresh stream-i4 mode OR freshly-allocated per-core buffer */
-    if (c->last_dt != 5 /* DT_I4_STREAM */) { act(fd, RKNPU_ACT_RESET, 0); c->last_dt = 5; c->warmed = 0; for (int i = 0; i < ORK_MAXCORE; i++) c->mwarm[i] = 0; cold = 1; }
+    if (ork_npu_enter(c, 5 /* DT_I4_STREAM */, XP_I4_STREAM)) cold = 1;
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     if (mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {
