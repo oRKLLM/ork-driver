@@ -831,26 +831,25 @@ static void set_f16_out(uint32_t*rc,int N,int stride){
  * writes 0x4084=1 WITHOUT DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16), so the fp16 CVT is never enabled. Here we take
  * the vendor's mode/bypass/CVT registers verbatim and keep only the matmul-shaped output GEOMETRY (N channels). */
 static void set_f16_out_fp16in(uint32_t*rc,int N){
-    /* TRUE MINIMAL DELTA: synth's REGCMD template is ALREADY a working fp16-front-end matmul that outputs fp32
-     * (0x400c OUTPUT_MODE=2, 0x40c0, CNA 0x100c fp16, CVT 0x104c bypass all match the vendor). Going fp32-out ->
-     * fp16-out is exactly two registers: OUT_PRECISION fp32->fp16, and DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16) to
-     * actually enable the fp32->fp16 conversion on writeout. Overriding the BS/BN/EW ALU stages with the vendor
-     * CONV's values (a different op geometry) BROKE the working pipeline and hung — so touch nothing else. */
-    setr(rc,REGCMD_N,0x1001,0x4010,0x48000002);                       /* DATA_FORMAT OUT=fp16 (was fp32 0xa8000002) */
+    /* fp16-in fp16-out DPU output stage, taken VERBATIM from a captured VENDOR fp16->fp16 MATMUL output stage
+     * (~/rknn_sdk/cap_fp16f16.dec, dom 1001). The prior attempts hung because they used the vendor CONV's stage
+     * (0x4040=0x20150 BS-ALU ACTIVE, 0x40c0=0x40) — but a MATMUL BYPASSES BS (0x4040=0x53) and uses 0x40c0=0x20.
+     * Only the precision/bypass/CVT regs are set here; the shape-dependent geometry (0x4034/0x4038/0x403c/0x4058/
+     * 0x405c) is left to synth's per-(M,N) programming. KEY vs fp32-out: 0x4010 OUT=fp16, 0x4084 FP32TOFP16_EN. */
+    setr(rc,REGCMD_N,0x1001,0x4004,0x0000000e);
+    setr(rc,REGCMD_N,0x1001,0x400c,0x000001e4);                       /* FEATURE_MODE OUTPUT_MODE=2 */
+    setr(rc,REGCMD_N,0x1001,0x4010,0x48000002);                       /* DATA_FORMAT fp16/fp16/fp16 */
+    setr(rc,REGCMD_N,0x1001,0x4040,0x00000053);                       /* BS FULLY BYPASSED (matmul, NOT conv's 0x20150) */
+    setr(rc,REGCMD_N,0x1001,0x4050,0x00000126);                       /* BS_OW_CFG */
+    setr(rc,REGCMD_N,0x1001,0x4060,0x00000053);                       /* BN fully bypassed */
+    setr(rc,REGCMD_N,0x1001,0x4070,0x00000383);                       /* EW fully bypassed */
+    setr(rc,REGCMD_N,0x1001,0x4078,0x00000001);
+    setr(rc,REGCMD_N,0x1001,0x4080,0x00000000);
     setr(rc,REGCMD_N,0x1001,0x4084,0x00010001);                       /* OUT_CVT_SCALE: FP32TOFP16_EN=1 | scale=1  <-- KEY */
-    (void)N;
-    /* BLOCKED (2026-07-14, RK3588): three fp16-out configs — full vendor-conv output stage, no-geometry, and this
-     * true 2-reg minimal delta — ALL HANG the fp16 MATMUL (synth) standalone (errno=110), while the SAME matmul
-     * with fp32-out (template default) runs fine. Decoded proof the deltas were right: synth's template already
-     * matches the vendor conv on CNA fp16 (0x100c=0x20000120), CVT bypass (0x104c=0xb), OUTPUT_MODE=2 (0x400c),
-     * and 0x40c0 — the only gap to the vendor's fp16-out was OUT_PRECISION + FP32TOFP16_EN, set here. It still
-     * hangs => the fp16 matmul datapath (enable=0xd) has no working 2-byte DPU writeout; the vendor emits fp16
-     * only from the CONV datapath (enable=0x1d). Consistent with "int8->fp16 fused not a datapath": on-chip fp16
-     * OUTPUT is constrained to the conv/fused path. int8-in is also out (int32 acc, no int32->fp16 CVT -> zeros).
-     * => The single-submit fp16 A·V-normalize bridge needs the CONV front-end reproduced for a matmul-equivalent
-     * (or the chained SDP reconfigured to read fp32 G). The SEPARATE-submit attention (fp16 matmul fp32-out ->
-     * CPU -> mul_perchan_f16) is already coherent and the chain is throughput-neutral, so this is an architectural
-     * nicety, not a perf lever. See ATTN_REDERIVE_WIP.md / wiki Exp-2026-07-14. */
+    setr(rc,REGCMD_N,0x1001,0x4088,0x00000000);
+    setr(rc,REGCMD_N,0x1001,0x40c0,0x00000020);                       /* matmul fp16 surface elem (NOT conv's 0x40) */
+    setr(rc,REGCMD_N,0x1001,0x40c4,0x00000000);
+    setr(rc,REGCMD_N,0x1001,0x4038,(((N/8)-1)<<16)|((N/8)-1));        /* fp16 atom-8 group stride (capture N/8-1; synth's N/4-1 is the fp32 atom) */
 }
 
 /* Runtime gate for the PPU fused-output path. Gated on the DETECTED SoC: the fused output stage (int8
@@ -5240,17 +5239,28 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     struct buf O=bcreate(fd,osz,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
     uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (unwarmed synth writes zeros) */
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_N];
-    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
-    set_f16_out_fp16in(rc,N);                                        /* vendor fp16-out stage (FP32TOFP16_EN set) */
+    int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
+    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    if(!getenv("ORK_F16_FP32OUT")) set_f16_out_fp16in(rc,N);          /* vendor fp16-out stage; skip => synth's native fp32-out (compute sanity) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     sub.timeout=to_ms;
     int ok=-1;
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
-        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n));
+    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }  /* fp16 cold 2-pass re-warm */
+    if(ok==0){
+        int ewc=getenv("ORK_F16_EWC")?1:0;                            /* readback layout: default CONTIGUOUS [M][N]; ORK_F16_EWC=atom-8 */
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+(ewc?EWCUBEH(m,n):((size_t)(m*N+n)*2)));
+        if(getenv("ORK_F16_RAWDUMP")){ uint16_t*o=(uint16_t*)O.cpu; int nz=0,ne=osz/2; int first[16],nf=0;
+            for(int i=0;i<ne;i++) if(o[i]){ nz++; if(nf<16){ first[nf++]=i; } }
+            fprintf(stderr,"[f16raw] osz=%zu nonzero=%d/%d  first offsets(elem):",osz,nz,ne);
+            for(int i=0;i<nf;i++) fprintf(stderr," %d=%.3g",first[i],(double)*(ork_f16*)&o[first[i]]);
+            fprintf(stderr,"\n"); }
         ok=0; }
     bdestroy(fd,&W);bdestroy(fd,&O);
     #undef EWCUBEH
@@ -7064,30 +7074,40 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
     memset(G.cpu,0,sz); memset(O.cpu,0,sz); memset(SB.cpu,0,4096);
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
-    /* ERDMA mode for the chained SDP (RE): default per-channel (0x08, b=[N] contiguous); ORK_CHAIN_PE=1 =>
-     * per-ELEMENT (0x40000008, b=[M][N] EWCUBEH, scale tiled across rows) — isolates ERDMA-in-chain vs per-channel mode. */
-    uint32_t r34=0x00000008u;                                                 /* ERDMA per-channel + 2-byte (fp16 SDP) */
-    { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=(ork_f16)scale[n]; }  /* fp16 per-channel scale CONTIGUOUS [N] */
+    /* ALL-INT16 dtype-matched chain (the fp16-out matmul writeout is a HW dead end — see set_f16_out_fp16in NOTE).
+     * int8 matmul -> INT16 G (set_i16_out, PROVEN by the gate->silu chain) -> INT16 2-input per-channel SDP
+     * (REGCMD_MUL_I16, PROC_PRECISION=1, DATA_FORMAT 0x24000001). Both int16 => dtype-path matched (the same fix
+     * that unhung the fp16 pair), and the matmul CAN emit int16 (unlike fp16). PC16/EWCUBEH atom-8 layout is shared
+     * between set_i16_out output and the int16 SDP input (the gatesilu bridge).
+     * RESULT (2026-07-14): HANGS (errno=110) — the int16 2-input SDP (REGCMD_MUL_I16) is NOT chain-safe: it keeps
+     * the BS-ALU ACTIVE (0x4040=0x20050) + relies on reset-provided state, unlike the vendor fp16 chain SDP
+     * (REGCMD_MUL_F16_CHAIN, BS fully bypassed 0x53). Dtype-match is necessary but NOT sufficient; the SDP must
+     * also be the chain-safe (BS/BN bypassed) variant, which we only have for fp16. So neither end lines up:
+     * fp16 has the chain-safe SDP but no matmul writeout; int16 has the matmul writeout but no chain-safe SDP.
+     * Next lever = capture a vendor GEMM with fp16-out (how the vendor emits fp16 from a matmul-class op). */
+    uint32_t r34=0x00000008u;                                                 /* ERDMA per-channel + 2-byte (int16 SDP) */
+    { int16_t*sb=(int16_t*)SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }      /* int16 per-channel scale CONTIGUOUS [N] */
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
-    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul FP16-out -> G */
-    set_f16_out(mm,N,0);                                                              /* fp16 G to match the fp16 SDP (PROC_PRECISION=2) — the dtype-path fix */
-    /* prog1: VENDOR-captured chained 2-input SDP (REGCMD_MUL_F16_CHAIN, known-good in-chain: BS+BN bypassed).
-     * Patch only addrs + geometry + ERDMA mode; keep the vendor's chain-safe config verbatim (the user's call:
-     * use the vendor's working version rather than patching our standalone-tuned template). (void)m2;(void)s2. */
-    (void)m1;(void)s1;(void)m2;(void)s2;
-    memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
-    set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5018,(uint32_t)G.dma);                    /* INPUT = matmul OUTPUT (bridge) */
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5038,(uint32_t)SB.dma);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5034,r34);                               /* ERDMA mode (per-channel 0x08 / per-element 0x40000008) */
+    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
+    set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
+    /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
+     * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
+     * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
+    memcpy(pc,REGCMD_MUL_I16,sizeof pc);
+    set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
     double t0=ork_now_us();
-    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,-1} };
+    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
     int crc=ork_npu_chain_progs(c,2,progs,dom);
     if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
-        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=(int16_t)lrintf((float)*(ork_f16*)((char*)O.cpu+EWCUBEH(m,n))); }  /* fp16 O -> int16 return */
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }  /* int16 O */
     bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
     #undef EWCUBEH
     return crc;
@@ -7102,6 +7122,7 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_HW);                    /* prime the fp16 pipeline (2-pass cold re-warm) — synth's fp16 matmul writes zeros unwarmed */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
     struct buf W=bcreate(fd,(size_t)K*N*2,0x403,dom), G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom), SB=bcreate(fd,4096,0x403,dom);
@@ -7116,7 +7137,8 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
-    synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF);   /* prog0: FP16 matmul -> G */
+    int sched=((K&(K-1))==0 && K>=128 && K<2048);                                /* run_stream_f16's rule; small K => sched=0 (sched=1 miscomputes small K) */
+    synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,sched,CBUF); /* prog0: FP16 matmul -> G (CONTIGUOUS [M][N]) */
     set_f16_out_fp16in(mm,N);                                                     /* vendor fp16-out stage (FP32TOFP16_EN set) */
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
     set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
