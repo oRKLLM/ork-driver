@@ -111,21 +111,34 @@ intentional, so each is decided individually in Phase 2 (a one-row `XSPEC` edit,
    ADD_F16          0.2 ok   0.3 ok   0.3 ok          0.5 ok    107 ok    107 ok
    ```
    All SAFE; no wedges. `none` (keep-warm) is optimal for every pair.
-2. **Chain profiles ignore `ORK_SSM_KEEPWARM`.** `XP_CHAIN_NT` uses `KWP_NTL` (nothrash-only); a chain
-   after an fp16 op resets where `XP_SC_MM`/stream (`KWP_F16`) keep warm. Decide whether chains should
-   honor the (default-on) SSM keep-warm.
-3. **`XP_STREAM_I8` vs `XP_STREAM_I8B` divergence.** Both target I8_CHAIN(3): `run_stream_i8` gates
-   reset on `!I8_LIVE && !kw`, the other on `!kw`. Identical at default knobs, differ at
-   `ORK_SSM_KEEPWARM=0`. Likely should be one profile.
-4. **Diagnostic forced-fp16 resets skipped** (`ork_ssd_fused`, `ork_ssd_probe_rawmm/fusedmm_f16`):
-   unconditional `act(); warmed=0; last_dt=DT_F16` with NO `if(dt!=last_dt)` guard, so a `setdt`
-   profile's `from==to` early-return would drop the intentional forced reset → NOT cleanly replaceable.
-   Board-only diagnostics; low priority (add a `force` profile if wired).
-5. **Conditional prime resets skipped**: the `ORK_I16_RESET`-gated int16 reset and the fused-SiLU LUT
-   `!ORK_I8_LIVE || ORK_PROBE_RESET` prime — env/warm-conditional and leave `last_dt`; model as a
-   conditional SDP variant.
-6. **int4 clear-gating asymmetries** (encoded faithfully, worth reconciling): `XP_I4_MC` clears `mccsz`
-   on `!nothrash`; `XP_I4_MWARM` clears no size; `XP_I4_INCR` clears nothing (caller-local `warm`).
+2. **Chain profiles honor `ORK_SSM_KEEPWARM` — FIXED 2026-07-14 (★ ~105ms/transition win).**
+   `XP_CHAIN_NT` used `KWP_NTL` + `RC_NOTLIVE`, so a chain entered from an fp16 op ate a **full ACT_RESET
+   soft-reset** where the stream profiles kept warm. `chain_xition_probe` (manufactured fp16→int8-chain
+   across a wide K/N/M sweep, since the path is dormant in a dense pipeline) measured the cost: **chain(hw)
+   after-fp16 reset-cost ≈ 53,538 µs avg (individual ~104–107 ms), stream(sw) ≈ 0 — and BOTH coherent**,
+   proving the reset was pure drift, not correctness. Converged `XP_CHAIN_NT` → `KWP_MC` + `RC_NOTLIVE_NOTKW`
+   (at `to=3`, `KWP_MC` = keep-warm if `f16warm&KW(from)` or `nothrash&INT(from)` — the unified predicate).
+   Re-ran the probe: chain(hw) reset-cost **53,538 → −1.1 µs**, all coherent. `make test` still passes.
+3. **`XP_STREAM_I8`/`XP_STREAM_I8B` unified — FIXED 2026-07-14.** Both targeted I8_CHAIN(3) with only
+   non-default-knob reset/warm-cond differences (gratuitous drift). Converged both to `KWP_MC` +
+   `RC_NOTLIVE_NOTKW` + `WC_NOTLIVE_NOTKW`, which made them identical, then **collapsed to one profile**
+   (`XP_STREAM_I8`); `run_stream_i8_sk` repointed to it and `XP_STREAM_I8B` removed. Single source of truth.
+4. **Diagnostic forced-fp16 resets — ASSESSED 2026-07-14: intentional, out of scope (leave).**
+   (`ork_ssd_fused`, `ork_ssd_probe_rawmm/fusedmm_f16`) do an unconditional `act(); warmed=0;
+   last_dt=DT_F16` with NO guard — a deliberate *forced reinit* in board-only diagnostic/bench code, not
+   a precision-mode *transition*. A `setdt` profile's `from==to` early-return would (correctly) drop the
+   forced reset, so they are not the same construct. Not production drift; left as-is.
+5. **Conditional prime resets — ASSESSED 2026-07-14: correct as-is (leave).** The `ORK_I16_RESET`-gated
+   reset and the fused-SiLU LUT `!ORK_I8_LIVE || ORK_PROBE_RESET` prime are env/warm-gated and leave
+   `last_dt` untouched — which is exactly the correct SDP-axis behavior confirmed by the Phase-2 mode_probe
+   finding (SDP ops leaving `last_dt` alone is optimal, not a bug). Not drift.
+6. **int4 clear-gating — ASSESSED 2026-07-14: plausibly mechanism-legit, deferred with rationale.**
+   `XP_I4_MC` (run_i4_mc/grouped, standard multicore output), `XP_I4_MWARM` (incr_mc/bchain/cbatch,
+   batch-chain paths that size their own grow-only per-call buffers), and `XP_I4_INCR` (single-core, static
+   local buffers) use *different buffer-management strategies*, so the size-clear difference is not obviously
+   the *same* transition (guiding-principle caveat: confirm same-transition before converging). Converging
+   would need an int4-specific manufactured probe to prove equivalence; low value (int4 is the experimental
+   tier, W8A8 is production) and non-zero risk → deferred, not a Phase-2 blocker.
 
 ## How to work on this
 See AGENTS.md §"Mode-transition layer" for the modify/add/test recipe. Scratch doc — fold into the

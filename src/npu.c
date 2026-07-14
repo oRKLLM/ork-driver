@@ -3596,11 +3596,13 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0)
  * Each run path calls ork_npu_enter(c, target_marker, profile, chain) FIRST; the per-profile row of XSPEC
  * below IS the policy for that path. A profile is a faithful, byte-for-byte transcription of the site
  * it replaced (verified `make test` byte-identical across all dtypes and both keep-warm knobs), so
- * Phase-1 behavior is UNCHANGED — this is the behavior-preserving consolidation. The historical drift
- * is now visible AS DATA (e.g. the nothrash-keyed chain profile XP_CHAIN_NT ignores ORK_SSM_KEEPWARM
- * where the matmul/stream profiles honor it via KWP_F16), and a policy change is a one-row edit.
- * See MODE_TRANSITION_LAYER_WIP.md for the Phase-2 catalogue and AGENTS.md §"Mode-transition layer"
- * for how to add or change a transition.
+ * Phase-1 behavior was UNCHANGED — the consolidation was behavior-preserving. The drift is visible AS
+ * DATA, and a policy change is a one-row edit — e.g. PHASE 2 (2026-07-14) converged the →I8_CHAIN
+ * profiles: XP_CHAIN_NT used to ignore ORK_SSM_KEEPWARM (KWP_NTL + RC_NOTLIVE), so a chain entered
+ * from an fp16 op ate a full ~105ms ACT_RESET where the stream profiles kept warm; switching it to
+ * KWP_MC + RC_NOTLIVE_NOTKW eliminated that (chain_xition_probe: reset-cost 53538us→~0, coherent), and
+ * the two stream-int8 profiles collapsed into one (XP_STREAM_I8). See MODE_TRANSITION_LAYER_WIP.md for
+ * the full Phase-2 record and AGENTS.md §"Mode-transition layer" for how to add or change a transition.
  *
  * EXHAUSTIVE (from -> to) permutation space — modes = { COLD(-1), F16(0), I8(1), I4(2), I8_CHAIN(3),
  * I4_CHAIN(4), I4_STREAM(5) }, plus SDP = a TRANSIENT activation/ewmul reset with NO stored marker.
@@ -3644,14 +3646,13 @@ enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
 enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
 struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
 /* transition profiles — one row per distinct historical site (line refs = pre-refactor src/npu.c) */
-enum { XP_MC_MM, XP_SC_MM, XP_CHAIN_NT, XP_STREAM_I8, XP_STREAM_I8B, XP_STREAM_F16,
+enum { XP_MC_MM, XP_SC_MM, XP_CHAIN_NT, XP_STREAM_I8, XP_STREAM_F16,
        XP_I4_MC, XP_I4_MWARM, XP_I4_INCR, XP_I4CHAIN, XP_I4_STREAM, XP_SDP, XP_NPROFILE };
 static const struct ork_xspec XSPEC[XP_NPROFILE] = {
   /* XP_MC_MM      3596  run_multicore   */ { KWP_MC,  RC_I8ENTRY,       TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT_NOTKW, 1 },
   /* XP_SC_MM      4211  run single-core */ { KWP_SC,  RC_I8ENTRY,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NT_NOTKW, 1 },
-  /* XP_CHAIN_NT   7194/7477 chain       */ { KWP_NTL, RC_NOTLIVE,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NOTKW,    1 },
-  /* XP_STREAM_I8  7821  run_stream_i8   */ { KWP_F16, RC_NOTLIVE_NOTKW, TG_BOTH,    WC_NOTLIVE_NOTKW, TG_NONE,    WC_NONE,     1 },
-  /* XP_STREAM_I8B 7954  stream int8     */ { KWP_F16, RC_NOTKW,         TG_BOTH,    WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
+  /* XP_CHAIN_NT   7194/7477 chain       */ { KWP_MC,  RC_NOTLIVE_NOTKW, TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NOTKW,    1 },
+  /* XP_STREAM_I8  7821  run_stream_i8   */ { KWP_MC,  RC_NOTLIVE_NOTKW, TG_BOTH,    WC_NOTLIVE_NOTKW, TG_NONE,    WC_NONE,     1 },
   /* XP_STREAM_F16 7892/8026 stream f16  */ { KWP_F16, RC_NOTKW,         TG_BOTH,    WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
   /* XP_I4_MC      4000/4161 int4 mc     */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT,       1 },
   /* XP_I4_MWARM   8692/8783/8816 int4   */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
@@ -8083,7 +8084,7 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
         if(mk>maxMK)maxMK=mk; if(mn>maxMN4)maxMN4=mn; }
     int fd=c->fd;
     /* int8-live entry (last_dt=3); keep-warm across int8<->fp16 stage transitions under ORK_SSM_KEEPWARM */
-    ork_npu_enter(c,3,XP_STREAM_I8B,OCK_SW);
+    ork_npu_enter(c,3,XP_STREAM_I8,OCK_SW);  /* small-K int8 stream: same →I8_CHAIN transition as run_stream_i8 (profiles converged 2026-07-14) */
     int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
     if(mc_ensure(c,nc)) return -1;
     for(int i=0;i<nc;i++){

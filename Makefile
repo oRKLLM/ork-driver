@@ -459,6 +459,9 @@ floor_decomp: tools/floor_decomp.c $(CORE)
 mode_probe: tools/mode_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
 
+chain_xition_probe: tools/chain_xition_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
 ssd_layer_bench: tools/ssd_layer_bench.c $(CORE)
 	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(CORE) -lm -lpthread
 
