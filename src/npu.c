@@ -63,7 +63,9 @@ static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK
  * (2-byte activation) size and are reused by int8. Off by default; validate on silicon (errno=110) before
  * promoting. The families that may interleave reset-free: int8-live (DT_I8/chain) and DT_F16. */
 #define ORK_KW_DT(dt) (ORK_I8_LIVE(dt) || (dt)==DT_F16)
-static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=(e&&atoi(e))?1:0;} return v; }
+/* DEFAULT ON (2026-07-13): validated general, coherent, bit-exact-safe win — skips the int8<->fp16 ACT_RESET
+ * churn for any fp16-op interleaved with int8 matmuls (SSM scan etc.). ORK_SSM_KEEPWARM=0 to disable. */
+static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
 static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
 /* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
@@ -8077,10 +8079,10 @@ static int ork_ssm_i8_mask(void){ static int v=-2; if(v==-2){const char*e=getenv
 /* ORK_SSM_CHAIN: route the fp16 scan stages through the chained-multicore stream (one task_number>1 submit
  * per core, PC-chaining the core's heads) instead of run_stream_f16 (one submit per head). Escapes the
  * per-matmul submit floor while keeping 3-core parallelism. Off by default. */
-static int ork_ssm_chain(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_CHAIN"); v=e?atoi(e):0;} return v; }
+static int ork_ssm_chain(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_CHAIN"); v=e?atoi(e):1;} return v; }  /* DEFAULT ON: fused-multicore fp16 stream, part of the validated SSM-scan win. ORK_SSM_CHAIN=0 to disable. */
 /* ORK_SSM_CS: SSD chunk size (default 64). Bigger CS = fewer chunks (NC=nt/CS) but O(CS^2) intra-chunk
  * work (the G / decay-mask are CS x CS). Clamped to a %16 value in [16,256]. */
-static int ork_ssm_cs(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_CS"); v=e?atoi(e):64; if(v<16||v>256||v%16)v=64;} return v; }
+static int ork_ssm_cs(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_CS"); v=e?atoi(e):128; if(v<16||v>256||v%16)v=128;} return v; }  /* DEFAULT 128: +5% short-prefill (CS≈nt capped 128); ORK_SSM_CS overrides (64 for long prefill). */
 /* ORK_SSM_BATCH: batch the chunk-independent matmul stages ACROSS all NC chunks — each stage becomes ONE
  * dispatch of nh*NC matmuls (instead of nh, NC times). Only the CPU inter-chunk carry stays sequential.
  * Cuts NPU dispatches from 4*NC to 4 (fewer pool wake-ups, better floor amortization). fp16-only. */
