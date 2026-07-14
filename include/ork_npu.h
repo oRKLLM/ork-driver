@@ -603,6 +603,8 @@ int          ork_npu_mul_perchan_i16(ork_npu *ctx, const short *a, const short *
  * single-submit attention chain). out=clamp_i16(requant(A[M,K]xB[K,N],m1,s1)*scale[n]*m2>>s2). K%32,N%32,M<=64. */
 int          ork_npu_chain_mm_perchan_i16(ork_npu *ctx, int M, int K, int N, const signed char *A, const signed char *B,
                                           const short *scale, int m1, int s1, int m2, int s2, short *out, double *us);
+int          ork_npu_chain_mm_perchan_f16(ork_npu *ctx, int M, int K, int N, const unsigned short *A, const unsigned short *B,
+                                          const unsigned short *scale, unsigned short *out, double *us);
 int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
                             double a_scale, double b_scale, double out_scale, signed char *out, double *us);
 
@@ -700,6 +702,8 @@ void         ork_f16_fuzz_clear(void);
 void         ork_f16_fuzz_add(unsigned int blk, unsigned int reg, unsigned int val);
 int          ork_npu_probe_f16_mm(ork_npu *ctx, int M, int K, int N,
                                  const unsigned short *A, const unsigned short *B, float *raw);
+int          ork_npu_probe_f16_mm_f16out(ork_npu *ctx, int M, int K, int N,
+                                 const unsigned short *A, const unsigned short *B, unsigned short *out);
 
 /* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
 int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,

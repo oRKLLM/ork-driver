@@ -223,3 +223,29 @@ apply to the chained per-channel op -> unblock the single-submit chain. The user
 ## Board-ops
 - timeout every NPU cmd; SIGTERM never kill -9; wedge→`ssh board 'sudo reboot'`; hard-wedge→Rock 5B Plug.
 - never copy macOS binaries to board — rsync SOURCE, build natively.
+
+## ★ 2026-07-14 — chained 2-input SDP HANG FIXED; fp16-in VALUE path hits a HW datapath wall
+**Hang fix (committed):** the chained 2-input-SDP hang was a DTYPE-PATH mismatch — the fp16 SDP
+(PROC_PRECISION=2) was fed non-fp16 G. Matching the path (matmul emits fp16 → SDP walks) fixes it:
+`ork_npu_chain_mm_perchan_i16` chains `rc=0`, NO errno=110. The deep M4 handoff blocker is solved.
+
+**fp16-in close — BLOCKED on a HW datapath, not a bug.** To get CORRECT values the matmul must emit fp16
+(int8→fp16 = zeros, the known "not a datapath"). Built the fp16-in harness (`ork_npu_chain_mm_perchan_f16`,
+`ork_npu_probe_f16_mm_f16out`, `set_f16_out_fp16in`) + decoded the vendor conv task[0] fp16 output stage
+(conv_mul_full.dump → decode_rocket.py). Findings:
+- Vendor fp16-out stage: 0x4010=0x48000002, **0x4084=0x00010001 (FP32TOFP16_EN bit16 SET)** — the enable
+  bit `set_f16_out` was missing (it wrote 0x1). Also 0x400c OUTPUT_MODE=2, BS/BN/EW bypassed.
+- synth's fp16 template ALREADY matches the vendor on CNA fp16 (0x100c=0x20000120), CVT bypass (0x104c=0xb),
+  0x400c=0x1e4, 0x40c0 — so the only true delta to fp16-out is OUT_PRECISION + FP32TOFP16_EN.
+- **All three fp16-out configs HANG the fp16 matmul standalone (task_number=1, errno=110)** — full vendor
+  stage, no-geometry, and the 2-reg minimal delta — while the SAME matmul with fp32-out runs fine.
+- int8-in + FP32TOFP16_EN still = zeros (int32 acc, no int32→fp16 CVT). Confirms [[int8-fp16-fused-not-a-datapath]].
+=> **The fp16 matmul datapath (enable=0xd) has no working 2-byte DPU writeout.** The vendor emits fp16 ONLY
+from the CONV datapath (enable=0x1d). Closing the single-submit fp16 A·V-normalize bridge needs EITHER the
+conv front-end reproduced for a matmul-equivalent, OR the chained SDP reconfigured to read **fp32** G.
+
+**Practical status:** the SEPARATE-submit attention (fp16 matmul fp32-out → CPU → `mul_perchan_f16`) is ALREADY
+coherent, and the single-submit chain was established to be throughput-neutral (M4 = architectural/CPU-offload
+goal). So the fp16-in single-submit bridge is a nicety, not a perf lever. Code preserved on `feat/attn-primitives`.
+NEXT (board-safe, if pursued): (a) capture a vendor GEMM/matmul (not conv) with fp16 out to get a working
+matmul-datapath fp16 writeout, or (b) build an fp32-in chained SDP variant (DATA_FORMAT fp32) reading fp32 G.

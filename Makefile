@@ -539,3 +539,9 @@ tnorm_probe: tools/tnorm_probe.c $(CORE)
 
 chain_mm_perchan_probe: tools/chain_mm_perchan_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+chain_mm_perchan_f16_probe: tools/chain_mm_perchan_f16_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+f16_mm_f16out_probe: tools/f16_mm_f16out_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
