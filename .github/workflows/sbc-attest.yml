@@ -1,0 +1,28 @@
+# Board-validation gate. ork-driver's tests need the RK3588 NPU, which CI runners don't have — so CI
+# can't run them. But the golden-checksum tests + a `make test`-written attestation (tests/sbc_attest.txt,
+# a hash of the NPU-output-determining sources) let CI PROVE the pushed commit was validated on the board:
+# `make check-attest` (no NPU, no build — just sha256 + grep) fails if those sources/goldens changed since
+# the last passing board `make test`. It cannot guarantee the tests pass on the NPU, but it catches a
+# commit that was NOT board-tested before push (the author must re-run `make test` on the SBC + commit the
+# refreshed attestation). Also flags 0/placeholder goldens (a shape added without regeneration).
+name: sbc-attest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: sbc-attest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-attest:
+    runs-on: ubuntu-latest
+    # the version-bump bot edits only include/ork_npu.h (not the hashed sources), so its [skip ci] commit
+    # keeps the attest valid; skip it anyway for consistency with version-bump.yml.
+    if: ${{ !contains(github.event.head_commit.message, '[skip ci]') }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify board-validation attestation
+        run: make check-attest

@@ -23,6 +23,12 @@ CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activa
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
 COBJ    := $(CORE:.c=.o)
+# Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
+# the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
+# that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
+# only that header, so it must not invalidate the attest).
+ATTEST_FILE := tests/sbc_attest.txt
+ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused
 TESTS    :=
 
@@ -312,8 +318,8 @@ install: libork_npu.a libork_npu.so
 # 0/nonzero). Run them on the board; a wall timeout catches an NPU hang. The llama2 test
 # needs a model and is skipped when absent. ---
 MODEL ?= stories15M.bin
-# per-test wall timeout (s) — catches an NPU hang. test_matmul's full shape + ChainPrefill sweep
-# is ~3m15s, so the wall must exceed it; still bounds a genuine hang. Override: make test TEST_TIMEOUT=120
+# per-test wall timeout (s) — catches an NPU hang. Tests are golden-checksum'd now (full `make test`
+# ~33s), but the wall must still exceed a cold model/regen run; bounds a genuine hang. Override: TEST_TIMEOUT=120
 TEST_TIMEOUT ?= 360
 test: $(EXAMPLES) $(TESTS) chain_xition_probe
 	@fail=0; \
@@ -321,7 +327,30 @@ test: $(EXAMPLES) $(TESTS) chain_xition_probe
 	  echo "== $$t"; timeout $(TEST_TIMEOUT) sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
-	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; else echo "TESTS FAILED"; exit 1; fi
+	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; \
+	  { echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
+	    echo "# CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file."; \
+	    echo "CORE_SHA=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64)"; } > $(ATTEST_FILE); \
+	  echo "wrote $(ATTEST_FILE)"; \
+	  else echo "TESTS FAILED"; exit 1; fi
+
+# CI gate (no NPU): prove the commit was board-validated. `make test` on the SBC writes tests/sbc_attest.txt
+# with a hash of ATTEST_SRCS; this recomputes it and fails on a mismatch — i.e. the NPU-output-determining
+# sources (or goldens) changed since the last passing board `make test`. Also flags 0/placeholder goldens.
+check-attest:
+	@have=$$(grep '^CORE_SHA=' $(ATTEST_FILE) 2>/dev/null | cut -d= -f2); \
+	want=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64); \
+	if [ -z "$$have" ]; then echo "check-attest: no $(ATTEST_FILE) — run 'make test' on the SBC + commit it"; exit 1; fi; \
+	if [ "$$have" != "$$want" ]; then \
+	  echo "check-attest: FAIL — NPU-output sources/goldens changed since the last board-validated 'make test'."; \
+	  echo "  committed CORE_SHA=$$have"; echo "  working-tree =$$want"; \
+	  echo "  => run 'make test' on the SBC (RK3588) and commit $(ATTEST_FILE)."; exit 1; fi; \
+	echo "check-attest: attest OK ($$have)"; \
+	ph=0; \
+	if grep -nE '(check|check_i8|one)\(c[^)]*, *0\)' examples/test_matmul.c examples/quant.c examples/test_sn3.c 2>/dev/null; then ph=1; fi; \
+	if grep -nE 'case [0-9]+: *return 0;' examples/model.c 2>/dev/null; then ph=1; fi; \
+	if [ $$ph -ne 0 ]; then echo "check-attest: FAIL — placeholder (0) golden found; regen on the SBC"; exit 1; fi; \
+	echo "check-attest: no placeholder goldens — OK"
 
 # Quick subset via the same pass/fail harness — builds and runs only the named examples:
 #   make test-only T="test_ewmul_i8 test_ewmul_f16 test_ewmul_i16"     (a name may carry args, e.g. T="model 1")
@@ -338,7 +367,7 @@ bench-llama:
 clean:
 	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
-.PHONY: all lib install test clean
+.PHONY: all lib install test clean check-attest
 
 attn_cost: tools/attn_cost.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
