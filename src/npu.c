@@ -5717,6 +5717,46 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     return ok;
 }
 
+/* On-NPU PER-CHANNEL scale (int16): out[m][n] = clamp_i16(a[m][n]*b[n]*mult>>shift). b[N] per-channel
+ * broadcast (ERDMA_DATA_MODE=0, 0x5034=0x08 for 2-byte). int16 chain-intermediate variant of the per-channel
+ * scale (the M4 attention chain uses int16 between matmul and SDP, like the mm->silu chain). N%8. 0/ok, <0. */
+int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
+    #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* 2-byte atom=8 cube */
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+PC16(m,n))=a[(size_t)m*N+n];
+    for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
+    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);
+    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)shift);
+    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
+    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    #undef PC16
+    return ok;
+}
+
 /* On-NPU PER-CHANNEL scale (int8): out[m][n] = clamp_i8( a[m][n] * b[n] * mult >> (shift-14) ). b is a
  * length-N per-channel vector broadcast across all M rows via the EW operand-b per-channel mode
  * (ERDMA_CFG 0x5034: ERDMA_DATA_MODE bits[31:30]=0, DATA_SIZE bits[3:2]=1 => reg 0x00000004; confirmed

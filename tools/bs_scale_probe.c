@@ -27,10 +27,16 @@ int main(void){
         for(int n=0;n<N;n++) fb[n]=(ork_f16)((n%4)*0.25f);
         int rcf=ork_npu_mul_perchan_f16(c,fa,fb,M,N,fo,NULL);
         double maxerr=0; int badf=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float e=(float)fa[(size_t)m*N+n]*(float)fb[n]; float g=(float)fo[(size_t)m*N+n]; double er=fabs(g-e); if(er>maxerr)maxerr=er; if(er>0.02)badf++; }
-        printf("M=%-4d N=%-4d : i8 rc=%d %d/%d exact | f16 rc=%d %d/%d ok (max|err|=%.4f)  %s\n",
-               M,N,rc,M*N-bad,M*N, rcf,M*N-badf,M*N,maxerr, (!rc&&!bad&&!rcf&&!badf)?"OK":"FAIL");
-        if(rc||bad||rcf||badf)fail++;
-        free(a);free(b);free(out);free(fa);free(fb);free(fo);
+        /* int16 (gain=1: mult=0x4000, shift=14 -> out=a*b) */
+        int16_t*ia=malloc((size_t)M*N*2),*ib=malloc(N*2),*io=malloc((size_t)M*N*2);
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) ia[(size_t)m*N+n]=(int16_t)(((m+n)%7)-3);
+        for(int n=0;n<N;n++) ib[n]=(int16_t)(n%4);
+        int rci=ork_npu_mul_perchan_i16(c,ia,ib,M,N,0x4000,14,io,NULL);
+        int badi=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int e=(int)ia[(size_t)m*N+n]*(int)ib[n]; if(e>32767)e=32767; if(e<-32768)e=-32768; if(io[(size_t)m*N+n]!=e)badi++; }
+        printf("M=%-4d N=%-4d : i8 %d/%d | f16 %d/%d (err %.4f) | i16 rc=%d %d/%d  %s\n",
+               M,N,M*N-bad,M*N, M*N-badf,M*N,maxerr, rci,M*N-badi,M*N, (!rc&&!bad&&!rcf&&!badf&&!rci&&!badi)?"OK":"FAIL");
+        if(rc||bad||rcf||badf||rci||badi)fail++;
+        free(a);free(b);free(out);free(fa);free(fb);free(fo);free(ia);free(ib);free(io);
     }
     ork_npu_free(c);
     printf(fail?"\nRESULT: per-channel scale NOT clean\n":"\nRESULT: on-NPU per-channel scale (i8 + fp16) WORKS at general geometry\n");

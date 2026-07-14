@@ -597,6 +597,8 @@ int          ork_npu_row_max_i8(ork_npu *ctx, const signed char *a, int M, int N
 int          ork_npu_mul_perchan_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N, int mult, int shift, signed char *out, double *us);
 /* fp16 per-channel scale: out[m][n]=a[m][n]*b[n], b[N] broadcast across rows (ERDMA_DATA_MODE=0). N%8. Quant-free. */
 int          ork_npu_mul_perchan_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
+/* int16 per-channel scale: out[m][n]=clamp_i16(a[m][n]*b[n]*mult>>shift), b[N] broadcast. N%8. Chain intermediate. */
+int          ork_npu_mul_perchan_i16(ork_npu *ctx, const short *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
 int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
                             double a_scale, double b_scale, double out_scale, signed char *out, double *us);
 
