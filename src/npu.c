@@ -6985,6 +6985,49 @@ gfail:
     return -1;
 }
 
+/* CHAIN (M4 building block): int8-matmul(int16-out) -> PER-CHANNEL-scale(int16) in ONE PC-chain via
+ * chain_progs — the A·V->normalize pattern. The matmul's int16 output G IS the per-channel op's input
+ * (0x5018), validating the intermediate-buffer bridge (like ork_npu_chain_gatesilu_i16 but SDP=per-channel
+ * scale instead of silu). out = clamp_i16( requant_i16(A[M,K]xB[K,N], m1,s1) * scale[n] * m2 >> s2 ).
+ * A int8[M*K], B int8[K*N] row-major, scale int16[N] per-channel. K%32,N%32,N<=nmax,M<=64. 0/ok,<0. */
+int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+                                 const int16_t *scale,int m1,int s1,int m2,int s2,int16_t *out,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom), G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom), SB=bcreate(fd,4096,0x403,dom);
+    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB); return -1; }
+    { int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
+      for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
+    memset(G.cpu,0,sz); memset(O.cpu,0,sz); memset(SB.cpu,0,4096);
+    { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
+    { int16_t*sb=SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }               /* per-channel scale CONTIGUOUS [N] */
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
+    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul int16-out -> G */
+    set_i16_out(mm,N,0,m1,s1);
+    memcpy(pc,REGCMD_MUL_I16,sizeof pc);                                              /* prog1: per-channel scale G -> O */
+    set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,0x00000008);                              /* ERDMA per-channel + 2-byte */
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+    double t0=ork_now_us();
+    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
+    int crc=ork_npu_chain_progs(c,2,progs,dom);
+    if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }
+    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
+    #undef EWCUBEH
+    return crc;
+}
+
 /* Public on-NPU SiLU (int16 / w16a16i): out = clamp_i16(round( silu(in*in_scale)/out_scale )) via the standalone
  * int16 activation-LUT op, using RKNN's captured index params (full-range coverage). Builds the LUT the way RKNN
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)

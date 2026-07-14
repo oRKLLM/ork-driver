@@ -184,7 +184,24 @@ expected: normalize=H per-channel-scale submits + transpose marshaling; goal was
 Pool: added wet[h] (e^T weight), Oh16, invS. Handler: 2d captures invS=1/Σ; tnorm_ok gate; transposed A·V
 (weight=e^T repacked, act=V^T densified) → Ô[DV][N] → per-head ork_npu_mul_perchan_f16(Ô,1/Σ) → transposed scatter.
 
-## Next: M4 — collapse to a single PC-chain (QK^T→max→exp→Σ→A·V→normalize one submit); reduce H mul_perchan to 1
+### M4 batched normalize done (2026-07-14): H mul_perchan submits → 1 (lay Ô as [DV][H*N], invS[H*N]).
+COHERENT. But THROUGHPUT-NEUTRAL (pp512 70.9 vs 70.8) — the normalize is ELEMENT-bound (786K fp16 @ ~20ns/el
+= ~16ms/call), not submit-bound. Confirms: attention-on-NPU is element-compute-bound (exp 38ms + normalize
+17ms + CPU prep/quant/densify ~59ms per call), submits are a MINORITY (~17ms). => M4 single-submit chain is a
+CPU-OFFLOAD/purity play, NOT a throughput lever (user chose to pursue it anyway for the architectural goal).
+
+### M4 SINGLE-SUBMIT CHAIN — build plan (mechanism PROVEN, assembly is multi-session)
+Assembler EXISTS + proven: ork_npu_chain_progs(c,n,progs,dom) — chains n pre-built op regcmds into ONE
+task_number=n submit via PC next-descriptors (0x0010 addr / 0x0014 amount) at each prog's desc_slot;
+ping-pong OFF if any SDP (enable!=0xd). Backs the mm→silu FFN chain. ork_chain_prog = {rc, nwords,
+enable_mask, regcfg_amount, desc_slot}.
+THE WORK (multi-session): (1) expose a no-submit "build regcmd into buffer + return ork_chain_prog" variant
+of each attention op — fp16 matmul (QK^T, A·V), exp-LUT (SDP 0x18), reduce-matmul (Σ, 0xd), per-channel
+scale (SDP 0x18); (2) BUFFER ALIASING — each op's output buffer = next op's input, addresses wired so
+intermediates stay on-device (no CPU round-trip); (3) the max-reduce TREE (log2(nkvp) EW-max) as chained
+sub-tasks; (4) feed the program list to chain_progs; (5) each op regcmd needs a spare desc_slot to be a middle
+program. CPU prep/quant/densify stay CPU (ggml-layout bridge) — full CPU-offload needs whole-layer-NPU (bigger).
+Start: expose fp16-matmul regcmd-build, then exp/reduce/perchan; validate a 2-op chain (Σ→normalize) first.
 - Only known-good attention model on board = qwen2.5-7b-instruct-q8_0 (canonical baseline, 3-file).
   7B needs multi-domain footprint (`ORK_DOMAINS` + `ORK_NO_BF`) → then full end-to-end coherence +
   per-op profile + flow chart (the user's follow-on ask). Multi-domain layout is non-deterministic /

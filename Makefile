@@ -536,3 +536,6 @@ bs_scale_probe: tools/bs_scale_probe.c $(CORE)
 
 tnorm_probe: tools/tnorm_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+chain_mm_perchan_probe: tools/chain_mm_perchan_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
