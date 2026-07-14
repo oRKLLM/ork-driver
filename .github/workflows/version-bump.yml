@@ -30,6 +30,12 @@ jobs:
           fetch-tags: true          # need existing vX.Y.Z tags to pick a non-colliding next version
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Gate the bump on board-validation: do NOT bump/tag a commit whose NPU-output sources changed
+      # since the last passing board `make test` (attestation must precede the version bump). No NPU
+      # needed here — check-attest is just sha256 + grep. A stale attest fails the job before any bump.
+      - name: Verify board-validation attestation (gate the bump)
+        run: make check-attest
+
       - name: Bump ORK_NPU_VERSION
         run: |
           set -euo pipefail
