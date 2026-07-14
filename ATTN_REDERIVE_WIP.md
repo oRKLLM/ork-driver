@@ -249,3 +249,25 @@ coherent, and the single-submit chain was established to be throughput-neutral (
 goal). So the fp16-in single-submit bridge is a nicety, not a perf lever. Code preserved on `feat/attn-primitives`.
 NEXT (board-safe, if pursued): (a) capture a vendor GEMM/matmul (not conv) with fp16 out to get a working
 matmul-datapath fp16 writeout, or (b) build an fp32-in chained SDP variant (DATA_FORMAT fp32) reading fp32 G.
+
+## ★★ 2026-07-14 (cont.) — fp16 matmul->fp16 OUTPUT SOLVED (option a). The "HW wall" was 3 fixable bugs.
+Precision-swap Q: int16 works for the matmul OUTPUT (set_i16_out, proven) but its 2-input SDP
+(REGCMD_MUL_I16) is NOT chain-safe (BS-ALU active 0x4040=0x20050) -> hangs chained; only the vendor
+fp16 2-input SDP (REGCMD_MUL_F16_CHAIN, BS bypassed 0x53) chains. So fp16 is the viable path -> pursued (a).
+Option (a) DID NOT need a fresh capture: the board already had ~/rknn_sdk/cap_fp16f16.dec (a captured
+vendor fp16->fp16 MATMUL output stage). Decoding it showed my earlier fp16-out attempts used the wrong
+(conv) config. THREE fixes:
+  1. MATMUL output stage (not conv): 0x4040=0x53 (BS FULLY bypassed, not conv's 0x20150), 0x40c0=0x20.
+     The BS-active conv config was what HUNG the fp16 matmul.
+  2. DPU_OUT_CVT_SCALE needs FP32TOFP16_EN (bit16): 0x4084=0x00010001 (was 0x1 -> conversion never enabled).
+  3. sched=0 for small K (sched=1 gives a degenerate K-schedule -> zero output), and the fp16 matmul writes
+     CONTIGUOUS [M][N] (row-major), NOT the int-path atom-8 (EWCUBEH).
+=> ork_npu_probe_f16_mm_f16out = **512/512 BIT-EXACT** standalone (fp16 in, fp16 out). set_f16_out_fp16in
+rebuilt from the capture. The prior "fp16 matmul has no 2-byte writeout" verdict is WRONG/RETRACTED.
+
+**Single-submit chain (ork_npu_chain_mm_perchan_f16): 90% there.** Now walks FAST (258us, no hang) and
+computes real values (236/512). Remaining gap = ONLY a layout bridge: the fp16 matmul writes G CONTIGUOUS,
+but the chained SDP reads/writes atom-8 (the standalone mul_perchan_f16 layout). NEXT: unify — either
+(i) configure the chain's SDP input/output geometry (0x50xx RDMA cube + set_mul_geom) to CONTIGUOUS to match
+the fp16 matmul, or (ii) find the fp16 matmul atom-8 output geometry to match the existing SDP. Bounded
+layout RE, not a wall. All committed feat/attn-primitives (d710016).
