@@ -271,3 +271,26 @@ but the chained SDP reads/writes atom-8 (the standalone mul_perchan_f16 layout).
 (i) configure the chain's SDP input/output geometry (0x50xx RDMA cube + set_mul_geom) to CONTIGUOUS to match
 the fp16 matmul, or (ii) find the fp16 matmul atom-8 output geometry to match the existing SDP. Bounded
 layout RE, not a wall. All committed feat/attn-primitives (d710016).
+
+## 2026-07-14 (cont.) — layout bridge: characterized, one boundary remains
+Pushed to close the single-submit chain. The gap is a DPU feature-format boundary:
+- fp16 matmul emits CONTIGUOUS [M][N] (surf stride 0x10, 0x40c0=0x20) — PROVEN 512/512 (probe default).
+- the per-channel SDP (set_mul_geom) reads ATOM-8 / PC16 (surf stride M*16, 0x40c0=0x40). The DPU RDMA
+  width-stride is atom-derived => the SDP CANNOT read a contiguous buffer, and the fp16 matmul RESISTS
+  atom-8 output (M*16 strides->106/512; set_i16_out's 0x4050=0x248 -> HANGS with fp16 precision).
+Chain: walks fast (258us, no hang), computes real values, layout-limited ~236/512. ORK_F16_ATOM8 = gated
+WIP toggle (not yet correct); contiguous fp16-out is the proven default.
+
+**Two concrete closes (next session):**
+1. **BS-fold (most elegant):** do the per-channel scale in the fp16 matmul's OWN BS stage (BRDMA operand
+   0x5020 BS_BASE, 0x501c BRDMA_CFG, 0x4040 BS_ALU_ALGO=2 — exactly what the vendor conv_mul task0 does) =>
+   ONE task, no SDP, no layout bridge. Risk: BS-active hung the fp16 matmul before (need to confirm it was
+   conv-specific regs, not BS itself). This would make the "chain" a single op.
+2. **Contiguous SDP read:** map the DPU-RDMA line/surf-stride regs (0x50xx) for a contiguous read (surf
+   stride 0x10 + a line stride = N*2). Needs the RDMA stride regs from rocket_registers.h, or a captured
+   vendor MATMUL->per-channel-MUL chain (analogous to the conv->mul that unlocked the SDP config) to read
+   the exact matmul-out<->SDP-in strides.
+
+**Deliverable already complete:** the 2-submit on-NPU A·V-normalize (fp16 matmul fp16-out -> separate
+per-channel SDP) is fully coherent now that fp16-out is proven. Single-submit is the throughput-neutral
+optimization still blocked on the above. All committed feat/attn-primitives (e50a116).
