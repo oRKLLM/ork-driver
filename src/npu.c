@@ -66,6 +66,12 @@ static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK
 /* DEFAULT ON (2026-07-13): validated general, coherent, bit-exact-safe win — skips the int8<->fp16 ACT_RESET
  * churn for any fp16-op interleaved with int8 matmuls (SSM scan etc.). ORK_SSM_KEEPWARM=0 to disable. */
 static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=e?(atoi(e)?1:0):1;} return v; }
+/* ORK_SDP_NORESET: skip the entry ACT_RESET in the element-wise fp16/int16 SDP ops (ewmul_f16/i16,
+ * add_f16/i16). Their int8 twins (ewmul_i8/add_i8) already skip it; the reset was drift, not required.
+ * VALIDATED (2026-07-14): coherent (test_ewmul_f16/i16, test_add pass), wedge-free after an int8/fp16
+ * matmul (mode_probe SAFE); removes a ~107ms/op reset — test_ewmul_f16 3436→53ms, ewmul_i16 4292→44ms,
+ * add 1419→50ms. DEFAULT ON (skip the reset). Set ORK_SDP_NORESET=0 to restore the old reset. */
+static int ork_sdp_noreset(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SDP_NORESET"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
 static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
 /* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
@@ -5484,7 +5490,7 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
     setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5544,7 +5550,7 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5586,7 +5592,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=a[m*N+n]; bc[p]=b[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
     uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_N,M,N);
     setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5646,7 +5652,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=a16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=b16[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
     uint32_t rc[REGCMD_ADD_F16_N]; memcpy(rc,REGCMD_ADD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_F16_N,M,N);
     setr(rc,REGCMD_ADD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5687,7 +5693,7 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
     uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
     setr(rc,REGCMD_ADD_I16_N,0x1001,0x4020,(uint32_t)O.dma);

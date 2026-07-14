@@ -194,11 +194,20 @@ make bench-llama           # run the integration benchmark script tools/bench_tw
 ```
 
 Because the test inputs are fixed-seed deterministic, the NPU output is a constant, so the
-correctness check compares a **checksum of the NPU output against an embedded static golden**
-rather than recomputing the O(M·N·K) CPU reference every run (a wide-K shape's reference is
-billions of MACs — minutes on the CPU, ~0.5 s on the NPU). The CPU reference is kept and runs
-only to regenerate a golden after a *deliberate* output-changing edit, or to diagnose a
-mismatch:
+reference-bound tests (`test_matmul`, `quant`, `test_sn3`) compare an **fnv64 checksum of the NPU
+output against an embedded static golden** (FNV-1a 64-bit — a dependency-free non-cryptographic hash,
+~1 xor+multiply per byte, sub-ms even on a multi-MB output; change-detection needs speed, not
+collision resistance, so md5/sha would be needless overhead) rather than recomputing the O(M·N·K) CPU reference every
+run (a wide-K shape's reference is billions of MACs — minutes on the CPU, ~0.5 s on the NPU). This
+cut those tests by ~40–200× (e.g. `test_matmul` 195 s → 5 s, `quant` 39.8 s → 1 s).
+
+**Invalidation is deliberate, human-in-the-loop.** The golden is trusted until a checksum *mismatch*
+occurs — which happens only when the NPU output actually changes. A mismatch **fails the test**
+(never silently absorbed): you then decide whether the change was an intended output-altering edit —
+regenerate the golden — or a regression — fix the code. The CPU reference is kept precisely for these
+two moments (regenerate / diagnose); it does not run on the fast path. (This applies only to tests
+bounded by a *recomputed reference*; a test bounded by the NPU op itself can't be short-circuited —
+you must run the op to produce the output you'd hash.)
 
 ```sh
 sudo env ORK_REGEN=1 ./test_matmul     # print fresh golden checksums to paste into the test
