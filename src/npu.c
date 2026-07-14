@@ -5409,7 +5409,16 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
       if(co) setr(rc,REGCMD_MUL_N,0x1001,0x4074,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
       if(cs) setr(rc,REGCMD_MUL_N,0x1001,0x4078,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
       const char*ao=getenv("ORK_EW_AOFF");
-      if(ao) setr(rc,REGCMD_MUL_N,0x1001,0x4044,(uint32_t)strtoul(ao,0,0)); } /* BS_ALU_OPERAND = za (operand a zero-pt) */
+      if(ao) setr(rc,REGCMD_MUL_N,0x1001,0x4044,(uint32_t)strtoul(ao,0,0));   /* BS_ALU_OPERAND = za (operand a zero-pt) */
+      /* SDP DPU ALU-mode registers (rocket rocket_registers.h: 0x4040=BS_CFG, 0x4048=BS_MUL_CFG,
+       * 0x4070=EW_CFG w/ EW_ALU_ALGO bits[19:16]: MAX=0,MIN=1,SUM=2,EQL=3). Override to retarget the
+       * ALU function (e.g. ADD-routing + algo=0 => on-NPU max(a,b)). RE hooks for building max-reduce. */
+      const char*r40=getenv("ORK_EW_R40"),*r48=getenv("ORK_EW_R48"),*r70=getenv("ORK_EW_R70");
+      if(r40) setr(rc,REGCMD_MUL_N,0x1001,0x4040,(uint32_t)strtoul(r40,0,0));
+      if(r48) setr(rc,REGCMD_MUL_N,0x1001,0x4048,(uint32_t)strtoul(r48,0,0));
+      if(r70) setr(rc,REGCMD_MUL_N,0x1001,0x4070,(uint32_t)strtoul(r70,0,0));
+      const char*r34=getenv("ORK_EW_R34");   /* ERDMA_CFG 0x5034: ERDMA_DATA_MODE bits[31:30] — per-channel operand-b broadcast RE */
+      if(r34) setr(rc,REGCMD_MUL_N,0x2001,0x5034,(uint32_t)strtoul(r34,0,0)); }
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
         bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O); return 0; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5604,6 +5613,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     setr(rc,REGCMD_ADD_N,0x1001,0x4044,(uint32_t)za);
     setr(rc,REGCMD_ADD_N,0x1001,0x4074,(uint32_t)zb);
     setr(rc,REGCMD_ADD_N,0x1001,0x4080,(uint32_t)zo);
+    { const char*r70=getenv("ORK_EW_R70"); if(r70) setr(rc,REGCMD_ADD_N,0x1001,0x4070,(uint32_t)strtoul(r70,0,0)); }  /* EW_ALU_ALGO override: SUM(2)->MAX(0)/MIN(1) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -5614,6 +5624,183 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
     #undef EWCUBE
+    return ok;
+}
+
+/* On-NPU per-row MAX-REDUCE (int8): out[m] = max_n a[m*N+n], N%16, N<=8192. Batched pairwise-max TREE
+ * using the SDP EW ALU in MAX mode (EW_ALU_ALGO=0 @ reg 0x4070, rocket_registers.h; NVDLA map_alu_op
+ * MAX=0). Each level maxes channels [0,h) vs [h,2h) across ALL M rows in ONE submit: channel h sits at
+ * cube offset (h/16)*M*16, so operand b = a + (h/16)*M*16 (valid since h stays %16 down the tree). Reduces
+ * N->16 on-NPU (log2(N/16) submits, ping-pong buffers), then a 16-wide CPU tail. Reusable: softmax
+ * stability, max-pool, top-k, clamp. 0/ok, <0 err. */
+int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    #define RMCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf W0=bcreate(fd,sz,0x403,-1), W1=bcreate(fd,sz,0x403,-1);
+    if(!W0.cpu||!W1.cpu){ bdestroy(fd,&W0);bdestroy(fd,&W1); return -2; }
+    memset(W0.cpu,0,sz); memset(W1.cpu,0,sz);
+    { int8_t*wc=W0.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) wc[RMCUBE(m,n)]=a[(size_t)m*N+n]; }
+    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18;
+    struct buf *cur=&W0,*oth=&W1; int ok=0, cur_n=N; double t0=ork_now_us();
+    while(cur_n>16){
+        int h=cur_n/2;
+        uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
+        set_mul_geom(rc,REGCMD_ADD_N,M,h);
+        setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)oth->dma);                                  /* out */
+        setr(rc,REGCMD_ADD_N,0x2001,0x5018,(uint32_t)cur->dma);                                  /* a = ch [0,h) */
+        setr(rc,REGCMD_ADD_N,0x2001,0x5038,(uint32_t)(cur->dma+(uint32_t)((size_t)(h/16)*M*16))); /* b = ch [h,2h) */
+        setr(rc,REGCMD_ADD_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_ADD_N,0x1001,0x4088,28);      /* identity out-cvt */
+        setr(rc,REGCMD_ADD_N,0x1001,0x4078,0x4000);                                              /* identity b-scale */
+        setr(rc,REGCMD_ADD_N,0x1001,0x4044,0); setr(rc,REGCMD_ADD_N,0x1001,0x4074,0); setr(rc,REGCMD_ADD_N,0x1001,0x4080,0);
+        setr(rc,REGCMD_ADD_N,0x1001,0x4070,0x904002c0);                                          /* EW_ALU_ALGO = MAX(0) */
+        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+        sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        { struct buf*t=cur; cur=oth; oth=t; } cur_n=h;
+    }
+    if(ok==0){
+        bsync(fd,cur,RKNPU_MEM_SYNC_FROM_DEVICE); int8_t*r=cur->cpu;
+        for(int m=0;m<M;m++){ int mx=-128; for(int n=0;n<cur_n;n++){ int v=r[RMCUBE(m,n)]; if(v>mx)mx=v; } out[m]=(int8_t)mx; }
+        if(us)*us=ork_now_us()-t0;
+    }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    bdestroy(fd,&W0); bdestroy(fd,&W1);
+    #undef RMCUBE
+    return ok;
+}
+
+/* On-NPU PER-CHANNEL scale (fp16): out[m][n] = a[m][n] * b[n]. b[N] per-channel vector broadcast across all
+ * M rows via ERDMA_DATA_MODE=0 (0x5034=0x08 = per-channel + DATA_SIZE TWO_BYTE for fp16). fp16 EW MUL,
+ * quant-free (no gain/zero-points). N%8, N<=8192. b laid CONTIGUOUS [N] (fp16). The transposed-softmax
+ * normalize (b=1/Σ per-query). 0/ok, <0 err. */
+int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    #define PCH16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* fp16 cube byte offset, atom=8, surf=M*16 */
+    const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+PCH16(m,n))=a16[(size_t)m*N+n];
+    for(int n=0;n<N;n++) ((uint16_t*)B.cpu)[n]=b16[n];               /* per-channel vector CONTIGUOUS [N] (fp16) */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
+    setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5038,(uint32_t)B.dma);
+    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+PCH16(m,n)); }
+    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    #undef PCH16
+    return ok;
+}
+
+/* On-NPU PER-CHANNEL scale (int8): out[m][n] = clamp_i8( a[m][n] * b[n] * mult >> (shift-14) ). b is a
+ * length-N per-channel vector broadcast across all M rows via the EW operand-b per-channel mode
+ * (ERDMA_CFG 0x5034: ERDMA_DATA_MODE bits[31:30]=0, DATA_SIZE bits[3:2]=1 => reg 0x00000004; confirmed
+ * on RK3588 — DATA_MODE=1 is per-element, =0 is per-channel broadcast). EW MUL unit; N%16, N<=8192.
+ * Reusable: softmax normalize (b=1/Σ), LayerNorm/RMSNorm affine, per-channel requant. 0/ok, <0 err. */
+int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,int mult,int shift,int8_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    #define PCCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
+    { int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[PCCUBE(m,n)]=a[(size_t)m*N+n]; }
+    { int8_t*bc=B.cpu; for(int n=0;n<N;n++) bc[n]=b[n]; }                        /* per-channel vector: CONTIGUOUS [N] (not surface-strided) */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_N,M,N);
+    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);            /* a (SRDMA, per-element) */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);            /* b (ERDMA / EW_BASE) */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5034,0x00000004);                /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=1 */
+    setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0); setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); /* za/zb/zo = 0 (drop captured zero-points) */
+    setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=oc[PCCUBE(m,n)]; }
+    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    #undef PCCUBE
+    return ok;
+}
+
+/* RE PROBE: on-NPU PER-CHANNEL scale via the SDP BS (bias/scale) stage reading a per-channel vector from
+ * memory. out[m][n] = a[m][n] * scale[n]  (scale broadcast across rows = NATIVE per-channel, no tiling).
+ * Regs (rocket_registers.h — RK3588 offsets, NOT vanilla NVDLA): 0x501c RDMA_BRDMA_CFG (BRDMA_DATA_USE
+ * bits[4:1]), 0x5020 RDMA_BS_BASE_ADDR (scale vector src); 0x4040 BS_CFG (BS_BYPASS b0 / BS_ALU_BYPASS b1
+ * / BS_MUL_BYPASS b4 / BS_RELU_BYPASS b6), 0x4048 BS_MUL_CFG (BS_MUL_SRC b0 =MEM, BS_MUL_SHIFT_VALUE b[13:8]).
+ * Config regs env-overridable (ORK_BS_R40/R48/BRDMA) to pin the DATA_USE/enable values on-board. int8. 0/ok. */
+int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,int N,int8_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    #define BSCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), S=bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!S.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&S); return -2; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(S.cpu,0,4096);
+    { int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[BSCUBE(m,n)]=a[(size_t)m*N+n]; }
+    /* per-channel scale vector b[N]: try the EW-operand cube layout for a single width row (width=1). */
+    { int8_t*sc=S.cpu; for(int n=0;n<N;n++) sc[(n/16)*16 + (n%16)]=scale[n]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    /* EW MUL out=a*b, b (ERDMA 0x5038) as a PER-CHANNEL vector via ERDMA_DATA_MODE (0x5034 bits[31:30]). */
+    uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
+    set_mul_geom(rc,REGCMD_MUL_N,M,N);
+    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);            /* input a (SRDMA, per-element) */
+    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)S.dma);            /* scale b (ERDMA / EW_BASE) */
+    #define ENV32(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
+    setr(rc,REGCMD_MUL_N,0x2001,0x5034,ENV32("ORK_ERDMA",0x40000000)); /* ERDMA_CFG: ERDMA_DATA_MODE bits[31:30] (sweep per-channel) */
+    setr(rc,REGCMD_MUL_N,0x1001,0x4084,ENV32("ORK_BS_GAIN",0x00004000)); setr(rc,REGCMD_MUL_N,0x1001,0x4088,28); /* out gain */
+    #undef ENV32
+    if(getenv("ORK_BS_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2){ unsigned rg=rc[k]&0xffff,ln=rc[k+1]>>16; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); if(rg==0x4020||rg==0x4070||rg==0x5018||rg==0x5034||rg==0x5038) printf("  reg=%04x lane=%04x val=%08x\n",rg,ln,v);} }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=oc[BSCUBE(m,n)]; }
+    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&S);
+    #undef BSCUBE
     return ok;
 }
 

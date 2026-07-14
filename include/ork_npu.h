@@ -589,6 +589,14 @@ int          ork_npu_chain_mm_silu_i16(ork_npu *ctx, const short *in, int M, int
 /* On-NPU element-wise ADD (int8): out = clamp_i8(round( (a*a_scale + b*b_scale)/out_scale )) via the 2-input SDP
  * ALU=add op. Symmetric quant. Residual add (a_scale==b_scale==out_scale) => out=clamp_i8(a+b), bit-exact.
  * in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+/* On-NPU per-row MAX-REDUCE (int8): out[m]=max_n a[m*N+n]. Batched pairwise-max tree on the SDP EW ALU
+ * (EW_ALU_ALGO=MAX). N%16, reduces N->16 on-NPU + 16-wide CPU tail. Reusable: softmax max, max-pool, top-k. */
+int          ork_npu_row_max_i8(ork_npu *ctx, const signed char *a, int M, int N, signed char *out, double *us);
+/* On-NPU PER-CHANNEL scale (int8): out[m][n]=clamp(a[m][n]*b[n]*mult>>(shift-14)); b[N] broadcast across rows
+ * (EW operand per-channel mode, ERDMA_DATA_MODE=0). N%16. Reusable: softmax normalize, LayerNorm affine, requant. */
+int          ork_npu_mul_perchan_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N, int mult, int shift, signed char *out, double *us);
+/* fp16 per-channel scale: out[m][n]=a[m][n]*b[n], b[N] broadcast across rows (ERDMA_DATA_MODE=0). N%8. Quant-free. */
+int          ork_npu_mul_perchan_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
 int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
                             double a_scale, double b_scale, double out_scale, signed char *out, double *us);
 

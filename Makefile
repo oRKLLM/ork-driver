@@ -513,5 +513,26 @@ ssd_cumba_exp: tools/ssd_cumba_exp.c $(CORE)
 softmax_probe: tools/softmax_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+softmax_cost: tools/softmax_cost.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 rope_probe: tools/rope_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+two_stream_f16_probe: tools/two_stream_f16_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+softmax_reduce_probe: tools/softmax_reduce_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+sdp_max_fuzz: tools/sdp_max_fuzz.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+max_reduce_probe: tools/max_reduce_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+bs_scale_probe: tools/bs_scale_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+tnorm_probe: tools/tnorm_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
