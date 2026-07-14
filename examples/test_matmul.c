@@ -13,46 +13,59 @@ static unsigned sd=12345; static int rnd(){sd=sd*1103515245+12345;return (sd>>16
  * are DETERMINISTIC across runs; a correctness check need only compare the O(M*N) output checksum
  * against a static golden, NOT recompute the O(M*N*K) CPU reference every run. The reference is kept
  * (below) and runs ONLY to regenerate a golden (ORK_REGEN=1) or diagnose a mismatch (ORK_FULL_REF=1). */
-static uint64_t fnv64(const void*p,size_t n){ const uint8_t*b=(const uint8_t*)p; uint64_t h=1469598103934665603ULL;
+static uint64_t fnv64u(uint64_t h,const void*p,size_t n){ const uint8_t*b=(const uint8_t*)p;
     for(size_t i=0;i<n;i++){ h^=b[i]; h*=1099511628211ULL; } return h; }
+static uint64_t fnv64(const void*p,size_t n){ return fnv64u(1469598103934665603ULL,p,n); }
 
-static int check(ork_npu*ctx,int M,int K,int N){
+static int check(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     printf("FP16 check start: M=%d, K=%d, N=%d\n", M, K, N); fflush(stdout);
     f16*A=malloc((size_t)M*K*2),*B=malloc((size_t)K*N*2); float*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)rnd();
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(f16)rnd();
-    printf("  Packing...\n"); fflush(stdout);
     ork_w*w=ork_mm_pack(ctx,K,N,B);
-    if(!w){printf("pack failed %d,%d\n",K,N);return 1;}
-    int bad=0;
-    /* run the SAME resident weights for several M (decode then prefill), validate each */
-    int Ms[]={1,1,4,M}; for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
-        printf("  Running run (t=%d, m=%d)...\n", t, m); fflush(stdout);
-        printf("Running ork_mm_run...\n");
-        if(ork_mm_run(ctx,w,m,A,C)){printf("run failed\n");return 1;}
-        for(int i=0;i<m;i++)for(int n=0;n<N;n++){float ref=0;for(int k=0;k<K;k++)ref+=(float)A[(size_t)i*K+k]*(float)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;}
+    if(!w){printf("pack failed %d,%d\n",K,N);free(A);free(B);free(C);return 1;}
+    /* run the SAME resident weights for several M (decode then prefill); hash each run's output */
+    int Ms[]={1,1,4,M}; uint64_t got=1469598103934665603ULL;
+    for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
+        if(ork_mm_run(ctx,w,m,A,C)){printf("run failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        got=fnv64u(got,C,(size_t)m*N*4); }
+    int bad=0,ret,regen=getenv("ORK_REGEN")!=NULL;
+    if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){
+        printf("  ok   MKN=%d,%d,%d fp16 (golden 0x%016llx)\n",M,K,N,(unsigned long long)got); ret=0;   /* fast: no O(M*N*K) ref */
+    } else {   /* preserved fp32 reference (re-run the M-tiles — NPU cheap; the CPU ref is the cost) */
+        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_mm_run(ctx,w,m,A,C);
+            for(int i=0;i<m;i++)for(int n=0;n<N;n++){float ref=0;for(int k=0;k<K;k++)ref+=(float)A[(size_t)i*K+k]*(float)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;} }
+        if(regen||!gold) printf("  REGEN check GOLD {%d,%d,%d} = 0x%016llxULL (mism=%d)\n",M,K,N,(unsigned long long)got,bad);
+        else if(got!=gold) printf("  GOLDEN MISMATCH fp16 {%d,%d,%d} (mism=%d) — regen if intended\n",M,K,N,bad);
+        printf("  %s MKN=%d,%d,%d (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
+        ret=(bad||(gold&&got!=gold&&!regen))?1:0;
     }
-    printf("  %s MKN=%d,%d,%d (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
-    ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
+    ork_w_free(w); free(A);free(B);free(C); return ret;
 }
 /* int8/w8a8: A,B int8 -> C int32 (exact integer reference). K%32, N%32. */
-static int check_i8(ork_npu*ctx,int M,int K,int N){
+static int check_i8(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     printf("Int8 check start: M=%d, K=%d, N=%d\n", M, K, N); fflush(stdout);
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
-    printf("  Packing...\n"); fflush(stdout);
     ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
-    if(!w){printf("pack_i8 failed %d,%d\n",K,N);return 1;}
-    int bad=0; int Ms[]={1,1,4,M};
+    if(!w){printf("pack_i8 failed %d,%d\n",K,N);free(A);free(B);free(C);return 1;}
+    int Ms[]={1,1,4,M}; uint64_t got=1469598103934665603ULL;
     for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
-        printf("  Running run_i8 (t=%d, m=%d)...\n", t, m); fflush(stdout);
-        printf("Running ork_mm_run_i8...\n");
-        if(ork_mm_run_i8(ctx,w,m,A,C)){printf("run_i8 failed\n");return 1;}
-        for(int i=0;i<m;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;}
+        if(ork_mm_run_i8(ctx,w,m,A,C)){printf("run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        got=fnv64u(got,C,(size_t)m*N*4); }
+    int bad=0,ret,regen=getenv("ORK_REGEN")!=NULL;
+    if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){
+        printf("  ok   MKN=%d,%d,%d int8 (golden 0x%016llx)\n",M,K,N,(unsigned long long)got); ret=0;   /* fast: no O(M*N*K) ref */
+    } else {   /* preserved exact int32 reference */
+        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_mm_run_i8(ctx,w,m,A,C);
+            for(int i=0;i<m;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;} }
+        if(regen||!gold) printf("  REGEN check_i8 GOLD {%d,%d,%d} = 0x%016llxULL (mism=%d)\n",M,K,N,(unsigned long long)got,bad);
+        else if(got!=gold) printf("  GOLDEN MISMATCH int8 {%d,%d,%d} (mism=%d) — regen if intended\n",M,K,N,bad);
+        printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
+        ret=(bad||(gold&&got!=gold&&!regen))?1:0;
     }
-    printf("  %s MKN=%d,%d,%d int8 (reused weights x4 runs) mism=%d\n",bad?"WRONG":"ok  ",M,K,N,bad); fflush(stdout);
-    ork_w_free(w); free(A);free(B);free(C); return bad?1:0;
+    ork_w_free(w); free(A);free(B);free(C); return ret;
 }
 /* CHAIN-PREFILL correctness: exercise the int8 M>1 full-K prefill multi-core path with shapes that
  * force BOTH multiple M-tiles (M >> chunk) AND multiple N-tiles across cores (N spanning several
@@ -591,8 +604,8 @@ int main(void){
      * Kp>=2048 (validated mc<=8 OK / mc>=9 garbage); it is now gated to sched=0 there. The layer/model
      * path is multi-core (always tiles to mc=8) so this single-core M>8 path was previously UNTESTED. */
     ork_npu_set_core_budget(ctx, 1);
-    fail|=check(ctx, 64, 2048, 256);    /* fp16 1-core K=2048 M=64>8 — pre-fix: garbage */
-    fail|=check(ctx, 256, 3584, 256);   /* fp16 1-core K=3584 M=256       */
+    fail|=check(ctx, 64, 2048, 256,  0x63da26feb5488eddULL);    /* fp16 1-core K=2048 M=64>8 — pre-fix: garbage */
+    fail|=check(ctx, 256, 3584, 256, 0xd659053d19504e43ULL);   /* fp16 1-core K=3584 M=256       */
     ork_npu_free(ctx);
     ork_npu*c8=ork_npu_init(); if(!c8){printf("init failed (NPU?)\n");return 1;}
     ork_npu_set_core_budget(c8, 3);
@@ -619,8 +632,8 @@ int main(void){
      * above): exercises the weight-DMA M-tile = mg_max*64 (128 @K2048) on the single-core full-K path —
      * the lever that was throttled to R-1=31. Bit-exact integer ref guards both the size and the fix. */
     ork_npu_set_core_budget(c8, 1);
-    fail|=check_i8(c8, 512, 2048, 256);   /* int8 1-core K=2048 M=512 (mg_max*64 tile) */
-    fail|=check_i8(c8, 256, 3584, 256);   /* int8 1-core K=3584 M=256 (mg_max*64=64)   */
+    fail|=check_i8(c8, 512, 2048, 256, 0xda6b68f190453353ULL);   /* int8 1-core K=2048 M=512 (mg_max*64 tile) */
+    fail|=check_i8(c8, 256, 3584, 256, 0x454860dd91b46165ULL);   /* int8 1-core K=3584 M=256 (mg_max*64=64)   */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
