@@ -7006,14 +7006,13 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
     /* ERDMA mode for the chained SDP (RE): default per-channel (0x08, b=[N] contiguous); ORK_CHAIN_PE=1 =>
      * per-ELEMENT (0x40000008, b=[M][N] EWCUBEH, scale tiled across rows) — isolates ERDMA-in-chain vs per-channel mode. */
-    int pe=getenv("ORK_CHAIN_PE")?1:0; uint32_t r34=pe?0x40000008u:0x00000008u;
-    if(pe){ int16_t*sb=SB.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)SB.cpu+(((n)/8)*(M*16)+(m)*16+((n)%8)*2))=scale[n]; }
-    else  { int16_t*sb=SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }           /* per-channel scale CONTIGUOUS [N] */
+    uint32_t r34=0x00000008u;                                                 /* ERDMA per-channel + 2-byte (fp16 SDP) */
+    { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=(ork_f16)scale[n]; }  /* fp16 per-channel scale CONTIGUOUS [N] */
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
-    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul int16-out -> G */
-    set_i16_out(mm,N,0,m1,s1);
+    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul FP16-out -> G */
+    set_f16_out(mm,N,0);                                                              /* fp16 G to match the fp16 SDP (PROC_PRECISION=2) — the dtype-path fix */
     /* prog1: VENDOR-captured chained 2-input SDP (REGCMD_MUL_F16_CHAIN, known-good in-chain: BS+BN bypassed).
      * Patch only addrs + geometry + ERDMA mode; keep the vendor's chain-safe config verbatim (the user's call:
      * use the vendor's working version rather than patching our standalone-tuned template). (void)m2;(void)s2. */
@@ -7028,7 +7027,7 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,-1} };
     int crc=ork_npu_chain_progs(c,2,progs,dom);
     if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
-        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=(int16_t)lrintf((float)*(ork_f16*)((char*)O.cpu+EWCUBEH(m,n))); }  /* fp16 O -> int16 return */
     bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
     #undef EWCUBEH
     return crc;
