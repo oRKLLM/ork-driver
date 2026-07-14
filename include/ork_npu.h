@@ -868,5 +868,13 @@ int          ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int 
                               const float *B,const float *C,float *y,float *s_new);
 int          ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,int iters,int dtype,int perhead,
                                       double *fused_us,double *persub_us,int *ok_out);  /* dtype:1=int8,0=fp16; perhead:1=fp16-stable per-head Y_diag */
+/* Gated-DeltaNet (GDA) chunked scan on the NPU — the delta-rule twin of ork_ssm_scan_f32 (fp16 matmul
+ * stages on the fused-multicore stream + CPU forward-subst UT-transform). Square d×d state per head
+ * (S_k==S_v==d), scalar gate per (head,token). v1: n_key_heads==n_value_heads==nh, d%16==0. Layout:
+ *   q,k,v: [ns,nt,nh,d]   g,beta: [ns,nt,nh]   s0,s_new: [ns,nh,d,d] (key-major)   o: [ns,nt,nh,d].
+ * ORK_GDN_CS sets chunk size (default 64). Returns 0/ok, <0 on error. */
+int          ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
+                              const float *s0,const float *q,const float *k,const float *v,
+                              const float *g,const float *beta,float *o,float *s_new);
 
 #endif

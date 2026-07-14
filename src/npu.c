@@ -63,7 +63,9 @@ static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK
  * (2-byte activation) size and are reused by int8. Off by default; validate on silicon (errno=110) before
  * promoting. The families that may interleave reset-free: int8-live (DT_I8/chain) and DT_F16. */
 #define ORK_KW_DT(dt) (ORK_I8_LIVE(dt) || (dt)==DT_F16)
-static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=(e&&atoi(e))?1:0;} return v; }
+/* DEFAULT ON (2026-07-13): validated general, coherent, bit-exact-safe win — skips the int8<->fp16 ACT_RESET
+ * churn for any fp16-op interleaved with int8 matmuls (SSM/GDN scan, etc.). ORK_SSM_KEEPWARM=0 to disable. */
+static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
 static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
 /* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
@@ -184,7 +186,9 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* persistent little-core (A55) marshalling helper (ORK_SSM_PIPELINE): spawned once, condvar-signalled
      * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
-    pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
+    pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob;
+    /* persistent Gated-DeltaNet scan pool (ork_gdn_scan_f32), same reuse discipline as the SSM pool. */
+    struct gdn_pool *gdn; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
@@ -1127,11 +1131,14 @@ void ork_load_prof_dump(void){
     g_lp_alloc=g_lp_mmap=g_lp_prime=g_lp_create=g_lp_memcpy=g_lp_bf=0; g_lp_nchunk=0; g_lp_bytes=0;
 }
 static void ssm_pool_free(ork_npu *c);   /* fwd: defined near ork_ssm_scan_f32 */
+static void gdn_pool_free(ork_npu *c);   /* fwd: defined near ork_gdn_scan_f32 */
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
+void ork_gdn_prof_dump(void);            /* fwd: ORK_GDN_PROF per-section accounting */
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
-void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump();
+void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_gdn_prof_dump();
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
+    gdn_pool_free(c);   /* release the persistent Gated-DeltaNet scan pool (no-op if never used) */
     if(g_ork_prof){
         if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
                                     g_prof_i8_calls, g_prof_i8_us/1e3, g_prof_i8_us/g_prof_i8_calls);
@@ -8077,10 +8084,10 @@ static int ork_ssm_i8_mask(void){ static int v=-2; if(v==-2){const char*e=getenv
 /* ORK_SSM_CHAIN: route the fp16 scan stages through the chained-multicore stream (one task_number>1 submit
  * per core, PC-chaining the core's heads) instead of run_stream_f16 (one submit per head). Escapes the
  * per-matmul submit floor while keeping 3-core parallelism. Off by default. */
-static int ork_ssm_chain(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_CHAIN"); v=e?atoi(e):0;} return v; }
+static int ork_ssm_chain(void){ static int v=-2; if(v==-2){const char*e=getenv("ORK_SSM_CHAIN"); v=e?atoi(e):1;} return v; }  /* DEFAULT ON: fused-multicore fp16 stream, part of the validated SSM-scan win. ORK_SSM_CHAIN=0 to disable. */
 /* ORK_SSM_CS: SSD chunk size (default 64). Bigger CS = fewer chunks (NC=nt/CS) but O(CS^2) intra-chunk
  * work (the G / decay-mask are CS x CS). Clamped to a %16 value in [16,256]. */
-static int ork_ssm_cs(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_CS"); v=e?atoi(e):64; if(v<16||v>256||v%16)v=64;} return v; }
+static int ork_ssm_cs(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_CS"); v=e?atoi(e):128; if(v<16||v>256||v%16)v=128;} return v; }  /* DEFAULT 128: +5% short-prefill (CS≈nt capped 128); ORK_SSM_CS overrides (64 for long prefill). */
 /* ORK_SSM_BATCH: batch the chunk-independent matmul stages ACROSS all NC chunks — each stage becomes ONE
  * dispatch of nh*NC matmuls (instead of nh, NC times). Only the CPU inter-chunk carry stays sequential.
  * Cuts NPU dispatches from 4*NC to 4 (fewer pool wake-ups, better floor amortization). fp16-only. */
@@ -8376,6 +8383,145 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
     #undef _NOW
 done2:
     if(ret) ssm_pool_free(c);   /* on error drop the cache so the next call re-allocs clean; on success KEEP it warm */
+    return ret;
+}
+
+/* ======================================================================================
+ * Gated-DeltaNet (GDA) chunked scan — the delta-rule twin of ork_ssm_scan_f32, same design
+ * pattern (fused-multicore fp16 stream matmul stages + CPU marshalling + persistent pool).
+ * Square d×d state per head (S_k==S_v==d), scalar gate per (head,token); v1: n_key==n_value==nh.
+ * Per head, per chunk, matching the CPU reference (examples/test_gdn_chunk.c) exactly:
+ *   ST1 Sk  = k·S       [CS,d]    ST2 Sq = (q·qscale)·S  [CS,d]   (state reads, weight = carry S)
+ *   ST3 KK  = k·kᵀ      [CS,CS]   ST4 KQ = (q·qscale)·kᵀ [CS,CS]  (grams, weight = kᵀ)
+ *     CPU: A[l,s]=β_l(a_l/a_s)KK ; W = (I+A)^{-1}(β(v−a·Sk)) by forward-subst ; coef=(a_l/a_s)KQ
+ *   ST5 Oi  = coef·W    [CS,d]    ST6 Sd = K_decᵀ·W       [d,d]   (output + state write, weight=W)
+ *   o = a_l·Sq + Oi ;  S = a_{CS-1}·S + Sd    (a_l = exp(cumsum g))
+ * The triangular solve (UT-transform) is the one non-matmul piece — CPU forward-substitution.
+ * ====================================================================================== */
+static int ork_gdn_cs(void){ static int v=-1; if(v<0){ const char*e=getenv("ORK_GDN_CS"); v=e?atoi(e):64; if(v<16)v=64; if(v%16)v=(v/16)*16; if(v<16)v=64; } return v; }
+
+struct gdn_pool { int d,nh,csz; ork_w **pSk,**pSq,**pKK,**pKQ,**pOi,**pSd;
+    ork_f16 *Ak,*Aq,*Bs,*BkT,*coef,*KdecT,*Wf;
+    float *Ck,*Cq,*CKK,*CKQ,*COi,*CSd,*S; double *acs,*W; ork_mm_task_f16 *tk; };
+
+static void gdn_pool_free(ork_npu *c){ struct gdn_pool *P=c->gdn; if(!P)return; int nh=P->nh;
+    for(int h=0;h<nh;h++){ if(P->pSk&&P->pSk[h])ork_mm_free(c,P->pSk[h]); if(P->pSq&&P->pSq[h])ork_mm_free(c,P->pSq[h]);
+        if(P->pKK&&P->pKK[h])ork_mm_free(c,P->pKK[h]); if(P->pKQ&&P->pKQ[h])ork_mm_free(c,P->pKQ[h]);
+        if(P->pOi&&P->pOi[h])ork_mm_free(c,P->pOi[h]); if(P->pSd&&P->pSd[h])ork_mm_free(c,P->pSd[h]); }
+    free(P->pSk);free(P->pSq);free(P->pKK);free(P->pKQ);free(P->pOi);free(P->pSd);
+    free(P->Ak);free(P->Aq);free(P->Bs);free(P->BkT);free(P->coef);free(P->KdecT);free(P->Wf);
+    free(P->Ck);free(P->Cq);free(P->CKK);free(P->CKQ);free(P->COi);free(P->CSd);free(P->S);
+    free(P->acs);free(P->W);free(P->tk);
+    free(P); c->gdn=NULL; }
+
+static int gdn_pool_ensure(ork_npu *c,int d,int nh,int CS){
+    struct gdn_pool *P=c->gdn;
+    if(P && P->d==d && P->nh==nh && P->csz==CS) return 0;   /* warm reuse */
+    gdn_pool_free(c);
+    P=calloc(1,sizeof(*P)); if(!P) return -1; c->gdn=P; P->d=d; P->nh=nh; P->csz=CS;
+    P->pSk=calloc(nh,sizeof(ork_w*));P->pSq=calloc(nh,sizeof(ork_w*));P->pKK=calloc(nh,sizeof(ork_w*));
+    P->pKQ=calloc(nh,sizeof(ork_w*));P->pOi=calloc(nh,sizeof(ork_w*));P->pSd=calloc(nh,sizeof(ork_w*));
+    if(!P->pSk||!P->pSq||!P->pKK||!P->pKQ||!P->pOi||!P->pSd){ gdn_pool_free(c); return -1; }
+    for(int h=0;h<nh;h++){ P->pSk[h]=ork_mm_f16_scratch(c,d,d); P->pSq[h]=ork_mm_f16_scratch(c,d,d);
+        P->pKK[h]=ork_mm_f16_scratch(c,d,CS); P->pKQ[h]=ork_mm_f16_scratch(c,d,CS);
+        P->pOi[h]=ork_mm_f16_scratch(c,CS,d); P->pSd[h]=ork_mm_f16_scratch(c,CS,d);
+        if(!P->pSk[h]||!P->pSq[h]||!P->pKK[h]||!P->pKQ[h]||!P->pOi[h]||!P->pSd[h]){ gdn_pool_free(c); return -1; } }
+    P->Ak=malloc((size_t)nh*CS*d*2);P->Aq=malloc((size_t)nh*CS*d*2);P->Bs=malloc((size_t)nh*d*d*2);
+    P->BkT=malloc((size_t)nh*d*CS*2);P->coef=malloc((size_t)nh*CS*CS*2);P->KdecT=malloc((size_t)nh*d*CS*2);P->Wf=malloc((size_t)nh*CS*d*2);
+    P->Ck=malloc((size_t)nh*CS*d*4);P->Cq=malloc((size_t)nh*CS*d*4);P->CKK=malloc((size_t)nh*CS*CS*4);
+    P->CKQ=malloc((size_t)nh*CS*CS*4);P->COi=malloc((size_t)nh*CS*d*4);P->CSd=malloc((size_t)nh*d*d*4);
+    P->S=malloc((size_t)nh*d*d*4);P->acs=malloc((size_t)nh*CS*8);P->W=malloc((size_t)CS*d*8);
+    P->tk=malloc((size_t)nh*sizeof(ork_mm_task_f16));
+    if(!P->Ak||!P->Aq||!P->Bs||!P->BkT||!P->coef||!P->KdecT||!P->Wf||!P->Ck||!P->Cq||!P->CKK||!P->CKQ||!P->COi||!P->CSd||!P->S||!P->acs||!P->W||!P->tk){ gdn_pool_free(c); return -1; }
+    return 0;
+}
+
+/* ORK_GDN_PROF: per-section accounting for ork_gdn_scan_f32 (accumulated across calls, dumped at teardown).
+ * Isolates the SCAN cost (independent of projections/act-quant) — the honest NPU-vs-CPU scan question. */
+static int g_gdn_prof=-1; static long g_gdn_calls=0; static double g_gdn_prep=0,g_gdn_npu=0,g_gdn_solve=0,g_gdn_post=0;
+void ork_gdn_prof_dump(void){
+    if(g_gdn_prof<=0||!g_gdn_calls) return;
+    double tot=g_gdn_prep+g_gdn_npu+g_gdn_solve+g_gdn_post; if(tot<=0)tot=1;
+    fprintf(stderr,"[ork GDN PROF] %ld calls, scan total %.1f ms | prep(cumsum+fp16 cast) %.0f%% %.1fms | NPU matmul-stages %.0f%% %.1fms | CPU solve(UT+coef) %.0f%% %.1fms | post(o+carry) %.0f%% %.1fms\n",
+        g_gdn_calls, tot/1000.0, 100*g_gdn_prep/tot, g_gdn_prep/1000.0, 100*g_gdn_npu/tot, g_gdn_npu/1000.0,
+        100*g_gdn_solve/tot, g_gdn_solve/1000.0, 100*g_gdn_post/tot, g_gdn_post/1000.0);
+}
+int ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
+                     const float *s0,const float *q,const float *k,const float *v,
+                     const float *g,const float *beta,float *o,float *s_new){
+    if(!c||d<1||nh<1||nt<1||ns<1) return -2;
+    if(d%16) return -2;                        /* N must be %16 for the fp16 stream */
+    const int CS=ork_gdn_cs(), NC=(nt+CS-1)/CS;
+    if(gdn_pool_ensure(c,d,nh,CS)) return -1;
+    struct gdn_pool *P=c->gdn;
+    const double qscale=1.0/sqrt((double)d);
+    int ret=0;
+    if(g_gdn_prof<0)g_gdn_prof=getenv("ORK_GDN_PROF")?1:0; g_gdn_calls++;
+    #define _GNOW (g_gdn_prof>0?ork_now_us():0.0)
+    /* one matmul stage = nh uniform tasks: repack B[K,N]->pool[h], task{pool[h],M,A,C}, fused stream. */
+    #define GST(pool,M,K,N,A,aS,B,bS,Cc,cS) do{ \
+        for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,P->pool[h],(K),(N),P->B+(size_t)h*(bS))){ret=-1;goto done_gdn;} \
+            P->tk[h]=(ork_mm_task_f16){P->pool[h],(M),P->A+(size_t)h*(aS),P->Cc+(size_t)h*(cS)}; } \
+        if(ork_mm_run_stream_f16_chain(c,nh,P->tk)){ret=-1;goto done_gdn;} }while(0)
+
+    for(int seq=0; seq<ns && !ret; seq++){
+        for(size_t i=0;i<(size_t)nh*d*d;i++) P->S[i]=s0[(size_t)seq*nh*d*d+i];
+        for(int cc=0;cc<NC;cc++){ int base=cc*CS; double _t=_GNOW;
+            /* prep: cumulative-gate a_l, fp16 operands Ak(k)/Aq(q·qscale)/Bs(state S)/BkT(kᵀ) */
+            for(int h=0;h<nh;h++){ double run=0;
+                for(int l=0;l<CS;l++){ int t=base+l;
+                    double gl=(t<nt)?g[(size_t)(seq*nt+t)*nh+h]:0.0; run+=gl; P->acs[(size_t)h*CS+l]=exp(run);
+                    for(int e=0;e<d;e++){ int val=t<nt;
+                        P->Ak[((size_t)h*CS+l)*d+e]=val?(ork_f16)k[((size_t)(seq*nt+t)*nh+h)*d+e]:(ork_f16)0.0f;
+                        P->Aq[((size_t)h*CS+l)*d+e]=val?(ork_f16)(q[((size_t)(seq*nt+t)*nh+h)*d+e]*qscale):(ork_f16)0.0f; } }
+                for(int key=0;key<d;key++)for(int val=0;val<d;val++) P->Bs[((size_t)h*d+key)*d+val]=(ork_f16)P->S[((size_t)h*d+key)*d+val];
+                for(int e=0;e<d;e++)for(int s=0;s<CS;s++){ int t=base+s; P->BkT[((size_t)h*d+e)*CS+s]=(t<nt)?(ork_f16)k[((size_t)(seq*nt+t)*nh+h)*d+e]:(ork_f16)0.0f; } }
+            g_gdn_prep+=_GNOW-_t; _t=_GNOW;
+            GST(pSk,CS,d,d,  Ak,(size_t)CS*d, Bs,(size_t)d*d,  Ck,(size_t)CS*d);   /* Sk = k·S   */
+            GST(pSq,CS,d,d,  Aq,(size_t)CS*d, Bs,(size_t)d*d,  Cq,(size_t)CS*d);   /* Sq = qs·S  */
+            GST(pKK,CS,d,CS, Ak,(size_t)CS*d, BkT,(size_t)d*CS, CKK,(size_t)CS*CS);/* KK = k·kᵀ  */
+            GST(pKQ,CS,d,CS, Aq,(size_t)CS*d, BkT,(size_t)d*CS, CKQ,(size_t)CS*CS);/* KQ = qs·kᵀ */
+            g_gdn_npu+=_GNOW-_t; _t=_GNOW;
+            /* CPU: forward-subst W = (I+A)^{-1} rhs ; build coef, K_decᵀ, Wf for ST5/ST6 */
+            for(int h=0;h<nh;h++){ double *acs=P->acs+(size_t)h*CS;
+                for(int l=0;l<CS;l++){ int t=base+l; double bl=(t<nt)?beta[(size_t)(seq*nt+t)*nh+h]:0.0;
+                    for(int val=0;val<d;val++){ double vv=(t<nt)?v[((size_t)(seq*nt+t)*nh+h)*d+val]:0.0;
+                        double sk=acs[l]*P->Ck[((size_t)h*CS+l)*d+val];
+                        P->W[(size_t)l*d+val]=bl*(vv-sk); }
+                    for(int s=0;s<l;s++){ double amt=bl*(acs[l]/acs[s])*P->CKK[((size_t)h*CS+l)*CS+s];
+                        for(int val=0;val<d;val++) P->W[(size_t)l*d+val]-=amt*P->W[(size_t)s*d+val]; } }
+                for(int l=0;l<CS;l++)for(int val=0;val<d;val++) P->Wf[((size_t)h*CS+l)*d+val]=(ork_f16)P->W[(size_t)l*d+val];
+                for(int l=0;l<CS;l++)for(int s=0;s<CS;s++){ double cf=(s<=l)?(acs[l]/acs[s])*P->CKQ[((size_t)h*CS+l)*CS+s]:0.0; P->coef[((size_t)h*CS+l)*CS+s]=(ork_f16)cf; }
+                double alast=acs[CS-1];
+                for(int e=0;e<d;e++)for(int s=0;s<CS;s++){ int t=base+s; double kk=(t<nt)?(alast/acs[s])*k[((size_t)(seq*nt+t)*nh+h)*d+e]:0.0; P->KdecT[((size_t)h*d+e)*CS+s]=(ork_f16)kk; } }
+            g_gdn_solve+=_GNOW-_t; _t=_GNOW;
+            GST(pOi,CS,CS,d, coef,(size_t)CS*CS, Wf,(size_t)CS*d, COi,(size_t)CS*d);/* O_intra = coef·W */
+            /* ST6 Sdelta = K_decᵀ·W [d,d]: M=d. fp16 has a latent large-M-tile bug (AGENTS §weight-DMA),
+             * so tile the d key-rows into fp16-safe M<=64 slices (SSM only ever used M=CS=64). */
+            for(int m0=0;m0<d && !ret;m0+=64){ int Mt=(d-m0<64)?(d-m0):64;
+                for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,P->pSd[h],CS,d,P->Wf+(size_t)h*CS*d)){ret=-1;goto done_gdn;}
+                    P->tk[h]=(ork_mm_task_f16){P->pSd[h],Mt,P->KdecT+(size_t)h*d*CS+(size_t)m0*CS,P->CSd+(size_t)h*d*d+(size_t)m0*d}; }
+                if(ork_mm_run_stream_f16_chain(c,nh,P->tk)){ret=-1;goto done_gdn;} }
+            g_gdn_npu+=_GNOW-_t; _t=_GNOW;
+            if(getenv("ORK_GDN_DBG")&&seq==0&&cc==0){ double nk=0,nq=0,nkk=0,nkq=0,noi=0,nsd=0;
+                for(size_t i=0;i<(size_t)nh*CS*d;i++){ nk+=P->Ck[i]*P->Ck[i]; nq+=P->Cq[i]*P->Cq[i]; noi+=P->COi[i]*P->COi[i]; }
+                for(size_t i=0;i<(size_t)nh*CS*CS;i++){ nkk+=P->CKK[i]*P->CKK[i]; nkq+=P->CKQ[i]*P->CKQ[i]; }
+                for(size_t i=0;i<(size_t)nh*d*d;i++) nsd+=P->CSd[i]*P->CSd[i];
+                fprintf(stderr,"[gdn dbg d=%d nh=%d] |Sk|=%.3e |Sq|=%.3e |KK|=%.3e |KQ|=%.3e |Oi|=%.3e |Sd|=%.3e\n",
+                        d,nh,sqrt(nk),sqrt(nq),sqrt(nkk),sqrt(nkq),sqrt(noi),sqrt(nsd)); }
+            /* post: o = a_l·Sq + O_intra ;  state carry S = a_{CS-1}·S + Sdelta */
+            for(int h=0;h<nh;h++){ double *acs=P->acs+(size_t)h*CS; double alast=acs[CS-1];
+                for(int l=0;l<CS;l++){ int t=base+l; if(t>=nt)continue;
+                    for(int val=0;val<d;val++) o[((size_t)(seq*nt+t)*nh+h)*d+val]=(float)(acs[l]*P->Cq[((size_t)h*CS+l)*d+val]+P->COi[((size_t)h*CS+l)*d+val]); }
+                for(int key=0;key<d;key++)for(int val=0;val<d;val++){ size_t j=((size_t)h*d+key)*d+val; P->S[j]=(float)(alast*P->S[j]+P->CSd[((size_t)h*d+key)*d+val]); } }
+            g_gdn_post+=_GNOW-_t;
+        }
+        for(size_t i=0;i<(size_t)nh*d*d;i++) s_new[(size_t)seq*nh*d*d+i]=P->S[i];
+    }
+    #undef GST
+    #undef _GNOW
+done_gdn:
+    if(ret) gdn_pool_free(c);
     return ret;
 }
 
