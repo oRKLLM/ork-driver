@@ -119,9 +119,19 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   against an embedded golden** (`fnv64` + a `GOLD[]` table); the CPU reference function is **kept** and
   runs ONLY to **regenerate a golden** (`sudo env ORK_REGEN=1 ./test_matmul` → paste the printed
   `REGEN GOLD[...]` values) or to **diagnose a mismatch** (`ORK_FULL_REF=1`). Leave the golden static
-  until a *deliberate* matmul change alters the output, then regen. Applies to the O(M·N·K)-reference
-  tests (`test_matmul`, and the same pattern fits `test_bmm`/`test_layouts`/`test_sn3`). NOTE: pass env
+  until a *deliberate* output-changing edit, then regen. In use on `test_matmul`, `quant`, `test_sn3`,
+  `model` (the reference-bound tests); took full `make test` from ~10-11 min to **~33 s**. NOTE: pass env
   through `sudo env VAR=…` — a bare `VAR=… sudo …` prefix is stripped by sudo.
+- **CI board-validation gate (`make check-attest`).** The tests need the NPU, which CI runners lack — so
+  CI can't run them. Instead, `make test` on the SBC (on ALL PASS) writes `tests/sbc_attest.txt` =
+  sha256 of the NPU-output-determining `.c` sources + the golden-bearing tests; CI `make check-attest`
+  (no NPU — sha256 + grep) fails if the tree hash differs, catching a commit that changed NPU-relevant
+  code **without** a board `make test`. So: after any such change, run `make test` on the SBC and
+  **commit the refreshed `tests/sbc_attest.txt`** or CI (and the version bump — `version-bump.yml` runs
+  `check-attest` before bumping) will fail. Workflows: `.github/workflows/sbc-attest.yml` + `version-bump.yml`.
+- **Fast rebuilds.** CORE (`npu.c`) is compiled **once** into shared `-fPIC` objects (`$(COBJ)`) that the
+  examples/tests link — an `npu.c` edit rebuilds it once, not ~30×. `CC` uses **ccache** when present
+  (`NO_CCACHE=1` to disable). Full build ~20 s, incremental npu.c-edit rebuild ~9 s. `make -j` parallelizes.
 - **No macOS Binary Transfers:** Never push or copy local macOS binaries (from arm64/x86_64 Mac workstation builds) to the target SBC. Only source files should be synchronized (e.g., via git or targeted rsync) and then built natively on the board.
 
 ---
@@ -255,7 +265,7 @@ mechanism that actually applies at each call site; **don't** default everything 
   after (the "28→1" keep-warm behavior must be intact).
 
 **Phase status.** The consolidation landed **behavior-preserving** (Phase 1). Sites that do **not** map
-cleanly (drifted or specially-motivated) are **left as-is and catalogued in `MODE_TRANSITION_LAYER_WIP.md`** for a
+cleanly (drifted or specially-motivated) are **left as-is and catalogued in the wiki "Exp-2026-07-14 Mode-Transition Layer"** for a
 Phase-2 1-by-1 evaluation — that is where behavior changes (e.g. flipping `XP_SDP.setdt=1` to fix the
 fp16-mm→SDP→fp16-mm wedge, or making the chain profiles honor `ORK_SSM_KEEPWARM`) happen, each a
 one-row edit re-validated by `make test` + bench. **Do not conflate** the precision-mode reset (which

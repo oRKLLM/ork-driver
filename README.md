@@ -217,6 +217,15 @@ sudo env ORK_FULL_REF=1 ./test_matmul  # force the full CPU reference (diagnose 
 From a workstation, sync the source to the board and run it there, e.g.
 `rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'`.
 
+Builds are incremental: the core sources compile once to shared `-fPIC` objects reused across
+every example, and the compiler is wrapped in `ccache` when available (`make NO_CCACHE=1` to
+disable), so a re-build after an edit is seconds, not minutes. On a full-pass `make test` the
+runner writes `tests/sbc_attest.txt` — a sha256 of the NPU-output-determining sources. CI can't
+run the tests (no NPU on the runners), but it runs `make check-attest` (pure sha256 + grep) to
+**gate every push and version bump on that attestation**: if a hashed source or a golden changed
+since the last passing board run, the check fails, catching a commit that was not re-validated on
+the SBC. It cannot prove the tests pass on the NPU, only that the board run happened.
+
 ## How it works
 
 A matmul is lowered to a sequence of NPU register writes (the regcmd "ISA": `(reg, block,

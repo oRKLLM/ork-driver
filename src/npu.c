@@ -3607,8 +3607,8 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0)
  * profiles: XP_CHAIN_NT used to ignore ORK_SSM_KEEPWARM (KWP_NTL + RC_NOTLIVE), so a chain entered
  * from an fp16 op ate a full ~105ms ACT_RESET where the stream profiles kept warm; switching it to
  * KWP_MC + RC_NOTLIVE_NOTKW eliminated that (chain_xition_probe: reset-cost 53538us→~0, coherent), and
- * the two stream-int8 profiles collapsed into one (XP_STREAM_I8). See MODE_TRANSITION_LAYER_WIP.md for
- * the full Phase-2 record and AGENTS.md §"Mode-transition layer" for how to add or change a transition.
+ * the two stream-int8 profiles collapsed into one (XP_STREAM_I8). See the wiki "Exp-2026-07-14 Mode-
+ * Transition Layer" for the full Phase-2 record and AGENTS.md §"Mode-transition layer" for how to add/change.
  *
  * EXHAUSTIVE (from -> to) permutation space — modes = { COLD(-1), F16(0), I8(1), I4(2), I8_CHAIN(3),
  * I4_CHAIN(4), I4_STREAM(5) }, plus SDP = a TRANSIENT activation/ewmul reset with NO stored marker.
