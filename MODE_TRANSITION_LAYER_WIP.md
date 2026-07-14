@@ -132,13 +132,17 @@ intentional, so each is decided individually in Phase 2 (a one-row `XSPEC` edit,
    reset and the fused-SiLU LUT `!ORK_I8_LIVE || ORK_PROBE_RESET` prime are env/warm-gated and leave
    `last_dt` untouched — which is exactly the correct SDP-axis behavior confirmed by the Phase-2 mode_probe
    finding (SDP ops leaving `last_dt` alone is optimal, not a bug). Not drift.
-6. **int4 clear-gating — ASSESSED 2026-07-14: plausibly mechanism-legit, deferred with rationale.**
-   `XP_I4_MC` (run_i4_mc/grouped, standard multicore output), `XP_I4_MWARM` (incr_mc/bchain/cbatch,
-   batch-chain paths that size their own grow-only per-call buffers), and `XP_I4_INCR` (single-core, static
-   local buffers) use *different buffer-management strategies*, so the size-clear difference is not obviously
-   the *same* transition (guiding-principle caveat: confirm same-transition before converging). Converging
-   would need an int4-specific manufactured probe to prove equivalence; low value (int4 is the experimental
-   tier, W8A8 is production) and non-zero risk → deferred, not a Phase-2 blocker.
+6. **int4 clear-gating — RESOLVED 2026-07-14: mechanism-legit, NOT a bug (no convergence).**
+   Built `tools/i4_xition_probe.c` (manufactures {fp16,int8,int4-live} → int4 across a wide K/N/M sweep;
+   `A=B=1 ⇒ C==K`). Result: **all four int4 mechanisms — `run_i4`(XP_I4_MC), `run_i4_incr`(XP_I4_INCR),
+   `run_chain_i4`(XP_I4CHAIN), `run_stream_i4`(XP_I4_STREAM) — are 36/36 coherent** across every predecessor
+   and shape. `XP_I4_MC` (persistent per-core `mcc` output → needs a transition-time `mccsz` clear to resize
+   on an int4 entry) vs `XP_I4_MWARM`/`XP_I4_INCR` (size their own buffers per call) is a *legitimate*
+   buffer-lifecycle difference, not gratuitous drift — coherence confirms each is correct. Not the same
+   transition ⇒ do NOT converge. **Observation (separate, not a transition issue):** an earlier probe variant
+   ran `ork_mm_run_chain_i4` twice back-to-back and the 2nd call miscomputed — a possible re-warm gap on
+   *repeated* raw chain_i4 calls (same weight, no intervening op); unconfirmed, experimental path, worth a
+   dedicated check if int4-chain goes production.
 
 ## How to work on this
 See AGENTS.md §"Mode-transition layer" for the modify/add/test recipe. Scratch doc — fold into the

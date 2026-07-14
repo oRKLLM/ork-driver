@@ -472,6 +472,9 @@ mode_probe: tools/mode_probe.c $(COBJ)
 chain_xition_probe: tools/chain_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 ssd_layer_bench: tools/ssd_layer_bench.c $(CORE)
 	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(CORE) -lm -lpthread
 
