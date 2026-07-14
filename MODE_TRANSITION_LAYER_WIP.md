@@ -51,13 +51,32 @@ Premise of the refactor: a transition that doesn't map cleanly is *probably* a b
 intentional, so each is decided individually in Phase 2 (a one-row `XSPEC` edit, re-validated by
 `make test` + bench), using the guiding principle above. **Do not flip these blind.**
 
-1. **SDP / activation ops not wired (the main event).** `XP_SDP` is defined + documented but no op calls
-   it. The ops still do their own entry `ACT_RESET` and **leave `last_dt` untouched** → the
-   fp16-mm→SDP→fp16-mm wedge (wiki Exp-2026-07-12). They are also mutually inconsistent:
-   `ork_npu_ewmul_i8` does **no** reset (comment: not needed for the SDP element-wise op),
-   `ork_npu_ewmul_f16` **does**. Phase-2 fix: route SDP-op entry resets through `ork_npu_enter(c,…,
-   XP_SDP)`, flip `XP_SDP.setdt=1`, add `SDP→matmul` reset rows. Keep the `c->task` LUT-descriptor axis
-   SEPARATE — `ACT_RESET` does not fix it (Exp-2026-07-12).
+1. **SDP / activation ops — RESOLVED 2026-07-14: NOT a bug, do NOT wire `XP_SDP`.** *(This item's
+   Phase-1 framing was WRONG; corrected here per guiding-principle #4 — keep the record self-correcting.)*
+   The Phase-1 catalogue mis-attributed the "SDP→matmul wedge" to SDP leaving `last_dt` untouched.
+   Wrong: the wedge was the **`c->task` LUT-descriptor poisoning** — a *separate* axis (nuance #1),
+   already fixed in **98c00b1** (LUT ops save/restore `c->task`). `Exp-2026-07-12` states outright "the
+   wedge has nothing to do with `last_dt`"; `test_mode_transition` regresses it and passes.
+   Board **`mode_probe` (2026-07-14, full matrix below)** confirms **every** SDP→matmul pair is **SAFE
+   with `fix=none`** — including the once-failing `ewmul_f16→MM_F16` — and that `fix=none` is *faster*:
+   SDP→int8-matmul is ~0.3ms with `none` vs **~105ms** when `invalidate`/`reset` forces a re-warm. So
+   flipping `XP_SDP.setdt=1` would re-introduce the exact ~105ms/transition churn `ORK_SSM_KEEPWARM`
+   removes, for **zero** correctness gain. **Decision (principle #1: correctness ties → best perf):**
+   leave SDP ops as-is (correctly leave `last_dt` untouched); keep `XP_SDP` reserved/unused. The
+   `ewmul_i8`(no reset) vs `ewmul_f16`(reset) difference is op-local self-correctness, not a precision
+   transition — deferred, low priority.
+
+   **mode_probe SDP→matmul matrix (RK3588, 2026-07-14; `B(rc,ms)` = victim matmul):**
+   ```
+   SDP op        -> MM_F16                         -> MM_I8
+                    none     inval    reset           none      inval     reset
+   EXP_I16          0.2 ok   0.3 ok   0.3 ok          0.3 ok    105 ok    107 ok
+   SILU_I16         0.2 ok   0.3 ok   0.3 ok          0.4 ok    105 ok    107 ok
+   EWMUL_I16        0.2 ok   0.3 ok   0.3 ok          0.5 ok    107 ok    107 ok
+   EWMUL_F16        0.2 ok   0.3 ok   0.3 ok          0.4 ok    107 ok    107 ok
+   ADD_F16          0.2 ok   0.3 ok   0.3 ok          0.5 ok    107 ok    107 ok
+   ```
+   All SAFE; no wedges. `none` (keep-warm) is optimal for every pair.
 2. **Chain profiles ignore `ORK_SSM_KEEPWARM`.** `XP_CHAIN_NT` uses `KWP_NTL` (nothrash-only); a chain
    after an fp16 op resets where `XP_SC_MM`/stream (`KWP_F16`) keep warm. Decide whether chains should
    honor the (default-on) SSM keep-warm.

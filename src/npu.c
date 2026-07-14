@@ -3612,10 +3612,16 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0)
  *   ->I8_CHAIN(3)  : DT_I8<->DT_I8_CHAIN is NOT a hw mode change (ORK_I8_LIVE) -> no reset.
  *   ->I4_CHAIN(4)  : unconditional reset on entry (single-core int4 M=1 chain).
  *   ->I4_STREAM(5) : unconditional reset on entry.
- *   ->SDP          : activation/ewmul reprogram the pipeline; PHASE 1 preserves current behavior —
- *                    unconditional entry ACT_RESET and last_dt LEFT UNTOUCHED (setdt=0), which keeps
- *                    the documented fp16-mm->SDP->fp16-mm wedge (Exp-2026-07-12) observable. PHASE 2
- *                    flips XP_SDP.setdt=1 (+ adds SDP->matmul reset rows) as the one-row wedge fix.
+ *   ->SDP          : activation/ewmul reprogram the pipeline but correctly LEAVE last_dt untouched
+ *                    (setdt=0), so the NEXT matmul keeps warm (no ~105us re-warm). The historical
+ *                    "SDP->matmul wedge" was NOT a last_dt issue — it was the c->task LUT-descriptor
+ *                    poisoning (nuance #1), fixed independently in 98c00b1 (Exp-2026-07-12). Board
+ *                    mode_probe (2026-07-14) confirms EVERY SDP->matmul is SAFE with NO reset, and
+ *                    that forcing one costs ~105us/transition for zero correctness gain. XP_SDP is
+ *                    therefore RESERVED/unused — do NOT wire it to force matmul resets; that would
+ *                    re-introduce the exact churn ORK_SSM_KEEPWARM removes. (SDP ops that need their
+ *                    OWN entry reset for self-correctness keep doing it inline; that is op-local, not
+ *                    a precision-mode transition.)
  * NUANCE #1 (kept SEPARATE, per Exp-2026-07-12): the c->task LUT-descriptor poisoning is a DISTINCT
  * axis from precision-mode and ACT_RESET does NOT fix it — the layer owns only the precision reset;
  * the c->task save/restore stays an op responsibility (no clr_task cell is wired in Phase 1). */
