@@ -3669,7 +3669,7 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
  * empirically test transition reachability (e.g. is XP_CHAIN_NT ever entered from F16?). Dumped by
  * ork_npu_xprof_dump() at teardown. Zero cost when off (one cached getenv). */
 static long g_xcount[XP_NPROFILE][8]; static int g_xprof=-1;
-static const char *XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_I8B","STREAM_F16",
+static const char *XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
     "I4_MC","I4_MWARM","I4_INCR","I4CHAIN","I4_STREAM","SDP"};
 static const char *XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
 static void ork_npu_xprof_dump(void){
