@@ -9,6 +9,12 @@
 #include "ork_npu.h"
 typedef ork_f16 f16;
 static unsigned sd=12345; static int rnd(){sd=sd*1103515245+12345;return (sd>>16)%4;}
+/* FNV-1a 64-bit checksum. rnd() is a fixed-seed LCG, so the inputs — and therefore the NPU output —
+ * are DETERMINISTIC across runs; a correctness check need only compare the O(M*N) output checksum
+ * against a static golden, NOT recompute the O(M*N*K) CPU reference every run. The reference is kept
+ * (below) and runs ONLY to regenerate a golden (ORK_REGEN=1) or diagnose a mismatch (ORK_FULL_REF=1). */
+static uint64_t fnv64(const void*p,size_t n){ const uint8_t*b=(const uint8_t*)p; uint64_t h=1469598103934665603ULL;
+    for(size_t i=0;i<n;i++){ h^=b[i]; h*=1099511628211ULL; } return h; }
 
 static int check(ork_npu*ctx,int M,int K,int N){
     printf("FP16 check start: M=%d, K=%d, N=%d\n", M, K, N); fflush(stdout);
@@ -58,6 +64,11 @@ static int check_chain_prefill(ork_npu*ctx){
      * with ORK_CHAIN_KSPLIT=1 (chained) and =0 (per-tile K-split). */
     int shapes[][3] = { {256,18944,3584}, {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048} };
     int ns = (int)(sizeof(shapes)/sizeof(shapes[0]));
+    /* Static golden output checksums (fnv64 of the int32 C) for the fixed-seed inputs above. Regenerate
+     * with `ORK_REGEN=1 sudo ./test_matmul` and paste the printed values. A 0 entry auto-triggers regen. */
+    static const uint64_t GOLD[] = {  /* regenerated 2026-07-14 (RK3588); ref-verified bad=0 */
+        0xb4d325e573e7037cULL, 0x6084624fae4ea1cdULL, 0x1fc8a45628241e4bULL, 0xa752ea8100ba7d54ULL, 0x21dc86bea3c1015fULL,
+    };
     int fail=0;
     for(int s=0;s<ns;s++){
         int M=shapes[s][0],K=shapes[s][1],N=shapes[s][2];
@@ -68,10 +79,19 @@ static int check_chain_prefill(ork_npu*ctx){
         ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
         if(!w){printf("  pack_i8 failed\n");free(A);free(B);free(C);return 1;}
         if(ork_mm_run_i8(ctx,w,M,A,C)){printf("  run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
-        long bad=0;
-        for(int i=0;i<M && bad<5;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref){bad++;if(bad<=3)printf("    mism @ (%d,%d): got %d ref %d\n",i,n,C[(size_t)i*N+n],ref);}}
-        printf("  %s\n",bad?"WRONG":"ok"); fflush(stdout);
-        if(bad)fail=1;
+        uint64_t got=fnv64(C,(size_t)M*N*4);
+        uint64_t gold = s<(int)(sizeof GOLD/sizeof*GOLD) ? GOLD[s] : 0;
+        int regen=getenv("ORK_REGEN")!=NULL;
+        if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){
+            printf("  ok (golden 0x%016llx)\n",(unsigned long long)got); fflush(stdout);   /* fast: no O(M*N*K) recompute */
+        } else {
+            long bad=0;   /* preserved CPU reference: regen a golden or diagnose a mismatch */
+            for(int i=0;i<M && bad<5;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref){bad++;if(bad<=3)printf("    mism @ (%d,%d): got %d ref %d\n",i,n,C[(size_t)i*N+n],ref);}}
+            if(regen||!gold) printf("  REGEN GOLD[%d]=0x%016llxULL  {%d,%d,%d} ref-bad=%ld\n",s,(unsigned long long)got,M,K,N,bad);
+            else if(got!=gold) printf("  GOLDEN MISMATCH {%d,%d,%d}: output changed (ref-bad=%ld) — regen if intended\n",M,K,N,bad);
+            if(bad || (gold && got!=gold && !regen)) fail=1;
+            printf("  %s (ref-checked)\n",bad?"WRONG":"ok"); fflush(stdout);
+        }
         ork_w_free(w);free(A);free(B);free(C);
     }
     return fail;

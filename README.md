@@ -193,6 +193,18 @@ make test MODEL=/path/to/stories15M.bin   # also run the real-model llama2 test 
 make bench-llama           # run the integration benchmark script tools/bench_two_turn.sh
 ```
 
+Because the test inputs are fixed-seed deterministic, the NPU output is a constant, so the
+correctness check compares a **checksum of the NPU output against an embedded static golden**
+rather than recomputing the O(M·N·K) CPU reference every run (a wide-K shape's reference is
+billions of MACs — minutes on the CPU, ~0.5 s on the NPU). The CPU reference is kept and runs
+only to regenerate a golden after a *deliberate* output-changing edit, or to diagnose a
+mismatch:
+
+```sh
+sudo env ORK_REGEN=1 ./test_matmul     # print fresh golden checksums to paste into the test
+sudo env ORK_FULL_REF=1 ./test_matmul  # force the full CPU reference (diagnose a mismatch)
+```
+
 From a workstation, sync the source to the board and run it there, e.g.
 `rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'`.
 

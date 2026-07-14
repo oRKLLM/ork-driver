@@ -112,6 +112,16 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 - **The examples ARE the tests** — each self-validates against a CPU reference (NPU output must
   match within fp16 tolerance; NaN/inf or dead output must fail). When you fix a hardware-behavior
   bug, add a shape/config case to the relevant example so `make test` would have caught it.
+- **Static golden verification (don't recompute the CPU reference every run).** Test inputs are
+  fixed-seed deterministic (e.g. `test_matmul`'s `rnd()` is a fixed-seed LCG), so the NPU output is a
+  constant — a wide-K reference like `{256,18944,3584}` is ~17 B MACs the NPU does in ~0.5 s but a naive
+  O(M·N·K) CPU loop takes minutes. So the pass-path asserts an **O(M·N) checksum of the NPU output
+  against an embedded golden** (`fnv64` + a `GOLD[]` table); the CPU reference function is **kept** and
+  runs ONLY to **regenerate a golden** (`sudo env ORK_REGEN=1 ./test_matmul` → paste the printed
+  `REGEN GOLD[...]` values) or to **diagnose a mismatch** (`ORK_FULL_REF=1`). Leave the golden static
+  until a *deliberate* matmul change alters the output, then regen. Applies to the O(M·N·K)-reference
+  tests (`test_matmul`, and the same pattern fits `test_bmm`/`test_layouts`/`test_sn3`). NOTE: pass env
+  through `sudo env VAR=…` — a bare `VAR=… sudo …` prefix is stripped by sudo.
 - **No macOS Binary Transfers:** Never push or copy local macOS binaries (from arm64/x86_64 Mac workstation builds) to the target SBC. Only source files should be synchronized (e.g., via git or targeted rsync) and then built natively on the board.
 
 ---
