@@ -7020,6 +7020,7 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
     setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
     setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);                                     /* ERDMA mode (per-channel 0x08 / per-element 0x40000008) */
+    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4040,0x00000053);                              /* BS stage FULLY bypassed (vendor chained-mul: BYPASS+ALU+MUL+RELU) — template had BS active (0x20050) which stalls in-chain */
     setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
     setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
     double t0=ork_now_us();

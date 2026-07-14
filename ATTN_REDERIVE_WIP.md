@@ -208,6 +208,18 @@ Start: expose fp16-matmul regcmd-build, then exp/reduce/perchan; validate a 2-op
   swap-bound (see [[multi-domain-runtime]]) — a separate footprint task.
 - OR: re-convert a small qwen3/qwen2.5 attention model with a correct vocab (.239 conversion box).
 
+## ★ CHAIN-ERDMA CAPTURE (2026-07-14) — vendor conv→mul fusion reveals chained 2-input SDP config
+Built tools/re/models/build_fuse.py (Conv->Mul/Add 2-input), compiled conv_mul.rknn on the .239 COLIMA VM
+(rknn-toolkit2 2.3.2, OpFusing ran), captured on board (~/conv_mul.dump via regcmd_capture.so). 6 tasks;
+task[0]=conv (enable=0x1d), task[1]=the 2-input MUL SDP (enable=0x18, 69 regs). Vendor task[1] DMA config:
+0x5034(ERDMA_CFG)=0x40000008 (DATA_MODE=1 per-element + DATA_SIZE=2), 0x5038(EW_BASE)=2nd operand,
+0x4040(BS_CFG)=0x53 (BS fully bypassed: BYPASS b0 + ALU_BYPASS b1 + MUL_BYPASS b4 + RELU_BYPASS b6),
+0x4070(EW_CFG)=0x108003c4, 0x5040(EW_SURF)=0x400, 0x501c/0x5020(BRDMA/BS)=0.
+=> ERDMA CAN chain (vendor does it). My chained per-element (ORK_CHAIN_PE) used 0x5034=0x40000008 too but
+HUNG -> missing bits are ELSEWHERE in the SDP regcmd (ACT_RESET provides them standalone). NEXT (board-safe):
+diff vendor task[1] vs my REGCMD_MUL_I16-based pc reg-by-reg (suspect 0x4040=0x53 BS-bypass, 0x4070). Then
+apply to the chained per-channel op -> unblock the single-submit chain. The user-directed capture worked.
+
 ## Board-ops
 - timeout every NPU cmd; SIGTERM never kill -9; wedge→`ssh board 'sudo reboot'`; hard-wedge→Rock 5B Plug.
 - never copy macOS binaries to board — rsync SOURCE, build natively.
