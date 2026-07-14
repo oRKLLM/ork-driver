@@ -7004,7 +7004,11 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
     memset(G.cpu,0,sz); memset(O.cpu,0,sz); memset(SB.cpu,0,4096);
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
-    { int16_t*sb=SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }               /* per-channel scale CONTIGUOUS [N] */
+    /* ERDMA mode for the chained SDP (RE): default per-channel (0x08, b=[N] contiguous); ORK_CHAIN_PE=1 =>
+     * per-ELEMENT (0x40000008, b=[M][N] EWCUBEH, scale tiled across rows) — isolates ERDMA-in-chain vs per-channel mode. */
+    int pe=getenv("ORK_CHAIN_PE")?1:0; uint32_t r34=pe?0x40000008u:0x00000008u;
+    if(pe){ int16_t*sb=SB.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)SB.cpu+(((n)/8)*(M*16)+(m)*16+((n)%8)*2))=scale[n]; }
+    else  { int16_t*sb=SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }           /* per-channel scale CONTIGUOUS [N] */
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
@@ -7015,7 +7019,7 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
     setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
     setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,0x00000008);                              /* ERDMA per-channel + 2-byte */
+    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);                                     /* ERDMA mode (per-channel 0x08 / per-element 0x40000008) */
     setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
     setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
     double t0=ork_now_us();
