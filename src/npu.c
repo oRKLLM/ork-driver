@@ -7014,17 +7014,18 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
     synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul int16-out -> G */
     set_i16_out(mm,N,0,m1,s1);
-    memcpy(pc,REGCMD_MUL_I16,sizeof pc);                                              /* prog1: per-channel scale G -> O */
-    set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);                                     /* ERDMA mode (per-channel 0x08 / per-element 0x40000008) */
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4040,0x00000053);                              /* BS stage FULLY bypassed (vendor chained-mul: BYPASS+ALU+MUL+RELU) — template had BS active (0x20050) which stalls in-chain */
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+    /* prog1: VENDOR-captured chained 2-input SDP (REGCMD_MUL_F16_CHAIN, known-good in-chain: BS+BN bypassed).
+     * Patch only addrs + geometry + ERDMA mode; keep the vendor's chain-safe config verbatim (the user's call:
+     * use the vendor's working version rather than patching our standalone-tuned template). (void)m2;(void)s2. */
+    (void)m1;(void)s1;(void)m2;(void)s2;
+    memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
+    set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
+    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4020,(uint32_t)O.dma);
+    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5018,(uint32_t)G.dma);                    /* INPUT = matmul OUTPUT (bridge) */
+    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5038,(uint32_t)SB.dma);
+    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5034,r34);                               /* ERDMA mode (per-channel 0x08 / per-element 0x40000008) */
     double t0=ork_now_us();
-    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
+    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,-1} };
     int crc=ork_npu_chain_progs(c,2,progs,dom);
     if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }
