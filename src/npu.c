@@ -5659,7 +5659,7 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
     setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5719,7 +5719,7 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5761,7 +5761,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=a[m*N+n]; bc[p]=b[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_N,M,N);
     setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -5804,7 +5804,7 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
     memset(W0.cpu,0,sz); memset(W1.cpu,0,sz);
     { int8_t*wc=W0.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) wc[RMCUBE(m,n)]=a[(size_t)m*N+n]; }
     bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18;
     struct buf *cur=&W0,*oth=&W1; int ok=0, cur_n=N; double t0=ork_now_us();
@@ -5939,7 +5939,7 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+PCH16(m,n))=a16[(size_t)m*N+n];
     for(int n=0;n<N;n++) ((uint16_t*)B.cpu)[n]=b16[n];               /* per-channel vector CONTIGUOUS [N] (fp16) */
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
     setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -6057,7 +6057,7 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+PC16(m,n))=a[(size_t)m*N+n];
     for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -6098,7 +6098,7 @@ int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int 
     { int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[PCCUBE(m,n)]=a[(size_t)m*N+n]; }
     { int8_t*bc=B.cpu; for(int n=0;n<N;n++) bc[n]=b[n]; }                        /* per-channel vector: CONTIGUOUS [N] (not surface-strided) */
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
     setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
@@ -6141,7 +6141,7 @@ int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,
     /* per-channel scale vector b[N]: try the EW-operand cube layout for a single width row (width=1). */
     { int8_t*sc=S.cpu; for(int n=0;n<N;n++) sc[(n/16)*16 + (n%16)]=scale[n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     /* EW MUL out=a*b, b (ERDMA 0x5038) as a PER-CHANNEL vector via ERDMA_DATA_MODE (0x5034 bits[31:30]). */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
@@ -6203,7 +6203,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=a16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=b16[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_F16_N]; memcpy(rc,REGCMD_ADD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_F16_N,M,N);
     setr(rc,REGCMD_ADD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
@@ -6244,7 +6244,7 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);   /* ORK_SDP_NORESET experiment: element-wise SDP entry reset */
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
     setr(rc,REGCMD_ADD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
