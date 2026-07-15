@@ -6155,6 +6155,16 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     return ok;
 }
 
+/* Wall-#2 probe: a background thread that, mid-submit, hot-patches ONE descriptor far ahead in the treadmill
+ * ring (outside the NPU's prefetch horizon) to a MARKER task, then flushes. If the NPU honors the live patch
+ * (re-reads the descriptor from DRAM when it arrives), the marker's side effect appears. */
+struct ork_rsh_patch { ork_npu *c; struct rknpu_task marker; uint32_t idx; uint32_t delay_us;
+    int rcmode; uint32_t *rcword; uint32_t rcval0,rcval1; };  /* rcmode: patch a regcmd word in c->regcmd instead of a descriptor */
+static void *ork_rsh_patcher(void *p){ struct ork_rsh_patch *a=p; usleep(a->delay_us);
+    if(a->rcmode){ a->rcword[0]=a->rcval0; a->rcword[1]=a->rcval1; bsync(a->c->fd,&a->c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); }
+    else { struct rknpu_task *tk=(struct rknpu_task*)a->c->task.cpu; tk[a->idx]=a->marker; bsync(a->c->fd,&a->c->task,RKNPU_MEM_SYNC_TO_DEVICE); }
+    __asm__ __volatile__("dsb sy":::"memory"); return NULL; }
+
 /* RE (WIP, RESHAPE_WIP.md): FULL-CHAIN REPLAY of the vendor gemm+reshape (task0-10) to validate the reshape
  * IN CONTEXT (task4 is a mid-chain op needing task1-3's pipeline state — standalone it saturates). Loads the
  * captured vendor IOVA image (gemm_mul_image.bin, 77824B, IB=0xfffed000), blanket single-delta rebases every
@@ -6235,15 +6245,35 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     for(int j=0;j<NT;j++){ tk[j].enable_mask=TK(j).en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
         tk[j].regcfg_amount=eamt[j]; tk[j].regcmd_addr = inimg ? (uint32_t)BIG.dma+TK(j).off : (uint32_t)c->regcmd.dma+cro[j]*4; }
     for(uint32_t j=(uint32_t)NT;j<tn;j++) tk[j]=tk[NT-1];          /* RING: replicate the (completable) last task to fill the treadmill */
+    /* Wall-#2 live-patch test: whole ring = cheap dummy (does NOT write 0x3000); MARKER = the GEMM (DOES write
+     * 0x3000). A bg thread hot-patches descriptor[tn/2] (far ahead) to the marker mid-submit. If 0x3000 ends up
+     * nonzero, the NPU re-read the patched descriptor from DRAM when it arrived -> live far-ahead patch HONORED. */
+    pthread_t pth; struct ork_rsh_patch parg; int patching=0;
+    if(getenv("ORK_RESHAPE_PATCH") && tn>(uint32_t)NT){
+        parg.c=c; parg.marker=tk[0];                              /* GEMM marker (writes 0x3000) */
+        for(uint32_t j=0;j<tn;j++) tk[j]=tk[NT-1];                /* ring = cheap reshape-delta dummy */
+        parg.idx=tn/2; { const char*e=getenv("ORK_RESHAPE_PATCH_US"); parg.delay_us=e?(uint32_t)strtoul(e,0,0):50; }
+        parg.rcmode=0;
+        if(getenv("ORK_RESHAPE_PATCHRC")){ /* alt: patch the shared DUMMY regcmd's 0x4020 output -> 0x3000, mid-run (tests regcmd live re-read) */
+            uint32_t *drc=cr+cro[NT-1]; int dnw=(int)eamt[NT-1]*2+16; parg.rcword=NULL;
+            for(int k=0;k+1<dnw;k+=2){ if((drc[k]&0xffff)==0x4020 && (drc[k+1]>>16)==0x1001){ parg.rcword=drc+k;
+                uint32_t nv=(uint32_t)BIG.dma+0x3000; parg.rcval0=0x4020|((nv&0xffff)<<16); parg.rcval1=(0x1001u<<16)|((nv>>16)&0xffff); break; } }
+            if(parg.rcword) parg.rcmode=1; }
+        memset((char*)BIG.cpu+0x3000,0,0x400); bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); patching=1;
+    }
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
     sub.flags=flg; sub.task_number=tn; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
     sub.fence_fd=-1; sub.timeout=ew_timeout_ms();
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,tn}; /* vendor sets all 3 */
+    if(patching) pthread_create(&pth,NULL,ork_rsh_patcher,&parg);   /* fire the mid-submit far-ahead descriptor patch */
     int ok=-1; double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
     else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(patching){ pthread_join(pth,NULL); int mnz=0; uint16_t*mg=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<512;i++)if(mg[i])mnz++;
+        fprintf(stderr,"[patch] ring=%u idx=%u delay=%uus -> gemm-marker(0x3000) nz=%d -> %s\n",
+            tn,parg.idx,parg.delay_us,mnz, mnz?"WRITTEN (live far-ahead patch HONORED)":"zero (patch NOT honored / prefetched)"); }
     if(gemm_raw){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<gemm_words;i++)gemm_raw[i]=g[i]; }       /* 0xffff0000 */
     uint32_t roff=0x3680; { const char*e=getenv("ORK_RESHAPE_ROUT"); if(e)roff=(uint32_t)strtoul(e,0,0); } /* reshape-out read offset (0x3680 atom-8 base; 0x3280=task2 out) */
     if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+roff); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; }
