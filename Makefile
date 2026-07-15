@@ -569,3 +569,6 @@ stridedA_bmm_probe: tools/stridedA_bmm_probe.c $(CORE)
 
 i16out_probe: tools/i16out_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+perchan_bench: tools/perchan_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
