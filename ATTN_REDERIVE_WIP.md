@@ -379,3 +379,22 @@ the axis the LINE_NOTCH acts between (HEIGHT/line, not WIDTH) — task13 has WID
 8x8 tile's row axis + its notch mapping needs the exact NVDLA cube semantics. Bounded: fix the (WIDTH/HEIGHT/
 CHANNEL <-> row/channel) assignment so LINE_NOTCH skips per row. Mechanism runs reliably; row 0 is proof.
 ork_npu_mul_perchan_f16_contig + REGCMD_MUL_F16_NOTCH committed; env ORK_MULC_* (ONES/OPROW/EW/ERDMA/504x).
+
+## 2026-07-14 — KEY REFRAME: the vendor RESHAPES between matmul and Mul (contiguous-read isn't the vendor path)
+Rows-as-HEIGHT (ORK_MULC_HROW) test: still reads CONTIGUOUS (row 0 exact, no per-row skip) — the LINE_NOTCH
+never triggers a skip on raw [M][N], in either WIDTH-row or HEIGHT-row assignment. Root cause found by
+re-reading the task graph: the vendor Mul (task13) reads from 0xffff0a00, but the matmul (task1) wrote to
+0xffff0000 — DIFFERENT buffers. Between them are small enable=0xd regcfg=12 tasks (task5-12) = a RESHAPE.
+So task13's notch (0x5048/0x504c) is calibrated for the RESHAPED intermediate, NOT the raw contiguous matmul
+output. Applying it verbatim to raw contiguous gives a correct base read (row 0 bit-exact) but no row skip.
+
+=> Two clean pure-NPU paths, both vendor-faithful:
+  (A) matmul(contiguous) -> ON-NPU reshape (replicate task5-12) -> the EXISTING bit-exact atom-8 SDP
+      (ork_npu_mul_perchan_f16). This is what the vendor does. The reshape is a small enable=0xd op.
+  (B) derive the raw-contiguous strided read from NVDLA DMA math (LINE/SURF stride + notch for [M][N]),
+      instead of reusing task13's reshaped-layout notch.
+Our current 2-submit (matmul contiguous -> CPU repack to atom-8 -> atom-8 SDP) is functionally the SAME as
+(A) but with the reshape on CPU. So attention-normalize is ALREADY pure-in-compute on NPU; only the small
+repack is on CPU. Pursuing (A) moves that repack on-NPU too. ork_npu_mul_perchan_f16_contig +
+REGCMD_MUL_F16_NOTCH remain as the reference/harness (runs, row-0 bit-exact); the notch needs deriving for
+raw contiguous OR a reshape stage. Bounded, but a fresh sub-task. Env ORK_MULC_* (ONES/HROW/OPROW/EW/ERDMA).

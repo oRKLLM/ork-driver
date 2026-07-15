@@ -5907,7 +5907,14 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
         setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4058,7);
         setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x405c,(uint32_t)(M-1));
         setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x40c0,(uint32_t)(M*16));
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,(uint32_t)(M-1));                   /* WIDTH = M-1 */
+        if(getenv("ORK_MULC_HROW")){                                                    /* rows as HEIGHT lines (LINE_NOTCH acts between heights) */
+            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,0);                             /* RDMA WIDTH = 1 */
+            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5010,(uint32_t)(M-1));               /* RDMA HEIGHT = M-1 (rows) */
+            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4030,0);                             /* DPU WIDTH = 1 */
+            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4034,(uint32_t)(M-1));               /* DPU HEIGHT = M-1 */
+        } else {
+            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,(uint32_t)(M-1));               /* WIDTH = M-1 */
+        }
         /* vendor task13 is PER-ELEMENT (DATA_MODE=2, compiler broadcast [1,1,N]->[M,N]); switch to PER-CHANNEL
          * (DATA_MODE=0) so an [N] scale operand applies per output channel. */
         uint32_t ewcfg=getenv("ORK_MULC_EW")?strtoul(getenv("ORK_MULC_EW"),0,0):0x20800384; /* vendor: EW mul, DATA_MODE=2 (per-element), fp16 */
