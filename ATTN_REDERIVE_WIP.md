@@ -398,3 +398,18 @@ Our current 2-submit (matmul contiguous -> CPU repack to atom-8 -> atom-8 SDP) i
 repack is on CPU. Pursuing (A) moves that repack on-NPU too. ork_npu_mul_perchan_f16_contig +
 REGCMD_MUL_F16_NOTCH remain as the reference/harness (runs, row-0 bit-exact); the notch needs deriving for
 raw contiguous OR a reshape stage. Bounded, but a fresh sub-task. Env ORK_MULC_* (ONES/HROW/OPROW/EW/ERDMA).
+
+## ★★★ 2026-07-14 — CLOSED: per-channel-scaled fp16 matmul on NPU, bit-exact
+The atom-8 matmul-output route is out (fp16 matmul CNA→DPU hangs on the SDP's atom-8 geometry; no vendor
+fp16-matmul-atom-8 reference — the vendor always writes contiguous + reshapes). The CNA-copy reshape (task5,
+13-reg CNA feature-copy contiguous→atom-8) is a genuine new op. So the achievable + vendor-faithful close =
+compose the two BIT-EXACT primitives:
+  ork_npu_mm_perchan_f16(M,K,N,A,B,scale,out) = fp16 matmul (ork_npu_probe_f16_mm_f16out, CONTIGUOUS fp16 out,
+  512/512) -> atom-8 per-channel EW-mul SDP (ork_npu_mul_perchan_f16, takes contiguous in / contiguous out,
+  repacking to atom-8 internally). This IS the vendor structure (plain fp16 matmul -> separate fp16 per-channel
+  SDP). **VALIDATED BIT-EXACT on silicon, 3 shapes: MKN {8,32,64}=512/512, {16,64,128}=2048/2048,
+  {32,128,256}=8192/8192, all rc=0, ~60us.** (tools/mm_perchan_f16_probe.c.)
+The ONLY CPU part is the O(M·N) contiguous↔atom-8 repack inside the SDP; the vendor does it as small on-NPU
+CNA copies (task5-12) — a pure-perf follow-on (removes the repack, not needed for correctness). The
+attention A·V-normalize is CLOSED as a usable, coherent, bit-exact on-NPU op. Harness for the CNA reshape /
+contiguous-read SDP preserved (ork_npu_mul_perchan_f16_contig, REGCMD_MUL_F16_NOTCH, env ORK_MULC_*/ORK_F16_ATOM8).

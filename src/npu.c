@@ -852,14 +852,20 @@ static void set_f16_out_fp16in(uint32_t*rc,int M,int N){
     setr(rc,REGCMD_N,0x1001,0x4088,0x00000000);
     setr(rc,REGCMD_N,0x1001,0x40c4,0x00000000);
     if(getenv("ORK_F16_ATOM8")){
-        /* EXPERIMENTAL / WIP (default OFF): attempt an atom-8 fp16 output to match the SDP's PC16 read. NOT YET
-         * CORRECT — the fp16 output stage resists atom-8 (0x4050=0x248 hangs; M*16 surface strides give 106/512;
-         * fp16 natively writes CONTIGUOUS). The single-submit chain layout bridge (matmul contiguous vs SDP
-         * atom-8) is the open item; see ATTN_REDERIVE_WIP.md. Keep this branch non-hanging for iteration. */
-        (void)M;
-        setr(rc,REGCMD_N,0x1001,0x4038,(((N/8)-1)<<16)|((N/16)-1));   /* atom-8 group stride (asymmetric) */
-        setr(rc,REGCMD_N,0x1001,0x4050,0x00000126);
-        setr(rc,REGCMD_N,0x1001,0x40c0,0x00000040);                   /* 2-byte atom-8 element */
+        /* ATOM-8 fp16 output — geometry taken EXACTLY from the bit-exact atom-8 SDP (REGCMD_MUL_F16 / set_mul_geom):
+         * surface stride M*16, 0x4050 BS_OW_CFG=0x2 (OD_BYPASS, SIZE_E=0 — NOT the contiguous 0x126 or the int16
+         * 0x248 that hung), 0x4038=0. This makes the fp16 matmul emit the PC16 atom-8 layout the SDP reads, so
+         * ork_npu_mul_perchan_f16 can consume it directly (no reshape, no notch). */
+        uint32_t s=(uint32_t)(M*16);
+        setr(rc,REGCMD_N,0x1001,0x4024,s);                            /* DST_SURF_STRIDE = M*16 */
+        setr(rc,REGCMD_N,0x1001,0x4030,(uint32_t)(M-1));
+        setr(rc,REGCMD_N,0x1001,0x4034,0);
+        setr(rc,REGCMD_N,0x1001,0x4038,0);
+        setr(rc,REGCMD_N,0x1001,0x403c,(uint32_t)(((N-1)<<16)|(N-1)));
+        setr(rc,REGCMD_N,0x1001,0x4050,0x00000002);                   /* BS_OW_CFG = 0x2 (atom-8; KEY) */
+        setr(rc,REGCMD_N,0x1001,0x4058,(uint32_t)(N-1));
+        setr(rc,REGCMD_N,0x1001,0x405c,(uint32_t)(M-1));
+        setr(rc,REGCMD_N,0x1001,0x40c0,s);                            /* SURFACE_ADD = M*16 */
     } else {
         (void)M;                                                      /* CONTIGUOUS [M][N] (cap_fp16f16); PROVEN 512/512 standalone */
         setr(rc,REGCMD_N,0x1001,0x4038,(((N/8)-1)<<16)|((N/8)-1));
@@ -5821,6 +5827,23 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
     bdestroy(fd,&W0); bdestroy(fd,&W1);
     #undef RMCUBE
     return ok;
+}
+
+/* PUBLIC per-channel-scaled fp16 matmul, on NPU: out[m][n] = (Σ_k A[m][k]B[k][n]) * scale[n]. Composes the two
+ * bit-exact primitives — the fp16 matmul with fp16 CONTIGUOUS output (ork_npu_probe_f16_mm_f16out, 512/512) and
+ * the atom-8 per-channel EW-mul SDP (ork_npu_mul_perchan_f16, which takes a CONTIGUOUS input and repacks to
+ * atom-8 internally). This is the vendor's own structure (plain fp16 matmul → separate fp16 per-channel SDP);
+ * the contiguous↔atom-8 reshape is the SDP's internal O(M·N) repack (on CPU; the vendor does it as small on-NPU
+ * CNA copies — a follow-on optimization, see ATTN_REDERIVE_WIP.md). A/B/scale/out fp16 bit patterns. 0/ok, <0. */
+int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+                           const uint16_t *scale,uint16_t *out,double *us){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    uint16_t *G=malloc((size_t)M*N*2); if(!G) return -1;
+    int rc=ork_npu_probe_f16_mm_f16out(c,M,K,N,A,B,G);               /* fp16 matmul -> CONTIGUOUS fp16 G (512/512) */
+    if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scale,M,N,(ork_f16*)out,us); /* per-channel scale */
+    free(G);
+    return rc;
 }
 
 /* On-NPU PER-CHANNEL scale (fp16): out[m][n] = a[m][n] * b[n]. b[N] per-channel vector broadcast across all
