@@ -413,3 +413,22 @@ The ONLY CPU part is the O(M·N) contiguous↔atom-8 repack inside the SDP; the 
 CNA copies (task5-12) — a pure-perf follow-on (removes the repack, not needed for correctness). The
 attention A·V-normalize is CLOSED as a usable, coherent, bit-exact on-NPU op. Harness for the CNA reshape /
 contiguous-read SDP preserved (ork_npu_mul_perchan_f16_contig, REGCMD_MUL_F16_NOTCH, env ORK_MULC_*/ORK_F16_ATOM8).
+
+## 2026-07-14 — on-NPU repack: needs a from-scratch CNA copy op (DPU-RDMA can't read contiguous)
+Investigated moving the O(M·N) contiguous↔atom-8 repack (inside ork_npu_mul_perchan_f16) onto the NPU.
+Ground-truth findings:
+- **The DPU RDMA has NO independent SRC line/surf-stride register** (rocket_regs.h: only 0x5040 EW_SURF_STRIDE
+  for the operand, 0x5048 SRC_DMA_CFG.LINE_NOTCH, 0x504c SURF_NOTCH). So the DPU/SDP CANNOT read a raw
+  contiguous [M][N] as atom-8 — the notch is calibrated for the vendor's already-reshaped buffer, not raw
+  contiguous (confirmed earlier: row 0 exact, rows 1+ read next contiguous cols).
+- **The vendor CNA reshape (task5) is a 13-reg CHAINED-DELTA op** — it inherits the pipeline's accumulated
+  register base and uses a compressed identity weight (DCOMP 0x1110). NOT standalone-replicable from 13 regs.
+- The reshape MUST go through the CNA (the activation reader — the ONLY unit with a contiguous line stride,
+  0x107c), as a fp16 passthrough/identity copy: CNA reads contiguous [M][N] -> DPU writes atom-8 (native).
+- Direct fp16-matmul-atom-8 output is out (CNA->DPU hangs on the SDP atom-8 geometry; no vendor ref — the
+  vendor always writes contiguous + reshapes).
+=> Moving the repack on-NPU = a NEW CNA fp16 passthrough-copy op (build the full CNA read-contiguous +
+DPU-atom8-write config from scratch, not the vendor's chained delta). Bounded but a real op build, for a
+NEGLIGIBLE O(M·N) gain (vs the matmul's O(M·K·N)). RECOMMENDATION: bank — the operation is CLOSED bit-exact
+(ork_npu_mm_perchan_f16); the repack is a micro-optimization not worth a new op. Reference preserved for if
+it's ever wanted (task5 decode above; CNA line-stride 0x107c; DPU atom-8 output = set_mul_geom geometry).
