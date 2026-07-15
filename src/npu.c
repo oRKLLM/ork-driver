@@ -5266,8 +5266,7 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     if(rowpitch!=K){ for(int j=0;j<M*rowpitch;j++)ad[j]=0xdead; for(int m=0;m<M;m++)for(int k=0;k<K;k++)ad[(size_t)m*rowpitch+k]=A[(size_t)m*K+k]; }
     else for(int j=0;j<M*K;j++)ad[j]=A[j];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (unwarmed synth writes zeros) */
-    act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset; keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
     synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
@@ -5316,8 +5315,7 @@ int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,
     { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=*(const ork_f16*)&scale[n]; }   /* per-channel scale, CONTIGUOUS [N] fp16 */
     uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline */
-    act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset) */
     uint32_t base[REGCMD_N], rc[REGCMD_I8_EW_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
     synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
@@ -5879,7 +5877,7 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     { uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }    /* activation1 = A (only host->dev copy of an INPUT) */
     bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&W2,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE); act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* layer owns the reset (keep-warm-aware; no redundant manual reset) */
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu;
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
