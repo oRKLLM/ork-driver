@@ -5249,6 +5249,56 @@ int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     return ok;
 }
 
+/* DOORBELL PIPELINE PROFILER (Tier 11): measure the wall of `iters` SERIAL int8 matmuls, BLOCKING vs
+ * NONBLOCK + DRAM-doorbell busy-poll. Blocking = submit waits (~130µs floor + compute)/op. Nonblock = submit
+ * returns ~5µs, CPU busy-polls the output SENTINEL (DC CIVAC invalidate + read) until the NPU overwrites it =
+ * op done, no sleep/wake. Same op (all-ones int8 -> every output = K) both ways; validates output == K. Calls
+ * the raw ioctl directly with explicit flags (bypasses the env/sleep wrapper). 0/ok, <0 err. */
+int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_us,double *nb_us,int *ok_block,int *ok_nb){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    memset(W.cpu,1,(size_t)K*N);                                  /* int8 weight all-1 (layout-agnostic) */
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}   /* int32 out */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);  /* act all-1 -> out=K */
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.task_number=1; sub.task_obj_addr=c->task.obj;
+    sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=4000; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    volatile int32_t *dbell=(volatile int32_t*)((char*)O.cpu + (size_t)(M*N-1)*4);  /* last output int32 = doorbell */
+    const int32_t SENT=0x7ffffff;                                  /* matmul (all-1, K) can't produce this */
+    volatile int32_t *o0=(volatile int32_t*)O.cpu, *ol=(volatile int32_t*)dbell;  /* check endpoints */
+    /* ---- BLOCKING: flags=0x5 via the proper submit path (domain/bookkeeping) ---- */
+    *o0=SENT; *ol=SENT; __asm__ volatile("dc cvac,%0"::"r"(o0):"memory"); __asm__ volatile("dc cvac,%0"::"r"(ol):"memory"); __asm__ volatile("dsb ish":::"memory"); /* seed endpoints (like the doorbell) so CIVAC can read fresh */
+    sub.flags=0x5; rknpu_submit_ioctl(fd,&sub,-1); rknpu_submit_ioctl(fd,&sub,-1);  /* warm (mode + first-cold) */
+    double t0=ork_now_us();
+    for(int i=0;i<iters;i++){ sub.flags=0x5; if(rknpu_submit_ioctl(fd,&sub,-1)){*ok_block=0;} }
+    if(block_us)*block_us=(ork_now_us()-t0)/iters;
+    { for(long s=0;s<2000000L && (*o0==SENT||*ol==SENT);s++){ __asm__ volatile("dc civac,%0"::"r"(o0):"memory"); __asm__ volatile("dc civac,%0"::"r"(ol):"memory"); __asm__ volatile("dsb ish":::"memory"); }
+      *ok_block=(*o0==K && *ol==K);
+      if(getenv("ORK_DBELL_DBG"))fprintf(stderr,"[dbg-block] o[0]=%d o[last]=%d K=%d\n",*o0,*ol,K); }
+    /* ---- NONBLOCK + doorbell busy-poll: flags=0x7 (adds NONBLOCK 0x2), submit returns ~5µs, spin on the sentinel ---- */
+    t0=ork_now_us(); int polled_ok=1;
+    for(int i=0;i<iters;i++){
+        *dbell=SENT; __asm__ volatile("dc cvac, %0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); /* seed sentinel in DRAM */
+        sub.flags=0x7;                                             /* PC|PINGPONG|NONBLOCK */
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ polled_ok=0; break; }
+        long s=0; for(;s<20000000L;s++){ __asm__ volatile("dc civac, %0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
+            if(*dbell!=SENT) break; }                              /* busy-poll: NPU overwrote the doorbell = done */
+        if(s>=20000000L){ polled_ok=0; break; }                   /* poll timed out */
+    }
+    if(nb_us)*nb_us=(ork_now_us()-t0)/iters;
+    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    { int32_t*o=O.cpu; *ok_nb=(polled_ok && o[0]==K && o[M*N-1]==K);
+      if(getenv("ORK_DBELL_DBG"))fprintf(stderr,"[dbg-nb] o[0]=%d o[last]=%d K=%d polled_ok=%d\n",o[0],o[M*N-1],K,polled_ok); }
+    bdestroy(fd,&W); bdestroy(fd,&O);
+    return 0;
+}
+
 /* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via synth(). Weight tile [NT][KT][16][32]
  * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
  * bit patterns (uint16). ork_f16_fuzz overrides apply inside synth(). 0/ok -1 wedged -2 dims. */

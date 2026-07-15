@@ -572,3 +572,6 @@ i16out_probe: tools/i16out_probe.c $(CORE)
 
 perchan_bench: tools/perchan_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+doorbell_prof: tools/doorbell_prof.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

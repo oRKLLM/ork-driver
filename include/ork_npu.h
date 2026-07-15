@@ -599,6 +599,9 @@ int          ork_npu_mul_perchan_i8(ork_npu *ctx, const signed char *a, const si
 int          ork_npu_mul_perchan_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
 /* int16 per-channel scale: out[m][n]=clamp_i16(a[m][n]*b[n]*mult>>shift), b[N] broadcast. N%8. Chain intermediate. */
 int          ork_npu_mul_perchan_i16(ork_npu *ctx, const short *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
+/* Tier 11 doorbell pipeline profiler: N serial int8 matmuls, BLOCKING vs NONBLOCK + DRAM-doorbell busy-poll.
+ * Fills per-op us for each + a correctness flag each. See Optimization-Roadmap Tier 11. */
+int          ork_npu_doorbell_prof(ork_npu *ctx, int M, int K, int N, int iters, double *block_us, double *nb_us, int *ok_block, int *ok_nb);
 /* RE (WIP): full-chain replay of vendor gemm+reshape (task0-10); returns gemm output (contiguous) + reshape
  * output (atom-8) so caller verifies reshape_out==atom8(gemm_out). Loads gemm_mul_image.bin. See RESHAPE_WIP.md. */
 int          ork_npu_replay_reshape_f16(ork_npu *ctx, unsigned short *gemm_raw, int gemm_words, unsigned short *reshape_raw, int reshape_words, double *us);
