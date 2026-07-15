@@ -5197,6 +5197,12 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1; }
+    else if(getenv("ORK_MM_DUMPOUT")){ /* partial-write signature: how far did the WDMA get before the stall? */
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); int16_t*oc=O.cpu; long last=-1; int tot=0,rows=0;
+        for(long i=0;i<(long)M*N;i++) if(oc[i]){ tot++; if(i>last)last=i; }
+        for(int m=0;m<M;m++){ int rnz=0; for(int n=0;n<N;n++) if(oc[(size_t)m*N+n])rnz++; if(rnz)rows++; }
+        fprintf(stderr,"[dumpout] M=%d N=%d: nonzero=%d/%d  rows-with-data=%d/%d  last-nz-elem=%ld (row %ld/%d)\n",
+                M,N,tot,M*N,rows,M,last,last<0?-1:last/N,M); }
     bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
