@@ -590,3 +590,6 @@ split_expert_probe: tools/split_expert_probe.c $(CORE)
 # per-op NPU-vs-CPU profiler (NEON sdot needs +dotprod).
 op_profile: tools/op_profile.c $(CORE)
 	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+
+qkv_chain_probe: tools/qkv_chain_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
