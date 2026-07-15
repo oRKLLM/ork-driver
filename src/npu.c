@@ -5865,6 +5865,64 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
 /* On-NPU PER-CHANNEL scale (int16): out[m][n] = clamp_i16(a[m][n]*b[n]*mult>>shift). b[N] per-channel
  * broadcast (ERDMA_DATA_MODE=0, 0x5034=0x08 for 2-byte). int16 chain-intermediate variant of the per-channel
  * scale (the M4 attention chain uses int16 between matmul and SDP, like the mm->silu chain). N%8. 0/ok, <0. */
+/* ork_npu_mul_perchan_f16_contig — per-channel fp16 MUL that reads a CONTIGUOUS [M][N] fp16 input (the native
+ * fp16 matmul output layout), via the vendor task13 config (FLYING_MODE + NOTCH addressing, EW_CFG=0x20800384,
+ * ERDMA=0x8000000a). This is the SDP that matches the fp16 matmul's contiguous output — closing the chain / a
+ * pure-NPU 2-submit without the CPU atom-8 repack. a=[M][N] contiguous fp16, b=[N] scale, out=[M][N]. Captured
+ * at M=8,N=64; notch is verbatim for N=64. ORK_MULC_* env for on-board geometry RE. 0/ok,-1,-2,-3. */
+int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>64||N<8||N>8192||(N&7)) return -2;
+    const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
+    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
+    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,4096);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) ((uint16_t*)A.cpu)[(size_t)m*N+n]=a16[(size_t)m*N+n];  /* CONTIGUOUS in */
+    for(int n=0;n<N;n++) ((uint16_t*)B.cpu)[n]=b16[n];                                              /* scale [N] contiguous */
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    /* TILED per the vendor (task13): one SDP task per 8-channel group (CHANNEL=7). Each tile reads its 8
+     * contiguous columns of A via NOTCH (LINE skip = N-8 for the row stride) and writes an 8xM atom block to
+     * its slot in O. Notch (0x5048/0x504c) is verbatim for N=64; other N derives LINE_NOTCH=N-8. */
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    int NT=N/8; double t0=ork_now_us(); int ok=0;
+    for(int t=0; t<NT && ok==0; t++){
+        uint32_t rc[REGCMD_MUL_F16_NOTCH_N]; memcpy(rc,REGCMD_MUL_F16_NOTCH,sizeof rc);
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5018,(uint32_t)(A.dma+(size_t)t*8*2));   /* input cols 8t..8t+7 */
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5038,(uint32_t)(B.dma+(size_t)t*8*2));   /* scale for those 8 chans */
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4020,(uint32_t)(O.dma+(size_t)t*M*16));  /* tile slot: 8xM atom block */
+        /* COMPACT atom-8 output for the 8-channel tile (override the vendor's downstream 0x400 stride) so the
+         * readback O+t*M*16 + m*16 + j*2 matches (1 surface, M rows). */
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4024,(uint32_t)(M*16));                  /* DST_SURF_STRIDE */
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4030,(uint32_t)(M-1));
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4034,0);
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x403c,(uint32_t)((7<<16)|7));             /* 8 channels */
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4058,7);
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x405c,(uint32_t)(M-1));
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x40c0,(uint32_t)(M*16));
+        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,(uint32_t)(M-1));                   /* WIDTH = M-1 */
+        if(N!=64){ setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5048,(uint32_t)((N-8)<<18)); } /* LINE_NOTCH for other N (verbatim @64) */
+        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+        sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
+        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+    }
+    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+        /* read back: tile t's slot O+t*M*16, channel j (0..7) of row m at atom offset m*16 + j*2 */
+        for(int t=0;t<NT;t++)for(int m=0;m<M;m++)for(int j=0;j<8;j++)
+            o16[(size_t)m*N + t*8 + j]=*(uint16_t*)((char*)O.cpu + (size_t)t*M*16 + (size_t)m*16 + j*2);
+        if(getenv("ORK_MULC_RAW")){ uint16_t*o=(uint16_t*)O.cpu; int nz=0,ne=(int)((size_t)NT*M*16/2); for(int i=0;i<ne;i++) if(o[i])nz++;
+            fprintf(stderr,"[mulc_raw] nonzero=%d/%d first16:",nz,ne); for(int i=0;i<16;i++) fprintf(stderr," %.3g",(double)*(ork_f16*)&o[i]); fprintf(stderr,"\n"); }
+    }
+    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    return ok;
+}
+
 int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;

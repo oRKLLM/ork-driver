@@ -346,3 +346,18 @@ path. ABANDON fused; the 2-submit path is vendor-correct.
 either 8-channel-tiled (N/8 SDP tasks like the vendor) or a single full-N cube if the mode allows. That
 replaces the atom-8 SDP and closes the chain / makes the 2-submit path pure-NPU (no CPU round-trip). NOT a
 guess anymore — the exact vendor config is captured. Board-safe: notch math + one shape first.
+
+## 2026-07-14 (cont.) — NOTCH-addressed contiguous SDP: BUILT, runs, layout-partial
+Templatized the vendor task13 as REGCMD_MUL_F16_NOTCH (src/regcmd_ewmul.h) and built
+ork_npu_mul_perchan_f16_contig (+ tools/mul_perchan_f16_contig_probe.c): reads a CONTIGUOUS [M][N] fp16
+input (the native matmul output) via FLYING_MODE + NOTCH, per-channel-scales, tiled by 8-channel groups
+(N/8 SDP tasks, verbatim notch for N=64). RESULT: **RUNS with NO hang** (the vendor config is correct) and
+COMPUTES (297/512 nonzero, 119/512 exact) — up from 38 nonzero for the full-N single-task attempt, so the
+8-channel tiling is the right structure. Remaining: the per-tile INPUT-notch row alignment + OUTPUT atom
+readback are off (row 0 of each tile reads back zero; values are shifted ~one row). The output-geometry
+override (compact atom-8) had no effect on the raw layout => the tile's row/surface addressing (0x5048
+LINE_NOTCH init + 0x4024/0x504c) needs exact derivation from task13, not the set_mul_geom atom.
+NEXT: decode task13's SRC_DMA_CFG (0x5048=0x01c00000) + SURF_NOTCH (0x504c=0x380) bit-fields precisely
+(LINE_NOTCH vs an initial line offset), and match the tile output layout to the readback. Bounded layout RE.
+Committed WIP (env ORK_MULC_*). The mechanism (vendor fp16 contiguous-read per-channel mul) is proven to
+run; only the exact tile addressing remains for bit-exact.

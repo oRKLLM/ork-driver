@@ -548,3 +548,6 @@ f16_mm_f16out_probe: tools/f16_mm_f16out_probe.c $(CORE)
 
 mm_perchan_f16_fused_probe: tools/mm_perchan_f16_fused_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+mul_perchan_f16_contig_probe: tools/mul_perchan_f16_contig_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

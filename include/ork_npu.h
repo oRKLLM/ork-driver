@@ -706,6 +706,8 @@ int          ork_npu_probe_f16_mm_f16out(ork_npu *ctx, int M, int K, int N,
                                  const unsigned short *A, const unsigned short *B, unsigned short *out);
 int          ork_npu_mm_perchan_f16_fused(ork_npu *ctx, int M, int K, int N, const unsigned short *A,
                                  const unsigned short *B, const unsigned short *scale, unsigned short *out);
+int          ork_npu_mul_perchan_f16_contig(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N,
+                                 ork_f16 *out, double *us);
 
 /* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
 int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,
