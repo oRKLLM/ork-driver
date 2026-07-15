@@ -316,3 +316,33 @@ Took on BS-fold (per-channel scale in the matmul's own output stage → one task
 RE item). The **2-submit on-NPU path is complete and coherent** (fp16 matmul fp16-out [512/512 proven] +
 separate per-channel SDP) and delivers attention-normalize fully on-NPU today. Single-submit is the
 throughput-neutral optimization still open.
+
+## ★★ 2026-07-14 — VENDOR fp16 matmul->per-channel-mul CAPTURE (decisive; option-a follow-through)
+Cleared .239 access (use IP 10.3.0.239, NOT orthanc.local — that resolves to an untrusted IPv6). Built
+gemm_mul_f16.rknn on the Colima VM (tools/re/models/build_gemm_mul.py: Gemm * [1,1,N] per-channel input, fp16,
+no-quant, OpFusing ran), captured on board (rknn_sdk/rknpu_dump_full.so, RKDUMP_WORDS=400), decoded with
+decode_rocket.py. Artifacts: tools/re/captures/gemm_mul_f16*.{dump,words}.
+
+**DECISIVE: the vendor does NOT fuse a fp16 matmul with a per-channel scale.** The matmul task (enable=0xd,
+e.g. task1) is a PLAIN fp16 matmul — BS, BN, EW ALL bypassed (0x53/0x53/0x383), no 0x50xx lane — writing
+CONTIGUOUS fp16 (0x4024=0x10, 0x40c0=0x20, 0x4050=0x126: EXACTLY our proven 512/512 config). The per-channel
+scale is a SEPARATE SDP task (enable=0x18). => our fused single-task ork_npu_mm_perchan_f16_fused attempts a
+datapath the vendor never uses (explains the hang). The vendor's method IS matmul->separate-SDP = our 2-submit
+path. ABANDON fused; the 2-submit path is vendor-correct.
+
+**The vendor fp16 per-channel-mul SDP (task13) — the config we were guessing:**
+- 0x4010 DATA_FORMAT = 0x48000002 (all fp16); 0x4084 = 0x00010001 (FP32TOFP16_EN).
+- 0x4070 EW_CFG = **0x20800384** (EW_OP_TYPE=1 mul, EW_DATA_MODE=2, EDATA_SIZE=2).
+- 0x5034 ERDMA = **0x8000000a** (ERDMA_DATA_MODE=2, DATA_SIZE=2 fp16, OV4K_BYPASS).
+- 0x5044 = **0x00017849** (FLYING_MODE=1, MRDMA_FP16TOFP32_EN=1, IN/PROC fp16) — reads the matmul output
+  IN-PIPELINE; 0x5040 EW_SURF_STRIDE=0x10; 0x5038 = scale operand.
+- Reads the CONTIGUOUS matmul output via NOTCH addressing: 0x5048 SRC_DMA_CFG=0x01c00000 (LINE_NOTCH),
+  0x504c SURF_NOTCH=0x380 — and is TILED by 8-channel groups (cube WIDTH=M-1=7, CHANNEL=7, one atom/task;
+  N=64 => 8 Mul tasks). So the contiguous read is done via FLYING_MODE + NOTCH, not the atom-8 surf-stride
+  our conv-derived REGCMD_MUL_F16_CHAIN used (the mismatch = the chain's 236/512).
+
+**CLOSE PATH (reference-driven, next session):** build the chained/2nd SDP from task13 — fp16 EW-mul, ERDMA
+0x8000000a, FEATURE_MODE 0x17849 (flying + fp16), reading the contiguous matmul G via NOTCH addressing,
+either 8-channel-tiled (N/8 SDP tasks like the vendor) or a single full-N cube if the mode allows. That
+replaces the atom-8 SDP and closes the chain / makes the 2-submit path pure-NPU (no CPU round-trip). NOT a
+guess anymore — the exact vendor config is captured. Board-safe: notch math + one shape first.
