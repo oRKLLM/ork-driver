@@ -599,6 +599,9 @@ int          ork_npu_mul_perchan_i8(ork_npu *ctx, const signed char *a, const si
 int          ork_npu_mul_perchan_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
 /* int16 per-channel scale: out[m][n]=clamp_i16(a[m][n]*b[n]*mult>>shift), b[N] broadcast. N%8. Chain intermediate. */
 int          ork_npu_mul_perchan_i16(ork_npu *ctx, const short *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
+/* LOOPBACK Pass-2: standalone SDP reads INT32 accumulator from DRAM, per-channel scale + requant -> int16.
+ * out[m][n]=clamp_i16(a_i32[m][n]*b[n]*mult>>shift). Routes around the broken CNA->DPU requant-WDMA. */
+int          ork_npu_requant_perchan_i32(ork_npu *ctx, const int *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
 /* CHAIN: int8-matmul(int16-out) -> per-channel-scale in ONE PC-chain (A·V->normalize building block for the
  * single-submit attention chain). out=clamp_i16(requant(A[M,K]xB[K,N],m1,s1)*scale[n]*m2>>s2). K%32,N%32,M<=64. */
 int          ork_npu_chain_mm_perchan_i16(ork_npu *ctx, int M, int K, int N, const signed char *A, const signed char *B,

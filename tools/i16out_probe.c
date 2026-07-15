@@ -3,9 +3,10 @@
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>
-int main(void){
+int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
     int M=8,K=32,N=64;
+    if(argc>=4){ M=atoi(argv[1]); K=atoi(argv[2]); N=atoi(argv[3]); }
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); short*out=malloc((size_t)M*N*2);
     unsigned s=5;
     for(int i=0;i<M*K;i++){s=s*1103515245+12345;A[i]=(int8_t)((s>>16)&1);}
