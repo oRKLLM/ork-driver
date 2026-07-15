@@ -11,9 +11,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 static double siluf(double x){ return x/(1.0+exp(-x)); }
+static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 
-int main(void){
+int main(int argc, char**argv){
+    int ITER=argc>1?atoi(argv[1]):50;
     setvbuf(stdout,NULL,_IONBF,0);
     ork_npu *c=ork_npu_init(); if(!c){ printf("no board\n"); return 0; }
     const int M=8, K=512, N=64;   /* run_chain_i8 envelope: K%512==0 && K<=4096 */
@@ -73,6 +76,9 @@ int main(void){
         };
         double is = 3.0/32.0, os = siluf(3.0)/60.0;
         int r=ork_mm_run_chain_i8_ffn(c,5,t,ops,is,os);
+        if(r==0){ double t0=now_us(); for(int i=0;i<ITER;i++) ork_mm_run_chain_i8_ffn(c,5,t,ops,is,os);
+            double ms=(now_us()-t0)/ITER/1000.0;
+            printf("  ★ FFN5 chain per-submit: %.3f ms (gate+silu+up+glu+down in ONE submit) — vs standalone silu ~106ms/call\n", ms); }
         printf("chain_gu_silu[FFN5]: [gate -> silu -> up -> glu -> down] ONE submit  (M=%d K=%d N=%d)\n",Mf,Kf,Nf);
         printf("  rc=%d\n", r);
         if(r==0){ signed char *cg=(signed char*)Cg,*cs=(signed char*)Cs,*cu=(signed char*)Cu,*ch=(signed char*)Ch;
