@@ -586,3 +586,7 @@ split_matmul_probe: tools/split_matmul_probe.c $(CORE)
 # MoE expert-split CPU+NPU probe (NEON sdot needs +dotprod).
 split_expert_probe: tools/split_expert_probe.c $(CORE)
 	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+
+# per-op NPU-vs-CPU profiler (NEON sdot needs +dotprod).
+op_profile: tools/op_profile.c $(CORE)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
