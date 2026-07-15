@@ -593,3 +593,7 @@ op_profile: tools/op_profile.c $(CORE)
 
 qkv_chain_probe: tools/qkv_chain_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# CPU-only int4-vs-int8 memory-bound GEMV (no NPU). NEON +dotprod.
+cpu_i4_vs_i8: tools/cpu_i4_vs_i8.c
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< -lpthread
