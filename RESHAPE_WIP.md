@@ -176,6 +176,20 @@ before the permutation formula is trustworthy.
    is effectively the "build the op" step (matmul→reshape→SDP integration), not a standalone derive.
 3. Generalize (M,N) + the 64-entry weight permutation, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
 
+## ★ TERMINAL FINDING (2026-07-15): the vendor reshape is NOT SEPARABLE + the end-to-end already works
+- **task2 (reshape stage 1) alone + GINJ distinct input → 139/512 map, scattered** (ORK_RESHAPE_ROUT=0x3280
+  reads task2's output). So task2 does NOT value-preservingly process plain-contiguous data — the vendor
+  reshape is coupled to the GEMM's output tiling and **cannot be extracted as a reusable standalone op** for our
+  own fp16 matmul. Combined with the from-scratch route being blocked (matmul min-output-16 vs fp16 8-channel
+  atom), **an on-NPU reshape that replaces the CPU repack is not viable by either route.**
+- **BUT the end-to-end matmul→(contiguous→atom-8)→SDP EXISTS and is CPU-VALIDATED bit-exact** (re-confirmed
+  on-board, 3 shapes each): `ork_npu_mm_perchan_f16` (matmul → tiny CPU repack → atom-8 SDP, O(M·N),
+  512/2048/8192 exact) and `ork_npu_mm_perchan_f16_diag` (matmul → diagonal matmul, PURE-NPU O(M·N²),
+  512/2048/8192 exact). The only non-NPU part of the SDP-path is the O(M·N) repack; the diagonal is fully NPU.
+- **Net:** the reshape RE was scientifically productive (weight solved, execution unlocked, dataflow mapped,
+  clean completion of the vendor chain) but the reshape is not separable, so the CPU repack (or the diagonal)
+  stays. The attention-normalize capability is DELIVERED by the two validated end-to-ends above.
+
 ## WHAT'S SOLID (this campaign)
 Weight solved (64-entry all-1.0 perm); execution unlocked (skip SDP task0); dataflow largely mapped
 (GEMM→task2→8 groups); **CLEAN COMPLETION of the full task1-10 chain (rc=0, ~75µs)** via all-deltas-promoted-

@@ -6223,7 +6223,8 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
     else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(gemm_raw){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<gemm_words;i++)gemm_raw[i]=g[i]; }       /* 0xffff0000 */
-    if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+0x3680); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; } /* 0xffff0680 = atom-8 base (8 groups task3-10) */
+    uint32_t roff=0x3680; { const char*e=getenv("ORK_RESHAPE_ROUT"); if(e)roff=(uint32_t)strtoul(e,0,0); } /* reshape-out read offset (0x3680 atom-8 base; 0x3280=task2 out) */
+    if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+roff); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; }
     bdestroy(fd,&BIG);
     #undef TK
     return ok;
