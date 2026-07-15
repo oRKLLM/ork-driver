@@ -31,6 +31,7 @@
 #include "regcmd_ewmul.h"
 #include "regcmd_softmax_f16.h"   /* RE: captured vendor forward-softmax 9-task graph (replay) */
 #include "regcmd_softmax_wt.h"    /* RE: its matmul weight blobs (verbatim) */
+#include "regcmd_reshape.h"       /* RE: vendor fp16 contiguous->atom-8 reshape base (task4) — WIP */
 #include "ork_npu.h"
 #include "soc.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -6135,6 +6136,107 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
     bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
     #undef PC16
+    return ok;
+}
+
+/* RE (WIP, RESHAPE_WIP.md): FULL-CHAIN REPLAY of the vendor gemm+reshape (task0-10) to validate the reshape
+ * IN CONTEXT (task4 is a mid-chain op needing task1-3's pipeline state — standalone it saturates). Loads the
+ * captured vendor IOVA image (gemm_mul_image.bin, 77824B, IB=0xfffed000), blanket single-delta rebases every
+ * in-image reference (data/weights/chain-0x0010) to our buffer, replays task0..task10 as ONE hardware chain,
+ * then hands back the GEMM output (@0xffff0000, contiguous [M][N]) and the RESHAPE output (@0xffff0a00, atom-8)
+ * so the caller can verify reshape_out == atom8(gemm_out) IN-PLACE — no weight extraction / CPU ref needed.
+ * M8/N64 captured geometry. Env ORK_RESHAPE_IMG=path. 0/ok, <0 err. */
+int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint16_t *reshape_raw,int reshape_words,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    const uint32_t IB=0xfffed000u; const size_t ISZ=0x13000;   /* vendor image span */
+    /* task0..21: {imgoff, enable, regcfg_amount} — the FULL first forward pass from the capture */
+    static const struct { uint32_t off; uint32_t en; uint32_t amt; } TK[22]={
+        {0xd8c0,0x18,69},{0xdb40,0xd,108},{0xdec0,0xd,108},{0xe240,0xd,108},{0xe5c0,0xd,108},
+        {0xe940,0xd,13},{0xea00,0xd,12},{0xea80,0xd,12},{0xeb00,0xd,12},{0xeb80,0xd,12},{0xec00,0xd,12},
+        {0xec80,0x18,69},{0xef00,0x18,69},{0xf180,0x18,69},{0xf400,0x18,25},{0xf500,0x18,9},{0xf580,0x18,9},
+        {0xf600,0x18,9},{0xf680,0x18,9},{0xf700,0x18,9},{0xf780,0x18,9},{0xf800,0x18,69}};
+    int NT=22; { const char*e=getenv("ORK_RESHAPE_NT"); if(e){int v=atoi(e); if(v>=1&&v<=22)NT=v;} }
+    const char *path=getenv("ORK_RESHAPE_IMG"); if(!path)path="gemm_mul_image.bin";
+    FILE *f=fopen(path,"rb"); if(!f) return -2;
+    struct buf BIG=bcreate(fd,ISZ,0x403,-1); if(!BIG.cpu){fclose(f);return -2;}
+    memset(BIG.cpu,0,ISZ);
+    size_t rd=fread(BIG.cpu,1,ISZ,f); fclose(f); if(rd<ISZ){ bdestroy(fd,&BIG); return -2; }
+    /* inject DISTINCT input (@0xfffef000, imgoff 0x2000) so gemm_out is non-degenerate -> derivable perm */
+    if(getenv("ORK_RESHAPE_INJECT")){ uint16_t*x=(uint16_t*)((char*)BIG.cpu+0x2000);
+        for(int i=0;i<512;i++){ float v=(float)((i%37)-8)*0.25f; __fp16 h=(__fp16)v; memcpy(&x[i],&h,2); } }
+    uint32_t delta=(uint32_t)BIG.dma - IB;
+    /* blanket single-delta rebase of each task's regcmd (data addrs, weights, chain 0x0010 next-regcmd) */
+    for(int j=0;j<NT;j++){
+        uint32_t *rc=(uint32_t*)((char*)BIG.cpu + TK[j].off);
+        int nw=(int)TK[j].amt*2+16;   /* regcfg entries*2 + trailer, matches capture layout */
+        for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16; uint32_t v=((rc[k+1]&0xffff)<<16)|(rc[k]>>16);
+            if(v>=IB && v<IB+ISZ){ uint32_t nv=v+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } }
+        if(j==NT-1){ /* TERMINATE the chain at the last task: null its 0x0010(next-regcmd)/0x0014(next-amount) */
+            for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16;
+                if(d==0x0101 && (a==0x0010||a==0x0014)){ rc[k]=0; rc[k+1]=0; } } }
+    }
+    /* ZERO the gemm-out (0x3000) + reshape-out (0x3a00) regions so we can tell FRESH computation from the
+     * image's BAKED capture data (if they're written after submit -> tasks actually executed). */
+    if(getenv("ORK_RESHAPE_ZERO")){ memset((char*)BIG.cpu+0x3000,0,0x400); memset((char*)BIG.cpu+0x3a00,0,0x400); } /* precise: gemm_out + reshape_out only (0x3480 task0-out untouched) */
+    bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*NT);
+    for(int j=0;j<NT;j++){ tk[j].enable_mask=TK[j].en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
+        tk[j].regcfg_amount=TK[j].amt; tk[j].regcmd_addr=(uint32_t)BIG.dma + TK[j].off; }
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
+    sub.flags=flg; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
+    sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT}; sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(gemm_raw){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<gemm_words;i++)gemm_raw[i]=g[i]; }       /* 0xffff0000 */
+    if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+0x3a00); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; } /* 0xffff0a00 */
+    bdestroy(fd,&BIG);
+    return ok;
+}
+
+/* RE PROBE (WIP, RESHAPE_WIP.md): submit the vendor fp16 contiguous->atom-8 RESHAPE base op (task4,
+ * REGCMD_RESHAPE_F16) with a CONSTRUCTED permutation weight (64 all-1.0 entries = the captured N=64 pattern)
+ * + our own contiguous [M][N] fp16 input, standalone (task_number=1, enable=0xd). Reads the output buffer RAW
+ * so the caller can compare it to the atom-8 layout PCH16(m,n)=(n/8)*(M*16)+m*16+(n%8)*2. N=64 only (the
+ * weight pattern + geometry are the captured M=8/N=64 op). Empirical step: learn what ONE reshape op does
+ * (task4 is one M-tile of the vendor's M-tiled reshape) before chaining. 0/ok, <0 err. */
+int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_t *out_raw,int out_words,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(N!=64||M<1||M>8) return -2;   /* WIP: captured pattern/geometry is M=8,N=64 */
+    static const int WPOS[64]={0,65,136,201,272,337,408,473,544,609,680,745,816,881,952,1017,1026,1091,1162,
+        1227,1298,1363,1434,1499,1570,1635,1706,1771,1842,1907,1978,2043,2052,2117,2188,2253,2324,2389,2460,
+        2525,2596,2661,2732,2797,2868,2933,3004,3069,3078,3143,3214,3279,3350,3415,3486,3551,3622,3687,3758,
+        3823,3894,3959,4030,4095};
+    size_t isz=(size_t)M*N*2; if(isz<4096)isz=4096;
+    size_t osz=(size_t)M*N*2*2; if(osz<8192)osz=8192;   /* generous output room */
+    struct buf In=bcreate(fd,isz,0x403,-1), W=bcreate(fd,8192,0x403,-1), O=bcreate(fd,osz,0x403,-1);
+    if(!In.cpu||!W.cpu||!O.cpu){ bdestroy(fd,&In);bdestroy(fd,&W);bdestroy(fd,&O); return -2; }
+    memset(In.cpu,0,isz); memset(W.cpu,0,8192); memset(O.cpu,0,osz);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) ((uint16_t*)In.cpu)[(size_t)m*N+n]=src[(size_t)m*N+n];
+    for(int i=0;i<64;i++) ((uint16_t*)W.cpu)[WPOS[i]]=0x3c00;   /* fp16 1.0 permutation (channel reorder) */
+    bsync(fd,&In,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
+    uint32_t rc[REGCMD_RESHAPE_F16_N]; memcpy(rc,REGCMD_RESHAPE_F16,sizeof rc);
+    setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1070,(uint32_t)In.dma);    /* input base (CNA activation) */
+    setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1110,(uint32_t)W.dma);     /* weight base (permutation) */
+    setr(rc,REGCMD_RESHAPE_F16_N,0x1001,0x4020,(uint32_t)O.dma);    /* output base (DPU) */
+    { const char*e;   /* RE: reconcile the reshape read geometry to OUR contiguous [M][N] input pitch */
+      if((e=getenv("ORK_RSH_107C"))) setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x107c,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_RSH_1080"))) setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1080,(uint32_t)strtoul(e,0,0)); }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    else { bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }   /* coherent buffer: read partial write on fail too */
+    if(out_raw){ int w=(int)(osz/2); if(w>out_words)w=out_words; for(int i=0;i<w;i++) out_raw[i]=((uint16_t*)O.cpu)[i]; }
+    bdestroy(fd,&In);bdestroy(fd,&W);bdestroy(fd,&O);
     return ok;
 }
 

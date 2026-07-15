@@ -599,6 +599,12 @@ int          ork_npu_mul_perchan_i8(ork_npu *ctx, const signed char *a, const si
 int          ork_npu_mul_perchan_f16(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N, ork_f16 *out, double *us);
 /* int16 per-channel scale: out[m][n]=clamp_i16(a[m][n]*b[n]*mult>>shift), b[N] broadcast. N%8. Chain intermediate. */
 int          ork_npu_mul_perchan_i16(ork_npu *ctx, const short *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
+/* RE (WIP): full-chain replay of vendor gemm+reshape (task0-10); returns gemm output (contiguous) + reshape
+ * output (atom-8) so caller verifies reshape_out==atom8(gemm_out). Loads gemm_mul_image.bin. See RESHAPE_WIP.md. */
+int          ork_npu_replay_reshape_f16(ork_npu *ctx, unsigned short *gemm_raw, int gemm_words, unsigned short *reshape_raw, int reshape_words, double *us);
+/* RE (WIP): vendor fp16 contiguous->atom-8 RESHAPE base op (task4) with a constructed permutation weight.
+ * Reads the output RAW for layout inspection. N=64/M<=8 only (captured geometry). See RESHAPE_WIP.md. */
+int          ork_npu_reshape_probe_f16(ork_npu *ctx, int M, int N, const unsigned short *src, unsigned short *out_raw, int out_words, double *us);
 /* LOOPBACK Pass-2: standalone SDP reads INT32 accumulator from DRAM, per-channel scale + requant -> int16.
  * out[m][n]=clamp_i16(a_i32[m][n]*b[n]*mult>>shift). Routes around the broken CNA->DPU requant-WDMA. */
 int          ork_npu_requant_perchan_i32(ork_npu *ctx, const int *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
