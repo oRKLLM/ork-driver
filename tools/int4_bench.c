@@ -69,22 +69,22 @@ static void pc_i8(ork_npu*ctx,int M,int K,int N,int iters,double*ms){
     ork_w_free(w); free(Bq);free(Aq);free(Ci);
 }
 
+/* GUARDED ISOLATION: run ONE path on ONE shape so a wedge can be attributed + recovered.
+ *   ./int4_bench <iters> <mode> [M K N G]   mode: 0=int8  1=int4-perchan  2=int4-grouped */
 int main(int argc,char**argv){
-    int iters=argc>1?atoi(argv[1]):30;
+    int iters=argc>1?atoi(argv[1]):5;
+    int mode =argc>2?atoi(argv[2]):0;
+    int M=argc>3?atoi(argv[3]):1, K=argc>4?atoi(argv[4]):2048, N=argc>5?atoi(argv[5]):512, G=argc>6?atoi(argv[6]):128;
+    setvbuf(stdout,0,_IONBF,0);
+    printf("int4_bench mode=%d (%s)  M=%d K=%d N=%d G=%d iters=%d\n",
+           mode, mode==0?"int8":mode==1?"int4-perchan":"int4-grouped", M,K,N,G,iters);
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
-    int G=128;
-    struct{int M,K,N;}shp[]={ {512,2048,512}, {128,2048,512}, {16,2048,512}, {1,2048,512} };
-    printf("int4 per-channel (1 submit) vs grouped G=%d (K/G submits) vs int8 — warm, %d iters\n",G,iters);
-    printf("  %-14s %10s %10s %10s   %8s %8s\n","MKN","pc-i4 ms","grp-i4 ms","i8 ms","i4/i8","grp/i4");
-    for(unsigned s=0;s<sizeof shp/sizeof*shp;s++){
-        int M=shp[s].M,K=shp[s].K,N=shp[s].N; double m_pc,m_g,m_i8,rms;
-        rms=pc_i4(ctx,M,K,N,iters,&m_pc);
-        grp_i4(ctx,M,K,N,G,iters,&m_g);
-        pc_i8(ctx,M,K,N,iters,&m_i8);
-        char mkn[32]; snprintf(mkn,sizeof mkn,"%d,%d,%d",M,K,N);
-        printf("  %-14s %10.3f %10.3f %10.3f   %8.2f %8.2f   pc-i4 RMS=%.1f%%\n",
-               mkn,m_pc,m_g,m_i8, m_i8>0?m_pc/m_i8:0, m_pc>0?m_g/m_pc:0, rms*100);
-    }
+    printf("INIT OK\n");
+    double ms=-1,rms=-1;
+    if(mode==0){ pc_i8(ctx,M,K,N,iters,&ms); printf("  int8: %.3f ms\n",ms); }
+    else if(mode==1){ rms=pc_i4(ctx,M,K,N,iters,&ms); printf("  int4-perchan: %.3f ms  RMS=%.1f%%\n",ms,rms*100); }
+    else { grp_i4(ctx,M,K,N,G,iters,&ms); printf("  int4-grouped: %.3f ms\n",ms); }
+    printf("DONE mode=%d ms=%.3f\n",mode,ms);
     ork_npu_free(ctx);
     return 0;
 }
