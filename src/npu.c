@@ -6245,15 +6245,19 @@ int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_
  * to ROUTE AROUND the broken CNA->DPU requant-WDMA (narrow-output matmul does not self-complete) by doing
  * the 32->16 requant in a SEPARATE SDP pass (enable=0x18, DPU-RDMA — a different physical block): Pass-1 =
  * int8 matmul OUT_PRECISION=int32 (self-completes); Pass-2 = THIS op.  RESULT (2026-07-15, RK3588): the SDP
- * main feature RDMA (MRDMA) does NOT accept an int32 (4-byte) feature input — it clamps to a 2-byte read and
- * fetches HALF the bytes, starving the math engine mid-job -> WDMA terminal-count never reached -> errno=110.
- * Proven shape-INVARIANT: all 8 IN_PRECISION[17:15] enums in 0x5044 stall, AND it stalls at M=1 (single row,
- * so NOT an inter-row stride bug — the under-fetch is intra-row). Architectural root: the DPU compute lanes
- * (EW-mul / requant CVT) are int8/int16/fp16; int32 is accumulator/bias-ONLY and cannot be read back from
- * DRAM as a feature. So the 32->16 downcast is dead by BOTH feeders (CNA-internal AND RDMA-external) — the
- * O(M.N) route is fp16 matmul (self-completes) + CNA permutation-conv reshape + fp16 SDP. See wiki
- * Exp-2026-07-14 (narrow-output section). Env: ORK_RQ_4010 / ORK_RQ_MSTRIDE / ORK_RQ_5034 / ORK_RQ_5044 /
- * ORK_RQ_DUMP; argv "M N" (test the decisive single-row M=1). */
+ * main feature RDMA (MRDMA) clamps to a 2-byte read: with the DPU in int32 mode it fetches HALF the bytes
+ * (2E vs the 4E consumed), starving the pipeline mid-job -> WDMA terminal-count never reached -> errno=110.
+ * Shape-INVARIANT at the default config (all 8 IN_PRECISION enums, M=1..32).
+ * ★ OVER-FETCH FIX (2026-07-15, RK3588): the RDMA input dims (0x500c width / 0x5014 channel) are DECOUPLED
+ * from the DPU output dims. INFLATING the RDMA element count (ORK_RQ_5014=2N-1) makes it fetch 4E bytes so
+ * both terminal counters hit together -> the int32-input SDP SELF-COMPLETES (rc=0, ~30-80us). So int32 CAN be
+ * read to completion — the "terminal silicon" wall was a fetch/consume byte-count DISAGREEMENT, fixable in SW.
+ * ★ BUT the DPU still processes it as TWO int16 LANES, not a true int32: out[even 2k]=low16(a[k]),
+ * out[odd 2k+1]=high16(a[k]) (spread across 2 output channels; out[n]<-a[n/2], odd=0 for a<2^16). So a true
+ * int32-VALUE requant still isn't a single-datapath op (the low/high halves land in separate channels the
+ * per-channel EW-mul can't recombine) — but for int16-range accumulators the even-channel (low-half) read is
+ * usable. Full int32 needs recombining the lanes (open). Env: ORK_RQ_4010/MSTRIDE/5034/5044/5014/500C/DUMP;
+ * argv "M N". See wiki Exp-2026-07-14 (narrow-output section). */
 int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -6280,6 +6284,12 @@ int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int
     setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);        /* per-channel scale vector */
     setr(rc,REGCMD_MUL_I16_N,0x2001,0x5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
     { const char*e=getenv("ORK_RQ_5044"); if(e) setr(rc,REGCMD_MUL_I16_N,0x2001,0x5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
+    /* OVER-FETCH hack: RDMA input dims (0x500c width / 0x5014 channel) are DECOUPLED from the DPU output dims
+     * (0x4058/0x405c). If the RDMA is stuck 2-byte fetching 2E but the DPU consumes 4E (int32) -> 50% starve,
+     * INFLATE the RDMA element count so it fetches 4E bytes -> both terminal counts hit together -> clean. */
+    { const char*e;
+      if((e=getenv("ORK_RQ_5014"))) setr(rc,REGCMD_MUL_I16_N,0x2001,0x5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
+      if((e=getenv("ORK_RQ_500C"))) setr(rc,REGCMD_MUL_I16_N,0x2001,0x500c,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)shift);
     setr(rc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
     #undef RQENV
