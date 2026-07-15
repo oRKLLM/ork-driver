@@ -3674,11 +3674,14 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0)
  *                    "SDP->matmul wedge" was NOT a last_dt issue — it was the c->task LUT-descriptor
  *                    poisoning (nuance #1), fixed independently in 98c00b1 (Exp-2026-07-12). Board
  *                    mode_probe (2026-07-14) confirms EVERY SDP->matmul is SAFE with NO reset, and
- *                    that forcing one costs ~105us/transition for zero correctness gain. XP_SDP is
- *                    therefore RESERVED/unused — do NOT wire it to force matmul resets; that would
- *                    re-introduce the exact churn ORK_SSM_KEEPWARM removes. (SDP ops that need their
- *                    OWN entry reset for self-correctness keep doing it inline; that is op-local, not
- *                    a precision-mode transition.)
+ *                    that FORCING one costs ~105us/transition for zero correctness gain. XP_SDP is
+ *                    therefore KEEP-WARM-AWARE: rst=RC_SDPKW (reset iff !ork_sdp_noreset(), i.e. only
+ *                    when the ORK_SDP_NORESET skip is OFF), setdt=0 (no marker, leaves last_dt). This is
+ *                    the op-local SDP reset expressed AS DATA — byte-identical to the historical inline
+ *                    `if(!ork_sdp_noreset()) act(RESET)`, default-SKIP so it does NOT re-introduce the
+ *                    churn ORK_SSM_KEEPWARM removes. NEVER set XP_SDP to RC_ALWAYS (that forces the reset).
+ *                    Wired via ork_npu_enter(c, c->last_dt, XP_SDP, OCK_NONE); SDP ops still not yet
+ *                    converted keep the inline form (identical behavior) pending a Phase-2 sweep.
  * NUANCE #1 (kept SEPARATE, per Exp-2026-07-12): the c->task LUT-descriptor poisoning is a DISTINCT
  * axis from precision-mode and ACT_RESET does NOT fix it — the layer owns only the precision reset;
  * the c->task save/restore stays an op responsibility (no clr_task cell is wired in Phase 1). */
@@ -3693,7 +3696,7 @@ enum ork_chain_kind { OCK_NONE=0, OCK_SW, OCK_HW, OCK_FUSED };
 /* keep-warm predicate selector (from = c->last_dt, to = target marker) */
 enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
 /* reset condition selector */
-enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS };
+enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS, RC_SDPKW };
 /* warm/size-clear condition selector (shared enum for both the warm and the size clear) */
 enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
 /* clear target: bit0 = scalar (warmed / ccsz), bit1 = per-core (mwarm[] / mccsz[]) */
@@ -3713,7 +3716,7 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
   /* XP_I4_INCR    8552  int4 incr       */ { KWP_NTI, RC_NOTKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },
   /* XP_I4CHAIN    8497  run_chain_i4 (4)*/ { KWP_NONE,RC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,   1 },
   /* XP_I4_STREAM  9014  stream i4 (5)   */ { KWP_NONE,RC_ALWAYS,        TG_BOTH,    WC_ALWAYS,        TG_NONE,    WC_NONE,     1 },
-  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_ALWAYS,        TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     0 },
+  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_SDPKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     0 },
 };
 /* Enter mode `to` via `profile`. Returns 1 if a real transition fired (last_dt changed, or an SDP
  * entry reset was issued), 0 if this was a no-op (from==to). The return lets the two sites that gate a
@@ -3760,6 +3763,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_NOTLIVE:       rst=!ORK_I8_LIVE(from); break;
       case RC_NOTLIVE_NOTKW: rst=(!ORK_I8_LIVE(from) && !kw); break;
       case RC_ALWAYS:        rst=1; break;
+      case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
     if(rst) act(fd,RKNPU_ACT_RESET,0);
@@ -5982,7 +5986,7 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
       for(int t=0;t<NT0;t++)for(int j=0;j<8;j++)for(int m=0;m<M;m++)
         bb[(size_t)t*M*8 + (chmaj?(j*M+m):(m*8+j))]=ones?*(uint16_t*)&one:b16[t*8+j]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!ork_sdp_noreset()) act(fd,RKNPU_ACT_RESET,0);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; leaves last_dt) */
     /* TILED per the vendor (task13): one SDP task per 8-channel group (CHANNEL=7). Each tile reads its 8
      * contiguous columns of A via NOTCH (LINE skip = N-8 for the row stride) and writes an 8xM atom block to
      * its slot in O. Notch (0x5048/0x504c) is verbatim for N=64; other N derives LINE_NOTCH=N-8. */
