@@ -147,12 +147,22 @@ fresh in c->regcmd at a fixed stride, not a rebased vendor image).
   (clear n*8 stride), **76-120/512 PCH16 match** (partial — chain still errno=110 so not all groups/M-tiles
   land, and non-unique gemm values confound exact derivation).
 
+## ★ CLEAN COMPLETION ACHIEVED (2026-07-15, cont.) — full GEMM+reshape chain rc=0
+Bisected T0=1 NT=1..10: **NT≤5 complete, NT=6 hangs**. Root cause: **12-reg reshape deltas (task6-10) cannot
+sustain a PC-chain** — only 108-reg tasks and the 13-reg first-delta (task5) do. task5 has an extra
+`0x1040=0x201b` write the 12-reg deltas lack; that write is required for chain continuation (mid-chain AND
+terminus), not just completion. FIX (in `ork_npu_replay_reshape_f16`): **promote EVERY 12-reg delta to task5's
+13-reg form**, patched to that delta's own captured 0x1070/0x4020 (in/out), + **recompute each task's `0x0014`
+next-amount = (eff_amt[j+1]+3)/2** (the promotion changes amounts, so captured next-amounts go stale → hang).
+RESULT: **the full GEMM+reshape chain task1-10 completes rc=0, ~75µs** (NT=7/8/10 all clean). The reshape output
+is structured (`g[5][n]->r[n*8]` clean stride). (ORK_RESHAPE_NOTERM disables the promotion for A/B.)
+
 ## REMAINING (bounded)
-1. Clean completion: the GEMM+reshape chain (task1-10) still errno=110 — some group/M-tile doesn't complete.
-   Bisect NT within 1..10; the reshape is task2(transpose)+task3-10(8 groups). Get all groups to land.
-2. Exact layout: inject DISTINCT gemm input (0xffff0480, offset 0x3480) for T0=1 -> unique gemm_out -> derive
-   the exact contiguous->atom-8 permutation formula (confirm/replace PCH16), bit-exact.
-3. Generalize (M,N) + weight, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
+1. Exact permutation: gemm_out has DUPLICATE values (g[5][0]==g[5][8]) confounding the value->position derive.
+   Inject DISTINCT gemm input (0xffff0480, offset 0x3480, T0=1) OR use T0=2 + GINJ (distinct reshape input at
+   0x3000) and compare reshape_out(0x3680) against the KNOWN injected pattern -> derive the exact
+   contiguous->atom-8 permutation (the n*8 stride suggests a transpose-like layout, not plain PCH16).
+2. Generalize (M,N) + the 64-entry weight permutation, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
 
 ## ASSESSMENT
 Genuine multi-session research now. The vendor reshape runs as a single op (needs pipeline context) and the

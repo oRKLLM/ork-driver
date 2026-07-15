@@ -6177,17 +6177,33 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
      * c->regcmd word offset; copy its regcmd out of the image; rebase DATA addrs -> BIG, and point the chain
      * 0x0010 -> the NEXT task's c->regcmd offset (NOT BIG). (ORK_RESHAPE_INIMG = old in-image path for A/B.) */
     int inimg=getenv("ORK_RESHAPE_INIMG")!=0;
-    uint32_t *cr=(uint32_t*)c->regcmd.cpu; uint32_t cro[22]; { uint32_t cur=0; for(int j=0;j<NT;j++){ cro[j]=cur; cur+=(uint32_t)TK(j).amt*2+16; } }
+    /* ★ TERMINAL COMPLETABILITY: a 12-reg reshape DELTA cannot be the chain's last task (only 108-reg or the
+     * 13-reg first-delta task5 raise DONE as terminus — task5 has an extra 0x1040=0x201b write the 12-reg
+     * deltas lack). In the vendor graph the deltas are never last. So promote the terminal 12-reg delta to
+     * task5's 13-reg form, patched to the terminal group's own in/out addresses. (ORK_RESHAPE_NOTERM = off.) */
+    int termfix = !getenv("ORK_RESHAPE_NOTERM") && !inimg;
+    uint32_t *cr=(uint32_t*)c->regcmd.cpu; uint32_t cro[22]; uint32_t eamt[22]; int prom[22];
+    { uint32_t cur=0; for(int j=0;j<NT;j++){ prom[j]= termfix && (int)TK(j).amt==12; /* every 12-reg delta -> 13-reg task5 form */
+        eamt[j]=prom[j]?13u:(uint32_t)TK(j).amt; cro[j]=cur; cur+=eamt[j]*2+16; } }
     for(int j=0;j<NT;j++){
-        int nw=(int)TK(j).amt*2+16;   /* regcfg entries*2 + trailer */
+        int last=(j==NT-1);
+        uint32_t srcoff = prom[j] ? TK[5].off : TK(j).off;   /* TK[5] = the completable 13-reg delta */
+        int nw=(int)eamt[j]*2+16;   /* regcfg entries*2 + trailer */
+        uint32_t pin=0,pout=0;   /* this delta's OWN captured in/out (patch task5-form to it) */
+        if(prom[j]){ uint32_t*orc=(uint32_t*)((char*)BIG.cpu+TK(j).off); int onw=(int)TK(j).amt*2+16;
+            for(int k=0;k+1<onw;k+=2){ unsigned a=orc[k]&0xffff,d=orc[k+1]>>16; uint32_t v=((orc[k+1]&0xffff)<<16)|(orc[k]>>16);
+                if(a==0x1070&&d==0x0201)pin=v; if(a==0x4020&&d==0x1001)pout=v; } }
         uint32_t *rc = inimg ? (uint32_t*)((char*)BIG.cpu+TK(j).off) : (cr+cro[j]);
-        if(!inimg) memcpy(rc,(char*)BIG.cpu+TK(j).off,(size_t)nw*4);
+        if(!inimg) memcpy(rc,(char*)BIG.cpu+srcoff,(size_t)nw*4);
         for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16; uint32_t v=((rc[k+1]&0xffff)<<16)|(rc[k]>>16);
             if(d==0x0101 && a==0x0010){ /* chain: next-regcmd addr */
                 uint32_t nx = (inimg? (uint32_t)BIG.dma+TK(j+1<NT?j+1:j).off : (uint32_t)c->regcmd.dma+cro[j+1<NT?j+1:j]*4);
-                if(j<NT-1){ rc[k]=0x0010|((nx&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((nx>>16)&0xffff); }
+                if(!last){ rc[k]=0x0010|((nx&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((nx>>16)&0xffff); }
                 else { rc[k]=0; rc[k+1]=0; } }                             /* terminate last */
-            else if(d==0x0101 && a==0x0014){ if(j==NT-1){ rc[k]=0; rc[k+1]=0; } } /* keep captured next-amount, null on last */
+            else if(d==0x0101 && a==0x0014){ if(last){ rc[k]=0; rc[k+1]=0; } /* null on last */
+                else { uint32_t na=(eamt[j+1]+3)/2; rc[k]=0x0014|((na&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((na>>16)&0xffff); } } /* next-amount = (eff_amt[j+1]+3)/2 (handles promotion) */
+            else if(prom[j] && a==0x1070 && d==0x0201){ uint32_t nv=pin+delta;  rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } /* patch task5-form to THIS group */
+            else if(prom[j] && a==0x4020 && d==0x1001){ uint32_t nv=pout+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); }
             else if(v>=IB && v<IB+ISZ){ uint32_t nv=v+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } } /* DATA -> BIG */
     }
     /* ZERO gemm-out (0x3000) + reshape-out (0x3a00) so FRESH computation is distinguishable from baked image data. */
@@ -6196,7 +6212,7 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     if(!inimg) bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*NT);
     for(int j=0;j<NT;j++){ tk[j].enable_mask=TK(j).en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
-        tk[j].regcfg_amount=TK(j).amt; tk[j].regcmd_addr = inimg ? (uint32_t)BIG.dma+TK(j).off : (uint32_t)c->regcmd.dma+cro[j]*4; }
+        tk[j].regcfg_amount=eamt[j]; tk[j].regcmd_addr = inimg ? (uint32_t)BIG.dma+TK(j).off : (uint32_t)c->regcmd.dma+cro[j]*4; }
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
