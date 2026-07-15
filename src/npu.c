@@ -6188,7 +6188,8 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
     sub.flags=flg; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
-    sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT}; sub.timeout=ew_timeout_ms();
+    sub.fence_fd=-1; sub.timeout=ew_timeout_ms();
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT}; /* vendor sets all 3 */
     int ok=-1; double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
     else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);

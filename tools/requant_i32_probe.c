@@ -12,9 +12,15 @@
 static int one(ork_npu*c,int M,int N,int mult,int shift){
     int *a=malloc((size_t)M*N*4); short *b=malloc((size_t)N*2); short *out=malloc((size_t)M*N*2);
     unsigned s=7;
-    for(int i=0;i<M*N;i++){ s=s*1103515245+12345; a[i]=(int)((s>>18)%64)-16; }  /* small int32 accumulators */
-    for(int n=0;n<N;n++){ s=s*1103515245+12345; b[n]=(short)((s>>20)%5); }        /* per-channel scale 0..4 */
+    int big=getenv("ORK_RQ_BIG")!=0;
+    if(big){ for(int i=0;i<M*N;i++) a[i]=(i%N+1)*20000;   /* LARGE int32 (>2^16 for n>=4): expose low/high split */
+             for(int n=0;n<N;n++) b[n]=1; mult=16384; shift=14; }               /* b=1, x1.0 -> out should == a */
+    else { for(int i=0;i<M*N;i++){ s=s*1103515245+12345; a[i]=(int)((s>>18)%64)-16; }  /* small int32 accumulators */
+           for(int n=0;n<N;n++){ s=s*1103515245+12345; b[n]=(short)((s>>20)%5); } }     /* per-channel scale 0..4 */
     double us=0; int rc=ork_npu_requant_perchan_i32(c,a,b,M,N,mult,shift,out,&us);
+    if(big){ printf("  BIG raw out[0][0..15] (expect even=low16(a), odd=high16(a) if int16-lane-split):\n   ");
+        for(int n=0;n<16;n++) printf(" %d",(unsigned short)out[n]);
+        printf("\n   a[0][0..7]="); for(int n=0;n<8;n++) printf(" %d(lo=%d,hi=%d)",a[n],a[n]&0xffff,(a[n]>>16)&0xffff); printf("\n"); }
     int bad=0,nz=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){
         long prod=(long)a[(size_t)m*N+n]*(long)b[n]*(long)mult; long ref=prod>>shift;

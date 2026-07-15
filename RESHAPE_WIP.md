@@ -121,11 +121,23 @@ input-injectable (ORK_RESHAPE_INJECT), output-zeroable (ORK_RESHAPE_ZERO, PRECIS
 - **Dataflow more tangled than gemm(0xffff0000)->reshape(0xffff0a00):** the reshape tasks read 0xffff0600 (not
   0xffff0000), and with 0xffff0000 zeroed the reshape still produces output → the 2-buffer model is wrong.
 
-## REMAINING (now a DEEP sub-investigation, not bounded debug)
-1. Fully decode every task0-21 in(0x1070/0x5018)/out(0x4020) → the real dataflow DAG (buffers + CBUF residency).
-2. Understand THIS graph's multi-task chain-walk (why task1's GEMM output doesn't land): diff the task-descriptor
-   / PC-programming / chain-descriptor setup against a WORKING run_chain_i8 multi-task submit (not just softmax).
-3. Then isolate the reshape sub-chain, validate with controlled data, generalize (M,N)+weight, build the op.
+## SHARPENED BLOCKER (2026-07-15, cont.): the REPLAY PATH doesn't execute rebased vendor tasks
+Tried all-3-subcore (sub.subcore_task[0]=[1]=[2]={0,NT}, matching the vendor capture + run_chain_i8), flags
+0x1/0x5, NT bisect 1..22. **NT=1 (task0 alone, via the replay) ALSO errno=110** — yet the standalone
+`ork_npu_reshape_probe_f16` (task4 copied to c->regcmd, patched addrs) DOES execute. So #2 is NOT primarily the
+multi-task chain-walk; it's the **regcmd-in-BIG-image + blanket-delta-rebase replay mechanism** failing to run a
+single rebased vendor task. Precise-zero test confirms task1's GEMM output never lands (all "nonzero" was baked
+image data outside the zeroed regions). Candidates: (a) SDP task0 (en=0x18) needs setup the blanket rebase
+doesn't preserve; (b) regcmd living in a 0x403 data buffer vs c->regcmd behaves differently; (c) the rebase
+corrupts a non-address value, or misses a needed reference. Distinct from run_chain_i8 (which builds regcmds
+fresh in c->regcmd at a fixed stride, not a rebased vendor image).
+
+## REMAINING (DEEP sub-investigation)
+1. Diagnose why the replay path won't run a single rebased vendor task (compare reshape_probe_f16's working
+   c->regcmd submit vs the replay's BIG-image submit for ONE task; try copying the single task's regcmd to
+   c->regcmd + patching, like reshape_probe_f16 does, instead of regcmd-in-image).
+2. Fully decode every task0-21 in/out → the real dataflow DAG (the simple gemm->reshape 2-buffer model is wrong).
+3. Then multi-task chain-walk, isolate the reshape sub-chain, controlled-data validation, generalize + build.
 
 ## ASSESSMENT
 Genuine multi-session research now. The vendor reshape runs as a single op (needs pipeline context) and the
