@@ -643,10 +643,17 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
                     g_bcreate_n, g_bimport_n, g_bdestroy_n, g_bcreate_n+g_bimport_n-g_bdestroy_n);
             fflush(tf); fsync(fileno(tf)); }
     }
+    int _nb = getenv("ORK_JOB_NONBLOCK")!=NULL;   /* TEST: RKNPU_JOB_NONBLOCK (1<<1=0x2) — does SUBMIT return before completion? */
+    if(_nb) sub->flags |= 0x2;
     double _fd_t0 = ork_now_us();
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     { double _fd_dt = ork_now_us() - _fd_t0; g_fd_ioctl_us += _fd_dt; g_fd_hw_raw_last = (long long)sub->hw_elapse_time;
-      g_fd_hw_us += (double)sub->hw_elapse_time; g_fd_n++; }
+      g_fd_hw_us += (double)sub->hw_elapse_time; g_fd_n++;
+      if(_nb){ int async=(rc==0 && _fd_dt<50.0);  /* returned in <50us => before the HW could run => async */
+               fprintf(stderr,"[nonblock] flags=0x%x rc=%d ioctl-return=%.0fus hw_elapse=%lldus%s\n",
+                   sub->flags, rc, _fd_dt, (long long)sub->hw_elapse_time,
+                   async?"  <- ASYNC (RKNPU_JOB_NONBLOCK works: submit returned before HW done)":"  (blocked till done)");
+               usleep(300000); } }  /* SAFETY: let the async job drain before any teardown/next submit -> no freed-buffer race */
     if (rc < 0) {
         int e = errno;
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
