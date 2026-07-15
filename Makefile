@@ -578,3 +578,7 @@ doorbell_prof: tools/doorbell_prof.c $(CORE)
 
 overlap_prof: tools/overlap_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# split-tensor CPU+NPU decode probe: NEON sdot CPU GEMV needs armv8.2 +dotprod (A76).
+split_matmul_probe: tools/split_matmul_probe.c $(CORE)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
