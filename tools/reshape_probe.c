@@ -1,12 +1,14 @@
-/* reshape_probe — WIP: FULL-CHAIN REPLAY validation of the vendor fp16 contiguous->atom-8 reshape.
- * Replays task0-10 (input-convert + GEMM + reshape) from the captured vendor image, then verifies IN-PLACE
- * that the reshape output (atom-8 @0xffff0a00) is a correct rearrangement of the GEMM output (contiguous
- * @0xffff0000). No weight extraction / CPU ref needed: reshape_out[atom8(m,n)] must equal gemm_out[m][n].
- * BOARD: sudo env ORK_EW_TIMEOUT=2000 ./reshape_probe   (needs gemm_mul_image.bin in cwd) */
+/* reshape_probe — derive the EXACT contiguous->atom-8 permutation with DISTINCT input.
+ * Run the reshape (T0=2, start at the transpose task2) with ORK_RESHAPE_GINJ (fills the reshape input
+ * 0xffff0000 with fp16(i+1), all distinct), read reshape_out @0xffff0680. Each output value v uniquely
+ * identifies its source input index = round(v)-1, so reshape_out[p] <- input[map(p)] is exactly derivable.
+ * BOARD: sudo env ORK_RESHAPE_T0=2 ORK_RESHAPE_GINJ=1 ORK_EW_TIMEOUT=2000 ./reshape_probe   (needs image bin) */
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
+static float h2f(unsigned short u){ __fp16 h; memcpy(&h,&u,2); return (float)h; }
 int main(void){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
     if(!ork_ppu_fuse_enabled(c)){printf("PPU fuse not enabled — SKIP\n");ork_npu_free(c);return 0;}
@@ -14,22 +16,23 @@ int main(void){
     unsigned short *g=calloc(M*N,2), *r=calloc(4096,2); double us=0;
     int rc=ork_npu_replay_reshape_f16(c,g,M*N,r,4096,&us);
     printf("replay_reshape rc=%d  %.0fus\n",rc,us);
-    int gnz=0,rnz=0; for(int i=0;i<M*N;i++)if(g[i])gnz++; for(int i=0;i<4096;i++)if(r[i])rnz++;
-    printf("  gemm_out nonzero=%d/%d   reshape_out nonzero=%d\n",gnz,M*N,rnz);
-    /* verify reshape_out is atom-8 of gemm_out, trying the PCH16 formula */
-    int ok=0,tot=0;
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int a8=(n/8)*(M*8)+m*8+(n%8); tot++;
-        if(r[a8]==g[m*N+n]) ok++; }
-    printf("  atom-8 (PCH16) match: %d/%d\n",ok,tot);
-    /* if PCH16 wrong, derive the empirical permutation: for each gemm elem, where does its value land? */
-    if(ok<tot){
-        printf("  deriving layout (gemm[m][n] -> reshape pos), first 24:\n");
-        int shown=0;
-        for(int m=0;m<M && shown<24;m++)for(int n=0;n<N && shown<24;n++){
-            unsigned short v=g[m*N+n]; if(!v)continue;
-            for(int p=0;p<4096;p++) if(r[p]==v){ printf("    g[%d][%d]=0x%04x -> r[%d]  (PCH16=%d)\n",m,n,v,p,(n/8)*(M*8)+m*8+(n%8)); shown++; break; }
-        }
+    int ginj=getenv("ORK_RESHAPE_GINJ")!=0;
+    if(!ginj){ printf("  (set ORK_RESHAPE_T0=2 ORK_RESHAPE_GINJ=1 to derive the permutation)\n"); free(g);free(r);ork_npu_free(c);return rc?1:0; }
+    /* input[i] = fp16(i+1). For each reshape-out position p, recover the source input index. */
+    /* Hypothesis A: PCH16 atom-8  a8(m,n)=(n/8)*(M*8)+m*8+(n%8).  Hypothesis B: TRANSPOSE t(m,n)=n*M+m. */
+    int okA=0,okB=0,mapped=0;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){
+        int i=m*N+n;                                  /* input index (contiguous [M][N]) */
+        /* find where fp16(i+1) landed */
+        int found=-1; for(int p=0;p<M*N;p++){ int idx=(int)lroundf(h2f(r[p]))-1; if(idx==i){found=p;break;} }
+        if(found<0) continue; mapped++;
+        int a8=(n/8)*(M*8)+m*8+(n%8);
+        int tr=n*M+m;
+        if(found==a8)okA++;
+        if(found==tr)okB++;
+        if(mapped<=16) printf("   in(m=%d,n=%d)=%d -> r[%d]   PCH16=%d transpose=%d\n",m,n,i,found,a8,tr);
     }
+    printf("  mapped=%d/%d   PCH16(atom8) match=%d   TRANSPOSE(n*M+m) match=%d\n",mapped,M*N,okA,okB);
     free(g);free(r); ork_npu_free(c);
-    return (rc==0&&ok==tot)?0:1;
+    return rc?1:0;
 }

@@ -157,12 +157,30 @@ next-amount = (eff_amt[j+1]+3)/2** (the promotion changes amounts, so captured n
 RESULT: **the full GEMM+reshape chain task1-10 completes rc=0, ~75µs** (NT=7/8/10 all clean). The reshape output
 is structured (`g[5][n]->r[n*8]` clean stride). (ORK_RESHAPE_NOTERM disables the promotion for A/B.)
 
-## REMAINING (bounded)
-1. Exact permutation: gemm_out has DUPLICATE values (g[5][0]==g[5][8]) confounding the value->position derive.
-   Inject DISTINCT gemm input (0xffff0480, offset 0x3480, T0=1) OR use T0=2 + GINJ (distinct reshape input at
-   0x3000) and compare reshape_out(0x3680) against the KNOWN injected pattern -> derive the exact
-   contiguous->atom-8 permutation (the n*8 stride suggests a transpose-like layout, not plain PCH16).
-2. Generalize (M,N) + the 64-entry weight permutation, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
+## PERMUTATION DERIVATION (2026-07-15, cont.) — reshape is COUPLED to the GEMM output tiling
+Distinct-input derive (T0=2 start at transpose + GINJ fp16(i+1) at the reshape input 0xffff0000, read
+reshape-out @0xffff0680, recover source idx = round(v)-1): **only 139/512 values map, positions scattered**
+(input(0,0)→r[210], NOT r[0]=PCH16 nor r[0]=transpose). So the multi-stage reshape is NOT a clean standalone
+value-permutation of a plain-contiguous input — **task2 (the "transpose") is coupled to the GEMM's specific
+fp16 output TILING**, which plain row-major GINJ doesn't match. (Earlier PCH16 "matches" on real data were
+duplicate-value coincidences.)
+Also unresolved: **the reshape writes 8 groups at 0xffff0680+g*0x80, but the SDP (task13) reads 0xffff0a00**
+(= task10's LAST group), not 0x680 — so either the atom-8 base the SDP consumes is 0xa00 (groups laid
+differently than I model), or there's another consolidation step. The 0x680-vs-0xa00 dataflow must be resolved
+before the permutation formula is trustworthy.
+
+## REMAINING (deeper than expected)
+1. Resolve the reshape-output base (0x680 groups vs 0xa00 SDP-read) + the GEMM output tiling task2 consumes.
+2. Cleanest validation is NOT value-tracing but END-TO-END: feed a REAL ork fp16-matmul output (matching the
+   GEMM's tiling) through the reshape → the SDP → compare per-channel-scaled result to CPU (bit-exact). That
+   is effectively the "build the op" step (matmul→reshape→SDP integration), not a standalone derive.
+3. Generalize (M,N) + the 64-entry weight permutation, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
+
+## WHAT'S SOLID (this campaign)
+Weight solved (64-entry all-1.0 perm); execution unlocked (skip SDP task0); dataflow largely mapped
+(GEMM→task2→8 groups); **CLEAN COMPLETION of the full task1-10 chain (rc=0, ~75µs)** via all-deltas-promoted-
+to-13-reg + next-amount recompute. The exact atom-8 permutation + end-to-end bit-exact is the remaining
+(genuinely deeper) work; diagonal close covers attention meanwhile.
 
 ## ASSESSMENT
 Genuine multi-session research now. The vendor reshape runs as a single op (needs pipeline context) and the
