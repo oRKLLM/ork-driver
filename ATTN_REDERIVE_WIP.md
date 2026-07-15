@@ -361,3 +361,21 @@ NEXT: decode task13's SRC_DMA_CFG (0x5048=0x01c00000) + SURF_NOTCH (0x504c=0x380
 (LINE_NOTCH vs an initial line offset), and match the tile output layout to the readback. Bounded layout RE.
 Committed WIP (env ORK_MULC_*). The mechanism (vendor fp16 contiguous-read per-channel mul) is proven to
 run; only the exact tile addressing remains for bit-exact.
+
+## 2026-07-14 (cont.) — NOTCH SDP decoded + isolated to ONE remaining bug (row-stride)
+Decoded the vendor task13 notch/EW fields (rocket_regs.h):
+- 0x5048 SRC_DMA_CFG.LINE_NOTCH_ADDR[31:19] = 0x38 = 56 = N-8 (row-stride skip). [my N!=64 fallback fixed to <<19]
+- 0x504c SURF_NOTCH_ADDR[31:4] = 56; 0x5040 EW_SURF_STRIDE[31:4] = 1.
+- 0x4070 EW_CFG=0x20800384: EW_DATA_MODE[29:28]=2 (PER-ELEMENT), EDATA_SIZE[23:22]=2 (fp16), EW_OP_TYPE=1 (mul).
+- 0x5034 ERDMA=0x8000000a: ERDMA_DATA_MODE[31:30]=2 (per-element), DATA_SIZE[3:2]=2. Per-channel (DATA_MODE=0,
+  ERDMA=0x0a) ERRORED with the flying/notch config, so the vendor per-element mode is required; supply the
+  scale as a per-element [M][8]-broadcast operand.
+- Output tile layout = CHANNEL-MAJOR (O[j*M+m]); scale-0 channels come back exactly 0 (structure correct).
+
+**ISOLATED to ONE bug (operand=1.0 test, ORK_MULC_ONES):** O[0..7] == A[0][0..7] BIT-EXACT — the first
+row reads+scales+writes perfectly. Rows 1+ read the NEXT CONTIGUOUS COLUMNS instead of skipping N-8 to the
+next row => the LINE_NOTCH row-stride is NOT being applied. Likely the cube-axis assignment: rows must be
+the axis the LINE_NOTCH acts between (HEIGHT/line, not WIDTH) — task13 has WIDTH=7,HEIGHT=0,CHANNEL=7, so the
+8x8 tile's row axis + its notch mapping needs the exact NVDLA cube semantics. Bounded: fix the (WIDTH/HEIGHT/
+CHANNEL <-> row/channel) assignment so LINE_NOTCH skips per row. Mechanism runs reliably; row 0 is proof.
+ork_npu_mul_perchan_f16_contig + REGCMD_MUL_F16_NOTCH committed; env ORK_MULC_* (ONES/OPROW/EW/ERDMA/504x).
