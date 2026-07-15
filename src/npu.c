@@ -4282,18 +4282,34 @@ static void *i4_mcworker_g(void *vp){
                 sub.fence_fd = -1;
                 sub.core_mask = 1u << i;
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+                /* ORK_I4G_DOORBELL: dispatch each per-group submit NONBLOCK + spin-poll a DRAM doorbell (the last
+                 * output int16, seeded to an unproducible sentinel) instead of the blocking wait — cuts the
+                 * per-submit scheduler-wake off the K/G-submit grouped-int4 cost. SAFE at M=1 (nc=1, one submit
+                 * stream); NOT for large-M grouped (nc>1 concurrent streams -> wedge risk). */
+                static int i4g_db=-1; if(i4g_db<0){const char*e=getenv("ORK_I4G_DOORBELL"); i4g_db=(e&&atoi(e))?1:0;}
                 for (int rep = 0; rep < reps; rep++) {
                     int last = (rep == reps - 1);
                     sub.timeout = mm_timeout_ms();
-                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
-                        if (last) {
-                            a->rc = -1;
-                            free(acc);
-                            return NULL;
+                    if (i4g_db) {
+                        volatile int16_t *db=(volatile int16_t*)O->cpu + (Ncore-1);   /* last output elem = doorbell */
+                        const int16_t SENT=0x7fff;                                    /* int4·int4·G max ~8192 < 32767 */
+                        *db=SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
+                        struct rknpu_submit s2=sub; s2.flags |= 0x2;                  /* NONBLOCK */
+                        if (rknpu_submit_ioctl(fd, &s2, w->domain)) { if(last){a->rc=-1;free(acc);return NULL;} continue; }
+                        long sp=0; for(;sp<20000000L && *db==SENT;sp++){ __asm__ volatile("dc civac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory"); }
+                        if (sp>=20000000L){ if(last){a->rc=-1;free(acc);return NULL;} continue; }
+                        bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);                      /* coherent full-tile read for the accumulate */
+                    } else {
+                        if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
+                            if (last) {
+                                a->rc = -1;
+                                free(acc);
+                                return NULL;
+                            }
+                            continue;
                         }
-                        continue;
+                        bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
                     }
-                    bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
                 }
                 c->mwarm[i]=1;
                 if (active && acc) {
