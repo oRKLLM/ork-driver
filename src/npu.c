@@ -5173,7 +5173,20 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     uint32_t rc[REGCMD_I8_N];
     synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     if(getenv("ORK_MM_F16OUT")) set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
+    else if(getenv("ORK_MM_I32OUT")) { /* CONTROL: skip set_i16_out -> synth_i8's default int32 output (works standalone) */ }
     else                        set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
+    /* TOGGLE SWEEP: restore individual output-stage regs to their int32 (completing) values to isolate the
+     * WDMA terminal-count stall. Each ORK_MM_R<reg>=<hex> overrides one reg AFTER set_i16_out. */
+    { const char*e;
+      if((e=getenv("ORK_MM_R4010"))) setr(rc,REGCMD_I8_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4038"))) setr(rc,REGCMD_I8_N,0x1001,0x4038,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4050"))) setr(rc,REGCMD_I8_N,0x1001,0x4050,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4084"))) setr(rc,REGCMD_I8_N,0x1001,0x4084,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4088"))) setr(rc,REGCMD_I8_N,0x1001,0x4088,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R40c0"))) setr(rc,REGCMD_I8_N,0x1001,0x40c0,(uint32_t)strtoul(e,0,0)); }
+    if(getenv("ORK_MM_DUMPRC")){ const char*tag=getenv("ORK_MM_I32OUT")?"I32":"I16"; /* dump the assembled 0x40xx output stage for diffing */
+        for(int k=0;k+1<REGCMD_I8_N;k+=2){ uint32_t r=rc[k]&0xffff, v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
+            if(r>=0x4000 && r<0x4100) fprintf(stderr,"[%s] 0x%04x = 0x%08x\n",tag,r,v); } }
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_i16_out", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7381,23 +7394,65 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     { int16_t*sb=(int16_t*)SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }      /* int16 per-channel scale CONTIGUOUS [N] */
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(getenv("ORK_I16_ENTER")) ork_npu_enter(c,DT_I8,XP_SC_MM,OCK_NONE);   /* layer entry */
+    else act(fd,RKNPU_ACT_RESET,0);                                         /* gatesilu-style bare reset (proven for this chained int16-out matmul) */
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
     synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
     set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
+    { const char*e=getenv("ORK_I16_MM4010"); if(e) setr(mm,REGCMD_I8_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
     /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
      * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
      * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
-    memcpy(pc,REGCMD_MUL_I16,sizeof pc);
-    set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);                          /* INPUT = matmul OUTPUT (bridge) */
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
-    setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
-    setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+    if(getenv("ORK_I16_MULTMPL")){   /* OLD: standalone-captured REGCMD_MUL_I16 (hangs chained — no chained-ERDMA arming) */
+        memcpy(pc,REGCMD_MUL_I16,sizeof pc);
+        set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
+        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
+        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);
+        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
+        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);
+        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
+        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4040,0x00000053); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4060,0x00000053);
+    } else {   /* CHAIN-SAFE int16 SDP = the PROVEN chained fp16 template (REGCMD_MUL_F16_CHAIN, vendor conv->mul
+                * chained-ERDMA arming), patched precision fp16->int16: 0x4010 int16 DATA_FORMAT, int16 requant
+                * (m2/s2), ERDMA per-channel 2-byte. The chain-safe arming (0x5004/0x5008/0x5044/BS-bypass) is
+                * inherited verbatim — that's what REGCMD_MUL_I16 lacked. */
+        memcpy(pc,REGCMD_MUL_F16_CHAIN,REGCMD_MUL_F16_CHAIN_N*4);
+        set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4020,(uint32_t)O.dma);
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5018,(uint32_t)G.dma);
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5038,(uint32_t)SB.dma);
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
+        uint32_t r10=getenv("ORK_I16_R4010")?strtoul(getenv("ORK_I16_R4010"),0,0):0x24000001; /* int16 DATA_FORMAT (was fp16 0x48000002) */
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4010,r10);
+        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4088,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
+    }
     double t0=ork_now_us();
-    ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
-    int crc=ork_npu_chain_progs(c,2,progs,dom);
+    int crc;
+    if(getenv("ORK_I16_SEQ")){
+        /* O(M·N) PURE-NPU per-channel scale via SEQUENCED submits (the 2-input SDP isn't chain-safe, but as a
+         * SEPARATE submit it reads the matmul's atom-8 G in place — SAME layout, NO repack, NO reshape). The SDP
+         * is element-wise per-channel = O(M·N), vs the fp16 diagonal-matmul's O(M·N²). int16 matmul writes atom-8
+         * natively (set_i16_out) so — unlike fp16 — no contiguous↔atom-8 bridge is needed. G device-resident. */
+        /* mirror the WORKING standalone (mul_perchan_i16): the task already points at c->regcmd from init — only
+         * flip regcfg_amount + enable_mask (NO memset / regcmd_addr, which would clobber init's task config). */
+        struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask; crc=0;
+        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        { tk->regcfg_amount=108; tk->enable_mask=0xd; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] MATMUL submit failed errno=%d dom=%d\n",errno,dom);} else bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); }   /* matmul -> atom-8 int16 G (device-resident) */
+        if(!crc){ ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer */
+          memcpy(c->regcmd.cpu,pc,REGCMD_MUL_I16_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+          tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] SDP submit failed errno=%d dom=%d\n",errno,dom);} else bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }              /* SDP per-channel scale (reads G atom-8 in place) -> O */
+        tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);   /* restore shared task */
+    } else {
+        ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
+        crc=ork_npu_chain_progs(c,2,progs,dom);
+        if(crc){ bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); int gnz=0; int16_t*g=(int16_t*)G.cpu; for(int i=0;i<M*N;i++) if(g[i])gnz++;
+            fprintf(stderr,"[i16chain] chain_progs crc=%d errno=%d — G nonzero=%d/%d (task0 matmul %s)\n",crc,errno,gnz,M*N,gnz?"COMPLETED":"did NOT complete"); }
+    }
     if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }  /* int16 O */
     bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
