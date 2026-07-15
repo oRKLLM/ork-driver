@@ -6229,15 +6229,18 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     if(getenv("ORK_RESHAPE_ZERO")){ memset((char*)BIG.cpu+0x3000,0,0x400); memset((char*)BIG.cpu+0x3680,0,0x400); }
     bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE);
     if(!inimg) bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*NT);
+    uint32_t tn=(uint32_t)NT; { const char*e=getenv("ORK_RESHAPE_TN"); if(e){unsigned v=(unsigned)strtoul(e,0,0); if(v>=1)tn=v;} } /* TREADMILL = #descriptors (task_number must match; a big RING beats the prefetcher) */
+    if(tn>13000)tn=13000;                                          /* c->task=512KB / ~40B per rknpu_task */
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*tn);
     for(int j=0;j<NT;j++){ tk[j].enable_mask=TK(j).en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
         tk[j].regcfg_amount=eamt[j]; tk[j].regcmd_addr = inimg ? (uint32_t)BIG.dma+TK(j).off : (uint32_t)c->regcmd.dma+cro[j]*4; }
+    for(uint32_t j=(uint32_t)NT;j<tn;j++) tk[j]=tk[NT-1];          /* RING: replicate the (completable) last task to fill the treadmill */
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
-    sub.flags=flg; sub.task_number=(uint32_t)NT; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
+    sub.flags=flg; sub.task_number=tn; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
     sub.fence_fd=-1; sub.timeout=ew_timeout_ms();
-    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT}; /* vendor sets all 3 */
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,tn}; /* vendor sets all 3 */
     int ok=-1; double t0=ork_now_us();
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
     else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
