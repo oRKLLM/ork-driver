@@ -582,3 +582,7 @@ overlap_prof: tools/overlap_prof.c $(CORE)
 # split-tensor CPU+NPU decode probe: NEON sdot CPU GEMV needs armv8.2 +dotprod (A76).
 split_matmul_probe: tools/split_matmul_probe.c $(CORE)
 	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+
+# MoE expert-split CPU+NPU probe (NEON sdot needs +dotprod).
+split_expert_probe: tools/split_expert_probe.c $(CORE)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
