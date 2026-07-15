@@ -466,3 +466,19 @@ pure-NPU-for-compute tradeoff vs the SDP path's O(M·N)+CPU-repack. Both paths s
 NEXT: PC-chain the two matmuls into ONE submit (both enable=0xd, uniform — like run_chain_i8) = pure-NPU
 SINGLE-SUBMIT per-channel-scaled matmul. Plus the CNA-strided-read discovery is a lever for reading
 non-contiguous attention operands (densify) directly via the matmul activation.
+
+## ★★★★ 2026-07-14 — SINGLE-SUBMIT pure-NPU per-channel-scaled matmul (M4 CLOSED via 2-matmul chain)
+PC-chained matmul1 (A·B->G) -> matmul2 (G·diag(scale)->out) in ONE submit — both uniform enable=0xd matmuls,
+so they chain cleanly like run_chain_i8 (NO matmul->SDP layout bridge, which was the whole blocker). G
+device-resident. **VALIDATED BIT-EXACT single-submit: MKN {8,32,64}/{16,64,128}/{32,128,256}=512/2048/8192.**
+(ork_npu_mm_perchan_f16_diag + ORK_DIAG_CHAIN.) So the M4 single-submit per-channel-scaled attention-normalize
+IS achievable — via two chained matmuls, sidestepping the matmul->SDP dtype/layout bridge that blocked the
+SDP chain. Three working closes now, escalating purity:
+  1. ork_npu_mm_perchan_f16          — matmul + atom-8 SDP (O(M·N), tiny CPU repack).
+  2. ork_npu_mm_perchan_f16_diag     — two matmuls, device-resident, 2 submits (O(M·N²), pure NPU).
+  3. ork_npu_mm_perchan_f16_diag + ORK_DIAG_CHAIN — two matmuls, ONE submit (O(M·N²), pure NPU, single-submit).
+NPU DISCOVERIES this session: (a) fp16 matmul CAN emit fp16 (3 bug-fixes); (b) fp16 matmul writes CONTIGUOUS,
+not atom-8 (atom-8 output hangs — no fp16-matmul-atom-8 datapath); (c) the DPU-RDMA has NO src line stride
+(can't read raw contiguous); (d) the CNA (matmul activation reader) DOES read strided/contiguous (LINE_STRIDE
+0x107c) — the lever for reading non-contiguous operands via a matmul; (e) the vendor per-channel-scale is a
+plain matmul + separate SDP (not fused), with the reshape done as a CNA permutation-conv.

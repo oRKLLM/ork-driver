@@ -5880,6 +5880,20 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     /* matmul1: A·B -> G (contiguous fp16, device); activation from c->Af. matmul2: G·diag -> O; activation = G (device). */
     struct { int K2,N2; uint32_t aA,aW,aO; } pass[2]={ {K,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G.dma},
                                                        {N,N,(uint32_t)G.dma,(uint32_t)W2.dma,(uint32_t)O.dma} };
+    if(getenv("ORK_DIAG_CHAIN")){
+        /* SINGLE-SUBMIT: PC-chain matmul1 -> matmul2 (both uniform enable=0xd, like run_chain_i8). G resident. */
+        static uint32_t mm1[REGCMD_N], mm2[REGCMD_N];
+        int s1=((K&(K-1))==0 && K>=128 && K<2048), s2=((N&(N-1))==0 && N>=128 && N<2048);
+        synth(mm1,M,K,N,pass[0].aA,pass[0].aW,pass[0].aO,s1,CBUF); set_f16_out_fp16in(mm1,M,N);
+        synth(mm2,M,N,N,pass[1].aA,pass[1].aW,pass[1].aO,s2,CBUF); set_f16_out_fp16in(mm2,M,N);
+        ork_chain_prog progs[2]={ {mm1,REGCMD_N,0xd,108,216}, {mm2,REGCMD_N,0xd,108,-1} };
+        int crc=ork_npu_chain_progs(c,2,progs,c->dom_active);
+        if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+            for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n]; }
+        bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O);
+        #undef TILE
+        return crc;
+    }
     for(int p=0; p<2 && ok==0; p++){
         uint32_t rc[REGCMD_N];
         int sched=((pass[p].K2&(pass[p].K2-1))==0 && pass[p].K2>=128 && pass[p].K2<2048);
