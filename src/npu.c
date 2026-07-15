@@ -5299,6 +5299,59 @@ int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_u
     return 0;
 }
 
+/* overlap_prof — Tier 11: does REAL CPU work in the shadow of an async NPU op stay FREE (overlap wall ~= max),
+ * or does shared LPDDR4X bandwidth contention stretch it (wall -> npu+cpu)? This is the "zero-time router"
+ * thesis (speculative/batched MoE) in one number. cpu_reps = # of 512x512 fp32 GEMVs run on the CPU between
+ * the NONBLOCK submit and the doorbell poll (a stand-in for the routing math; 1MB matrix -> real DRAM traffic).
+ * Fills npu_solo (submit+poll, no CPU work), cpu_solo (the GEMVs alone), overlap_wall (submit+CPU-work+poll). */
+int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
+                         double *npu_solo,double *cpu_solo,double *overlap_wall,int *ok){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    memset(W.cpu,1,(size_t)K*N); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.task_number=1; sub.task_obj_addr=c->task.obj;
+    sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=4000; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    volatile int32_t *dbell=(volatile int32_t*)((char*)O.cpu + (size_t)(M*N-1)*4);
+    const int32_t SENT=0x7ffffff;
+    const int RN=512; float*Wc=malloc((size_t)RN*RN*4),*xc=malloc(RN*4),*yc=malloc(RN*4);  /* CPU "router" state */
+    if(!Wc||!xc||!yc){free(Wc);free(xc);free(yc);bdestroy(fd,&W);bdestroy(fd,&O);return -2;}
+    for(int i=0;i<RN*RN;i++)Wc[i]=(float)(((unsigned)i*2654435761u)>>28)*0.01f; for(int i=0;i<RN;i++)xc[i]=1.0f;
+#define CPU_ROUTER() do{ for(int r=0;r<cpu_reps;r++){ for(int a=0;a<RN;a++){ float acc=0; const float*wr=Wc+(size_t)a*RN; \
+        for(int b=0;b<RN;b++)acc+=wr[b]*xc[b]; yc[a]=acc; } xc[0]=yc[RN-1]*1e-9f; } }while(0)  /* cross-rep dep -> no DCE */
+    sub.flags=0x5; rknpu_submit_ioctl(fd,&sub,-1); rknpu_submit_ioctl(fd,&sub,-1);  /* warm */
+    int okk=1;
+    /* (1) NPU solo: nonblock submit + doorbell poll, NO cpu work */
+    double t0=ork_now_us();
+    for(int i=0;i<iters;i++){ *dbell=SENT; __asm__ volatile("dc cvac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
+        sub.flags=0x7; if(rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
+        long s=0; for(;s<20000000L && *dbell==SENT;s++){ __asm__ volatile("dc civac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); }
+        if(s>=20000000L){okk=0;break;} }
+    if(npu_solo)*npu_solo=(ork_now_us()-t0)/iters;
+    /* (2) CPU solo: the router GEMVs alone, no NPU */
+    t0=ork_now_us(); for(int i=0;i<iters;i++){ CPU_ROUTER(); } if(cpu_solo)*cpu_solo=(ork_now_us()-t0)/iters;
+    volatile float sink=xc[0]; (void)sink;
+    /* (3) OVERLAP: nonblock submit, run the router in the shadow, THEN poll for NPU completion */
+    t0=ork_now_us();
+    for(int i=0;i<iters;i++){ *dbell=SENT; __asm__ volatile("dc cvac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
+        sub.flags=0x7; if(rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
+        CPU_ROUTER();                                              /* CPU works while the NPU crunches */
+        long s=0; for(;s<20000000L && *dbell==SENT;s++){ __asm__ volatile("dc civac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); }
+        if(s>=20000000L){okk=0;break;} }
+    if(overlap_wall)*overlap_wall=(ork_now_us()-t0)/iters;
+    *ok=okk;
+    free(Wc);free(xc);free(yc); bdestroy(fd,&W);bdestroy(fd,&O);
+#undef CPU_ROUTER
+    return 0;
+}
+
 /* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via synth(). Weight tile [NT][KT][16][32]
  * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
  * bit patterns (uint16). ork_f16_fuzz overrides apply inside synth(). 0/ok -1 wedged -2 dims. */

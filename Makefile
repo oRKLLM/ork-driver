@@ -575,3 +575,6 @@ perchan_bench: tools/perchan_bench.c $(CORE)
 
 doorbell_prof: tools/doorbell_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+overlap_prof: tools/overlap_prof.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
