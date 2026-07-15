@@ -132,12 +132,27 @@ doesn't preserve; (b) regcmd living in a 0x403 data buffer vs c->regcmd behaves 
 corrupts a non-address value, or misses a needed reference. Distinct from run_chain_i8 (which builds regcmds
 fresh in c->regcmd at a fixed stride, not a rebased vendor image).
 
-## REMAINING (DEEP sub-investigation)
-1. Diagnose why the replay path won't run a single rebased vendor task (compare reshape_probe_f16's working
-   c->regcmd submit vs the replay's BIG-image submit for ONE task; try copying the single task's regcmd to
-   c->regcmd + patching, like reshape_probe_f16 does, instead of regcmd-in-image).
-2. Fully decode every task0-21 in/out → the real dataflow DAG (the simple gemm->reshape 2-buffer model is wrong).
-3. Then multi-task chain-walk, isolate the reshape sub-chain, controlled-data validation, generalize + build.
+## ★ #2 CRACKED at the mechanism level (2026-07-15, cont.) — reshape executes + dataflow mapped
+- **Root of the "nothing executes": the SDP input-convert task0 (en=0x18) doesn't run standalone in the replay**
+  (NT=1 errno=110 in BOTH regcmd-in-image and c->regcmd paths), and the chain starts with it. **Skipping it
+  (ORK_RESHAPE_T0=1, start at the GEMM) UNLOCKS the matmul chain: gemm_out lands FRESH (469/512 nonzero, was 0
+  when zeroed).** So the blocker was task0, not the replay mechanism or multi-task chaining.
+- Added the c->regcmd replay path (regcmds copied to c->regcmd, chain 0x0010 -> c->regcmd, DATA stays in BIG;
+  ORK_RESHAPE_INIMG = old path), ORK_RESHAPE_T0 (start task), ORK_RESHAPE_GINJ (pre-fill gemm-out distinct).
+- **Full dataflow DAG decoded** (per-task 0x1070/0x4020): task1 GEMM 0xffff0480->0xffff0000; task2 TRANSPOSE
+  0xffff0000->0xffff0280; task3-10 = 8 atom-8 GROUP writes at **0xffff0680 + g*0x80** (each = M*16=128B, one
+  8-channel group). So the reshape output BASE is **0xffff0680 (offset 0x3680)** — NOT 0xffff0a00 (that's just
+  task10's last group). Fixed the probe read offset -> 0x3680.
+- **The reshape RUNS and produces structured atom-8 output**: g[5][0]->r[0], g[5][1]->r[8], g[5][2]->r[16]
+  (clear n*8 stride), **76-120/512 PCH16 match** (partial — chain still errno=110 so not all groups/M-tiles
+  land, and non-unique gemm values confound exact derivation).
+
+## REMAINING (bounded)
+1. Clean completion: the GEMM+reshape chain (task1-10) still errno=110 — some group/M-tile doesn't complete.
+   Bisect NT within 1..10; the reshape is task2(transpose)+task3-10(8 groups). Get all groups to land.
+2. Exact layout: inject DISTINCT gemm input (0xffff0480, offset 0x3480) for T0=1 -> unique gemm_out -> derive
+   the exact contiguous->atom-8 permutation formula (confirm/replace PCH16), bit-exact.
+3. Generalize (M,N) + weight, build `ork_npu_reshape_c2a8_f16`, wire into mul_perchan_f16.
 
 ## ASSESSMENT
 Genuine multi-session research now. The vendor reshape runs as a single op (needs pipeline context) and the

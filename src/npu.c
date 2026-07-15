@@ -6156,34 +6156,47 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
         {0xe940,0xd,13},{0xea00,0xd,12},{0xea80,0xd,12},{0xeb00,0xd,12},{0xeb80,0xd,12},{0xec00,0xd,12},
         {0xec80,0x18,69},{0xef00,0x18,69},{0xf180,0x18,69},{0xf400,0x18,25},{0xf500,0x18,9},{0xf580,0x18,9},
         {0xf600,0x18,9},{0xf680,0x18,9},{0xf700,0x18,9},{0xf780,0x18,9},{0xf800,0x18,69}};
-    int NT=22; { const char*e=getenv("ORK_RESHAPE_NT"); if(e){int v=atoi(e); if(v>=1&&v<=22)NT=v;} }
+    int T0=0; { const char*e=getenv("ORK_RESHAPE_T0"); if(e){int v=atoi(e); if(v>=0&&v<22)T0=v;} } /* start task (skip SDP convert) */
+    int NT=22-T0; { const char*e=getenv("ORK_RESHAPE_NT"); if(e){int v=atoi(e); if(v>=1&&v<=22-T0)NT=v;} }
+    #define TK(j) TK[(T0)+(j)]
     const char *path=getenv("ORK_RESHAPE_IMG"); if(!path)path="gemm_mul_image.bin";
     FILE *f=fopen(path,"rb"); if(!f) return -2;
     struct buf BIG=bcreate(fd,ISZ,0x403,-1); if(!BIG.cpu){fclose(f);return -2;}
     memset(BIG.cpu,0,ISZ);
     size_t rd=fread(BIG.cpu,1,ISZ,f); fclose(f); if(rd<ISZ){ bdestroy(fd,&BIG); return -2; }
     /* inject DISTINCT input (@0xfffef000, imgoff 0x2000) so gemm_out is non-degenerate -> derivable perm */
-    if(getenv("ORK_RESHAPE_INJECT")){ uint16_t*x=(uint16_t*)((char*)BIG.cpu+0x2000);
+    if(getenv("ORK_RESHAPE_INJECT")){ uint16_t*x=(uint16_t*)((char*)BIG.cpu+0x2000);      /* task0 input @0xfffef000 */
         for(int i=0;i<512;i++){ float v=(float)((i%37)-8)*0.25f; __fp16 h=(__fp16)v; memcpy(&x[i],&h,2); } }
-    uint32_t delta=(uint32_t)BIG.dma - IB;
-    /* blanket single-delta rebase of each task's regcmd (data addrs, weights, chain 0x0010 next-regcmd) */
+    int ginj=getenv("ORK_RESHAPE_GINJ")!=0;
+    if(ginj){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000);          /* GEMM output @0xffff0000: DISTINCT so reshape perm is derivable (start at task2, T0=2) */
+        for(int i=0;i<512;i++){ __fp16 h=(__fp16)(float)(i+1); memcpy(&g[i],&h,2); }
+        memset((char*)BIG.cpu+0x3680,0,0x400); }                      /* zero ONLY reshape-out so fresh writes show */
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);   /* warm/reset BEFORE we write c->regcmd (enter may use it) */
+    uint32_t delta=(uint32_t)BIG.dma - IB;   /* DATA addresses -> BIG */
+    /* #2 fix: put regcmds in c->regcmd (the path that EXECUTES), DATA stays in BIG. Compute each task's
+     * c->regcmd word offset; copy its regcmd out of the image; rebase DATA addrs -> BIG, and point the chain
+     * 0x0010 -> the NEXT task's c->regcmd offset (NOT BIG). (ORK_RESHAPE_INIMG = old in-image path for A/B.) */
+    int inimg=getenv("ORK_RESHAPE_INIMG")!=0;
+    uint32_t *cr=(uint32_t*)c->regcmd.cpu; uint32_t cro[22]; { uint32_t cur=0; for(int j=0;j<NT;j++){ cro[j]=cur; cur+=(uint32_t)TK(j).amt*2+16; } }
     for(int j=0;j<NT;j++){
-        uint32_t *rc=(uint32_t*)((char*)BIG.cpu + TK[j].off);
-        int nw=(int)TK[j].amt*2+16;   /* regcfg entries*2 + trailer, matches capture layout */
+        int nw=(int)TK(j).amt*2+16;   /* regcfg entries*2 + trailer */
+        uint32_t *rc = inimg ? (uint32_t*)((char*)BIG.cpu+TK(j).off) : (cr+cro[j]);
+        if(!inimg) memcpy(rc,(char*)BIG.cpu+TK(j).off,(size_t)nw*4);
         for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16; uint32_t v=((rc[k+1]&0xffff)<<16)|(rc[k]>>16);
-            if(v>=IB && v<IB+ISZ){ uint32_t nv=v+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } }
-        if(j==NT-1){ /* TERMINATE the chain at the last task: null its 0x0010(next-regcmd)/0x0014(next-amount) */
-            for(int k=0;k+1<nw;k+=2){ unsigned a=rc[k]&0xffff,d=rc[k+1]>>16;
-                if(d==0x0101 && (a==0x0010||a==0x0014)){ rc[k]=0; rc[k+1]=0; } } }
+            if(d==0x0101 && a==0x0010){ /* chain: next-regcmd addr */
+                uint32_t nx = (inimg? (uint32_t)BIG.dma+TK(j+1<NT?j+1:j).off : (uint32_t)c->regcmd.dma+cro[j+1<NT?j+1:j]*4);
+                if(j<NT-1){ rc[k]=0x0010|((nx&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((nx>>16)&0xffff); }
+                else { rc[k]=0; rc[k+1]=0; } }                             /* terminate last */
+            else if(d==0x0101 && a==0x0014){ if(j==NT-1){ rc[k]=0; rc[k+1]=0; } } /* keep captured next-amount, null on last */
+            else if(v>=IB && v<IB+ISZ){ uint32_t nv=v+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } } /* DATA -> BIG */
     }
-    /* ZERO the gemm-out (0x3000) + reshape-out (0x3a00) regions so we can tell FRESH computation from the
-     * image's BAKED capture data (if they're written after submit -> tasks actually executed). */
-    if(getenv("ORK_RESHAPE_ZERO")){ memset((char*)BIG.cpu+0x3000,0,0x400); memset((char*)BIG.cpu+0x3a00,0,0x400); } /* precise: gemm_out + reshape_out only (0x3480 task0-out untouched) */
+    /* ZERO gemm-out (0x3000) + reshape-out (0x3a00) so FRESH computation is distinguishable from baked image data. */
+    if(getenv("ORK_RESHAPE_ZERO")){ memset((char*)BIG.cpu+0x3000,0,0x400); memset((char*)BIG.cpu+0x3680,0,0x400); }
     bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
+    if(!inimg) bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*NT);
-    for(int j=0;j<NT;j++){ tk[j].enable_mask=TK[j].en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
-        tk[j].regcfg_amount=TK[j].amt; tk[j].regcmd_addr=(uint32_t)BIG.dma + TK[j].off; }
+    for(int j=0;j<NT;j++){ tk[j].enable_mask=TK(j).en; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
+        tk[j].regcfg_amount=TK(j).amt; tk[j].regcmd_addr = inimg ? (uint32_t)BIG.dma+TK(j).off : (uint32_t)c->regcmd.dma+cro[j]*4; }
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
@@ -6194,8 +6207,9 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
     else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(gemm_raw){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<gemm_words;i++)gemm_raw[i]=g[i]; }       /* 0xffff0000 */
-    if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+0x3a00); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; } /* 0xffff0a00 */
+    if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+0x3680); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; } /* 0xffff0680 = atom-8 base (8 groups task3-10) */
     bdestroy(fd,&BIG);
+    #undef TK
     return ok;
 }
 
