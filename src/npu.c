@@ -6215,8 +6215,11 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
             if(d==0x0101 && a==0x0010){ /* chain: next-regcmd addr */
                 uint32_t nx = (inimg? (uint32_t)BIG.dma+TK(j+1<NT?j+1:j).off : (uint32_t)c->regcmd.dma+cro[j+1<NT?j+1:j]*4);
                 if(!last){ rc[k]=0x0010|((nx&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((nx>>16)&0xffff); }
+                else if(getenv("ORK_RESHAPE_SELFLOOP")){ uint32_t sp=(uint32_t)c->regcmd.dma+cro[j]*4; /* self-loop: 0x0010 -> own regcmd (free-run probe) */
+                    rc[k]=0x0010|((sp&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((sp>>16)&0xffff); }
                 else { rc[k]=0; rc[k+1]=0; } }                             /* terminate last */
-            else if(d==0x0101 && a==0x0014){ if(last){ rc[k]=0; rc[k+1]=0; } /* null on last */
+            else if(d==0x0101 && a==0x0014){ if(last&&getenv("ORK_RESHAPE_SELFLOOP")){ uint32_t na=(eamt[j]+3)/2; rc[k]=0x0014|((na&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((na>>16)&0xffff); } /* self-loop: next-amount = own */
+                else if(last){ rc[k]=0; rc[k+1]=0; } /* null on last */
                 else { uint32_t na=(eamt[j+1]+3)/2; rc[k]=0x0014|((na&0xffff)<<16); rc[k+1]=(0x0101u<<16)|((na>>16)&0xffff); } } /* next-amount = (eff_amt[j+1]+3)/2 (handles promotion) */
             else if(prom[j] && a==0x1070 && d==0x0201){ uint32_t nv=pin+delta;  rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); } /* patch task5-form to THIS group */
             else if(prom[j] && a==0x4020 && d==0x1001){ uint32_t nv=pout+delta; rc[k]=a|((nv&0xffff)<<16); rc[k+1]=(d<<16)|((nv>>16)&0xffff); }
