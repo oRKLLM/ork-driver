@@ -482,3 +482,12 @@ not atom-8 (atom-8 output hangs — no fp16-matmul-atom-8 datapath); (c) the DPU
 (can't read raw contiguous); (d) the CNA (matmul activation reader) DOES read strided/contiguous (LINE_STRIDE
 0x107c) — the lever for reading non-contiguous operands via a matmul; (e) the vendor per-channel-scale is a
 plain matmul + separate SDP (not fused), with the reshape done as a CNA permutation-conv.
+
+## ★★ 2026-07-14 — NPU DISCOVERY: the matmul reads STRIDED (non-contiguous) activations via CNA LINE_STRIDE
+Confirmed on-silicon: a fp16 matmul reading an activation stored at ROW PITCH S>K (junk 0xdead padding
+between rows), with CNA LINE_STRIDE (0x107c)=S/8 (surface units, 8-channel/16B surfaces), computes 512/512
+BIT-EXACT — it reads only the real [M][K] rows at the strided offsets, ignoring the padding. (probe
+ORK_F16_ROWPITCH.) So **the matmul CNA reads arbitrary row-strided / non-contiguous activations directly** —
+this is the DENSIFY lever: permuted-Q and KV-cache-view attention operands can be fed to the matmul WITHOUT a
+CPU gather/densify (the 2026-07-13 attention-on-NPU densify was a CPU marshal; this moves it into the CNA
+read). 0x107c LINE_STRIDE = per-row stride in surfaces; 0x1080 SURF_STRIDE = channel-group stride (next).

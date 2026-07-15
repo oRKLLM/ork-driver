@@ -5258,13 +5258,20 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
     size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
     struct buf O=bcreate(fd,osz,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
-    uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j];
+    /* ORK_F16_ROWPITCH=S: DISCOVERY probe — store the activation rows at pitch S>K (padding between rows) and
+     * read them via CNA LINE_STRIDE=S/8. Validates the CNA reads STRIDED/non-contiguous activations directly
+     * (the densify lever). Default: contiguous (pitch=K). */
+    int rowpitch=getenv("ORK_F16_ROWPITCH")?atoi(getenv("ORK_F16_ROWPITCH")):K;
+    uint16_t*ad=c->Af.cpu;
+    if(rowpitch!=K){ for(int j=0;j<M*rowpitch;j++)ad[j]=0xdead; for(int m=0;m<M;m++)for(int k=0;k<K;k++)ad[(size_t)m*rowpitch+k]=A[(size_t)m*K+k]; }
+    else for(int j=0;j<M*K;j++)ad[j]=A[j];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (unwarmed synth writes zeros) */
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_N];
     int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
     synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    if(rowpitch!=K) setr(rc,REGCMD_N,0x201,0x107c,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
     if(!getenv("ORK_F16_FP32OUT")) set_f16_out_fp16in(rc,M,N);        /* vendor fp16-out stage (atom-8); skip => synth's native fp32-out (compute sanity) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
