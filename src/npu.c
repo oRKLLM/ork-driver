@@ -5905,11 +5905,27 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
 int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                            const uint16_t *scale,uint16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
-    uint16_t *G=malloc((size_t)M*N*2); if(!G) return -1;
-    int rc=ork_npu_probe_f16_mm_f16out(c,M,K,N,A,B,G);               /* fp16 matmul -> CONTIGUOUS fp16 G (512/512) */
-    if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scale,M,N,(ork_f16*)out,us); /* per-channel scale */
-    free(G);
+    if(K%32||N<1||N>c->soc->nmax||M<1||M>64) return -2;
+    if(N%32==0){                                                    /* fast path: N is a valid tile width */
+        uint16_t *G=malloc((size_t)M*N*2); if(!G) return -1;
+        int rc=ork_npu_probe_f16_mm_f16out(c,M,K,N,A,B,G);          /* fp16 matmul -> CONTIGUOUS fp16 G (512/512) */
+        if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scale,M,N,(ork_f16*)out,us); /* per-channel scale */
+        free(G);
+        return rc;
+    }
+    /* N%32!=0 (e.g. decode: N=queries=1): pad N up to a 32-multiple, zero-pad the B columns + scale vector,
+     * compute the padded matmul+scale, then extract the real N columns. The zero-pad columns produce 0 (matmul
+     * of a zero weight column) so they don't perturb the real columns; the tiny extra compute is negligible. */
+    int Np=((N+31)/32)*32;
+    uint16_t *Bp=malloc((size_t)K*Np*2), *scp=malloc((size_t)Np*2), *G=malloc((size_t)M*Np*2), *op=malloc((size_t)M*Np*2);
+    if(!Bp||!scp||!G||!op){ free(Bp);free(scp);free(G);free(op); return -1; }
+    for(int k=0;k<K;k++){ const uint16_t*br=B+(size_t)k*N; uint16_t*pr=Bp+(size_t)k*Np;
+        for(int n=0;n<N;n++)pr[n]=br[n]; for(int n=N;n<Np;n++)pr[n]=0; }
+    for(int n=0;n<N;n++)scp[n]=scale[n]; for(int n=N;n<Np;n++)scp[n]=0;
+    int rc=ork_npu_probe_f16_mm_f16out(c,M,K,Np,A,Bp,G);
+    if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scp,M,Np,(ork_f16*)op,us);
+    if(rc==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=op[(size_t)m*Np+n];
+    free(Bp);free(scp);free(G);free(op);
     return rc;
 }
 

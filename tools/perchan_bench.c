@@ -10,7 +10,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
     if(!ork_ppu_fuse_enabled(c)){printf("PPU fuse not enabled — SKIP\n");ork_npu_free(c);return 0;}
     int M=argc>1?atoi(argv[1]):64, K=argc>2?atoi(argv[2]):512;
-    int Ns[]={64,128,256,512,1024,2048}; int nN=sizeof(Ns)/sizeof(Ns[0]);
+    int Ns[]={1,3,17,33,64,128,256,512,1024,2048}; int nN=sizeof(Ns)/sizeof(Ns[0]); /* 1..33 exercise the N%32 pad (decode) */
     printf("per-channel-scaled fp16 matmul: SDP-path vs DIAGONAL  (M=%d head_dim, K=%d seq)\n",M,K);
     printf("   N(queries) | SDP-path us | diagonal us | winner\n");
     for(int s=0;s<nN;s++){ int N=Ns[s];
