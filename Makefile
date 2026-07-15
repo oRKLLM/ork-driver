@@ -557,3 +557,6 @@ mm_perchan_f16_probe: tools/mm_perchan_f16_probe.c $(CORE)
 
 mm_perchan_f16_diag_probe: tools/mm_perchan_f16_diag_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+stridedA_bmm_probe: tools/stridedA_bmm_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

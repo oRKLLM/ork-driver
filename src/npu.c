@@ -5298,6 +5298,44 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     return ok;
 }
 
+/* ZERO-COPY STRIDED activation fp16 matmul — the densify-drop primitive for attention. A is logical [M][K] but
+ * stored at row pitch `apitch` (apitch>=K, apitch%8==0) in a DEVICE (DMA) buffer; the NPU reads it DIRECTLY via
+ * CNA LINE_STRIDE (0x107c=apitch/8), with NO host->Af gather. This is what a permuted-Q / KV-cache-view feeds:
+ * the fork stages A once in a DMA buffer (KV-cache) and the matmul reads the strided view in place — no CPU
+ * densify. Here the DMA buffer is allocated + filled internally to VALIDATE the zero-copy strided read against a
+ * contiguous reference (out = A[:, :K]·B, contiguous fp16). A[M*apitch],B[K*N] fp16 patterns. 0/ok,-1,-2. */
+int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,int apitch,const uint16_t *B,uint16_t *out){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)||apitch<K||(apitch&7)) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
+    { int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;
+      for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)]; }
+    size_t asz=(size_t)M*apitch*2; if(asz<4096)asz=4096; size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
+    struct buf Adev=bcreate(fd,asz,0x403,-1), O=bcreate(fd,osz,0x403,-1);
+    if(!Adev.cpu||!O.cpu){ bdestroy(fd,&W);bdestroy(fd,&Adev);bdestroy(fd,&O); return -2; }
+    { uint16_t*ad=Adev.cpu; for(size_t i=0;i<asz/2;i++)ad[i]=0xdead;                 /* junk padding between rows */
+      for(int m=0;m<M;m++)for(int k=0;k<K;k++) ad[(size_t)m*apitch+k]=A[(size_t)m*K+k]; }  /* A row @ pitch (as the KV-view sits in the DMA buffer) */
+    memset(O.cpu,0,osz);
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Adev,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
+    uint32_t rc[REGCMD_N];
+    int sched=((K&(K-1))==0 && K>=128 && K<2048);
+    synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
+    setr(rc,REGCMD_N,0x201,0x107c,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
+    set_f16_out_fp16in(rc,M,N);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+    uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    if(ok==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n];  /* contiguous fp16 out */
+    bdestroy(fd,&W);bdestroy(fd,&Adev);bdestroy(fd,&O);
+    return ok;
+}
+
 /* SINGLE-SUBMIT fp16 matmul with per-channel scale FUSED into the output stage (BS-fold family): one task,
  * no separate SDP, no matmul-out<->SDP-in layout bridge. The EW-mul lane (0x50xx, spliced via splice_ew_lane)
  * multiplies the ON-CHIP accumulator by a per-CHANNEL operand scale[N] (ERDMA per-channel 0x5034=0x08, operand

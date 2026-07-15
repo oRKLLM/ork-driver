@@ -704,6 +704,8 @@ int          ork_npu_probe_f16_mm(ork_npu *ctx, int M, int K, int N,
                                  const unsigned short *A, const unsigned short *B, float *raw);
 int          ork_npu_probe_f16_mm_f16out(ork_npu *ctx, int M, int K, int N,
                                  const unsigned short *A, const unsigned short *B, unsigned short *out);
+int          ork_npu_probe_f16_stridedA(ork_npu *ctx, int M, int K, int N, const unsigned short *A, int apitch,
+                                 const unsigned short *B, unsigned short *out);
 int          ork_npu_mm_perchan_f16_fused(ork_npu *ctx, int M, int K, int N, const unsigned short *A,
                                  const unsigned short *B, const unsigned short *scale, unsigned short *out);
 int          ork_npu_mul_perchan_f16_contig(ork_npu *ctx, const ork_f16 *a, const ork_f16 *b, int M, int N,

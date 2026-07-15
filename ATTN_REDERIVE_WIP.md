@@ -491,3 +491,13 @@ ORK_F16_ROWPITCH.) So **the matmul CNA reads arbitrary row-strided / non-contigu
 this is the DENSIFY lever: permuted-Q and KV-cache-view attention operands can be fed to the matmul WITHOUT a
 CPU gather/densify (the 2026-07-13 attention-on-NPU densify was a CPU marshal; this moves it into the CNA
 read). 0x107c LINE_STRIDE = per-row stride in surfaces; 0x1080 SURF_STRIDE = channel-group stride (next).
+
+## ★ 2026-07-14 — DENSIFY-DROP primitive: zero-copy strided-A fp16 matmul (applies the CNA discovery)
+Built ork_npu_probe_f16_stridedA: a fp16 matmul that reads its activation DIRECTLY from a DMA buffer at row
+pitch>K via CNA LINE_STRIDE (0x107c=apitch/8), with NO host->Af gather. Validated BIT-EXACT on attention
+shapes (M=queries,K=head_dim,N=out,apitch strided into a wider tensor): {8,32,64,p64}/{16,64,128,p256}/
+{32,128,256,p512} = 512/2048/8192 exact. This is the densify-drop: a permuted-Q / KV-cache-view sits in a DMA
+buffer and the matmul reads the strided view IN PLACE — no CPU gather (the ~11%+5% densify in the pp512
+attention profile). vs ork_bmm_fp16_strided which CPU-gathers A (bmm_gather_f16). FORK integration (Stage-2):
+stage the KV-cache/Q in an ork_dma_alloc buffer + pass the ggml nb[] row stride as apitch; drop the densify
+gather in the ggml-ork bmm handler. Primitive is the enabling piece; tools/stridedA_bmm_probe.c.
