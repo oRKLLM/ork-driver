@@ -432,3 +432,19 @@ DPU-atom8-write config from scratch, not the vendor's chained delta). Bounded bu
 NEGLIGIBLE O(M·N) gain (vs the matmul's O(M·K·N)). RECOMMENDATION: bank — the operation is CLOSED bit-exact
 (ork_npu_mm_perchan_f16); the repack is a micro-optimization not worth a new op. Reference preserved for if
 it's ever wanted (task5 decode above; CNA line-stride 0x107c; DPU atom-8 output = set_mul_geom geometry).
+
+## 2026-07-14 — DEFINITIVE: DPU/SDP cannot read raw contiguous; on-NPU reshape needs a from-scratch CNA conv
+Exhaustive on-silicon confirmation (operand=1.0 isolation, ORK_MULC_ONES): across rows-as-WIDTH,
+rows-as-HEIGHT (ORK_MULC_HROW), per-channel AND per-element operand modes, the SDP always reads row 0/line 0
+BIT-EXACT (O[0..7]==A[0][0..7]) but NEVER applies the LINE_NOTCH per-row skip on a raw contiguous [M][N]
+buffer — subsequent rows read the next contiguous columns (or stop). Combined with the register fact (no
+independent DPU-RDMA SRC line/surf stride — only EW stride + NOTCH), this is conclusive: **the DPU/SDP can
+only read its native surface layout; the NOTCH adjusts WITHIN the vendor's already-reshaped buffer, it cannot
+turn raw row-major contiguous into surface-order reads.**
+=> The on-NPU contiguous->atom-8 reshape MUST go through the CNA (the only unit with a real feature line
+stride, 0x107c). The vendor's CNA reshape is a chained-delta / depthwise-identity-conv (WEIGHT_REUSE + DCOMP
+compressed weight) — replicating it is a FROM-SCRATCH new op (RE the CNA depthwise/copy mode + identity
+weight + DPU atom-8 output), with a NEGLIGIBLE O(M·N) payoff vs the matmul's O(M·K·N).
+**FINAL:** the operation is CLOSED bit-exact (ork_npu_mm_perchan_f16); the only-CPU part is the O(M·N) repack.
+Moving it on-NPU is hardware-blocked for every clean mechanism and needs a disproportionate CNA-conv op-build.
+RECOMMEND BANKING. All reference/harness preserved (task5 decode, notch fields, ORK_MULC_*/ORK_F16_ATOM8).
