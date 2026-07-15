@@ -5846,6 +5846,59 @@ int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const 
     return rc;
 }
 
+/* PURE-NPU per-channel-scaled fp16 matmul via a DIAGONAL second matmul (no SDP, no reshape, no CPU repack).
+ * out = (A·B) · diag(scale): matmul1 A[M,K]·B[K,N] -> G[M,N] (contiguous fp16), then matmul2 G[M,N]·D[N,N] where
+ * D=diag(scale) -> out[m][n]=Σ_k G[m][k]·D[k][n]=G[m][n]·scale[n]. The 2nd matmul reads G CONTIGUOUS as its
+ * activation (synth's native activation layout) — the CNA reads it directly (the vendor-reshape discovery:
+ * the CNA has a real feature LINE_STRIDE, unlike the DPU-RDMA). Cost: the diagonal adds O(M·N²) MACs (N×N
+ * weight, mostly zero) — pure-NPU at the price of compute. A/B/scale/out fp16 bit patterns. 0/ok,<0. */
+int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+                                const uint16_t *scale,uint16_t *out,double *us){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&31)) return -2;    /* N%32 for the diagonal matmul's K=N */
+    /* DEVICE-RESIDENT: G stays on the NPU between the two matmuls — zero CPU touch of the intermediate. */
+    #define TILE(dst,src,KK,NN) do{ int NT=(NN)/16,KT=(KK)/32; uint16_t*bb=(dst); \
+        for(int nt=0;nt<NT;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++) \
+          bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=(src)[(size_t)(kt*32+kk)*(NN)+(nt*16+nl)]; }while(0)
+    size_t gsz=(size_t)M*N*2; if(gsz<4096)gsz=4096;
+    struct buf W1=bcreate(fd,(size_t)K*N*2,0x403,-1), G=bcreate(fd,gsz,0x403,-1),
+               W2=bcreate(fd,(size_t)N*N*2,0x403,-1), O=bcreate(fd,gsz,0x403,-1);
+    if(!W1.cpu||!G.cpu||!W2.cpu||!O.cpu){ bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O); return -1; }
+    TILE(W1.cpu,B,K,N);                                             /* weight1 = B[K][N] */
+    { uint16_t*d=W2.cpu; memset(d,0,(size_t)N*N*2); uint16_t*Draw=calloc((size_t)N*N,2);   /* weight2 = diag(scale)[N][N] */
+      for(int n=0;n<N;n++) Draw[(size_t)n*N+n]=scale[n]; TILE(W2.cpu,Draw,N,N); free(Draw); }
+    memset(G.cpu,0,gsz); memset(O.cpu,0,gsz);
+    { uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }    /* activation1 = A (only host->dev copy of an INPUT) */
+    bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&W2,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE); act(fd,RKNPU_ACT_RESET,0);
+    uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
+    struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu;
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
+    int ok=0; double t0=ork_now_us();
+    /* matmul1: A·B -> G (contiguous fp16, device); activation from c->Af. matmul2: G·diag -> O; activation = G (device). */
+    struct { int K2,N2; uint32_t aA,aW,aO; } pass[2]={ {K,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G.dma},
+                                                       {N,N,(uint32_t)G.dma,(uint32_t)W2.dma,(uint32_t)O.dma} };
+    for(int p=0; p<2 && ok==0; p++){
+        uint32_t rc[REGCMD_N];
+        int sched=((pass[p].K2&(pass[p].K2-1))==0 && pass[p].K2>=128 && pass[p].K2<2048);
+        synth(rc,M,pass[p].K2,pass[p].N2,pass[p].aA,pass[p].aW,pass[p].aO,sched,CBUF);
+        set_f16_out_fp16in(rc,M,pass[p].N2);
+        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(tk,0,sizeof *tk); tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff;
+        tk->regcfg_amount=108; tk->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        int done=-1; for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ done=-1; continue; }
+            if(p==0) bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); else bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); done=0; }
+        if(done) ok=-1;
+    }
+    if(ok==0){ if(us)*us=ork_now_us()-t0;
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n]; }  /* CONTIGUOUS */
+    bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O);
+    #undef TILE
+    return ok;
+}
+
 /* On-NPU PER-CHANNEL scale (fp16): out[m][n] = a[m][n] * b[n]. b[N] per-channel vector broadcast across all
  * M rows via ERDMA_DATA_MODE=0 (0x5034=0x08 = per-channel + DATA_SIZE TWO_BYTE for fp16). fp16 EW MUL,
  * quant-free (no gain/zero-points). N%8, N<=8192. b laid CONTIGUOUS [N] (fp16). The transposed-softmax

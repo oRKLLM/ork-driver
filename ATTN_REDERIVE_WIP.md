@@ -448,3 +448,21 @@ weight + DPU atom-8 output), with a NEGLIGIBLE O(M·N) payoff vs the matmul's O(
 **FINAL:** the operation is CLOSED bit-exact (ork_npu_mm_perchan_f16); the only-CPU part is the O(M·N) repack.
 Moving it on-NPU is hardware-blocked for every clean mechanism and needs a disproportionate CNA-conv op-build.
 RECOMMEND BANKING. All reference/harness preserved (task5 decode, notch fields, ORK_MULC_*/ORK_F16_ATOM8).
+
+## ★★★ 2026-07-14 — PURE-NPU close via DIAGONAL matmul + CNA-strided-read DISCOVERY
+DISCOVERY (reconstructing task5's full effective register state, task0..5 accumulated): the vendor reshape is
+a CNA CONVOLUTION with a PERMUTATION weight (WEIGHT_KERNELS=64, WEIGHT_WIDTH=8, WEIGHT_BYTES=0x2000=64·8·8·2)
+that reads the CONTIGUOUS input via **CNA LINE_STRIDE (0x107c=0x20) + SURF_STRIDE (0x1080)** and rearranges
+layout by convolution. KEY HARDWARE FACT: **the CNA (matmul activation reader) reads STRIDED/contiguous
+input** — unlike the DPU-RDMA (no src line stride). synth's matmul activation is contiguous [M][K].
+=> PURE-NPU per-channel-scaled matmul via a DIAGONAL 2nd matmul: out=(A·B)·diag(scale), out[m][n]=G[m][n]·
+scale[n]. The 2nd matmul reads G CONTIGUOUS as its activation (CNA), weight=diag(scale)[N][N]. NO SDP, NO
+reshape, NO CPU repack. **DEVICE-RESIDENT (G stays on NPU between the two matmuls — zero CPU touch of the
+intermediate). VALIDATED BIT-EXACT: MKN {8,32,64}/{16,64,128}/{32,128,256} = 512/2048/8192 exact.**
+(ork_npu_mm_perchan_f16_diag, tools/mm_perchan_f16_diag_probe.c.) Cost: the diagonal adds O(M·N²) MACs — a
+pure-NPU-for-compute tradeoff vs the SDP path's O(M·N)+CPU-repack. Both paths shipped:
+- ork_npu_mm_perchan_f16      = fp16 matmul -> atom-8 SDP (O(M·N), tiny CPU repack).
+- ork_npu_mm_perchan_f16_diag = two fp16 matmuls (O(M·N²), PURE NPU, zero CPU touch).
+NEXT: PC-chain the two matmuls into ONE submit (both enable=0xd, uniform — like run_chain_i8) = pure-NPU
+SINGLE-SUBMIT per-channel-scaled matmul. Plus the CNA-strided-read discovery is a lever for reading
+non-contiguous attention operands (densify) directly via the matmul activation.
