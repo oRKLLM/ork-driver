@@ -294,3 +294,25 @@ WIP toggle (not yet correct); contiguous fp16-out is the proven default.
 **Deliverable already complete:** the 2-submit on-NPU A·V-normalize (fp16 matmul fp16-out -> separate
 per-channel SDP) is fully coherent now that fp16-out is proven. Single-submit is the throughput-neutral
 optimization still blocked on the above. All committed feat/attn-primitives (e50a116).
+
+## 2026-07-14 (cont.) — BS-fold / fused single-submit: built, blocked on fp16+EW output stage
+Took on BS-fold (per-channel scale in the matmul's own output stage → one task, no SDP, no layout bridge):
+- **Pure BS-fold is impossible:** the fp16 matmul regcmd (REGCMD) has NO 0x50xx RDMA / BS-operand block
+  (feature is on-chip from the CNA), and setr only REPLACES existing slots — it can't add the BRDMA regs.
+- **Fused EW-mul (the real single-submit form):** splice_ew_lane inserts the 0x50xx lane INTO the matmul
+  regcmd (as synth_i8_ew does for int8), so the per-channel scale multiplies the ON-CHIP accumulator and
+  the output stays the matmul's native CONTIGUOUS layout — no bridge. Built ork_npu_mm_perchan_f16_fused
+  (fp16 matmul + spliced EW lane + per-channel ERDMA 0x08 + fp16 scale operand, regcfg=126, enable=0x1d).
+  RESULT: **HANGS (errno=110)** for every EW config swept — vendor fp16 SDP cfg 0x108003c4, int8-fused cfg
+  0x904002c4, and 0x4010 EW-enable variants (0x480000e2/82/e0). The fp16-main-lane + EW-second-lane
+  combination doesn't arm. int8-fused-EW works (synth_i8_ew) and plain fp16-out works (cap_fp16f16), but
+  fp16 + fused-EW together is unproven and hangs on guessed bits.
+=> Needs a CAPTURED vendor **fp16 matmul with a fused EW-mul/scale** (build a Gemm+Mul that the compiler
+   fuses, keeping fp16 — build_gemm.py-style, on the Colima VM) to read the exact fp16 EW output-stage bits.
+   Not safe to keep bit-sweeping (each miss = a wedge-risk self-heal). ork_npu_mm_perchan_f16_fused is
+   committed as WIP (env-tunable ORK_F16EW_*).
+
+**Net:** the SINGLE-SUBMIT per-channel fold is blocked on the fp16 fused-EW output stage (a capture-needed
+RE item). The **2-submit on-NPU path is complete and coherent** (fp16 matmul fp16-out [512/512 proven] +
+separate per-channel SDP) and delivers attention-normalize fully on-NPU today. Single-submit is the
+throughput-neutral optimization still open.

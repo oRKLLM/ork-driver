@@ -5282,6 +5282,66 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     return ok;
 }
 
+/* SINGLE-SUBMIT fp16 matmul with per-channel scale FUSED into the output stage (BS-fold family): one task,
+ * no separate SDP, no matmul-out<->SDP-in layout bridge. The EW-mul lane (0x50xx, spliced via splice_ew_lane)
+ * multiplies the ON-CHIP accumulator by a per-CHANNEL operand scale[N] (ERDMA per-channel 0x5034=0x08, operand
+ * CONTIGUOUS [N]) before the fp16 writeout, so the output keeps the matmul's native CONTIGUOUS [M][N] layout
+ * (proven 512/512). out[m][n] = (Σ_k A[m][k]B[k][n]) * scale[n]. A/B/scale/out fp16 bit patterns. Env-tunable
+ * EW regs (ORK_F16EW_*) for on-board RE. 0/ok,-1 wedged,-2 dims,-3 SoC. */
+int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+                                 const uint16_t *scale,uint16_t *out){
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
+    int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;
+    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+        bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
+    size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
+    struct buf O=bcreate(fd,osz,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
+    struct buf SB=bcreate(fd,4096,0x403,-1); if(!SB.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} memset(SB.cpu,0,4096);
+    { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=*(const ork_f16*)&scale[n]; }   /* per-channel scale, CONTIGUOUS [N] fp16 */
+    uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j];
+    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline */
+    act(fd,RKNPU_ACT_RESET,0);
+    uint32_t base[REGCMD_N], rc[REGCMD_I8_EW_N];
+    int sched=((K&(K-1))==0 && K>=128 && K<2048);
+    synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    set_f16_out_fp16in(base,M,N);                                   /* main lane: fp16 CONTIGUOUS out */
+    splice_ew_lane(rc,base);                                        /* add the 0x50xx EW-operand lane */
+    /* EW-mul: multiply the on-chip fp16 accumulator by the per-channel operand. fp16 EW config + per-channel ERDMA. */
+    uint32_t ewcfg=getenv("ORK_F16EW_CFG")?strtoul(getenv("ORK_F16EW_CFG"),0,0):0x108003c4;   /* vendor fp16 EW mul */
+    uint32_t erdma=getenv("ORK_F16EW_ERDMA")?strtoul(getenv("ORK_F16EW_ERDMA"),0,0):0x00000008;/* per-channel + 2-byte */
+    uint32_t r4050=getenv("ORK_F16EW_4050")?strtoul(getenv("ORK_F16EW_4050"),0,0):0x00000127; /* out row cfg + EW-enable bit0 */
+    setr(rc,REGCMD_I8_EW_N,0x1001,0x4070,ewcfg);
+    setr(rc,REGCMD_I8_EW_N,0x1001,0x4074,0x00000000);
+    setr(rc,REGCMD_I8_EW_N,0x1001,0x4078,0x00000001);
+    setr(rc,REGCMD_I8_EW_N,0x1001,0x4050,r4050);
+    { const char*e=getenv("ORK_F16EW_4010"); if(e) setr(rc,REGCMD_I8_EW_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); } /* fp16 DATA_FORMAT + EW-enable bits sweep */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5004,0x0000000e);
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5008,0x00000001);               /* RDMA_OPERATION_ENABLE */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x500c,(uint32_t)(M-1));          /* WIDTH=M-1 */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5010,0x00000000);              /* HEIGHT=1 */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5014,(uint32_t)(N-1));          /* CHANNEL=N-1 */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5034,erdma);
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5038,(uint32_t)SB.dma);         /* EW operand = scale[N] */
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x5018,(uint32_t)SB.dma);
+    setr(rc,REGCMD_I8_EW_N,0x2001,0x501c,0x00000002);              /* BRDMA_DATA_USE=1 */
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_EW_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0x1d; tk->int_mask=0x300; tk->int_clear=0x1ffff;               /* 0x1d: enable EW/second lane */
+    tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->regcmd_addr=(uint32_t)c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    if(ok==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n];  /* CONTIGUOUS */
+    bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&SB);
+    return ok;
+}
+
 /* RE/validation for the FUSED EW-mul output stage (step 3, SwiGLU dual-input): run a full-K int8 matmul
  * whose output stage int8-requantizes the accumulator AND multiplies it by a SECOND input G (= silu(gate)),
  * returning C[M*N] int8. This splices the 0x50xx second-DPU lane into the regcmd (synth_i8_ew) and submits
