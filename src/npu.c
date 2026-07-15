@@ -653,7 +653,9 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
                fprintf(stderr,"[nonblock] flags=0x%x rc=%d ioctl-return=%.0fus hw_elapse=%lldus%s\n",
                    sub->flags, rc, _fd_dt, (long long)sub->hw_elapse_time,
                    async?"  <- ASYNC (RKNPU_JOB_NONBLOCK works: submit returned before HW done)":"  (blocked till done)");
-               usleep(300000); } }  /* SAFETY: let the async job drain before any teardown/next submit -> no freed-buffer race */
+               { const char*se=getenv("ORK_NONBLOCK_SLEEP_US"); unsigned su=se?(unsigned)strtoul(se,0,0):300000; if(su)usleep(su); } } }
+               /* drain sleep configurable (default 300ms safety). Set SMALL (< compute) to force job OVERLAP and test
+                * whether a 2nd NONBLOCK submit QUEUES (returns ~5us) or SERIALIZES (blocks ~compute) on the busy NPU. */
     if (rc < 0) {
         int e = errno;
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
