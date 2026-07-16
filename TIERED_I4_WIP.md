@@ -110,3 +110,26 @@ Causes (both match the user's framing):
   A FULL resident .orkpack (pre-tiled int8 bytes, load-not-repack; board has only a 126MB STUB) collapses it.
   Only AFTER that does the concurrent compute split become the deciding lever. Plan sound; split is premature
   at 35B-stream until streaming is fixed. Caveat: multi-domain layout is non-deterministic (some run variance).
+
+## ★★★★ ACCURACY DE-RISK (2026-07-15) — no int4 is BOTH accurate AND free-to-upconvert
+CPU-only probe (llama.cpp tools/cpu_i4_vs_q4k.cpp, real ggml Q4_K kernel), K3584 N18944, rel-RMSE vs f32:
+  int4 per-channel (FREE inflate):        0.1479   (unusable — 10x worse than Q4_K)
+  int4 per-64-block (no free inflate):    0.0627   (per-block recovers 2.4x but loses free-inflate + 4x>Q4_K)
+  Q4_K per-32-block+super (ggml):         0.0145   (best)
+  speed: ork per-channel int4 only 1.06-1.12x faster than Q4_K (both ~24 GB/s, memory-bound)
+=> The FREE int4->int8 nibble-expand ONLY works for per-channel UNIFORM int4, which is unusably lossy (14.8%).
+   Accurate 4-bit needs per-block scales (Q4_K), which CANNOT free-inflate (block scale must be applied = real
+   dequant = the resolve tax). So "CPU-int4 + free-upconvert-to-NPU-int8" is OUT on accuracy. Q4_K is ALREADY
+   the optimal CPU 4-bit (accurate + bandwidth-competitive) => keep the CPU on Q4_K; don't convert to ork-int4.
+
+## ★★★★★ REVISED DECODE DESIGN (2026-07-15, user) — no-upconvert + pre-tiled-int8 + hide-swap-behind-CPU
+Sidesteps the accuracy wall by removing the runtime upconvert:
+- NPU tier = PRE-TILED int8 in the orkpack (resolve paid ONCE at build, never at runtime). Decode "domain swap"
+  = pure DMA of pre-quantized int8 tiles into IOVA (no dequant, no upconvert).
+- PER-TOKEN dynamic residence (not a fixed sensitive share -> NPU would idle): swap in the token's ACTIVE
+  experts; NPU picks up its share once the swap lands.
+- HIDE the swap: CPU starts the token on its Q4_K share immediately; swap latency masked by the CPU window.
+- CPU stays Q4_K (accuracy data says don't touch it). No upconvert anywhere.
+- Near-term constraint: "no upconvert" + int4-default => needs NPU W4A4 (deferred). So near-term NPU tier=int8.
+- FEASIBILITY GATE = swap-hiding budget: per-token active int8 tiles must DMA into IOVA within the CPU window
+  (~1.1GB/tok @ ~11GB/s ≈ 100ms vs ~160ms CPU decode). Plausible but TIGHT — the next thing to measure.
