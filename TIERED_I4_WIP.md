@@ -236,3 +236,17 @@ REMAINING (large multi-repo backend integration; NOT env-gated — FEATURE-DETEC
 - #15: e2e via ork_bench + bench_monitored.sh (decode tok/s vs baseline; PPL of int4-majority).
 - NF4 LUT fit: BLOCKED on 35B base download (only 0.6B/1.7B bases present). nf4_sample -> nf4_fit -> LUT.
 Each #12/#14 step needs a ~15min fork build + board cycle; backend integration is iterative (per moe-offload history).
+
+## ★★★★★★★★★★ #12 DONE (2026-07-16) — CPU reads ork-native, validated + pushed
+ggml-ork cold-expert path now feature-detects the loaded orkpack (persist_mode==1 + expert entry
+dtype==ORKPACK_DT_I4) and computes via ork_native_cpu.h (ork_cpu_gemv over the O4N1 Bi4 + int8 acts),
+NO env gate. Fork feat/ork-async-stream b9c867fcd; ork-driver submodule -> 9d14d04.
+VALIDATED on 35B (ORK_MOE_NPU=1 ORK_MOE_ALL_ACTIVE=0 ORK_MOE_HOT=0 => all experts cold via ork-native):
+clean run, 0 compute NaN, full 16 tokens, coherent first token, no wedge. 6.48 prefill / 3.11 decode
+(all-experts-on-CPU config). Rigorous PPL = next quality gate (will show NF4 cost, tier-map recovers).
+NOTE the flaky NPU-MoE submit (errno=110 on mcworker_pref_chain at batched prefill) recovered via
+self-healing reset — #14 must use CHAINED NPU share (run_chain_i8, the hybrid_decode_probe path), not
+the single mcworker submit.
+## NEXT: #14 swap-hidden decode pipeline — CPU int4/NF4 bulk (#12) ‖ NPU int8 chained share (non-block,
+threaded), overlapped, feature-detected. The ~7% aggregate (hybrid_decode_probe 1.07x). Then #15 e2e +
+PPL, NF4 LUT fit (base BF16 GGUF down), tier-map.
