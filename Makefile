@@ -625,3 +625,11 @@ ork_dyn_test: tools/ork_dyn_test.c $(CORE)
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# persistent-job spin keep-alive + mid-flight redirect probe. Not in all/test.
+dyn_spin_probe: tools/dyn_spin_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# precompiled-program cache (regime A) vs synth-every-call bench. Not in all/test.
+ork_pc_bench: tools/ork_pc_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

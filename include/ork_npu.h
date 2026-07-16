@@ -768,6 +768,7 @@ int          ork_dyn_max_steps(void);                                           
 int          ork_dyn_steps(ork_dyn_chain *h);                                     /* total steps submitted in this chain */
 int          ork_dyn_remaining(ork_dyn_chain *h);                                 /* steps not yet completed (budget left before the chain ends) */
 int          ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);        /* extend a running chain in-flight (wrap); 1=too late, 0=ok, <0=err */
+int          ork_dyn_spin_probe(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive); /* circular-spin keep-alive + redirect probe */
 /* Submit QUEUE: chunk-pipeline over the dynamic API — accumulate tasks, run a chunk NONBLOCK while the
  * caller does other work (CPU‖NPU decode split), auto-split work > chunk_max into successive clean chunks. */
 typedef struct ork_dyn_queue ork_dyn_queue;
@@ -779,6 +780,12 @@ int          ork_dyn_queue_flush(ork_dyn_queue *q);                             
 int          ork_dyn_queue_pending(ork_dyn_queue *q);                             /* tasks not yet submitted */
 int          ork_dyn_queue_drain(ork_dyn_queue *q);                               /* finish all chunks + writeback; ret total ops */
 void         ork_dyn_queue_destroy(ork_dyn_queue *q);
+/* Precompiled-program cache (regime A: fixed chain, pinned buffers). Compile the chain ONCE, then re-run it
+ * every token with only the activation contents refreshed — no per-token synth/validate. */
+typedef struct ork_pc_chain ork_pc_chain;
+ork_pc_chain *ork_pc_compile(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* build the program pool once; NULL on bad args */
+int          ork_pc_run(ork_pc_chain *pc);                                        /* refresh A + NONBLOCK submit + drain; ret highest op */
+void         ork_pc_free(ork_pc_chain *pc);
 /* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
  * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before
  * the chain. Chains [gate*silu -> up -> ...] in ONE submit. lut/params as ork_mm_run_i8_silu (build with

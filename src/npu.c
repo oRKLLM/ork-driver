@@ -8923,6 +8923,80 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     ORK_MC_ROUND();   /* real NONBLOCK round: all cores concurrently */
     return h;
 }
+/* SPIN-KEEP-ALIVE PROBE — validates the persistent-job mechanism. Program 0 is a CIRCULAR spin (its next
+ * descriptor points back to itself) writing a dedicated spin slot, keeping the job alive on one core WITHOUT
+ * completing. Programs 1..S are the real chain (terminate at S). Submit NONBLOCK once; the sequencer loops on
+ * program 0. After spin_us, redirect program 0's next-pointer into program 1 — the sequencer flows into the
+ * real chain and runs 1..S. A lost redirect race just re-loops program 0 (NO abort — the safety win vs a
+ * terminator frontier). Returns #real outputs completed (0..S); *spin_alive = spin ran but real outputs
+ * stayed untouched during the spin window (the loop parked as intended). */
+int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive) {
+    if (!c || S < 1 || S > 500 || !tasks) return -1;
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1 || w->K % 512 || w->K > 4096) return -1;
+        if (!dma_find(c, (void*)tasks[i].C)) return -1; }
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    int fd = c->fd, CBUF = c->soc->cbuf_elems, N = tasks[0].w->N; unsigned dom = tasks[0].w->domain;
+    int P = S + 1;   /* program 0 = spin; 1..S = real tasks 0..S-1 */
+    if ((size_t)P * REGCMD_I8_N * 4 > c->regcmd.size) return -1;
+    struct buf ascr[512]; int nascr = 0;
+    struct buf spinC = bcreate(fd, (size_t)N * 4, 0x403, c->dom_active);
+    #define SPIN_CLEAN() do { for (int j=0;j<nascr;j++) bdestroy(fd,&ascr[j]); bdestroy(fd,&spinC); } while (0)
+    if (!spinC.cpu) { return -1; }
+    uint32_t rc[REGCMD_I8_N + 4];
+    /* program 0: spin = task[0]'s matmul writing spinC, self-looping */
+    { ork_w *w = tasks[0].w; int K = w->K;
+      struct buf s = bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
+      memcpy(s.cpu,tasks[0].A,(size_t)K); bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
+      uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
+      memset(rc,0,sizeof rc); synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,(uint32_t)spinC.dma,1,CBUF,0);
+      uint64_t self=c->regcmd.dma;   /* self-loop */
+      rc[216]=0x0010|((self&0xffff)<<16); rc[217]=(0x0101<<16)|((self>>16)&0xffff);
+      rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16);
+      memcpy((char*)c->regcmd.cpu,rc,REGCMD_I8_N*4); }
+    int32_t *outptr[500];
+    for (int i=0;i<S;i++){ int p=i+1; ork_w *w=tasks[i].w; int K=w->K;
+      struct buf s=bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
+      memcpy(s.cpu,tasks[i].A,(size_t)K); bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
+      struct buf *cb=dma_find(c,(void*)tasks[i].C);
+      uint32_t cdma=(uint32_t)(cb->dma+((const char*)tasks[i].C-(const char*)cb->cpu));
+      uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
+      memset(rc,0,sizeof rc); synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,cdma,1,CBUF,0);
+      if(p<P-1){ uint64_t nx=c->regcmd.dma+(size_t)(p+1)*REGCMD_I8_N*4;
+        rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
+        rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16); }
+      memcpy((char*)c->regcmd.cpu+(size_t)p*REGCMD_I8_N*4,rc,REGCMD_I8_N*4); outptr[i]=(int32_t*)tasks[i].C; }
+    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,(size_t)P*sizeof *t);
+    for(int p=0;p<P;p++){ t[p].enable_mask=0xd;t[p].int_mask=0x300;t[p].int_clear=0x1ffff;t[p].regcfg_amount=108;t[p].regcmd_addr=c->regcmd.dma+(size_t)p*REGCMD_I8_N*4; }
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    { volatile int32_t*sd=(volatile int32_t*)((int32_t*)spinC.cpu+(N-1)); *sd=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(sd):"memory"); }
+    for(int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=ork_ppflags()|0x2u; sub.task_number=P; sub.task_obj_addr=c->task.obj; sub.core_mask=1; sub.fence_fd=-1;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
+    sub.timeout=mm_timeout_ms();
+    c->warmed=1;
+    if(rknpu_submit_ioctl(fd,&sub,dom)){ SPIN_CLEAN(); return -1; }
+    if(spin_us>0){ struct timespec ts={spin_us/1000000,(long)(spin_us%1000000)*1000}; nanosleep(&ts,0); }
+    /* liveness: spin slot written (loop ran) AND no real output touched (loop parked, didn't leak forward) */
+    int spinran=0,leaked=0;
+    { volatile int32_t*sd=(volatile int32_t*)((int32_t*)spinC.cpu+(N-1)); __asm__ volatile("dc civac,%0"::"r"(sd):"memory"); if(*sd!=ORK_DYN_SENT)spinran=1; }
+    for(int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)leaked++; }
+    if(spin_alive) *spin_alive = (spinran && leaked==0);
+    /* REDIRECT program 0 -> program 1 (jump into the real chain) */
+    { uint32_t*p0=(uint32_t*)((char*)c->regcmd.cpu); uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;
+      p0[216]=0x0010|((nx&0xffff)<<16); p0[217]=(0x0101<<16)|((nx>>16)&0xffff);
+      p0[218]=0x0014|(0x0037u<<16); p0[219]=(0x0101<<16);
+      __asm__ volatile("dc cvac,%0"::"r"(&p0[216]):"memory"); __asm__ volatile("dc cvac,%0"::"r"(&p0[218]):"memory"); __asm__ volatile("dsb ish":::"memory"); }
+    double t0=ork_now_us(); for(;;){ int done=0; for(int i=0;i<S;i++){volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)done++;} if(done>=S||ork_now_us()-t0>2e6)break; }
+    for(int i=0;i<S;i++){ struct buf*cb=dma_find(c,(void*)tasks[i].C); bsync(fd,cb,RKNPU_MEM_SYNC_FROM_DEVICE); }
+    int comp=0; for(int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)comp++; }
+    SPIN_CLEAN();
+    return comp;
+}
 /* Highest op index whose output has landed in DRAM (doorbell), or -1 if none yet. Non-blocking. */
 int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
     for (int i = 0; i < h->S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
@@ -9045,6 +9119,86 @@ int ork_dyn_queue_drain(ork_dyn_queue *q) {
         if (q->submitted < q->n) ork_dyn_queue_flush(q); }
     q->n = 0; q->submitted = 0; return done; }
 void ork_dyn_queue_destroy(ork_dyn_queue *q) { if (!q) return; if (q->h) ork_dyn_end(q->h); free(q->tasks); free(q); }
+
+/* ========= PRECOMPILED-PROGRAM CACHE (regime A: fixed chain, pinned buffers) =====================
+ * The per-token host-build (~95us of the submit floor) is synth_i8 + validate + memcpy of ~108 regs PER
+ * program. For a FIXED decode chain the program is identical every token (same weight/shapes/addresses) —
+ * only the activation *contents* change. So COMPILE the chain ONCE into a program pool (like precompiling a
+ * static regcmd graph), and RUN it every token with just an A-refresh + submit — no synth, no validate. The
+ * task list references the pool (the "program domain" indirection); programs need not be contiguous.
+ * v1: M=1, DT_I8, K%512==0 && K<=4096, C resident. A is staged into a per-program FIXED scratch (zero-copy A
+ * miscomputes at M=1); ork_pc_run refreshes that scratch from the caller's A source each token. Single-core. */
+struct ork_pc_chain {
+    ork_npu *c; int S, N, warmed; unsigned dom;
+    struct buf pool;                 /* S precompiled programs, contiguous in one buffer */
+    struct buf ascr[512];            /* per-program fixed A scratch (address baked into the program) */
+    const void *asrc[512]; int Ksz[512];   /* caller's A source + K, re-read each run */
+    struct buf *outbuf[512]; int32_t *outptr[512];
+};
+ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if (!c || S < 1 || S > 512 || !tasks) return NULL;
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1 || w->K % 512 || w->K > 4096) return NULL;
+        if (w->Sk != 1 && !w->Bf) return NULL;
+        if (!dma_find(c, (void*)tasks[i].C)) return NULL; }
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    int fd = c->fd, CBUF = c->soc->cbuf_elems, N = tasks[0].w->N;
+    ork_pc_chain *pc = calloc(1, sizeof *pc); if (!pc) return NULL;
+    pc->c = c; pc->S = S; pc->N = N; pc->dom = tasks[0].w->domain;
+    pc->pool = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403, c->dom_active);
+    if (!pc->pool.cpu) { free(pc); return NULL; }
+    uint32_t rc[REGCMD_I8_N + 4];
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K;
+        pc->ascr[i] = bcreate(fd, (size_t)K, 0x403, c->dom_active);
+        if (!pc->ascr[i].cpu) { for (int j=0;j<i;j++) bdestroy(fd,&pc->ascr[j]); bdestroy(fd,&pc->pool); free(pc); return NULL; }
+        memcpy(pc->ascr[i].cpu, tasks[i].A, (size_t)K); bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        pc->asrc[i] = tasks[i].A; pc->Ksz[i] = K;
+        struct buf *cb = dma_find(c, (void*)tasks[i].C);
+        uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
+        uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+        memset(rc, 0, sizeof rc);
+        synth_i8(rc, 1, K, N, (uint32_t)pc->ascr[i].dma, bdma, cdma, 1, CBUF, 0);   /* A/C addresses BAKED IN */
+        if (validate_regcmd("ork_pc", c, rc, REGCMD_I8_N, w, pc->ascr, i+1)) { for (int j=0;j<=i;j++) bdestroy(fd,&pc->ascr[j]); bdestroy(fd,&pc->pool); free(pc); return NULL; }
+        if (i < S - 1) { uint64_t nx = pc->pool.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
+            rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037u << 16);        rc[219] = (0x0101 << 16); }
+        memcpy((char*)pc->pool.cpu + (size_t)i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+        pc->outbuf[i] = cb; pc->outptr[i] = (int32_t*)tasks[i].C;
+    }
+    bsync(fd, &pc->pool, RKNPU_MEM_SYNC_TO_DEVICE);   /* pool is STATIC — synced once, never re-synth'd */
+    return pc;
+}
+/* Re-run the precompiled chain: refresh A contents from the caller's (fixed-address) source, submit NONBLOCK,
+ * poll doorbells, writeback. No synth/validate. Returns highest completed op, -1 on submit error. */
+int ork_pc_run(ork_pc_chain *pc) {
+    if (!pc) return -1; ork_npu *c = pc->c; int fd = c->fd, S = pc->S, N = pc->N;
+    for (int i = 0; i < S; i++) { memcpy(pc->ascr[i].cpu, pc->asrc[i], (size_t)pc->Ksz[i]); bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE); }
+    struct rknpu_task *t = c->task.cpu; memset(t, 0, (size_t)S * sizeof *t);
+    for (int p = 0; p < S; p++) { t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
+        t[p].regcfg_amount = 108; t[p].regcmd_addr = pc->pool.dma + (size_t)p * REGCMD_I8_N * 4; }
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = ork_ppflags() | 0x2u; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
+    sub.timeout = mm_timeout_ms();
+    #define ORK_PC_SEED() do { for (int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while(0)
+    ORK_PC_SEED();
+    if (!pc->warmed) {   /* cold: throwaway NONBLOCK warm pass, poll, reseed (blocking multi-task submit EINVALs) */
+        if (!rknpu_submit_ioctl(fd, &sub, pc->dom)) { double tw=ork_now_us();
+            for(;;){ int a=1; for(int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){a=0;break;} } if(a||ork_now_us()-tw>2e6)break; } }
+        pc->warmed = 1; ORK_PC_SEED();
+    }
+    if (rknpu_submit_ioctl(fd, &sub, pc->dom)) return -1;
+    double t0 = ork_now_us(); int last = -1;
+    for (;;) { int hi=-1; for (int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)hi=i; }
+        if (hi>=S-1){ last=hi; break; } if (ork_now_us()-t0>2e6){ last=hi; break; } }
+    struct buf *done[512]; int nd=0;
+    for (int i=0;i<S;i++){ struct buf*b=pc->outbuf[i]; int seen=0; for(int j=0;j<nd;j++) if(done[j]==b)seen=1; if(!seen){ bsync(fd,b,RKNPU_MEM_SYNC_FROM_DEVICE); if(nd<512)done[nd++]=b; } }
+    return last;
+}
+void ork_pc_free(ork_pc_chain *pc) { if (!pc) return; int fd = pc->c->fd;
+    for (int i=0;i<pc->S;i++) bdestroy(fd,&pc->ascr[i]); bdestroy(fd,&pc->pool); free(pc); }
 
 /* CHAIN ASSEMBLER CORE: submit N pre-built HETEROGENEOUS programs as ONE PC-chain (task_number=N, one ioctl).
  * Packs the programs contiguously into c->regcmd (content-driven stride, per AGENTS.md); for each non-last
