@@ -73,11 +73,32 @@ static int32_t dot_nf4(const int8_t*a,const uint8_t*b4,int K){
     }
     return vaddvq_s32(ac);
 }
+static uint8_t *gN6,*gM6a,*gM6b;   /* int6: nibble (K/2) + bit4 plane (K/8) + bit5 plane (K/8) = 3K/4 */
+/* LEAN int6 dot: nibble + two 1-bit planes (bit4,bit5) merged, sign-extend from bit5. reads 3K/4 bytes */
+static int32_t dot_i6(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,const uint8_t*b5p,int K){
+    int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
+    uint8x16_t bsel=vld1q_u8(BITSEL), c4=vdupq_n_u8(0x10), c5=vdupq_n_u8(0x20);
+    int k=0,kb=0,km=0;
+    for(;k+32<=K;k+=32,kb+=16,km+=4){
+        uint8x16_t pk=vld1q_u8(nb+kb);
+        uint8x16_t lo=vandq_u8(pk,m), hi=vshrq_n_u8(pk,4);
+        uint8x16_t l4=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b4p[km]),  vdup_n_u8(b4p[km+1])),bsel),c4);
+        uint8x16_t l5=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b5p[km]),  vdup_n_u8(b5p[km+1])),bsel),c5);
+        uint8x16_t h4=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b4p[km+2]),vdup_n_u8(b4p[km+3])),bsel),c4);
+        uint8x16_t h5=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b5p[km+2]),vdup_n_u8(b5p[km+3])),bsel),c5);
+        int8x16_t lo6=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(lo,l4),l5)),2),2);
+        int8x16_t hi6=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(hi,h4),h5)),2),2);
+        ac=vdotq_s32(ac,lo6,vld1q_s8(a+k));
+        ac=vdotq_s32(ac,hi6,vld1q_s8(a+k+16));
+    }
+    return vaddvq_s32(ac);
+}
 typedef struct{int lo,hi,mode;}job;
 static void* wk(void*p){ job*j=p; cpu_set_t s;CPU_ZERO(&s);CPU_SET(4+((j->lo/((gN+gNT-1)/gNT))%4),&s);pthread_setaffinity_np(pthread_self(),sizeof s,&s);
     if(j->mode==8) for(int n=j->lo;n<j->hi;n++) gC[n]=dot_i8(gA,gB8+(size_t)n*gK,gK);
     else if(j->mode==4) for(int n=j->lo;n<j->hi;n++) gC[n]=dot_i4(gA,gB4+(size_t)n*(gK/2),gK);
     else if(j->mode==6) for(int n=j->lo;n<j->hi;n++) gC[n]=dot_nf4(gA,gB4+(size_t)n*(gK/2),gK);
+    else if(j->mode==3) for(int n=j->lo;n<j->hi;n++) gC[n]=dot_i6(gA,gN6+(size_t)n*(gK/2),gM6a+(size_t)n*(gK/8),gM6b+(size_t)n*(gK/8),gK);
     else for(int n=j->lo;n<j->hi;n++) gC[n]=dot_i5(gA,gN5+(size_t)n*(gK/2),gM5+(size_t)n*(gK/8),gK);
     return NULL; }
 static double run(int mode){ pthread_t th[8]; job jb[8]; int per=(gN+gNT-1)/gNT;
@@ -92,13 +113,16 @@ int main(int argc,char**argv){
     gA=malloc(K); for(int k=0;k<K;k++) gA[k]=(int8_t)((k%17)-8);
     gB8=malloc((size_t)N*K); gB4=malloc((size_t)N*K/2);
     gN5=malloc((size_t)N*K/2); gM5=malloc((size_t)N*K/8);
+    gN6=malloc((size_t)N*K/2); gM6a=malloc((size_t)N*K/8); gM6b=malloc((size_t)N*K/8);
     gC=malloc((size_t)N*4);
     /* fill weights with int5 codes q in [-15,15]; pack all forms in the LEAN 32-block layout:
      * nibble byte (16b+i): low=w[32b+i], high=w[32b+16+i]; msb 4 bytes/block: [km,km+1]=lo half, [km+2,km+3]=hi */
     #define QCODE(n,k) ( ((int)(((size_t)(n)*131+(k)*7)%31)) - 15 )   /* deterministic in [-15,15] */
+    #define QCODE6(n,k) ( ((int)(((size_t)(n)*151+(k)*11)%63)) - 31 )  /* deterministic in [-31,31] */
     for(size_t n=0;n<(size_t)N;n++){
         int8_t *b8=gB8+n*K; uint8_t *b4=gB4+n*(K/2), *n5=gN5+n*(K/2), *m5=gM5+n*(K/8);
         memset(m5,0,K/8);
+        uint8_t *n6=gN6+n*(K/2), *m6a=gM6a+n*(K/8), *m6b=gM6b+n*(K/8); memset(m6a,0,K/8); memset(m6b,0,K/8);
         for(int b=0;b<K/32;b++){ int km=b*4;
             for(int i=0;i<16;i++){ int kl=32*b+i, kh=32*b+16+i; int ql=QCODE(n,kl), qh=QCODE(n,kh);
                 b8[kl]=(int8_t)ql; b8[kh]=(int8_t)qh;
@@ -107,6 +131,13 @@ int main(int argc,char**argv){
                 n5[16*b+i]=(uint8_t)((ql&0xf)|((qh&0xf)<<4));
                 if((ql>>4)&1) m5[km   + i/8] |= (uint8_t)(1<<(i&7));
                 if((qh>>4)&1) m5[km+2 + i/8] |= (uint8_t)(1<<(i&7));
+                /* int6: 6-bit codes in [-31,31] = nibble + bit4 + bit5(sign) */
+                int q6l=QCODE6(n,kl), q6h=QCODE6(n,kh);
+                n6[16*b+i]=(uint8_t)((q6l&0xf)|((q6h&0xf)<<4));
+                if((q6l>>4)&1) m6a[km   + i/8]|=(uint8_t)(1<<(i&7));
+                if((q6l>>5)&1) m6b[km   + i/8]|=(uint8_t)(1<<(i&7));
+                if((q6h>>4)&1) m6a[km+2 + i/8]|=(uint8_t)(1<<(i&7));
+                if((q6h>>5)&1) m6b[km+2 + i/8]|=(uint8_t)(1<<(i&7));
             }
         }
     }
@@ -117,23 +148,33 @@ int main(int argc,char**argv){
                 int ml=(mb[km+i/8]>>(i&7))&1, mh=(mb[km+2+i/8]>>(i&7))&1;
                 int vl=(int8_t)((nl|(ml<<4))<<3); vl>>=3; int vh=(int8_t)((nh|(mh<<4))<<3); vh>>=3;
                 int kl=32*b+i, kh=32*b+16+i;
-                if(vl!=QCODE(n,kl)||vh!=QCODE(n,kh)){printf("  MISMATCH n=%d b=%d i=%d\n",n,b,i);bad=1;break;} } } }
+                if(vl!=QCODE(n,kl)||vh!=QCODE(n,kh)){printf("  int5 MISMATCH n=%d b=%d i=%d\n",n,b,i);bad=1;break;} } } }
+    for(int n=0;n<8 && !bad;n++){ const uint8_t*nb=gN6+(size_t)n*(K/2), *b4p=gM6a+(size_t)n*(K/8), *b5p=gM6b+(size_t)n*(K/8);
+        for(int b=0;b<K/32 && !bad;b++){ int km=b*4;
+            for(int i=0;i<16;i++){ int nl=nb[16*b+i]&0xf, nh=nb[16*b+i]>>4;
+                int l4=(b4p[km+i/8]>>(i&7))&1, l5=(b5p[km+i/8]>>(i&7))&1;
+                int h4=(b4p[km+2+i/8]>>(i&7))&1, h5=(b5p[km+2+i/8]>>(i&7))&1;
+                int vl=(int8_t)((nl|(l4<<4)|(l5<<5))<<2); vl>>=2; int vh=(int8_t)((nh|(h4<<4)|(h5<<5))<<2); vh>>=2;
+                int kl=32*b+i, kh=32*b+16+i;
+                if(vl!=QCODE6(n,kl)||vh!=QCODE6(n,kh)){printf("  int6 MISMATCH n=%d b=%d i=%d got %d,%d want %d,%d\n",n,b,i,vl,vh,QCODE6(n,kl),QCODE6(n,kh));bad=1;break;} } } }
     /* also a full GEMV correctness check vs scalar int5 dot */
     { long ref=0; const int8_t*b8=gB8; for(int k=0;k<K;k++) ref+=(long)gA[k]*b8[k];   /* row0, int8==int5 codes */
       run(5); if(gC[0]!=ref){ printf("  GEMV MISMATCH row0: i5=%d ref=%ld\n",gC[0],(int)ref); bad=1; } }
     printf("  lossless round-trip + GEMV: %s\n", bad?"FAIL":"PASS");
 
     { int8_t lt[16]; for(int i=0;i<16;i++) lt[i]=(int8_t)(i-8); gLUT=vld1q_s8(lt); }   /* any 16-entry LUT (speed test) */
-    run(4); run(6); run(5); run(8);   /* warm */
+    run(4); run(6); run(5); run(3); run(8);   /* warm */
     double t0=now_us(); for(int i=0;i<iters;i++) run(4); double t4=(now_us()-t0)/iters;
     t0=now_us(); for(int i=0;i<iters;i++) run(6); double t6=(now_us()-t0)/iters;
     t0=now_us(); for(int i=0;i<iters;i++) run(5); double t5=(now_us()-t0)/iters;
+    t0=now_us(); for(int i=0;i<iters;i++) run(3); double t3=(now_us()-t0)/iters;
     t0=now_us(); for(int i=0;i<iters;i++) run(8); double t8=(now_us()-t0)/iters;
-    printf("  int4 (uniform):  %8.1f us  %6.1f GB/s (K/2 read)\n",  t4, (double)N*K/2/t4/1e3);
-    printf("  NF4  (LUT vqtbl):%8.1f us  %6.1f GB/s (K/2 read)\n",  t6, (double)N*K/2/t6/1e3);
+    printf("  int4 (uniform):  %8.1f us  %6.1f GB/s (K/2  read)\n",  t4, (double)N*K/2/t4/1e3);
+    printf("  NF4  (LUT vqtbl):%8.1f us  %6.1f GB/s (K/2  read)\n",  t6, (double)N*K/2/t6/1e3);
     printf("  int5 (bit-plane):%8.1f us  %6.1f GB/s (5K/8 read)\n", t5, (double)N*K*5/8/t5/1e3);
-    printf("  int8:            %8.1f us  %6.1f GB/s (K   read)\n",  t8, (double)N*K/t8/1e3);
-    printf("  ★ memory-bound-free? (time vs int8's mem-bound, lower time=better): int4 %.2fx NF4 %.2fx int5 %.2fx  [1.0=int8 time]\n",
-           t4/t8, t6/t8, t5/t8);
+    printf("  int6 (2 planes): %8.1f us  %6.1f GB/s (3K/4 read)\n", t3, (double)N*K*3/4/t3/1e3);
+    printf("  int8:            %8.1f us  %6.1f GB/s (K    read)\n",  t8, (double)N*K/t8/1e3);
+    printf("  ★ time vs int8 (lower=faster): int4 %.2fx NF4 %.2fx int5 %.2fx int6 %.2fx  [free widths: 4,8]\n",
+           t4/t8, t6/t8, t5/t8, t3/t8);
     return bad?2:0;
 }
