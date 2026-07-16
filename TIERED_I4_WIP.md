@@ -48,3 +48,21 @@ needs int8 — upconverted ONCE, resident, NOT streamed. So:
   (CPU-Q4 already fast → NPU is a modest parallel helper, not a multiplier).
 - So "run the 35B on the NPU" = keep it Q4-on-CPU (primary) + a fixed NPU-int8 slice in parallel. No streaming,
   no conversion, no JIT-per-swap. The lever is bounded (~1.1x); the big streaming build was unnecessary.
+
+## ★★ BENCH FINDING (2026-07-15) — PATH-B on 35B: NPU 7×/expert at PREFILL, IOVA is the wall
+Ran ork_bench 35B-A3B-Q4_K_XL, ORK_MOE_NPU=1 PATHB=1 PATHB_PARK=1 FRAC=0.15 (spec config: CPU=int4/Q4_K
+native ‖ NPU=int8 minimal IOVA slice, concurrent). Prefill PATH-B profile (57 calls):
+  NPU-experts=954 CPU-experts=5619 | npu=119ms cpu=5064ms | => NPU 0.125 ms/expert vs CPU 0.90 ms/expert
+  => at PREFILL (batched M) the NPU is ~7× FASTER PER EXPERT. NPU wildly UNDERLOADED at FRAC=0.15
+     (119ms of a 5064ms window). Balancing npu_t≈cpu_t => ~88% of experts to NPU => ~7× prefill MoE win.
+  This is NOT 1.1× — the concurrent split + user's "NPU-heavy on prefill" is a genuine multi-× prefill lever.
+- REGIME (confirmed): PATH-B only engages at `batched` (ORK_MOE_BATCH_MINM, M_e>=8) => decode (M=1) already
+  falls to CPU. So "prefill NPU-heavy / decode CPU-heavy" is partly free; need a tunable per-regime FRAC.
+- ★ BINDING CONSTRAINT = IOVA (as the user called out). One domain = 3900 MiB fits only ~954 experts (~14.5%),
+  and even that STARVES the dense (attn/shared) weights: with default HOT_GIB=2.5, experts(2.5G)+dense(~1.4G)
+  hit the 3900 cap => "IOVA guard refusing MEM_CREATE" => dense pack fails => "warmup prefill FAILED" (abort,
+  NOT a wedge — board stayed healthy). So two IOVA claimants: MoE-expert pool AND dense weights.
+- FIX for a clean completing run: cap ORK_MOE_HOT_GIB=1.8 (experts 1.8G + dense 1.4G = 3.2G, ~700M headroom).
+- LEVER to raise the NPU prefill share past 14.5% (toward the 88% balance): EXPAND IOVA via ORK_DOMAINS>1
+  (spread experts across N IOMMU domains; ~6 domains reaches the balance point). Multi-domain is wedge-prone
+  (multi-domain-runtime: non-deterministic layout, swap-bound) => validate carefully, single-domain clean first.
