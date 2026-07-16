@@ -250,3 +250,15 @@ the single mcworker submit.
 ## NEXT: #14 swap-hidden decode pipeline — CPU int4/NF4 bulk (#12) ‖ NPU int8 chained share (non-block,
 threaded), overlapped, feature-detected. The ~7% aggregate (hybrid_decode_probe 1.07x). Then #15 e2e +
 PPL, NF4 LUT fit (base BF16 GGUF down), tier-map.
+
+## ★★★★★★★★★★★ #14 DONE (2026-07-16) — swap-hidden overlap WORKS in-model
+ggml-ork decode MoE handler: NPU hot chain (run_stream/chain) on a dedicated thread OVERLAPS the CPU cold
+bulk (run_cold = #12 ork-native NF4 / vec_dot), join, combine. Fork feat/ork-async-stream (this commit).
+VALIDATED on 35B (ORK_MOE_NPU=1 ORK_MOE_ALL_ACTIVE=0, orkpack): CLEAN, no wedge, coherent. Decode 3.29
+vs #12-all-cold 3.11 = +6% from the overlap (mechanism real in-model).
+★ REGIME CONFIRMED: at M=1 the NPU hot share is SUBMIT-FLOOR-dominated (MoE-chain chain-submit 9992ms=72%),
+so overlapped it's the LONG pole (npu_t>cpu_t, not hidden) -> CPU-only decode (4.42, MOE_NPU off) still BEATS
+the hybrid (3.29). #14 is the right mechanism; the WIN is at PREFILL (large M, NPU efficient). Decode should be
+CPU-heavy (matches the design + decode-is-cpu-path). Remaining tuning = regime-gate the NPU share to prefill
+(#8/#15): NPU-heavy prefill overlap + CPU-only (or minimal-NPU) decode. Prefill batched-NPU errno=110's
+(flaky) -> use the chained hot path (#14) at prefill too, or fix the batched submit.
