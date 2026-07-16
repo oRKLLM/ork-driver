@@ -233,8 +233,9 @@ mc_prof: tools/mc_prof.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
 # decode-pipeline validator: CPU int4 bulk || NPU int8 share overlapped — aggregate win at M=1? Not in all/test.
+# -march=native: ork_native_cpu.h uses vdotq_s32 (dotprod ISA), which the default CFLAGS march may not enable.
 hybrid_decode_probe: tools/hybrid_decode_probe.c $(CORE)
-	$(CC) $(CFLAGS) -Iinclude -o $@ $< $(CORE) -lm -lpthread
+	$(CC) $(CFLAGS) -march=native -Iinclude -o $@ $< $(CORE) -lm -lpthread
 
 # diagnostic: ceiling of within-backend CPU/NPU overlap (quant/deq pipelined behind NPU run). Not in all/test.
 overlap_probe: tools/overlap_probe.c $(CORE)
