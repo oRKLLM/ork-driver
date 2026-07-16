@@ -8878,12 +8878,12 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1;
     unsigned dom = tasks[0].w->domain;
     int N0 = tasks[0].w->N;
-    /* DIRECT vs COPY-BACK: when the submit runs in domain 0 AND every caller C is a resident DMA buffer, the C
-     * is already in the submit's domain — write to it in place (zero-copy, the fast single-domain path). Only
-     * when the submit runs in a NON-0 domain (multi-domain) is the caller's (domain-0) C out-of-domain, so
-     * route outputs through the in-domain per-core scratch c->mcc[i] and copy back in end. */
-    int direct = (dom == 0);
-    if (direct) for (int i = 0; i < S; i++) if (!dma_find(c, (void*)tasks[i].C)) { direct = 0; break; }
+    /* DIRECT vs COPY-BACK: write the caller's C in place (zero-copy) iff EVERY C is a resident DMA buffer
+     * ALREADY in the submit's domain (`dom`) — true for single-domain (domain 0), and for multi-domain when
+     * the caller places C in the node's domain (Lever 1: per-domain output buffers). Any mismatch/absence
+     * falls back to the in-domain per-core scratch c->mcc[i] + copy-back in end. */
+    int direct = 1;
+    for (int i = 0; i < S; i++) { struct buf *cb = dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = (size_t)P * N0 * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
