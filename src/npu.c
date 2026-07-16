@@ -1301,6 +1301,11 @@ void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>
  * output scratch follows the most-recently-set pack domain. domain<0 reverts to the process default
  * (env ORK_IOMMU_DOMAIN, else 0). Domains are created lazily by the kernel on first use. */
 void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(c) c->pack_domain = domain<0 ? -1 : domain; }
+int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   /* current pack domain (save/restore around a domain-targeted alloc) */
+/* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
+ * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
+ * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
+void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) dom_activate(c, domain<0?0:domain); }
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
@@ -8879,11 +8884,12 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     unsigned dom = tasks[0].w->domain;
     int N0 = tasks[0].w->N;
     /* DIRECT vs COPY-BACK: write the caller's C in place (zero-copy) iff EVERY C is a resident DMA buffer
-     * ALREADY in the submit's domain (`dom`) — true for single-domain (domain 0), and for multi-domain when
-     * the caller places C in the node's domain (Lever 1: per-domain output buffers). Any mismatch/absence
-     * falls back to the in-domain per-core scratch c->mcc[i] + copy-back in end. */
+     * ALREADY in the submit's domain (`dom`). True for single-domain (domain 0), and for multi-domain when
+     * the caller places C in the node's domain (Lever 1: per-domain output). Any mismatch/absence => in-domain
+     * per-core scratch c->mcc[i] + copy-back in end. */
     int direct = 1;
     for (int i = 0; i < S; i++) { struct buf *cb = dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
+    if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d dom=%u direct=%d N=%d\n", S, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = (size_t)P * N0 * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);

@@ -112,6 +112,8 @@ void         ork_npu_set_core_budget(ork_npu *ctx, int n);
  * tiles in `domain` and records it; ork_mm_run* then submits that weight's matmuls against the same
  * domain automatically. domain<0 reverts to the process default (env ORK_IOMMU_DOMAIN, else 0). */
 void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
+int          ork_npu_pack_domain(const ork_npu *ctx);   /* current pack domain (for save/restore) */
+void         ork_npu_activate_domain(ork_npu *ctx, int domain);   /* make domain active (establish); alloc in-domain buffers after this */
 int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
 
 /**
