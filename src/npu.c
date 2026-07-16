@@ -8697,12 +8697,27 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     sub.flags = ss ? 0x1u : ork_ppflags(); sub.task_number = P; sub.task_obj_addr = c->task.obj;
     sub.core_mask = 1u << tc; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
-    int reps = c->warmed ? 1 : 2;
+    /* RE PROBE (ORK_STEER_HALT_AT=<p>): does the PC sequencer read each program's chain descriptor from DRAM
+     * at EXECUTION time (steerable mid-flight) or pre-cache the whole chain at submit? Submit NONBLOCK, then
+     * overwrite program p's next-amount word (0x0014, amount 0 = documented clean halt) in the LIVE regcmd
+     * DRAM. If the chain halts at p (outputs beyond p stay unwritten) -> read-from-DRAM -> dynamic steering /
+     * our-own-submit-API is reachable; if it runs to the end -> pre-cached. Matmul chains only (dw=216). */
+    int steer_at; { const char*e=getenv("ORK_STEER_HALT_AT"); steer_at = e?atoi(e):-1; }   /* per-call: probe warms unset, then sets it */
+    int do_steer = (steer_at >= 0 && steer_at < P-1 && !ss);
+    if (do_steer) sub.flags |= 0x2u;                        /* NONBLOCK: ioctl returns so we can edit mid-flight */
+    int reps = do_steer ? 1 : (c->warmed ? 1 : 2);
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = mm_timeout_ms();
         if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
+        if (do_steer) {   /* mid-flight: halt program steer_at by zeroing its next-amount (0x0014) in DRAM */
+            uint32_t *rcp = (uint32_t*)((char*)c->regcmd.cpu + (size_t)steer_at * REGCMD_I8_N * 4);
+            rcp[218] = 0x0014;   /* 0x0014 | (amount 0) => sequencer stops after this program */
+            __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
+            usleep((unsigned)(P*60u + 8000u));   /* drain the (halted-or-full) chain before the FROM bsync */
+            if (getenv("ORK_VERBOSE")) fprintf(stderr, "[STEER] NONBLOCK submit + halt-inject at prog %d/%d\n", steer_at, P);
+        }
     }
     c->warmed = 1;
 

@@ -613,3 +613,7 @@ jit_i4_i8_probe: tools/jit_i4_i8_probe.c $(CORE)
 # static-ID doorbell probe: can one address show the current op ID? Not in all/test.
 static_id_probe: tools/static_id_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
+# RE probe: does the PC sequencer read chain descriptors from DRAM at exec-time (steerable) or pre-cache? Not in all/test.
+steer_probe: tools/steer_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
