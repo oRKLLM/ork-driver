@@ -357,6 +357,10 @@ static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
 #define ORK_IOVA_NDOM 64
 static size_t g_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
 static long g_bcreate_n, g_bimport_n, g_bdestroy_n;   /* cumulative alloc/free counts (ORK_PRESUBMIT_TRACE leak diag) */
+/* NPU on-chip SRAM total (bytes), queried once at init. 0 => the kernel/DTB did NOT allocate SRAM to the
+ * NPU (stock config, no CONFIG_ROCKCHIP_RKNPU_SRAM / no rkvdec0_sram reassignment). bcreate uses this to
+ * fail a TRY_ALLOC_SRAM request over to DRAM so the submit path is portable across kernels/DTBs. */
+static uint64_t g_sram_total = 0;
 static size_t ork_iova_ceiling(void){
     static size_t v=0;
     if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):3900; if(mb<=0)mb=3900; v=(size_t)mb*1024u*1024u; }
@@ -403,9 +407,18 @@ static void ork_sig_teardown(int sig){
 }
 static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     int dom=ork_dom(domain); size_t need=pgup(size);
+    /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (g_sram_total
+     * ==0, stock kernel/DTB), drop to DRAM up front — don't even try. If SRAM exists but the alloc faults
+     * (SRAM full/contended), retry once in DRAM below. Keeps the async submit path portable. */
+    if((flags & RKNPU_MEM_TRY_ALLOC_SRAM) && g_sram_total==0) flags &= ~RKNPU_MEM_TRY_ALLOC_SRAM;
     if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
     struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){
+        if(flags & RKNPU_MEM_TRY_ALLOC_SRAM){   /* SRAM path faulted -> DRAM failover (retry once, same IOVA reservation) */
+            memset(&c,0,sizeof c); c.size=need; c.flags=flags & ~RKNPU_MEM_TRY_ALLOC_SRAM; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
+            if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
+        } else {perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
+    }
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");ork_iova_release(dom,need);return (struct buf){0};}
     void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
@@ -1167,6 +1180,12 @@ ork_npu *ork_npu_init(void){
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in bcreate (see g_sram_total). */
+    { struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_TOTAL_SRAM_SIZE;
+      if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) g_sram_total=a.value;
+      if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
+          fprintf(stderr,"[ork] NPU SRAM: %u KiB %s\n",(unsigned)(g_sram_total>>10),
+                  g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
     ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
