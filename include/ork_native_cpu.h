@@ -28,24 +28,27 @@ typedef enum { ORK_CPU_I4=0, ORK_CPU_NF4=1, ORK_CPU_I5=2, ORK_CPU_I6=3, ORK_CPU_
 
 static const uint8_t ORK_CPU_BITSEL[16]={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
 
-/* int4 uniform: 32 wts/iter, low nibbles=w[0..15], high=w[16..31], sign-extend 4-bit. reads K/2 */
+/* int4 uniform, ork-driver Bi4 CONSECUTIVE layout (byte j = w[2j]low|w[2j+1]high, matches
+ * expand_chan_i4_i8): 32 wts/iter; vld2 deinterleaves the activation into even/odd. sign-extend 4-bit. */
 static inline int32_t ork_dot_i4(const int8_t*a,const uint8_t*b4,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
-        uint8x16_t pk=vld1q_u8(b4+kb);
-        int8x16_t lo=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vandq_u8(pk,m)),4),4);
-        int8x16_t hi=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),4),4);
-        ac=vdotq_s32(ac,lo,vld1q_s8(a+k)); ac=vdotq_s32(ac,hi,vld1q_s8(a+k+16));
+        uint8x16_t pk=vld1q_u8(b4+kb);                       /* w[k..k+31] as 16 consecutive pairs */
+        int8x16_t lo=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vandq_u8(pk,m)),4),4);  /* w[k],w[k+2],..,w[k+30] */
+        int8x16_t hi=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),4),4);/* w[k+1],..,w[k+31] */
+        int8x16x2_t a2=vld2q_s8(a+k);                        /* a2.val[0]=a[even], a2.val[1]=a[odd] */
+        ac=vdotq_s32(ac,lo,a2.val[0]); ac=vdotq_s32(ac,hi,a2.val[1]);
     }
     return vaddvq_s32(ac);
 }
-/* NF4: nibble INDEX -> int8 code via vqtbl LUT (free). reads K/2 */
+/* NF4: Bi4 CONSECUTIVE nibble INDEX -> int8 code via vqtbl LUT (free). vld2 activation. */
 static inline int32_t ork_dot_nf4(const int8_t*a,const uint8_t*b4,int8x16_t lut,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
         uint8x16_t pk=vld1q_u8(b4+kb);
-        ac=vdotq_s32(ac,vqtbl1q_s8(lut,vandq_u8(pk,m)),vld1q_s8(a+k));
-        ac=vdotq_s32(ac,vqtbl1q_s8(lut,vshrq_n_u8(pk,4)),vld1q_s8(a+k+16));
+        int8x16x2_t a2=vld2q_s8(a+k);
+        ac=vdotq_s32(ac,vqtbl1q_s8(lut,vandq_u8(pk,m)),a2.val[0]);
+        ac=vdotq_s32(ac,vqtbl1q_s8(lut,vshrq_n_u8(pk,4)),a2.val[1]);
     }
     return vaddvq_s32(ac);
 }
@@ -128,22 +131,26 @@ static inline int ork_cpu_pack(ork_cpu_fmt fmt,int K,int N,const float*W,
         float inv = sc>0?1.0f/sc:0.0f;
         if(bscale) bscale[n] = fmt==ORK_CPU_NF4 ? sc/127.0f : sc;  /* NF4 codes = level*127 -> dequant mx/127 */
         if(fmt==ORK_CPU_I8){ for(int k=0;k<K;k++){int q=(int)lrintf(fr[k]*inv); i8[(size_t)n*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} continue; }
-        uint8_t*nb=nibble+(size_t)n*(K/2); uint8_t*b4=bit4?bit4+(size_t)n*(K/8):0; uint8_t*b5=bit5?bit5+(size_t)n*(K/8):0;
+        uint8_t*nb=nibble+(size_t)n*(K/2);
+        /* int4 / NF4: ork-driver Bi4 CONSECUTIVE layout — byte j = code(w[2j]) | code(w[2j+1])<<4. */
+        if(fmt==ORK_CPU_I4 || fmt==ORK_CPU_NF4){
+            for(int j=0;j<K/2;j++){ int c0,c1; int kl=2*j, kh=2*j+1;
+                if(fmt==ORK_CPU_NF4){ float wl=fr[kl]*inv,wh=fr[kh]*inv; if(wl>1)wl=1;if(wl<-1)wl=-1; if(wh>1)wh=1;if(wh<-1)wh=-1;
+                    int il=0,ih=0; float dl=1e9f,dh=1e9f; for(int q=0;q<16;q++){ float a=ORK_NF4_LVL[q]-wl;a=a<0?-a:a; if(a<dl){dl=a;il=q;} float cc=ORK_NF4_LVL[q]-wh;cc=cc<0?-cc:cc; if(cc<dh){dh=cc;ih=q;} }
+                    c0=il; c1=ih;
+                } else { c0=(int)lrintf(fr[kl]*inv); if(c0>7)c0=7;if(c0<-7)c0=-7; c1=(int)lrintf(fr[kh]*inv); if(c1>7)c1=7;if(c1<-7)c1=-7; }
+                nb[j]=(uint8_t)((c0&0xf)|((c1&0xf)<<4));
+            }
+            continue;
+        }
+        /* int5 / int6: LEAN 32-block nibble + bit4(/bit5) planes (CPU-only formats). */
+        uint8_t*b4=bit4?bit4+(size_t)n*(K/8):0; uint8_t*b5=bit5?bit5+(size_t)n*(K/8):0;
         if(b4) for(int i=0;i<K/8;i++) b4[i]=0; if(b5) for(int i=0;i<K/8;i++) b5[i]=0;
+        int lim = fmt==ORK_CPU_I5?15:31;
         for(int b=0;b<K/32;b++){ int km=b*4;
             for(int i=0;i<16;i++){ int kl=32*b+i, kh=32*b+16+i;
-                int cl,ch;
-                if(fmt==ORK_CPU_NF4){ /* nearest codebook index (0..15) */
-                    float wl=fr[kl]*inv, wh=fr[kh]*inv; if(wl>1)wl=1;if(wl<-1)wl=-1; if(wh>1)wh=1;if(wh<-1)wh=-1;
-                    int il=0,ih=0; float dl=1e9f,dh=1e9f;
-                    for(int j=0;j<16;j++){ float a=ORK_NF4_LVL[j]-wl; a=a<0?-a:a; if(a<dl){dl=a;il=j;}
-                                           float c=ORK_NF4_LVL[j]-wh; c=c<0?-c:c; if(c<dh){dh=c;ih=j;} }
-                    cl=il; ch=ih;
-                } else {
-                    int lim = fmt==ORK_CPU_I4?7:fmt==ORK_CPU_I5?15:31;
-                    cl=(int)lrintf(fr[kl]*inv); if(cl>lim)cl=lim;if(cl<-lim)cl=-lim;
-                    ch=(int)lrintf(fr[kh]*inv); if(ch>lim)ch=lim;if(ch<-lim)ch=-lim;
-                }
+                int cl=(int)lrintf(fr[kl]*inv); if(cl>lim)cl=lim;if(cl<-lim)cl=-lim;
+                int ch=(int)lrintf(fr[kh]*inv); if(ch>lim)ch=lim;if(ch<-lim)ch=-lim;
                 nb[16*b+i]=(uint8_t)((cl&0xf)|((ch&0xf)<<4));
                 if(b4){ if((cl>>4)&1) b4[km+i/8]|=(uint8_t)(1<<(i&7)); if((ch>>4)&1) b4[km+2+i/8]|=(uint8_t)(1<<(i&7)); }
                 if(b5){ if((cl>>5)&1) b5[km+i/8]|=(uint8_t)(1<<(i&7)); if((ch>>5)&1) b5[km+2+i/8]|=(uint8_t)(1<<(i&7)); }
