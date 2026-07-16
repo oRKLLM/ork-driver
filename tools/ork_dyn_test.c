@@ -1,0 +1,68 @@
+/* ork_dyn_test — exercise the dynamic-submit API (ork_dyn_begin/progress/halt/end).
+ *  A) full run: begin, end (no halt) -> all S outputs computed (==K).
+ *  B) early-exit: begin, poll progress, halt(H), end -> outputs 0..~H computed, rest untouched (NPU freed early).
+ *   make ork_dyn_test && sudo ./ork_dyn_test [S=16] [H=8]
+ * (NPU op; the halt leaves a partial kernel job — run alone; reboot if a later NPU op misbehaves.)
+ */
+#define _GNU_SOURCE
+#include "ork_npu.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
+static inline void civac(volatile void*p){ __asm__ volatile("dc civac,%0"::"r"(p):"memory"); }
+#define SENT 0x7fffffff
+
+int main(int argc,char**argv){
+    int S=argc>1?atoi(argv[1]):16, H=argc>2?atoi(argv[2]):8, K=512, N=512;
+    setvbuf(stdout,0,_IONBF,0);
+    ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
+    printf("ork_dyn_test: S=%d ops (K=%d,N=%d), halt at H=%d\n",S,K,N,H);
+    int8_t*A=(int8_t*)malloc(K); memset(A,1,K);   /* malloc (NOT ork_dma_alloc): zero-copy DMA-A miscomputes at M=1 */
+    int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
+    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!O){printf("dma_alloc fail\n");return 1;}
+    ork_mm_task_i8*tk=malloc(sizeof(ork_mm_task_i8)*S);
+    for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
+    int nwritten(void){ int n=0; for(int i=0;i<S;i++){ volatile int32_t*d=(volatile int32_t*)(O+(size_t)i*N+(N-1)); civac((void*)d); if(*d==K)n++; } return n; }
+
+    printf("  budget: ork_dyn_max_steps=%d (this chain S=%d)\n", ork_dyn_max_steps(), S);
+
+    /* A) full run — no halt */
+    ork_dyn_chain*h=ork_dyn_begin(c,S,tk); if(!h){printf("A: begin failed\n");return 1;}
+    int done=ork_dyn_end(h);
+    int na=nwritten();
+    printf("  A full: end highest=%d, outputs==K: %d/%d -> %s\n", done, na, S, na==S?"PASS":"FAIL");
+
+    /* B) early-exit — halt at H once progress passes a couple ops */
+    h=ork_dyn_begin(c,S,tk); if(!h){printf("B: begin failed\n");return 1;}
+    double t0=now_us(); int p=-1;
+    while((p=ork_dyn_progress(h))<2 && now_us()-t0<1e6) ;   /* wait until a couple ops in */
+    int hr=ork_dyn_halt(h,H);
+    int hd=ork_dyn_end(h);
+    int nw=nwritten();
+    printf("  B early-exit: halt(%d) rc=%d, progress-at-halt=%d, end highest=%d, outputs==K=%d/%d\n", H, hr, p, hd, nw, S);
+    printf("  ★ early-exit %s (outputs ~%d..%d done, rest freed): nw=%d in [%d,%d] => %s\n",
+           (nw<S && nw>=H)?"WORKED":"CHECK", 0, H, nw, H, H+3,
+           (nw<S && nw>=H-1 && nw<=H+3)?"PASS (NPU freed early)":(nw==S?"ran-to-end (halt too late / lead too short)":"AMBIGUOUS"));
+
+    /* C) UNINTERRUPTED WRAP (EXPERIMENTAL, opt-in): in-flight append races the kernel job model and can ABORT
+     *    the NPU (soft-reset) on a lost race — see ork_dyn_append. Gated so default runs stay board-safe. */
+    if(!getenv("ORK_DYN_TEST_APPEND")){ printf("  C wrap: skipped (set ORK_DYN_TEST_APPEND=1; experimental, can wedge)\n"); ork_npu_free(c); return 0; }
+    for(int i=0;i<S;i++){ volatile int32_t*d=(volatile int32_t*)(O+(size_t)i*N+(N-1)); *d=SENT; civac((void*)d);} __asm__ volatile("dsb ish":::"memory");
+    int START=S<8?2:4;
+    { char rs[16]; snprintf(rs,sizeof rs,"%d",S); setenv("ORK_DYN_RESERVE",rs,1); }   /* reserve budget = full S so append can extend in-flight */
+    h=ork_dyn_begin(c,START,tk); if(!h){printf("C: begin failed\n");return 1;}
+    unsetenv("ORK_DYN_RESERVE");
+    int appended=0, toolate=0;
+    for(int i=START;i<S;i++){ int r,tries=0; while((r=ork_dyn_append(h,&tk[i]))==1 && tries++<200000) ;
+        if(r==0) appended++; else { toolate=1; break; } }
+    int cd=ork_dyn_end(h);
+    int ncw=nwritten();
+    printf("  C wrap: began %d, appended %d in-flight (total %d), end highest=%d, outputs==K %d/%d%s\n",
+           START, appended, START+appended, cd, ncw, S, toolate?" [race lost -> planned break]":"");
+    printf("  ★ uninterrupted wrap => %s\n", ncw==S?"PASS (no break: chain extended in-flight)":(toolate?"PARTIAL (lost race; needs more headroom / faster fill)":"FAIL"));
+    ork_npu_free(c); return 0;
+}

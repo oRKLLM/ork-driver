@@ -617,3 +617,11 @@ static_id_probe: tools/static_id_probe.c $(CORE)
 # RE probe: does the PC sequencer read chain descriptors from DRAM at exec-time (steerable) or pre-cache? Not in all/test.
 steer_probe: tools/steer_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# dynamic-submit API test: begin/progress/halt/end (NONBLOCK chain, per-op doorbell, mid-flight early-exit). Not in all/test.
+ork_dyn_test: tools/ork_dyn_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
+ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

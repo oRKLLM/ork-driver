@@ -8752,6 +8752,219 @@ cleanup:
     return ok;
 }
 
+/* ================= DYNAMIC STEERED SUBMISSION API (validated by tools/steer_probe + doorbell_id_probe) =====
+ * A run_chain_i8 chain, but submitted NONBLOCK so the host can (a) watch per-op progress via each op's output
+ * doorbell (dc civac poll), (b) HALT it mid-flight to free the NPU early (write 0x0014=0 into a future op's
+ * live regcmd descriptor — the sequencer reads it from DRAM at exec-time), (c) later, redirect the next-pointer
+ * for runtime routing. v1 constraints: M=1 per task, single-slice conforming K (K%512==0, K<=4096), and A/C
+ * resident in ork_dma_alloc buffers (so we hold DMA addrs + poll outputs coherently). One program per task
+ * (P==S). Steering must lead the sequencer by ~1-2 ops (time it off ork_dyn_progress). */
+struct ork_dyn_chain {
+    ork_npu *c; int S, P, N, reserve; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow) */
+    struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
+    int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][N-1] */
+    struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
+};
+#define ORK_DYN_SENT 0x7fffffff
+ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if (!c || S < 1 || S > 1024 || !tasks) return NULL;   /* S==1 is valid: a 1-program chain (task_number=1 runs it) */
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1) return NULL;
+        if (w->K % 512 || w->K > 4096) return NULL;
+        if (w->Sk != 1 && !w->Bf) return NULL;
+        if (!dma_find(c, (void*)tasks[i].C)) return NULL; }   /* C must be resident (doorbell poll + writeback); A is copied to scratch */
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    int fd = c->fd, CBUF = c->soc->cbuf_elems, P = S;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = S; h->P = P; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain;
+    uint32_t rc[REGCMD_I8_N + 4];
+    const void *seenA[1024]; uint32_t seenAdma[1024]; int nseenA = 0;   /* dedup scratch copies of a shared A pointer */
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K, N = w->N;
+        struct buf *cb = dma_find(c, (void*)tasks[i].C);
+        /* A: copy into a scratch DMA buffer (zero-copy A is bit-wrong at M=1 — the known ZC-A M=1 bug),
+         * deduped by pointer (a shared activation is copied once). */
+        uint32_t adma;
+        struct buf *ab = dma_find(c, (void*)tasks[i].A);
+        if (ab) { bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)tasks[i].A - (const char*)ab->cpu)); }
+        else { int hit = -1; for (int j = 0; j < nseenA; j++) if (seenA[j] == tasks[i].A) { hit = j; break; }
+               if (hit >= 0) adma = seenAdma[hit];
+               else { struct buf s = bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) { for (int j=0;j<h->nascr;j++) bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
+                      memcpy(s.cpu, tasks[i].A, (size_t)K); bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s;
+                      if (nseenA < 1024) { seenA[nseenA] = tasks[i].A; seenAdma[nseenA] = adma; nseenA++; } } }
+        uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
+        uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+        memset(rc, 0, sizeof rc);
+        synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
+        if (validate_regcmd("ork_dyn", c, rc, REGCMD_I8_N, w, h->ascr, h->nascr)) { for (int j=0;j<h->nascr;j++) bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
+        if (i < P - 1) { uint64_t nx = c->regcmd.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
+            rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+        memcpy((char*)c->regcmd.cpu + (size_t)i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+        h->outbuf[i] = cb; h->outptr[i] = (int32_t*)tasks[i].C;
+    }
+    /* RESERVE a budget: submit task_number=reserve (>= S) so the chain can be EXTENDED in-flight (ork_dyn_append)
+     * up to `reserve`. task_number is IMMUTABLE post-submit — the HW walking past it aborts the job (measured:
+     * -22), so the budget must be reserved up front. Reserved slots [S,reserve) are pre-filled with program S-1
+     * (a valid terminator) so their task descriptors are valid; the HW never reaches them (the frontier
+     * terminator halts it) until append fills them with real work. This is the pre-allocation the wrap needs. */
+    int reserve = P; { const char *e = getenv("ORK_DYN_RESERVE"); if (e) { int r = atoi(e); if (r > reserve) reserve = r; if (reserve > 1024) reserve = 1024; } }
+    h->reserve = reserve;
+    for (int p = P; p < reserve; p++) memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);   /* rc still holds program S-1 (terminator) */
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    /* task_number=reserve PC-chain model (like run_chain_i8): kernel programs PC from task[0]; the HW walks via
+     * each program's in-regcmd next-descriptor (0x0010/0x0014), bounded by task_number. ALL reserve descriptors
+     * must be present (task_number=1 runs program 0 ONLY — measured; it does NOT walk). */
+    struct rknpu_task *t = c->task.cpu;
+    #define ORK_DYN_TASKS() do { memset(t, 0, (size_t)reserve * sizeof *t); for (int p = 0; p < reserve; p++) { \
+        t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff; \
+        t[p].regcfg_amount = 108; t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4; } } while (0)
+    ORK_DYN_TASKS();
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = ork_ppflags(); sub.task_number = reserve; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)reserve};
+    sub.timeout = mm_timeout_ms();
+    int _dbg = getenv("ORK_DYN_DEBUG") != NULL;
+    sub.flags |= 0x2u;   /* NONBLOCK: returns so the host can steer/poll */
+    /* Cold mode-establishment needs a warm pass, but a BLOCKING multi-task submit (flags 0x5) EINVALs +
+     * soft-resets here. So warm with a throwaway NONBLOCK pass (which works), poll it to completion, then
+     * re-seed and run the real pass. Cold without any warm is flaky (miscomputes — measured 1/16). */
+    #define ORK_DYN_SEED() do { for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1)); \
+        *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while (0)
+    if (!c->warmed) {
+        ORK_DYN_SEED(); sub.timeout = mm_timeout_ms();
+        if (!rknpu_submit_ioctl(fd, &sub, h->dom)) {                 /* warm pass */
+            double tw = ork_now_us(); for (;;) { int alld = 1;
+                for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
+                    __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_DYN_SENT) { alld = 0; break; } }
+                if (alld || ork_now_us() - tw > 2e6) break; } }
+        c->warmed = 1;
+    }
+    ORK_DYN_SEED();
+    sub.timeout = mm_timeout_ms();
+    int rr = rknpu_submit_ioctl(fd, &sub, h->dom);
+    if (_dbg) fprintf(stderr, "[dyn] NONBLOCK submit rc=%d (flags=0x%x task_number=%u)\n", rr, sub.flags, sub.task_number);
+    if (rr) { free(h); return NULL; }
+    if (_dbg) { usleep((unsigned)(P*80u+4000u)); for (int i = 0; i < S && i < 8; i++) { volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(h->N-1));
+        __asm__ volatile("dc civac,%0"::"r"(db):"memory"); fprintf(stderr, "[dyn] post-NB   out[%d][N-1]=%d (want %d)\n", i, *db, tasks[i].w->K); } }
+    return h;
+}
+/* Highest op index whose output has landed in DRAM (doorbell), or -1 if none yet. Non-blocking. */
+int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
+    for (int i = 0; i < h->S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
+        __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db != ORK_DYN_SENT) hi = i; }
+    return hi; }
+/* ---- Budget accounting: a submit runs a FIXED step count and the NPU STOPS at the end (program P-1's
+ * terminator). Work longer than one chain must be split into successive begin() calls; these let the caller
+ * size chunks (max_steps) and know how close the running chain is to its end (remaining) so it can plan the
+ * next submit without an unintended break. (Single-stream NPU can't overlap submits, so the wrap costs one
+ * submit floor ~167us per chain — negligible at realistic step counts.) */
+int ork_dyn_max_steps(void) { return 1024; }             /* per-chain step cap: API arrays (regcmd holds ~2340, task buf ~13107) */
+int ork_dyn_steps(ork_dyn_chain *h) { return h ? h->P : -1; }             /* total steps submitted in this chain */
+int ork_dyn_remaining(ork_dyn_chain *h) { if (!h) return -1; int p = ork_dyn_progress(h); return h->P - (p + 1); }  /* steps not yet completed (budget left) */
+/* WRAP primitive — EXPERIMENTAL / NOT PRODUCTION-SAFE. Extends a RUNNING chain in-flight by filling `task`
+ * into the next reserved slot and rewriting the current terminator into a continue-descriptor. The sequencer
+ * reads descriptors from DRAM at exec-time, so IF the rewrite lands before the sequencer reaches the frontier
+ * it walks on. BUT this is a hard race against the kernel's fixed-task_number job model: if the rewrite lands
+ * AFTER the sequencer passed the frontier, the job aborts (ret -22, ~10s timeout, NPU soft-reset) — MEASURED.
+ * So this can WEDGE the NPU on a lost race. The robust wrap is chunk + resubmit (each chunk a clean job;
+ * inter-chunk bubble ~one submit floor, <0.1% at large chunks). Kept for research; gate behind a reserved
+ * budget (ORK_DYN_RESERVE) and keep the fill frontier well ahead of ork_dyn_progress. Returns 1 (too late),
+ * 0 (ok), <0 (error). Same v1 op constraints as begin (M=1, DT_I8, K%512==0 && K<=4096, N matches, C resident). */
+#define ORK_DYN_HEADROOM 2
+int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task) {
+    if (!h || !task) return -1;
+    ork_npu *c = h->c; int fd = c->fd, CBUF = c->soc->cbuf_elems;
+    ork_w *w = task->w;
+    if (!w || w->dtype != DT_I8 || task->M != 1 || w->Sn != 1) return -1;
+    if (w->K % 512 || w->K > 4096 || w->N != h->N) return -1;
+    if (w->Sk != 1 && !w->Bf) return -1;
+    if (h->P >= h->reserve) return -2;                 /* reserved budget exhausted — wrap to a fresh chain */
+    int prog = ork_dyn_progress(h);
+    if (prog >= h->P - 1 - ORK_DYN_HEADROOM) return 1; /* sequencer too close to the terminator — lost the race */
+    int idx = h->P, K = w->K, N = w->N;
+    struct buf *cb = dma_find(c, (void*)task->C); if (!cb) return -1;
+    uint32_t adma;                                     /* A -> scratch (zero-copy A miscomputes at M=1) */
+    struct buf *ab = dma_find(c, (void*)task->A);
+    if (ab) { bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)task->A - (const char*)ab->cpu)); }
+    else { if (h->nascr >= 1024) return -2; struct buf s = bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) return -1;
+           memcpy(s.cpu, task->A, (size_t)K); bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s; }
+    uint32_t cdma = (uint32_t)(cb->dma + ((const char*)task->C - (const char*)cb->cpu));
+    uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+    uint32_t rc[REGCMD_I8_N + 4]; memset(rc, 0, sizeof rc);
+    synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);   /* new program: NO continue descriptor => it is the new terminator */
+    memcpy((char*)c->regcmd.cpu + (size_t)idx * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+    h->outbuf[idx] = cb; h->outptr[idx] = (int32_t*)task->C;
+    { volatile int32_t *db = (volatile int32_t*)(h->outptr[idx] + (N - 1)); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    /* flush the new program to DRAM BEFORE pointing the prior terminator at it (the sequencer must see a valid target) */
+    { char *p = (char*)c->regcmd.cpu + (size_t)idx * REGCMD_I8_N * 4; for (size_t off = 0; off < (size_t)REGCMD_I8_N * 4; off += 64) __asm__ volatile("dc cvac,%0"::"r"(p + off):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    /* rewrite prior terminator (idx-1) -> continue into idx: the extend */
+    uint32_t *pv = (uint32_t*)((char*)c->regcmd.cpu + (size_t)(idx - 1) * REGCMD_I8_N * 4);
+    uint64_t nx = c->regcmd.dma + (size_t)idx * REGCMD_I8_N * 4;
+    pv[216] = 0x0010 | ((nx & 0xffff) << 16); pv[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+    pv[218] = 0x0014 | (0x0037u << 16);        pv[219] = (0x0101 << 16);
+    __asm__ volatile("dc cvac,%0"::"r"(&pv[216]):"memory"); __asm__ volatile("dc cvac,%0"::"r"(&pv[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
+    h->P++; h->S++;
+    return 0;
+}
+/* Halt the chain AFTER program `at` (frees the NPU early) by zeroing its next-amount in the live regcmd DRAM.
+ * Must lead the sequencer (at > current progress by ~1-2). Returns 0/ok, -1 bad arg. */
+int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || at < 0 || at >= h->P - 1) return -1;
+    uint32_t *rcp = (uint32_t*)((char*)h->c->regcmd.cpu + (size_t)at * REGCMD_I8_N * 4);
+    rcp[218] = 0x0014;   /* 0x0014 | amount 0 => sequencer stops after program `at` */
+    __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
+    return 0; }
+/* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
+int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
+    double t0 = ork_now_us(); int last = -2; double lastchg = t0;
+    for (;;) { int p = ork_dyn_progress(h);
+        if (p >= h->S - 1) { last = p; break; }
+        if (p != last) { last = p; lastchg = ork_now_us(); }
+        else if (ork_now_us() - lastchg > 500.0) break;     /* 500us no progress => halted/done */
+        if (ork_now_us() - t0 > 3e6) break; }
+    struct buf *done[1024]; int nd = 0;
+    for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
+        for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
+        if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
+    int r = last; free(h); return r; }
+
+/* ============ SUBMIT QUEUE: chunk-pipeline over the dynamic API (the robust wrap) ==================
+ * Accumulate matmul tasks, submit them as clean task_number-bounded chunks, and let the NPU run a chunk
+ * NONBLOCK while the caller does other work (CPU int4 bulk in the decode split). This is the production
+ * wrap: each chunk is a complete job (no in-flight extension), work > chunk_max splits into successive
+ * chunks (inter-chunk bubble ~one submit floor, <0.1% at big chunks). Usage:
+ *   q = ork_dyn_queue_create(c, chunk_max);
+ *   for (...) ork_dyn_queue_push(q, &task);   // accumulate the NPU's share
+ *   ork_dyn_queue_flush(q);                    // NPU starts (NONBLOCK)
+ *   ... CPU does its bulk in parallel ...
+ *   n = ork_dyn_queue_drain(q);                // rendezvous + writeback
+ *   ork_dyn_queue_destroy(q); */
+struct ork_dyn_queue { ork_npu *c; int chunk_max; ork_mm_task_i8 *tasks; int n, cap, submitted; ork_dyn_chain *h; };
+ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max) {
+    if (!c) return NULL; int mx = ork_dyn_max_steps(); if (chunk_max <= 0 || chunk_max > mx) chunk_max = mx;
+    ork_dyn_queue *q = calloc(1, sizeof *q); if (!q) return NULL; q->c = c; q->chunk_max = chunk_max; return q; }
+int ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task) {
+    if (!q || !task) return -1;
+    if (q->n == q->cap) { int nc = q->cap ? q->cap * 2 : 64; void *t = realloc(q->tasks, (size_t)nc * sizeof *q->tasks); if (!t) return -1; q->tasks = t; q->cap = nc; }
+    q->tasks[q->n++] = *task; return 0; }
+/* submit the next pending chunk NONBLOCK (NPU runs while the caller works); no-op if one is already flying */
+int ork_dyn_queue_flush(ork_dyn_queue *q) {
+    if (!q) return -1; if (q->h || q->submitted >= q->n) return 0;
+    int cnt = q->n - q->submitted; if (cnt > q->chunk_max) cnt = q->chunk_max;
+    q->h = ork_dyn_begin(q->c, cnt, q->tasks + q->submitted); if (!q->h) return -1;
+    q->submitted += cnt; return 0; }
+int ork_dyn_queue_pending(ork_dyn_queue *q) { return q ? q->n - q->submitted : -1; }   /* not-yet-submitted count */
+/* drain: finish the flying chunk + submit/finish any remaining chunks, writeback; returns total ops completed */
+int ork_dyn_queue_drain(ork_dyn_queue *q) {
+    if (!q) return -1; int done = 0; if (!q->h) ork_dyn_queue_flush(q);
+    while (q->h) { int d = ork_dyn_end(q->h); q->h = NULL; if (d >= 0) done += d + 1;
+        if (q->submitted < q->n) ork_dyn_queue_flush(q); }
+    q->n = 0; q->submitted = 0; return done; }
+void ork_dyn_queue_destroy(ork_dyn_queue *q) { if (!q) return; if (q->h) ork_dyn_end(q->h); free(q->tasks); free(q); }
+
 /* CHAIN ASSEMBLER CORE: submit N pre-built HETEROGENEOUS programs as ONE PC-chain (task_number=N, one ioctl).
  * Packs the programs contiguously into c->regcmd (content-driven stride, per AGENTS.md); for each non-last
  * program it WRITES that program's PC next-descriptor at its designated desc_slot (word index, e.g. matmul

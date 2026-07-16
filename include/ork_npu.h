@@ -753,6 +753,29 @@ typedef struct {
 } ork_mm_task_i4;
 
 int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+
+/* ---- Dynamic steered submission (NONBLOCK chain + per-op doorbell progress + mid-flight halt) ----
+ * Submit an S-task int8 chain NONBLOCK, then watch/steer it from the host. v1: M=1/task, single-slice
+ * conforming K (K%512==0, K<=4096), A & C in ork_dma_alloc buffers. Enables early-exit-to-free-the-NPU and
+ * runtime observability without a kernel round-trip per chain. (See tools/ork_dyn_test.c.) */
+typedef struct ork_dyn_chain ork_dyn_chain;
+ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit; NULL on bad args */
+int          ork_dyn_progress(ork_dyn_chain *h);                                  /* highest completed op idx, -1 none */
+int          ork_dyn_halt(ork_dyn_chain *h, int at);                              /* halt after op `at` (free NPU early) */
+int          ork_dyn_end(ork_dyn_chain *h);                                       /* drain + writeback + free; ret highest done */
+int          ork_dyn_max_steps(void);                                             /* per-chain step cap (split longer work across chains) */
+int          ork_dyn_steps(ork_dyn_chain *h);                                     /* total steps submitted in this chain */
+int          ork_dyn_remaining(ork_dyn_chain *h);                                 /* steps not yet completed (budget left before the chain ends) */
+int          ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);        /* extend a running chain in-flight (wrap); 1=too late, 0=ok, <0=err */
+/* Submit QUEUE: chunk-pipeline over the dynamic API — accumulate tasks, run a chunk NONBLOCK while the
+ * caller does other work (CPU‖NPU decode split), auto-split work > chunk_max into successive clean chunks. */
+typedef struct ork_dyn_queue ork_dyn_queue;
+ork_dyn_queue *ork_dyn_queue_create(ork_npu *ctx, int chunk_max);                 /* chunk_max<=0 => max_steps */
+int          ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task);    /* enqueue a matmul */
+int          ork_dyn_queue_flush(ork_dyn_queue *q);                               /* submit next chunk NONBLOCK (NPU starts) */
+int          ork_dyn_queue_pending(ork_dyn_queue *q);                             /* tasks not yet submitted */
+int          ork_dyn_queue_drain(ork_dyn_queue *q);                               /* finish all chunks + writeback; ret total ops */
+void         ork_dyn_queue_destroy(ork_dyn_queue *q);
 /* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
  * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before
  * the chain. Chains [gate*silu -> up -> ...] in ONE submit. lut/params as ork_mm_run_i8_silu (build with
