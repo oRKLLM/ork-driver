@@ -66,3 +66,17 @@ native ‖ NPU=int8 minimal IOVA slice, concurrent). Prefill PATH-B profile (57 
 - LEVER to raise the NPU prefill share past 14.5% (toward the 88% balance): EXPAND IOVA via ORK_DOMAINS>1
   (spread experts across N IOMMU domains; ~6 domains reaches the balance point). Multi-domain is wedge-prone
   (multi-domain-runtime: non-deterministic layout, swap-bound) => validate carefully, single-domain clean first.
+
+## ★★ IOVA-CAPACITY CONSTRAINT (2026-07-15) — 35B backbone alone ~fills one domain
+Four single-domain runs all abort at "warmup prefill FAILED" (IOVA guard, graceful — NOT wedge, board healthy):
+  FRAC=0.15 default HOT_GIB=2.5 -> 954 experts, domain 0 at 3899 MiB (over 3900) -> dense pack Bb[0] fatal
+  HOT_GIB=1.8/1.0 -> STILL 954 experts (get_hot budget counts K*N ~1MiB/expert, all 954 fit under 1GiB) -> 3899
+  HOT_GIB=0.5 -> 512 experts (~512MiB) BUT domain STILL at 3889 -> +16MiB dense pack fatal
+=> The 35B-A3B BACKBONE (attn/shared/embed resident wcache) alone ≈ 3.4-3.9 GiB — it nearly FILLS one 3900 MiB
+   domain by itself. So single-domain CANNOT hold backbone + ANY MoE-expert offload. HOT_GIB barely helps
+   (experts are only ~1 GiB; the backbone is the fill). The baseline (MOE_NPU off) completes because experts
+   go to CPU (no IOVA). => Multi-domain (ORK_DOMAINS>=2) is REQUIRED to fit backbone + expert offload, not
+   just to scale the NPU prefill share. This is the designed fix ("spread domains" per the guard message).
+- overlap-eff: 0.58x (cold, 954 experts, 3508ms first-touch packs in-window) -> 0.80x (512 experts, fewer
+  cold packs). Warm/amortized should approach max(npu_t,cpu_t). The eff drag is cold first-touch packing.
+- NPU still ~7×/expert at prefill (npu 64ms/512e=125us vs cpu per-expert ~730us). Lever intact; IOVA is the gate.
