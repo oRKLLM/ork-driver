@@ -207,3 +207,8 @@ END-PHASE PLAN (after orkpack done + NPU free + base model down):
 - ★ hybrid_decode_probe PASS (pipeline aggregate gate): W=96 M=1 K2048 N512, NPU share=12 chained int8,
   CPU bulk=84 int4. CPU-all 2487us | CPU-bulk 2197 | NPU-solo 1969 (<=cpu-bulk => HIDDEN) | HYBRID 2317
   => 1.07x aggregate WIN at M=1. Near-balanced -> tunable higher. #14 pipeline VALIDATED worth building.
+- ★ orkpack read-mode VALIDATED: mmaps + runs coherent, 22.66 prefill / 4.42 decode tok/s, board clean,
+  no wedge. Prerequisite proven usable. (Decode 4.42 < Q4_K baseline 6.14 = current NON-hybrid path:
+  experts still CPU-Q4_K, orkpack used for NPU-resident dense across 16 domains + multi-domain variance.
+  #12/#14 hybrid = CPU-int4-bulk + NPU-int8-hidden, the design that changes this.)
+- NEXT: #12 wire ggml-ork CPU cold-expert path to read orkpack NF4 (ork_native_cpu.h, CPU-only PPL validate).
