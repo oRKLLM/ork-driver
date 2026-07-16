@@ -181,3 +181,21 @@ REMAINING (the genuinely-new integration):
 - #15 full orkpack build on 35B + e2e via ork_bench+bench_monitored.sh — board (wedge-risky, END).
 - int5/int6 orkpack dtype (DT_I5/I6) + dump/load — refinement (CPU-only).
 SCHEDULING: safe code + compile now; wedge-risky board (orkpack build, pipeline, e2e) batched at END.
+
+## BUILD PROGRESS (2026-07-16)
+IN FLIGHT (board, monitored): full NF4 orkpack build — ork_bench ORK_MOE_NPU=1 ORK_NF4=1 ORK_PERSIST=
+  full-nf4.orkpack. CONVERT mode persists ALL experts (ork_persist_write_experts) + computes MoE on CPU
+  (board-safe, no NPU MoE submit). Target ~20GB. (First attempt w/o MOE_NPU only dumped 1.4GB dense — the
+  sparse-touch gap; MOE_NPU=1 makes the expert handler fire + dump all experts.)
+DONE + VALIDATED this phase:
+- CPU kernel ladder + ork_cpu_pack aligned to ork-driver Bi4 CONSECUTIVE layout (int4/NF4) so CPU reads the
+  EXACT orkpack bytes (true single format); int5/6 lean. Roundtrip coherent (int4 .157/NF4 .107/int5 .068/
+  int6 .035/int8 .009). include/ork_native_cpu.h.
+- hybrid_decode_probe.c (decode pipeline aggregate validator) — built, runs END-phase (NPU-free).
+- nf4_fit.c (model-fitted NF4 codebook, Lloyd-Max) — built, runs when base model lands.
+END-PHASE PLAN (after orkpack done + NPU free + base model down):
+1. Validate orkpack ~20GB + loads coherent (ork_bench read-mode).
+2. nf4_sample (extract per-channel-normalized weights from base model) -> nf4_fit -> model NF4 LUT.
+3. hybrid_decode_probe -> does CPU-int4-bulk ‖ NPU-int8 overlap win at M=1 (gates #14).
+4. #12 wire ggml-ork cold-expert CPU path to read orkpack NF4 (ork_native_cpu.h) — CPU-only validate (PPL).
+5. #14 swap-hidden pipeline (if probe wins) + #15 e2e bench via ork_bench + bench_monitored.sh.
