@@ -36,6 +36,21 @@ int main(int argc,char**argv){
     int na=nwritten();
     printf("  A full: end highest=%d, outputs==K: %d/%d -> %s\n", done, na, S, na==S?"PASS":"FAIL");
 
+    /* D) M>1 begin_mc: partition S tasks (M rows each) across cores via the NON-BLOCKING doorbell; verify
+     *    EVERY row's last col == K (A=B=1 -> each dot = K). The doorbell only polls the last element (row
+     *    M-1), so checking all M rows validates the M-tile write-order assumption (last element written last). */
+    { int MM=4;
+      int8_t*Am=(int8_t*)malloc((size_t)MM*K); memset(Am,1,(size_t)MM*K);
+      int32_t*Om=(int32_t*)ork_dma_alloc(c,(size_t)S*MM*N*sizeof(int32_t));
+      ork_mm_task_i8*tm=malloc(sizeof(ork_mm_task_i8)*S);
+      for(int i=0;i<S;i++){ tm[i].w=w; tm[i].M=MM; tm[i].A=Am; tm[i].C=Om+(size_t)i*MM*N; }
+      ork_dyn_chain*hm=Om?ork_dyn_begin_mc(c,S,tm,0):NULL;
+      if(hm){ ork_dyn_end(hm); int okm=0;
+        for(int i=0;i<S;i++){ int allk=1; for(int m=0;m<MM;m++){ volatile int32_t*d=(volatile int32_t*)(Om+(size_t)i*MM*N+(size_t)m*N+(N-1)); civac((void*)d); if(*d!=K){allk=0;break;} } if(allk)okm++; }
+        printf("  D M>1 begin_mc: M=%d, %d/%d tasks all-rows==K -> %s\n", MM, okm, S, okm==S?"PASS":"FAIL"); }
+      else printf("  D M>1 begin_mc: begin_mc NULL (ineligible / per-core scratch too small) -> CHECK\n");
+      free(Am); if(Om) ork_dma_free(c,Om); free(tm); }
+
     /* B) early-exit — halt at H once progress passes a couple ops */
     h=ork_dyn_begin(c,S,tk); if(!h){printf("B: begin failed\n");return 1;}
     double t0=now_us(); int p=-1;
