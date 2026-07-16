@@ -237,6 +237,10 @@ mc_prof: tools/mc_prof.c $(CORE)
 hybrid_decode_probe: tools/hybrid_decode_probe.c $(CORE)
 	$(CC) $(CFLAGS) -march=native -Iinclude -o $@ $< $(CORE) -lm -lpthread
 
+# per-op doorbell progress probe: can the host see per-op chain completions by polling? Not in all/test.
+doorbell_id_probe: tools/doorbell_id_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
 # diagnostic: ceiling of within-backend CPU/NPU overlap (quant/deq pipelined behind NPU run). Not in all/test.
 overlap_probe: tools/overlap_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
