@@ -93,3 +93,20 @@ Multi-domain fit: 4.29 GiB resident across 2 domains (dom0 1.94 / dom1 2.36), pe
   slice; the win is capped by the streaming+quant overhead until THOSE are attacked (resident .orkpack so no
   re-resolve; act-quant reuse). The concurrent split is correct + safe but not the dominant lever at 35B-stream.
 - NEXT: controlled baseline (MOE_NPU off, same 2 domains) to isolate PATH-B delta.
+
+## ★★★ CONTROLLED RESULT (2026-07-15) — PATH-B LOSES on 35B (streaming-bound, not compute-bound)
+                    prefill    decode
+  BASELINE (MoE->CPU, 2 dom)  22.77      6.14   tok/s
+  SPEC (PATH-B MoE->NPU)      20.50      3.71   tok/s
+  delta                       0.90x      0.60x
+=> MoE-NPU offload LOSES both regimes on the 35B. Re-derived on the current stack => moe-offload-closed HOLDS.
+Causes (both match the user's framing):
+- PREFILL 0.90x: NPU MoE slice=367ms but enabling it ADDS 26s of NPU expert run-time (baseline run 2.2s ->
+  spec 28s) + gather/quant/park + IOVA pressure on the STREAMING path (24s weight re-resolve) that actually
+  dominates. Compute wasn't the bottleneck => splitting compute didn't help; it hurt (overhead).
+- DECODE 0.60x: MOE_NPU=1 routes decode (M=1) experts to the NPU hot-pool = the warned ~3x M=1 loss. The
+  user's regime rule (decode->CPU) is NOT enforced yet (task #8). Enforcing it recovers decode to ~6.14.
+- PREREQUISITE LEVER: the 24s weight re-resolve (dequant Q4_K->f32->int8->tile every pass) is the real wall.
+  A FULL resident .orkpack (pre-tiled int8 bytes, load-not-repack; board has only a 126MB STUB) collapses it.
+  Only AFTER that does the concurrent compute split become the deciding lever. Plan sound; split is premature
+  at 35B-stream until streaming is fixed. Caveat: multi-domain layout is non-deterministic (some run variance).
