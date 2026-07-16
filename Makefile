@@ -609,3 +609,7 @@ cpu_i4_vs_i8: tools/cpu_i4_vs_i8.c
 
 jit_i4_i8_probe: tools/jit_i4_i8_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# static-ID doorbell probe: can one address show the current op ID? Not in all/test.
+static_id_probe: tools/static_id_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
