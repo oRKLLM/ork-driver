@@ -148,3 +148,19 @@ Weight-recon rel-RMSE (Gaussian weights, tools/cpu_i4_vs_q4k.cpp):
   coherent, repack-free-ish = cheap lossless widen, hidden behind the swap). True zero-copy W4A4 = future.
 - Caveats: Gaussian synthetic (real weights have outliers where Q4_K per-block pulls ahead — validate int5 on
   a real tensor); int5 doesn't nibble-align (needs 8-vals/5-bytes bit-packing, more complex unpack than int4).
+
+## ★★★★★★★ FORMAT DECISION (2026-07-15) — NF4 (free vqtbl inflate), NOT int5 (ALU-bound at M=1)
+tools/int5_probe.c (M=1 GEMV, 4 threads, board), lossless round-trip PASS for all:
+  int4 uniform 23.4 GB/s (0.52x int8 time, acc 0.156) | NF4 vqtbl 22.7 GB/s (0.54x, acc 0.109) | int5
+  bit-plane 11.8 GB/s (1.29x int8 time — SLOWER than int8!, acc 0.073) | int8 24.4 GB/s
+- ★ int5's 5th-bit merge (bit-plane spread) is ALU-BOUND at M=1 — doesn't hide, ends up slower than int8.
+  No cheaper int5 encoding (bit-packed = worse cross-byte ALU; vqtbl2 needs the same 5-bit index assembly).
+  int5 DROPPED for decode.
+- ★ NF4 (int4 index -> int8 via single vqtbl1q LUT) is MEMORY-BOUND-FREE (22.7 = int4 speed) with better
+  accuracy (0.109 vs int4 0.156). The vqtbl lookup hides fully. This is the free-inflate format to use.
+- ★ REVISED format decision:
+  - CPU bulk STAYS Q4_K (memory-bound, acc 0.071, zero refactor — already optimal).
+  - NPU offload tier = NF4 (free vqtbl inflate -> int8 -> W8A8, repack-free, compact, least-sensitive OK).
+  - int8-storage for any full-accuracy NPU tier (zero-copy W8A8, 2x mem).
+  This kills the resolve tax for the NPU feed WITHOUT int5's ALU cost. Lean int4/NF4 inflate confirmed free;
+  int8 write to the DMA tile remains the only non-free NPU-feed cost (fundamental for an int8-reading NPU).
