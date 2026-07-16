@@ -8878,8 +8878,13 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1;
     unsigned dom = tasks[0].w->domain;
     int N0 = tasks[0].w->N;
-    /* grow each core's IN-DOMAIN output scratch c->mcc[i] to hold its programs' outputs (N int32 each) */
-    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
+    /* DIRECT vs COPY-BACK: when the submit runs in domain 0 AND every caller C is a resident DMA buffer, the C
+     * is already in the submit's domain — write to it in place (zero-copy, the fast single-domain path). Only
+     * when the submit runs in a NON-0 domain (multi-domain) is the caller's (domain-0) C out-of-domain, so
+     * route outputs through the in-domain per-core scratch c->mcc[i] and copy back in end. */
+    int direct = (dom == 0);
+    if (direct) for (int i = 0; i < S; i++) if (!dma_find(c, (void*)tasks[i].C)) { direct = 0; break; }
+    if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = (size_t)P * N0 * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; } }
@@ -8895,7 +8900,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N;
             if (astage + (size_t)K > AF->size) { free(h); return NULL; }
             memcpy((char*)AF->cpu + astage, t->A, (size_t)K); uint32_t adma = (uint32_t)(AF->dma + astage); astage += K;
-            uint32_t cdma = (uint32_t)(CC->dma + coff);   /* IN-DOMAIN per-core scratch; copied to caller's C in end */
+            struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
+            uint32_t cdma = direct ? (uint32_t)(cb->dma + ((const char*)t->C - (const char*)cb->cpu))   /* zero-copy: write C in place */
+                                   : (uint32_t)(CC->dma + coff);                                         /* multi-domain: in-domain scratch, copy back */
             uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
             memset(rc, 0, sizeof rc);
             synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
@@ -8907,7 +8914,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
             tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4;
             tk[p] = tt;
-            int gi = lo + p; h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+            int gi = lo + p;
+            if (direct) { h->outbuf[gi] = cb; h->outptr[gi] = (int32_t*)t->C; h->dst[gi] = NULL; }   /* poll C in place, no copy */
+            else        { h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C; }
             coff += (size_t)N * 4;
         }
         memset(&subs[i], 0, sizeof subs[i]);
