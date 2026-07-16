@@ -133,3 +133,18 @@ Sidesteps the accuracy wall by removing the runtime upconvert:
 - Near-term constraint: "no upconvert" + int4-default => needs NPU W4A4 (deferred). So near-term NPU tier=int8.
 - FEASIBILITY GATE = swap-hiding budget: per-token active int8 tiles must DMA into IOVA within the CPU window
   (~1.1GB/tok @ ~11GB/s ≈ 100ms vs ~160ms CPU decode). Plausible but TIGHT — the next thing to measure.
+
+## ★★★★★★ int5 + LUT DE-RISK (2026-07-15) — int5→int8→W8A8 unblocks the decode design WITHOUT W4A4
+Weight-recon rel-RMSE (Gaussian weights, tools/cpu_i4_vs_q4k.cpp):
+  int4 per-chan uniform (free inflate) 0.1559 | NF4 per-chan LUT (free) 0.1093 | int5 per-chan 0.0728
+  int4 per-64-block 0.1076 | Q4_K per-32-block 0.0713
+- ★ int5 per-channel = 0.0728 ≈ Q4_K 0.0713 — padding int4->int5 (16->32 levels) HALVES the step, matches Q4_K,
+  and KEEPS per-channel scale (inflate-friendly). User's int5 instinct validated.
+- ★ NF4 codebook LUT (the "lut in the orkpack") = 0.1093, 1.4x better than uniform int4, nibble-packs + free LUT.
+- ★★ KEY: int5 value [-15,15] fits an int8 byte EXACTLY => int5->int8 expand is LOSSLESS. So
+  int5-storage -> int8-container -> W8A8 = Q4_K-grade WEIGHT accuracy + INT8 ACTIVATIONS (coherent). This
+  SIDESTEPS the W4A4 PPL-104 problem (which was int4 ACTIVATIONS, not weights). => the decode design is
+  buildable NEAR-TERM without the deferred W4A4: NPU least-sensitive share = int5->int8->W8A8 (accurate,
+  coherent, repack-free-ish = cheap lossless widen, hidden behind the swap). True zero-copy W4A4 = future.
+- Caveats: Gaussian synthetic (real weights have outliers where Q4_K per-block pulls ahead — validate int5 on
+  a real tensor); int5 doesn't nibble-align (needs 8-vals/5-bytes bit-packing, more complex unpack than int4).
