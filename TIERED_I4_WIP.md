@@ -164,3 +164,20 @@ tools/int5_probe.c (M=1 GEMV, 4 threads, board), lossless round-trip PASS for al
   - int8-storage for any full-accuracy NPU tier (zero-copy W8A8, 2x mem).
   This kills the resolve tax for the NPU feed WITHOUT int5's ALU cost. Lean int4/NF4 inflate confirmed free;
   int8 write to the DMA tile remains the only non-free NPU-feed cost (fundamental for an int8-reading NPU).
+
+## ★★★★★★★★ BUILD PHASE (2026-07-15) — autonomous end-to-end build
+DONE + VALIDATED (ork-driver, board CPU-only):
+- CPU kernel ladder (int4/NF4/int5/int6/int8) NEON dots — lossless round-trip PASS; int4/NF4 free
+  (0.56-0.57x int8 time), int5/6 ALU-priced levers (1.37/1.88x). tools/int5_probe.c.
+- ork_cpu_pack (f32->tiered) + ork_native_cpu.h reusable header — pack->gemv vs f32 coherent:
+  int4 .157 / NF4 .107 / int5 .068 / int6 .035 / int8 .009. tools/ork_native_roundtrip.c.
+- NF4 fast vqtbl inflate already in ork-driver (inflate_chan_nf4_i8).
+KEY: the CORE tiered orkpack needs NO new code — int4+NF4 (ORK_NF4, quant_kind in blob) + int8
+  (source-type tier) + CPU-only build (ORK_ORKPACK_CPU) ALL EXIST. So the prerequisite full orkpack
+  (NF4 bulk + int8 sensitive) is buildable with current ggml-ork. int5/int6 = optional refinements.
+REMAINING (the genuinely-new integration):
+- #12 CPU reads ork-native int4/NF4 (not ggml Q4_K) — THE crux; CPU-only run validates (board-safe).
+- #14 swap-hidden decode pipeline (CPU int4 ‖ NPU int8 non-blocking) — needs board (wedge-risky, END).
+- #15 full orkpack build on 35B + e2e via ork_bench+bench_monitored.sh — board (wedge-risky, END).
+- int5/int6 orkpack dtype (DT_I5/I6) + dump/load — refinement (CPU-only).
+SCHEDULING: safe code + compile now; wedge-risky board (orkpack build, pipeline, e2e) batched at END.
