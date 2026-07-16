@@ -8763,6 +8763,7 @@ struct ork_dyn_chain {
     ork_npu *c; int S, P, N, reserve, mc; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core */
     struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
     int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][N-1] */
+    int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
 };
 #define ORK_DYN_SENT 0x7fffffff
@@ -8856,7 +8857,11 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
  * (run_stream_i8/mcworker already do it); NONBLOCK just lets the host poll doorbells instead of threads
  * blocking. Beats the std::thread+blocking-stream decode overlap: thread-free, 3-core, doorbell rendezvous.
  * ork_dyn_progress/end poll every task's C[N-1] (works across cores); halt/append are single-core only.
- * v1: M=1, DT_I8, K%512==0 && K<=4096, C resident; A staged into the per-core AF (zero-copy A is M=1-wrong). */
+ * v1: M=1, DT_I8, K%512==0 && K<=4096. MULTI-DOMAIN-SAFE: outputs go to the per-core IN-DOMAIN scratch
+ * c->mcc[i] (dom_activate-swapped, so always in the submit's domain), then end copies them back to the
+ * caller's C (a host memcpy) — so the caller's C need NOT be resident or in the submit's domain. A likewise
+ * staged into the per-core AF (zero-copy A is M=1-wrong). All S tasks must share one domain (a MoE node's
+ * experts do: layer-based residence); begin_mc submits + allocs its scratch in tasks[0]'s domain. */
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
@@ -8864,7 +8869,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
         if (w->Sk != 1 && !w->Bf) return NULL;
-        if (!dma_find(c, (void*)tasks[i].C)) return NULL; }
+        if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     if (mc_ensure(c, nc)) return NULL;
@@ -8872,20 +8877,25 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1;
     unsigned dom = tasks[0].w->domain;
+    int N0 = tasks[0].w->N;
+    /* grow each core's IN-DOMAIN output scratch c->mcc[i] to hold its programs' outputs (N int32 each) */
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
+        size_t osz = (size_t)P * N0 * 4;
+        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; } }
     uint32_t rc[REGCMD_I8_N + 4];
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     for (int i = 0; i < nc; i++) {
         int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
         Pc[i] = P; if (P < 1) continue;
         if ((size_t)P * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)P * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
-        struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
-        size_t astage = 0;
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        size_t astage = 0, coff = 0;
         for (int p = 0; p < P; p++) {
             const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N;
             if (astage + (size_t)K > AF->size) { free(h); return NULL; }
             memcpy((char*)AF->cpu + astage, t->A, (size_t)K); uint32_t adma = (uint32_t)(AF->dma + astage); astage += K;
-            struct buf *cb = dma_find(c, (void*)t->C);
-            uint32_t cdma = (uint32_t)(cb->dma + ((const char*)t->C - (const char*)cb->cpu));
+            uint32_t cdma = (uint32_t)(CC->dma + coff);   /* IN-DOMAIN per-core scratch; copied to caller's C in end */
             uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
             memset(rc, 0, sizeof rc);
             synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
@@ -8897,7 +8907,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
             tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4;
             tk[p] = tt;
-            int gi = lo + p; h->outbuf[gi] = cb; h->outptr[gi] = (int32_t*)t->C;
+            int gi = lo + p; h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+            coff += (size_t)N * 4;
         }
         memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = P; subs[i].task_obj_addr = c->mtk[i].obj;
@@ -9075,6 +9086,8 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
         if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C */
+    for (int i = 0; i < h->S; i++) if (h->dst[i]) memcpy(h->dst[i], h->outptr[i], (size_t)h->N * 4);
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h); return r; }
 
