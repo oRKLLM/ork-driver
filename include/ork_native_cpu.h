@@ -26,11 +26,18 @@
 
 typedef enum { ORK_CPU_I4=0, ORK_CPU_NF4=1, ORK_CPU_I5=2, ORK_CPU_I6=3, ORK_CPU_I8=4 } ork_cpu_fmt;
 
+/* The dot kernels use vdotq_s32 (dotprod ISA). This header is included by TUs (e.g. ggml-ork.cpp) whose
+ * global -march may not enable dotprod, so tag each kernel with target("+dotprod") — vdotq's always_inline
+ * then succeeds regardless of the TU's baseline. No-op when the TU already has dotprod. */
+#ifndef ORK_NATIVE_TARGET
+#define ORK_NATIVE_TARGET __attribute__((target("+dotprod")))
+#endif
+
 static const uint8_t ORK_CPU_BITSEL[16]={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,128};
 
 /* int4 uniform, ork-driver Bi4 CONSECUTIVE layout (byte j = w[2j]low|w[2j+1]high, matches
  * expand_chan_i4_i8): 32 wts/iter; vld2 deinterleaves the activation into even/odd. sign-extend 4-bit. */
-static inline int32_t ork_dot_i4(const int8_t*a,const uint8_t*b4,int K){
+static inline ORK_NATIVE_TARGET int32_t ork_dot_i4(const int8_t*a,const uint8_t*b4,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
         uint8x16_t pk=vld1q_u8(b4+kb);                       /* w[k..k+31] as 16 consecutive pairs */
@@ -42,7 +49,7 @@ static inline int32_t ork_dot_i4(const int8_t*a,const uint8_t*b4,int K){
     return vaddvq_s32(ac);
 }
 /* NF4: Bi4 CONSECUTIVE nibble INDEX -> int8 code via vqtbl LUT (free). vld2 activation. */
-static inline int32_t ork_dot_nf4(const int8_t*a,const uint8_t*b4,int8x16_t lut,int K){
+static inline ORK_NATIVE_TARGET int32_t ork_dot_nf4(const int8_t*a,const uint8_t*b4,int8x16_t lut,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
         uint8x16_t pk=vld1q_u8(b4+kb);
@@ -53,7 +60,7 @@ static inline int32_t ork_dot_nf4(const int8_t*a,const uint8_t*b4,int8x16_t lut,
     return vaddvq_s32(ac);
 }
 /* int5: nibble + bit4 plane, sign-extend 5-bit. reads 5K/8 (ALU-priced) */
-static inline int32_t ork_dot_i5(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,int K){
+static inline ORK_NATIVE_TARGET int32_t ork_dot_i5(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     uint8x16_t bsel=vld1q_u8(ORK_CPU_BITSEL), c4=vdupq_n_u8(0x10);
     for(int k=0,kb=0,km=0;k+32<=K;k+=32,kb+=16,km+=4){
@@ -67,7 +74,7 @@ static inline int32_t ork_dot_i5(const int8_t*a,const uint8_t*nb,const uint8_t*b
     return vaddvq_s32(ac);
 }
 /* int6: nibble + bit4 + bit5 planes, sign-extend 6-bit. reads 3K/4 (ALU-priced) */
-static inline int32_t ork_dot_i6(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,const uint8_t*b5p,int K){
+static inline ORK_NATIVE_TARGET int32_t ork_dot_i6(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,const uint8_t*b5p,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     uint8x16_t bsel=vld1q_u8(ORK_CPU_BITSEL), c4=vdupq_n_u8(0x10), c5=vdupq_n_u8(0x20);
     for(int k=0,kb=0,km=0;k+32<=K;k+=32,kb+=16,km+=4){
@@ -83,7 +90,7 @@ static inline int32_t ork_dot_i6(const int8_t*a,const uint8_t*nb,const uint8_t*b
     return vaddvq_s32(ac);
 }
 /* int8: reads K */
-static inline int32_t ork_dot_i8(const int8_t*a,const int8_t*b,int K){
+static inline ORK_NATIVE_TARGET int32_t ork_dot_i8(const int8_t*a,const int8_t*b,int K){
     int32x4_t ac=vdupq_n_s32(0); for(int k=0;k+16<=K;k+=16) ac=vdotq_s32(ac,vld1q_s8(b+k),vld1q_s8(a+k));
     return vaddvq_s32(ac);
 }
