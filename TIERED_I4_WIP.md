@@ -199,3 +199,11 @@ END-PHASE PLAN (after orkpack done + NPU free + base model down):
 3. hybrid_decode_probe -> does CPU-int4-bulk ‖ NPU-int8 overlap win at M=1 (gates #14).
 4. #12 wire ggml-ork cold-expert CPU path to read orkpack NF4 (ork_native_cpu.h) — CPU-only validate (PPL).
 5. #14 swap-hidden pipeline (if probe wins) + #15 e2e bench via ork_bench + bench_monitored.sh.
+
+## ★★★★★★★★★ END-PHASE (2026-07-16)
+- full-nf4.orkpack BUILT: 23.3GB (matches ~20GB expectation; NF4 bulk + int8 sensitive + some int8
+  fallback where NPU was busy). Convert mode = COLD (pack->dump->free ~0 resident) => 0.54 tok/s build
+  (one-time). Board clean, no wedge.
+- ★ hybrid_decode_probe PASS (pipeline aggregate gate): W=96 M=1 K2048 N512, NPU share=12 chained int8,
+  CPU bulk=84 int4. CPU-all 2487us | CPU-bulk 2197 | NPU-solo 1969 (<=cpu-bulk => HIDDEN) | HYBRID 2317
+  => 1.07x aggregate WIN at M=1. Near-balanced -> tunable higher. #14 pipeline VALIDATED worth building.
