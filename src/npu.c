@@ -8912,9 +8912,17 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
-    /* fp16 doorbell is WIP: the per-row completion poll that fixed int8 M>1 does NOT fully fix fp16 (its DPU
-     * output stage doesn't write each row's last col last -> flaky completion). Opt-in via ORK_DYN_F16 until
-     * the fp16 write order is understood; default keeps the async path int8-only (validated bit-exact). */
+    /* fp16 doorbell is WIP, opt-in via ORK_DYN_F16; default keeps the async path int8-only (validated
+     * bit-exact). The original "fp16 DPU writes each row's last col in a different order" hypothesis is
+     * DISPROVEN: an on-board seed-all + snapshot probe finds ZERO elements written after their row's last
+     * col — there is no fp16 output write-order permutation (the doorbell word is correct). The real fp16
+     * failures are two coherency/mode effects handled below when the gate is on: (1) fp16 direct-output
+     * needs a full-surface clean-BEFORE the NPU write (dirty/stale host lines race the write — the ZC_OUT
+     * class) — the ORK_MC_SEED fp16 branch seeds every element, not just last-cols; (2) fp16 mc drains
+     * in-submit (the doorbell win is int8's). These cut fp16 mc flakiness ~80%->~10%, but a RESIDUAL
+     * SYSTEMIC ~10-20% "all-16-fail" race remains in the cold warm->real double-submit (a whole-round
+     * mis-establish; NOT fixed by re-ork_npu_enter, seed timing, or extra drains — tested). So fp16 mc is
+     * NOT yet reliably bit-exact and stays gated. int8 A(M=1)/D(M>1) are solid (16/16 across ~80 runs). */
     if (dt == DT_F16 && !getenv("ORK_DYN_F16")) return NULL;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
@@ -8986,9 +8994,17 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
         subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
     }
+    /* Seed the doorbell(s). int8: every row's last col (the M-tile writes a row's last col last, so that
+     * word is the per-row completion sentinel). fp16: seed EVERY output element — fp16 direct-output needs
+     * a full clean-before-write (dc cvac cleans each output cache line to DRAM) or dirty/stale CPU lines in
+     * the output interior RACE the NPU's real-round writes and corrupt it (the same DMA cache-coherency
+     * class as the ORK_ZC_OUT fix). int8's warm/last-col seed is sufficient for int8; only fp16 needs the
+     * full-surface clean. Seeding all also lets end() poll any element, but done_i still uses last-cols. */
     #define ORK_MC_SEED() do { for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N; \
-        for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
-        *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } __asm__ volatile("dsb ish":::"memory"); } while (0)
+        if (dt == DT_F16) { for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + n); \
+            *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } \
+        else { for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
+        *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } } __asm__ volatile("dsb ish":::"memory"); } while (0)
     #define ORK_MC_ROUND() do { for (int i = 0; i < nc; i++) if (Pc[i]) { \
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
@@ -9003,6 +9019,24 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         ORK_MC_SEED();
     }
     ORK_MC_ROUND();   /* real NONBLOCK round: all cores concurrently */
+    if (dt == DT_F16) {
+        /* fp16 drains in-submit (int8 stays async — the doorbell win is int8's). Polling the real round to
+         * completion HERE (vs deferring the first poll to ork_dyn_end) removes a per-run race where end()
+         * read last-cols that briefly showed the throwaway warm round's stale values (fp16's warm job retires
+         * slower than int8's), reporting "done" in ~14us with wrong output. Poll-to-done in place makes end()
+         * see a settled surface. (This + the clean-before seed cut fp16 flakiness ~80%->~10%; a residual
+         * systemic ~10-20% cold-round mis-establish race persists — see the gate comment — so fp16 stays
+         * gated. int8 needs none of this.) */
+        double tp = ork_now_us();
+        for(;;){ int alld=1; for(int x=0;x<S;x++) if(!ork_dyn_done_i(h,x)){alld=0;break;} if(alld||ork_now_us()-tp>3e6) break; }
+        /* Full-surface invalidate-read of every output element after the doorbell fires. done_i (last-cols)
+         * signals the tile's row is written, but for fp16 the interior settles a touch later; this sweep both
+         * lets it settle and freshly invalidates every output line so end()/caller reads DRAM, not a stale
+         * line. Empirically this trims the per-task near-misses (14-15/16); the systemic all-16 race is
+         * separate (see gate comment) and NOT cured here. Cheap (M*N civac per op). int8 does not need it. */
+        for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N;
+            for (long e=0;e<(long)Mx*Nx;e++){ volatile int32_t*db=(volatile int32_t*)(h->outptr[x]+e); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); (void)*db; } }
+    }
     return h;
 }
 /* SPIN-KEEP-ALIVE PROBE — validates the persistent-job mechanism. Program 0 is a CIRCULAR spin (its next
@@ -9151,8 +9185,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
     for (;;) { int n = 0; for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) n++;
         if (n >= h->S) break;                               /* all tasks, all rows */
+        /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
+         * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
+         * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
         if (n != lastn) { lastn = n; lastchg = ork_now_us(); }
-        else if (ork_now_us() - lastchg > 500.0) break;     /* no progress => halted/done */
+        else if (!h->mc && ork_now_us() - lastchg > 500.0) break;   /* single-core only: no progress => halted */
         if (ork_now_us() - t0 > 3e6) break; }
     int last = ork_dyn_progress(h);
     struct buf *done[1024]; int nd = 0;
