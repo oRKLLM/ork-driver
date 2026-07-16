@@ -8802,6 +8802,16 @@ struct ork_dyn_chain {
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
 };
 #define ORK_DYN_SENT 0x7fffffff
+/* Per-row completion: a task is done only when EVERY row's last column has been overwritten. The M-tile
+ * scheduler does NOT write the global last element (row M-1, col N-1) strictly last for M>1 — so a single-
+ * word doorbell RACES (end() returns before earlier rows land; M=1 is safe since within a row last-col IS
+ * last). Poll all M rows' last cols (M<=64, cheap). Sentinel 0x7fffffff = INT_MAX / fp32 NaN — no valid
+ * matmul output equals it, so this is precision-agnostic (int8->int32, fp16->fp32). */
+static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
+    int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
+    for (int m = 0; m < M; m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(size_t)m*Nx+(Nx-1));
+        __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
+    return 1; }
 ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;   /* S==1 is valid: a 1-program chain (task_number=1 runs it) */
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
@@ -8900,18 +8910,27 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
+    int dt = tasks[0].w->dtype;
+    if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
+    /* fp16 doorbell is WIP: the per-row completion poll that fixed int8 M>1 does NOT fully fix fp16 (its DPU
+     * output stage doesn't write each row's last col last -> flaky completion). Opt-in via ORK_DYN_F16 until
+     * the fp16 write order is understood; default keeps the async path int8-only (validated bit-exact). */
+    if (dt == DT_F16 && !getenv("ORK_DYN_F16")) return NULL;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;
          * a bigger M would need multi-regcmd tiling the chain can't express, so the caller uses sync. */
-        if (!w || w->dtype != DT_I8 || tasks[i].M < 1 || tasks[i].M > 64 || w->Sn != 1) return NULL;
+        if (!w || w->dtype != dt || tasks[i].M < 1 || tasks[i].M > 64 || w->Sn != 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
+        if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf) return NULL;
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
-    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);   /* fp16 pipeline (layer owns reset, keep-warm-aware) */
+    else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     if (mc_ensure(c, nc)) return NULL;
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
+    if (dt == DT_F16 && CBUF > 32768) CBUF = 32768;   /* fp16 M-scheduler validated only to the 32768 tile (int8-only cbuf raise) */
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1;
     unsigned dom = tasks[0].w->domain;
@@ -8937,7 +8956,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         size_t astage = 0, coff = 0;
         for (int p = 0; p < P; p++) {
             const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N, M = t->M;
-            size_t asz = (size_t)M * K;
+            size_t esz = (dt == DT_F16) ? 2 : 1;         /* fp16 activation is 2 bytes/elem; int8 is 1 */
+            size_t asz = (size_t)M * K * esz;
             if (astage + asz > AF->size) { free(h); return NULL; }
             memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;
             struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
@@ -8945,7 +8965,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                                    : (uint32_t)(CC->dma + coff);                                         /* multi-domain: in-domain scratch, copy back */
             uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
             memset(rc, 0, sizeof rc);
-            synth_i8(rc, M, K, N, adma, bdma, cdma, 1, CBUF, 0);
+            if (dt == DT_F16) synth   (rc, M, K, N, adma, bdma, cdma, 1, CBUF);      /* fp16: fp32 C, REGCMD (same 224-word size) */
+            else              synth_i8(rc, M, K, N, adma, bdma, cdma, 1, CBUF, 0);
             if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
             if (p < P - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
                 rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -8965,8 +8986,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
         subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
     }
-    #define ORK_MC_SEED() do { for (int x = 0; x < S; x++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (h->nout[x]-1)); \
-        *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while (0)
+    #define ORK_MC_SEED() do { for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N; \
+        for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
+        *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } __asm__ volatile("dsb ish":::"memory"); } while (0)
     #define ORK_MC_ROUND() do { for (int i = 0; i < nc; i++) if (Pc[i]) { \
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
@@ -8975,8 +8997,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     ORK_MC_SEED();
     if (cold) {   /* throwaway NONBLOCK warm round (cold miscomputes without it), poll to done, reseed */
         ORK_MC_ROUND();
-        double tw = ork_now_us(); for (;;) { int alld = 1; for (int x = 0; x < S; x++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (h->nout[x]-1));
-            __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_DYN_SENT) { alld = 0; break; } }
+        double tw = ork_now_us(); for (;;) { int alld = 1; for (int x = 0; x < S; x++) if (!ork_dyn_done_i(h,x)) { alld = 0; break; }
             if (alld || ork_now_us() - tw > 2e6) break; }
         for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
         ORK_MC_SEED();
@@ -9060,9 +9081,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
 }
 /* Highest op index whose output has landed in DRAM (doorbell), or -1 if none yet. Non-blocking. */
 int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
-    for (int i = 0; i < h->S; i++) { int no = h->nout[i] ? h->nout[i] : h->N;   /* M*N (mc, M>1) or N (single-core M=1) */
-        volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (no - 1));
-        __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db != ORK_DYN_SENT) hi = i; }
+    for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) hi = i;   /* per-row: task done = ALL its rows' last cols written */
     return hi; }
 /* ---- Budget accounting: a submit runs a FIXED step count and the NPU STOPS at the end (program P-1's
  * terminator). Work longer than one chain must be split into successive begin() calls; these let the caller
@@ -9127,12 +9146,15 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0 || at >= 
     return 0; }
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
-    double t0 = ork_now_us(); int last = -2; double lastchg = t0;
-    for (;;) { int p = ork_dyn_progress(h);
-        if (p >= h->S - 1) { last = p; break; }
-        if (p != last) { last = p; lastchg = ork_now_us(); }
-        else if (ork_now_us() - lastchg > 500.0) break;     /* 500us no progress => halted/done */
+    /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
+     * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
+    double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
+    for (;;) { int n = 0; for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) n++;
+        if (n >= h->S) break;                               /* all tasks, all rows */
+        if (n != lastn) { lastn = n; lastchg = ork_now_us(); }
+        else if (ork_now_us() - lastchg > 500.0) break;     /* no progress => halted/done */
         if (ork_now_us() - t0 > 3e6) break; }
+    int last = ork_dyn_progress(h);
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;

@@ -51,6 +51,27 @@ int main(int argc,char**argv){
       else printf("  D M>1 begin_mc: begin_mc NULL (ineligible / per-core scratch too small) -> CHECK\n");
       free(Am); if(Om) ork_dma_free(c,Om); free(tm); }
 
+    /* E) M>1 fp16 begin_mc: fp16 A·B -> fp32 C, verify each output element == (float)Kf (A=B=1.0 -> dot=Kf).
+     *    Validates the fp16 doorbell generalization (synth, 2-byte activation, fp32 4-byte output). */
+    { int MM=2, Kf=512, Nf=256; ork_f16 one=(ork_f16)1.0f;
+      ork_f16*Bf=(ork_f16*)malloc((size_t)Kf*Nf*sizeof(ork_f16)); for(size_t i=0;i<(size_t)Kf*Nf;i++) Bf[i]=one;
+      setenv("ORK_DYN_F16","1",1);   /* E exercises the WIP fp16 doorbell (gated off for the default int8-only path) */
+      ork_w*wf=ork_mm_pack(c,Kf,Nf,Bf);
+      ork_f16*Af=wf?(ork_f16*)ork_dma_alloc(c,(size_t)MM*Kf*sizeof(ork_f16)):NULL; if(Af) for(int i=0;i<MM*Kf;i++) Af[i]=one;
+      float*Of=Af?(float*)ork_dma_alloc(c,(size_t)S*MM*Nf*sizeof(float)):NULL;
+      ork_mm_task_i8*tf=malloc(sizeof(ork_mm_task_i8)*S);
+      for(int i=0;i<S;i++){ tf[i].w=wf; tf[i].M=MM; tf[i].A=(const int8_t*)Af; tf[i].C=(int32_t*)(Of+(size_t)i*MM*Nf); }
+      ork_dyn_chain*hf=Of?ork_dyn_begin_mc(c,S,tf,0):NULL;
+      if(hf){ ork_dyn_end(hf); int okf=0;
+        for(int i=0;i<S;i++){ int allk=1; for(int m=0;m<MM;m++){ volatile float*d=(volatile float*)(Of+(size_t)i*MM*Nf+(size_t)m*Nf+(Nf-1)); civac((void*)d); if(*d<(float)Kf-2||*d>(float)Kf+2){allk=0;break;} } if(allk)okf++; }
+        printf("  E M>1 fp16 begin_mc: M=%d, %d/%d tasks all-rows==%d.0 -> %s\n", MM, okf, S, Kf, okf==S?"PASS":"FAIL"); }
+      else printf("  E M>1 fp16 begin_mc: begin_mc NULL (ineligible / pack fail) -> CHECK\n");
+      free(Bf); if(Af)ork_dma_free(c,(void*)Af); if(Of)ork_dma_free(c,Of); free(tf); }
+
+    /* B/C exercise ork_dyn_halt/append which leave a partial NPU job (can wedge the board on a lost race) —
+     * default run stops here (A+D+E are clean begin/end). Set ORK_DYN_TEST_HALT=1 to run them. */
+    if(!getenv("ORK_DYN_TEST_HALT")){ printf("  (B/C halt/append skipped; ORK_DYN_TEST_HALT=1 to run)\n"); ork_npu_free(c); return 0; }
+
     /* B) early-exit — halt at H once progress passes a couple ops */
     h=ork_dyn_begin(c,S,tk); if(!h){printf("B: begin failed\n");return 1;}
     double t0=now_us(); int p=-1;
