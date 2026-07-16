@@ -80,3 +80,16 @@ Four single-domain runs all abort at "warmup prefill FAILED" (IOVA guard, gracef
 - overlap-eff: 0.58x (cold, 954 experts, 3508ms first-touch packs in-window) -> 0.80x (512 experts, fewer
   cold packs). Warm/amortized should approach max(npu_t,cpu_t). The eff drag is cold first-touch packing.
 - NPU still ~7×/expert at prefill (npu 64ms/512e=125us vs cpu per-expert ~730us). Lever intact; IOVA is the gate.
+
+## ★★★ SPEC CONFIG COMPLETES (2026-07-15) — ORK_DOMAINS=2, PATH-B, PARK, FRAC=0.15
+35B-A3B-Q4_K_XL, ork_bench P128/G64: **prefill 20.50 tok/s | decode 3.71 tok/s**. NO WEDGE, board healthy.
+Multi-domain fit: 4.29 GiB resident across 2 domains (dom0 1.94 / dom1 2.36), per-token churn=0.
+- Concurrent CPU-int4(Q4_K) ‖ NPU-int8 MoE split WORKS end-to-end. But NPU contribution MARGINAL:
+  PATH-B npu=367ms ‖ cpu=13743ms; hot-expert hit-rate 15.9% (IOVA-limited pool) -> 84% experts CPU cold GEMV.
+- ★ BOTTLENECK is NOT the MoE split: wallsum 78s = quant(act) 25s (32%) + resolve(weight-stream) 24s (31%)
+  [dequant src->f32 14.5s + pack i8->IOVA 9.1s] + run 28s (36%). The 22GB model streamed through the 7800MiB
+  2-domain window => constant weight re-resolution DOMINATES. NPU MoE (367ms) is noise vs this.
+- Implication for the plan: raising the NPU prefill share (bigger FRAC / more domains) helps only the 367ms
+  slice; the win is capped by the streaming+quant overhead until THOSE are attacked (resident .orkpack so no
+  re-resolve; act-quant reuse). The concurrent split is correct + safe but not the dominant lever at 35B-stream.
+- NEXT: controlled baseline (MOE_NPU off, same 2 domains) to isolate PATH-B delta.
