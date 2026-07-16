@@ -212,3 +212,27 @@ END-PHASE PLAN (after orkpack done + NPU free + base model down):
   experts still CPU-Q4_K, orkpack used for NPU-resident dense across 16 domains + multi-domain variance.
   #12/#14 hybrid = CPU-int4-bulk + NPU-int8-hidden, the design that changes this.)
 - NEXT: #12 wire ggml-ork CPU cold-expert path to read orkpack NF4 (ork_native_cpu.h, CPU-only PPL validate).
+
+## STATE @ end of autonomous build burst (2026-07-16)
+DONE + VALIDATED (all committed, board-verified):
+- Full architecture designed (wiki: Hybrid-Precision-Decode-Architecture) with all refinements folded in
+  (single per-channel ork-native format; int8=NPU-only; int4=CPU bulk; int5/6=CPU-only levers; bit-need
+  routes engine; NF4 free-inflate; int5 dropped as shared).
+- CPU kernel+pack ladder (int4/NF4/int5/int6/int8) ALIGNED to ork-driver Bi4 consecutive layout (int4/NF4)
+  => CPU reads the EXACT orkpack bytes (single format). Roundtrip vs f32: int4 .157/NF4 .107/int5 .068/
+  int6 .035/int8 .009. include/ork_native_cpu.h (+ ork_cpu_pack).
+- Decode pipeline aggregate MECHANISM validated: hybrid_decode_probe 1.07x @M=1 (NPU int8 share chained,
+  HIDDEN in CPU int4 window: npu 1969us <= cpu-bulk 2197us). #14 worth building.
+- FULL NF4 orkpack BUILT: full-nf4.orkpack 23.3GB (prereq; MOE_NPU=1 convert persists all experts, CPU
+  compute, board-safe). Read-mode VALIDATED coherent: 22.66 prefill / 4.42 decode, board clean.
+- Tools: hybrid_decode_probe, nf4_fit (both compile).
+- O4N1 blob layout known: hdr{magic,ver,K,N,quant_kind}=20B + bscale[N]f32 + Bi4[K*N/2] (channel-contig).
+
+REMAINING (large multi-repo backend integration; NOT env-gated — FEATURE-DETECT orkpack presence+dtype):
+- #12: bump vendored ork-driver submodule (add ork_native_cpu.h) -> wire ggml-ork cold-expert path: when
+  persist_mode==1 && persist_idx[expert#e].dtype==ORKPACK_DT_I4, read mmap'd O4N1 (Bi4+bscale, quant_kind
+  -> NF4/I4) + int8-quant the activation + ork_cpu_gemv_m1 (else ggml vec_dot). Compile + CPU-only PPL validate.
+- #14: swap-hidden pipeline (CPU int4 bulk ‖ NPU int8 non-blocking chained share, little-core swap) — the ~7%.
+- #15: e2e via ork_bench + bench_monitored.sh (decode tok/s vs baseline; PPL of int4-majority).
+- NF4 LUT fit: BLOCKED on 35B base download (only 0.6B/1.7B bases present). nf4_sample -> nf4_fit -> LUT.
+Each #12/#14 step needs a ~15min fork build + board cycle; backend integration is iterative (per moe-offload history).
