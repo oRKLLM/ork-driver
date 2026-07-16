@@ -759,7 +759,8 @@ int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *task
  * conforming K (K%512==0, K<=4096), A & C in ork_dma_alloc buffers. Enables early-exit-to-free-the-NPU and
  * runtime observability without a kernel round-trip per chain. (See tools/ork_dyn_test.c.) */
 typedef struct ork_dyn_chain ork_dyn_chain;
-ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit; NULL on bad args */
+ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit (single-core chain); NULL on bad args */
+ork_dyn_chain *ork_dyn_begin_mc(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int nc); /* NONBLOCK across nc cores (nc<=0=all); halt/append N/A */
 int          ork_dyn_progress(ork_dyn_chain *h);                                  /* highest completed op idx, -1 none */
 int          ork_dyn_halt(ork_dyn_chain *h, int at);                              /* halt after op `at` (free NPU early) */
 int          ork_dyn_end(ork_dyn_chain *h);                                       /* drain + writeback + free; ret highest done */
@@ -770,7 +771,9 @@ int          ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);      
 /* Submit QUEUE: chunk-pipeline over the dynamic API — accumulate tasks, run a chunk NONBLOCK while the
  * caller does other work (CPU‖NPU decode split), auto-split work > chunk_max into successive clean chunks. */
 typedef struct ork_dyn_queue ork_dyn_queue;
-ork_dyn_queue *ork_dyn_queue_create(ork_npu *ctx, int chunk_max);                 /* chunk_max<=0 => max_steps */
+ork_dyn_queue *ork_dyn_queue_create(ork_npu *ctx, int chunk_max, int ncore);      /* chunk_max<=0=>max_steps; ncore<=1 single-core, >1 multi-core NONBLOCK */
+void         ork_dyn_queue_set_linger(ork_dyn_queue *q, int us);                  /* coalesce window; default = one submit floor */
+int          ork_dyn_queue_linger_us(ork_dyn_queue *q);
 int          ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task);    /* enqueue a matmul */
 int          ork_dyn_queue_flush(ork_dyn_queue *q);                               /* submit next chunk NONBLOCK (NPU starts) */
 int          ork_dyn_queue_pending(ork_dyn_queue *q);                             /* tasks not yet submitted */
