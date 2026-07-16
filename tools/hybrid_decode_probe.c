@@ -42,7 +42,7 @@ int main(int argc,char**argv){
     float*Wf=malloc((size_t)N*K*4); uint64_t s=0x2545F49ULL;
     for(size_t i=0;i<(size_t)N*K;i++){ s=s*6364136223846793005ULL+1442695040888963407ULL; Wf[i]=0.06f*((int)((s>>40)&1023)-512)/512.0f; }
     uint8_t*nib=malloc((size_t)N*K/2); float*bs=malloc(N*4);
-    ork_cpu_pack(ORK_CPU_I4,K,N,Wf,nib,0,0,0,bs,0);
+    ork_cpu_pack(ORK_CPU_I4,K,N,Wf,nib,0,0,0,0,bs,0);
     static ork_cpu_w cw; cw.fmt=ORK_CPU_I4; cw.nibble=nib; cw.bscale=bs; cw.K=K; cw.N=N;
     gCW=malloc(sizeof(ork_cpu_w)*W); for(int w=0;w<W;w++) gCW[w]=cw;
     int8_t*Ai8=malloc(K); for(int k=0;k<K;k++) Ai8[k]=(int8_t)((k%17)-8); gA=Ai8; gAsc=1.0f;

@@ -24,15 +24,15 @@ int main(void){
     /* f32 reference: out_ref[n] = sum_k W[n,k]*Av[k] */
     for(int n=0;n<N;n++){ double d=0; const float*fr=W+(size_t)n*K; for(int k=0;k<K;k++) d+=(double)fr[k]*Av[k]; ref[n]=(float)d; }
 
-    uint8_t*nib=malloc((size_t)N*K/2),*b4=malloc((size_t)N*K/8),*b5=malloc((size_t)N*K/8);
+    uint8_t*nib=malloc((size_t)N*K/2),*b4=malloc((size_t)N*K/8),*b5=malloc((size_t)N*K/8),*b6=malloc((size_t)N*K/8);
     int8_t*i8=malloc((size_t)N*K); float*bs=malloc(N*4); int8_t lut[16];
-    const char*names[]={"int4","NF4 ","int5","int6","int8"};
-    ork_cpu_fmt fmts[]={ORK_CPU_I4,ORK_CPU_NF4,ORK_CPU_I5,ORK_CPU_I6,ORK_CPU_I8};
+    const char*names[]={"int4","NF4 ","int5","int6","int8","int7"};
+    ork_cpu_fmt fmts[]={ORK_CPU_I4,ORK_CPU_NF4,ORK_CPU_I5,ORK_CPU_I6,ORK_CPU_I8,ORK_CPU_I7};
     printf("ork_native_roundtrip: K=%d N=%d Gaussian; pack->gemv vs f32 ref (rel-RMSE, incl activation-int8 err)\n",K,N);
-    for(int f=0;f<5;f++){ ork_cpu_fmt fmt=fmts[f];
-        memset(nib,0,(size_t)N*K/2); memset(b4,0,(size_t)N*K/8); memset(b5,0,(size_t)N*K/8);
-        ork_cpu_pack(fmt,K,N,W,nib,b4,b5,i8,bs,lut);
-        ork_cpu_w w={0}; w.fmt=fmt; w.nibble=nib; w.bit4=b4; w.bit5=b5; w.i8=i8; w.bscale=bs; w.K=K; w.N=N;
+    for(int f=0;f<6;f++){ ork_cpu_fmt fmt=fmts[f];
+        memset(nib,0,(size_t)N*K/2); memset(b4,0,(size_t)N*K/8); memset(b5,0,(size_t)N*K/8); memset(b6,0,(size_t)N*K/8);
+        ork_cpu_pack(fmt,K,N,W,nib,b4,b5,b6,i8,bs,lut);
+        ork_cpu_w w={0}; w.fmt=fmt; w.nibble=nib; w.bit4=b4; w.bit5=b5; w.bit6=b6; w.i8=i8; w.bscale=bs; w.K=K; w.N=N;
         if(fmt==ORK_CPU_NF4) w.nf4_lut=vld1q_s8(lut);
         ork_cpu_gemv_m1(&w,A,asc,out,0,N);
         printf("  %s : rel-RMSE %.4f\n", names[f], relrmse(out,ref,N));

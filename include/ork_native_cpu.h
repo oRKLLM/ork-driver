@@ -24,7 +24,7 @@
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
 
-typedef enum { ORK_CPU_I4=0, ORK_CPU_NF4=1, ORK_CPU_I5=2, ORK_CPU_I6=3, ORK_CPU_I8=4 } ork_cpu_fmt;
+typedef enum { ORK_CPU_I4=0, ORK_CPU_NF4=1, ORK_CPU_I5=2, ORK_CPU_I6=3, ORK_CPU_I8=4, ORK_CPU_I7=5 } ork_cpu_fmt;
 
 /* The dot kernels use vdotq_s32 (dotprod ISA). This header is included by TUs (e.g. ggml-ork.cpp) whose
  * global -march may not enable dotprod, so tag each kernel with target("+dotprod") — vdotq's always_inline
@@ -89,10 +89,62 @@ static inline ORK_NATIVE_TARGET int32_t ork_dot_i6(const int8_t*a,const uint8_t*
     }
     return vaddvq_s32(ac);
 }
+/* int7: nibble + bit4 + bit5 + bit6 planes, sign-extend 7-bit. reads 7K/8 (ALU-priced) */
+static inline ORK_NATIVE_TARGET int32_t ork_dot_i7(const int8_t*a,const uint8_t*nb,const uint8_t*b4p,const uint8_t*b5p,const uint8_t*b6p,int K){
+    int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
+    uint8x16_t bsel=vld1q_u8(ORK_CPU_BITSEL), c4=vdupq_n_u8(0x10), c5=vdupq_n_u8(0x20), c6=vdupq_n_u8(0x40);
+    for(int k=0,kb=0,km=0;k+32<=K;k+=32,kb+=16,km+=4){
+        uint8x16_t pk=vld1q_u8(nb+kb), lo=vandq_u8(pk,m), hi=vshrq_n_u8(pk,4);
+        uint8x16_t l4=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b4p[km]),  vdup_n_u8(b4p[km+1])),bsel),c4);
+        uint8x16_t l5=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b5p[km]),  vdup_n_u8(b5p[km+1])),bsel),c5);
+        uint8x16_t l6=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b6p[km]),  vdup_n_u8(b6p[km+1])),bsel),c6);
+        uint8x16_t h4=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b4p[km+2]),vdup_n_u8(b4p[km+3])),bsel),c4);
+        uint8x16_t h5=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b5p[km+2]),vdup_n_u8(b5p[km+3])),bsel),c5);
+        uint8x16_t h6=vandq_u8(vtstq_u8(vcombine_u8(vdup_n_u8(b6p[km+2]),vdup_n_u8(b6p[km+3])),bsel),c6);
+        int8x16_t lo7=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(vorrq_u8(lo,l4),l5),l6)),1),1);
+        int8x16_t hi7=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vorrq_u8(vorrq_u8(vorrq_u8(hi,h4),h5),h6)),1),1);
+        ac=vdotq_s32(ac,lo7,vld1q_s8(a+k)); ac=vdotq_s32(ac,hi7,vld1q_s8(a+k+16));
+    }
+    return vaddvq_s32(ac);
+}
 /* int8: reads K */
 static inline ORK_NATIVE_TARGET int32_t ork_dot_i8(const int8_t*a,const int8_t*b,int K){
     int32x4_t ac=vdupq_n_s32(0); for(int k=0;k+16<=K;k+=16) ac=vdotq_s32(ac,vld1q_s8(b+k),vld1q_s8(a+k));
     return vaddvq_s32(ac);
+}
+/* ---- x4 register-blocked variants: 4 output columns per pass, activation loaded ONCE (amortized load +
+ * 4 independent accumulator chains for ILP). Column c weight = base + c*stride. Same math as 4 scalar dots.
+ * This is the GEMV fusing that closes the ork-CPU vs ggml-fused gap while keeping the ork-native format. */
+static inline ORK_NATIVE_TARGET void ork_dot_nf4_x4(const int8_t*a,const uint8_t*b,size_t stride,int8x16_t lut,int K,int32_t out[4]){
+    const uint8_t*b0=b,*b1=b+stride,*b2=b+2*stride,*b3=b+3*stride;
+    int32x4_t c0=vdupq_n_s32(0),c1=vdupq_n_s32(0),c2=vdupq_n_s32(0),c3=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
+    for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){ int8x16x2_t av=vld2q_s8(a+k);
+        uint8x16_t p0=vld1q_u8(b0+kb); c0=vdotq_s32(c0,vqtbl1q_s8(lut,vandq_u8(p0,m)),av.val[0]); c0=vdotq_s32(c0,vqtbl1q_s8(lut,vshrq_n_u8(p0,4)),av.val[1]);
+        uint8x16_t p1=vld1q_u8(b1+kb); c1=vdotq_s32(c1,vqtbl1q_s8(lut,vandq_u8(p1,m)),av.val[0]); c1=vdotq_s32(c1,vqtbl1q_s8(lut,vshrq_n_u8(p1,4)),av.val[1]);
+        uint8x16_t p2=vld1q_u8(b2+kb); c2=vdotq_s32(c2,vqtbl1q_s8(lut,vandq_u8(p2,m)),av.val[0]); c2=vdotq_s32(c2,vqtbl1q_s8(lut,vshrq_n_u8(p2,4)),av.val[1]);
+        uint8x16_t p3=vld1q_u8(b3+kb); c3=vdotq_s32(c3,vqtbl1q_s8(lut,vandq_u8(p3,m)),av.val[0]); c3=vdotq_s32(c3,vqtbl1q_s8(lut,vshrq_n_u8(p3,4)),av.val[1]); }
+    out[0]=vaddvq_s32(c0);out[1]=vaddvq_s32(c1);out[2]=vaddvq_s32(c2);out[3]=vaddvq_s32(c3);
+}
+static inline ORK_NATIVE_TARGET void ork_dot_i4_x4(const int8_t*a,const uint8_t*b,size_t stride,int K,int32_t out[4]){
+    const uint8_t*b0=b,*b1=b+stride,*b2=b+2*stride,*b3=b+3*stride;
+    int32x4_t c0=vdupq_n_s32(0),c1=vdupq_n_s32(0),c2=vdupq_n_s32(0),c3=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
+    for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){ int8x16x2_t a2=vld2q_s8(a+k);
+        #define ORK_I4X(cc,bb){ uint8x16_t pk=vld1q_u8((bb)+kb); \
+            int8x16_t lo=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vandq_u8(pk,m)),4),4); \
+            int8x16_t hi=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),4),4); \
+            cc=vdotq_s32(cc,lo,a2.val[0]); cc=vdotq_s32(cc,hi,a2.val[1]); }
+        ORK_I4X(c0,b0) ORK_I4X(c1,b1) ORK_I4X(c2,b2) ORK_I4X(c3,b3)
+        #undef ORK_I4X
+    }
+    out[0]=vaddvq_s32(c0);out[1]=vaddvq_s32(c1);out[2]=vaddvq_s32(c2);out[3]=vaddvq_s32(c3);
+}
+static inline ORK_NATIVE_TARGET void ork_dot_i8_x4(const int8_t*a,const int8_t*b,size_t stride,int K,int32_t out[4]){
+    const int8_t*b0=b,*b1=b+stride,*b2=b+2*stride,*b3=b+3*stride;
+    int32x4_t c0=vdupq_n_s32(0),c1=vdupq_n_s32(0),c2=vdupq_n_s32(0),c3=vdupq_n_s32(0);
+    for(int k=0;k+16<=K;k+=16){ int8x16_t av=vld1q_s8(a+k);
+        c0=vdotq_s32(c0,vld1q_s8(b0+k),av); c1=vdotq_s32(c1,vld1q_s8(b1+k),av);
+        c2=vdotq_s32(c2,vld1q_s8(b2+k),av); c3=vdotq_s32(c3,vld1q_s8(b3+k),av); }
+    out[0]=vaddvq_s32(c0);out[1]=vaddvq_s32(c1);out[2]=vaddvq_s32(c2);out[3]=vaddvq_s32(c3);
 }
 
 /* One packed ork-native weight (per output channel n contiguous in each plane). */
@@ -100,7 +152,8 @@ typedef struct {
     ork_cpu_fmt fmt;
     const uint8_t *nibble;   /* [N][K/2]  (i4/nf4/i5/i6)   */
     const uint8_t *bit4;     /* [N][K/8]  (i5/i6)          */
-    const uint8_t *bit5;     /* [N][K/8]  (i6)             */
+    const uint8_t *bit5;     /* [N][K/8]  (i6/i7)          */
+    const uint8_t *bit6;     /* [N][K/8]  (i7)             */
     const int8_t  *i8;       /* [N][K]    (i8)             */
     const float   *bscale;   /* [N]                        */
     int8x16_t      nf4_lut;  /* (nf4)                      */
@@ -110,12 +163,24 @@ typedef struct {
 /* M=1 decode GEMV: out[n] = ascale * bscale[n] * dot(A_i8, W_n), for n in [n0,n1). */
 static inline void ork_cpu_gemv_m1(const ork_cpu_w*w,const int8_t*A,float ascale,float*out,int n0,int n1){
     int K=w->K; size_t kh=(size_t)K/2, ke=(size_t)K/8;
-    for(int n=n0;n<n1;n++){ int32_t d;
+    int n=n0;
+    /* x4 register-blocked fast path (i4/nf4/i8): 4 output cols per pass, activation loaded once. */
+    if(w->fmt==ORK_CPU_I4||w->fmt==ORK_CPU_NF4||w->fmt==ORK_CPU_I8){
+        for(; n+4<=n1; n+=4){ int32_t d[4];
+            if(w->fmt==ORK_CPU_I4)       ork_dot_i4_x4 (A, w->nibble+(size_t)n*kh, kh,            K, d);
+            else if(w->fmt==ORK_CPU_NF4) ork_dot_nf4_x4(A, w->nibble+(size_t)n*kh, kh, w->nf4_lut, K, d);
+            else                         ork_dot_i8_x4 (A, w->i8    +(size_t)n*K,  (size_t)K,     K, d);
+            out[n]=ascale*w->bscale[n]*(float)d[0]; out[n+1]=ascale*w->bscale[n+1]*(float)d[1];
+            out[n+2]=ascale*w->bscale[n+2]*(float)d[2]; out[n+3]=ascale*w->bscale[n+3]*(float)d[3];
+        }
+    }
+    for(; n<n1; n++){ int32_t d;
         switch(w->fmt){
         case ORK_CPU_I4:  d=ork_dot_i4 (A,w->nibble+(size_t)n*kh,K); break;
         case ORK_CPU_NF4: d=ork_dot_nf4(A,w->nibble+(size_t)n*kh,w->nf4_lut,K); break;
         case ORK_CPU_I5:  d=ork_dot_i5 (A,w->nibble+(size_t)n*kh,w->bit4+(size_t)n*ke,K); break;
         case ORK_CPU_I6:  d=ork_dot_i6 (A,w->nibble+(size_t)n*kh,w->bit4+(size_t)n*ke,w->bit5+(size_t)n*ke,K); break;
+        case ORK_CPU_I7:  d=ork_dot_i7 (A,w->nibble+(size_t)n*kh,w->bit4+(size_t)n*ke,w->bit5+(size_t)n*ke,w->bit6+(size_t)n*ke,K); break;
         default:          d=ork_dot_i8 (A,w->i8+(size_t)n*K,K); break;
         }
         out[n]=ascale*w->bscale[n]*(float)d;
@@ -128,12 +193,12 @@ static inline void ork_cpu_gemv_m1(const ork_cpu_w*w,const int8_t*A,float ascale
 static const float ORK_NF4_LVL[16]={-1.0f,-0.6961928f,-0.5250731f,-0.3949175f,-0.2844414f,-0.1847734f,
     -0.0910500f,0.0f,0.0795803f,0.1609302f,0.2461123f,0.3379152f,0.4407098f,0.5626170f,0.7229568f,1.0f};
 static inline int ork_cpu_pack(ork_cpu_fmt fmt,int K,int N,const float*W,
-        uint8_t*nibble,uint8_t*bit4,uint8_t*bit5,int8_t*i8,float*bscale,int8_t nf4_lut_out[16]){
+        uint8_t*nibble,uint8_t*bit4,uint8_t*bit5,uint8_t*bit6,int8_t*i8,float*bscale,int8_t nf4_lut_out[16]){
     if(K%32) return -1;
     if(fmt==ORK_CPU_NF4 && nf4_lut_out) for(int i=0;i<16;i++) nf4_lut_out[i]=(int8_t)lrintf(ORK_NF4_LVL[i]*127.0f);
     for(int n=0;n<N;n++){ const float*fr=W+(size_t)n*K; float mx=1e-9f;
         for(int k=0;k<K;k++){ float v=fr[k]<0?-fr[k]:fr[k]; if(v>mx)mx=v; }
-        float lev = fmt==ORK_CPU_I4?7:fmt==ORK_CPU_I5?15:fmt==ORK_CPU_I6?31:fmt==ORK_CPU_I8?127:127;
+        float lev = fmt==ORK_CPU_I4?7:fmt==ORK_CPU_I5?15:fmt==ORK_CPU_I6?31:fmt==ORK_CPU_I7?63:fmt==ORK_CPU_I8?127:127;
         float sc = fmt==ORK_CPU_NF4 ? mx : mx/lev;   /* NF4: normalize by absmax for index select */
         float inv = sc>0?1.0f/sc:0.0f;
         if(bscale) bscale[n] = fmt==ORK_CPU_NF4 ? sc/127.0f : sc;  /* NF4 codes = level*127 -> dequant mx/127 */
@@ -150,10 +215,10 @@ static inline int ork_cpu_pack(ork_cpu_fmt fmt,int K,int N,const float*W,
             }
             continue;
         }
-        /* int5 / int6: LEAN 32-block nibble + bit4(/bit5) planes (CPU-only formats). */
-        uint8_t*b4=bit4?bit4+(size_t)n*(K/8):0; uint8_t*b5=bit5?bit5+(size_t)n*(K/8):0;
-        if(b4) for(int i=0;i<K/8;i++) b4[i]=0; if(b5) for(int i=0;i<K/8;i++) b5[i]=0;
-        int lim = fmt==ORK_CPU_I5?15:31;
+        /* int5 / int6 / int7: LEAN 32-block nibble + bit4(/bit5/bit6) planes (CPU-only formats). */
+        uint8_t*b4=bit4?bit4+(size_t)n*(K/8):0; uint8_t*b5=bit5?bit5+(size_t)n*(K/8):0; uint8_t*b6=bit6?bit6+(size_t)n*(K/8):0;
+        if(b4) for(int i=0;i<K/8;i++) b4[i]=0; if(b5) for(int i=0;i<K/8;i++) b5[i]=0; if(b6) for(int i=0;i<K/8;i++) b6[i]=0;
+        int lim = fmt==ORK_CPU_I5?15:fmt==ORK_CPU_I6?31:63;
         for(int b=0;b<K/32;b++){ int km=b*4;
             for(int i=0;i<16;i++){ int kl=32*b+i, kh=32*b+16+i;
                 int cl=(int)lrintf(fr[kl]*inv); if(cl>lim)cl=lim;if(cl<-lim)cl=-lim;
@@ -161,6 +226,7 @@ static inline int ork_cpu_pack(ork_cpu_fmt fmt,int K,int N,const float*W,
                 nb[16*b+i]=(uint8_t)((cl&0xf)|((ch&0xf)<<4));
                 if(b4){ if((cl>>4)&1) b4[km+i/8]|=(uint8_t)(1<<(i&7)); if((ch>>4)&1) b4[km+2+i/8]|=(uint8_t)(1<<(i&7)); }
                 if(b5){ if((cl>>5)&1) b5[km+i/8]|=(uint8_t)(1<<(i&7)); if((ch>>5)&1) b5[km+2+i/8]|=(uint8_t)(1<<(i&7)); }
+                if(b6){ if((cl>>6)&1) b6[km+i/8]|=(uint8_t)(1<<(i&7)); if((ch>>6)&1) b6[km+2+i/8]|=(uint8_t)(1<<(i&7)); }
             }
         }
     }
