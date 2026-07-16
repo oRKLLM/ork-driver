@@ -33,3 +33,18 @@ int8 JUST-IN-TIME at the domain swap via the free CPU unpack — CPU-int4 / NPU-
 - [x] Branch + WIP.
 - [x] Slice 1 (jit_i4_i8_probe): JIT int4->int8 CORRECT (run == int8, bit-exact) but naive pack_i4_to_i8 inflate = 274ms (the TILE layout, not the unpack). => Slice 2 = in-place inflate into a pre-tiled reused domain buffer (park int4 tiled; per-swap nibble-expand -> int8 in place; target ~free-unpack ~1-2ms/68MB).
 - [ ] Slice 2: in-place JIT inflate (pre-tiled int4 -> int8 into reused domain buffer).
+
+## ★ REFRAME (2026-07-15) — CPU-int4-primary collapses the streaming program
+Two facts converged: (a) `pack_i4_to_i8` is just `pack_i8` (no cheap inflate — the 274ms is a full int8 pack),
+(b) CPU decodes int4 at 2x int8 and BEATS the NPU on the big weight (1.4 vs 2.4ms) → CPU-int4 is the PRIMARY
+decode engine, NPU-int8 is a HELPER on a small share. Therefore only a PORTION (the NPU's IOVA-fitting slice)
+needs int8 — upconverted ONCE, resident, NOT streamed. So:
+- DROP Slice 2 (in-place streaming inflate) + Slice 3 (streaming tier-map) — no streaming; the bulk stays
+  int4-in-RAM for the CPU, the NPU slice is upconverted once.
+- The 35B is ALREADY Q4_K_XL → no q4→int4 conversion needed for the CPU bulk (it's llama.cpp's Q4 CPU path,
+  already 3.2 t/s). DROP Slice 4.
+- REMAINING = the aggregate co-work (already built/measured): CPU-Q4 bulk ‖ NPU-int8 fixed resident slice
+  (pack_i8 of a portion that fits IOVA). This is the expert-split / MoE-offload mechanism, ~1.1x measured
+  (CPU-Q4 already fast → NPU is a modest parallel helper, not a multiplier).
+- So "run the 35B on the NPU" = keep it Q4-on-CPU (primary) + a fixed NPU-int8 slice in parallel. No streaming,
+  no conversion, no JIT-per-swap. The lever is bounded (~1.1x); the big streaming build was unnecessary.
