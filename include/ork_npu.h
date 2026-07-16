@@ -761,6 +761,8 @@ int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *task
  * conforming K (K%512==0, K<=4096), A & C in ork_dma_alloc buffers. Enables early-exit-to-free-the-NPU and
  * runtime observability without a kernel round-trip per chain. (See tools/ork_dyn_test.c.) */
 typedef struct ork_dyn_chain ork_dyn_chain;
+size_t        ork_npu_sram_total(ork_npu *ctx);   /* NPU on-chip SRAM bytes (0 = none: stock kernel/DTB) */
+size_t        ork_npu_sram_free (ork_npu *ctx);   /* free NPU SRAM bytes now (confirms ORK_WEIGHT_SRAM placement) */
 ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit (single-core chain); NULL on bad args */
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int nc); /* NONBLOCK across nc cores (nc<=0=all); halt/append N/A */
 int          ork_dyn_progress(ork_dyn_chain *h);                                  /* highest completed op idx, -1 none */

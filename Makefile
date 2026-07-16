@@ -622,6 +622,10 @@ steer_probe: tools/steer_probe.c $(CORE)
 ork_dyn_test: tools/ork_dyn_test.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# SRAM-vs-DRAM contention probe: is NPU-on-SRAM a separate memory path from CPU-on-DRAM? (partition test)
+sram_bw_probe: tools/sram_bw_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm

@@ -1170,6 +1170,12 @@ static void warn_if_governor_parked(void){
     fclose(f);
 }
 
+/* Free NPU on-chip SRAM bytes right now (0 if none). Confirms ORK_WEIGHT_SRAM actually placed a tile in SRAM
+ * (free drops) for the CPU/NPU partition experiment. */
+size_t ork_npu_sram_free(ork_npu *c){ if(!c) return 0; struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_FREE_SRAM_SIZE;
+    return ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a) ? 0 : a.value; }
+size_t ork_npu_sram_total(ork_npu *c){ (void)c; return (size_t)g_sram_total; }
+
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
@@ -1495,7 +1501,10 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     if(!consolidate)
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,0x403,w->domain);
+        /* ORK_WEIGHT_SRAM: request on-chip SRAM for the int8 weight tile (bcreate fails a too-big tile / no-SRAM
+         * board over to DRAM). For the CPU/NPU decode PARTITION experiment: NPU reads SRAM ‖ CPU reads DRAM. */
+        const uint32_t wflags = getenv("ORK_WEIGHT_SRAM") ? (0x403u|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,wflags,w->domain);
         if(!b->cpu){
             fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack (size=%zu)\n",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
             for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
