@@ -4,12 +4,15 @@
  * ork_submit_seq MANY times, checking EVERY element of EVERY op's output on EVERY run. With A=B=all-ones,
  * an int8 matmul output element == K and an fp16 one == (float)K, so every element is exactly checkable.
  *
- * The scheduler HW-batches the two leading consecutive int8 ops onto the doorbell (ork_dyn_begin_mc), then
- * BREAKS the chain to the SW model (run_stream_f16) for the fp16 op, re-opens a fresh int8 HW segment for
- * the third int8 op, and breaks again for the last fp16 op — so a single run exercises HW->SW AND SW->HW
- * transitions. The point: the fp16 ops go through the SW-chain (blocking completion + bsync), NOT the
- * doorbell (whose fp16 path produces non-deterministic partial-K reductions), so they must be bit-exact
- * every run; the int8 HW-chained ops must be bit-exact every run too, INCLUDING across the chain breaks.
+ * fp16 now rides the SAME thread-free HW-chain doorbell as int8 (ork_dyn_begin_mc, host-A). A doorbell run
+ * is ONE dtype, so the scheduler flushes [i8,i8] as one doorbell, then the f16 as its OWN doorbell (dtype
+ * break, NOT a SW break), then the 3rd i8, then the last f16 — FOUR doorbell submits, zero SW-chain breaks,
+ * all thread-free. Every op must be bit-exact every run, INCLUDING across each i8<->f16 mode transition
+ * (which fires inside begin_mc's ork_npu_enter at the dtype boundary). Run with ORK_SEQ_DEBUG=1 to see the
+ * flush pattern (four "[seq] HW flush" lines, dt alternating, and ZERO "[seq] SW break" lines).
+ *
+ * A trailing NON-CONFORMING fp16 op (K not %512) then confirms seq_hw_ok() rejects it -> it correctly falls
+ * back to the SW run_stream_f16 path (one "[seq] SW break" line) and is still bit-exact.
  *
  * BOARD:  make test_submit_seq && sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./test_submit_seq [runs=30]
  * Exit 0 = all ops correct on all runs; nonzero = at least one op miscomputed (a flaky transition).
@@ -26,7 +29,7 @@
 
 int main(int argc,char**argv){
     int runs=argc>1?atoi(argv[1]):30;
-    int K=512, N=512, M=8;                 /* K conforming (K%512==0, K<=4096); N%32 (int8) & N%16 (fp16); M<=64 */
+    int K=argc>2?atoi(argv[2]):512, N=argc>3?atoi(argv[3]):512, M=argc>4?atoi(argv[4]):8;  /* K conforming (K%512==0, K<=4096); N%32 (int8) & N%16 (fp16); M<=64 & M*K<=32768 (fp16 tile) */
     setvbuf(stdout,0,_IONBF,0);
     ork_npu*c=ork_npu_init(); if(!c){ printf("init failed\n"); return 2; }
     printf("test_submit_seq: mixed [i8][i8][f16][i8][f16], M=%d K=%d N=%d, %d runs\n", M,K,N,runs);
@@ -76,6 +79,32 @@ int main(int argc,char**argv){
     printf("  int8 HW-chain ops : %d/%d runs correct\n", runs-i8_bad-rc_bad, runs);
     printf("  fp16 SW-chain ops : %d/%d runs correct\n", runs-f16_bad-rc_bad, runs);
     if(rc_bad) printf("  scheduler errors  : %d/%d runs\n", rc_bad, runs);
+
+    /* --- non-conforming fp16 op: K%512!=0 => seq_hw_ok rejects => SW run_stream_f16 fallback, still exact --- */
+    {
+        int Knc=768;                          /* K%32==0 (fp16 pack ok) but K%512!=0 (doorbell-ineligible) */
+        ork_f16 *Bnc=(ork_f16*)malloc((size_t)Knc*N); for(size_t i=0;i<(size_t)Knc*N;i++) Bnc[i]=(ork_f16)1.0f;
+        ork_f16 *Anc=(ork_f16*)malloc((size_t)M*Knc*sizeof(ork_f16)); for(size_t i=0;i<(size_t)M*Knc;i++) Anc[i]=(ork_f16)1.0f;
+        ork_w *wnc=ork_mm_pack(c,Knc,N,Bnc);
+        float *Fnc=malloc(ei*4);
+        int sub=0;
+        if(!wnc){ printf("  non-conforming fp16 pack fail\n"); fail=1; }
+        else {
+            for(int r=0;r<8 && !sub;r++){
+                for(size_t k=0;k<ei;k++) Fnc[k]=POISON_F;
+                /* one conforming i8 (HW) followed by the non-conforming f16 (SW break) — exercises HW->SW */
+                ork_seq_op s2[2]={ { .kind=ORK_OP_MM_I8, .w=wi, .M=M, .N=N, .A=Ai, .C=O0 },
+                                   { .kind=ORK_OP_MM_F16,.w=wnc,.M=M, .N=N, .A=Anc,.C=Fnc } };
+                if(ork_submit_seq(c,s2,2)){ printf("  non-conforming seq rc!=0\n"); sub=1; fail=1; break; }
+                for(size_t k=0;k<ei;k++) if(Fnc[k]<(float)Knc-1.f||Fnc[k]>(float)Knc+1.f){ sub=1; break; }
+            }
+            printf("  fp16 SW-fallback  : %s (non-conforming K=%d -> run_stream_f16, want %d.0)\n",
+                   sub?"MISMATCH":"OK", Knc, Knc);
+            if(sub) fail=1;
+            ork_mm_free(c,wnc);
+        }
+        free(Bnc);free(Anc);free(Fnc);
+    }
 
     /* empty sequence must be a clean no-op */
     if(ork_submit_seq(c,ops,0)!=0){ printf("  empty-sequence returned nonzero\n"); fail=1; }

@@ -797,24 +797,26 @@ void         ork_pc_free(ork_pc_chain *pc);
 /* ---- Heterogeneous op-sequence scheduler (ork_submit_seq) ----------------------------------------
  * Ingest a mixed sequence of NPU ops (any precision, matmul or SDP/activation) and run it correctly by
  * routing each op to the ONE execution model it is reliable on. Different op types are reliable on
- * different models (a hard, exhaustively-established finding): int8 matmul with conforming K
- * (K%512==0 && K<=4096) is bit-exact on the thread-free HW-chain DOORBELL (ork_dyn_begin_mc, NONBLOCK
- * poll); fp16 matmul, int4, non-conforming-K int8, and SDP/activation ops are NOT (fp16 on the doorbell
- * produces non-deterministic partial-K reductions) but ARE reliable on the SW-chain / thread-pool +
- * blocking-completion model (run_stream_f16 / run_multicore / the int4 stream / the SDP op fns).
+ * different models (a hard, exhaustively-established finding): int8 AND fp16 matmul with conforming K
+ * (K%512==0 && K<=4096, M<=64, Sn==1; fp16 also M*K<=32768) are bit-exact on the thread-free HW-chain
+ * DOORBELL (ork_dyn_begin_mc, NONBLOCK poll) — fp16 requires host (malloc) A, the same convention int8
+ * uses. int4, non-conforming int8/fp16, and SDP/activation ops are NOT doorbell-reliable but ARE reliable
+ * on the SW-chain / thread-pool + blocking-completion model (run_stream_f16 / run_stream_i4 / the SDP fns).
  *
  * The scheduler batches maximal runs of consecutive HW-chainable ops into ONE doorbell submit and BREAKS
- * the chain to the SW model at every op that isn't. Each break's precision/chain mode transition is
- * handled by the driver's existing table-driven ork_npu_enter/XSPEC layer — so op classification is DATA
- * (a per-op-kind row of {marker, XSPEC profile, ork_chain_kind, dispatch}), not branches. Adding a new
- * precision/op is one more row; the moment fp16-HW-chain is ever solved it is a one-line OCK_SW->OCK_HW
- * flip of that row (the scheduler loop is unchanged regardless of how many kinds exist).
+ * the chain to the SW model at every op that isn't. A doorbell run is ONE dtype + ONE domain (begin_mc's
+ * requirement), so the run also breaks at a dtype change (i8<->f16) — each dtype gets its own doorbell and
+ * begin_mc's internal ork_npu_enter fires the mode transition at the boundary. Each break's precision/chain
+ * mode transition is handled by the driver's table-driven ork_npu_enter/XSPEC layer — so op classification
+ * is DATA (a per-op-kind row of {hw, marker, XSPEC profile, ork_chain_kind, dispatch}), not branches.
+ * Adding a new precision/op is one more row (an hw=1 row rides the doorbell when seq_hw_ok() accepts it and
+ * falls back to its SW dispatch fn otherwise); the scheduler loop is unchanged regardless of how many kinds.
  *
  * PHASE 1 (now): CORRECTNESS + RELIABILITY of a mixed sequence across the HW<->SW transitions. No
  * CPU/NPU overlap yet (that is phase 2 — see tools/test_submit_seq.c). Ops execute in order. */
 typedef enum {
     ORK_OP_MM_I8 = 0,   /* int8 matmul:  w=DT_I8 weight, A int8[M,K], C int32[M,N]  (HW doorbell if K conforms) */
-    ORK_OP_MM_F16,      /* fp16 matmul:  w=DT_F16 weight, A fp16[M,K], C fp32[M,N]  (SW: run_stream_f16) */
+    ORK_OP_MM_F16,      /* fp16 matmul:  w=DT_F16 weight, A fp16[M,K] (HOST mem), C fp32[M,N]  (HW doorbell if K conforms & M*K<=32768, else SW run_stream_f16) */
     ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K], C int32[M,N]  (SW: run_stream_i4) */
     ORK_OP_SILU_F16,    /* fp16 SiLU activation (SDP): A fp16[M,N] -> C fp16[M,N]   (SW SDP; needs LUT — TODO row) */
     ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_npu_ewmul_f16) */

@@ -11021,8 +11021,8 @@ int ork_npu_last_async_cpu(ork_npu *c){ return c ? c->last_async_cpu : -1; }
  * See the header for the design. The classification is a TABLE (SEQ_CLASS[], one row per ork_seq_kind)
  * in the same "data, not branches" spirit as XSPEC — the scheduler LOOP never switches on op-kind, it
  * only reads the row. A row is { hw, marker, profile, chain, fn }:
- *   hw     : 1 => the op-KIND can ride the HW-chain doorbell (int8 mm) IF the runtime predicate seq_hw_ok()
- *            also holds (conforming K, M<=64, single-slice). Otherwise it takes the SW break path below.
+ *   hw     : 1 => the op-KIND can ride the HW-chain doorbell (int8 or fp16 mm) IF the runtime predicate
+ *            seq_hw_ok() also holds (conforming K, M<=64, single-slice). Otherwise it takes the SW break below.
  *   marker : the ork_npu_enter target mode for the SW break path (SEQ_KEEPDT => keep c->last_dt, for SDP).
  *   profile: the XSPEC profile (XP_*) driving that transition's reset/rewarm policy.
  *   chain  : ork_chain_kind recorded as transition state (OCK_SW for every break here).
@@ -11042,32 +11042,44 @@ static int seq_disp_i4_mm  (ork_npu *c,const ork_seq_op *o){ ork_mm_task_i4 t={o
 static int seq_disp_ewmul_f16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_ewmul_f16(c,(const f16*)o->A,(const f16*)o->B,o->M,o->N,(f16*)o->C,&us); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
-  /* ORK_OP_MM_F16  */ { 0, DT_F16,     XP_STREAM_F16, OCK_SW, seq_disp_f16_mm   },
+  /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
   /* ORK_OP_MM_I4   */ { 0, 5/*I4_STRM*/,XP_I4_STREAM, OCK_SW, seq_disp_i4_mm    },
   /* ORK_OP_SILU_F16*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, NULL /*TODO: fp16 SiLU needs a per-(in,out)-scale LUT plumbed through ork_seq_op — ork_npu_probe_silu_std_f16(idx_off,cfg,lut,nlut)*/ },
   /* ORK_OP_EWMUL_F16*/{ 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_ewmul_f16 },
 };
-/* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces for an int8 task (single-slice,
- * conforming K, M<=64). An op of an hw=1 KIND that fails this is downgraded to the SW break path. */
+/* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces for an int8 OR fp16 task
+ * (single-slice, conforming K%512 && K<=4096, M<=64, Sn==1; fp16 adds the M*K<=32768 tile cap). An op of
+ * an hw=1 KIND that fails this is downgraded to the SW break path (its SEQ_CLASS fn). Kept in lockstep with
+ * ork_dyn_begin_mc's per-task guard — if that guard changes, change this. */
 static int seq_hw_ok(const ork_seq_op *o){
-    if(o->kind!=ORK_OP_MM_I8) return 0;
-    ork_w *w=o->w; if(!w||w->dtype!=DT_I8) return 0;
+    if(o->kind!=ORK_OP_MM_I8 && o->kind!=ORK_OP_MM_F16) return 0;
+    ork_w *w=o->w; if(!w) return 0;
     if(o->M<1||o->M>64||w->Sn!=1) return 0;
     if(w->K%512||w->K>4096) return 0;
     if(w->Sk!=1 && !w->Bf) return 0;
+    if(o->kind==ORK_OP_MM_I8){ if(w->dtype!=DT_I8) return 0; }
+    else { if(w->dtype!=DT_F16) return 0; if((size_t)o->M*w->K>32768) return 0; }  /* fp16 tile cap */
     return 1;
 }
 #define ORK_SEQ_HWBATCH 256   /* max ops per doorbell submit (well under ork_dyn_begin_mc's 1024 cap) */
 int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     if(!c||n<0||(n>0&&!ops)) return -2;
-    ork_mm_task_i8 batch[ORK_SEQ_HWBATCH]; int nb=0, bdom=0;
+    ork_mm_task_i8 batch[ORK_SEQ_HWBATCH]; int nb=0, bdom=0, bdt=0;
     int ret=0;
-    /* flush the accumulated int8 HW run as ONE doorbell submit (begin_mc owns its own mode enter) */
+    /* Flush the accumulated HW run as ONE doorbell submit (begin_mc owns its own mode enter). A run is one
+     * dtype AND one domain (begin_mc requires both), so bdt/bdom key the batch; a dtype/domain change breaks
+     * it. The SW fallback (begin_mc returned NULL — shouldn't happen since seq_hw_ok mirrors its guard, but
+     * defensive) is dtype-aware: fp16 -> run_stream_f16, int8 -> run_i8. */
     #define SEQ_FLUSH_HW() do{ if(nb){ ork_dyn_chain *h=ork_dyn_begin_mc(c,nb,batch,0); \
+        if(getenv("ORK_SEQ_DEBUG")) fprintf(stderr,"[seq] HW flush dt=%d n=%d -> %s\n", bdt, nb, h?"doorbell":"SW-fallback"); \
         if(h){ ork_dyn_end(h); } \
         else { /* ineligible/rejected: fall back to SW per-op (still correct, just no doorbell) */ \
-            for(int _q=0;_q<nb && !ret;_q++){ ork_npu_enter(c,DT_I8,XP_MC_MM,OCK_SW); \
-                if(ork_mm_run_i8(c,batch[_q].w,batch[_q].M,batch[_q].A,batch[_q].C)) ret=-1; } } \
+            for(int _q=0;_q<nb && !ret;_q++){ \
+                if(bdt==DT_F16){ ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_SW); \
+                    ork_mm_task_f16 _t={batch[_q].w,batch[_q].M,(const f16*)batch[_q].A,(float*)batch[_q].C}; \
+                    if(ork_mm_run_stream_f16(c,1,&_t)) ret=-1; } \
+                else { ork_npu_enter(c,DT_I8,XP_MC_MM,OCK_SW); \
+                    if(ork_mm_run_i8(c,batch[_q].w,batch[_q].M,batch[_q].A,batch[_q].C)) ret=-1; } } } \
         nb=0; } }while(0)
     for(int i=0;i<n && !ret;i++){
         const ork_seq_op *o=&ops[i];
@@ -11075,15 +11087,19 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
         const struct ork_seq_class *cl=&SEQ_CLASS[o->kind];
         int dom = o->w ? o->w->domain : 0;
         if(cl->hw && seq_hw_ok(o)){
-            /* accumulate a maximal run of consecutive HW-chainable ops (same domain; begin_mc = one domain) */
-            if(nb && (dom!=bdom || nb>=ORK_SEQ_HWBATCH)) SEQ_FLUSH_HW();
-            if(!nb) bdom=dom;
+            /* accumulate a maximal run of consecutive HW-chainable ops. begin_mc = ONE dtype + ONE domain,
+             * so break the run at a dtype change (i8<->f16) too — each dtype gets its own doorbell; the
+             * i8<->f16 mode transition fires inside begin_mc's ork_npu_enter at the boundary. */
+            int dt = o->w->dtype;
+            if(nb && (dom!=bdom || dt!=bdt || nb>=ORK_SEQ_HWBATCH)) SEQ_FLUSH_HW();
+            if(!nb){ bdom=dom; bdt=dt; }
             batch[nb].w=o->w; batch[nb].M=o->M; batch[nb].A=(const int8_t*)o->A; batch[nb].C=(int32_t*)o->C; nb++;
             continue;
         }
         /* SW break: close any open HW run, transition via the layer, dispatch on the reliable fn */
         SEQ_FLUSH_HW();
         if(ret) break;
+        if(getenv("ORK_SEQ_DEBUG")) fprintf(stderr,"[seq] SW break kind=%d\n", (int)o->kind);
         int mk = (cl->marker==SEQ_KEEPDT) ? c->last_dt : cl->marker;
         ork_npu_enter(c, mk, cl->profile, cl->chain);
         if(!cl->fn){ ret=-3; break; }         /* op-kind dispatch not yet wired (documented TODO row) */
