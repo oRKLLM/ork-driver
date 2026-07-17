@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include "ork_npu.h"
 
 int main(void) {
@@ -29,37 +30,47 @@ int main(void) {
     tasks[0].w = w; tasks[0].M = M1; tasks[0].A = A1; tasks[0].C = C1;
     tasks[1].w = w; tasks[1].M = M2; tasks[1].A = A2; tasks[1].C = C2;
 
-    int rc = ork_mm_run_chain_i4(ctx, 2, tasks);
-    if (rc) { printf("run failed %d\n", rc); return 1; }
-
+    /* Call the chain REPEATEDLY on the same context: run_chain_i4 bcreate/bdestroys a fresh int16 output
+     * scratch each call, and a recycled DMA region can carry dirty CPU cache lines that evict over the NPU's
+     * writes -> "correct run 0, garbage runs 1+". A single call never exercised that; loop to guard it. */
     int bad = 0;
-    // verify task 1
-    for (int m=0; m<M1; m++) {
-        for (int n=0; n<N; n++) {
-            long s=0; 
-            for (int k=0; k<K; k++) s+=(long)A1[m*K+k]*B[k*N+n];
-            if (C1[m*N+n] != s) {
-                if (bad < 5) printf("C1[%d] = %d, expected %ld\n", m*N+n, C1[m*N+n], s);
-                bad++;
+    const int REPS = 4;
+    for (int rep = 0; rep < REPS; rep++) {
+        /* poison the output each rep so a not-actually-written result stays wrong */
+        memset(C1, 0x5a, (size_t)M1 * N * 4);
+        memset(C2, 0x5a, (size_t)M2 * N * 4);
+
+        int rc = ork_mm_run_chain_i4(ctx, 2, tasks);
+        if (rc) { printf("run failed %d (rep %d)\n", rc, rep); return 1; }
+
+        // verify task 1
+        for (int m=0; m<M1; m++) {
+            for (int n=0; n<N; n++) {
+                long s=0;
+                for (int k=0; k<K; k++) s+=(long)A1[m*K+k]*B[k*N+n];
+                if (C1[m*N+n] != s) {
+                    if (bad < 5) printf("rep %d C1[%d] = %d, expected %ld\n", rep, m*N+n, C1[m*N+n], s);
+                    bad++;
+                }
             }
         }
-    }
-    // verify task 2
-    for (int m=0; m<M2; m++) {
-        for (int n=0; n<N; n++) {
-            long s=0; 
-            for (int k=0; k<K; k++) s+=(long)A2[m*K+k]*B[k*N+n];
-            if (C2[m*N+n] != s) {
-                if (bad < 10) printf("C2[%d] = %d, expected %ld\n", m*N+n, C2[m*N+n], s);
-                bad++;
+        // verify task 2
+        for (int m=0; m<M2; m++) {
+            for (int n=0; n<N; n++) {
+                long s=0;
+                for (int k=0; k<K; k++) s+=(long)A2[m*K+k]*B[k*N+n];
+                if (C2[m*N+n] != s) {
+                    if (bad < 10) printf("rep %d C2[%d] = %d, expected %ld\n", rep, m*N+n, C2[m*N+n], s);
+                    bad++;
+                }
             }
         }
     }
 
     if (bad) {
-        printf("FAIL: %d mismatches\n", bad);
+        printf("FAIL: %d mismatches over %d reps\n", bad, REPS);
     } else {
-        printf("OK: chain_i4 output verified.\n");
+        printf("OK: chain_i4 output verified (%d reps).\n", REPS);
     }
 
     /* ---- stream_i4: S independent W4A4 matmuls (varying M) dispatched round-robin across cores ---- */

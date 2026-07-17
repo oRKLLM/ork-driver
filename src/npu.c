@@ -10390,6 +10390,14 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     }
     bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
 
+    /* Clean-before-write the int16 output scratch. chain_C is bcreate'd fresh each call and the kernel can
+     * hand back a recycled DMA region carrying dirty CPU cache lines (from a prior occupant). Those lines
+     * evict to DRAM AFTER the NPU writes chain_C, clobbering the NPU output -> "correct run 0, garbage runs
+     * 1+" on warm reuse. Dirty the whole surface then clean it to DRAM (TO_DEVICE) so no stale line survives
+     * to evict later -- same full-surface clean-before as ork_dyn_begin_mc_i4's doorbell scratch. */
+    memset(chain_C.cpu, 0, (size_t)S * max_N * 2);
+    bsync(fd, &chain_C, RKNPU_MEM_SYNC_TO_DEVICE);
+
     struct buf extra[2] = {chain_A, chain_C};
     uint32_t rc[REGCMD_I4_N];
 
