@@ -102,6 +102,11 @@ int main(void) {
     fail += one_case_m(c, 512,  2048, 1, 3, 1);   /* nc=3 colsplit, cacheable output */
     fail += one_case_m(c, 2048, 4096, 1, 3, 1);   /* bigger K/N */
     fail += one_case_m(c, 3072, 8192, 1, 3, 1);   /* N=nmax, Sn==1 */
+    /* M>1 prefill colsplit: column-split across cores + M-tiling within each core + strided col copy-back. */
+    printf("-- P3 colsplit: M>1 prefill, N-columns split across 3 cores --\n");
+    fail += one_case_m(c, 2048, 4096, 8,   3, 1);   /* M=8  (cap=128 => 1 M-tile/core) */
+    fail += one_case_m(c, 2048, 4096, 64,  3, 1);   /* M=64 (cap=128 => 1 M-tile/core) */
+    fail += one_case_m(c, 4096, 2048, 128, 3, 1);   /* M=128 (cap=64 => 2 M-tiles/core within the colsplit) */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

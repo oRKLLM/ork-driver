@@ -8933,6 +8933,8 @@ struct ork_dyn_chain {
     int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
     int        oSk[1024];       /* per-op K-split count: >1 => the op's output is oSk partial [M,N] blocks in scratch
                                  * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
+    int        ostride[1024];   /* per-op copy-back dst row stride (elements): >0 => end() writes [M, nout/M] scratch
+                                 * to dst at this row stride (a column-slice of a wider C, colsplit M>1). 0 = contiguous. */
     int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
     int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
@@ -9186,16 +9188,17 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
 }
 
-/* P3: sub-nmax N-COLUMN tiling across cores on the NONBLOCK doorbell (M=1 decode; int8, Sn==1, K<=4096 Bf).
- * A single matmul C[1,N] is split by N-columns across nc cores exactly as run_multicore does (t0=i*NN/nc);
- * each core computes its [1,Ncore] column range into per-core scratch (NONBLOCK), and end() copies each range
- * back to C. This gives the doorbell run_multicore's TILE-parallel multi-core for one matmul (the doorbell's
- * op-partition would otherwise put a single op on one core). Scratch+copy-back is used (not direct output):
- * multi-core direct output to a shared resident C is the unsafe ZC-OUT-multicore case; the single-threaded
- * copy-back after poll is coherent. */
-static ork_dyn_chain *ork_dyn_begin_colsplit_m1(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
-    ork_w *w = t->w; int K = w->K, N = w->N, fd = c->fd, CBUF = c->soc->cbuf_elems;
-    int nt_sz = 32, NN = N / nt_sz;                 /* int8 output column tiles are 32 wide */
+/* P3: sub-nmax N-COLUMN tiling across cores on the NONBLOCK doorbell (int8, Sn==1, K<=4096 Bf, M 1..64).
+ * A single matmul C[M,N] is split by N-columns across nc cores exactly as run_multicore does (t0=i*NN/nc);
+ * each core computes its [M,Ncore] column range into per-core scratch (M-tiled into mtile_cap(K)-row chained
+ * programs when M>cap), NONBLOCK, and end() copies each range back to C's columns [c0,c0+Ncore) at row-stride
+ * N (strided for M>1). This gives the doorbell run_multicore's TILE-parallel multi-core for one matmul (the
+ * op-partition would otherwise pin a single op to one core). Scratch+copy-back (not direct output): multi-core
+ * direct output to a shared resident C is the unsafe ZC-OUT-multicore case; the copy-back after poll is
+ * single-threaded => coherent. */
+static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
+    ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
+    int nt_sz = 32, NN = N / nt_sz, mcap = mtile_cap(K);      /* int8 output column tiles are 32 wide; mcap rows/program */
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
@@ -9208,29 +9211,38 @@ static ork_dyn_chain *ork_dyn_begin_colsplit_m1(ork_npu *c, const ork_mm_task_i8
         int t0 = (int)((long)i * NN / nc), t1 = (int)((long)(i+1) * NN / nc), Ncore = (t1 - t0) * nt_sz, c0 = t0 * nt_sz;
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
-        if ((size_t)K > AF->size) { free(h); return NULL; }
-        memcpy(AF->cpu, t->A, (size_t)K); uint32_t adma = (uint32_t)AF->dma;   /* full A[1,K], host memory */
-        size_t osz = (size_t)Ncore * 4;
+        if ((size_t)M * K > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
+        memcpy(AF->cpu, t->A, (size_t)M * K); uint32_t adma = (uint32_t)AF->dma;   /* full A[M,K], host memory (all cores read all A) */
+        size_t osz = (size_t)M * Ncore * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
         struct buf *CC = &c->mcc[i];
         uint32_t wbase = (uint32_t)(w->Bf[0].dma + (uint64_t)t0 * K * nt_sz);   /* column-tile offset into the Bf weight */
-        memset(rc, 0, sizeof rc);
-        synth_i8(rc, 1, K, Ncore, adma, wbase, (uint32_t)CC->dma, 1, CBUF, 0);   /* [1,Ncore] contiguous into per-core scratch */
-        if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
-        memcpy(RC->cpu, rc, REGCMD_I8_N * 4);
-        struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-        tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma;
-        tk[0] = tt;
-        h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = Ncore; h->oM[i] = 1; h->oSk[i] = 0;
-        h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4);   /* copy this core's range to C[c0:c0+Ncore] */
-        Pc[i] = 1;
+        int np = 0;   /* programs (M-tiles) for this core */
+        for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+            if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+            memset(rc, 0, sizeof rc);
+            synth_i8(rc, mc, K, Ncore, adma + (uint32_t)((size_t)m0 * K), wbase, (uint32_t)(CC->dma + (size_t)m0 * Ncore * 4), 1, CBUF, 0);   /* rows [m0,m0+mc) of [M,Ncore] */
+            if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+            memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+            np++;
+        }
+        for (int p = 0; p < np; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
+            if (p < np - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
+                pr[216] = 0x0010 | ((nx & 0xffff) << 16); pr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                pr[218] = 0x0014 | (0x0037u << 16);       pr[219] = (0x0101 << 16); }
+            struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+            tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
+        h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = M * Ncore; h->oM[i] = M; h->oSk[i] = 0;
+        h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = (M > 1) ? N : 0;   /* strided col copy-back for M>1 */
+        Pc[i] = np;
         memset(&subs[i], 0, sizeof subs[i]);
-        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = 1; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np; subs[i].task_obj_addr = c->mtk[i].obj;
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
-        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np};
     }
-    for (int i = 0; i < nc; i++) if (Pc[i]) { volatile int32_t *db = h->outptr[i] + (h->nout[i]-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    for (int i = 0; i < nc; i++) if (Pc[i]) { int Mx = h->oM[i], Nx = h->nout[i]/Mx;   /* seed each row's last col (per-core scratch) */
+        for (int m = 0; m < Mx; m++) { volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -9244,11 +9256,11 @@ static ork_dyn_chain *ork_dyn_begin_colsplit_m1(ork_npu *c, const ork_mm_task_i8
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
-    /* P3 sub-nmax column-tiling: a single M=1 int8 matmul (Sn==1, K<=4096 Bf) multi-cores by N-column split
-     * rather than being pinned to one core by the op-partition. */
-    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && tasks[0].M == 1 && tasks[0].w->Sn == 1
+    /* P3 sub-nmax column-tiling: a single int8 matmul (Sn==1, K<=4096 Bf) multi-cores by N-column split
+     * (M-tiled within each core when M>mtile_cap) rather than being pinned to one core by the op-partition. */
+    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && tasks[0].w->Sn == 1
         && tasks[0].w->K <= 4096 && tasks[0].w->Bf && (tasks[0].w->N / 32) >= 2)
-        return ork_dyn_begin_colsplit_m1(c, &tasks[0], nc);
+        return ork_dyn_begin_colsplit(c, &tasks[0], nc);
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
@@ -9725,6 +9737,9 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
                 blk += (size_t)Me * Nc; }
         }
         else if (h->esz == 2) { const int16_t *o=(const int16_t*)h->outptr[i]; int32_t *d=h->dst[i]; for (int e=0;e<no;e++) d[e]=o[e]; }
+        else if (h->ostride[i] > 0) {   /* colsplit M>1: [Me,Ne] scratch -> dst column-slice at row-stride ostride */
+            const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
+            for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * h->ostride[i]], &src[(size_t)m * Ne], (size_t)Ne * 4); }
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
