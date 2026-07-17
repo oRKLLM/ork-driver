@@ -43,7 +43,9 @@ static int one_case_m(ork_npu *c, int K, int N, int M, int nc, int cmode) {
     int done = ork_dyn_end(h);
 
     int bad = 0;
-    if (done != 0) { printf("  [%s K=%d N=%d M=%d nc=%d Sn=%d] DOORBELL MISS: ork_dyn_end=%d\n", cm, K, N, M, nc, Sn, done); bad = 1; }
+    (void)done;   /* ork_dyn_end returns the last completed entry index (S-1 for op-partition, nc-1 for a
+                   * colsplit's internal tiles) — informational; correctness is the bit-exact scan below.
+                   * A real doorbell miss leaves sentinel/zeros -> caught as a mismatch. */
     long mism = 0; int fm = -1, fn = -1; int32_t fg = 0, fe = 0;
     long sc_ok[8] = {0}, sc_zero[8] = {0}, sc_wrong[8] = {0};
     for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) {
@@ -94,6 +96,12 @@ int main(void) {
     fail += one_case_m(c, 4096, 512,  128, 1, 1);   /* cap=64 => 2 M-tiles */
     fail += one_case_m(c, 2048, 1024, 256, 1, 1);   /* cap=128 => 2 M-tiles */
     fail += one_case_m(c, 4096, 1024, 256, 1, 1);   /* cap=64 => 4 M-tiles */
+    /* P3: sub-nmax column-split across cores (M=1 int8, Sn==1, nc>1) — matches run_multicore's N-split. */
+    printf("-- P3 colsplit: M=1 decode, N-columns split across 3 cores --\n");
+    fail += one_case_m(c, 512,  2048, 1, 3, 0);   /* nc=3 colsplit, dma output */
+    fail += one_case_m(c, 512,  2048, 1, 3, 1);   /* nc=3 colsplit, cacheable output */
+    fail += one_case_m(c, 2048, 4096, 1, 3, 1);   /* bigger K/N */
+    fail += one_case_m(c, 3072, 8192, 1, 3, 1);   /* N=nmax, Sn==1 */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

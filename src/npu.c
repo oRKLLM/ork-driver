@@ -9176,9 +9176,70 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
 }
 
+/* P3: sub-nmax N-COLUMN tiling across cores on the NONBLOCK doorbell (M=1 decode; int8, Sn==1, K<=4096 Bf).
+ * A single matmul C[1,N] is split by N-columns across nc cores exactly as run_multicore does (t0=i*NN/nc);
+ * each core computes its [1,Ncore] column range into per-core scratch (NONBLOCK), and end() copies each range
+ * back to C. This gives the doorbell run_multicore's TILE-parallel multi-core for one matmul (the doorbell's
+ * op-partition would otherwise put a single op on one core). Scratch+copy-back is used (not direct output):
+ * multi-core direct output to a shared resident C is the unsafe ZC-OUT-multicore case; the single-threaded
+ * copy-back after poll is coherent. */
+static ork_dyn_chain *ork_dyn_begin_colsplit_m1(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
+    ork_w *w = t->w; int K = w->K, N = w->N, fd = c->fd, CBUF = c->soc->cbuf_elems;
+    int nt_sz = 32, NN = N / nt_sz;                 /* int8 output column tiles are 32 wide */
+    int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
+    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    if (mc_ensure(c, nc)) return NULL;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    uint32_t rc[REGCMD_I8_N + 4];
+    for (int i = 0; i < nc; i++) {
+        int t0 = (int)((long)i * NN / nc), t1 = (int)((long)(i+1) * NN / nc), Ncore = (t1 - t0) * nt_sz, c0 = t0 * nt_sz;
+        if (Ncore <= 0) { Pc[i] = 0; continue; }
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        if ((size_t)K > AF->size) { free(h); return NULL; }
+        memcpy(AF->cpu, t->A, (size_t)K); uint32_t adma = (uint32_t)AF->dma;   /* full A[1,K], host memory */
+        size_t osz = (size_t)Ncore * 4;
+        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
+        struct buf *CC = &c->mcc[i];
+        uint32_t wbase = (uint32_t)(w->Bf[0].dma + (uint64_t)t0 * K * nt_sz);   /* column-tile offset into the Bf weight */
+        memset(rc, 0, sizeof rc);
+        synth_i8(rc, 1, K, Ncore, adma, wbase, (uint32_t)CC->dma, 1, CBUF, 0);   /* [1,Ncore] contiguous into per-core scratch */
+        if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+        memcpy(RC->cpu, rc, REGCMD_I8_N * 4);
+        struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+        tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma;
+        tk[0] = tt;
+        h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = Ncore; h->oM[i] = 1; h->oSk[i] = 0;
+        h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4);   /* copy this core's range to C[c0:c0+Ncore] */
+        Pc[i] = 1;
+        memset(&subs[i], 0, sizeof subs[i]);
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = 1; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, 1};
+    }
+    for (int i = 0; i < nc; i++) if (Pc[i]) { volatile int32_t *db = h->outptr[i] + (h->nout[i]-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (!c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* cold fresh-scratch clean-before */
+        c->mwarm[i] = 1;
+        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], w->domain);
+    }
+    return h;
+}
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
-    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
+    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
+    /* P3 sub-nmax column-tiling: a single M=1 int8 matmul (Sn==1, K<=4096 Bf) multi-cores by N-column split
+     * rather than being pinned to one core by the op-partition. */
+    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && tasks[0].M == 1 && tasks[0].w->Sn == 1
+        && tasks[0].w->K <= 4096 && tasks[0].w->Bf && (tasks[0].w->N / 32) >= 2)
+        return ork_dyn_begin_colsplit_m1(c, &tasks[0], nc);
+    if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
     if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
