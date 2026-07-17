@@ -8912,18 +8912,17 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
-    /* fp16 doorbell is WIP, opt-in via ORK_DYN_F16; default keeps the async path int8-only (validated
-     * bit-exact). The original "fp16 DPU writes each row's last col in a different order" hypothesis is
-     * DISPROVEN: an on-board seed-all + snapshot probe finds ZERO elements written after their row's last
-     * col — there is no fp16 output write-order permutation (the doorbell word is correct). The real fp16
-     * failures are two coherency/mode effects handled below when the gate is on: (1) fp16 direct-output
-     * needs a full-surface clean-BEFORE the NPU write (dirty/stale host lines race the write — the ZC_OUT
-     * class) — the ORK_MC_SEED fp16 branch seeds every element, not just last-cols; (2) fp16 mc drains
-     * in-submit (the doorbell win is int8's). These cut fp16 mc flakiness ~80%->~10%, but a RESIDUAL
-     * SYSTEMIC ~10-20% "all-16-fail" race remains in the cold warm->real double-submit (a whole-round
-     * mis-establish; NOT fixed by re-ork_npu_enter, seed timing, or extra drains — tested). So fp16 mc is
-     * NOT yet reliably bit-exact and stays gated. int8 A(M=1)/D(M>1) are solid (16/16 across ~80 runs). */
-    if (dt == DT_F16 && !getenv("ORK_DYN_F16")) return NULL;
+    /* fp16 doorbell: bit-exact and enabled by default (was WIP-gated). The prior "residual ~10-20% all-16
+     * cold-race" that kept it gated was NOT a chaining/coherency defect — it was the TEST feeding the A
+     * activation from an ork_dma_alloc (zero-copy) buffer. This path STAGES A into maf via memcpy; a DMA-A
+     * source's CPU writes are not coherently readable by that staged read (partial bytes -> partial-K sums
+     * that look like a nondeterministic chaining bug). Proven by dump-and-diff vs the working
+     * run_stream_f16_chain: byte-identical regcmd (only the output-C address word differs), identical
+     * ACT_RESET, identical submit — the ONLY difference was the A source. With host (malloc) A — the same
+     * convention the int8 doorbell already requires — the DEFAULT fp16 path (seed-all clean-before +
+     * poll-to-done + civac) is bit-exact: 28/28 over 2 shapes (K512N256M2, K1024N512M4), multi-core.
+     * A must be host memory (as for int8 A/D); a zero-copy DMA-A source is unsupported here. Legacy
+     * opt-in env ORK_DYN_F16 is now a no-op. */
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;

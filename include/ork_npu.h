@@ -757,9 +757,12 @@ typedef struct {
 int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
 
 /* ---- Dynamic steered submission (NONBLOCK chain + per-op doorbell progress + mid-flight halt) ----
- * Submit an S-task int8 chain NONBLOCK, then watch/steer it from the host. v1: M=1/task, single-slice
- * conforming K (K%512==0, K<=4096), A & C in ork_dma_alloc buffers. Enables early-exit-to-free-the-NPU and
- * runtime observability without a kernel round-trip per chain. (See tools/ork_dyn_test.c.) */
+ * Submit an S-task int8 OR fp16 chain NONBLOCK, then watch/steer it from the host. v1: M=1/task (mc: M<=64),
+ * single-slice conforming K (K%512==0, K<=4096). C is a resident ork_dma_alloc buffer (zero-copy direct
+ * output) or host memory (copy-back); A is HOST (malloc) memory — begin_mc STAGES A via memcpy and a
+ * zero-copy DMA-A source's CPU writes are not coherently readable by that staged read (partial-K sums).
+ * Enables early-exit-to-free-the-NPU and runtime observability without a kernel round-trip per chain.
+ * (See tools/ork_dyn_test.c: D=int8, E=fp16.) */
 typedef struct ork_dyn_chain ork_dyn_chain;
 size_t        ork_npu_sram_total(ork_npu *ctx);   /* NPU on-chip SRAM bytes (0 = none: stock kernel/DTB) */
 size_t        ork_npu_sram_free (ork_npu *ctx);   /* free NPU SRAM bytes now (confirms ORK_WEIGHT_SRAM placement) */

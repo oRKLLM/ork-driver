@@ -627,6 +627,14 @@ steer_probe: tools/steer_probe.c $(CORE)
 ork_dyn_test: tools/ork_dyn_test.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# fp16-doorbell priming/persistence probe (int8-primes-fp16 hypothesis for the mixed-precision async pipeline)
+ork_dyn_f16_interleave: tools/ork_dyn_f16_interleave.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+# fp16 doorbell-vs-chain regcmd/submit dump-and-diff (RE: crack fp16 HW-chaining). Not in all/test.
+f16_dumpdiff: tools/f16_dumpdiff.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+
 # SRAM-vs-DRAM contention probe: is NPU-on-SRAM a separate memory path from CPU-on-DRAM? (partition test)
 sram_bw_probe: tools/sram_bw_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
