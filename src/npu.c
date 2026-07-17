@@ -8609,6 +8609,23 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
+    /* P1a — SPINE MIGRATION (submit consolidation). Route the plain (ss==NULL) M=1 single-slice resident-C
+     * matmul chain onto the ONE NONBLOCK doorbell submit (ork_dyn_begin_mc) instead of this path's hand-rolled
+     * blocking submit. NO legacy fallback — git is the recovery, not a runtime hedge: a doorbell miss returns
+     * an error AFTER ork_dyn_end auto-dumps the stuck-descriptor core-dump, so the failure surfaces with
+     * diagnostics (the forcing function toward the doorbell fix) instead of being masked. Non-routable shapes
+     * (M>1, K-split, SDP/silu via ss) still take the chain path below until their gaps (G1..G5) are migrated. */
+    if (!ss) {
+        int routable = 1;
+        for (int i = 0; i < S; i++) if (tasks[i].M != 1 || !dma_find(c, (void*)tasks[i].C)) { routable = 0; break; }
+        if (routable) {
+            ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, 1);   /* single-core doorbell spine */
+            if (!h) return -1;                                     /* rejected/alloc-fail — surface it, no fallback */
+            int d = ork_dyn_end(h);                                /* auto-dumps on an incomplete drain */
+            return (d == S - 1) ? 0 : -1;                          /* all landed = ok; miss = error (dumped) */
+        }
+    }
+
     // 2. State transition for int8 mode. DT_I8 <-> DT_I8_CHAIN is NOT a hardware mode change (see line 42),
     // so under ORK_MIXED_NOTHRASH we KEEP the warm state across the transition — mirroring the mcworker
     // keepwarm (line 3501). Without this, entering the chain from a plain int8 op re-warmed every call
@@ -9482,6 +9499,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         else if (!h->mc && ork_now_us() - lastchg > 500.0) break;   /* single-core only: no progress => halted */
         if (ork_now_us() - t0 > 3e6) break; }
     int last = ork_dyn_progress(h);
+    /* AUTO CORE-DUMP on a real miss: a plain chain that drained INCOMPLETE (not all S landed) is a doorbell
+     * dispatch/completion failure — capture the stuck-descriptor post-mortem before the state is lost. Skip
+     * intentionally-truncated chains (spin_end = bulk-terminated by design). This is the forcing function:
+     * every path we move onto the spine auto-reports its misses, pointing at the doorbell fix. */
+    if (last < h->S - 1 && !h->spin_end) ork_dyn_dump(h, "ork_dyn_end incomplete (doorbell miss)");
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
