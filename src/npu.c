@@ -8953,7 +8953,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N (M>1) */
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
-            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; } }
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }   /* fresh scratch => "cold" so the clean-before-round fires (dirty-line coherency) */
     uint32_t rc[REGCMD_I8_N + 4];
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     for (int i = 0; i < nc; i++) {
@@ -9010,15 +9010,25 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); } } while (0)
     int cold = 0; for (int i = 0; i < nc; i++) if (Pc[i] && !c->mwarm[i]) cold = 1;
-    ORK_MC_SEED();
-    if (cold) {   /* throwaway NONBLOCK warm round (cold miscomputes without it), poll to done, reseed */
-        ORK_MC_ROUND();
-        double tw = ork_now_us(); for (;;) { int alld = 1; for (int x = 0; x < S; x++) if (!ork_dyn_done_i(h,x)) { alld = 0; break; }
-            if (alld || ork_now_us() - tw > 2e6) break; }
+    if (cold) {
+        /* COLD FRESH-BUFFER COHERENCY (the real cold bug — NOT a pipeline-warm issue; blocking vs NONBLOCK is
+         * irrelevant). The first cold call writes into a FRESHLY bcreate'd output scratch (c->mcc[i], or a
+         * fresh caller DMA buffer): its CPU cache holds dirty/uninitialized lines. The NPU writes the result
+         * to DRAM, then those dirty lines evict and OVERWRITE ~half of it with zeros -> O0[0]=0, partial-K
+         * look (this is exactly the ORK_ZC_OUT class fixed in 3fad74a: clean-before + invalidate-after). Warm
+         * calls don't hit it because the prior end()'s FROM_DEVICE bsync already invalidated the scratch. The
+         * fp16 branch's ORK_MC_SEED already cleans every element (dc cvac); int8 seeds only last-cols, leaving
+         * the interior dirty. Fix: clean the whole output surface to DRAM BEFORE the round so no dirty CPU line
+         * can evict over the NPU's writes. Then a single NONBLOCK round is correct — no throwaway/dummy round,
+         * no blocking. (end() does the invalidate-after via its FROM_DEVICE bsync.) */
+        struct buf *cleaned[1024]; int ncl = 0;
+        for (int x = 0; x < S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
+            for (int j = 0; j < ncl; j++) if (cleaned[j] == b) seen = 1;
+            if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cleaned[ncl++] = b; } }
         for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
-        ORK_MC_SEED();
     }
-    ORK_MC_ROUND();   /* real NONBLOCK round: all cores concurrently */
+    ORK_MC_SEED();
+    ORK_MC_ROUND();   /* single NONBLOCK round, cold or warm (the doorbell win) */
     if (dt == DT_F16) {
         /* fp16 drains in-submit (int8 stays async — the doorbell win is int8's). Polling the real round to
          * completion HERE (vs deferring the first poll to ork_dyn_end) removes a per-run race where end()

@@ -53,12 +53,12 @@ int main(int argc,char**argv){
         { .kind=ORK_OP_MM_F16, .w=wf, .M=M, .N=N, .A=Af, .C=F4 },
     };
 
-    /* WARMUP: the HW-chain doorbell (ork_dyn_begin_mc) needs a cold establish on its first-ever submit —
-     * begin_mc runs an internal throwaway warm round, but the very first cold establish can still partially
-     * miscompute (a documented residual cold-round property of the doorbell, independent of this scheduler;
-     * the int8 segment re-entered AFTER a break, and every fp16 SW op, are correct even on that first pass).
-     * Standard NPU hygiene (AGENTS.md benchmark methodology) is to warm before measuring — 2 discarded runs. */
-    for(int w=0;w<2;w++) ork_submit_seq(c,ops,5);
+    /* NO WARMUP: run 0 below IS the HW-chain doorbell's first-ever (cold) submit and MUST be bit-exact.
+     * The old run-0 miscompute was NOT a pipeline-warm problem — it was a fresh-output-buffer DMA coherency
+     * bug (the ORK_ZC_OUT class): begin_mc's first cold call writes a freshly-allocated int8 output scratch
+     * whose dirty CPU cache lines then evict and overwrite ~half the NPU's result with zeros. begin_mc now
+     * cleans the output surface to DRAM before the cold round (still a single NONBLOCK round), so run 0 is
+     * correct — this gate would catch a regression of that clean-before. */
 
     int fail=0, i8_bad=0, f16_bad=0, rc_bad=0;
     for(int r=0;r<runs;r++){
