@@ -768,9 +768,15 @@ int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *task
 typedef struct ork_dyn_chain ork_dyn_chain;
 size_t        ork_npu_sram_total(ork_npu *ctx);   /* NPU on-chip SRAM bytes (0 = none: stock kernel/DTB) */
 size_t        ork_npu_sram_free (ork_npu *ctx);   /* free NPU SRAM bytes now (confirms ORK_WEIGHT_SRAM placement) */
+uint64_t      ork_npu_dma_rw    (ork_npu *ctx);   /* cumulative NPU DMA rw bytes; delta across a submit = HW did work (0 => never dispatched) */
+void          ork_npu_dump_state(ork_npu *ctx, const char *label);   /* snapshot NPU state (freq/volt/DMA counters) to stderr on anomaly, before a wedge destroys it */
+int           ork_npu_soft_reset(ork_npu *ctx);   /* RKNPU_ACT_RESET + force re-warm; recovery step after a dump so a stuck job doesn't accumulate into a hard wedge */
+int           ork_npu_recover   (ork_npu *ctx, const char *label);   /* self-heal: dump + soft-reset + dummy-op probe; 1 = recovered (continue), 0 = still broken (throw fault) */
+int           ork_npu_force_fault(ork_npu *ctx);   /* DIAGNOSTIC: deliberately force a reliable NPU fault (bogus weight addr -> DMA fault); 0 = faulted as intended */
 ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit (single-core chain); NULL on bad args */
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int nc); /* NONBLOCK across nc cores (nc<=0=all); halt/append N/A */
 int          ork_dyn_progress(ork_dyn_chain *h);                                  /* highest completed op idx, -1 none */
+void         ork_dyn_dump(ork_dyn_chain *h, const char *label);                   /* chain-aware anomaly dump: names the STUCK descriptor (progress+1) + its regcmd/addr/doorbell + hw_elapse */
 int          ork_dyn_halt(ork_dyn_chain *h, int at);                              /* halt after op `at` (free NPU early) */
 int          ork_dyn_end(ork_dyn_chain *h);                                       /* drain + writeback + free; ret highest done */
 int          ork_dyn_max_steps(void);                                             /* per-chain step cap (split longer work across chains) */

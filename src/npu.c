@@ -1175,6 +1175,109 @@ static void warn_if_governor_parked(void){
 size_t ork_npu_sram_free(ork_npu *c){ if(!c) return 0; struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_FREE_SRAM_SIZE;
     return ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a) ? 0 : a.value; }
 size_t ork_npu_sram_total(ork_npu *c){ (void)c; return (size_t)g_sram_total; }
+/* Cumulative NPU DMA read/write byte counter (RKNPU_GET_TOTAL_RW_AMOUNT). Sample before/after a submit; a
+ * ~0 delta means the HW did NO work (job never dispatched); a nonzero delta means it ran (did DMA). The key
+ * signal for "did a failed round even reach the NPU?". 0 if unavailable. */
+uint64_t ork_npu_dma_rw(ork_npu *c){ if(!c) return 0; struct rknpu_action a; memset(&a,0,sizeof a);
+    a.flags=RKNPU_GET_TOTAL_RW_AMOUNT; return ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a) ? 0 : a.value; }
+/* Snapshot the queryable NPU state (freq/volt/iommu/free-SRAM + cumulative DMA counters DT_rd/DT_wr/WT_rd/
+ * total_rw) to stderr with a label. Call it when something goes awry (a round fails to land, a submit errors)
+ * to capture state before a wedge/reboot destroys it. task_counter is a submit-time out field (0 for NONBLOCK)
+ * so it is not queryable post-hoc; the DMA-amount deltas + the per-op output doorbells (ork_dyn_progress) are
+ * the post-mortem signals. */
+void ork_npu_dump_state(ork_npu *c, const char *label){
+    if(!c) return; int fd=c->fd; struct rknpu_action a;
+    unsigned long long freq=0,volt=0,iommu=0,sram=0,hwv=0;
+    #define ORK_Q(F,V) do{ memset(&a,0,sizeof a); a.flags=(F); if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) V=(unsigned long long)a.value; }while(0)
+    ORK_Q(RKNPU_GET_HW_VERSION,hwv); ORK_Q(RKNPU_GET_FREQ,freq); ORK_Q(RKNPU_GET_VOLT,volt);
+    ORK_Q(RKNPU_GET_IOMMU_EN,iommu); ORK_Q(RKNPU_GET_FREE_SRAM_SIZE,sram);
+    #undef ORK_Q
+    /* The LIVE signals (established by floor_decomp / slice_replay — NOT the RKNPU_GET_*_AMOUNT DMA counters,
+     * which read 0 on this kernel): (1) g_fd_hw_raw_last = the kernel's per-submit NPU-busy time (hw_elapse),
+     * captured after EVERY submit; 0 => the last job did NO work (faulted/never ran). (2) per-task int_status
+     * from the shared task buffer (read after a FROM_DEVICE sync). */
+    struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
+    fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=0x%x 0x%x 0x%x 0x%x\n",
+            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)g_fd_hw_raw_last, t[0].int_status,t[1].int_status,t[2].int_status,t[3].int_status);
+}
+/* Soft-reset the NPU (RKNPU_ACT_RESET) and force a re-warm (clear c->warmed). Intended as the recovery step
+ * AFTER ork_npu_dump_state when a round goes awry: it clears a stuck/faulted job so the bad state does not
+ * accumulate into a hard wedge across repeated submits. Returns the ioctl result (0 ok). */
+int ork_npu_soft_reset(ork_npu *c){ if(!c) return -1; struct rknpu_action a; memset(&a,0,sizeof a);
+    a.flags=RKNPU_ACT_RESET; int r=ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a); c->warmed=0;
+    for(int i=0;i<c->soc->cores;i++) c->mwarm[i]=0; return r; }
+/* Recovery probe (the "dummy op") — NONBLOCK + HOST-BOUNDED, so it can NEVER hang on an already-wedged NPU.
+ * A blocking submit on a wedged job enters the kernel's `continue wait` and re-waits PAST its own timeout in an
+ * uninterruptible D-state (observed 61s->122s, unkillable) — so the recovery probe MUST NOT block. This issues
+ * a tiny int8 matmul (1x512x16, A=B=1 => C==512) with flags PC|NONBLOCK: the ioctl returns immediately (never
+ * enters the kernel wait), then we poll the output doorbell HOST-side with a hard 300ms cap. Doorbell lands
+ * with the right value => NPU is dispatching again (recovered, 1); host-timeout => still wedged (0 => fault).
+ * (A comprehensive fp16/SDP/PPU self-test is fine for HEALTHY validation but is the wrong tool here — it blocks.) */
+static int ork_dummy_probe(ork_npu *c){
+    int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    struct buf A=bcreate(fd,(size_t)K,0x403,dom), B=bcreate(fd,(size_t)K*N,0x403,dom), Cc=bcreate(fd,(size_t)N*4,0x403,dom);
+    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(B.cpu)bdestroy(fd,&B); if(Cc.cpu)bdestroy(fd,&Cc); return 0; }
+    memset(A.cpu,1,K); memset(B.cpu,1,(size_t)K*N);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
+    __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
+    uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
+    synth_i8(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit s; memset(&s,0,sizeof s);
+    s.flags=0x1|0x2u;   /* PC | NONBLOCK: ioctl returns immediately, cannot enter the kernel continue-wait */
+    s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=300;
+    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+    int rr=rknpu_submit_ioctl(fd,&s,dom), ok=0;
+    if(rr==0){ double t0=ork_now_us();   /* host-side bounded poll — no kernel wait, cannot hang */
+        for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory");
+            if(*db!=0x7fffffff){ ok=(*db==K); break; }
+            if(ork_now_us()-t0>300000.0) break;   /* 300ms host cap => doorbell never landed => still wedged */ } }
+    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc);
+    return ok;
+}
+/* Self-healing recovery: detect -> DUMP everything -> soft RESET -> DUMMY-op probe. Returns 1 if the dummy op
+ * PASSES (NPU recovered — caller keeps going), 0 if it FAILS (NPU still broken — caller should throw a fault
+ * and stop, rather than spiral into a hard wedge). This is the recovery contract the caller runs on an anomaly
+ * (a round that fails to land / a submit error). */
+int ork_npu_recover(ork_npu *c, const char *label){
+    if(!c) return 0;
+    ork_npu_dump_state(c,label);
+    ork_npu_soft_reset(c);
+    int ok=ork_dummy_probe(c);
+    fprintf(stderr,"[NPU-RECOVER %s] dump + soft-reset + dummy-op -> %s\n", label?label:"", ok?"PASS (recovered, continue)":"FAIL (still broken, FAULT)");
+    return ok;
+}
+/* Deliberately force a RELIABLE NPU fault (to exercise dump/recover): a tiny int8 matmul whose WEIGHT address
+ * is BOGUS (0x1000 — an unmapped low page) so the NPU DMA-reads from unmapped and faults every time. NONBLOCK +
+ * a 1s bounded host poll so the caller never blocks. Returns 1 if the output doorbell landed (no fault), 0 if it
+ * did NOT land in the window (the expected fault). May soft-reset or IOMMU-fault the NPU — that's the point. */
+int ork_npu_force_fault(ork_npu *c){
+    if(!c) return -1; int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
+    struct buf A=bcreate(fd,(size_t)K,0x403,dom), Cc=bcreate(fd,(size_t)N*4,0x403,dom);
+    if(!A.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(Cc.cpu)bdestroy(fd,&Cc); return -1; }
+    memset(A.cpu,1,K); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+    volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
+    __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
+    uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
+    synth_i8(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    struct rknpu_submit s; memset(&s,0,sizeof s);
+    s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=500;
+    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+    int rr=rknpu_submit_ioctl(fd,&s,dom), landed=0;
+    if(rr==0){ double t0=ork_now_us(); for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=0x7fffffff){landed=1;break;} if(ork_now_us()-t0>1000000.0) break; } }
+    fprintf(stderr,"[FORCE-FAULT] bogus-weight matmul submit rc=%d, doorbell %s (rw counters unreliable; watch dmesg for DMA_READ_ERROR/soft reset)\n", rr, landed?"LANDED (no fault?!)":"did NOT land (faulted as intended)");
+    bdestroy(fd,&A); bdestroy(fd,&Cc);
+    return landed;
+}
 
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
@@ -8796,7 +8899,7 @@ cleanup:
  * resident in ork_dma_alloc buffers (so we hold DMA addrs + poll outputs coherently). One program per task
  * (P==S). Steering must lead the sequencer by ~1-2 ops (time it off ork_dyn_progress). */
 struct ork_dyn_chain {
-    ork_npu *c; int S, P, N, reserve, mc; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core */
+    ork_npu *c; int S, P, N, reserve, mc, spin_end; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core; spin_end = reserve if the tail is a persistent spin (forward-chained), else 0 */
     struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
     int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
     int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
@@ -8868,7 +8971,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     int reserve = P; { const char *e = getenv("ORK_DYN_RESERVE"); if (e) { int r = atoi(e); if (r > reserve) reserve = r; if (reserve > 1024) reserve = 1024; } }
     h->reserve = reserve;
     for (int p = P; p < reserve; p++) memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);   /* rc still holds program S-1 (terminator) */
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);   /* TERMINATING chain (0..S-1) for the warm pass; the spin tail (if any) is applied AFTER warm — see below */
     /* task_number=reserve PC-chain model (like run_chain_i8): kernel programs PC from task[0]; the HW walks via
      * each program's in-regcmd next-descriptor (0x0010/0x0014), bounded by task_number. ALL reserve descriptors
      * must be present (task_number=1 runs program 0 ONLY — measured; it does NOT walk). */
@@ -8898,6 +9001,49 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
                 if (alld || ork_now_us() - tw > 2e6) break; } }
         c->warmed = 1;
     }
+    if (_dbg) fprintf(stderr, "[dyn] warm phase done (warmed=%d), spin=%d reserve=%d — applying spin + real submit next\n", c->warmed, (reserve > P) ? 1 : 0, reserve);
+    /* PERSISTENT SPIN TAIL (on whenever reserve>P — a reserve budget implies a persistent spin) — applied HERE, AFTER warm, so the warm pass ran the
+     * TERMINATING chain (0..S-1, the proven protocol — it completes cleanly, no in-flight job) and does NOT
+     * collide with this real submit on the single-stream NPU (the overlap that hung/soft-reset the earlier
+     * version). Forward-chain the reserved slots (S-1 -> S -> ... -> reserve-1; reserve-1 stays terminal) so the
+     * real submit re-runs program S-1's matmul idempotently through the reserve budget and stays BUSY, haltable
+     * early by ork_dyn_halt / ork_dyn_queue_idle (spin_end-aware). Bounded — no self-loop, no redirect. Progress
+     * can't advance past S-1 in the spin (tail re-writes the same C), so a clean halt must lead the sequencer from
+     * near the start; ork_dyn_end bulk-terminates the tail before freeing (safe teardown). Per-slot spin doorbell
+     * for late/long-spin halting is a follow-up. */
+    if (reserve > P) {
+        /* DEDICATED NO-OP SPIN TAIL. Re-running program S-1 (the real matmul, SAME doorbell output C) as chained
+         * tasks ABORTS the job — verified by bisection: reserve>P non-spin = 8/8, spin-by-re-run = 0/8 (whole job
+         * yields nothing). So the tail is a dedicated matmul that reuses the resident weight B but reads a zeroed
+         * throwaway spinA and writes a throwaway spinC (a plain bcreate buffer, NOT one of the polled doorbell
+         * outputs) — so it never touches the real outputs' coherent buffers. Fill reserved slots [S..reserve-1]
+         * with it, forward-chained (reserve-1 terminal), and chain the last real program S-1 -> slot S. Real
+         * outputs 0..S-1 land; the tail spins harmlessly. spinA/spinC park in h->ascr (freed by ork_dyn_end). */
+        ork_w *lw = tasks[S - 1].w; int lK = lw->K, lN = lw->N;
+        uint32_t lB = lw->Bf ? (uint32_t)lw->Bf[0].dma : (uint32_t)lw->Bb[0].dma;
+        struct buf spinA = bcreate(fd, (size_t)lK, 0x403, c->dom_active);
+        struct buf spinC = bcreate(fd, (size_t)lN * 4, 0x403, c->dom_active);
+        if (spinA.cpu && spinC.cpu && h->nascr + 2 <= 1024) {
+            memset(spinA.cpu, 0, (size_t)lK); bsync(fd, &spinA, RKNPU_MEM_SYNC_TO_DEVICE);
+            h->ascr[h->nascr++] = spinA; h->ascr[h->nascr++] = spinC;
+            uint32_t rcs[REGCMD_I8_N + 4]; memset(rcs, 0, sizeof rcs);
+            synth_i8(rcs, 1, lK, lN, (uint32_t)spinA.dma, lB, (uint32_t)spinC.dma, 1, CBUF, 0);
+            for (int p = P; p < reserve; p++) {
+                uint32_t *slot = (uint32_t*)((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4);
+                memcpy(slot, rcs, REGCMD_I8_N * 4);
+                if (p < reserve - 1) { uint64_t nx = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                    slot[216] = 0x0010 | ((nx & 0xffff) << 16); slot[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    slot[218] = 0x0014 | (0x0037u << 16);       slot[219] = (0x0101 << 16); }   /* else: reserve-1 terminal (rcs has a 0 descriptor) */
+            }
+            uint32_t *lr = (uint32_t*)((char*)c->regcmd.cpu + (size_t)(P - 1) * REGCMD_I8_N * 4);   /* real S-1 -> first spin slot */
+            uint64_t nx = c->regcmd.dma + (size_t)P * REGCMD_I8_N * 4;
+            lr[216] = 0x0010 | ((nx & 0xffff) << 16); lr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+            lr[218] = 0x0014 | (0x0037u << 16);       lr[219] = (0x0101 << 16);
+            h->spin_end = reserve;
+            bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+        } else { if (spinA.cpu) bdestroy(fd, &spinA); if (spinC.cpu) bdestroy(fd, &spinC); }   /* alloc failed: no spin, stay terminating */
+    }
+    if (_dbg) fprintf(stderr, "[dyn] spin applied (spin_end=%d); seeding + real submit now\n", h->spin_end);
     ORK_DYN_SEED();
     sub.timeout = mm_timeout_ms();
     int rr = rknpu_submit_ioctl(fd, &sub, h->dom);
@@ -9213,6 +9359,42 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
 int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
     for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) hi = i;   /* per-row: task done = ALL its rows' last cols written */
     return hi; }
+/* Chain-aware anomaly dump. Uses the doorbell DETECTOR (ork_dyn_progress) to name the STUCK descriptor — the
+ * first op that did NOT land = progress+1 — and extracts THAT op's context: its regcmd slot DMA address, baked
+ * output C address + current doorbell value, and the in-regcmd next-descriptor words 216..219 (feed to
+ * tools/re/decode_reg for a register post-mortem). Plus the per-op doorbell map and the context-level
+ * ork_npu_dump_state (freq/volt/hw_elapse/int_status). Fire on an anomaly BEFORE a wedge/reboot loses it.
+ * Single-core chains (mc uses per-core regcmd buffers — only the map + context are shown there). */
+void ork_dyn_dump(ork_dyn_chain *h, const char *label){
+    if(!h) return; ork_npu *c=h->c; int N=h->N;
+    ork_npu_dump_state(c,label);
+    int prog=ork_dyn_progress(h), stuck=prog+1;
+    fprintf(stderr,"[DYN-DUMP %s] S=%d P=%d reserve=%d spin_end=%d mc=%d | progress=%d landed => STUCK op #%d\n",
+            label?label:"", h->S, h->P, h->reserve, h->spin_end, h->mc, prog, (stuck<h->P)?stuck:-1);
+    fprintf(stderr,"  doorbell map [#=landed .=stuck]: ");
+    for(int i=0;i<h->S;i++) fprintf(stderr,"%c", ork_dyn_done_i(h,i)?'#':'.');
+    fprintf(stderr,"\n");
+    if(!h->mc && stuck>=0 && stuck<h->reserve){
+        /* dump the [prev, STUCK, next] descriptor window: the linkage around the stall. A correct chain has
+         * prev.next-desc -> stuck's regcmd_dma, and stuck.next-desc -> next's regcmd_dma; a mismatch or a
+         * bad address here IS the fault. Slots < S are real ops (have an output doorbell); >= S are spin/tail. */
+        int lo=stuck-1; if(lo<0)lo=0; int hi=stuck+1; if(hi>=h->reserve)hi=h->reserve-1;
+        for(int p=lo;p<=hi;p++){
+            uint32_t *rc=(uint32_t*)((char*)c->regcmd.cpu+(size_t)p*REGCMD_I8_N*4);
+            unsigned long long rdma=(unsigned long long)(c->regcmd.dma+(size_t)p*REGCMD_I8_N*4);
+            const char *tag=(p<stuck)?"prev ":(p==stuck)?"STUCK":"next ";
+            if(p<h->S && h->outptr[p]){ volatile int32_t *db=(volatile int32_t*)(h->outptr[p]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory");
+                fprintf(stderr,"  [%s] op #%d: regcmd_dma=0x%llx C=%p doorbell=%d(0x%08x) next-desc=%08x %08x %08x %08x\n",
+                        tag,p,rdma,(void*)h->outptr[p],(int)*db,(unsigned)*db,rc[216],rc[217],rc[218],rc[219]);
+            } else {
+                fprintf(stderr,"  [%s] slot #%d (spin/tail): regcmd_dma=0x%llx next-desc=%08x %08x %08x %08x\n",
+                        tag,p,rdma,rc[216],rc[217],rc[218],rc[219]);
+            }
+        }
+        uint32_t *rcs=(uint32_t*)((char*)c->regcmd.cpu+(size_t)stuck*REGCMD_I8_N*4);
+        fprintf(stderr,"  regcmd[STUCK #%d] head (decode_reg):",stuck); for(int w=0;w<12;w++) fprintf(stderr," %08x",rcs[w]); fprintf(stderr," ...\n");
+    }
+}
 /* ---- Budget accounting: a submit runs a FIXED step count and the NPU STOPS at the end (program P-1's
  * terminator). Work longer than one chain must be split into successive begin() calls; these let the caller
  * size chunks (max_steps) and know how close the running chain is to its end (remaining) so it can plan the
@@ -9269,13 +9451,25 @@ int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task) {
 }
 /* Halt the chain AFTER program `at` (frees the NPU early) by zeroing its next-amount in the live regcmd DRAM.
  * Must lead the sequencer (at > current progress by ~1-2). Returns 0/ok, -1 bad arg. */
-int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0 || at >= h->P - 1) return -1;   /* mc: per-core, no single-buffer halt */
+int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -1;   /* mc: per-core, no single-buffer halt */
+    int _lim = h->spin_end ? h->spin_end : h->P; if (at >= _lim - 1) return -1;   /* halt within real programs, or within the spin tail if present */
     uint32_t *rcp = (uint32_t*)((char*)h->c->regcmd.cpu + (size_t)at * REGCMD_I8_N * 4);
     rcp[218] = 0x0014;   /* 0x0014 | amount 0 => sequencer stops after program `at` */
     __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
     return 0; }
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
+    /* SPIN TEARDOWN (safety): a persistent spin tail keeps re-reading the scratch/regcmd after the real outputs
+     * land, so freeing below would race an in-flight re-run (IOMMU fault / wedge). Null-terminate EVERY reserved
+     * spin slot first: wherever the sequencer currently is, its next slot is now terminal, so it stops within
+     * ~1-2 tasks — then the drain + free are safe. Bounded, no race (all slots terminal, not a chased frontier). */
+    if (h->spin_end) {
+        for (int p = h->P; p < h->spin_end; p++) {
+            uint32_t *rcp = (uint32_t*)((char*)h->c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4);
+            rcp[218] = 0x0014; __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory");
+        }
+        __asm__ volatile("dsb ish":::"memory");
+    }
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
     double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
@@ -9348,7 +9542,8 @@ int ork_dyn_queue_idle(ork_dyn_queue *q) {
     ork_dyn_chain *h = q->h;
     if (h->mc) return 0;                                                    /* mc: no single-buffer halt */
     int at = ork_dyn_progress(h) + 1 + ORK_DYN_HEADROOM;                    /* halt just ahead of the sequencer */
-    if (at >= h->P - 1) return 0;                                          /* already at/near terminator — nothing to cut */
+    int lim = h->spin_end ? h->spin_end : h->P;                            /* spin tail extends the haltable range past P */
+    if (at >= lim - 1) return 0;                                          /* already at/near terminator — nothing to cut */
     return ork_dyn_halt(h, at) == 0 ? 1 : 0;
 }
 /* drain: finish the flying chunk + submit/finish any remaining chunks, writeback; returns total ops completed */

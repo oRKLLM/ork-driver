@@ -658,3 +658,12 @@ ork_pc_bench: tools/ork_pc_bench.c $(CORE)
 
 ork_pc_sram_probe: tools/ork_pc_sram_probe.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+ork_dyn_spin_test: tools/ork_dyn_spin_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+ork_dyn_spin_diag: tools/ork_dyn_spin_diag.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+risky_dump_test: tools/risky_dump_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
