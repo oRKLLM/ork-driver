@@ -100,6 +100,15 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
 - **P2 — recipe = compile-once into the SRAM table.** Fold `ork_pc`'s compile-once into the wrapper so a fixed
   chain (decode, scan, FFN) compiles once into the SRAM pool and re-runs with only an A-refresh. Add the spin /
   warm / POST entries to the same pool.
+- **P3 STARTED — run_multicore M=1 int8 DECODE migrated onto the spine.** The blocker was a
+  parallelization-model mismatch (run_multicore splits one matmul's N-columns SUB-nmax across cores; the
+  doorbell partitioned whole ops). Resolved by adding `ork_dyn_begin_colsplit_m1` (sub-nmax N-column tiling
+  across cores on the NONBLOCK doorbell, matching `t0=i*NN/nc` bit-exact; scratch+copy-back = coherency-safe
+  under multi-core). `run_multicore` now routes M=1 int8 decode (Sn==1, K<=4096 Bf, nc>1) through it — no
+  legacy fallback. Validated: make test golden bit-exact (model/decode), decode latency neutral-to-faster
+  (873 vs 884ms/500-iter, NONBLOCK dispatch). NOTE: production decode is CPU, so this affects the NPU-decode
+  path (used when NPU decode is forced), not the default fast decode. NEXT P3: M>1 prefill colsplit (sub-nmax
+  across cores + M>1 => per-core scratch + scatter/copy-back, no direct output), then run_stream / bmm.
 - **P3 — migrate core run paths onto the spine, one at a time, byte-identical:** `run_chain_i8` →
   `run_stream_f16_chain` → `run_multicore` → `bmm` → `run_i4`. Each: build `ork_seq_op[]`/recipe, submit via the
   spine, drop the hand-rolled `rknpu_submit_ioctl`. `make test` bit-exact + attest refresh per path.

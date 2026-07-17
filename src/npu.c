@@ -3943,6 +3943,16 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
+    /* P3 MIGRATION: M=1 int8 decode runs on the NONBLOCK doorbell (sub-nmax N-column split across cores,
+     * ork_dyn_begin_colsplit_m1). Decode is dispatch-bound, so NONBLOCK helps, and this consolidates the
+     * decode submit onto the spine (no legacy fallback — git is the recovery). Eligible: int8, Sn==1,
+     * K<=4096 with full-K Bf, nc>1. Output is bit-exact vs the mcworker N-split (same t0=i*NN/nc columns). */
+    if(dt==DT_I8 && M==1 && w->Sn==1 && w->K<=4096 && w->Bf && nc>1){
+        ork_mm_task_i8 t = { .w=w, .M=1, .A=(const int8_t*)A, .C=(int32_t*)C };
+        ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
+        if(!h) return -1;
+        ork_dyn_end(h); return 0;
+    }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
 
