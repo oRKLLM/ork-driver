@@ -8995,6 +8995,8 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
 }
 
+/* GDN-doorbell decomposition timers: phase split inside begin_mc's fp16 path (dumped by ork_gdn_prof_dump). */
+double g_db_build=0, g_db_round=0, g_db_poll=0, g_db_civac=0; long g_db_n=0;
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
@@ -9026,6 +9028,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf) return NULL;
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
+    double _dbt_entry = ork_now_us();
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);   /* fp16 pipeline (layer owns reset, keep-warm-aware) */
     else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
@@ -9123,8 +9126,10 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cleaned[ncl++] = b; } }
         for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     }
+    double _dbt_build = ork_now_us();
     ORK_MC_SEED();
     ORK_MC_ROUND();   /* single NONBLOCK round, cold or warm (the doorbell win) */
+    double _dbt_round = ork_now_us();
     if (dt == DT_F16) {
         /* fp16 drains in-submit (int8 stays async — the doorbell win is int8's). Polling the real round to
          * completion HERE (vs deferring the first poll to ork_dyn_end) removes a per-run race where end()
@@ -9135,6 +9140,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * gated. int8 needs none of this.) */
         double tp = ork_now_us();
         for(;;){ int alld=1; for(int x=0;x<S;x++) if(!ork_dyn_done_i(h,x)){alld=0;break;} if(alld||ork_now_us()-tp>3e6) break; }
+        double _dbt_poll = ork_now_us();
         /* Full-surface invalidate-read of every output element after the doorbell fires. done_i (last-cols)
          * signals the tile's row is written, but for fp16 the interior settles a touch later; this sweep both
          * lets it settle and freshly invalidates every output line so end()/caller reads DRAM, not a stale
@@ -9142,6 +9148,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * separate (see gate comment) and NOT cured here. Cheap (M*N civac per op). int8 does not need it. */
         for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N;
             for (long e=0;e<(long)Mx*Nx;e++){ volatile int32_t*db=(volatile int32_t*)(h->outptr[x]+e); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); (void)*db; } }
+        double _dbt_civac = ork_now_us();
+        g_db_build += _dbt_build - _dbt_entry; g_db_round += _dbt_round - _dbt_build;
+        g_db_poll += _dbt_poll - _dbt_round; g_db_civac += _dbt_civac - _dbt_poll; g_db_n++;
     }
     return h;
 }
@@ -10357,11 +10366,17 @@ done2:
  * whether the doorbell's dispatch-half win shrinks the ~44% NPU-submit fraction of the GDN scan. Requires
  * the fp16 K%512 guard relaxation in ork_dyn_begin_mc above. Default OFF (baseline = run_stream_f16_chain). */
 static int gdn_doorbell(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_GDN_DOORBELL"); v=(e&&atoi(e))?1:0;} return v; }
+/* decomposition timers (ORK_GDN_PROF): split the doorbell per-stage cost begin_mc vs end, count calls. */
+double g_gdn_db_begin=0, g_gdn_db_end=0; long g_gdn_db_calls=0;
 static int gdn_run_stage(ork_npu *c,int nh,const ork_mm_task_f16 *tk){
     if(!gdn_doorbell()) return ork_mm_run_stream_f16_chain(c,nh,tk);
+    double t0=ork_now_us();
     ork_dyn_chain *h=ork_dyn_begin_mc(c,nh,(const ork_mm_task_i8*)tk,0);   /* task_i8/f16 layout-identical */
-    if(!h) return -1;
+    double t1=ork_now_us();
+    if(!h){ return -1; }
     int r=ork_dyn_end(h);
+    double t2=ork_now_us();
+    g_gdn_db_begin+=t1-t0; g_gdn_db_end+=t2-t1; g_gdn_db_calls++;
     return (r<0)?-1:0;
 }
 /* ======================================================================================
@@ -10423,6 +10438,10 @@ void ork_gdn_prof_dump(void){
     fprintf(stderr,"[ork GDN PROF] %ld calls, scan total %.1f ms | prep(cumsum+fp16 cast) %.0f%% %.1fms | NPU matmul-stages %.0f%% %.1fms | CPU solve(UT+coef) %.0f%% %.1fms | post(o+carry) %.0f%% %.1fms\n",
         g_gdn_calls, tot/1000.0, 100*g_gdn_prep/tot, g_gdn_prep/1000.0, 100*g_gdn_npu/tot, g_gdn_npu/1000.0,
         100*g_gdn_solve/tot, g_gdn_solve/1000.0, 100*g_gdn_post/tot, g_gdn_post/1000.0);
+    if(g_gdn_db_calls) fprintf(stderr,"[ork GDN PROF doorbell] %ld begin_mc+end calls | begin_mc %.1fms (%.0fus/call) | end %.1fms (%.0fus/call) | total %.1fms\n",
+        g_gdn_db_calls, g_gdn_db_begin/1000.0, g_gdn_db_begin/g_gdn_db_calls, g_gdn_db_end/1000.0, g_gdn_db_end/g_gdn_db_calls, (g_gdn_db_begin+g_gdn_db_end)/1000.0);
+    if(g_db_n) fprintf(stderr,"[ork GDN PROF begin_mc phases] %ld fp16 calls (us/call): build+enter+mc_ensure %.0f | seed+bsync+submit %.0f | poll-to-done %.0f | civac-sweep %.0f\n",
+        g_db_n, g_db_build/g_db_n, g_db_round/g_db_n, g_db_poll/g_db_n, g_db_civac/g_db_n);
 }
 int ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
                      const float *s0,const float *q,const float *k,const float *v,
