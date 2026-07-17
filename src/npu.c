@@ -1302,6 +1302,9 @@ void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
     struct buf b=bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
+/* ork_dma_alloc that requests on-chip SRAM residence (fails over to DRAM if the NPU has no SRAM / it is full).
+ * For validating the precompiled/doorbell submit against an SRAM-resident output the CPU polls via dc civac. */
+void *ork_dma_alloc_sram(ork_npu *c, size_t size){ return ork_dma_alloc_flags(c, size, 0x401 | RKNPU_MEM_TRY_ALLOC_SRAM); }
 /* Diagnostic only: clean-only flush (TO_DEVICE) of a sub-range — push dirty CPU cache lines out to DRAM
  * so the NPU reads correct data, WITHOUT the FROM_DEVICE invalidate. This is the bsync a cacheable
  * weight buffer needs before submit (the "clean cost" the probe measures separately). */
@@ -9365,11 +9368,16 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems, N = tasks[0].w->N;
     ork_pc_chain *pc = calloc(1, sizeof *pc); if (!pc) return NULL;
     pc->c = c; pc->S = S; pc->N = N; pc->dom = tasks[0].w->domain;
-    pc->pool = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403, c->dom_active);
+    /* Park the static regcmd pool + per-op A-scratch in on-chip NPU SRAM when present — it is otherwise-unused
+     * memory, so residing there frees DRAM/IOVA for the rest of the pipeline. Detection-gated: bcreate drops
+     * TRY_ALLOC_SRAM to DRAM when g_sram_total==0 (stock kernel/DTB) and fails an over-budget/contended alloc
+     * over to DRAM per-buffer (so large chains spill gracefully). Opt out with ORK_PC_NO_SRAM (benchmarks). */
+    unsigned pcsf = getenv("ORK_PC_NO_SRAM") ? 0 : RKNPU_MEM_TRY_ALLOC_SRAM;
+    pc->pool = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403 | pcsf, c->dom_active);
     if (!pc->pool.cpu) { free(pc); return NULL; }
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K;
-        pc->ascr[i] = bcreate(fd, (size_t)K, 0x403, c->dom_active);
+        pc->ascr[i] = bcreate(fd, (size_t)K, 0x403 | pcsf, c->dom_active);
         if (!pc->ascr[i].cpu) { for (int j=0;j<i;j++) bdestroy(fd,&pc->ascr[j]); bdestroy(fd,&pc->pool); free(pc); return NULL; }
         memcpy(pc->ascr[i].cpu, tasks[i].A, (size_t)K); bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE);
         pc->asrc[i] = tasks[i].A; pc->Ksz[i] = K;

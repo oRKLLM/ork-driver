@@ -126,6 +126,8 @@ int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight
  * @return CPU-visible pointer, or NULL on failure / zero-copy table full (fall back to malloc).
  */
 void        *ork_dma_alloc(ork_npu *ctx, size_t size);
+/** @brief Like ork_dma_alloc but requests on-chip NPU SRAM residence (fails over to DRAM if none/full). */
+void        *ork_dma_alloc_sram(ork_npu *ctx, size_t size);
 /** @brief Free a buffer returned by ork_dma_alloc(). */
 void         ork_dma_free (ork_npu *ctx, void *ptr);
 

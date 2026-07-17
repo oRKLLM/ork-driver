@@ -655,3 +655,6 @@ dyn_spin_probe: tools/dyn_spin_probe.c $(CORE)
 # precompiled-program cache (regime A) vs synth-every-call bench. Not in all/test.
 ork_pc_bench: tools/ork_pc_bench.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
+ork_pc_sram_probe: tools/ork_pc_sram_probe.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
