@@ -9198,12 +9198,13 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
         if (w->K % 512) return NULL;
-        /* G2 K-split: K>4096 (int8) rides Sk per-K-slice partials + host accumulate. First increment is
-         * Sn==1 && M==1 (wide-K DECODE, e.g. ffn_down) — M>1 prefill needs the mg_max*64 M-tile chunking
-         * (the cap shrinks below 64 for K>4096) + an A-gather, a follow-up. fp16 K>4096 unsupported. */
+        /* G2 K-split: K>4096 (int8) rides Sk per-K-slice partials + host accumulate. Sn==1 (wide-K without
+         * wide-N — the ffn_down shape). M 1..64: each K-slice's Kp<=KS(=1024) gives an mg_max*64 M-tile cap
+         * >=320, so the whole M-tile fits ONE program per K-slice (no M-chunking); a defensive per-slice cap
+         * check in the build rejects a pathological ORK_KTILE. fp16 K>4096 unsupported. */
         int ksplit = (dt == DT_I8 && w->K > 4096);
         if (w->K > 4096 && !ksplit) return NULL;
-        if (ksplit && (w->Sn != 1 || tasks[i].M != 1)) return NULL;
+        if (ksplit && w->Sn != 1) return NULL;
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf && !ksplit) return NULL;   /* non-ksplit Sk>1 needs the full-K Bf; ksplit uses the Bb K-slices */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
@@ -9245,24 +9246,36 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += (tasks[p].w->K > 4096) ? tasks[p].w->Sk : tasks[p].w->Sn;   /* K-split (K>4096) => Sk programs; else Sn (N-tile/plain) */
         Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        /* A-staging need: K-split GATHERS every K-slice's [M,Kp] tile (sum = M*K) and all Sk tiles must be
+         * resident at once (one chained submit); non-K-split stages [M,K]*esz. Grow maf (default 256KB) if a
+         * wide-K M>1 op needs more (e.g. ffn_down M=64 => ~1.2MB). */
+        size_t afneed = 0; for (int p = lo; p < hi; p++) { ork_w *ww = tasks[p].w; afneed += (size_t)tasks[p].M * ww->K * ((ww->K > 4096) ? 1 : ((dt == DT_F16) ? 2 : 1)); }
+        if (c->maf[i].size < afneed) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, afneed, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         size_t astage = 0, coff = 0; int pp = 0;   /* pp = program (task) index within this core's chain */
         for (int p = 0; p < nop; p++) {
             const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, Sn = w->Sn, Sk = w->Sk;
             size_t esz = (dt == DT_F16) ? 2 : 1;         /* fp16 activation is 2 bytes/elem; int8 is 1 */
             size_t asz = (size_t)M * K * esz;
-            if (astage + asz > AF->size) { free(h); return NULL; }
-            memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;   /* A shared across the op's N-slices */
-            if (K > 4096) {   /* ------- G2 K-SPLIT (int8, Sn==1, M==1): Sk partial programs + host accumulate -------
-                * A[1,K] is staged contiguously above; K-slice ks reads adma+k0 (Kp bytes). Each program writes
-                * a [1,N] partial into a disjoint scratch slot (ks*N); end() SUMS the Sk partials into C (no
-                * on-device C+= mode). Output is always scratch (direct forced off for Sk>1). */
+            if (K > 4096) {   /* ------- G2 K-SPLIT (int8, Sn==1, M 1..64): Sk partial programs + host accumulate --
+                * Each K-slice ks computes a [M,N] partial from A[:, k0:k0+Kp] x Bb[ks]; end() SUMS the Sk
+                * partials into C (the NPU has no on-device C+= mode). A_ks is GATHERED into a contiguous
+                * [M,Kp] tile (synth_i8 reads A row-stride Kp; the caller's A has row-stride K) — for M==1 the
+                * gather is a plain Kp-byte copy. Output is always scratch (partials + accumulate). */
                 int KS = int8_ks(c); int gi = lo + p;
                 uint32_t cbase = (uint32_t)(CC->dma + coff);
                 for (int ks = 0; ks < Sk; ks++) {
                     int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
+                    /* defensive: the whole M-tile must fit one program for this Kp (mg_max*64 K-reduction cap).
+                     * default KS=1024 gives cap>=320 so M<=64 always fits; a pathological ORK_KTILE could not. */
+                    double scale = (double)Kp / 512.0; int base = (int)(177.0 - 15.0*(scale-1.0)), slope = (int)(15.0*scale);
+                    int mg_max = base >= 0x1b ? (base-0x1b)/slope + 1 : 0; int chunk = mg_max * 64;
+                    if (M > chunk) { free(h); return NULL; }   /* would need M-tile chunking — not implemented */
+                    if (astage + (size_t)M * Kp > AF->size) { free(h); return NULL; }
+                    for (int r = 0; r < M; r++) memcpy((char*)AF->cpu + astage + (size_t)r*Kp, (const char*)t->A + (size_t)r*K + k0, Kp);   /* gather [M,Kp] */
+                    uint32_t aks = (uint32_t)(AF->dma + astage); astage += (size_t)M * Kp;
                     memset(rc, 0, sizeof rc);
-                    synth_i8(rc, 1, Kp, N, adma + (uint32_t)k0, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * N * 4), sched, CBUF, 0);
+                    synth_i8(rc, M, Kp, N, aks, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * M * N * 4), sched, CBUF, 0);   /* [M,N] partial ks */
                     if (validate_regcmd("ork_dyn_mc_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -9273,10 +9286,12 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                     tk[pp] = tt; pp++;
                 }
                 h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
-                h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk;   /* Sk partials of [1,N]; end() sums to [1,N] */
-                coff += (size_t)Sk * N * 4;
+                h->nout[gi] = Sk * M * N; h->oM[gi] = M; h->oSk[gi] = Sk;   /* Sk partials of [M,N]; end() sums to [M,N] */
+                coff += (size_t)Sk * M * N * 4;
                 continue;
             }
+            if (astage + asz > AF->size) { free(h); return NULL; }
+            memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;   /* A shared across the op's N-slices */
             struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
             /* Per-op output base: C in place (direct) or in-domain scratch. The Sn N-slices write DISJOINT
              * column ranges [n0,n0+Nc) of this [M,N]-laid-out output, each at row-stride N (synth_i8 stride arg)
@@ -9591,10 +9606,12 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     int NMAXe = h->c->soc->nmax;
     for (int i = 0; i < h->S; i++) if (h->dst[i]) { int no = h->nout[i] ? h->nout[i] : h->N;
         int Me = h->oM[i] ? h->oM[i] : 1, Ne = no / Me;
-        /* K-SPLIT ACCUMULATE (M==1): scratch holds oSk partial [1,N] blocks; sum them into C[1,N]. */
+        /* K-SPLIT ACCUMULATE: scratch holds oSk partial [M,N] blocks ([ks][m][n]); sum over ks into C[M,N]. */
         if (h->oSk[i] > 1) {
-            int Sk = h->oSk[i], Nn = no / Sk; const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
-            for (int n = 0; n < Nn; n++) { int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Nn + n]; d[n] = (int32_t)acc; }
+            int Sk = h->oSk[i], Nn = no / (Sk * Me); const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
+            for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
+                int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
+                d[(size_t)m * Nn + n] = (int32_t)acc; }
         }
         else
         /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into

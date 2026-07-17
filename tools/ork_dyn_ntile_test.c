@@ -78,11 +78,17 @@ int main(void) {
     fail += one_case_m(c, 512, 16384, 8, 1, 1);   /* M>1 Sn=2 scatter */
     fail += one_case_m(c, 512, 16384, 8, 3, 1);   /* M>1 Sn=2 scatter, multi-core requested */
     fail += one_case_m(c, 512, 24576, 8, 1, 1);   /* M>1 Sn=3 scatter */
-    /* G2 K-split: wide-K DECODE (M=1, K>4096 => Sk K-slice partials + host accumulate). */
-    printf("-- K-split (wide-K, M=1, Sn==1) --\n");
-    fail += one_case_m(c, 8192,  2048, 1, 1, 1);   /* Sk=8, cacheable output */
-    fail += one_case_m(c, 8192,  2048, 1, 1, 0);   /* Sk=8, dma output */
-    fail += one_case_m(c, 18944, 3584, 1, 1, 1);   /* Sk~19, ffn_down-like */
+    /* G2 K-split: wide-K (K>4096 => Sk K-slice partials + host accumulate). Sn==1. */
+    printf("-- K-split (wide-K, Sn==1) — M=1 decode + M>1 prefill --\n");
+    fail += one_case_m(c, 8192,  2048, 1,  1, 1);   /* Sk=8, M=1 decode */
+    fail += one_case_m(c, 8192,  2048, 1,  1, 0);   /* Sk=8, M=1 dma output */
+    fail += one_case_m(c, 18944, 3584, 1,  1, 1);   /* Sk~19, ffn_down-like decode */
+    /* M>1 = A-gather + [M,N] partials + [M,N] accumulate. N kept modest on the M=64 cases so the O(M*N*K)
+     * CPU reference stays fast (the 17MB-partial N=3584/M=64 shape is the same code, just a bigger bcreate). */
+    fail += one_case_m(c, 8192,  2048, 8,  1, 1);   /* Sk=8,  M=8  prefill */
+    fail += one_case_m(c, 8192,  512,  64, 1, 1);   /* Sk=8,  M=64 prefill */
+    fail += one_case_m(c, 18944, 3584, 8,  1, 1);   /* Sk~19, M=8  ffn_down-like prefill */
+    fail += one_case_m(c, 18944, 512,  64, 1, 1);   /* Sk~19, M=64 prefill */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

@@ -139,11 +139,15 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
   K=8192 (Sk=8) and K=18944 (Sk~19, ffn_down-like), cacheable + dma output. All predicates key on `K>4096`
   (NOT `Sk>1` — K<=4096 has Sk>1 too but uses the full-K Bf path; keying on Sk>1 broke byte-identical).
   make test ALL PASS byte-identical.
-  - **G2 NEXT: M>1 K-split (wide-K PREFILL).** Needs (a) the mg_max*64 M-tile chunking — the cap shrinks
-    below 64 for K>4096, so an M=64 tile must split into multiple programs per K-slice; (b) per-(K-slice,
-    M-tile) A-GATHER (`ad[r*Kp+j]=A[(m0+r)*K+k0+j]`, strided for M>1) instead of the M=1 contiguous offset;
-    (c) CC-budget BATCHING for large Sk*M*N partials (ffn_down M=64 => ~17MB) — mirror mcworker's
-    chain-ksplit batch/accumulate loop. Then combined Sn>1 && K>4096 (wide-N AND wide-K).
+  - **G2 M>1 K-split (wide-K PREFILL): DONE — bit-exact.** M 1..64 now handled. Findings that simplified it:
+    (a) NO M-tile chunking needed — for KS=1024 (default) every K-slice has Kp in {1024,512} (since K%512==0),
+    whose mg_max*64 cap is 320/704 >= 64 >= M, so the whole M-tile fits ONE program per K-slice (a defensive
+    per-slice cap check rejects a pathological ORK_KTILE); (b) added the per-K-slice A-GATHER (contiguous
+    [M,Kp] tile; for M==1 it degenerates to a plain copy); (c) NO CC-budget batching needed at M<=64 — the
+    partials (<=~17MB for ffn_down M=64 N=3584) fit mcc after a grow, and maf is grown to hold the M*K gather
+    (all Sk tiles resident in one submit). Validated bit-exact: K=8192/18944, M=1/8/64. make test byte-ident.
+  - **G2 NEXT: combined Sn>1 && K>4096** (wide-N AND wide-K in one op) — currently guarded to Sn==1. Needs the
+    (ns,ks) 2D program grid with per-(ns) accumulation. Rare shape (ffn_down is Sn==1); low priority.
 - **Then** G3/G4 fp16-M>1 / int4-M>1, G5 SDP/PPU. Each: extend wrapper → migrate a path → make test
   byte-identical + attest.
   - **KERNEL CONSTRAINT (found starting P1b):** a PC-CHAIN cannot span >1 N-slice — distinct `Bb[ns]`/`Bf[ns]`
