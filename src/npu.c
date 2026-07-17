@@ -10027,6 +10027,76 @@ int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks)
     c->warmed=1;
     return rc;
 }
+/* ---- LEAN fp16 NONBLOCK HW-chain (ork_mm_run_stream_f16_chain_nb) — GDN doorbell experiment -------
+ * Same lean, persistent-buffer management as ork_mm_run_stream_f16_chain (reused mrc/maf/mtk/mcc, per-call
+ * synth, PC-chain, NO calloc/validate_regcmd/full-surface-seed/civac-sweep) BUT the submit is NONBLOCK
+ * (flags|0x2) issued from ONE thread (no pthread-pool fan-out/join) + a per-core single-element DRAM
+ * sentinel busy-poll, then one FROM_DEVICE bsync for coherency + copyback. This isolates the ONE variable
+ * the coordinator flagged: BLOCKING pool-driven issue vs NONBLOCK single-thread issue, holding the (lean)
+ * build path constant. Coherence gated by the caller's rel-L2 check. ORK_GDN_DOORBELL=2. */
+#define ORK_F16NB_SENT ((int32_t)0x7fc00001)   /* a fp32-NaN bit pattern real results won't hit */
+long g_f16nb_fail=0;   /* count of NONBLOCK rounds whose sentinel never fired (completion-race diagnostic) */
+int ork_mm_run_stream_f16_chain_nb(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
+    if(!c||S<1||!tasks) return -2;
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
+        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
+        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;
+        if(w->K%32||w->N%16) return -2; }
+    int fd=c->fd, CBUF=c->soc->cbuf_elems; if(CBUF>32768)CBUF=32768;
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_HW);
+    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(mc_ensure(c,nc)) return -1;
+    int per=(S+nc-1)/nc;
+    size_t needrc=(size_t)per*REGCMD_I8_N*4, needtk=(size_t)per*sizeof(struct rknpu_task);
+    size_t maxMK=(size_t)per*tasks[0].M*tasks[0].w->K*2, maxMN4=(size_t)per*tasks[0].M*tasks[0].w->N*4;
+    for(int i=0;i<nc;i++){
+        if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active); if(!c->mrc[i].cpu)return -1; c->mwarm[i]=0; }
+        if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active); if(!c->mtk[i].cpu)return -1; }
+        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+    struct rknpu_submit sub[ORK_MAXCORE]; int cntc[ORK_MAXCORE]; volatile int32_t *sent[ORK_MAXCORE];
+    uint32_t rc[REGCMD_I8_N];
+    for(int i=0;i<nc;i++){
+        int cnt=0; for(int k=i;k<S;k+=nc) cnt++; cntc[i]=cnt; if(cnt==0) continue;
+        struct rknpu_task *mt=c->mtk[i].cpu; int p=0;
+        for(int k=i;k<S;k+=nc,p++){ const ork_mm_task_f16 *t=&tasks[k]; ork_w *w=t->w; int M=t->M,K=w->K,N=w->N;
+            int sched=(K&(K-1))==0 && K>=128 && K<2048;
+            memcpy((char*)c->maf[i].cpu+(size_t)p*M*K*2, t->A, (size_t)M*K*2);
+            memset(rc,0,REGCMD_I8_N*4);
+            synth(rc,M,K,N,(uint32_t)(c->maf[i].dma+(size_t)p*M*K*2),(uint32_t)w->Bb[0].dma,(uint32_t)(c->mcc[i].dma+(size_t)p*M*N*4),sched,CBUF);
+            if(p<cnt-1){ uint64_t next=c->mrc[i].dma+(size_t)(p+1)*REGCMD_I8_N*4;
+                rc[216]=0x0010|((next&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(next>>16)&0xffff); rc[218]=0x0014|(0x0037u<<16); }
+            memcpy((char*)c->mrc[i].cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
+            memset(&mt[p],0,sizeof mt[p]); mt[p].enable_mask=0xd; mt[p].int_mask=0x300; mt[p].int_clear=0x1ffff;
+            mt[p].regcfg_amount=108; mt[p].regcmd_addr=c->mrc[i].dma+(size_t)p*REGCMD_I8_N*4; }
+        /* completion sentinel = last program's last output element */
+        { const ork_mm_task_f16 *tl=&tasks[i+(cnt-1)*nc]; int M=tl->M,N=tl->w->N;
+          volatile int32_t *s=(volatile int32_t*)((char*)c->mcc[i].cpu+(size_t)(cnt-1)*M*N*4)+((size_t)M*N-1);
+          *s=ORK_F16NB_SENT; sent[i]=s; }
+        __asm__ volatile("dsb ish":::"memory");
+        bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean whole output surface (seed + cold dirty lines) */
+        memset(&sub[i],0,sizeof sub[i]);
+        sub[i].flags=ork_ppflags()|0x2u; sub[i].task_number=cnt; sub[i].task_obj_addr=c->mtk[i].obj; sub[i].core_mask=1u<<i; sub[i].fence_fd=-1;
+        sub[i].subcore_task[0]=sub[i].subcore_task[1]=sub[i].subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)cnt};
+        sub[i].timeout=mm_timeout_ms(); }
+    for(int i=0;i<nc;i++) if(cntc[i]) rknpu_submit_ioctl(fd,&sub[i],tasks[i].w->domain);   /* NONBLOCK issue, no pool */
+    double tp=ork_now_us(); double pto=getenv("ORK_F16NB_PTO")?atof(getenv("ORK_F16NB_PTO"))*1000.0:3e6;
+    for(int i=0;i<nc;i++) if(cntc[i]){ int to=1; for(;;){ __asm__ volatile("dc civac,%0"::"r"(sent[i]):"memory");
+        if(*sent[i]!=ORK_F16NB_SENT){to=0;break;} if(ork_now_us()-tp>pto) break; }
+        if(to){ extern long g_f16nb_fail; g_f16nb_fail++;
+            if(getenv("ORK_F16NB_DBG")) fprintf(stderr,"[f16nb] STALL core=%d S=%d M=%d K=%d N=%d cnt=%d\n",i,S,tasks[0].M,tasks[0].w->K,tasks[0].w->N,cntc[i]); } }
+    int ret=0;
+    for(int i=0;i<nc;i++) if(cntc[i]){ bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+        int p=0; for(int k=i;k<S;k+=nc,p++){ const ork_mm_task_f16 *t=&tasks[k]; int M=t->M,N=t->w->N;
+            memcpy(t->C,(char*)c->mcc[i].cpu+(size_t)p*M*N*4,(size_t)M*N*4); }
+        c->mwarm[i]=1; }
+    c->warmed=1;
+    return ret;
+}
 /* STREAMED batched fp16 GEMM — pack each B (fp16), dispatch the nb matmuls round-robin across cores. */
 int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||nb<1||M<1||K<1||N<1||K%32||N%16) return -2;
@@ -10365,11 +10435,15 @@ done2:
  * HW-chain doorbell (ork_dyn_begin_mc) instead of the blocking thread-pool run_stream_f16_chain, to test
  * whether the doorbell's dispatch-half win shrinks the ~44% NPU-submit fraction of the GDN scan. Requires
  * the fp16 K%512 guard relaxation in ork_dyn_begin_mc above. Default OFF (baseline = run_stream_f16_chain). */
-static int gdn_doorbell(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_GDN_DOORBELL"); v=(e&&atoi(e))?1:0;} return v; }
+/* ORK_GDN_DOORBELL: 0=baseline blocking run_stream_f16_chain; 1=begin_mc doorbell (heavy); 2=LEAN NONBLOCK. */
+static int gdn_doorbell(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_GDN_DOORBELL"); v=e?atoi(e):0;} return v; }
+int ork_mm_run_stream_f16_chain_nb(ork_npu *c, int S, const ork_mm_task_f16 *tasks);   /* fwd */
 /* decomposition timers (ORK_GDN_PROF): split the doorbell per-stage cost begin_mc vs end, count calls. */
 double g_gdn_db_begin=0, g_gdn_db_end=0; long g_gdn_db_calls=0;
 static int gdn_run_stage(ork_npu *c,int nh,const ork_mm_task_f16 *tk){
-    if(!gdn_doorbell()) return ork_mm_run_stream_f16_chain(c,nh,tk);
+    int m=gdn_doorbell();
+    if(m==0) return ork_mm_run_stream_f16_chain(c,nh,tk);
+    if(m==2) return ork_mm_run_stream_f16_chain_nb(c,nh,tk);   /* lean NONBLOCK */
     double t0=ork_now_us();
     ork_dyn_chain *h=ork_dyn_begin_mc(c,nh,(const ork_mm_task_i8*)tk,0);   /* task_i8/f16 layout-identical */
     double t1=ork_now_us();
@@ -10442,6 +10516,7 @@ void ork_gdn_prof_dump(void){
         g_gdn_db_calls, g_gdn_db_begin/1000.0, g_gdn_db_begin/g_gdn_db_calls, g_gdn_db_end/1000.0, g_gdn_db_end/g_gdn_db_calls, (g_gdn_db_begin+g_gdn_db_end)/1000.0);
     if(g_db_n) fprintf(stderr,"[ork GDN PROF begin_mc phases] %ld fp16 calls (us/call): build+enter+mc_ensure %.0f | seed+bsync+submit %.0f | poll-to-done %.0f | civac-sweep %.0f\n",
         g_db_n, g_db_build/g_db_n, g_db_round/g_db_n, g_db_poll/g_db_n, g_db_civac/g_db_n);
+    { extern long g_f16nb_fail; if(g_f16nb_fail) fprintf(stderr,"[ork GDN PROF lean-nb] %ld NONBLOCK completion STALLS (sentinel never fired)\n", g_f16nb_fail); }
 }
 int ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
                      const float *s0,const float *q,const float *k,const float *v,
