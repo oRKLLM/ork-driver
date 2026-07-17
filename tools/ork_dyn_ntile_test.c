@@ -78,6 +78,11 @@ int main(void) {
     fail += one_case_m(c, 512, 16384, 8, 1, 1);   /* M>1 Sn=2 scatter */
     fail += one_case_m(c, 512, 16384, 8, 3, 1);   /* M>1 Sn=2 scatter, multi-core requested */
     fail += one_case_m(c, 512, 24576, 8, 1, 1);   /* M>1 Sn=3 scatter */
+    /* G2 K-split: wide-K DECODE (M=1, K>4096 => Sk K-slice partials + host accumulate). */
+    printf("-- K-split (wide-K, M=1, Sn==1) --\n");
+    fail += one_case_m(c, 8192,  2048, 1, 1, 1);   /* Sk=8, cacheable output */
+    fail += one_case_m(c, 8192,  2048, 1, 1, 0);   /* Sk=8, dma output */
+    fail += one_case_m(c, 18944, 3584, 1, 1, 1);   /* Sk~19, ffn_down-like */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

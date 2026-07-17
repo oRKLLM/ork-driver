@@ -8921,6 +8921,8 @@ struct ork_dyn_chain {
     int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
     int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
     int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
+    int        oSk[1024];       /* per-op K-split count: >1 => the op's output is oSk partial [M,N] blocks in scratch
+                                 * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
     int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
     int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
@@ -8941,6 +8943,11 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
         for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e]==ORK_DYN_SENT16) return 0; }
         return 1; }
     int NMAXd = h->c->soc->nmax;
+    if (h->oSk[i] > 1) {   /* K-SPLIT: output is oSk partial [M,N] blocks; poll the FULL partial surface (the
+        * partials' write-order isn't last-col-last across blocks) — done only when every partial word landed. */
+        volatile int32_t *base = (volatile int32_t*)h->outptr[i];
+        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
+        return 1; }
     if (M > 1 && Nx > NMAXd) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
         * output's write-order over N is NOT reliably last-col-last (like the int4 int16 output above), so a
         * per-row-last-col poll fires before the whole block drains -> partial scatter -> non-deterministic
@@ -9190,9 +9197,15 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
-        if (w->K % 512 || w->K > 4096) return NULL;
+        if (w->K % 512) return NULL;
+        /* G2 K-split: K>4096 (int8) rides Sk per-K-slice partials + host accumulate. First increment is
+         * Sn==1 && M==1 (wide-K DECODE, e.g. ffn_down) — M>1 prefill needs the mg_max*64 M-tile chunking
+         * (the cap shrinks below 64 for K>4096) + an A-gather, a follow-up. fp16 K>4096 unsupported. */
+        int ksplit = (dt == DT_I8 && w->K > 4096);
+        if (w->K > 4096 && !ksplit) return NULL;
+        if (ksplit && (w->Sn != 1 || tasks[i].M != 1)) return NULL;
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
-        if (w->Sk != 1 && !w->Bf) return NULL;
+        if (w->Sk != 1 && !w->Bf && !ksplit) return NULL;   /* non-ksplit Sk>1 needs the full-K Bf; ksplit uses the Bb K-slices */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);   /* fp16 pipeline (layer owns reset, keep-warm-aware) */
@@ -9215,10 +9228,10 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * ZC-OUT class that keeps output zero-copy off by default). The scratch path (NPU -> cacheable mcc ->
      * bsync FROM_DEVICE -> CPU copy/scatter to the caller's C) is the reliable completion barrier and is
      * bit-exact. So force scratch for any M>1 op; end() straight-copies (Sn==1) or scatters (Sn>1 wide-N). */
-    for (int i = 0; i < S; i++) if (tasks[i].M > 1) { direct = 0; break; }
+    for (int i = 0; i < S; i++) if (tasks[i].M > 1 || tasks[i].w->K > 4096) { direct = 0; break; }   /* M>1 (ZC-OUT unsafe) and K-split (K>4096: partials+accumulate) both require the scratch path (K<=4096 uses full-K Bf, direct OK) */
     if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d dom=%u direct=%d N=%d\n", S, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
-        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N (M>1) */
+        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)(tasks[p].w->K > 4096 ? tasks[p].w->Sk : 1) * tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N; K-split (K>4096) holds Sk partials */
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }   /* fresh scratch => "cold" so the clean-before-round fires (dirty-line coherency) */
     uint32_t rc[REGCMD_I8_N + 4];
@@ -9229,7 +9242,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         if (nop < 1) { Pc[i] = 0; continue; }
         /* PROGRAM count (task_number) is decoupled from OP count: an op with Sn>1 N-slices emits Sn
          * chained programs (each a strided-output sub-op), so a core's program count is sum-of-Sn, not nop. */
-        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn;
+        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += (tasks[p].w->K > 4096) ? tasks[p].w->Sk : tasks[p].w->Sn;   /* K-split (K>4096) => Sk programs; else Sn (N-tile/plain) */
         Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
@@ -9240,6 +9253,30 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             size_t asz = (size_t)M * K * esz;
             if (astage + asz > AF->size) { free(h); return NULL; }
             memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;   /* A shared across the op's N-slices */
+            if (K > 4096) {   /* ------- G2 K-SPLIT (int8, Sn==1, M==1): Sk partial programs + host accumulate -------
+                * A[1,K] is staged contiguously above; K-slice ks reads adma+k0 (Kp bytes). Each program writes
+                * a [1,N] partial into a disjoint scratch slot (ks*N); end() SUMS the Sk partials into C (no
+                * on-device C+= mode). Output is always scratch (direct forced off for Sk>1). */
+                int KS = int8_ks(c); int gi = lo + p;
+                uint32_t cbase = (uint32_t)(CC->dma + coff);
+                for (int ks = 0; ks < Sk; ks++) {
+                    int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
+                    memset(rc, 0, sizeof rc);
+                    synth_i8(rc, 1, Kp, N, adma + (uint32_t)k0, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * N * 4), sched, CBUF, 0);
+                    if (validate_regcmd("ork_dyn_mc_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I8_N * 4;
+                    tk[pp] = tt; pp++;
+                }
+                h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+                h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk;   /* Sk partials of [1,N]; end() sums to [1,N] */
+                coff += (size_t)Sk * N * 4;
+                continue;
+            }
             struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
             /* Per-op output base: C in place (direct) or in-domain scratch. The Sn N-slices write DISJOINT
              * column ranges [n0,n0+Nc) of this [M,N]-laid-out output, each at row-stride N (synth_i8 stride arg)
@@ -9289,7 +9326,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * N-tiled int8 (Sn>1) ALSO needs the full-surface clean: the strided column-slice writes leave the row
      * interior uncovered by the last-col seed, so dirty/stale CPU lines there race the NPU writes (the same
      * coherency class) -> non-deterministic zeros. seed_all folds Sn>1 into the fp16 full-clean branch. */
-    int seed_all = (dt == DT_F16); for (int _si = 0; _si < S; _si++) if (tasks[_si].w->Sn > 1) { seed_all = 1; break; }
+    int seed_all = (dt == DT_F16); for (int _si = 0; _si < S; _si++) if (tasks[_si].w->Sn > 1 || tasks[_si].w->K > 4096) { seed_all = 1; break; }   /* full-surface clean for N-tile (Sn>1) and K-split (K>4096) scratch */
     #define ORK_MC_SEED() do { for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N; \
         if (seed_all) { for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + n); \
             *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } \
@@ -9554,6 +9591,12 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     int NMAXe = h->c->soc->nmax;
     for (int i = 0; i < h->S; i++) if (h->dst[i]) { int no = h->nout[i] ? h->nout[i] : h->N;
         int Me = h->oM[i] ? h->oM[i] : 1, Ne = no / Me;
+        /* K-SPLIT ACCUMULATE (M==1): scratch holds oSk partial [1,N] blocks; sum them into C[1,N]. */
+        if (h->oSk[i] > 1) {
+            int Sk = h->oSk[i], Nn = no / Sk; const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
+            for (int n = 0; n < Nn; n++) { int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Nn + n]; d[n] = (int32_t)acc; }
+        }
+        else
         /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into
          * C's column range [n0,n0+Nc) at row-stride Ne. (int8/int32 only — Sn>1 M>1 is not an int4/fp16 shape.) */
         if (h->esz != 2 && Me > 1 && Ne > NMAXe) {

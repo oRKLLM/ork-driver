@@ -131,7 +131,21 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
 - Committed: SRAM table (`ba77747`), linger (`a878169`), spin tail + self-heal/dump (`1d679d1`),
   **P1a** (`a89d45c`): single-slice run_chain_i8 routed onto the doorbell spine, no fallback, auto-dump-on-miss.
 - **P0 audit DONE**: ~35 submit sites in ~20 core fns are migration targets; ~60 in ~40 probe/RE fns leave; ~8 are the spine itself.
-- **P1b = G1 N-tiling** — extend the doorbell/`ork_submit_seq` to accept `Sn>1` so wider paths (FFN, lm_head, run_multicore) can route on; then G2 K-split, G3/G4 fp16-M>1 / int4-M>1, G5 SDP/PPU. Each: extend wrapper → migrate a path → make test byte-identical + attest.
+- **G1 N-tiling: DONE** (M=1 direct + M>1 scratch/scatter, bit-exact, committed 0fbf4b1). See below.
+- **G2 K-split (K>4096): FIRST INCREMENT DONE — wide-K DECODE (M=1) bit-exact.** `ork_dyn_begin_mc` now
+  accepts int8 K>4096 for Sn==1 && M==1: emits Sk per-K-slice partial programs (A_ks = contiguous offset
+  `A+k0` since M=1, no gather; Bb[ks] K-slice weight), chained; `end()` host-SUMS the Sk `[1,N]` partials
+  into C (marked by `oSk[gi]`); `done_i` full-surface polls the partial scratch. Validated bit-exact:
+  K=8192 (Sk=8) and K=18944 (Sk~19, ffn_down-like), cacheable + dma output. All predicates key on `K>4096`
+  (NOT `Sk>1` — K<=4096 has Sk>1 too but uses the full-K Bf path; keying on Sk>1 broke byte-identical).
+  make test ALL PASS byte-identical.
+  - **G2 NEXT: M>1 K-split (wide-K PREFILL).** Needs (a) the mg_max*64 M-tile chunking — the cap shrinks
+    below 64 for K>4096, so an M=64 tile must split into multiple programs per K-slice; (b) per-(K-slice,
+    M-tile) A-GATHER (`ad[r*Kp+j]=A[(m0+r)*K+k0+j]`, strided for M>1) instead of the M=1 contiguous offset;
+    (c) CC-budget BATCHING for large Sk*M*N partials (ffn_down M=64 => ~17MB) — mirror mcworker's
+    chain-ksplit batch/accumulate loop. Then combined Sn>1 && K>4096 (wide-N AND wide-K).
+- **Then** G3/G4 fp16-M>1 / int4-M>1, G5 SDP/PPU. Each: extend wrapper → migrate a path → make test
+  byte-identical + attest.
   - **KERNEL CONSTRAINT (found starting P1b):** a PC-CHAIN cannot span >1 N-slice — distinct `Bb[ns]`/`Bf[ns]`
     buffers make the CDMA walker reject the cross-buffer next-pointer (errno 110 "cdma address wild"; the same
     reason chain-K-split is `Sn==1`-only, per `mcworker`). So G1 is NOT "chain Sn programs in one submit".
