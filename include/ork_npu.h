@@ -790,6 +790,46 @@ typedef struct ork_pc_chain ork_pc_chain;
 ork_pc_chain *ork_pc_compile(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* build the program pool once; NULL on bad args */
 int          ork_pc_run(ork_pc_chain *pc);                                        /* refresh A + NONBLOCK submit + drain; ret highest op */
 void         ork_pc_free(ork_pc_chain *pc);
+
+/* ---- Heterogeneous op-sequence scheduler (ork_submit_seq) ----------------------------------------
+ * Ingest a mixed sequence of NPU ops (any precision, matmul or SDP/activation) and run it correctly by
+ * routing each op to the ONE execution model it is reliable on. Different op types are reliable on
+ * different models (a hard, exhaustively-established finding): int8 matmul with conforming K
+ * (K%512==0 && K<=4096) is bit-exact on the thread-free HW-chain DOORBELL (ork_dyn_begin_mc, NONBLOCK
+ * poll); fp16 matmul, int4, non-conforming-K int8, and SDP/activation ops are NOT (fp16 on the doorbell
+ * produces non-deterministic partial-K reductions) but ARE reliable on the SW-chain / thread-pool +
+ * blocking-completion model (run_stream_f16 / run_multicore / the int4 stream / the SDP op fns).
+ *
+ * The scheduler batches maximal runs of consecutive HW-chainable ops into ONE doorbell submit and BREAKS
+ * the chain to the SW model at every op that isn't. Each break's precision/chain mode transition is
+ * handled by the driver's existing table-driven ork_npu_enter/XSPEC layer — so op classification is DATA
+ * (a per-op-kind row of {marker, XSPEC profile, ork_chain_kind, dispatch}), not branches. Adding a new
+ * precision/op is one more row; the moment fp16-HW-chain is ever solved it is a one-line OCK_SW->OCK_HW
+ * flip of that row (the scheduler loop is unchanged regardless of how many kinds exist).
+ *
+ * PHASE 1 (now): CORRECTNESS + RELIABILITY of a mixed sequence across the HW<->SW transitions. No
+ * CPU/NPU overlap yet (that is phase 2 — see tools/test_submit_seq.c). Ops execute in order. */
+typedef enum {
+    ORK_OP_MM_I8 = 0,   /* int8 matmul:  w=DT_I8 weight, A int8[M,K], C int32[M,N]  (HW doorbell if K conforms) */
+    ORK_OP_MM_F16,      /* fp16 matmul:  w=DT_F16 weight, A fp16[M,K], C fp32[M,N]  (SW: run_stream_f16) */
+    ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K], C int32[M,N]  (SW: run_stream_i4) */
+    ORK_OP_SILU_F16,    /* fp16 SiLU activation (SDP): A fp16[M,N] -> C fp16[M,N]   (SW SDP; needs LUT — TODO row) */
+    ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_npu_ewmul_f16) */
+    ORK_OP_NKIND
+} ork_seq_kind;
+typedef struct {
+    ork_seq_kind kind;
+    ork_w      *w;                 /* matmul weight (NULL for weightless SDP ops) */
+    int         M, N;              /* M rows; N is taken from w for matmuls, supplied here for weightless SDP ops */
+    const void *A;                 /* primary input (int8/fp16 A, or SDP operand) */
+    const void *B;                 /* second SDP operand (ewmul "up"); NULL otherwise */
+    void       *C;                 /* output */
+    double      in_scale, out_scale;  /* SDP activation scales (LUT ops); ignored by matmul/ewmul kinds */
+} ork_seq_op;
+/* Run the n-op sequence in order, HW-batching + SW-breaking as above. 0/ok, -1 a submit failed/wedged,
+ * -2 bad args, -3 an op-kind whose dispatch is not yet wired (documented TODO row, e.g. SILU_F16). */
+int          ork_submit_seq(ork_npu *ctx, const ork_seq_op *ops, int n);
+
 /* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
  * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before
  * the chain. Chains [gate*silu -> up -> ...] in ONE submit. lut/params as ork_mm_run_i8_silu (build with

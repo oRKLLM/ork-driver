@@ -62,6 +62,11 @@ libork_npu.so: $(COBJ)                   # shared — dynamic link / FFI from Py
 rknpu_bench: tools/rknpu_bench.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+# Phase-1 validation of ork_submit_seq: mixed int8(HW-doorbell)+fp16(SW-chain) sequence, bit-exact across
+# many runs + HW<->SW transitions. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./test_submit_seq
+test_submit_seq: tools/test_submit_seq.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE/calibration probe: sweeps K to find this SoC's single-submit K-tile ceiling (int8).
 # Not in `all`/`test` — it intentionally wedges the NPU past the cap (recoverable).
 ksubmit_probe: tools/ksubmit_probe.c $(CORE)
