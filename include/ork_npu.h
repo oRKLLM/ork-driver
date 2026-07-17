@@ -822,7 +822,7 @@ void         ork_pc_free(ork_pc_chain *pc);
 typedef enum {
     ORK_OP_MM_I8 = 0,   /* int8 matmul:  w=DT_I8 weight, A int8[M,K], C int32[M,N]  (HW doorbell if K conforms) */
     ORK_OP_MM_F16,      /* fp16 matmul:  w=DT_F16 weight, A fp16[M,K] (HOST mem), C fp32[M,N]  (HW doorbell if K conforms & M*K<=32768, else SW run_stream_f16) */
-    ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K], C int32[M,N]  (SW: run_stream_i4) */
+    ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K] (HOST mem), C int32[M,N]  (HW doorbell if M==1 & single-slice, else SW run_stream_i4) */
     ORK_OP_SILU_F16,    /* fp16 SiLU activation (SDP): A fp16[M,N] -> C fp16[M,N]   (SW SDP; needs LUT — TODO row) */
     ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_npu_ewmul_f16) */
     ORK_OP_NKIND

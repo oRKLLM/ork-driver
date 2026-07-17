@@ -8800,6 +8800,9 @@ struct ork_dyn_chain {
     int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
     int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
+    int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
+                                 * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
+                                 * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
 };
 #define ORK_DYN_SENT 0x7fffffff
 /* Per-row completion: a task is done only when EVERY row's last column has been overwritten. The M-tile
@@ -8807,8 +8810,13 @@ struct ork_dyn_chain {
  * word doorbell RACES (end() returns before earlier rows land; M=1 is safe since within a row last-col IS
  * last). Poll all M rows' last cols (M<=64, cheap). Sentinel 0x7fffffff = INT_MAX / fp32 NaN — no valid
  * matmul output equals it, so this is precision-agnostic (int8->int32, fp16->fp32). */
+#define ORK_DYN_SENT16 ((int16_t)0x7fff)   /* int4 (int16 output) sentinel — no valid W4A4 accumulator equals it */
 static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
+    if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row */
+        volatile int16_t *o = (volatile int16_t*)h->outptr[i];
+        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e]==ORK_DYN_SENT16) return 0; }
+        return 1; }
     for (int m = 0; m < M; m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(size_t)m*Nx+(Nx-1));
         __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
     return 1; }
@@ -8907,10 +8915,86 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
  * caller's C (a host memcpy) — so the caller's C need NOT be resident or in the submit's domain. A likewise
  * staged into the per-core AF (zero-copy A is M=1-wrong). All S tasks must share one domain (a MoE node's
  * experts do: layer-based residence); begin_mc submits + allocs its scratch in tasks[0]'s domain. */
+/* int4 (W4A4) multi-core NONBLOCK doorbell — the DT_I4 sibling of ork_dyn_begin_mc. int4 is structurally
+ * different from int8/fp16 at the hardware level: the datapath writes an int16 (2-byte) accumulator (widened
+ * to int32 on the host, esz=2) and its HW chain is M=1 only — so it CANNOT share the 4-byte-C body. This keeps
+ * that body byte-identical and specialises the int4 divergences: tile_i4_Aslice host-A staging (0.5 B/elem),
+ * synth_i4 / REGCMD_I4_N stride / regcfg_amount=116, an int16 per-core output scratch (ALWAYS copy-back — the
+ * NPU never writes the caller's int32 C in place), and a FULL-SURFACE int16 sentinel seed that doubles as the
+ * clean-before-write the fresh/reused scratch needs (int4's int16 write-order over N is not last-col-last, so
+ * both the seed and the completion poll cover the whole row). Proven bit-exact single-core by ork_dyn_i4_probe;
+ * this is the productionised multi-core form the scheduler dispatches. Host (malloc) A only, as for int8/fp16.
+ * end() drains via the esz-aware ork_dyn_done_i and widens int16->int32 into the caller's C. */
+static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
+    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sn != 1 || w->Sk != 1) return NULL;   /* int4 HW chain: M=1, single-slice */
+        if (w->domain != tasks[0].w->domain) return NULL; }   /* one submit => one domain */
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
+    if (mc_ensure(c, nc)) return NULL;
+    int fd = c->fd;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1; h->esz = 2;
+    unsigned dom = tasks[0].w->domain;
+    /* int4 ALWAYS copy-back: per-core in-domain int16 scratch (M=1 => N int16/op), widened in end() */
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
+        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].w->N * 2;
+        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
+    uint32_t rc[REGCMD_I4_N];
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    for (int i = 0; i < nc; i++) {
+        int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
+        Pc[i] = P; if (P < 1) continue;
+        if ((size_t)P * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)P * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        size_t astage = 0, coff = 0;
+        for (int p = 0; p < P; p++) {
+            const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N;
+            size_t asz = (size_t)K / 2;                  /* int4 activation: 0.5 B/elem, tiled (not memcpy) */
+            if (astage + asz > AF->size) { free(h); return NULL; }
+            tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, 0, K);
+            uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;
+            uint32_t cdma = (uint32_t)(CC->dma + coff);   /* int16 scratch (always copy-back) */
+            uint32_t bdma = (uint32_t)w->Bb[0].dma;
+            memset(rc, 0, sizeof rc);
+            synth_i4(rc, 1, K, N, adma, bdma, cdma);
+            if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+            if (p < P - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I4_N * 4;
+                rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+            memcpy((char*)RC->cpu + (size_t)p * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+            struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+            tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I4_N * 4;   /* int4 = 116 regs */
+            tk[p] = tt;
+            int gi = lo + p;
+            h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+            h->nout[gi] = N; h->oM[gi] = 1;
+            coff += (size_t)N * 2;
+        }
+        memset(&subs[i], 0, sizeof subs[i]);
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = P; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
+    }
+    /* seed the FULL int16 output surface (clean-before-write for fresh/reused scratch; = the probe's fix) */
+    for (int x = 0; x < S; x++) { int N = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+        for (int col = 0; col < N; col++){ o[col] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[col]):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }
+    for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
+    return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
+}
+
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
+    if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
     if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
     /* fp16 doorbell: bit-exact and enabled by default (was WIP-gated). The prior "residual ~10-20% all-16
      * cold-race" that kept it gated was NOT a chaining/coherency defect — it was the TEST feeding the A
@@ -9205,8 +9289,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
         if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
-    /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C */
-    for (int i = 0; i < h->S; i++) if (h->dst[i]) memcpy(h->dst[i], h->outptr[i], (size_t)(h->nout[i] ? h->nout[i] : h->N) * 4);
+    /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C.
+     * int4 (esz==2): the NPU wrote an int16 accumulator; widen int16->int32 into the caller's int32 C. */
+    for (int i = 0; i < h->S; i++) if (h->dst[i]) { int no = h->nout[i] ? h->nout[i] : h->N;
+        if (h->esz == 2) { const int16_t *o=(const int16_t*)h->outptr[i]; int32_t *d=h->dst[i]; for (int e=0;e<no;e++) d[e]=o[e]; }
+        else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h); return r; }
 
@@ -11136,18 +11223,22 @@ static int seq_disp_ewmul_f16(ork_npu *c,const ork_seq_op *o){ double us; return
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
-  /* ORK_OP_MM_I4   */ { 0, 5/*I4_STRM*/,XP_I4_STREAM, OCK_SW, seq_disp_i4_mm    },
+  /* ORK_OP_MM_I4   */ { 1, 5/*I4_STRM*/,XP_I4_STREAM, OCK_SW, seq_disp_i4_mm    },
   /* ORK_OP_SILU_F16*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, NULL /*TODO: fp16 SiLU needs a per-(in,out)-scale LUT plumbed through ork_seq_op — ork_npu_probe_silu_std_f16(idx_off,cfg,lut,nlut)*/ },
   /* ORK_OP_EWMUL_F16*/{ 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_ewmul_f16 },
 };
-/* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces for an int8 OR fp16 task
- * (single-slice, conforming K%512 && K<=4096, M<=64, Sn==1; fp16 adds the M*K<=32768 tile cap). An op of
- * an hw=1 KIND that fails this is downgraded to the SW break path (its SEQ_CLASS fn). Kept in lockstep with
- * ork_dyn_begin_mc's per-task guard — if that guard changes, change this. */
+/* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
+ * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
+ * chain is M=1-only and writes int16). An op of an hw=1 KIND that fails this downgrades to the SW break path
+ * (its SEQ_CLASS fn). Kept in lockstep with begin_mc / begin_mc_i4's per-task guards — change both together. */
 static int seq_hw_ok(const ork_seq_op *o){
-    if(o->kind!=ORK_OP_MM_I8 && o->kind!=ORK_OP_MM_F16) return 0;
-    ork_w *w=o->w; if(!w) return 0;
-    if(o->M<1||o->M>64||w->Sn!=1) return 0;
+    if(o->kind!=ORK_OP_MM_I8 && o->kind!=ORK_OP_MM_F16 && o->kind!=ORK_OP_MM_I4) return 0;
+    ork_w *w=o->w; if(!w||w->Sn!=1) return 0;
+    if(o->kind==ORK_OP_MM_I4){                 /* int4: M=1 single-slice (begin_mc_i4) */
+        if(w->dtype!=DT_I4||o->M!=1||w->Sk!=1) return 0;
+        return 1;
+    }
+    if(o->M<1||o->M>64) return 0;
     if(w->K%512||w->K>4096) return 0;
     if(w->Sk!=1 && !w->Bf) return 0;
     if(o->kind==ORK_OP_MM_I8){ if(w->dtype!=DT_I8) return 0; }
@@ -11162,7 +11253,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     /* Flush the accumulated HW run as ONE doorbell submit (begin_mc owns its own mode enter). A run is one
      * dtype AND one domain (begin_mc requires both), so bdt/bdom key the batch; a dtype/domain change breaks
      * it. The SW fallback (begin_mc returned NULL — shouldn't happen since seq_hw_ok mirrors its guard, but
-     * defensive) is dtype-aware: fp16 -> run_stream_f16, int8 -> run_i8. */
+     * defensive) is dtype-aware: fp16 -> run_stream_f16, int4 -> run_stream_i4, int8 -> run_i8. */
     #define SEQ_FLUSH_HW() do{ if(nb){ ork_dyn_chain *h=ork_dyn_begin_mc(c,nb,batch,0); \
         if(getenv("ORK_SEQ_DEBUG")) fprintf(stderr,"[seq] HW flush dt=%d n=%d -> %s\n", bdt, nb, h?"doorbell":"SW-fallback"); \
         if(h){ ork_dyn_end(h); } \
@@ -11171,6 +11262,9 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
                 if(bdt==DT_F16){ ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_SW); \
                     ork_mm_task_f16 _t={batch[_q].w,batch[_q].M,(const f16*)batch[_q].A,(float*)batch[_q].C}; \
                     if(ork_mm_run_stream_f16(c,1,&_t)) ret=-1; } \
+                else if(bdt==DT_I4){ ork_npu_enter(c,5/*I4_STRM*/,XP_I4_STREAM,OCK_SW); \
+                    ork_mm_task_i4 _t={batch[_q].w,batch[_q].M,batch[_q].A,batch[_q].C}; \
+                    if(ork_mm_run_stream_i4(c,1,&_t)) ret=-1; } \
                 else { ork_npu_enter(c,DT_I8,XP_MC_MM,OCK_SW); \
                     if(ork_mm_run_i8(c,batch[_q].w,batch[_q].M,batch[_q].A,batch[_q].C)) ret=-1; } } } \
         nb=0; } }while(0)

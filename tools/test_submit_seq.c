@@ -106,6 +106,39 @@ int main(int argc,char**argv){
         free(Bnc);free(Anc);free(Fnc);
     }
 
+    /* --- mixed [i8][f16][i4][i8] at M=1: int4 now rides its OWN doorbell (dtype break i8->f16->i4->i8 =>
+     * FOUR doorbell submits, ZERO SW breaks). int4 HW chain is M=1-only, so this sub-sequence is all M=1.
+     * all-ones int4 dot == K. Run with ORK_SEQ_DEBUG=1: four "[seq] HW flush" (dt 1,0,2,1), no "SW break". --- */
+    {
+        int8_t *Bi4=(int8_t*)malloc((size_t)K*N); memset(Bi4,1,(size_t)K*N);   /* int4 nibble value 1 */
+        int8_t *Ai4=(int8_t*)malloc((size_t)K);   memset(Ai4,1,(size_t)K);
+        ork_w *wi4=ork_mm_pack_i4(c,K,N,Bi4);
+        int32_t *M0=malloc((size_t)N*4), *M3=malloc((size_t)N*4), *M2i=malloc((size_t)N*4); float *M1f=malloc((size_t)N*4);
+        int i4_fail=0;
+        if(!wi4){ printf("  pack_i4 fail\n"); fail=1; }
+        else {
+            ork_seq_op m[4] = {
+                { .kind=ORK_OP_MM_I8,  .w=wi,  .M=1, .N=N, .A=Ai, .C=M0  },
+                { .kind=ORK_OP_MM_F16, .w=wf,  .M=1, .N=N, .A=Af, .C=M1f },
+                { .kind=ORK_OP_MM_I4,  .w=wi4, .M=1, .N=N, .A=Ai4,.C=M2i },
+                { .kind=ORK_OP_MM_I8,  .w=wi,  .M=1, .N=N, .A=Ai, .C=M3  },
+            };
+            int i4_bad=0;
+            for(int r=0;r<runs;r++){
+                for(int n=0;n<N;n++){ M0[n]=M3[n]=M2i[n]=POISON_I; M1f[n]=POISON_F; }
+                if(ork_submit_seq(c,m,4)){ i4_bad++; fail=1; if(r<4) printf("  [i4mix] run %d: rc!=0\n",r); continue; }
+                int bad=0;
+                for(int n=0;n<N;n++){ if(M0[n]!=K||M3[n]!=K) bad++; if(M2i[n]!=K) bad++;
+                    if(M1f[n]<(float)K-1.f||M1f[n]>(float)K+1.f) bad++; }
+                if(bad){ i4_bad++; fail=1; if(i4_bad<=4) printf("  [i4mix] run %d: MISMATCH %d (i8=%d i4=%d f16=%.1f want %d)\n",r,bad,M0[0],M2i[0],M1f[0],K); }
+            }
+            i4_fail=(i4_bad>0);
+            printf("  [i4mix] i8/f16/i4  : %d/%d runs bit-exact ([i8][f16][i4][i8], int4 on doorbell)\n", runs-i4_bad, runs);
+            ork_mm_free(c,wi4);
+        }
+        (void)i4_fail; free(Bi4);free(Ai4);free(M0);free(M3);free(M2i);free(M1f);
+    }
+
     /* empty sequence must be a clean no-op */
     if(ork_submit_seq(c,ops,0)!=0){ printf("  empty-sequence returned nonzero\n"); fail=1; }
 
