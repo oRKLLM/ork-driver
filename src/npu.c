@@ -9017,7 +9017,12 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;
          * a bigger M would need multi-regcmd tiling the chain can't express, so the caller uses sync. */
         if (!w || w->dtype != dt || tasks[i].M < 1 || tasks[i].M > 64 || w->Sn != 1) return NULL;
-        if (w->K % 512 || w->K > 4096) return NULL;
+        if (w->K > 4096) return NULL;
+        /* int8 doorbell keeps the full-K Bf envelope (K%512==0). fp16 falls back to Bb[0] single-slice
+         * exactly like ork_mm_run_stream_f16_chain (K%32==0), so the sub-512 GDN scan shapes (K=64/128)
+         * can ride the NONBLOCK doorbell — GDN-doorbell EXPERIMENT (ORK_GDN_DOORBELL). */
+        if (dt == DT_I8 ? (w->K % 512) : (w->K % 32)) return NULL;
+        if (dt == DT_F16 && !w->Bf && !w->Bb) return NULL;   /* fp16 sub-512 uses Bb[0] */
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf) return NULL;
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
@@ -9061,7 +9066,10 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                                    : (uint32_t)(CC->dma + coff);                                         /* multi-domain: in-domain scratch, copy back */
             uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
             memset(rc, 0, sizeof rc);
-            if (dt == DT_F16) synth   (rc, M, K, N, adma, bdma, cdma, 1, CBUF);      /* fp16: fp32 C, REGCMD (same 224-word size) */
+            /* sched (0x1010) is a correctness-neutral perf hint. For sub-512 fp16 (GDN doorbell) match
+             * run_stream_f16_chain's schedule so the proven-fast tiling is reproduced; conforming K keeps 1. */
+            int schd = 1; if (dt == DT_F16 && (K % 512)) schd = ((K & (K-1))==0 && K>=128 && K<2048);
+            if (dt == DT_F16) synth   (rc, M, K, N, adma, bdma, cdma, schd, CBUF);    /* fp16: fp32 C, REGCMD (same 224-word size) */
             else              synth_i8(rc, M, K, N, adma, bdma, cdma, 1, CBUF, 0);
             if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
             if (p < P - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
@@ -10344,6 +10352,18 @@ done2:
     return ret;
 }
 
+/* ORK_GDN_DOORBELL EXPERIMENT: route the per-head fp16 matmul stages through the NONBLOCK multi-core
+ * HW-chain doorbell (ork_dyn_begin_mc) instead of the blocking thread-pool run_stream_f16_chain, to test
+ * whether the doorbell's dispatch-half win shrinks the ~44% NPU-submit fraction of the GDN scan. Requires
+ * the fp16 K%512 guard relaxation in ork_dyn_begin_mc above. Default OFF (baseline = run_stream_f16_chain). */
+static int gdn_doorbell(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_GDN_DOORBELL"); v=(e&&atoi(e))?1:0;} return v; }
+static int gdn_run_stage(ork_npu *c,int nh,const ork_mm_task_f16 *tk){
+    if(!gdn_doorbell()) return ork_mm_run_stream_f16_chain(c,nh,tk);
+    ork_dyn_chain *h=ork_dyn_begin_mc(c,nh,(const ork_mm_task_i8*)tk,0);   /* task_i8/f16 layout-identical */
+    if(!h) return -1;
+    int r=ork_dyn_end(h);
+    return (r<0)?-1:0;
+}
 /* ======================================================================================
  * Gated-DeltaNet (GDA) chunked scan — the delta-rule twin of ork_ssm_scan_f32, same design
  * pattern (fused-multicore fp16 stream matmul stages + CPU marshalling + persistent pool).
@@ -10420,7 +10440,7 @@ int ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
     #define GST(pool,M,K,N,A,aS,B,bS,Cc,cS) do{ \
         for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,P->pool[h],(K),(N),P->B+(size_t)h*(bS))){ret=-1;goto done_gdn;} \
             P->tk[h]=(ork_mm_task_f16){P->pool[h],(M),P->A+(size_t)h*(aS),P->Cc+(size_t)h*(cS)}; } \
-        if(ork_mm_run_stream_f16_chain(c,nh,P->tk)){ret=-1;goto done_gdn;} }while(0)
+        if(gdn_run_stage(c,nh,P->tk)){ret=-1;goto done_gdn;} }while(0)
 
     for(int seq=0; seq<ns && !ret; seq++){
         for(size_t i=0;i<(size_t)nh*d*d;i++) P->S[i]=s0[(size_t)seq*nh*d*d+i];
@@ -10459,7 +10479,7 @@ int ork_gdn_scan_f32(ork_npu *c,int d,int nh,int nt,int ns,
             for(int m0=0;m0<d && !ret;m0+=64){ int Mt=(d-m0<64)?(d-m0):64;
                 for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,P->pSd[h],CS,d,P->Wf+(size_t)h*CS*d)){ret=-1;goto done_gdn;}
                     P->tk[h]=(ork_mm_task_f16){P->pSd[h],Mt,P->KdecT+(size_t)h*d*CS+(size_t)m0*CS,P->CSd+(size_t)h*d*d+(size_t)m0*d}; }
-                if(ork_mm_run_stream_f16_chain(c,nh,P->tk)){ret=-1;goto done_gdn;} }
+                if(gdn_run_stage(c,nh,P->tk)){ret=-1;goto done_gdn;} }
             g_gdn_npu+=_GNOW-_t; _t=_GNOW;
             if(getenv("ORK_GDN_DBG")&&seq==0&&cc==0){ double nk=0,nq=0,nkk=0,nkq=0,noi=0,nsd=0;
                 for(size_t i=0;i<(size_t)nh*CS*d;i++){ nk+=P->Ck[i]*P->Ck[i]; nq+=P->Cq[i]*P->Cq[i]; noi+=P->COi[i]*P->COi[i]; }
