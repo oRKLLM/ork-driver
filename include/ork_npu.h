@@ -792,6 +792,7 @@ int          ork_dyn_queue_linger_us(ork_dyn_queue *q);
 int          ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task);    /* enqueue a matmul */
 int          ork_dyn_queue_flush(ork_dyn_queue *q);                               /* submit next chunk NONBLOCK (NPU starts) */
 int          ork_dyn_queue_pending(ork_dyn_queue *q);                             /* tasks not yet submitted */
+int          ork_dyn_queue_idle(ork_dyn_queue *q);                                /* on idle+linger-elapsed, halt a flying reserved/spin chain early (null-terminate); 1 if halted */
 int          ork_dyn_queue_drain(ork_dyn_queue *q);                               /* finish all chunks + writeback; ret total ops */
 void         ork_dyn_queue_destroy(ork_dyn_queue *q);
 /* Precompiled-program cache (regime A: fixed chain, pinned buffers). Compile the chain ONCE, then re-run it

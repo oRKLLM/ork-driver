@@ -9312,7 +9312,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
  *   n = ork_dyn_queue_drain(q);                // rendezvous + writeback
  *   ork_dyn_queue_destroy(q); */
 #define ORK_SUBMIT_FLOOR_US 167   /* measured RK3588 single-submit floor; linger past this isn't floor-bound */
-struct ork_dyn_queue { ork_npu *c; int chunk_max, ncore, linger_us; ork_mm_task_i8 *tasks; int n, cap, submitted; ork_dyn_chain *h; };
+struct ork_dyn_queue { ork_npu *c; int chunk_max, ncore, linger_us; ork_mm_task_i8 *tasks; int n, cap, submitted; ork_dyn_chain *h; double last_push_us; };
 /* ncore<=1 => single-core chain (begin); ncore>1 (or ORK_DYN_MC) => multi-core NONBLOCK stream (begin_mc). */
 ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore) {
     if (!c) return NULL; int mx = ork_dyn_max_steps(); if (chunk_max <= 0 || chunk_max > mx) chunk_max = mx;
@@ -9324,7 +9324,7 @@ int  ork_dyn_queue_linger_us(ork_dyn_queue *q) { return q ? q->linger_us : -1; }
 int ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task) {
     if (!q || !task) return -1;
     if (q->n == q->cap) { int nc = q->cap ? q->cap * 2 : 64; void *t = realloc(q->tasks, (size_t)nc * sizeof *q->tasks); if (!t) return -1; q->tasks = t; q->cap = nc; }
-    q->tasks[q->n++] = *task; return 0; }
+    q->tasks[q->n++] = *task; q->last_push_us = ork_now_us(); return 0; }
 /* submit the next pending chunk NONBLOCK (NPU runs while the caller works); no-op if one is already flying */
 int ork_dyn_queue_flush(ork_dyn_queue *q) {
     if (!q) return -1; if (q->h || q->submitted >= q->n) return 0;
@@ -9334,6 +9334,23 @@ int ork_dyn_queue_flush(ork_dyn_queue *q) {
     if (!q->h) return -1;
     q->submitted += cnt; return 0; }
 int ork_dyn_queue_pending(ork_dyn_queue *q) { return q ? q->n - q->submitted : -1; }   /* not-yet-submitted count */
+/* Idle-transition halt (the linger wiring): once the producer has drained the queue AND the linger window has
+ * elapsed since the last push, null-terminate the flying chain just ahead of the sequencer (0x0014=0 via the
+ * validated ork_dyn_halt) so a chain with unspent reserve/spin ahead of the frontier stops early and the NPU
+ * goes idle instead of running out its reserved budget. linger_us is the grace window before giving up on more
+ * work arriving. No-op (returns 0) if nothing is flying, work is still pending, we are within the linger window,
+ * the chain is multi-core (halt is single-buffer only — mc self-terminates per-core), or the frontier is already
+ * at the terminator. Returns 1 iff it halted. (Visible effect only for a reserved/persistent chain: a plain
+ * self-terminating chunk already stops at its own frontier; this is a no-op for it, by design.) */
+int ork_dyn_queue_idle(ork_dyn_queue *q) {
+    if (!q || !q->h || q->submitted < q->n) return 0;                       /* nothing flying, or work still pending */
+    if (ork_now_us() - q->last_push_us < (double)q->linger_us) return 0;    /* still inside the linger grace window */
+    ork_dyn_chain *h = q->h;
+    if (h->mc) return 0;                                                    /* mc: no single-buffer halt */
+    int at = ork_dyn_progress(h) + 1 + ORK_DYN_HEADROOM;                    /* halt just ahead of the sequencer */
+    if (at >= h->P - 1) return 0;                                          /* already at/near terminator — nothing to cut */
+    return ork_dyn_halt(h, at) == 0 ? 1 : 0;
+}
 /* drain: finish the flying chunk + submit/finish any remaining chunks, writeback; returns total ops completed */
 int ork_dyn_queue_drain(ork_dyn_queue *q) {
     if (!q) return -1; int done = 0; if (!q->h) ork_dyn_queue_flush(q);
