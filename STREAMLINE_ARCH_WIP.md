@@ -160,7 +160,19 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
         follows the compute width Nc (not full N), so for M>1 the rows collide (~12% correct, mostly
         wrong-nonzero). This is exactly why `mcworker` writes contiguous [M,Nc] scratch + host-scatters
         instead of a strided M-row write. Guarded off (`Sn>1 && M>1 => return NULL`) until scatter lands.
-    SCATTER IMPLEMENTED, M>1 still gated (not yet bit-exact). The mcworker-style scatter is wired:
+    RESOLVED & UNGATED (2026-07-17): M>1 wide-N is bit-exact on the doorbell. The scatter was CORRECT all
+    along — the zeros were NOT a scatter/multi-slice bug. Isolation study (ork_dyn_ntile_test cmode: dma vs
+    malloc C) proved it: the DIRECT (zero-copy) output path is coherency-unreliable for M>1 (M=8 direct drops
+    thousands of words to 0, non-deterministic, at Sn==1 too — the ZC-OUT class); the SCRATCH path (NPU ->
+    cacheable mcc -> bsync FROM_DEVICE -> CPU copy/scatter to the caller's C) is the reliable completion
+    barrier and is bit-exact. Fix: route ALL M>1 through scratch (never direct output for M>1); the earlier
+    test only failed because its C was always an ork_dma_alloc (the flaky direct/ZC-OUT destination). Now:
+    M=1 wide-N uses direct zero-copy (bit-exact); M>1 (single-slice AND wide-N scatter) uses scratch copy-back
+    to the caller's cacheable C (bit-exact, single- & multi-core). Gate removed. Output zero-copy to a
+    resident dma buffer at M>1 remains the separate ZC-OUT opt-in (off by default, coherency-unsafe) — NOT a
+    doorbell/N-tiling issue. make test ALL PASS byte-identical.
+
+    [historical] The mcworker-style scatter is wired:
       * build: Sn>1 && M>1 op writes each slice as a CONTIGUOUS [M,Nc] block (stride=0, offset M*n0) to
         in-domain scratch (forced non-direct); ork_dyn_end scatters each block to C columns [n0,n0+Nc) at
         row-stride N; done_i polls the block/full surface. Placement is CORRECT — wrong-nonzero = 0 across

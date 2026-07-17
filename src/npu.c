@@ -9190,12 +9190,6 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
-        /* M>1 wide-N (scatter path below) is IMPLEMENTED but not yet bit-exact: placement is correct
-         * (host-scatter of contiguous [M,Nc] blocks — verified wrong-nonzero=0), but the chained multi-slice
-         * M>1 output shows non-deterministic ZEROS that survive a full-surface done-poll => an async
-         * write-drain / scratch-cacheability race, still under root-cause (see STREAMLINE_ARCH_WIP.md).
-         * Gated until it lands bit-exact; M=1 wide-N is fully validated and stays on. NOT a fallback. */
-        if (w->Sn > 1 && tasks[i].M > 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf) return NULL;
@@ -9216,10 +9210,12 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * per-core scratch c->mcc[i] + copy-back in end. */
     int direct = 1;
     for (int i = 0; i < S; i++) { struct buf *cb = dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
-    /* SCATTER ops (Sn>1 && M>1) write per-slice CONTIGUOUS [M,Nc] scratch blocks (the strided M-row output
-     * can't place columns in-place for M>1), then end() scatters to C columns. They REQUIRE the in-domain
-     * scratch path, so if any op scatters, the whole submit uses scratch + copy-back/scatter (not zero-copy). */
-    for (int i = 0; i < S; i++) if (tasks[i].w->Sn > 1 && tasks[i].M > 1) { direct = 0; break; }
+    /* M>1 NEVER uses direct (zero-copy) output: the direct path is coherency-unreliable for M>1 (validated —
+     * M=8 direct output drops thousands of words to 0, non-deterministically, at Sn==1 AND Sn>1; the same
+     * ZC-OUT class that keeps output zero-copy off by default). The scratch path (NPU -> cacheable mcc ->
+     * bsync FROM_DEVICE -> CPU copy/scatter to the caller's C) is the reliable completion barrier and is
+     * bit-exact. So force scratch for any M>1 op; end() straight-copies (Sn==1) or scatters (Sn>1 wide-N). */
+    for (int i = 0; i < S; i++) if (tasks[i].M > 1) { direct = 0; break; }
     if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d dom=%u direct=%d N=%d\n", S, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N (M>1) */
@@ -9568,6 +9564,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         }
         else if (h->esz == 2) { const int16_t *o=(const int16_t*)h->outptr[i]; int32_t *d=h->dst[i]; for (int e=0;e<no;e++) d[e]=o[e]; }
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
+    __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h); return r; }
 
