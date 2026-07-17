@@ -10394,6 +10394,99 @@ cleanup:
     return ok;
 }
 
+/* EXPERIMENTAL int4 NONBLOCK-doorbell probe — byte-for-byte the ork_mm_run_chain_i4 build (M=1 int4 PC-chain,
+ * host A staged via tile_i4_Aslice, int16 output scratch), with EXACTLY TWO deltas vs the working reference:
+ *   (1) submit flags get NONBLOCK (|0x2u) — the ioctl returns immediately instead of blocking to completion;
+ *   (2) completion is detected by polling an int16 output-SENTINEL (0x7fff seeded into each op's last int16
+ *       column, dc cvac'd) rather than the blocking ioctl's implicit done.
+ * Everything else — synth_i4, the rc[216..219] chain descriptor, regcfg_amount=116, task_number=S, the int16
+ * ->int32 de-tile — is identical. This isolates the ONE question the coordinator posed: does the int4 int16-
+ * output datapath survive the doorbell's non-blocking sentinel poll (or does int16 output + async race it)? */
+#define ORK_I4_SENT16 ((int16_t)0x7fff)
+int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+    if (!c) return -1;
+    if (S < 1 || S > 1024) return -2;
+    if (!tasks) return -2;
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
+    int fd = c->fd;
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I4) return -2;
+        if (tasks[i].M != 1) return -2;                      /* int4 HW chain is M=1 only (like run_chain_i4) */
+        if (w->Sn != 1 || w->Sk != 1) return -2;
+    }
+    ork_npu_enter(c, 4 /* DT_I4_CHAIN */, XP_I4CHAIN, OCK_HW);
+    int ok = 0, max_K = 0, max_N = 0;
+    for (int i = 0; i < S; i++) {
+        if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
+        if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
+        struct buf *abuf = dma_find(c, tasks[i].A);
+        if (abuf) bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
+    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
+    if (!chain_A.cpu || !chain_C.cpu) { if (chain_A.cpu) bdestroy(fd,&chain_A); if (chain_C.cpu) bdestroy(fd,&chain_C); return -1; }
+    uint32_t act_dma[1024], out_dma[1024];
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        tile_i4_Aslice((uint8_t*)chain_A.cpu + (size_t)i * max_K, tasks[i].A, 0, w->K);
+        act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
+        out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
+    }
+    bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf extra[2] = {chain_A, chain_C};
+    uint32_t rc[REGCMD_I4_N];
+    for (int i = 0; i < S; i++) {
+        ork_w *w = tasks[i].w;
+        synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        if (validate_regcmd("ork_dyn_i4_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
+        if (i < S - 1) { uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
+            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
+            rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
+        } else { rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000; }
+        memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
+        if (i == 0 && getenv("ORK_I4PROBE_DUMP")) { fprintf(stderr,"[i4probe] op0 regcmd desc rc[216..219]=%08x %08x %08x %08x  aA=%08x aC=%08x\n",rc[216],rc[217],rc[218],rc[219],act_dma[0],out_dma[0]); }
+    }
+    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t = c->task.cpu;
+    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
+    for (int i = 0; i < S; i++) { t[i].enable_mask = 0xd; t[i].int_mask = 0x300; t[i].int_clear = 0x1ffff;
+        t[i].regcfg_amount = 116; t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4; }
+    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    /* seed the FULL int16 output surface with the sentinel (int4's int16 write order over N is NOT
+     * guaranteed last-col-last, unlike int8/fp16, so a single last-col sentinel poll races; poll ALL
+     * elements written — mirrors the fp16 full-surface seed). */
+    for (int i = 0; i < S; i++) { int N = tasks[i].w->N; int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i*max_N*2);
+        for (int col = 0; col < N; col++){ volatile int16_t *db = (volatile int16_t*)&o[col];
+            *db = ORK_I4_SENT16; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+    sub.flags = ork_ppflags() | 0x2u;                        /* DELTA 1: NONBLOCK (vs run_chain_i4's blocking) */
+    sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1; sub.core_mask = 1;
+    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
+    sub.timeout = mm_timeout_ms();
+    c->warmed = 1;
+    if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { ok = -1; goto cleanup; }
+    /* DELTA 2: poll the FULL int16 output surface to completion (every element != sentinel) instead of a
+     * blocking wait. Op i is "done" only when ALL N of its int16 columns have been overwritten. */
+    double t0 = ork_now_us();
+    for (;;) { int alld = 1;
+        for (int i = 0; i < S && alld; i++) { int N = tasks[i].w->N; int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i*max_N*2);
+            for (int col = 0; col < N; col++){ volatile int16_t *db = (volatile int16_t*)&o[col];
+                __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_I4_SENT16){ alld = 0; break; } } }
+        if (alld || ork_now_us() - t0 > 3e6) break; }
+    bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+    for (int i = 0; i < S; i++) {                            /* int16 -> int32 de-tile into caller C (== run_chain_i4) */
+        int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
+        int32_t *C = tasks[i].C; int N = tasks[i].w->N;
+        for (int col = 0; col < N; col++) C[col] = o[col];
+        struct buf *cbuf = dma_find(c, tasks[i].C); if (cbuf) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+    }
+cleanup:
+    bdestroy(fd, &chain_A); bdestroy(fd, &chain_C);
+    return ok;
+}
+
 /* read a register value out of a built regcmd by (block,offset) — for the incremental-task builder */
 static uint32_t regcmd_getv(const uint32_t*rc,int n,uint32_t blk,uint32_t off){
     for(int k=0;k+1<n;k+=2) if((rc[k]&0xffff)==off && (rc[k+1]>>16)==blk) return ((rc[k+1]&0xffff)<<16)|(rc[k]>>16);

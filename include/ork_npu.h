@@ -776,6 +776,11 @@ int          ork_dyn_steps(ork_dyn_chain *h);                                   
 int          ork_dyn_remaining(ork_dyn_chain *h);                                 /* steps not yet completed (budget left before the chain ends) */
 int          ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);        /* extend a running chain in-flight (wrap); 1=too late, 0=ok, <0=err */
 int          ork_dyn_spin_probe(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive); /* circular-spin keep-alive + redirect probe */
+/* EXPERIMENTAL int4 NONBLOCK-doorbell probe: mirrors ork_mm_run_chain_i4 (M=1 int4 PC-chain, host A) but
+ * flips the submit to NONBLOCK (0x2) + polls an int16 output-sentinel to completion, then de-tiles int16->
+ * int32 into each task->C. Answers the load-bearing question of whether the int4 (int16-output) datapath
+ * survives the doorbell's non-blocking sentinel poll. Returns 0/ok, <0 err. (Not a production path.) */
+int          ork_dyn_i4_probe(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* Submit QUEUE: chunk-pipeline over the dynamic API — accumulate tasks, run a chunk NONBLOCK while the
  * caller does other work (CPU‖NPU decode split), auto-split work > chunk_max into successive clean chunks. */
 typedef struct ork_dyn_queue ork_dyn_queue;
