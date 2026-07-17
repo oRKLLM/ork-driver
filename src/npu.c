@@ -8929,6 +8929,11 @@ struct ork_dyn_chain {
                                  * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
                                  * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
 };
+/* int8 M-tile row cap for a K-reduction width Kred: the 0x1040 schedule holds at most mg_max*64 rows in one
+ * regcmd (a bigger tile spills the K-partition and miscomputes). = 64 @ K<=4096, larger as K shrinks. Used to
+ * M-tile M>64 into chained programs and as the K-split per-slice defensive cap. */
+static int mtile_cap(int Kred){ double scale=(double)Kred/512.0; int base=(int)(177.0-15.0*(scale-1.0)), slope=(int)(15.0*scale);
+    int mg = base >= 0x1b ? (base-0x1b)/slope + 1 : 0; int cap = mg * 64; return cap < 1 ? 1 : cap; }
 #define ORK_DYN_SENT 0x7fffffff
 /* Per-row completion: a task is done only when EVERY row's last column has been overwritten. The M-tile
  * scheduler does NOT write the global last element (row M-1, col N-1) strictly last for M>1 — so a single-
@@ -9192,7 +9197,11 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;
          * a bigger M would need multi-regcmd tiling the chain can't express, so the caller uses sync. */
-        if (!w || w->dtype != dt || tasks[i].M < 1 || tasks[i].M > 64) return NULL;
+        if (!w || w->dtype != dt || tasks[i].M < 1) return NULL;
+        /* M>64: plain wide-M PREFILL, M-tiled into mg_max*64-row programs. int8 + Sn==1 + K<=4096 with a
+         * full-K Bf only (each M-tile is one full-K program). Combining M>64 with N-tiling / K-split / fp16
+         * (a 2D/3D program grid) is a follow-up; those stay M<=64. */
+        if (tasks[i].M > 64 && (dt != DT_I8 || w->Sn != 1 || w->K > 4096 || !w->Bf)) return NULL;
         /* G1 N-tiling: int8 accepts Sn>1 (each N-slice = one strided-output sub-op, synth_i8 stride arg).
          * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
@@ -9243,7 +9252,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         if (nop < 1) { Pc[i] = 0; continue; }
         /* PROGRAM count (task_number) is decoupled from OP count: an op with Sn>1 N-slices emits Sn
          * chained programs (each a strided-output sub-op), so a core's program count is sum-of-Sn, not nop. */
-        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += (tasks[p].w->K > 4096) ? tasks[p].w->Sk : tasks[p].w->Sn;   /* K-split (K>4096) => Sk programs; else Sn (N-tile/plain) */
+        int Pcore = 0; for (int p = lo; p < hi; p++) { ork_w *ww = tasks[p].w; int MM = tasks[p].M;   /* programs/op: K-split=>Sk, wide-M=>ceil(M/cap), else Sn (N-tile/plain) */
+            if (ww->K > 4096) Pcore += ww->Sk; else if (MM > 64) Pcore += (MM + mtile_cap(ww->K) - 1) / mtile_cap(ww->K); else Pcore += ww->Sn; }
         Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         /* A-staging need: K-split GATHERS every K-slice's [M,Kp] tile (sum = M*K) and all Sk tiles must be
@@ -9268,9 +9278,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                     int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
                     /* defensive: the whole M-tile must fit one program for this Kp (mg_max*64 K-reduction cap).
                      * default KS=1024 gives cap>=320 so M<=64 always fits; a pathological ORK_KTILE could not. */
-                    double scale = (double)Kp / 512.0; int base = (int)(177.0 - 15.0*(scale-1.0)), slope = (int)(15.0*scale);
-                    int mg_max = base >= 0x1b ? (base-0x1b)/slope + 1 : 0; int chunk = mg_max * 64;
-                    if (M > chunk) { free(h); return NULL; }   /* would need M-tile chunking — not implemented */
+                    if (M > mtile_cap(Kp)) { free(h); return NULL; }   /* would need M-tile chunking within a K-slice — not implemented */
                     if (astage + (size_t)M * Kp > AF->size) { free(h); return NULL; }
                     for (int r = 0; r < M; r++) memcpy((char*)AF->cpu + astage + (size_t)r*Kp, (const char*)t->A + (size_t)r*K + k0, Kp);   /* gather [M,Kp] */
                     uint32_t aks = (uint32_t)(AF->dma + astage); astage += (size_t)M * Kp;
@@ -9292,6 +9300,29 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             }
             if (astage + asz > AF->size) { free(h); return NULL; }
             memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;   /* A shared across the op's N-slices */
+            if (M > 64) {   /* ------- wide-M PREFILL (Sn==1, K<=4096 full-K Bf): M-tile into mtile_cap-row programs -------
+                * Each M-tile computes rows [m0,m0+mc) of [M,N] (A rows are contiguous: adma+m0*K); the tiles
+                * write disjoint row ranges of the [M,N] scratch, chained; end() straight-copies [M,N] to C. */
+                int mcap = mtile_cap(K); int gi = lo + p;
+                uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+                uint32_t cbase = (uint32_t)(CC->dma + coff);   /* scratch (direct forced off for M>1) */
+                for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+                    memset(rc, 0, sizeof rc);
+                    synth_i8(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+                    if (validate_regcmd("ork_dyn_mc_mt", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I8_N * 4;
+                    tk[pp] = tt; pp++;
+                }
+                h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+                h->nout[gi] = M * N; h->oM[gi] = M; h->oSk[gi] = 0;
+                coff += (size_t)M * N * 4;
+                continue;
+            }
             struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
             /* Per-op output base: C in place (direct) or in-domain scratch. The Sn N-slices write DISJOINT
              * column ranges [n0,n0+Nc) of this [M,N]-laid-out output, each at row-stride N (synth_i8 stride arg)

@@ -89,6 +89,11 @@ int main(void) {
     fail += one_case_m(c, 8192,  512,  64, 1, 1);   /* Sk=8,  M=64 prefill */
     fail += one_case_m(c, 18944, 3584, 8,  1, 1);   /* Sk~19, M=8  ffn_down-like prefill */
     fail += one_case_m(c, 18944, 512,  64, 1, 1);   /* Sk~19, M=64 prefill */
+    /* wide-M prefill (M>64): M-tiled into mtile_cap-row programs. K=4096 => cap=64 so M>64 multi-tiles. */
+    printf("-- wide-M prefill (M>64, Sn==1, K<=4096) --\n");
+    fail += one_case_m(c, 4096, 512,  128, 1, 1);   /* cap=64 => 2 M-tiles */
+    fail += one_case_m(c, 2048, 1024, 256, 1, 1);   /* cap=128 => 2 M-tiles */
+    fail += one_case_m(c, 4096, 1024, 256, 1, 1);   /* cap=64 => 4 M-tiles */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

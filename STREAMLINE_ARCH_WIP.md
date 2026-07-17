@@ -148,6 +148,14 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
     (all Sk tiles resident in one submit). Validated bit-exact: K=8192/18944, M=1/8/64. make test byte-ident.
   - **G2 NEXT: combined Sn>1 && K>4096** (wide-N AND wide-K in one op) — currently guarded to Sn==1. Needs the
     (ns,ks) 2D program grid with per-(ns) accumulation. Rare shape (ffn_down is Sn==1); low priority.
+- **Wide-M PREFILL (M>64): DONE — bit-exact.** `ork_dyn_begin_mc` now M-tiles M>64 (plain: int8, Sn==1,
+  K<=4096 with full-K Bf) into `mtile_cap(K)`-row chained programs (shared `mtile_cap` helper = mg_max*64;
+  A rows are contiguous so no gather; each tile writes disjoint rows of the [M,N] scratch; end() straight-copies
+  to a cacheable C). Validated bit-exact: K=4096 M=128 (2 tiles) / M=256 (4 tiles), K=2048 M=256 (2 tiles).
+  This completes the int8 matmul shape space on the doorbell (N-tile + K-split + M any) => `run_multicore`'s
+  int8 prefill/decode can now migrate onto the spine (P3). dma-OUTPUT at M>1 stays the ZC-OUT caveat
+  (copy-back to a non-cacheable ork_dma_alloc dst is flaky — off by default, orthogonal). Combining M>64 with
+  N-tiling / K-split (2D/3D grid) is the remaining tiling follow-up; those shapes stay M<=64 for now.
 - **Then** G3/G4 fp16-M>1 / int4-M>1, G5 SDP/PPU. Each: extend wrapper → migrate a path → make test
   byte-identical + attest.
   - **KERNEL CONSTRAINT (found starting P1b):** a PC-CHAIN cannot span >1 N-slice — distinct `Bb[ns]`/`Bf[ns]`
