@@ -8940,6 +8940,14 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
         volatile int16_t *o = (volatile int16_t*)h->outptr[i];
         for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e]==ORK_DYN_SENT16) return 0; }
         return 1; }
+    int NMAXd = h->c->soc->nmax;
+    if (M > 1 && Nx > NMAXd) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
+        * output's write-order over N is NOT reliably last-col-last (like the int4 int16 output above), so a
+        * per-row-last-col poll fires before the whole block drains -> partial scatter -> non-deterministic
+        * zeros. Poll the FULL surface: done only when EVERY scratch word is non-sentinel. */
+        volatile int32_t *base = (volatile int32_t*)h->outptr[i];
+        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
+        return 1; }
     for (int m = 0; m < M; m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(size_t)m*Nx+(Nx-1));
         __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
     return 1; }
@@ -9182,10 +9190,11 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
-        /* N-slice M>1 writes disjoint COLUMN ranges per row, but the strided M-row output stride follows the
-         * compute width Nc (not full N) -> rows collide. mcworker solves this with contiguous scratch + host
-         * scatter; that scatter isn't wired into the doorbell yet, so Sn>1 is M=1-only for now (covers the
-         * wide-N decode case, e.g. lm_head). A capability boundary, NOT a fallback. */
+        /* M>1 wide-N (scatter path below) is IMPLEMENTED but not yet bit-exact: placement is correct
+         * (host-scatter of contiguous [M,Nc] blocks — verified wrong-nonzero=0), but the chained multi-slice
+         * M>1 output shows non-deterministic ZEROS that survive a full-surface done-poll => an async
+         * write-drain / scratch-cacheability race, still under root-cause (see STREAMLINE_ARCH_WIP.md).
+         * Gated until it lands bit-exact; M=1 wide-N is fully validated and stays on. NOT a fallback. */
         if (w->Sn > 1 && tasks[i].M > 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
@@ -9207,6 +9216,10 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * per-core scratch c->mcc[i] + copy-back in end. */
     int direct = 1;
     for (int i = 0; i < S; i++) { struct buf *cb = dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
+    /* SCATTER ops (Sn>1 && M>1) write per-slice CONTIGUOUS [M,Nc] scratch blocks (the strided M-row output
+     * can't place columns in-place for M>1), then end() scatters to C columns. They REQUIRE the in-domain
+     * scratch path, so if any op scatters, the whole submit uses scratch + copy-back/scatter (not zero-copy). */
+    for (int i = 0; i < S; i++) if (tasks[i].w->Sn > 1 && tasks[i].M > 1) { direct = 0; break; }
     if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d dom=%u direct=%d N=%d\n", S, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N (M>1) */
@@ -9237,13 +9250,18 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
              * -> no host scatter (the strided write lands columns directly; scratch stays plain [M,N] for copy-back). */
             uint32_t cbase = direct ? (uint32_t)(cb->dma + ((const char*)t->C - (const char*)cb->cpu))
                                     : (uint32_t)(CC->dma + coff);
+            /* SCATTER (M>1 wide-N): each slice writes a CONTIGUOUS [M,Nc] scratch block (stride=0) at block
+             * offset M*n0; end() scatters to C columns. NON-scatter Sn>1 (M=1) writes the column-slice in
+             * place with a strided (row-stride N) output; Sn==1 is the plain single program. */
+            int scat = (Sn > 1 && M > 1);
             for (int ns = 0; ns < Sn; ns++) {
                 int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
                 uint32_t bdma = w->Bf ? (uint32_t)w->Bf[ns].dma : (uint32_t)w->Bb[(size_t)ns * Sk].dma;   /* slice weight: Bf[ns] full-K, or Bb[ns] when Sk==1 */
-                uint32_t cdma = cbase + (uint32_t)((size_t)n0 * 4);                                        /* column offset into [M,N] output */
+                uint32_t cdma = scat ? cbase + (uint32_t)((size_t)M * n0 * 4)                              /* contiguous [M,Nc] block */
+                                     : cbase + (uint32_t)((size_t)n0 * 4);                                 /* column offset into [M,N] output */
                 memset(rc, 0, sizeof rc);
                 if (dt == DT_F16) synth   (rc, M, K, Nc, adma, bdma, cdma, 1, CBUF);                       /* fp16: Sn==1 only (no stride arg) — guarded above */
-                else              synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, (Sn > 1) ? N : 0);     /* stride=N for a column-slice; 0 (=Nc) when single-slice */
+                else              synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
                 if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                 if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                     rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -9537,8 +9555,18 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
     /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C.
      * int4 (esz==2): the NPU wrote an int16 accumulator; widen int16->int32 into the caller's int32 C. */
+    int NMAXe = h->c->soc->nmax;
     for (int i = 0; i < h->S; i++) if (h->dst[i]) { int no = h->nout[i] ? h->nout[i] : h->N;
-        if (h->esz == 2) { const int16_t *o=(const int16_t*)h->outptr[i]; int32_t *d=h->dst[i]; for (int e=0;e<no;e++) d[e]=o[e]; }
+        int Me = h->oM[i] ? h->oM[i] : 1, Ne = no / Me;
+        /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into
+         * C's column range [n0,n0+Nc) at row-stride Ne. (int8/int32 only — Sn>1 M>1 is not an int4/fp16 shape.) */
+        if (h->esz != 2 && Me > 1 && Ne > NMAXe) {
+            const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i]; size_t blk = 0;
+            for (int n0 = 0; n0 < Ne; n0 += NMAXe) { int Nc = (Ne - n0 < NMAXe) ? (Ne - n0) : NMAXe;
+                for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * Ne + n0], &src[blk + (size_t)m * Nc], (size_t)Nc * 4);
+                blk += (size_t)Me * Nc; }
+        }
+        else if (h->esz == 2) { const int16_t *o=(const int16_t*)h->outptr[i]; int32_t *d=h->dst[i]; for (int e=0;e<no;e++) d[e]=o[e]; }
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h); return r; }

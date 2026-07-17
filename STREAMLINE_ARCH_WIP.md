@@ -160,8 +160,23 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
         follows the compute width Nc (not full N), so for M>1 the rows collide (~12% correct, mostly
         wrong-nonzero). This is exactly why `mcworker` writes contiguous [M,Nc] scratch + host-scatters
         instead of a strided M-row write. Guarded off (`Sn>1 && M>1 => return NULL`) until scatter lands.
-    IN PROGRESS: wire the mcworker-style scatter (contiguous per-slice scratch -> scatter to C columns
-    [n0,n0+Nc) at row-stride N in ork_dyn_end) so M>1 wide-N (prefill FFN up/gate, lm_head prefill) routes on.
+    SCATTER IMPLEMENTED, M>1 still gated (not yet bit-exact). The mcworker-style scatter is wired:
+      * build: Sn>1 && M>1 op writes each slice as a CONTIGUOUS [M,Nc] block (stride=0, offset M*n0) to
+        in-domain scratch (forced non-direct); ork_dyn_end scatters each block to C columns [n0,n0+Nc) at
+        row-stride N; done_i polls the block/full surface. Placement is CORRECT — wrong-nonzero = 0 across
+        all cases (the M-row collision is fixed).
+      * REMAINING BUG: non-deterministic ZEROS (~0.5-15% of outputs, varying run-to-run for identical
+        configs) that SURVIVE a full-surface done-poll (every scratch word polled non-sentinel before
+        scatter). got=0 (not the sentinel), wrong-nonzero=0. Only on the chained MULTI-slice M>1 path.
+        Ruled out: placement (wrong=0), done-timing (full-surface poll unchanged it), the seed (covers all
+        M*N words). Leading hypotheses: (1) async NPU write-drain to DRAM not complete at doorbell-detect
+        for the larger chained block output; (2) mcc scratch cacheability differs from ork_dma_alloc (M=1
+        direct C works), so the clean/invalidate coherency dance behaves differently on scratch.
+      * NEXT DIAGNOSTICS (cheap, decisive): (a) run the failing shape with a BLOCKING submit (drop the 0x2
+        NONBLOCK flag) — bit-exact => confirms async-drain; (b) compare vs ork_dyn_test's M>1 Sn==1 scratch
+        path (does single-slice M>1 via ork_dyn_begin_mc pass? isolates block-layout/multi-slice vs M>1);
+        (c) check mcc bcreate flags/cacheability vs ork_dma_alloc. UNGATE (remove the Sn>1 && M>1 guard)
+        the moment it lands bit-exact. Scatter scaffolding is preserved (dormant behind the guard).
 
 - **CONSOLIDATION REQUIREMENT — preserve legacy chain-format coverage in the examples.** As paths migrate onto
   the doorbell spine, an example MUST keep exercising `run_chain_i8`'s ORIGINAL hand-rolled chain format (the

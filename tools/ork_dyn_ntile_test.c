@@ -34,9 +34,9 @@ static int one_case(ork_npu *c, int K, int N, int M, int nc) {
     ork_mm_task_i8 t = { .w = w, .M = M, .A = A, .C = C };
     ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
     if (!h) {
-        /* Sn>1 with M>1 is a known capability boundary (needs host-scatter) — expected reject, not a failure. */
+        /* M>1 wide-N is gated (scatter placement correct, but async-drain zeros not yet resolved) — expected. */
         int expected = (Sn > 1 && M > 1);
-        printf("  [K=%d N=%d M=%d nc=%d Sn=%d] begin_mc=NULL (%s)\n", K, N, M, nc, Sn, expected ? "expected: M>1 wide-N not yet wired" : "UNEXPECTED reject");
+        printf("  [K=%d N=%d M=%d nc=%d Sn=%d] begin_mc=NULL (%s)\n", K, N, M, nc, Sn, expected ? "expected: M>1 wide-N gated pending drain fix" : "UNEXPECTED reject");
         ork_dma_free(c, C); free(A); free(B); return expected ? 0 : 1;
     }
     int done = ork_dyn_end(h);
