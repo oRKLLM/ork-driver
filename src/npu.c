@@ -9177,7 +9177,16 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;
          * a bigger M would need multi-regcmd tiling the chain can't express, so the caller uses sync. */
-        if (!w || w->dtype != dt || tasks[i].M < 1 || tasks[i].M > 64 || w->Sn != 1) return NULL;
+        if (!w || w->dtype != dt || tasks[i].M < 1 || tasks[i].M > 64) return NULL;
+        /* G1 N-tiling: int8 accepts Sn>1 (each N-slice = one strided-output sub-op, synth_i8 stride arg).
+         * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
+         * expressed there yet (fp16 N-tiling is a follow-up). */
+        if (w->Sn != 1 && dt != DT_I8) return NULL;
+        /* N-slice M>1 writes disjoint COLUMN ranges per row, but the strided M-row output stride follows the
+         * compute width Nc (not full N) -> rows collide. mcworker solves this with contiguous scratch + host
+         * scatter; that scatter isn't wired into the doorbell yet, so Sn>1 is M=1-only for now (covers the
+         * wide-N decode case, e.g. lm_head). A capability boundary, NOT a fallback. */
+        if (w->Sn > 1 && tasks[i].M > 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf) return NULL;
@@ -9205,33 +9214,47 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }   /* fresh scratch => "cold" so the clean-before-round fires (dirty-line coherency) */
     uint32_t rc[REGCMD_I8_N + 4];
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    int NMAX = c->soc->nmax;
     for (int i = 0; i < nc; i++) {
-        int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
-        Pc[i] = P; if (P < 1) continue;
-        if ((size_t)P * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)P * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), nop = hi - lo;
+        if (nop < 1) { Pc[i] = 0; continue; }
+        /* PROGRAM count (task_number) is decoupled from OP count: an op with Sn>1 N-slices emits Sn
+         * chained programs (each a strided-output sub-op), so a core's program count is sum-of-Sn, not nop. */
+        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn;
+        Pc[i] = Pcore;
+        if ((size_t)Pcore * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
-        size_t astage = 0, coff = 0;
-        for (int p = 0; p < P; p++) {
-            const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N, M = t->M;
+        size_t astage = 0, coff = 0; int pp = 0;   /* pp = program (task) index within this core's chain */
+        for (int p = 0; p < nop; p++) {
+            const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, Sn = w->Sn, Sk = w->Sk;
             size_t esz = (dt == DT_F16) ? 2 : 1;         /* fp16 activation is 2 bytes/elem; int8 is 1 */
             size_t asz = (size_t)M * K * esz;
             if (astage + asz > AF->size) { free(h); return NULL; }
-            memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;
+            memcpy((char*)AF->cpu + astage, t->A, asz); uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;   /* A shared across the op's N-slices */
             struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
-            uint32_t cdma = direct ? (uint32_t)(cb->dma + ((const char*)t->C - (const char*)cb->cpu))   /* zero-copy: write C in place */
-                                   : (uint32_t)(CC->dma + coff);                                         /* multi-domain: in-domain scratch, copy back */
-            uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
-            memset(rc, 0, sizeof rc);
-            if (dt == DT_F16) synth   (rc, M, K, N, adma, bdma, cdma, 1, CBUF);      /* fp16: fp32 C, REGCMD (same 224-word size) */
-            else              synth_i8(rc, M, K, N, adma, bdma, cdma, 1, CBUF, 0);
-            if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
-            if (p < P - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
-                rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
-                rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
-            memcpy((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
-            struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-            tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4;
-            tk[p] = tt;
+            /* Per-op output base: C in place (direct) or in-domain scratch. The Sn N-slices write DISJOINT
+             * column ranges [n0,n0+Nc) of this [M,N]-laid-out output, each at row-stride N (synth_i8 stride arg)
+             * -> no host scatter (the strided write lands columns directly; scratch stays plain [M,N] for copy-back). */
+            uint32_t cbase = direct ? (uint32_t)(cb->dma + ((const char*)t->C - (const char*)cb->cpu))
+                                    : (uint32_t)(CC->dma + coff);
+            for (int ns = 0; ns < Sn; ns++) {
+                int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                uint32_t bdma = w->Bf ? (uint32_t)w->Bf[ns].dma : (uint32_t)w->Bb[(size_t)ns * Sk].dma;   /* slice weight: Bf[ns] full-K, or Bb[ns] when Sk==1 */
+                uint32_t cdma = cbase + (uint32_t)((size_t)n0 * 4);                                        /* column offset into [M,N] output */
+                memset(rc, 0, sizeof rc);
+                if (dt == DT_F16) synth   (rc, M, K, Nc, adma, bdma, cdma, 1, CBUF);                       /* fp16: Sn==1 only (no stride arg) — guarded above */
+                else              synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, (Sn > 1) ? N : 0);     /* stride=N for a column-slice; 0 (=Nc) when single-slice */
+                if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
+                    rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I8_N * 4;
+                tk[pp] = tt; pp++;
+            }
+            /* Doorbell tracking is per-OP (one entry): the LAST N-slice covers column N-1, so it writes each
+             * row's completion sentinel (C[m][N-1]) last -> the per-op last-col poll is unchanged by N-tiling. */
             int gi = lo + p;
             if (direct) { h->outbuf[gi] = cb; h->outptr[gi] = (int32_t*)t->C; h->dst[gi] = NULL; }   /* poll C in place, no copy */
             else        { h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C; }
@@ -9239,18 +9262,22 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             coff += (size_t)M * N * 4;
         }
         memset(&subs[i], 0, sizeof subs[i]);
-        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = P; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = Pcore; subs[i].task_obj_addr = c->mtk[i].obj;
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
-        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)Pcore};
     }
     /* Seed the doorbell(s). int8: every row's last col (the M-tile writes a row's last col last, so that
      * word is the per-row completion sentinel). fp16: seed EVERY output element — fp16 direct-output needs
      * a full clean-before-write (dc cvac cleans each output cache line to DRAM) or dirty/stale CPU lines in
      * the output interior RACE the NPU's real-round writes and corrupt it (the same DMA cache-coherency
      * class as the ORK_ZC_OUT fix). int8's warm/last-col seed is sufficient for int8; only fp16 needs the
-     * full-surface clean. Seeding all also lets end() poll any element, but done_i still uses last-cols. */
+     * full-surface clean. Seeding all also lets end() poll any element, but done_i still uses last-cols.
+     * N-tiled int8 (Sn>1) ALSO needs the full-surface clean: the strided column-slice writes leave the row
+     * interior uncovered by the last-col seed, so dirty/stale CPU lines there race the NPU writes (the same
+     * coherency class) -> non-deterministic zeros. seed_all folds Sn>1 into the fp16 full-clean branch. */
+    int seed_all = (dt == DT_F16); for (int _si = 0; _si < S; _si++) if (tasks[_si].w->Sn > 1) { seed_all = 1; break; }
     #define ORK_MC_SEED() do { for (int x = 0; x < S; x++) { int Mx=h->oM[x]?h->oM[x]:1, Nx=h->nout[x]?h->nout[x]/Mx:h->N; \
-        if (dt == DT_F16) { for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + n); \
+        if (seed_all) { for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + n); \
             *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } \
         else { for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } } __asm__ volatile("dsb ish":::"memory"); } while (0)

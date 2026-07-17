@@ -632,6 +632,10 @@ steer_probe: tools/steer_probe.c $(CORE)
 ork_dyn_test: tools/ork_dyn_test.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
 
+# P1b/G1: N-tiling (Sn>1) on the doorbell — bit-exact vs CPU int32 ref, column-varying weights
+ork_dyn_ntile_test: tools/ork_dyn_ntile_test.c $(CORE)
+	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+
 # fp16-doorbell priming/persistence probe (int8-primes-fp16 hypothesis for the mixed-precision async pipeline)
 ork_dyn_f16_interleave: tools/ork_dyn_f16_interleave.c $(CORE)
 	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
