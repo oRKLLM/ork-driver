@@ -141,6 +141,12 @@ void         ork_dma_free (ork_npu *ctx, void *ptr);
 void        *ork_dma_import(ork_npu *ctx, size_t size);
 void         ork_dma_import_sync(ork_npu *ctx, void *ptr, size_t size);  /* clean CPU writes -> device (size 0 = whole buffer) */
 void         ork_dma_import_free(ork_npu *ctx, void *ptr);
+/* Import an EXTERNAL dma-buf fd (e.g. received over SCM_RIGHTS from another process) into the NPU's IOMMU
+ * domain and register it for zero-copy — the returned CPU pointer maps the shared buffer, and passing a ptr
+ * into it as A/C to ork_mm_run* makes the NPU read/write it IN PLACE (no copy). Takes ownership of the fd
+ * (closed by ork_dma_free/ork_dma_import_free). NULL on failure. Enables the orkd daemon to run a matmul
+ * directly against a client's shared buffer. Same 32-bit IOVA cap as ork_dma_import. */
+void        *ork_dma_import_fd(ork_npu *ctx, int dmabuf_fd, size_t size);
 
 /* Load pre-tiled int8 weight bytes (ork_w_dump / .orkpack) into NPU-resident storage WITHOUT the
  * alloc+memcpy of ork_mm_load_i8: each tile is imported zero-copy (dma-buf the NPU reads in place).
