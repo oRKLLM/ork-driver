@@ -13,7 +13,7 @@
 #define ORKD_CONNECT_TRIES 200          /* * 15ms ~= 3s to let an auto-spawned daemon bind */
 #define ORKD_CONNECT_BACKOFF_NS (15*1000*1000L)
 
-struct orkd_conn { int fd; uint32_t client_id; };
+struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; };
 
 /* live connections, for the atexit clean-BYE (small fixed set; a process rarely holds many) */
 static orkd_conn *g_live[16];
@@ -80,7 +80,7 @@ orkd_conn *orkd_connect(void){
     }
     orkd_conn *c = calloc(1, sizeof *c);
     if (!c){ close(fd); return 0; }
-    c->fd = fd; c->client_id = w.client_id;
+    c->fd = fd; c->client_id = w.client_id; c->soc_cores = w.soc_cores;
     if (!g_atexit_armed){ atexit(orkd_atexit); g_atexit_armed = 1; }
     if (g_nlive < (int)(sizeof g_live / sizeof g_live[0])) g_live[g_nlive++] = c;
     return c;
@@ -102,3 +102,4 @@ void orkd_disconnect(orkd_conn *c){
 }
 
 uint32_t orkd_client_id(orkd_conn *c){ return c ? c->client_id : 0; }
+uint32_t orkd_soc_cores(orkd_conn *c){ return c ? c->soc_cores : 0; }

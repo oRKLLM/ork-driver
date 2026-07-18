@@ -13,6 +13,7 @@
  * weights/IOVA are reclaimed. That is the design fix for the leak-on-kill that otherwise forces a reboot. */
 
 #include "orkd_proto.h"
+#include "ork_npu.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -115,10 +116,11 @@ int main(void){
     if (bind(lfd, (struct sockaddr*)&sa, sizeof sa) < 0){ perror("orkd: bind"); return 1; }
     if (listen(lfd, 16) < 0){ perror("orkd: listen"); return 1; }
 
-    /* TODO(next increment): ork_npu *npu = ork_npu_init(); own the NPU here; report soc cores in WELCOME. */
+    ork_npu *npu = ork_npu_init();             /* orkd OWNS the NPU for its whole lifetime (#2a) */
+    int cores = npu ? ork_npu_cores(npu) : 0;
     unsigned idle_ms = orkd_idle_ms();
-    fprintf(stderr, "[orkd] up pid=%d sock=%s idle=%ums (lifecycle skeleton; NPU stubbed)\n",
-            (int)getpid(), sockpath, idle_ms);
+    fprintf(stderr, "[orkd] up pid=%d sock=%s idle=%ums npu=%s cores=%d\n",
+            (int)getpid(), sockpath, idle_ms, npu ? "ok" : "FAILED", cores);
 
     struct client cl[ORKD_MAX_CLIENTS]; int nc = 0;
     uint32_t next_id = 1, refs = 0;
@@ -164,7 +166,7 @@ int main(void){
                     case ORKD_HELLO: {
                         struct orkd_welcome w; memset(&w, 0, sizeof w);
                         w.proto = ORKD_PROTO_VERSION; w.client_id = cl[i].id = next_id++;
-                        w.soc_cores = 0;           /* TODO: npu->soc->cores once wired */
+                        w.soc_cores = (uint32_t)cores;
                         if (!cl[i].hello){ cl[i].hello = 1; refs++; }
                         send_msg(cl[i].fd, ORKD_WELCOME, h.tag, &w, sizeof w);
                         break;
@@ -188,7 +190,7 @@ int main(void){
         }
     }
 
-    /* TODO(next increment): ork_npu_free(npu) — release NPU/IOMMU cleanly. */
+    if (npu) ork_npu_free(npu);                /* release NPU/IOMMU cleanly */
     close(lfd); unlink(sockpath);
     flock(pidfd, LOCK_UN); close(pidfd); unlink(pidpath);
     fprintf(stderr, "[orkd] down\n");

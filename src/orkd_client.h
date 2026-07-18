@@ -28,4 +28,7 @@ void orkd_disconnect(orkd_conn *c);
 /* Daemon-assigned subscriber id (diagnostics); 0 if NULL. */
 uint32_t orkd_client_id(orkd_conn *c);
 
+/* NPU core count reported by the daemon in WELCOME (RK3588 = 3; 0 if the daemon's NPU init failed or NULL). */
+uint32_t orkd_soc_cores(orkd_conn *c);
+
 #endif /* ORKD_CLIENT_H */
