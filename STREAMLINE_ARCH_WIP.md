@@ -390,7 +390,49 @@ verdict was largely a DEGRADING BOARD, not the codebase — #1 (run_stream_i8) +
 RULES: (1) before launching `make test`, `pgrep` the prior one is fully GONE (binaries too, not just make);
 (2) if standalone basic tests flake, suspect board degradation -> power-cycle, don't chase the code.
 
-**#2 fp16 stream: still PENDING.** The reroute is fine but the fp16 doorbell K-guard/sched extension had a real
-bug (K=2048 -> sched=0 -> deterministic hang; K>=128 pow2 including 2048 must stay sched=1). Reverted. Redo the
-sched formula (keep sched=1 for the K>=128 shapes the doorbell already handled; sched=0 only for the small-K it
-genuinely needs) + re-validate on a healthy board.
+**#2 fp16 stream: COMMITTED (86b9612), sched CORRECTED.** The K=2048->sched=0 hang was fixed before commit:
+`schedf = (K&(K-1))==0 && K>=128` (pow2 K>=128 including 2048 stays sched=1; no `<2048` bound). The committed
+form is in the 4-commit stack that passes make test on the healthy board. (Earlier "PENDING/Reverted" note was
+written while the bug was live — superseded.)
+
+## 2026-07-18 (cont.) — remaining submit-consolidation surface (audit)
+
+Mapping what still issues a blocking submit after #1/#2/#3/#6 + the #5 fused-chain port:
+- **`submit1()` — the single-core `run()` path (nc==1).** BLOCKING, shared by BOTH fp16 and int8 single-core
+  matmuls. This is the biggest remaining surface and what `ork_bmm_fp16`/`ork_bmm_fp16_strided` ride per-batch
+  (they loop `ork_mm_run` -> `run`; nc==1 -> submit1). Multi-core (nc>1) already rides the doorbell via
+  `run_multicore`/colsplit (P1a). Migrating submit1 is high blast radius (every small/single-core matmul) —
+  needs a healthy board + careful bit-exact validation across test_matmul/layer/decode/model (fp16+int8).
+- **`ork_bmm_fp16_fused` (10317)** — threaded blocking worker submit (the SSD per-stage H-batch fp16 chain);
+  test_bmm_fused covers it. A doorbell port mirrors the ss-chain port but fp16-typed.
+- **Standalone SDP ops** (run_i8_out8/ewmul/silu, int8 output) — need an int8/int16 sentinel (the fused-chain
+  port only handles int32-final; int8 output has no safe 0x7fffffff). Lower value (each is one op).
+- **int4** (#4) — deferred (non-production; int4 doorbell is M=1-chain-only, no colsplit).
+
+Recommended next: `submit1` single-core (highest leverage — completes fp16-bmm AND single-core int8 in one
+migration), on a healthy board, after #5-SDP commits.
+
+## 2026-07-18 (cont.) — #5: the fused (ss) FFN chain rides the NONBLOCK doorbell
+
+**Done — `run_chain_i8_impl` ss-path submit converted from blocking to the NONBLOCK doorbell.** The fused chain
+(gate->silu->up->glu->down, SDP silu/glu as MIDDLE ops) was the last core path still issuing a blocking
+`rknpu_submit_ioctl`. Now: `sub.flags |= 0x2` (NONBLOCK, ping-pong stays OFF for the LUT), and completion is a
+host-bounded poll on the FINAL op's output — seed it with the doorbell sentinel (0x7fffffff) + clean-to-DRAM
+before each submit, then last-word gate + full-surface verify after. Kept the existing bsync-FROM + memcpy /
+K-split accumulate afterward (the poll guarantees the chain drained first).
+
+**Gated to an int32 final output** (`fdb_on = ss && (final op OP_MM32 || its K-split)`): 0x7fffffff is a safe
+sentinel only for int32, and a matmul's last-col-last writeback makes the gate sound. An int8-output final op
+(a chain ending in EWMUL/SILU/out8 — e.g. the [gate,silu,up,glu] FFN4 or the ssd_fusion mixed chain) has NO
+safe int8 sentinel, so it KEEPS the blocking submit. SDP middle ops ride the NONBLOCK chain either way. This
+covers the production FFN inner (ORK_GU_CHAIN, ends in down=MM32).
+
+**Validated bit-exact on a healthy board** (chain_gu_silu_probe, all-ones inputs):
+- `ORK_GSILU_FFN5` (down MM32, no K-split): down=31232, 4096/4096 — "FULL FFN INNER CHAIN WORKS".
+- `ORK_GSILU_FFN6K` (down K-split Sk=6): down=374784, 4096/4096 — "REAL-WIDTH FFN INNER ... ONE submit, EXACT".
+- gsilu/sdpsilu (ss==NULL or int8-final) unchanged — fdb_on inert, blocking as before.
+
+NOTE: no `make test` example exercises `run_chain_i8_ffn` (tools only: chain_gu_silu_probe, ssd_fusion_bench),
+so `make test` is a regression gate for the non-ss paths, not a validator of the new NONBLOCK path — the probe
+sections above are that validator. Re-derives the old "SDP = SW by design / 8x-loss" verdict: SDP-in-a-chain
+now runs on the NONBLOCK spine, bit-exact. Old verdict predated the HW-chain path.

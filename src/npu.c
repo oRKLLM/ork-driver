@@ -8915,6 +8915,25 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     // ping-pong OFF (0x1) for any silu chain (SDP/LUT task present) so a bank swap doesn't race the LUT SRAM
     // commit (AGENTS.md); plain matmul chains keep ork_ppflags() (register-config-only, ping-pong safe).
+    /* P3 #5: the fused (ss) chain rides the NONBLOCK doorbell spine instead of a blocking submit. The chain is
+     * PC-sequential, so the FINAL op landing => the whole chain has drained; we seed that op's output with the
+     * doorbell sentinel before each submit and spin-poll it after (last-word gate, then a full-surface verify
+     * for any residual write-order lag). Gated to an int32 final output (the FFN's down matmul): ORK_DYN_SENT
+     * is a safe sentinel there and a matmul's last-col-last writeback makes the gate sound. An int8-output
+     * final op has no safe sentinel, so it keeps the blocking submit; SDP middle ops (silu/ewmul) ride the
+     * NONBLOCK chain regardless. */
+    int fi = S - 1, kf = CHAIN_KIND(fi);
+    /* mirror the completion's ffn_ksplit exactly: K-split partials live in scratch (tmp_C), never a resident cbuf */
+    int ksf = ss && ss->ops && ss->ops[fi].in0 >= 0 && (kf == OP_MM32 || kf == OP_MM8) && tasks[fi].w->K > 4096 && !cbufs[fi];
+    int fdb_on = ss && ((kf == OP_MM32) || ksf);            /* NONBLOCK only when the final output is int32 (safe sentinel) */
+    volatile int32_t *fdb = NULL; size_t fno = 0; struct buf *fbuf = NULL;
+    if (fdb_on) {
+        fdb = (volatile int32_t *)(cbufs[fi] ? (void *)tasks[fi].C : tmp_C[fi].cpu);
+        fno = ksf ? (size_t)(tasks[fi].w->K / KS_CHAIN) * tasks[fi].M * tasks[fi].w->N
+                  : (size_t)tasks[fi].M * tasks[fi].w->N;
+        fbuf = cbufs[fi] ? cbufs[fi] : &tmp_C[fi];
+    }
+
     sub.flags = ss ? 0x1u : ork_ppflags(); sub.task_number = P; sub.task_obj_addr = c->task.obj;
     sub.core_mask = 1u << tc; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
@@ -8925,13 +8944,22 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
      * our-own-submit-API is reachable; if it runs to the end -> pre-cached. Matmul chains only (dw=216). */
     int steer_at; { const char*e=getenv("ORK_STEER_HALT_AT"); steer_at = e?atoi(e):-1; }   /* per-call: probe warms unset, then sets it */
     int do_steer = (steer_at >= 0 && steer_at < P-1 && !ss);
-    if (do_steer) sub.flags |= 0x2u;                        /* NONBLOCK: ioctl returns so we can edit mid-flight */
+    if (do_steer || fdb_on) sub.flags |= 0x2u;              /* NONBLOCK: do_steer (RE probe) or the fused-chain doorbell */
     int reps = do_steer ? 1 : (c->warmed ? 1 : 2);
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = mm_timeout_ms();
+        if (fdb_on) {   /* seed the final-output sentinel and clean it to DRAM before the NONBLOCK submit */
+            for (size_t e = 0; e < fno; e++) fdb[e] = 0x7fffffff;   /* == ORK_DYN_SENT (defined below) */
+            bsync(fd, fbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+        }
         if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
+        if (fdb_on) {   /* doorbell drain: last-word gate, then a full-surface verify (bounded) */
+            double pt = ork_now_us(), cap = (double)mm_timeout_ms() * 1000.0;
+            for (;;) { __asm__ volatile("dc civac,%0"::"r"(&fdb[fno-1]):"memory"); if (fdb[fno-1] != 0x7fffffff) break; if (ork_now_us()-pt > cap) break; }
+            for (;;) { int dn = 1; for (size_t e = 0; e < fno; e++) { __asm__ volatile("dc civac,%0"::"r"(&fdb[e]):"memory"); if (fdb[e] == 0x7fffffff) { dn = 0; break; } } if (dn || ork_now_us()-pt > cap) break; }
+        }
         if (do_steer) {   /* mid-flight: halt program steer_at by zeroing its next-amount (0x0014) in DRAM */
             uint32_t *rcp = (uint32_t*)((char*)c->regcmd.cpu + (size_t)steer_at * REGCMD_I8_N * 4);
             rcp[218] = 0x0014;   /* 0x0014 | (amount 0) => sequencer stops after this program */
