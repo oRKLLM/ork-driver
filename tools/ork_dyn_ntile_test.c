@@ -112,6 +112,10 @@ int main(void) {
     fail += one_case_m(c, 2048, 16384, 1, 3, 1);   /* Sn=2, nc=3 (cores span the slice boundary) */
     fail += one_case_m(c, 3584, 18944, 1, 3, 1);   /* Sn=3, ffn_gate/up-like */
     fail += one_case_m(c, 2048, 24576, 1, 3, 1);   /* Sn=3 (cacheable; multi-core dma is ZC-OUT-unsafe) */
+    /* P3: wide-K colsplit (K>4096, Sn==1, M=1) — per-core K-split accumulate over the column range (ffn_down decode). */
+    printf("-- P3 colsplit: wide-K (K>4096) M=1 decode, per-core K-split accumulate --\n");
+    fail += one_case_m(c, 8192,  2048, 1, 3, 1);   /* Sk=8,  columns split across 3 cores */
+    fail += one_case_m(c, 18944, 3584, 1, 3, 1);   /* Sk~19, ffn_down-like */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

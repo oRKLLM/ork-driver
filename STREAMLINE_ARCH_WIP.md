@@ -129,7 +129,15 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
     wrong (verified: 112/256/240 zeros across identical runs) — the documented ZC-OUT-multicore-unsafe path
     (per-core bsyncs not serialized vs the writeback). Default cacheable output is bit-exact; dma-output stays
     the off-by-default opt-in. Applies equally to the old mcworker path, so no new risk.
-  - **NEXT P3: wide-K colsplit (ffn_down K>4096) = colsplit + K-split accumulate per core; then M>1 wide-N.**
+  - **Wide-K colsplit (K>4096, ffn_down): DONE for M=1 (decode) — bit-exact.** Each core does a per-core
+    K-split over its column range: Sk partial [1,Ncore] programs (Bb[ks] at the column offset), chained;
+    end() SUMS the Sk partials into C's columns [c0,c1) at row-stride N (oSk + ostride combined). Validated
+    bit-exact: K=8192 (Sk=8) & K=18944 (Sk~19, ffn_down-like), N split across 3 cores. run_multicore routes
+    wide-K M=1 decode onto it. make test golden bit-exact.
+  - **P3 status: ALL int8 FFN/attention decode (M=1) + Sn==1 prefill (any M) are on the doorbell spine.**
+    Routed: base (Sn==1, K<=4096, any M) + wide-N (Sn>1) M=1 + wide-K (K>4096) M=1. NOT yet: M>1 wide-N /
+    wide-K prefill (multi-slice/K-split done + strided writes unverified at M>1), and Sn>1 && K>4096 combined.
+    NEXT: end-to-end ork_bench (decode tok/s on the fork); then M>1 wide-N/K prefill; then run_stream / bmm.
 - **P3 — migrate core run paths onto the spine, one at a time, byte-identical:** `run_chain_i8` →
   `run_stream_f16_chain` → `run_multicore` → `bmm` → `run_i4`. Each: build `ork_seq_op[]`/recipe, submit via the
   spine, drop the hand-rolled `rknpu_submit_ioctl`. `make test` bit-exact + attest refresh per path.

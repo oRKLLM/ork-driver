@@ -3949,12 +3949,16 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * parity, once the ork_dyn_end heavy-job poll backoff removed the busy-poll civac contention with the NPU
      * writeback (M=256 was 2.8x slower on a pure spin; now at parity). Consolidates decode AND prefill submits
      * onto the spine (dump/self-heal coverage). No legacy fallback — git is the recovery. */
-    if(dt==DT_I8 && (w->Sn==1 || M==1) && w->K<=4096 && w->Bf && nc>1){
+    { int i8 = (dt==DT_I8 && (w->N/32)>=2 && nc>1);
+      int r_base = i8 && w->Sn==1 && w->K<=4096 && w->Bf;               /* any M */
+      int r_wideN = i8 && M==1 && w->Sn>1 && w->K<=4096 && w->Bf;       /* wide-N decode (ffn_gate/up) */
+      int r_wideK = i8 && M==1 && w->Sn==1 && w->K>4096;                /* wide-K decode (ffn_down) */
+      if(r_base || r_wideN || r_wideK){
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
         if(!h) return -1;
         ork_dyn_end(h); return 0;
-    }
+      } }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
 
@@ -9219,6 +9223,38 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
         struct buf *CC = &c->mcc[i]; int c1 = t1 * nt_sz;
+        if (K > 4096) {   /* WIDE-K colsplit (ffn_down; M==1, Sn==1): per-core K-split — Sk partial [1,Ncore]
+            * programs over this core's column range, end() SUMS them into C[c0:c1) at row-stride N. */
+            int KS = int8_ks(c);
+            size_t ksz = (size_t)w->Sk * Ncore * 4;
+            if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
+                if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; CC = &c->mcc[i]; }
+            int np2 = 0;
+            for (int ks = 0; ks < w->Sk; ks++) {
+                int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
+                if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+                uint32_t wbase = (uint32_t)(w->Bb[ks].dma + (uint64_t)(c0 / nt_sz) * Kp * nt_sz);   /* K-slice ks weight, column sub-range */
+                memset(rc, 0, sizeof rc);
+                synth_i8(rc, 1, Kp, Ncore, adma + (uint32_t)k0, wbase, (uint32_t)(CC->dma + (size_t)ks * Ncore * 4), sched, CBUF, 0);   /* [1,Ncore] partial ks */
+                if (validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                np2++;
+            }
+            for (int p = 0; p < np2; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
+                if (p < np2 - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
+                    pr[216] = 0x0010 | ((nx & 0xffff) << 16); pr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    pr[218] = 0x0014 | (0x0037u << 16);       pr[219] = (0x0101 << 16); }
+                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
+            h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * Ncore; h->oM[i] = 1; h->oSk[i] = w->Sk;
+            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* accumulate -> C columns at row-stride N */
+            Pc[i] = np2;
+            memset(&subs[i], 0, sizeof subs[i]);
+            subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;
+            subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+            subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np2};
+            continue;
+        }
         int np = 0;   /* programs for this core: (M-tile x overlapping N-slice) */
         /* This core owns the CONTIGUOUS column range [c0,c1) of C. Wide-N (Sn>1): that range can span several
          * N-slices, so emit one program per overlapping slice (its column sub-range), writing into the core's
@@ -9269,13 +9305,15 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
-    /* P3 sub-nmax column-tiling: a single int8 matmul (K<=4096 Bf) multi-cores by N-column split across cores
-     * (M-tiled within each core; wide-N Sn>1 spans slices) rather than being pinned to one core by the
-     * op-partition. Wide-N (Sn>1) is M=1-only for now (M>1 wide-N's per-row-last-col done across multi-slice
-     * strided writes is unverified — stays on mcworker); Sn==1 handles any M. */
-    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && (tasks[0].w->Sn == 1 || tasks[0].M == 1)
-        && tasks[0].w->K <= 4096 && tasks[0].w->Bf && (tasks[0].w->N / 32) >= 2)
-        return ork_dyn_begin_colsplit(c, &tasks[0], nc);
+    /* P3 sub-nmax column-tiling: a single int8 matmul multi-cored by N-column split across cores. base:
+     * Sn==1 & K<=4096 & Bf (any M). M=1 also does wide-N (Sn>1, K<=4096, Bf; core's range spans slices) and
+     * wide-K (Sn==1, K>4096; per-core K-split accumulate over Bb K-slices — no Bf). M>1 wide-N/wide-K stay on
+     * mcworker (their multi-slice/K-split done + strided writes are unverified at M>1). */
+    { const ork_w *cw = tasks[0].w; int cM = tasks[0].M, ci8 = (cw->dtype == DT_I8 && (cw->N / 32) >= 2);
+      int c_base = ci8 && cw->Sn == 1 && cw->K <= 4096 && cw->Bf;
+      int c_wideN = ci8 && cM == 1 && cw->Sn > 1 && cw->K <= 4096 && cw->Bf;
+      int c_wideK = ci8 && cM == 1 && cw->Sn == 1 && cw->K > 4096;
+      if (S == 1 && nc > 1 && (c_base || c_wideN || c_wideK)) return ork_dyn_begin_colsplit(c, &tasks[0], nc); }
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
@@ -9745,9 +9783,10 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         /* K-SPLIT ACCUMULATE: scratch holds oSk partial [M,N] blocks ([ks][m][n]); sum over ks into C[M,N]. */
         if (h->oSk[i] > 1) {
             int Sk = h->oSk[i], Nn = no / (Sk * Me); const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
+            size_t ds = h->ostride[i] > 0 ? (size_t)h->ostride[i] : (size_t)Nn;   /* colsplit wide-K: land the summed [M,Ncore] in C's columns at row-stride N */
             for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
                 int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
-                d[(size_t)m * Nn + n] = (int32_t)acc; }
+                d[(size_t)m * ds + n] = (int32_t)acc; }
         }
         else
         /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into
