@@ -412,6 +412,54 @@ Mapping what still issues a blocking submit after #1/#2/#3/#6 + the #5 fused-cha
 Recommended next: `submit1` single-core (highest leverage — completes fp16-bmm AND single-core int8 in one
 migration), on a healthy board, after #5-SDP commits.
 
+## 2026-07-18 (cont.) — #7: single-core run() matmul path onto the doorbell
+
+**Done — added `submit1_db()` (doorbell variant of `submit1`) and routed run()'s single-core matmul sites
+(run_fullk_dec + run_loop) through it.** `submit1_db` mirrors `submit1` (same task/core/warmup) but submits
+NONBLOCK (`ork_ppflags()|0x2`) and completes via a host-bounded poll on `c->Cc` — seed the tile's `nout=mc*Nc`
+elements with 0x7fffffff + clean-to-DRAM before the submit, then last-word gate + full-surface verify after,
+then the existing FROM bsync. Safe because the plain matmul output is int32 (int8 A·B) or fp32 (fp16) — a real
+int32 accumulator / finite fp32 never equals the 0x7fffffff NaN bit pattern.
+
+**Left blocking (kept `submit1`):** (a) the ZC-OUT (`cbuf`) case in run_fullk_dec — output goes to the user C
+buffer, not `c->Cc`, so the db poll target wouldn't match (ZC-OUT is opt-in/rare); (b) all the int8-OUTPUT
+`submit1` callers (fused SiLU / out8 / up-proj ~5 sites) — int8 has no safe sentinel (0x7f is a valid value).
+
+**Validated:** test_matmul rc=0 ALL OK (exercises both sites — run_fullk_dec at int8 M=512/256 K=2048/3584,
+run_loop at fp16 M=64 K=2048 + int8 tiles), bit-exact. Full make test gate running.
+
+**★ FIX (first make test caught it): the poll must be LAST-WORD-ONLY, not full-surface.** My first cut seeded
++ polled the ENTIRE tile (write nout sentinels + full-buffer `bsync TO_DEVICE` + O(nout) civac verify per tile) —
+copied from the fused-chain SDP concern. That does NOT apply to a plain matmul (writeback IS last-col-last), and
+it caused BOTH failures: `test_speed` single-core 139876us >> 6500us limit (the per-tile full-buffer bsync + O(nout)
+scan), and `CHAIN_XITION: FAIL (incoherent)` (the full-buffer `bsync TO` of the whole c->Cc before each submit
+raced the transition's warm/shared-buffer state). Fix = seed ONLY o[nout-1] + `dc cvac` it (no full bsync), poll
+ONLY o[nout-1] (last-col-last => last word landing = tile done), then the existing FROM bsync. After the fix:
+test_speed 1-core 4736.5us (PASS), CHAIN_XITION PASS (all coherent). LESSON: doorbell poll granularity is
+op-specific — full-surface for SDP/heterogeneous (write-order unknown), last-word for plain matmul (last-col-last).
+
+**★ RESOLVED: the mid-run wedge was board fragility, NOT submit1_db.** After the last-word fix, a make test run
+wedged in test_stream_interleave (iter 63, `job abort ret: -22` in dmesg) — but that test uses run_stream_i8
+(doorbell) + M=1 run_multicore, NEITHER calls submit1_db, so #7's code doesn't execute there. Same errno=22/-22
+degradation class that earlier reproduced on the PRISTINE 2210d84 baseline (= board, not code). Power-cycled →
+re-ran on the fresh board → **make test ALL TESTS PASSED** (incl test_speed, CHAIN_XITION, test_stream_interleave).
+Structural reason submit1_db is as safe as the doorbell: it goes through the same reject+retry (bac0051 lives in
+rknpu_submit_ioctl) and polls the output before returning; the only difference is single-core-0 vs the doorbell's
+per-core distribution. RESIDUAL (shared with ALL doorbell paths, not new to #7): on the stock kernel there is no
+job-retirement query and no working completion fence (fence_fd unused) — NONBLOCK completion = output-poll, which
+races retirement; mitigated (not eliminated) by reject+retry. Acceptable: it's the accepted doorbell architecture.
+
+**Consolidation COMPLETE for every run path that matters** — stream (i8/f16), chain (i8 + fused ss), multi-core
+(colsplit prefill/decode), single-core (submit1_db). Remaining blocking submits are the sentinel-blocked int8-output
+SDP output-stages (fused SiLU/out8), ZC-OUT, threaded fp16 bmm_fused, and int4 (#4) — the low-value tail. The
+natural next architecture is the orkd daemon (single NPU owner, serial queue for multiple clients; test suite as
+first client) — see memory orkd-daemon-direction / task #8. The submit-consolidation is its prerequisite.
+
+**Consolidation status:** every run path that matters is now on the NONBLOCK doorbell — stream (i8/f16), chain
+(i8 + fused ss), multi-core (colsplit prefill/decode), and single-core (submit1_db). Remaining blocking submits
+are the int8-output SDP output-stages (fused SiLU/out8 — no safe sentinel), ZC-OUT, threaded fp16 bmm_fused,
+and int4 (#4). These are the low-value / sentinel-blocked tail.
+
 ## 2026-07-18 (cont.) — #5: the fused (ss) FFN chain rides the NONBLOCK doorbell
 
 **Done — `run_chain_i8_impl` ss-path submit converted from blocking to the NONBLOCK doorbell.** The fused chain

@@ -3084,6 +3084,29 @@ static int submit1(ork_npu *c){
         bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
+/* P3 #7: doorbell variant of submit1 for the single-core matmul path (run()'s run_fullk_dec / run_loop) —
+ * NONBLOCK submit + host-bounded poll on c->Cc instead of the kernel-blocking submit. The plain matmul output
+ * is int32 (int8 A·B) or fp32 (fp16), so 0x7fffffff is a safe sentinel (a real int32 accumulator, or a finite
+ * fp32 result, won't equal that exact NaN bit pattern). nout = mc*Nc elements written this tile. Poll = last-
+ * word gate then a full-surface verify (matmul writeback is last-col-last, so the gate is sound; the verify
+ * covers any residual lag). The int8-OUTPUT submit1 callers (fused SiLU/out8) have no safe sentinel and keep
+ * the blocking submit1; the ZC-OUT (cbuf) case writes the user buffer, not c->Cc, and also keeps submit1. */
+static int submit1_db(ork_npu *c, size_t nout){
+    int fd=c->fd;
+    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags()|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
+    sub.core_mask=1u<<tc;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+    volatile int32_t *o=(volatile int32_t*)c->Cc.cpu; size_t li=nout-1;
+    int reps=c->warmed?1:2;
+    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
+        o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
+        if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
+        double pt=ork_now_us(), cap=(double)mm_timeout_ms()*1000.0;
+        for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
+        bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
+    c->warmed=1; return 0;
+}
 /* ---- multi-core (ORK_NPU_MC=<n>): use n cores (capped at soc->cores). Split each N-slice's
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
@@ -4686,7 +4709,8 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF,cbuf?N:Nc);
                 if (validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
                 memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-                if(submit1(c)) return -1;
+                if(cbuf){ if(submit1(c)) return -1; }                       /* ZC-OUT writes user C, not c->Cc -> keep blocking */
+                else    { if(submit1_db(c,(size_t)mc*Nc)) return -1; }      /* P3 #7: c->Cc int32 output rides the doorbell */
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
                 
                 /* For output zero copy, the NPU writes directly to the user-provided C buffer.
@@ -4734,7 +4758,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
             if (validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
             memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            if(submit1(c)) return -1;
+            if(submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
             double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
             if(dt==DT_F16){ float  *cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
             else { int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
