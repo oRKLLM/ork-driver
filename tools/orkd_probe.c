@@ -43,6 +43,11 @@ int main(int argc, char **argv){
     printf("[pid %d] connected: client_id=%u npu_cores=%u\n", (int)getpid(), orkd_client_id(c), orkd_soc_cores(c));
     int rc = 0;
     if (!strcmp(mode, "mm")) rc = do_matmul(c);
+    else if (!strcmp(mode, "dmabuf")){
+        int d = orkd_dmabuf_probe(c, 1u << 16);   /* 64 KiB dma-heap buffer shared to the daemon */
+        printf("dmabuf-share %s (rc=%d)\n", d == 0 ? "OK — orkd sees the same bytes" : (d == -2 ? "SKIP (no dma-heap)" : "FAILED"), d);
+        rc = (d == 0 || d == -2) ? 0 : 3;
+    }
     else { if (orkd_ping(c)){ printf("ping FAILED\n"); rc = 2; } else printf("ping OK\n"); if (hold > 0) sleep(hold); }
     orkd_disconnect(c);
     printf("[pid %d] disconnected\n", (int)getpid());

@@ -11,6 +11,7 @@
 #ifndef ORKD_CLIENT_H
 #define ORKD_CLIENT_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 typedef struct orkd_conn orkd_conn;
@@ -42,5 +43,9 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
 
 /* Free a resident weight (also freed automatically when the client disconnects). 0 = ok, <0 = error. */
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id);
+
+/* #2b-2 step 1 probe: allocate a dma-heap buffer, share its fd to orkd (SCM_RIGHTS), confirm orkd sees the
+ * same bytes through the shared mapping. 0 = shared OK; <0 = failure (-2 = no dma-heap on this host). */
+int orkd_dmabuf_probe(orkd_conn *c, size_t size);
 
 #endif /* ORKD_CLIENT_H */
