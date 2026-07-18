@@ -45,8 +45,11 @@ int main(int argc, char **argv){
     if (!strcmp(mode, "mm")) rc = do_matmul(c);
     else if (!strcmp(mode, "dmabuf")){
         int d = orkd_dmabuf_probe(c, 1u << 16);   /* 64 KiB dma-heap buffer shared to the daemon */
-        printf("dmabuf-share %s (rc=%d)\n", d == 0 ? "OK — orkd sees the same bytes" : (d == -2 ? "SKIP (no dma-heap)" : "FAILED"), d);
-        rc = (d == 0 || d == -2) ? 0 : 3;
+        const char *m = d == 0 ? "OK — NPU PRIME-imported the client buffer + read the same bytes"
+                      : d == 1 ? "OK (shared mmap; NPU PRIME-import failed)"
+                      : d == -2 ? "SKIP (no dma-heap)" : "FAILED";
+        printf("dmabuf-import %s (rc=%d)\n", m, d);
+        rc = (d == 0 || d == 1 || d == -2) ? 0 : 3;
     }
     else { if (orkd_ping(c)){ printf("ping FAILED\n"); rc = 2; } else printf("ping OK\n"); if (hold > 0) sleep(hold); }
     orkd_disconnect(c);

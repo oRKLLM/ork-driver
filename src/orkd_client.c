@@ -179,7 +179,7 @@ int orkd_dmabuf_probe(orkd_conn *c, size_t size){
         struct orkd_hdr rh;
         if (rn(c->fd, &rh, sizeof rh) > 0 && rh.type == ORKD_DMABUF_OK){
             struct orkd_dmabuf out;
-            if (rn(c->fd, &out, sizeof out) > 0){ if (rh.len > sizeof out) cdrain(c->fd, rh.len - sizeof out); rc = out.rc; }
+            if (rn(c->fd, &out, sizeof out) > 0){ if (rh.len > sizeof out) cdrain(c->fd, rh.len - sizeof out); rc = (out.rc == 0) ? (out.prime_ok ? 0 : 1) : -5; }
         }
     }
     munmap(m, size); close(dfd);

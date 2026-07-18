@@ -509,6 +509,26 @@ static struct buf bimport(int fd,size_t size,int domain){
     if(tr){ fprintf(stderr,"[IMP]   MEM_CREATE ok dma=0x%llx -> bimport DONE (imp#%ld dom_bytes=%zuMB)\n",(unsigned long long)b.dma,g_bimport_n,g_iova_bytes[dom>=0&&dom<ORK_IOVA_NDOM?dom:0]>>20); fflush(stderr); }
     return b;
 }
+/* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
+ * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
+ * This is the cross-process zero-copy primitive behind ork_dma_import_fd (the orkd daemon's data plane). */
+static struct buf bimport_fd(int fd,int dbuf,size_t size,int domain){
+    if(dbuf<0) return (struct buf){0};
+    size_t sz=pgup(size);
+    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
+    if(p==MAP_FAILED){ perror("mmap(import_fd)"); return (struct buf){0}; }
+    int dom=ork_dom(domain);
+    if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); return (struct buf){0}; }
+    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
+    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
+    struct buf b; memset(&b,0,sizeof b);
+    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
+    live_add(fd,b.handle,b.obj);
+    g_bimport_n++;
+    return b;
+}
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
  * it. The kernel rknpu driver lazily sets up a domain's IOVA allocator / page table on its FIRST buffer;
  * if that first buffer is an IMPORTED dma-buf, the import's SG-list pages get wrong/aliased IOVAs and the
@@ -1398,6 +1418,17 @@ void *ork_dma_import(ork_npu *c, size_t size){
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
+/* Import an EXTERNAL dma-buf fd (e.g. received over SCM_RIGHTS from another process) into the NPU's IOMMU
+ * domain and register it for zero-copy: the returned CPU pointer maps the shared buffer, and passing a ptr
+ * into it as A/C to ork_mm_run* makes the NPU read/write that buffer in place (dma_find resolves the IOVA).
+ * Takes ownership of `dmabuf_fd` (closed by ork_dma_free/ork_dma_import_free). NULL on failure. This is the
+ * orkd daemon's cross-process zero-copy hook (client shares a buffer; orkd runs against it, no copy). */
+void *ork_dma_import_fd(ork_npu *c, int dmabuf_fd, size_t size){
+    if(!c || dmabuf_fd<0 || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
+    ork_dom_prime(c, c->pack_domain);
+    struct buf b=bimport_fd(c->fd, dmabuf_fd, size, c->pack_domain); if(!b.cpu) return NULL;
+    c->dma_tab[c->dma_n++]=b; return b.cpu;
+}
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
 static struct buf *dma_find(ork_npu *c, const void *p){
     for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
