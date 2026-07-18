@@ -9416,7 +9416,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
-        if (w->K % 512) return NULL;
+        if (dt == DT_I8 ? (w->K % 512) : (w->K % 32)) return NULL;   /* int8: full-K Bf schedule needs K%512. fp16: single-slice small-K (the SSM scan, K%32) allowed — uses Bb + the K-dependent sched below. */
         /* G2 K-split: K>4096 (int8) rides Sk per-K-slice partials + host accumulate. Sn==1 (wide-K without
          * wide-N — the ffn_down shape). M 1..64: each K-slice's Kp<=KS(=1024) gives an mg_max*64 M-tile cap
          * >=320, so the whole M-tile fits ONE program per K-slice (no M-chunking); a defensive per-slice cap
@@ -9549,7 +9549,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                 uint32_t cdma = scat ? cbase + (uint32_t)((size_t)M * n0 * 4)                              /* contiguous [M,Nc] block */
                                      : cbase + (uint32_t)((size_t)n0 * 4);                                 /* column offset into [M,N] output */
                 memset(rc, 0, sizeof rc);
-                if (dt == DT_F16) synth   (rc, M, K, Nc, adma, bdma, cdma, 1, CBUF);                       /* fp16: Sn==1 only (no stride arg) — guarded above */
+                if (dt == DT_F16) { int schedf = ((K & (K-1)) == 0 && K >= 128);                            /* fp16 0x1040 sched: on for pow2 K>=128 (the doorbell's original always-on covered K512/1024/2048), off only for small/non-pow2 K (the SSM scan). NO <2048 upper bound — K=2048 (test_bmm) MUST stay sched=1 or the job hangs. */
+                                    synth   (rc, M, K, Nc, adma, bdma, cdma, schedf, CBUF); }               /* fp16: Sn==1 only (no stride arg) — guarded above */
                 else              synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
                 if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                 if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
@@ -10445,34 +10446,23 @@ static void *stream_worker_f16(void *vp){
 int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
-    size_t maxMK=0, maxMN4=0;
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
         if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
         if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
-        if(w->K%32||w->N%16) return -2;
-        size_t mk=(size_t)tasks[i].M*w->K*2, mn=(size_t)tasks[i].M*w->N*4;
-        if(mk>maxMK)maxMK=mk; if(mn>maxMN4)maxMN4=mn; }
-    int fd=c->fd;
-    /* fp16 entry: ACT_RESET ONCE on a mode change into fp16, then stay warm across stream calls (last_dt
-     * stays DT_F16 as long as only fp16 stream runs) — no per-call reset churn. */
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_SW);
+        if(w->K%32||w->N%16) return -2; }
+    /* P3 SPINE MIGRATION: fp16 stream onto the NONBLOCK doorbell (ork_dyn_begin_mc), like run_stream_i8. The
+     * doorbell fp16 path accepts single-slice small-K (K%32) shapes (uses Bb + the K-dependent sched); A stays
+     * host (the fp16 doorbell stages A into maf). Build the neutral ork_mm_task_i8 view — w carries dtype=DT_F16,
+     * A/C byte-reinterpreted (f16 A, fp32 C). fp16 already full-surface seeds + M<=64 always-cleans (interleave-
+     * safe), and rknpu_submit_ioctl retries a transient submit-rejection. No legacy fallback (miss => -1). */
+    if(S>1024) return -2;
+    ork_mm_task_i8 ti[1024];
+    for(int i=0;i<S;i++) ti[i]=(ork_mm_task_i8){ tasks[i].w, tasks[i].M, (const int8_t*)tasks[i].A, (int32_t*)tasks[i].C };
     int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
-    if(mc_ensure(c,nc)) return -1;
-    for(int i=0;i<nc;i++){
-        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
-        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
-    int rc=0; npu_pool_ensure(c);
-    struct streamw_f16 sw[ORK_MAXCORE]; int ctr=0;
-    for(int i=0;i<nc;i++) sw[i]=(struct streamw_f16){c,i,S,tasks,&ctr,0};
-    pthread_mutex_lock(&c->pmu);
-    c->pjob=sw; c->pjob_nc=nc; c->pjob_fn=stream_worker_f16; c->pjob_stride=sizeof(struct streamw_f16);
-    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-    pthread_mutex_unlock(&c->pmu);
-    stream_worker_f16(&sw[0]);                     /* core 0 on the calling thread */
-    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
-    for(int i=0;i<nc;i++) if(sw[i].rc) rc=-1;
-    c->warmed=1;
-    return rc;
+    ork_dyn_chain *h=ork_dyn_begin_mc(c,S,ti,nc);
+    if(!h) return -1;
+    int d=ork_dyn_end(h);
+    return (d==S-1)?0:-1;
 }
 /* ---- SMALL-K int8 ROUND-ROBIN STREAM (ork_mm_run_stream_i8_sk) — int8 twin of run_stream_f16 ----
  * run_stream_i8 is full-K only (K%512, 0x1040 schedule); this handles the scan's small single-slice int8
