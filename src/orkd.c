@@ -78,6 +78,43 @@ struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGH
 /* drain n bytes into the void — keeps the stream in sync when a request can't be serviced */
 static int drain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > sizeof b ? sizeof b : n; if (readn(fd, b, k) <= 0) return -1; n -= k; } return 0; }
 
+/* ---- submit queue + scheduler ------------------------------------------------------------------------
+ * A long run must NOT hog the single-stream NPU. RUN* requests are ENQUEUED (not run inline); the loop
+ * dispatches ONE quantum (row-slice) of the highest-priority item per tick, re-servicing sockets between
+ * quanta so a long run yields. CONTENTION-ADAPTIVE: with one queued item, run the whole thing (throughput);
+ * with others waiting, slice to ORKD_QUANTUM_ROWS so they interleave (fairness). Priority from orkd_run.flags
+ * (higher = sooner). v1 = single-threaded + priority + adaptive row-slice; domain-grouping, per-client
+ * domains, and a dedicated dispatch thread are follow-ons. */
+enum { ORKD_QMAX = 256, ORKD_QUANTUM_ROWS = 64 };
+struct work {
+    int used, fd, type, M, K, N, m0, rc;
+    uint32_t prio; uint64_t tag, seq, weight_id;
+    int8_t *A; int32_t *C;          /* A/C: socket-malloc'd unless the matching *_imp is set (zero-copy import) */
+    void *A_imp, *C_imp;            /* imported dma-bufs to ork_dma_free (NULL => socket-malloc'd A/C) */
+};
+static struct work g_q[ORKD_QMAX];
+static int g_qn;
+static uint64_t g_wseq;
+
+static void wk_free(ork_npu *npu, struct work *w){
+    if (!w->used) return;
+    if (w->A_imp) ork_dma_free(npu, w->A_imp); else free(w->A);
+    if (w->C_imp) ork_dma_free(npu, w->C_imp); else free(w->C);
+    memset(w, 0, sizeof *w);
+    g_qn--;
+}
+static struct work *wk_alloc(void){
+    for (int i = 0; i < ORKD_QMAX; i++) if (!g_q[i].used){ memset(&g_q[i], 0, sizeof g_q[i]); g_q[i].used = 1; g_q[i].seq = g_wseq++; g_qn++; return &g_q[i]; }
+    return NULL;
+}
+static void wk_purge_fd(ork_npu *npu, int fd){ for (int i = 0; i < ORKD_QMAX; i++) if (g_q[i].used && g_q[i].fd == fd) wk_free(npu, &g_q[i]); }
+static struct work *wk_pick(void){   /* highest prio, then FIFO (min seq) */
+    struct work *best = NULL;
+    for (int i = 0; i < ORKD_QMAX; i++){ struct work *w = &g_q[i]; if (!w->used) continue;
+        if (!best || w->prio > best->prio || (w->prio == best->prio && w->seq < best->seq)) best = w; }
+    return best;
+}
+
 /* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
  * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
  * so a RUN in flight never puts orkd in D-state -> orkd stays SIGTERM-clean and never blocks system shutdown. */
@@ -107,15 +144,11 @@ static int handle_run(struct client *cl, ork_npu *npu, uint64_t tag){
     if (!A){ drain(cl->fd, rq.abytes); send_error(cl->fd, tag, ORKD_EOOM, "A alloc"); return 0; }
     if (rq.abytes && readn(cl->fd, A, rq.abytes) <= 0){ free(A); return -1; }
     if (!cw || rq.abytes != (uint32_t)((size_t)rq.M * cw->K)){ free(A); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "A size mismatch" : "unknown weight"); return 0; }
-    size_t cn = (size_t)rq.M * cw->N;
-    int32_t *C = malloc(cn * 4);
-    if (!C){ free(A); send_error(cl->fd, tag, ORKD_EOOM, "C alloc"); return 0; }
-    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, A, C);   /* serialized: single daemon = single NPU stream */
-    free(A);
-    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
-    struct orkd_hdr rh = { ORKD_RUN_OK, (uint32_t)(sizeof hh + (rc == 0 ? cn * 4 : 0)), tag };   /* C payload only on success */
-    if (writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh) || (rc == 0 && writen(cl->fd, C, cn * 4))){ free(C); return -1; }
-    free(C);
+    int32_t *C = malloc((size_t)rq.M * cw->N * 4);
+    struct work *w = C ? wk_alloc() : NULL;
+    if (!C || !w){ free(A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
+    w->fd = cl->fd; w->type = ORKD_RUN; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->A = A; w->C = C;   /* enqueued; the scheduler dispatches it */
     return 0;
 }
 static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
@@ -142,12 +175,11 @@ static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, u
     if (!A){ close(a_fd); close(c_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
     void *C = ork_dma_import_fd(npu, c_fd, cn * 4);
     if (!C){ ork_dma_free(npu, A); close(c_fd); send_error(cl->fd, tag, ORKD_EOOM, "import C"); return 0; }
-    ork_npu_set_core_budget(npu, 1);                 /* ZC-OUT is single-core-safe only */
-    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, (const int8_t *)A, (int32_t *)C);   /* A read + C written zero-copy */
-    ork_npu_set_core_budget(npu, 0);                 /* restore: all cores */
-    ork_dma_free(npu, A); ork_dma_free(npu, C);      /* closes a_fd, c_fd */
-    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
-    send_msg(cl->fd, ORKD_RUN_OK, tag, &hh, sizeof hh);   /* NO C payload — C is in the client's shared buffer */
+    struct work *w = wk_alloc();
+    if (!w){ ork_dma_free(npu, A); ork_dma_free(npu, C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
+    w->fd = cl->fd; w->type = ORKD_RUN_ZC2; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N;
+    w->A = (int8_t *)A; w->A_imp = A; w->C = (int32_t *)C; w->C_imp = C;   /* dispatch: A read + C written in place, single-core */
     return 0;
 }
 /* #2b-2 step 3: ZERO-COPY RUN (input A by reference). The client shares A as a dma-buf fd (SCM_RIGHTS);
@@ -163,15 +195,11 @@ static int handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag
     size_t alen = (size_t)rq.M * cw->K;
     void *A = ork_dma_import_fd(npu, a_fd, alen);    /* import A into the NPU domain (takes a_fd ownership) */
     if (!A){ close(a_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
-    size_t cn = (size_t)rq.M * cw->N;
-    int32_t *C = malloc(cn * 4);
-    if (!C){ ork_dma_free(npu, A); send_error(cl->fd, tag, ORKD_EOOM, "C alloc"); return 0; }
-    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, (const int8_t *)A, C);   /* dma_find(A) -> A read zero-copy */
-    ork_dma_free(npu, A);                            /* frees the import + closes a_fd */
-    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
-    struct orkd_hdr rh = { ORKD_RUN_OK, (uint32_t)(sizeof hh + (rc == 0 ? cn * 4 : 0)), tag };
-    if (writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh) || (rc == 0 && writen(cl->fd, C, cn * 4))){ free(C); return -1; }
-    free(C);
+    int32_t *C = malloc((size_t)rq.M * cw->N * 4);
+    struct work *w = C ? wk_alloc() : NULL;
+    if (!C || !w){ ork_dma_free(npu, A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
+    w->fd = cl->fd; w->type = ORKD_RUN_ZC; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->A = (int8_t *)A; w->A_imp = A; w->C = C;   /* A zero-copy; C over socket */
     return 0;
 }
 /* #2b-2 step 1: prove cross-process dma-buf sharing. The client sent a dma-heap fd (SCM_RIGHTS); mmap it here
@@ -202,6 +230,31 @@ static int handle_dmabuf(struct client *cl, ork_npu *npu, int dfd, uint64_t tag)
 static void client_reclaim(struct client *cl, ork_npu *npu){
     for (int i = 0; i < cl->nw; i++) ork_mm_free(npu, cl->wt[i].w);
     cl->nw = 0;
+}
+
+/* dispatch ONE quantum of the highest-priority queued item; reply + free when its last rows land.
+ * (struct work + wk_* are defined above, before the handlers, since the handlers enqueue.) */
+static void dispatch_one(ork_npu *npu, struct client *cl, int nc){
+    struct work *w = wk_pick(); if (!w) return;
+    ork_w *ow = NULL; int alive = 0;                 /* re-resolve the weight (client/weight may have gone since enqueue) */
+    for (int i = 0; i < nc; i++) if (cl[i].fd == w->fd){ alive = 1; for (int j = 0; j < cl[i].nw; j++) if (cl[i].wt[j].id == w->weight_id){ ow = cl[i].wt[j].w; break; } break; }
+    if (!alive){ wk_free(npu, w); return; }          /* client gone: drop silently */
+    if (!ow){ send_error(w->fd, w->tag, ORKD_EBADH, "weight freed"); wk_free(npu, w); return; }
+    int remaining = w->M - w->m0;
+    int q = (g_qn == 1) ? remaining : (remaining < ORKD_QUANTUM_ROWS ? remaining : ORKD_QUANTUM_ROWS);   /* adaptive */
+    int zc2 = (w->type == ORKD_RUN_ZC2);
+    if (zc2) ork_npu_set_core_budget(npu, 1);        /* output zero-copy is single-core-safe only */
+    int r = ork_mm_run_i8(npu, ow, q, (const int8_t *)(w->A + (size_t)w->m0 * w->K), w->C + (size_t)w->m0 * w->N);
+    if (zc2) ork_npu_set_core_budget(npu, 0);
+    if (r && !w->rc) w->rc = r;
+    w->m0 += q;
+    if (w->m0 < w->M) return;                        /* more rows -> stays queued, re-scheduled next tick */
+    size_t cn = (size_t)w->M * w->N;
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = w->weight_id; hh.rc = w->rc;
+    int payload_c = (w->type != ORKD_RUN_ZC2 && w->rc == 0);   /* ZC2's C is the client's shared buffer */
+    struct orkd_hdr rh = { ORKD_RUN_OK, (uint32_t)(sizeof hh + (payload_c ? cn * 4 : 0)), w->tag };
+    (void)!(writen(w->fd, &rh, sizeof rh) || writen(w->fd, &hh, sizeof hh) || (payload_c && writen(w->fd, w->C, cn * 4)));
+    wk_free(npu, w);
 }
 
 /* Detach so an auto-spawned orkd outlives the client that fork+exec'd it: double-fork + setsid (reparent to
@@ -270,13 +323,14 @@ int main(void){
         for (int i = 0; i < nc; i++){ pfd[i+1].fd = cl[i].fd; pfd[i+1].events = POLLIN; }
 
         int timeout = -1;                      /* block indefinitely while we have subscribers */
-        if (refs == 0){
+        if (g_qn > 0) timeout = 0;             /* work queued: poll non-blocking, then dispatch a quantum */
+        else if (refs == 0){
             long left = (long)idle_ms - (now_ms() - idle_since);
             timeout = left > 0 ? (int)left : 0;
         }
         int pr = poll(pfd, (nfds_t)(nc+1), timeout);
         if (pr < 0){ if (errno == EINTR) continue; perror("orkd: poll"); break; }
-        if (pr == 0){                          /* timeout: idle-reap if still empty */
+        if (pr == 0 && g_qn == 0){             /* pure idle timeout: reap if no subscribers */
             if (refs == 0 && now_ms() - idle_since >= (long)idle_ms){
                 fprintf(stderr, "[orkd] idle %ums, no subscribers -> reap\n", idle_ms);
                 break;
@@ -321,12 +375,14 @@ int main(void){
             for (int f = 0; f < 2; f++) if (recvd_fds[f] >= 0) close(recvd_fds[f]);   /* stray fds not consumed by a handler */
             if (drop){
                 if (cl[i].hello && refs) refs--;
+                wk_purge_fd(npu, cl[i].fd);    /* drop this client's queued work (prevents fd-reuse aliasing) */
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
                 close(cl[i].fd);
                 cl[i] = cl[nc-1]; nc--; i--;   /* compact */
                 if (refs == 0) idle_since = now_ms();
             }
         }
+        if (g_qn > 0) dispatch_one(npu, cl, nc);   /* one quantum of the highest-priority queued run per tick */
     }
 
     if (npu) ork_npu_free(npu);                /* release NPU/IOMMU cleanly */
