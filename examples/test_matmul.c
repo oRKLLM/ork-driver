@@ -634,6 +634,7 @@ int main(void){
     ork_npu_set_core_budget(c8, 1);
     fail|=check_i8(c8, 512, 2048, 256, 0xda6b68f190453353ULL);   /* int8 1-core K=2048 M=512 (mg_max*64 tile) */
     fail|=check_i8(c8, 256, 3584, 256, 0x454860dd91b46165ULL);   /* int8 1-core K=3584 M=256 (mg_max*64=64)   */
+    fail|=check_i8(c8, 256, 256,  32, 0xf23ebd149849d390ULL);    /* int8 1-core K=256 (K%512!=0 -> run_loop) M=256>32768/Kp — guards the sched=0 M-tile cap (rows past the tile were garbage pre-fix) */
     ork_npu_free(c8);
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;

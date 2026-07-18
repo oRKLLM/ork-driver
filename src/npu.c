@@ -4772,13 +4772,21 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;   /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
+        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
+        /* sched=0 uses the DEFAULT 0x1040 template, which computes correctly only while the activation tile
+         * fits its budget: mc*Kp <= 32768 elements. (RB/2)/Kp overshoots (e.g. int8 K=256 -> chunk=224, but
+         * rows past 32768/256=128 in one submit are GARBAGE — isolated via shape_probe). The sched=1 path
+         * caps to mg_max*64; sched=0 must cap to 32768/Kp. Without this, int8 K%512!=0 at M>32768/Kp miscomputes
+         * (make test never hit it: test_matmul K=2048/3584 are %512 -> run_fullk_dec). */
+        if(!sched){ int cap=32768/Kp; if(cap<1)cap=1; if(chunk>cap)chunk=cap; }
+        /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
  * extrapolates too HIGH for small Kp (K=64->0x1040=188, K=32->190) and miscomputes (constant-garbage output),
  * and at Kp>=2048 it miscomputes >8 rows (mc<=8 OK / mc>=9 garbage). Outside the window, sched=0 (the general
  * path, no 0x1040 override) is correct — e.g. non-pow2 K=96 already took sched=0. Gates: Kp>=128 (low, fixes
  * fp16 attention at head_dim=32/64) and Kp<2048 (high). Validated in test_bmm (K-sweep 32..256). */
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+            { static int dbg=-1; if(dbg<0)dbg=getenv("ORK_RL_DBG")?1:0; if(dbg) fprintf(stderr,"[run_loop] ns=%d ks=%d Kp=%d sched=%d chunk=%d m0=%d mc=%d M=%d Nc=%d Afsz=%zu Ccsz=%zu\n",ns,ks,Kp,sched,chunk,m0,mc,M,Nc,c->Af.size,c->Cc.size); }
             double _tc0=ork_now_us();
             if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j]; }
             else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j]; }
