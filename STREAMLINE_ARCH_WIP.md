@@ -138,6 +138,24 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
     Routed: base (Sn==1, K<=4096, any M) + wide-N (Sn>1) M=1 + wide-K (K>4096) M=1. NOT yet: M>1 wide-N /
     wide-K prefill (multi-slice/K-split done + strided writes unverified at M>1), and Sn>1 && K>4096 combined.
     NEXT: end-to-end ork_bench (decode tok/s on the fork); then M>1 wide-N/K prefill; then run_stream / bmm.
+- **Graceful SIGTERM/SIGINT in the doorbell (631744d): DONE + validated.** The async poll (ork_dyn_end) spun
+  uninterruptibly — a kill -TERM during an NPU submit-wait was IGNORED, orphaning the process (forced a reboot;
+  kill -9 mid-submit risks an IOMMU wedge). Now a chained handler sets a flag; the poll breaks + DRAINS
+  (bsync + writeback + free) before the signal takes effect; never swallows it (idle => original disposition
+  immediately; in-poll => re-raise after drain). Validated on the board: kill -TERM of a doorbell workload
+  AND of the real ork_bench both exit cleanly in ~0.6-1.6s (was: uninterruptible), no orphan, NPU healthy.
+  make test byte-identical.
+- **End-to-end ork_bench: attempted, ENVIRONMENTALLY BLOCKED (not a code issue).** Rebuilt libggml-ork against
+  streamline-arch (confirmed `[ork] ork-driver 0.7.6` loads, not the old 0.6.46). But the run produced garbage
+  (`response: !!!`) because the NPU weight import ENOMEM'd (`PRIME_FD_TO_HANDLE: Cannot allocate memory` x60):
+  the orkllm systemd service auto-starts on boot and holds the SINGLE-STREAM NPU domain, so ork_bench can't
+  import. The auto-dump FIRED on the resulting doorbell miss (`S=3 progress=-1 STUCK`) — downstream of the
+  missing weights, and proof the diagnostic infra works. To get a valid number: stop orkllm (systemctl was
+  flaky over the non-login ssh; the service also auto-restarts) so the NPU is free, then re-run. Deferred —
+  the code is validated at make-test-golden + mc_prof (parity/faster) + SIGTERM-functional levels.
+  BOARD-OPS NOTE: a graceful `sudo reboot` did NOT bring sshd back (pinged, ssh refused ~12 min) => recovered
+  via HA "Rock 5B Plug" power-cycle (came back clean, no SPI corruption since it still pinged). Fork submodule
+  WIP was stashed for the rebuild and RESTORED after (checkout 22b7480 + stash pop + rebuild).
 - **P3 — migrate core run paths onto the spine, one at a time, byte-identical:** `run_chain_i8` →
   `run_stream_f16_chain` → `run_multicore` → `bmm` → `run_i4`. Each: build `ork_seq_op[]`/recipe, submit via the
   spine, drop the hand-rolled `rknpu_submit_ioctl`. `make test` bit-exact + attest refresh per path.
