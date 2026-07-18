@@ -222,3 +222,40 @@ int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const 
     return hh.rc;
 #endif
 }
+
+/* #2b-2 step 3b: full zero-copy — A read AND C written by reference (both shared dma-bufs, fds via SCM_RIGHTS).
+ * No A/C bytes cross the socket. (Plain-buffer convenience: A is memcpy'd in, C memcpy'd out; a dma-buf-native
+ * caller works the shared buffers directly for true no-copy.) 0 = ok, <0 = error (-2 = no dma-heap). */
+int orkd_run_i8_zc2(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
+#ifndef __linux__
+    (void)c;(void)weight_id;(void)M;(void)K;(void)N;(void)A;(void)C; return -2;
+#else
+    if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
+    size_t abytes = (size_t)M * K, cbytes = (size_t)M * N * 4;
+    int afd = orkd_dmaheap_alloc(abytes), cfd = orkd_dmaheap_alloc(cbytes);
+    if (afd < 0 || cfd < 0){ if (afd >= 0) close(afd); if (cfd >= 0) close(cfd); return -2; }
+    void *am = mmap(NULL, abytes, PROT_READ | PROT_WRITE, MAP_SHARED, afd, 0);
+    void *cm = mmap(NULL, cbytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
+    if (am == MAP_FAILED || cm == MAP_FAILED){ if (am != MAP_FAILED) munmap(am, abytes); if (cm != MAP_FAILED) munmap(cm, cbytes); close(afd); close(cfd); return -3; }
+    memcpy(am, A, abytes); orkd_dmabuf_clean(afd);
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0;
+    struct orkd_hdr h = { ORKD_RUN_ZC2, (uint32_t)sizeof rq, 8 };
+    int fds[2] = { afd, cfd };
+    int rc = -1;
+    if (!orkd_send_hdr_fds(c->fd, &h, fds, 2) && !wn(c->fd, &rq, sizeof rq)){
+        struct orkd_hdr rh;
+        if (rn(c->fd, &rh, sizeof rh) > 0){
+            if (rh.type == ORKD_RUN_OK){
+                struct orkd_handle hh;
+                if (rn(c->fd, &hh, sizeof hh) > 0){
+                    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+                    rc = hh.rc;
+                    if (rc == 0){ orkd_dmabuf_invalidate(cfd); memcpy(C, cm, cbytes); }   /* invalidate before reading C the NPU wrote */
+                }
+            } else if (rh.len) cdrain(c->fd, rh.len);
+        }
+    }
+    munmap(am, abytes); munmap(cm, cbytes); close(afd); close(cfd);
+    return rc;
+#endif
+}

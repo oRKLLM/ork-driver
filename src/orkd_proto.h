@@ -50,6 +50,7 @@ enum orkd_msg_type {
     ORKD_DMABUF_PROBE = 32, /* client->daemon: {orkd_dmabuf} + a dma-buf fd (SCM_RIGHTS): does orkd see the same bytes? */
     ORKD_DMABUF_OK    = 33, /* daemon->client: {orkd_dmabuf} echo — rc=0 + checksum orkd computed from the shared buffer */
     ORKD_RUN_ZC       = 34, /* client->daemon: {orkd_run} + A dma-buf fd (SCM_RIGHTS): A read ZERO-COPY in place; reply RUN_OK + C bytes */
+    ORKD_RUN_ZC2      = 35, /* client->daemon: {orkd_run} + [A_fd, C_fd] (SCM_RIGHTS): A read + C WRITTEN zero-copy in place; reply RUN_OK, NO C payload */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
