@@ -186,3 +186,39 @@ int orkd_dmabuf_probe(orkd_conn *c, size_t size){
     return rc;
 #endif
 }
+
+/* #2b-2 step 3: run int8 with A passed BY REFERENCE (zero-copy) — A is placed in a shared dma-buf, its fd
+ * handed to orkd (SCM_RIGHTS), and the NPU reads it in place; C comes back over the socket. (A plain-buffer
+ * A is memcpy'd into the dma-buf here for convenience; a dma-buf-native caller fills the shared buffer
+ * directly for true no-copy.) 0 = ok, <0 = error (-2 = no dma-heap). */
+int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
+#ifndef __linux__
+    (void)c;(void)weight_id;(void)M;(void)K;(void)N;(void)A;(void)C; return -2;
+#else
+    if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
+    size_t abytes = (size_t)M * K;
+    int afd = orkd_dmaheap_alloc(abytes);
+    if (afd < 0) return -2;
+    void *am = mmap(NULL, abytes, PROT_READ | PROT_WRITE, MAP_SHARED, afd, 0);
+    if (am == MAP_FAILED){ close(afd); return -3; }
+    memcpy(am, A, abytes);
+    orkd_dmabuf_clean(afd);                          /* flush A to device before the NPU reads it */
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0;
+    struct orkd_hdr h = { ORKD_RUN_ZC, (uint32_t)sizeof rq, 7 };
+    if (orkd_send_hdr_fd(c->fd, &h, afd) || wn(c->fd, &rq, sizeof rq)){ munmap(am, abytes); close(afd); return -1; }
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0){ munmap(am, abytes); close(afd); return -1; }
+    if (rh.type != ORKD_RUN_OK){ if (rh.len) cdrain(c->fd, rh.len); munmap(am, abytes); close(afd); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0){ munmap(am, abytes); close(afd); return -1; }
+    size_t consumed = sizeof hh, cbytes = (size_t)M * N * 4;
+    if (hh.rc == 0){
+        if (rh.len < consumed + cbytes){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); munmap(am, abytes); close(afd); return -1; }
+        if (rn(c->fd, C, cbytes) <= 0){ munmap(am, abytes); close(afd); return -1; }
+        consumed += cbytes;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    munmap(am, abytes); close(afd);
+    return hh.rc;
+#endif
+}

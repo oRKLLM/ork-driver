@@ -126,6 +126,30 @@ static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
     send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);   /* PACK_OK = generic handle-op ack */
     return 0;
 }
+/* #2b-2 step 3: ZERO-COPY RUN (input A by reference). The client shares A as a dma-buf fd (SCM_RIGHTS);
+ * orkd PRIME-imports it into the NPU's IOMMU domain and ork_mm_run_i8 reads A IN PLACE (dma_find hit =
+ * validated input zero-copy) — no A byte-transfer over the socket. C is still returned over the socket here
+ * (output zero-copy is the next sub-step: needs ORK_ZC_OUT + a cross-process invalidate). */
+static int handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag){
+    struct orkd_run rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0){ if (a_fd >= 0) close(a_fd); return -1; }
+    struct cweight *cw = NULL;
+    for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == rq.weight_id){ cw = &cl->wt[i]; break; }
+    if (!cw || a_fd < 0){ if (a_fd >= 0) close(a_fd); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "no A fd" : "unknown weight"); return 0; }
+    size_t alen = (size_t)rq.M * cw->K;
+    void *A = ork_dma_import_fd(npu, a_fd, alen);    /* import A into the NPU domain (takes a_fd ownership) */
+    if (!A){ close(a_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
+    size_t cn = (size_t)rq.M * cw->N;
+    int32_t *C = malloc(cn * 4);
+    if (!C){ ork_dma_free(npu, A); send_error(cl->fd, tag, ORKD_EOOM, "C alloc"); return 0; }
+    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, (const int8_t *)A, C);   /* dma_find(A) -> A read zero-copy */
+    ork_dma_free(npu, A);                            /* frees the import + closes a_fd */
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
+    struct orkd_hdr rh = { ORKD_RUN_OK, (uint32_t)(sizeof hh + (rc == 0 ? cn * 4 : 0)), tag };
+    if (writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh) || (rc == 0 && writen(cl->fd, C, cn * 4))){ free(C); return -1; }
+    free(C);
+    return 0;
+}
 /* #2b-2 step 1: prove cross-process dma-buf sharing. The client sent a dma-heap fd (SCM_RIGHTS); mmap it here
  * and confirm orkd sees the same bytes (fnv match). This validates the fd-passing + shared-memory plumbing;
  * PRIME-import into the NPU's IOMMU domain (zero-copy submit) is step 2 (needs a library fd hook). */
@@ -262,6 +286,7 @@ int main(void){
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fd, h.tag) < 0) drop = 1; recvd_fd = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fd, h.tag) < 0) drop = 1; recvd_fd = -1; break;
                 default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }

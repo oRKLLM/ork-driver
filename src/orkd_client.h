@@ -41,6 +41,10 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B);
 /* Run int8 A[M,K] x weight -> C[M,N] (int32), computed on the daemon's NPU. 0 = ok, <0 = error. */
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* Like orkd_run_i8 but A is passed BY REFERENCE: placed in a shared dma-buf and read zero-copy by the NPU
+ * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */
+int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+
 /* Free a resident weight (also freed automatically when the client disconnects). 0 = ok, <0 = error. */
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id);
 
