@@ -108,14 +108,16 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
   legacy fallback. Validated: make test golden bit-exact (model/decode), decode latency neutral-to-faster
   (873 vs 884ms/500-iter, NONBLOCK dispatch). NOTE: production decode is CPU, so this affects the NPU-decode
   path (used when NPU decode is forced), not the default fast decode.
-  - **M>1 prefill colsplit: BUILT + validated bit-exact, but NOT wired (regresses large-M).** `ork_dyn_begin_colsplit`
-    handles M 1..N (column-split across cores + in-core M-tiling + strided col copy-back), bit-exact for
-    M=8/64/128. Perf A/B: M=64 neutral (650 vs 647 ms/200-iter), **M=256 doorbell 2.8x SLOWER** (5147 vs
-    1809 ms). Hypothesis: the NONBLOCK single-thread poll doesn't parallelize heavy compute like mcworker's
-    3 blocking threads, and the busy-poll `civac` spam contends with the large NPU writeback. So `run_multicore`
-    routes ONLY M=1 decode; M>1 prefill stays on mcworker. The M>1 colsplit capability is committed (da982d7)
-    + dormant, ready once the heavy-job poll is optimized (backoff / fewer civac / fence-based completion).
-    NEXT P3: optimize the heavy-job poll to unblock prefill colsplit, OR migrate run_stream / bmm (decode-shaped).
+  - **M>1 prefill colsplit: WIRED — poll fix unblocked it, now at parity.** The M=256 2.8x regression was the
+    `ork_dyn_end` busy-poll's per-row `civac` (768 words/iter for M=256x3 cores) contending with the large NPU
+    writeback. Fix: `ork_dyn_end` now (a) caches per-entry done (stops re-civac'ing a finished core) and
+    (b) after a 1ms tight window that fully covers dispatch-bound decode, sleeps 50us between polls — so a
+    multi-ms prefill stops hammering the bus (adds only <=poll-granularity latency) while decode stays tight.
+    Result (mc_prof K=2048 N=4096): M=1 470 vs 505 ms (FASTER), M=64 654 vs 648 (neutral), M=256 1820 vs 1802
+    (PARITY, was 5147). So `run_multicore` now routes ALL int8 (Sn==1, K<=4096 Bf, nc>1) — decode AND prefill —
+    onto the doorbell colsplit. make test golden bit-exact. Consolidation at no perf cost (decode faster).
+    NEXT P3: end-to-end integration bench (ork_bench) to confirm; extend colsplit to wide-N / wide-K (combine
+    with N-tile/K-split) so the big FFN projections route too; then run_stream / bmm.
 - **P3 — migrate core run paths onto the spine, one at a time, byte-identical:** `run_chain_i8` →
   `run_stream_f16_chain` → `run_multicore` → `bmm` → `run_i4`. Each: build `ork_seq_op[]`/recipe, submit via the
   spine, drop the hand-rolled `rknpu_submit_ioctl`. `make test` bit-exact + attest refresh per path.

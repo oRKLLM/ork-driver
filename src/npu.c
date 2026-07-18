@@ -3943,17 +3943,14 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
-    /* P3 MIGRATION: M=1 int8 decode runs on the NONBLOCK doorbell (sub-nmax N-column split across cores,
-     * ork_dyn_begin_colsplit_m1). Decode is dispatch-bound, so NONBLOCK helps, and this consolidates the
-     * decode submit onto the spine (no legacy fallback — git is the recovery). Eligible: int8, Sn==1,
-     * K<=4096 with full-K Bf, nc>1. Output is bit-exact vs the mcworker N-split (same t0=i*NN/nc columns). */
-    /* Only M=1 DECODE is routed onto the doorbell: colsplit is neutral for M<=64 but REGRESSES large-M
-     * prefill (M=256 measured 2.8x slower — the NONBLOCK single-thread poll doesn't parallelize heavy compute
-     * like mcworker's 3 blocking threads; likely the busy-poll civac contends with the large NPU writeback).
-     * The M>1 colsplit capability is built + validated (ork_dyn_begin_colsplit) but stays off the prefill path
-     * until the poll is optimized. Decode is dispatch-bound so it wins/neutral there. */
-    if(dt==DT_I8 && M==1 && w->Sn==1 && w->K<=4096 && w->Bf && nc>1){
-        ork_mm_task_i8 t = { .w=w, .M=1, .A=(const int8_t*)A, .C=(int32_t*)C };
+    /* P3 MIGRATION: int8 matmul (Sn==1, K<=4096 with full-K Bf, nc>1) runs on the NONBLOCK doorbell via
+     * ork_dyn_begin_colsplit — sub-nmax N-column split across cores (matching mcworker's t0=i*NN/nc bit-exact),
+     * M-tiled within each core. Decode (M=1) is dispatch-bound => faster; prefill (M>1) is compute-bound =>
+     * parity, once the ork_dyn_end heavy-job poll backoff removed the busy-poll civac contention with the NPU
+     * writeback (M=256 was 2.8x slower on a pure spin; now at parity). Consolidates decode AND prefill submits
+     * onto the spine (dump/self-heal coverage). No legacy fallback — git is the recovery. */
+    if(dt==DT_I8 && w->Sn==1 && w->K<=4096 && w->Bf && nc>1){
+        ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
         if(!h) return -1;
         ork_dyn_end(h); return 0;
@@ -9702,14 +9699,21 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
     double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
-    for (;;) { int n = 0; for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) n++;
+    int edone[1024]; for (int i = 0; i < h->S; i++) edone[i] = 0;   /* per-entry done cache: stop re-polling (re-civac'ing) a core once it's complete */
+    for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
         if (n >= h->S) break;                               /* all tasks, all rows */
         /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
          * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
          * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
         if (n != lastn) { lastn = n; lastchg = ork_now_us(); }
         else if (!h->mc && ork_now_us() - lastchg > 500.0) break;   /* single-core only: no progress => halted */
-        if (ork_now_us() - t0 > 3e6) break; }
+        double el = ork_now_us() - t0;
+        if (el > 3e6) break;
+        /* HEAVY-JOB BACKOFF: after a tight window that fully covers dispatch-bound work (decode ~<1ms), sleep
+         * briefly between polls so the busy-poll's per-row civac stops contending with a large NPU writeback
+         * (the M>1 prefill regression: M=256 was 2.8x slower under a pure spin). Decode stays tight (el<1ms =>
+         * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
+        if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
     int last = ork_dyn_progress(h);
     /* AUTO CORE-DUMP on a real miss: a plain chain that drained INCOMPLETE (not all S landed) is a doorbell
      * dispatch/completion failure — capture the stuck-descriptor post-mortem before the state is lost. Skip
