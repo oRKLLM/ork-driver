@@ -46,6 +46,9 @@ enum orkd_msg_type {
     ORKD_RUN      = 18,  /* client->daemon: {orkd_run} weight id + M + A/C dma-buf fds -> queued submit        */
     ORKD_RUN_OK   = 19,  /* daemon->client: {orkd_handle} result ready (C written to the shared buf)           */
     ORKD_FREE     = 20,  /* client->daemon: {orkd_handle} free a resident weight                               */
+    /* ---- #2b-2 dma-buf sharing (SCM_RIGHTS fd passing) ---- */
+    ORKD_DMABUF_PROBE = 32, /* client->daemon: {orkd_dmabuf} + a dma-buf fd (SCM_RIGHTS): does orkd see the same bytes? */
+    ORKD_DMABUF_OK    = 33, /* daemon->client: {orkd_dmabuf} echo — rc=0 + checksum orkd computed from the shared buffer */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -102,6 +105,12 @@ struct orkd_error {
     uint32_t code;       /* enum orkd_err */
     uint32_t pad;
     char     msg[64];    /* NUL-terminated */
+};
+struct orkd_dmabuf {     /* #2b-2 probe: the fd rides as SCM_RIGHTS ancillary data, out of band */
+    uint64_t size;       /* bytes to check in the shared buffer */
+    uint64_t checksum;   /* PROBE: client's fnv of the buffer; OK: what orkd computed (must match) */
+    int32_t  rc;         /* OK: 0 = imported+mapped+matched, <0 = failure */
+    uint32_t prime_ok;   /* OK: 1 if DRM PRIME_FD_TO_HANDLE also succeeded (NPU-importable) */
 };
 #pragma pack(pop)
 

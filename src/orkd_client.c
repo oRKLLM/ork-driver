@@ -1,8 +1,10 @@
 /* orkd_client.c — connect/auto-spawn/ping/disconnect against the orkd daemon. See orkd_client.h. */
 #include "orkd_client.h"
 #include "orkd_proto.h"
+#include "orkd_shm.h"
 
 #include <errno.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -155,4 +157,32 @@ int orkd_free_weight(orkd_conn *c, uint64_t weight_id){
     if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
     if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
     return hh.rc;
+}
+
+/* #2b-2 step 1: allocate a dma-heap buffer, fill+hash it, pass the fd to orkd (SCM_RIGHTS), and confirm orkd
+ * reads the same bytes through the shared mapping. 0 = shared (fnv matched); <0 = failure (-2 = no dma-heap). */
+int orkd_dmabuf_probe(orkd_conn *c, size_t size){
+#ifndef __linux__
+    (void)c; (void)size; return -2;                 /* dma-heap is Linux-only */
+#else
+    if (!c || c->fd < 0 || !size) return -1;
+    int dfd = orkd_dmaheap_alloc(size);
+    if (dfd < 0) return -2;
+    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, 0);
+    if (m == MAP_FAILED){ close(dfd); return -3; }
+    uint8_t *b = (uint8_t *)m;
+    for (size_t i = 0; i < size; i++) b[i] = (uint8_t)(i * 131u + 7u);
+    struct orkd_dmabuf db; memset(&db, 0, sizeof db); db.size = size; db.checksum = orkd_fnv(m, size);
+    struct orkd_hdr h = { ORKD_DMABUF_PROBE, (uint32_t)sizeof db, 6 };
+    int rc = -4;
+    if (orkd_send_hdr_fd(c->fd, &h, dfd) == 0 && wn(c->fd, &db, sizeof db) == 0){
+        struct orkd_hdr rh;
+        if (rn(c->fd, &rh, sizeof rh) > 0 && rh.type == ORKD_DMABUF_OK){
+            struct orkd_dmabuf out;
+            if (rn(c->fd, &out, sizeof out) > 0){ if (rh.len > sizeof out) cdrain(c->fd, rh.len - sizeof out); rc = out.rc; }
+        }
+    }
+    munmap(m, size); close(dfd);
+    return rc;
+#endif
 }

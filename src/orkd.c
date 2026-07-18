@@ -13,9 +13,11 @@
  * weights/IOVA are reclaimed. That is the design fix for the leak-on-kill that otherwise forces a reboot. */
 
 #include "orkd_proto.h"
+#include "orkd_shm.h"
 #include "ork_npu.h"
 
 #include <errno.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -124,6 +126,21 @@ static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
     send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);   /* PACK_OK = generic handle-op ack */
     return 0;
 }
+/* #2b-2 step 1: prove cross-process dma-buf sharing. The client sent a dma-heap fd (SCM_RIGHTS); mmap it here
+ * and confirm orkd sees the same bytes (fnv match). This validates the fd-passing + shared-memory plumbing;
+ * PRIME-import into the NPU's IOMMU domain (zero-copy submit) is step 2 (needs a library fd hook). */
+static int handle_dmabuf(struct client *cl, int dfd, uint64_t tag){
+    struct orkd_dmabuf db;
+    if (readn(cl->fd, &db, sizeof db) <= 0){ if (dfd >= 0) close(dfd); return -1; }
+    struct orkd_dmabuf out; memset(&out, 0, sizeof out); out.size = db.size; out.rc = -1; out.prime_ok = 0;
+    if (dfd >= 0 && db.size && db.size <= ORKD_MAX_BYTES){
+        void *m = mmap(NULL, db.size, PROT_READ, MAP_SHARED, dfd, 0);
+        if (m != MAP_FAILED){ out.checksum = orkd_fnv(m, db.size); out.rc = (out.checksum == db.checksum) ? 0 : -1; munmap(m, db.size); }
+    }
+    if (dfd >= 0) close(dfd);
+    send_msg(cl->fd, ORKD_DMABUF_OK, tag, &out, sizeof out);
+    return 0;
+}
 /* free all of a client's resident weights on BYE / socket-EOF — the leak-safe reclaim (a crashed client can't leak) */
 static void client_reclaim(struct client *cl, ork_npu *npu){
     for (int i = 0; i < cl->nw; i++) ork_mm_free(npu, cl->wt[i].w);
@@ -216,9 +233,9 @@ int main(void){
         }
         for (int i = 0; i < nc; i++){
             if (!(pfd[i+1].revents & (POLLIN|POLLHUP|POLLERR))) continue;
-            int drop = 0;
+            int drop = 0, recvd_fd = -1;
             struct orkd_hdr h;
-            int rr = readn(cl[i].fd, &h, sizeof h);
+            int rr = orkd_recv_hdr_fd(cl[i].fd, &h, &recvd_fd);   /* recvmsg: captures any SCM_RIGHTS dma-buf fd */
             if (rr <= 0){ drop = 1; }          /* EOF (incl. abrupt client death) or error */
             else switch (h.type){
                 case ORKD_HELLO: {
@@ -236,8 +253,10 @@ int main(void){
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], recvd_fd, h.tag) < 0) drop = 1; recvd_fd = -1; break;
                 default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }
+            if (recvd_fd >= 0) close(recvd_fd);   /* stray fd on a non-dmabuf message — don't leak it */
             if (drop){
                 if (cl[i].hello && refs) refs--;
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
