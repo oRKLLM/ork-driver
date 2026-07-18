@@ -116,6 +116,17 @@ int main(void) {
     printf("-- P3 colsplit: wide-K (K>4096) M=1 decode, per-core K-split accumulate --\n");
     fail += one_case_m(c, 8192,  2048, 1, 3, 1);   /* Sk=8,  columns split across 3 cores */
     fail += one_case_m(c, 18944, 3584, 1, 3, 1);   /* Sk~19, ffn_down-like */
+    /* STAGE-3 RULE-OUT: the EXACT Qwen3-1.7B int8 matmul shapes (n_embd=2048, ff=6144, kv=1024), M=1 decode
+     * + M=64 prefill, bit-exact vs CPU. If these all pass, the matmul CORE is correct for the model => the
+     * bench garbage is upstream (backend act-quant/dequant), not stage 3. */
+    printf("-- STAGE-3 rule-out: exact Qwen3-1.7B matmul shapes (M=1 decode + M=64 prefill) --\n");
+    fail += one_case_m(c, 2048, 2048, 1,  3, 1);   /* attn q/o  decode */
+    fail += one_case_m(c, 2048, 1024, 1,  3, 1);   /* attn k/v  decode (GQA) */
+    fail += one_case_m(c, 2048, 6144, 1,  3, 1);   /* ffn gate/up decode */
+    fail += one_case_m(c, 6144, 2048, 1,  3, 1);   /* ffn down  decode (K>4096 => per-core K-split) */
+    fail += one_case_m(c, 2048, 2048, 64, 3, 1);   /* attn q/o  prefill */
+    fail += one_case_m(c, 2048, 6144, 64, 3, 1);   /* ffn gate/up prefill */
+    fail += one_case_m(c, 6144, 2048, 64, 3, 1);   /* ffn down  prefill */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");

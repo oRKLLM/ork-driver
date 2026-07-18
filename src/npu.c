@@ -4740,8 +4740,23 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w->dtype!=DT_I8) return -1;
     if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    if(!g_ork_prof) return run(c,w,M,A,C);
-    double t0=ork_now_us(); int r=run(c,w,M,A,C); g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; return r;
+    /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real
+     * run (NOT a synthetic tool). A garbage => backend act-quant (stage 2); C garbage w/ sane A => weight
+     * bytes/tiling (stage 1); both sane => the garbage is dequant/scales (stage 4). Flushed per line. */
+    static int rtr=-1; if(rtr<0){ const char*e=getenv("ORK_RUN_TRACE"); rtr=e?atoi(e):0; }
+    static long rn=0; long myn=rn++; int trace = rtr && myn<(long)rtr;
+    if(trace){ long amn=127,amx=-128,anz=0; size_t na=(size_t)M*w->K;
+        for(size_t i=0;i<na;i++){ int8_t v=A[i]; if(v<amn)amn=v; if(v>amx)amx=v; if(v)anz++; }
+        fprintf(stderr,"[RUN#%ld] i8 M=%d K=%d N=%d Sk=%d Sn=%d bf=%d | A[int8] min=%ld max=%ld nz=%ld/%zu head=[%d %d %d %d]\n",
+            myn,M,w->K,w->N,w->Sk,w->Sn,w->Bf?1:0,amn,amx,anz,na,A[0],A[1],A[2],A[3]); fflush(stderr); }
+    double t0 = g_ork_prof ? ork_now_us() : 0;
+    int r = run(c,w,M,A,C);
+    if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; }
+    if(trace){ long cmn=2147483647L,cmx=-2147483648L,cz=0; size_t nc=(size_t)M*w->N;
+        for(size_t i=0;i<nc;i++){ int32_t v=C[i]; if(v<cmn)cmn=v; if(v>cmx)cmx=v; if(!v)cz++; }
+        fprintf(stderr,"[RUN#%ld]   -> rc=%d C[int32] min=%ld max=%ld zero=%ld/%zu head=[%d %d %d %d]\n",
+            myn,r,cmn,cmx,cz,nc,C[0],C[1],C[2],C[3]); fflush(stderr); }
+    return r;
 }
 
 /* ---- FUSED FFN: matmul with an on-NPU output-stage activation (SwiGLU fusion) --------------------
