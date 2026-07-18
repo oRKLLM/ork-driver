@@ -118,6 +118,18 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
     onto the doorbell colsplit. make test golden bit-exact. Consolidation at no perf cost (decode faster).
     NEXT P3: end-to-end integration bench (ork_bench) to confirm; extend colsplit to wide-N / wide-K (combine
     with N-tile/K-split) so the big FFN projections route too; then run_stream / bmm.
+  - **Wide-N colsplit (Sn>1): DONE for M=1 (decode) — bit-exact.** ork_dyn_begin_colsplit now handles Sn>1: a
+    core's contiguous column range [c0,c1) can span N-slices, so it emits one program per overlapping slice
+    (its column sub-range, weight Bf[ns] at the in-slice offset), writing into the core's [M,Ncore] scratch;
+    since the range is contiguous in C the copy-back stays a single strided block. Validated bit-exact
+    (cacheable output): K=3584 N=18944 (ffn_gate/up-like, Sn=3), N=16384/24576, nc=3. M>1 wide-N stays on
+    mcworker for now (the per-row-last-col done across multi-slice strided writes is unverified). run_multicore
+    routes wide-N M=1 decode onto it. make test golden bit-exact.
+  - **ZC-OUT reconfirmed:** dma-OUTPUT (ork_dma_alloc as C) under MULTI-CORE colsplit is non-deterministically
+    wrong (verified: 112/256/240 zeros across identical runs) — the documented ZC-OUT-multicore-unsafe path
+    (per-core bsyncs not serialized vs the writeback). Default cacheable output is bit-exact; dma-output stays
+    the off-by-default opt-in. Applies equally to the old mcworker path, so no new risk.
+  - **NEXT P3: wide-K colsplit (ffn_down K>4096) = colsplit + K-split accumulate per core; then M>1 wide-N.**
 - **P3 — migrate core run paths onto the spine, one at a time, byte-identical:** `run_chain_i8` →
   `run_stream_f16_chain` → `run_multicore` → `bmm` → `run_i4`. Each: build `ork_seq_op[]`/recipe, submit via the
   spine, drop the hand-rolled `rknpu_submit_ioctl`. `make test` bit-exact + attest refresh per path.

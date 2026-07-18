@@ -3949,7 +3949,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * parity, once the ork_dyn_end heavy-job poll backoff removed the busy-poll civac contention with the NPU
      * writeback (M=256 was 2.8x slower on a pure spin; now at parity). Consolidates decode AND prefill submits
      * onto the spine (dump/self-heal coverage). No legacy fallback — git is the recovery. */
-    if(dt==DT_I8 && w->Sn==1 && w->K<=4096 && w->Bf && nc>1){
+    if(dt==DT_I8 && (w->Sn==1 || M==1) && w->K<=4096 && w->Bf && nc>1){
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
         if(!h) return -1;
@@ -9200,7 +9200,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
  * single-threaded => coherent. */
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
-    int nt_sz = 32, NN = N / nt_sz, mcap = mtile_cap(K);      /* int8 output column tiles are 32 wide; mcap rows/program */
+    int nt_sz = 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col tiles 32 wide; mcap rows/program; NMAX_C = N-slice width */
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
@@ -9218,16 +9218,27 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         size_t osz = (size_t)M * Ncore * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
-        struct buf *CC = &c->mcc[i];
-        uint32_t wbase = (uint32_t)(w->Bf[0].dma + (uint64_t)t0 * K * nt_sz);   /* column-tile offset into the Bf weight */
-        int np = 0;   /* programs (M-tiles) for this core */
+        struct buf *CC = &c->mcc[i]; int c1 = t1 * nt_sz;
+        int np = 0;   /* programs for this core: (M-tile x overlapping N-slice) */
+        /* This core owns the CONTIGUOUS column range [c0,c1) of C. Wide-N (Sn>1): that range can span several
+         * N-slices, so emit one program per overlapping slice (its column sub-range), writing into the core's
+         * [M,Ncore] scratch at the right column offset (row-stride Ncore via synth stride). Because the range
+         * is contiguous in C, end() copies the whole [M,Ncore] to C[c0:c1) as one strided block. */
         for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
-            if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
-            memset(rc, 0, sizeof rc);
-            synth_i8(rc, mc, K, Ncore, adma + (uint32_t)((size_t)m0 * K), wbase, (uint32_t)(CC->dma + (size_t)m0 * Ncore * 4), 1, CBUF, 0);   /* rows [m0,m0+mc) of [M,Ncore] */
-            if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
-            memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
-            np++;
+            for (int ns = 0; ns < w->Sn; ns++) {
+                int sl0 = ns * NMAX_C, slNc = (N - sl0 < NMAX_C) ? (N - sl0) : NMAX_C, sl1 = sl0 + slNc;
+                int ov0 = c0 > sl0 ? c0 : sl0, ov1 = c1 < sl1 ? c1 : sl1;   /* overlap of [c0,c1) with slice ns */
+                if (ov1 <= ov0) continue;
+                int Ncol = ov1 - ov0, inslice = ov0 - sl0, scol = ov0 - c0;   /* cols from this slice; offset in slice; offset in scratch */
+                if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+                uint32_t wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(inslice / nt_sz) * K * nt_sz);   /* column-tile offset within slice ns */
+                memset(rc, 0, sizeof rc);
+                synth_i8(rc, mc, K, Ncol, adma + (uint32_t)((size_t)m0 * K), wbase,
+                         (uint32_t)(CC->dma + ((size_t)m0 * Ncore + scol) * 4), 1, CBUF, Ncore);   /* rows [m0,m0+mc) x cols [scol,scol+Ncol) of [M,Ncore] */
+                if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                np++;
+            }
         }
         for (int p = 0; p < np; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
             if (p < np - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
@@ -9258,9 +9269,11 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
-    /* P3 sub-nmax column-tiling: a single int8 matmul (Sn==1, K<=4096 Bf) multi-cores by N-column split
-     * (M-tiled within each core when M>mtile_cap) rather than being pinned to one core by the op-partition. */
-    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && tasks[0].w->Sn == 1
+    /* P3 sub-nmax column-tiling: a single int8 matmul (K<=4096 Bf) multi-cores by N-column split across cores
+     * (M-tiled within each core; wide-N Sn>1 spans slices) rather than being pinned to one core by the
+     * op-partition. Wide-N (Sn>1) is M=1-only for now (M>1 wide-N's per-row-last-col done across multi-slice
+     * strided writes is unverified — stays on mcworker); Sn==1 handles any M. */
+    if (S == 1 && nc > 1 && tasks[0].w->dtype == DT_I8 && (tasks[0].w->Sn == 1 || tasks[0].M == 1)
         && tasks[0].w->K <= 4096 && tasks[0].w->Bf && (tasks[0].w->N / 32) >= 2)
         return ork_dyn_begin_colsplit(c, &tasks[0], nc);
     if (nc > S) nc = S;

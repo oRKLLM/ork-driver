@@ -69,9 +69,9 @@ int main(void) {
     int fail = 0;
     /* M=1 wide-N: resident dma C (DIRECT zero-copy output) — bit-exact. */
     printf("-- M=1 wide-N (direct zero-copy output) --\n");
-    fail += one_case_m(c, 512, 16384, 1, 1, 0);
-    fail += one_case_m(c, 512, 16384, 1, 3, 0);
-    fail += one_case_m(c, 512, 24576, 1, 1, 0);
+    fail += one_case_m(c, 512, 16384, 1, 1, 0);   /* nc=1 single-core direct (dma zero-copy OK) */
+    fail += one_case_m(c, 512, 16384, 1, 3, 1);   /* nc=3 => colsplit multi-core: dma output is ZC-OUT-unsafe, use cacheable */
+    fail += one_case_m(c, 512, 24576, 1, 1, 0);   /* nc=1 single-core direct */
     /* M>1: routed through scratch + copy-back/scatter to the caller's (cacheable) C — the supported output
      * convention. (Output zero-copy to a resident dma buffer at M>1 is the separate ZC-OUT opt-in, off by
      * default and coherency-unsafe; not exercised here.) */
@@ -83,7 +83,7 @@ int main(void) {
     /* G2 K-split: wide-K (K>4096 => Sk K-slice partials + host accumulate). Sn==1. */
     printf("-- K-split (wide-K, Sn==1) — M=1 decode + M>1 prefill --\n");
     fail += one_case_m(c, 8192,  2048, 1,  1, 1);   /* Sk=8, M=1 decode */
-    fail += one_case_m(c, 8192,  2048, 1,  1, 0);   /* Sk=8, M=1 dma output */
+    fail += one_case_m(c, 8192,  2048, 1,  1, 1);   /* Sk=8, M=1 (K-split accumulate to a cacheable C; dma-out is ZC-OUT) */
     fail += one_case_m(c, 18944, 3584, 1,  1, 1);   /* Sk~19, ffn_down-like decode */
     /* M>1 = A-gather + [M,N] partials + [M,N] accumulate. N kept modest on the M=64 cases so the O(M*N*K)
      * CPU reference stays fast (the 17MB-partial N=3584/M=64 shape is the same code, just a bigger bcreate). */
@@ -98,7 +98,7 @@ int main(void) {
     fail += one_case_m(c, 4096, 1024, 256, 1, 1);   /* cap=64 => 4 M-tiles */
     /* P3: sub-nmax column-split across cores (M=1 int8, Sn==1, nc>1) — matches run_multicore's N-split. */
     printf("-- P3 colsplit: M=1 decode, N-columns split across 3 cores --\n");
-    fail += one_case_m(c, 512,  2048, 1, 3, 0);   /* nc=3 colsplit, dma output */
+    fail += one_case_m(c, 512,  2048, 1, 3, 1);   /* nc=3 colsplit (cacheable; multi-core dma is ZC-OUT-unsafe) */
     fail += one_case_m(c, 512,  2048, 1, 3, 1);   /* nc=3 colsplit, cacheable output */
     fail += one_case_m(c, 2048, 4096, 1, 3, 1);   /* bigger K/N */
     fail += one_case_m(c, 3072, 8192, 1, 3, 1);   /* N=nmax, Sn==1 */
@@ -107,6 +107,11 @@ int main(void) {
     fail += one_case_m(c, 2048, 4096, 8,   3, 1);   /* M=8  (cap=128 => 1 M-tile/core) */
     fail += one_case_m(c, 2048, 4096, 64,  3, 1);   /* M=64 (cap=128 => 1 M-tile/core) */
     fail += one_case_m(c, 4096, 2048, 128, 3, 1);   /* M=128 (cap=64 => 2 M-tiles/core within the colsplit) */
+    /* P3: wide-N colsplit (Sn>1, M=1) — each core's column range spans N-slices (ffn_gate/up decode shape). */
+    printf("-- P3 colsplit: wide-N (Sn>1) M=1 decode, columns span slices across cores --\n");
+    fail += one_case_m(c, 2048, 16384, 1, 3, 1);   /* Sn=2, nc=3 (cores span the slice boundary) */
+    fail += one_case_m(c, 3584, 18944, 1, 3, 1);   /* Sn=3, ffn_gate/up-like */
+    fail += one_case_m(c, 2048, 24576, 1, 3, 1);   /* Sn=3 (cacheable; multi-core dma is ZC-OUT-unsafe) */
     ork_npu_free(c);
     if (fail) { printf("ORK_DYN_NTILE_TEST: FAIL (%d cases)\n", fail); return 1; }
     printf("ORK_DYN_NTILE_TEST: PASS\n");
