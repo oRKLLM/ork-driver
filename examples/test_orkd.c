@@ -59,6 +59,8 @@ int main(void){
     bad |= one(c, 8,  128, 64);    /* small prefill */
     bad |= one(c, 4,  256, 32);
     bad |= one(c, 16, 512, 64);    /* multi-tile */
+    bad |= one(c, 128, 512, 64);   /* big-M: exercises the row-slice quantum (>64) under contention */
+    bad |= one(c, 256, 512, 64);
     orkd_disconnect(c);
     printf("test_orkd: %s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
