@@ -31,4 +31,16 @@ uint32_t orkd_client_id(orkd_conn *c);
 /* NPU core count reported by the daemon in WELCOME (RK3588 = 3; 0 if the daemon's NPU init failed or NULL). */
 uint32_t orkd_soc_cores(orkd_conn *c);
 
+/* ---- submit RPC (#2b-1: int8, socket-transfer; dma-buf zero-copy is #2b-2) --------------------------------
+ * Synchronous request/reply over the connection; the daemon serializes all clients' runs onto the one NPU. */
+
+/* Pack an int8 weight B[K,N] resident in the daemon. Returns a weight id (>0) or 0 on failure. */
+uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B);
+
+/* Run int8 A[M,K] x weight -> C[M,N] (int32), computed on the daemon's NPU. 0 = ok, <0 = error. */
+int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+
+/* Free a resident weight (also freed automatically when the client disconnects). 0 = ok, <0 = error. */
+int orkd_free_weight(orkd_conn *c, uint64_t weight_id);
+
 #endif /* ORKD_CLIENT_H */

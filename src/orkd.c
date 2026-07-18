@@ -67,7 +67,68 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
     send_msg(fd, ORKD_ERROR, tag, &e, sizeof e);
 }
 
-struct client { int fd; int hello; uint32_t id; };
+#define ORKD_MAX_WEIGHTS 64
+#define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
+
+struct cweight { uint64_t id; ork_w *w; int K, N; };
+struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; };
+
+/* drain n bytes into the void — keeps the stream in sync when a request can't be serviced */
+static int drain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > sizeof b ? sizeof b : n; if (readn(fd, b, k) <= 0) return -1; n -= k; } return 0; }
+
+/* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
+ * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
+ * so a RUN in flight never puts orkd in D-state -> orkd stays SIGTERM-clean and never blocks system shutdown. */
+static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_pack pk;
+    if (readn(cl->fd, &pk, sizeof pk) <= 0) return -1;
+    if (pk.bytes == 0 || pk.bytes > ORKD_MAX_BYTES){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EPROTO, "bad pack size"); return 0; }
+    if (pk.dtype != ORKD_DT_I8){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_ENOSYS, "only int8 (#2b-1)"); return 0; }
+    int8_t *wbuf = malloc(pk.bytes);
+    if (!wbuf){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EOOM, "pack alloc"); return 0; }
+    if (readn(cl->fd, wbuf, pk.bytes) <= 0){ free(wbuf); return -1; }
+    ork_w *w = ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
+    free(wbuf);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh);
+    if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)pk.K, (int)pk.N }; }
+    else { if (w) ork_mm_free(npu, w); hh.rc = -1; }
+    send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);
+    return 0;
+}
+static int handle_run(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_run rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0) return -1;
+    struct cweight *cw = NULL;
+    for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == rq.weight_id){ cw = &cl->wt[i]; break; }
+    if (rq.abytes > ORKD_MAX_BYTES){ drain(cl->fd, rq.abytes); send_error(cl->fd, tag, ORKD_EPROTO, "bad A size"); return 0; }
+    int8_t *A = malloc(rq.abytes ? rq.abytes : 1);
+    if (!A){ drain(cl->fd, rq.abytes); send_error(cl->fd, tag, ORKD_EOOM, "A alloc"); return 0; }
+    if (rq.abytes && readn(cl->fd, A, rq.abytes) <= 0){ free(A); return -1; }
+    if (!cw || rq.abytes != (uint32_t)((size_t)rq.M * cw->K)){ free(A); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "A size mismatch" : "unknown weight"); return 0; }
+    size_t cn = (size_t)rq.M * cw->N;
+    int32_t *C = malloc(cn * 4);
+    if (!C){ free(A); send_error(cl->fd, tag, ORKD_EOOM, "C alloc"); return 0; }
+    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, A, C);   /* serialized: single daemon = single NPU stream */
+    free(A);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
+    struct orkd_hdr rh = { ORKD_RUN_OK, (uint32_t)(sizeof hh + (rc == 0 ? cn * 4 : 0)), tag };   /* C payload only on success */
+    if (writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh) || (rc == 0 && writen(cl->fd, C, cn * 4))){ free(C); return -1; }
+    free(C);
+    return 0;
+}
+static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_handle req;
+    if (readn(cl->fd, &req, sizeof req) <= 0) return -1;
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = req.id; hh.rc = -1;
+    for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == req.id){ ork_mm_free(npu, cl->wt[i].w); cl->wt[i] = cl->wt[--cl->nw]; hh.rc = 0; break; }
+    send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);   /* PACK_OK = generic handle-op ack */
+    return 0;
+}
+/* free all of a client's resident weights on BYE / socket-EOF — the leak-safe reclaim (a crashed client can't leak) */
+static void client_reclaim(struct client *cl, ork_npu *npu){
+    for (int i = 0; i < cl->nw; i++) ork_mm_free(npu, cl->wt[i].w);
+    cl->nw = 0;
+}
 
 /* Detach so an auto-spawned orkd outlives the client that fork+exec'd it: double-fork + setsid (reparent to
  * init, no controlling terminal), stdio -> /dev/null + stderr -> <runtime>/orkd.log. The intermediate
@@ -149,7 +210,7 @@ int main(void){
         if (pfd[0].revents & POLLIN){          /* new connection */
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0){
-                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; nc++; }
+                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; nc++; }
                 else { send_error(cfd, 0, ORKD_EOOM, "too many clients"); close(cfd); }
             }
         }
@@ -159,30 +220,27 @@ int main(void){
             struct orkd_hdr h;
             int rr = readn(cl[i].fd, &h, sizeof h);
             if (rr <= 0){ drop = 1; }          /* EOF (incl. abrupt client death) or error */
-            else {
-                char pay[512]; uint32_t plen = h.len > sizeof pay ? (uint32_t)sizeof pay : h.len;
-                if (h.len && readn(cl[i].fd, pay, plen) <= 0){ drop = 1; }
-                else switch (h.type){
-                    case ORKD_HELLO: {
-                        struct orkd_welcome w; memset(&w, 0, sizeof w);
-                        w.proto = ORKD_PROTO_VERSION; w.client_id = cl[i].id = next_id++;
-                        w.soc_cores = (uint32_t)cores;
-                        if (!cl[i].hello){ cl[i].hello = 1; refs++; }
-                        send_msg(cl[i].fd, ORKD_WELCOME, h.tag, &w, sizeof w);
-                        break;
-                    }
-                    case ORKD_PING: send_msg(cl[i].fd, ORKD_PONG, h.tag, NULL, 0); break;
-                    case ORKD_BYE:  drop = 1; break;
-                    case ORKD_PACK: case ORKD_RUN: case ORKD_FREE:
-                        send_error(cl[i].fd, h.tag, ORKD_ENOSYS, "NPU path not wired yet");
-                        break;
-                    default:
-                        send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message");
-                        break;
+            else switch (h.type){
+                case ORKD_HELLO: {
+                    struct orkd_hello he;
+                    if (readn(cl[i].fd, &he, sizeof he) <= 0){ drop = 1; break; }
+                    struct orkd_welcome w; memset(&w, 0, sizeof w);
+                    w.proto = ORKD_PROTO_VERSION; w.client_id = cl[i].id = next_id++;
+                    w.soc_cores = (uint32_t)cores;
+                    if (!cl[i].hello){ cl[i].hello = 1; refs++; }
+                    send_msg(cl[i].fd, ORKD_WELCOME, h.tag, &w, sizeof w);
+                    break;
                 }
+                case ORKD_PING: send_msg(cl[i].fd, ORKD_PONG, h.tag, NULL, 0); break;
+                case ORKD_BYE:  drop = 1; break;
+                case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }
             if (drop){
                 if (cl[i].hello && refs) refs--;
+                client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
                 close(cl[i].fd);
                 cl[i] = cl[nc-1]; nc--; i--;   /* compact */
                 if (refs == 0) idle_since = now_ms();

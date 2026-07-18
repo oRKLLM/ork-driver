@@ -103,3 +103,56 @@ void orkd_disconnect(orkd_conn *c){
 
 uint32_t orkd_client_id(orkd_conn *c){ return c ? c->client_id : 0; }
 uint32_t orkd_soc_cores(orkd_conn *c){ return c ? c->soc_cores : 0; }
+
+/* ---- submit RPC (#2b-1) ---- */
+static void cdrain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > sizeof b ? sizeof b : n; if (rn(fd, b, k) <= 0) return; n -= k; } }
+
+uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
+    if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
+    uint32_t bytes = (uint32_t)((size_t)K * N);
+    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I8; pk.bytes = bytes;
+    struct orkd_hdr h = { ORKD_PACK, (uint32_t)(sizeof pk + bytes), 3 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &pk, sizeof pk) || wn(c->fd, B, bytes)) return 0;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return 0;
+    if (rh.type != ORKD_PACK_OK){ if (rh.len) cdrain(c->fd, rh.len); return 0; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return 0;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc == 0 ? hh.id : 0;
+}
+
+int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
+    if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
+    uint32_t abytes = (uint32_t)((size_t)M * K);
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes;
+    struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_RUN_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, cbytes = (size_t)M * N * 4;
+    if (hh.rc == 0){
+        if (rh.len < consumed + cbytes){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        if (rn(c->fd, C, cbytes) <= 0) return -1;
+        consumed += cbytes;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
+int orkd_free_weight(orkd_conn *c, uint64_t weight_id){
+    if (!c || c->fd < 0) return -1;
+    struct orkd_handle req; memset(&req, 0, sizeof req); req.id = weight_id;
+    struct orkd_hdr h = { ORKD_FREE, (uint32_t)sizeof req, 5 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &req, sizeof req)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_PACK_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc;
+}
