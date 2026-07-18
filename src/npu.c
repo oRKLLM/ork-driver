@@ -8947,6 +8947,23 @@ struct ork_dyn_chain {
                                  * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
                                  * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
 };
+/* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
+ * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
+ * mid-submit risks an IOMMU/NPU wedge). A chained handler sets a flag; the poll breaks on it and DRAINS
+ * (bsync + writeback + free) before the process terminates. If the signal arrives while NOT in a doorbell
+ * (idle), the original disposition fires immediately — the handler never swallows SIGTERM. */
+static volatile sig_atomic_t g_ork_term = 0, g_in_doorbell = 0;
+static struct sigaction g_prev_sig[2];   /* [0]=SIGTERM, [1]=SIGINT */
+static void ork_term_handler(int sig) {
+    g_ork_term = 1;
+    if (!g_in_doorbell) { int k = (sig == SIGINT) ? 1 : 0; sigaction(sig, &g_prev_sig[k], NULL); raise(sig); }   /* idle: honor original disposition now */
+    /* in a doorbell poll: just flag — the poll breaks, drains, then re-raises with the original disposition */
+}
+static void ork_install_term(void) {
+    static int done = 0; if (done) return; done = 1;
+    struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = ork_term_handler; sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, &g_prev_sig[0]); sigaction(SIGINT, &sa, &g_prev_sig[1]);
+}
 /* int8 M-tile row cap for a K-reduction width Kred: the 0x1040 schedule holds at most mg_max*64 rows in one
  * regcmd (a bigger tile spills the K-partition and miscomputes). = 64 @ K<=4096, larger as K shrinks. Used to
  * M-tile M>64 into chained programs and as the K-split per-slice defensive cap. */
@@ -8982,6 +8999,7 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
         __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
     return 1; }
 ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    ork_install_term();   /* graceful SIGTERM: make the async poll interruptible */
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;   /* S==1 is valid: a 1-program chain (task_number=1 runs it) */
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1) return NULL;
@@ -9304,6 +9322,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
 }
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
+    ork_install_term();   /* graceful SIGTERM: make the async poll interruptible (covers colsplit + i4 dispatch too) */
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
     /* P3 sub-nmax column-tiling: a single int8 matmul multi-cored by N-column split across cores. base:
      * Sn==1 & K<=4096 & Bf (any M). M=1 also does wide-N (Sn>1, K<=4096, Bf; core's range spans slices) and
@@ -9750,9 +9769,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
     double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
+    g_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on g_ork_term and drains before the process ends */
     int edone[1024]; for (int i = 0; i < h->S; i++) edone[i] = 0;   /* per-entry done cache: stop re-polling (re-civac'ing) a core once it's complete */
     for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
         if (n >= h->S) break;                               /* all tasks, all rows */
+        if (g_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
         /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
          * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
          * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
@@ -9804,7 +9825,12 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
     for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
-    int r = last; free(h); return r; }
+    int r = last; free(h);
+    g_in_doorbell = 0;
+    if (g_ork_term) {   /* a SIGTERM/SIGINT arrived mid-poll: we've drained + written back cleanly — now honor it */
+        sigaction(SIGTERM, &g_prev_sig[0], NULL); sigaction(SIGINT, &g_prev_sig[1], NULL); raise(SIGTERM);
+    }
+    return r; }
 
 /* ============ SUBMIT QUEUE: chunk-pipeline over the dynamic API (the robust wrap) ==================
  * Accumulate matmul tasks, submit them as clean task_number-bounded chunks, and let the NPU run a chunk
