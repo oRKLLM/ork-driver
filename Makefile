@@ -530,6 +530,11 @@ orkd: src/orkd.c src/orkd_proto.h $(COBJ)
 orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
 
+# test_orkd — first orkd client: int8 matmuls THROUGH the daemon, self-validated vs CPU ref. Pure client
+# (links orkd_client, not COBJ). Standalone, NOT in `make test` (would contend with direct-NPU examples).
+test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+
 i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
