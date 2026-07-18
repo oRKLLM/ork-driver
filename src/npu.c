@@ -8675,10 +8675,16 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
      * diagnostics (the forcing function toward the doorbell fix) instead of being masked. Non-routable shapes
      * (M>1, K-split, SDP/silu via ss) still take the chain path below until their gaps (G1..G5) are migrated. */
     if (!ss) {
+        /* P3 (#3): route the FULL non-ss chain — ANY M, not just M==1 — onto the doorbell spine. The M>1 tasks
+         * use the doorbell's scratch+copy-back (M-tiling for M>64); M==1 with a non-resident C also falls back
+         * to scratch there, so no dma_find gate is needed. The pre-checks above already met ork_dyn_begin_mc's
+         * envelope (int8, Sn==1, K%512==0, K<=4096), EXCEPT it needs a full-K Bf for the wide-M (M>64) path — so
+         * the only shape it can't take is a M>64 task on a Sk==1 Bb-only weight (no Bf); leave that on the chain
+         * below. NO legacy fallback for the routed shapes (a miss returns -1 after ork_dyn_end auto-dumps). */
         int routable = 1;
-        for (int i = 0; i < S; i++) if (tasks[i].M != 1 || !dma_find(c, (void*)tasks[i].C)) { routable = 0; break; }
+        for (int i = 0; i < S; i++) if (tasks[i].M > 64 && !tasks[i].w->Bf) { routable = 0; break; }
         if (routable) {
-            ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, 1);   /* single-core doorbell spine */
+            ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, 1);   /* single-core doorbell spine (chain stays single-core) */
             if (!h) return -1;                                     /* rejected/alloc-fail — surface it, no fallback */
             int d = ork_dyn_end(h);                                /* auto-dumps on an incomplete drain */
             return (d == S - 1) ? 0 : -1;                          /* all landed = ok; miss = error (dumped) */
