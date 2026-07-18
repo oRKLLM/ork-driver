@@ -100,6 +100,25 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
 - **P2 — recipe = compile-once into the SRAM table.** Fold `ork_pc`'s compile-once into the wrapper so a fixed
   chain (decode, scan, FFN) compiles once into the SRAM pool and re-runs with only an A-refresh. Add the spin /
   warm / POST entries to the same pool.
+- **END-TO-END BENCH DIAGNOSIS (instrumented, systematic isolation on a clean board).** The ork_bench run
+  produced GARBAGE output (`response: !!!!`). Root-caused by isolation, NOT by guessing:
+  * **Import does NOT hang on a clean board.** The earlier D-state hangs were the DEGRADED post-power-cycle
+    board; with `ORK_IMPORT_TRACE` the import completes (196 weights, 459 chunks). So "the import always
+    works" — no import fix needed. (Efficiency bug found though: the consolidated import over-allocates —
+    each weight rounds up to a >=16MB chunk, so a 1.7B's ~1.8GB of weights import as ~3.6GB, near the 3900MB
+    IOVA cap. Worth fixing via cross-weight chunk sharing; not the garbage.)
+  * **Garbage is NOT the import** — `ORK_NO_IMPORT=1` (bcreate copy-load) gives the SAME garbage.
+  * **Garbage is NOT my colsplit** — `ORK_NO_COLSPLIT=1` (legacy mcworker) gives the SAME garbage.
+  * **Garbage IS the NPU compute** — `ORK_OFF=1` (pure CPU) gives COHERENT output ("...stacked layers of
+    self-attention and feed-forward networks. The transformer architecture processes...").
+  => The garbage is a deeper ggml-ork NPU-path / 0.7.x backend issue (act-quant or buffer layout), upstream
+  of P3/SIGTERM and likely in the WIP backend being built against. `make test`'s int8 goldens pass (the
+  ork-driver matmul CORE is correct), so it's the backend's USE of it. **P3 + SIGTERM are EXONERATED — not
+  the garbage source.** ork-driver 0.7.6 confirmed loaded. A valid NPU tok/s number is blocked on that
+  separate backend bug (a focused follow-up with the isolation data above), NOT on this branch's code.
+  BOARD-OPS: graceful reboots don't restore sshd (pings, ssh-refused ~12min) -> HA "Rock 5B Plug" power-cycle
+  recovers cleanly (no SPI corruption, still pings). Power-cycles also left system DBus down (systemctl flaky);
+  a user-issued reboot restored a clean board where the bench ran without wedging.
 - **P3 STARTED — run_multicore M=1 int8 DECODE migrated onto the spine.** The blocker was a
   parallelization-model mismatch (run_multicore splits one matmul's N-columns SUB-nmax across cores; the
   doorbell partitioned whole ops). Resolved by adding `ork_dyn_begin_colsplit_m1` (sub-nmax N-column tiling
