@@ -520,6 +520,12 @@ mode_probe: tools/mode_probe.c $(COBJ)
 chain_xition_probe: tools/chain_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# orkd — the NPU daemon (single owner + submit queue for many client processes). First increment is the
+# lifecycle skeleton (flock single-instance, accept loop, ref-count, idle-reap); NPU stubbed, so it needs no
+# COBJ yet. When the submit path is wired it will link $(COBJ). Not in `all`/`test` until it has a client.
+orkd: src/orkd.c src/orkd_proto.h
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
+
 i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
