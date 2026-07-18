@@ -3947,6 +3947,11 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * ork_dyn_begin_colsplit_m1). Decode is dispatch-bound, so NONBLOCK helps, and this consolidates the
      * decode submit onto the spine (no legacy fallback — git is the recovery). Eligible: int8, Sn==1,
      * K<=4096 with full-K Bf, nc>1. Output is bit-exact vs the mcworker N-split (same t0=i*NN/nc columns). */
+    /* Only M=1 DECODE is routed onto the doorbell: colsplit is neutral for M<=64 but REGRESSES large-M
+     * prefill (M=256 measured 2.8x slower — the NONBLOCK single-thread poll doesn't parallelize heavy compute
+     * like mcworker's 3 blocking threads; likely the busy-poll civac contends with the large NPU writeback).
+     * The M>1 colsplit capability is built + validated (ork_dyn_begin_colsplit) but stays off the prefill path
+     * until the poll is optimized. Decode is dispatch-bound so it wins/neutral there. */
     if(dt==DT_I8 && M==1 && w->Sn==1 && w->K<=4096 && w->Bf && nc>1){
         ork_mm_task_i8 t = { .w=w, .M=1, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
