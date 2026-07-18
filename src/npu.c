@@ -9339,13 +9339,25 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
         subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np};
     }
-    for (int i = 0; i < nc; i++) if (Pc[i]) { int Mx = h->oM[i], Nx = h->nout[i]/Mx;   /* seed each row's last col (per-core scratch) */
-        for (int m = 0; m < Mx; m++) { volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
+    /* HARDENED (decode/stream, M<=64): this per-core scratch is reused across doorbell ops interleaved in the
+     * decode loop, which can leave it dirty so a stale CPU line evicts over the NPU write and resurrects a
+     * mid-row SENT. Harden with a FULL-surface SENT seed + the ALWAYS-clean bsync below (flushes it to DRAM so
+     * nothing evicts over the NPU write); done_i then trusts each row's last col (row-major, last-col-last —
+     * same as begin_mc's plain-int8 path). Cheap at small M. PREFILL (M>64, large output) is not interleaved,
+     * so keep the original last-col seed + cold-only clean — the per-op full-buffer flush tripped test_speed's
+     * latency floor at M=512. Bit-exact either way; this only changes the completion barrier, not the math. */
+    int hardened = (M <= 64);
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
+        else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
+            volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        if (!c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* cold fresh-scratch clean-before */
+        if (hardened || !c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: ALWAYS for the
+            * interleaved decode/stream regime (M<=64 — a shared-scratch dirty line would evict over the NPU write and
+            * resurrect a mid-row SENT); cold-only for prefill (M>64, not interleaved — avoids the per-op full flush). */
         c->mwarm[i] = 1;
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], w->domain);
     }
@@ -9569,7 +9581,14 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); } } while (0)
     int cold = 0; for (int i = 0; i < nc; i++) if (Pc[i] && !c->mwarm[i]) cold = 1;
-    if (cold) {
+    /* INTERLEAVE-SAFE (decode/stream, all tasks M<=64): this output surface (per-core scratch or resident C) is
+     * reused across doorbell ops interleaved in the decode loop (e.g. run_stream groups between single run_i8),
+     * which can leave a dirty CPU line that evicts over the NPU write and resurrects a mid/last-col SENT
+     * (test_stream_interleave g/u). Force the full-surface clean-before EVERY round for that regime — same as the
+     * cold path. Prefill (M>64) is not interleaved and keeps cold-only (the per-op full clean costs latency at
+     * large M — mirrors colsplit's M<=64 hardening gate). */
+    int allsmall = 1; for (int i = 0; i < S; i++) if (tasks[i].M > 64) { allsmall = 0; break; }
+    if (cold || allsmall) {
         /* COLD FRESH-BUFFER COHERENCY (the real cold bug — NOT a pipeline-warm issue; blocking vs NONBLOCK is
          * irrelevant). The first cold call writes into a FRESHLY bcreate'd output scratch (c->mcc[i], or a
          * fresh caller DMA buffer): its CPU cache holds dirty/uninitialized lines. The NPU writes the result
@@ -9818,6 +9837,13 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
         if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
     int last = ork_dyn_progress(h);
+    if (getenv("ORK_DYN_TRACE")) { double _el = ork_now_us() - t0; int _nd = 0; for (int i = 0; i < h->S; i++) _nd += edone[i];
+        fprintf(stderr, "[dyn_end] S=%d mc=%d done=%d/%d last=%d elapsed=%.0fus %s\n", h->S, h->mc, _nd, h->S, last, _el,
+            _nd < h->S ? "INCOMPLETE(timeout/term)" : "all-done");
+        for (int i = 0; i < h->S; i++) if (!edone[i]) { int Me = h->oM[i]?h->oM[i]:1, no = h->nout[i]?h->nout[i]:h->N, Nx = no/Me;
+            fprintf(stderr, "  task%d NOT-done: outptr[Nx-1]=%d (SENT=%d) nout=%d oSk=%d ostride=%d dst=%p\n",
+                i, h->outptr[i][Nx-1], (int)ORK_DYN_SENT, no, h->oSk[i], h->ostride[i], (void*)h->dst[i]); }
+        fflush(stderr); }
     /* AUTO CORE-DUMP on a real miss: a plain chain that drained INCOMPLETE (not all S landed) is a doorbell
      * dispatch/completion failure — capture the stuck-descriptor post-mortem before the state is lost. Skip
      * intentionally-truncated chains (spin_end = bulk-terminated by design). This is the forcing function:
@@ -10346,7 +10372,6 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
     if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
     const int mrc_cap = 65536 / (REGCMD_I8_N * 4);
-    size_t maxMK = 0, maxMN4 = 0;
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I8 || tasks[i].M <= 0) return -2;
@@ -10356,38 +10381,20 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // to per-task run_i8 (which K-splits) for other K. Return -3 so it's distinguishable.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
         if ((tasks[i].M + chain_fullk_mcap_i8(c, w->K) - 1) / chain_fullk_mcap_i8(c, w->K) > mrc_cap) return -2;
-        size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 4;
-        if (mk > maxMK) maxMK = mk; if (mn > maxMN4) maxMN4 = mn;
     }
-    int fd = c->fd;
-    // RESET is only for ENTERING int8 from fp16/int4/cold — switching among int8 markers (single-core
-    // DT_I8 <-> chain/stream 3) needs none (see ORK_I8_LIVE), so decode can interleave run_i8 singletons
-    // with run_stream groups without a ~107ms soft-reset per matmul. Freshly-allocated per-core output
-    // buffers are primed deterministically by stream_worker's reps=2-on-first-use (mwarm[i]); a reset
-    // here clears every core's mwarm so they re-prime.
-    ork_npu_enter(c, 3, XP_STREAM_I8, OCK_SW);
-    // Core count is caller-configurable up to the SoC max: budget() honors ork_npu_set_core_budget()
-    // and the ORK_NPU_MC env (both capped to soc->cores). Capped to S (no more cores than tasks).
+    /* P3 SPINE MIGRATION (submit consolidation). The accepted shapes (Sn==1, K%512==0, K<=4096, Bf) are
+     * exactly the doorbell's multi-core int8 envelope, so route the S independent tasks onto ONE NONBLOCK
+     * doorbell submit (ork_dyn_begin_mc, block-distributed across cores) instead of the blocking round-robin
+     * stream_worker. NO legacy fallback — a doorbell miss returns -1 (ork_dyn_end auto-dumps the stuck
+     * descriptor). ork_dyn_begin_mc owns the mode-enter, per-core scratch sizing, and the per-task copy-back
+     * to each tasks[i].C. (Interleave-safe: the colsplit/mc scratch now full-surface seeds+polls — see
+     * colsplit's full-surface SENT seed + always-clean bsync — so a doorbell stream group no longer leaves the
+     * shared per-core scratch dirty in a way that races an interleaved single run_i8.) */
     int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
-    if (mc_ensure(c, nc)) return -1;
-    for (int i = 0; i < nc; i++) {   /* size per-core staging (A) + output (C) buffers to the largest task */
-        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; }
-        if (c->mccsz[i] < maxMN4) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN4, 0x403, c->dom_active); c->mccsz[i] = maxMN4; if (!c->mcc[i].cpu) return -1; c->mwarm[i] = 0; /* fresh output buffer -> re-prime */ }
-    }
-    int rc = 0;
-    npu_pool_ensure(c);
-    struct streamw sw[ORK_MAXCORE];
-    int ctr = 0;   /* single pass: stream_worker primes each fresh per-core buffer via reps=2-on-first-use */
-    for (int i = 0; i < nc; i++) sw[i] = (struct streamw){c, i, S, tasks, &ctr, 0};
-    pthread_mutex_lock(&c->pmu);
-    c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker; c->pjob_stride = sizeof(struct streamw);
-    c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-    pthread_mutex_unlock(&c->pmu);
-    stream_worker(&sw[0]);                            /* core 0 on the calling thread */
-    pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
-    for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
-    c->warmed = 1;
-    return rc;
+    ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);
+    if (!h) return -1;
+    int d = ork_dyn_end(h);
+    return (d == S - 1) ? 0 : -1;
 }
 
 /* ---- fp16 ROUND-ROBIN STREAM (ork_mm_run_stream_f16) — fp16 twin of the int8 stream above ----

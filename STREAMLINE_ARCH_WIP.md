@@ -300,3 +300,73 @@ Key decoupling: `task_number` (≤13107 descriptors, the spin/step budget) is IN
   production fallback (production has none — git is the recovery).
 - Wiki (`Exp-2026-07-16` doorbell page) is deliberately deferred until the architecture reaches desired state,
   then corrected in one pass (currently mis-files the reserve/spin wrap as a "negative result").
+
+---
+## 2026-07-17 — orkpack-reload garbage: ROOT-CAUSED to backend int8 `bscale` (read/use side)
+
+**Symptom:** `ork_bench` on a persisted `.orkpack` emits garbage tokens ("!!!!"); packing fresh in-memory is coherent.
+
+**Systematic isolation (all on RK3588, real bench, same build):**
+- Pack fresh in-memory → run: **COHERENT** ("attention and feed-forward…").
+- Dump → reload `.orkpack` → run: **GARBAGE** — even for `/tmp/q3p.orkpack` written by the SAME build (`bem21ms6k` pack) and read by the SAME build (`60917` load). Not staleness, not build-mismatch.
+- RUN_TRACE: load-run RUN#0 (N=2048) **and** RUN#1 (N=1024) int32 C are **BYTE-IDENTICAL** to the pack-run's (`[-7565 -923 -2569 -6095]` / `[98 -6291 3387 1564]`), with identical A[int8]. ⇒ int8 **tiles round-trip perfectly** (two different weights) and activation scale is identical. Only the post-matmul per-channel **`bscale`** dequant can differ → it's `bscale`.
+- Non-invasive file inspection (`tools`-style `opk_inspect.c`): the `.orkpack` FILE is **written perfectly** — all 196 int8 entries have `bscale_off==blob_off+blob_size` (MATCH), `bscale_n==N` (MATCH), sane `bscale` floats (0.0004–0.0016 = mx/127). ⇒ **write is correct; bug is read/use side.**
+- Both direct int8 `bscale` reads (ggml-ork.cpp:1216 wcache-miss, :3016 MoE-slot) read from the correct `persist_map + bscale_off`. `ork_w_bscale` uses (1209, 3015) are I4-only. Spool is OFF (needs `ORK_STREAM_POOL=1`) and `ork_spool_install` doesn't touch bscale. Every STATIC path checks out ⇒ the wrong bscale is a **runtime association/use** issue not visible by reading.
+
+**EXONERATED:** streamline-arch P3/colsplit/SIGTERM (int32 C byte-identical with all of it in the path; garbage reproduces identically). Ruled out: Bf-rebuild (`ORK_NO_BF` still garbage), import-vs-copy (`ORK_NO_IMPORT` still garbage), tiles, staleness, build-mismatch, MoE/spool.
+
+**NEXT (pinpoint):** 2-line printf in ggml-ork.cpp int8 dequant (~:1863) logging the actually-used `bscale[0..3]` for `blk.0.attn_q.weight` vs the file's known `[0.000402 0.000654 0.000742 0.000500]`. This is the fork WIP backend → coordinate before editing. Bench is runnable coherently by packing fresh (no persist reuse).
+
+---
+## 2026-07-17 — RESOLVED: orkpack-reload garbage was the FFN gate/up FUSION, not bscale
+
+**Real root cause (my earlier "bscale" call was wrong — bscale/tiles both round-trip perfectly):**
+The garbage was **M>1 (prefill) only** on the load path (P=1/decode was byte-identical pack-vs-load). At M>=2 the
+backend fuses gate+up into ONE N=12288 matmul (`ggml_backend_ork_mul_mat_group_i8`), keyed in the wcache by
+`g[0]->src[0]->data` = the **gate weight's data ptr**. On an .orkpack LOAD the **standalone gate weight (N=6144)
+is already resident under that same ptr**, so the fusion's `wcache.find(key)` HIT it and ran the N-wide gate as
+if it were the N*2 fused weight — writing only `ci[0:6144]` and leaving `up`'s `ci[6144:12288]` stale → wrong
+`silu(gate)*up` → garbage FFN → garbage tokens. Confirmed live: `[GRP] ng=2 Ntot=12288 oldkeyfind=HIT cachedN=6144`.
+At pack the standalone gate is not resident during prefill (packed at decode), so it built the fused fresh → coherent.
+
+Building the fused fresh at load is also (a) SLOW (rebuild from GGUF source = a pack-miss cost, 1.41 t/s) and
+(b) IOVA-overflowing (extra residence on top of the fully-loaded standalone weights on a single-domain 1.7B).
+
+**FIX (minimal, 1 line): skip the group fusion when serving a persisted .orkpack** (`persist_mode==1`) — run the
+already-resident standalone gate/up/q/k/v per-node (fast, fits, bit-exact; the attn matmuls were byte-identical
+pack-vs-load, proving the single-node path is correct on loaded weights). Fusion stays ON for pack/no-persist.
+Location: ggml-ork.cpp grouping condition (`if (fuse && ctx->persist_mode != 1 && ...)`). This is the **fork WIP
+backend** (working-tree edit, uncommitted — user owns the commit).
+
+**VALIDATED coherent + fast, loading /tmp/q3p.orkpack (P=128): prefill 82.31 t/s, decode 2.54 t/s** ("...attention
+and feed-forward networks. The transformer architecture processes sequences of tokens through stacked layers...").
+
+**FOLLOW-UP (restore the +11-17% prefill fusion win on the load path):** PERSIST the fused gate_up weight in the
+.orkpack (one N=12288 entry replacing the separate gate/up), so load gets it fast + resident without rebuild or
+extra memory. Until then the load path runs unfused (net-neutral vs the broken collision it replaced).
+
+---
+## 2026-07-18 — P3: run_stream_i8 migrated onto the spine + doorbell multi-core hardening
+
+**run_stream_i8 → ork_dyn_begin_mc** (NONBLOCK doorbell, S tasks block-distributed across cores) — replaces the
+blocking round-robin stream_worker. Shape guards (-2/-3) preserved; no legacy fallback.
+
+**Doorbell multi-core INTERLEAVE-SAFE hardening (the prerequisite).** Migrating run_stream exposed a coherency
+race: with a doorbell stream group interleaved with single run_i8 ops in a tight loop (test_stream_interleave),
+the shared per-core scratch / resident C is reused fast enough that a stale/dirty CPU line evicts over the NPU
+write and resurrects a last/mid-col SENT (last-col poll then copies it back). The blocking stream_worker never
+hit it (its bsync was a hard barrier). Fix, gated on the decode/stream regime (all tasks M<=64):
+- **colsplit** (ork_dyn_begin_colsplit): full-surface SENT seed + ALWAYS clean-before bsync (was cold-only).
+- **begin_mc** S>1: force the cold-path full-surface clean EVERY round (`cold || allsmall`), not just cold.
+- Prefill (M>64) keeps the original last-col seed + cold-only clean — a per-op full flush tripped test_speed's
+  latency floor (359ms full-surface POLL, or ~17% from an unconditional full clean). last-col-per-row poll kept
+  (row-major last-col-last writeback; coherency was the bug, not write-order).
+- +ORK_DYN_TRACE (gated) in ork_dyn_end: per-call done/timeout + elapsed + not-done task last-col.
+
+**VALIDATED (clean single runs — NOT contended):** test_stream_interleave 5/5 bit-exact; test_speed 1.73x
+(prefill unaffected); full `make test` ALL TESTS PASSED + sbc_attest refreshed.
+
+**BOARD-OPS LESSON:** a poll TIMING OUT != the make test finished (nohup keeps it running). Two concurrent
+`make test` runs contended the single-stream NPU -> soft-reset/60s job timeouts (the "o/g-u/q-v whack-a-mole"
+was CONTENTION, not code). Recovered via graceful `sudo reboot` (~10s). ALWAYS `pgrep` the prior make test
+gone before launching another.
