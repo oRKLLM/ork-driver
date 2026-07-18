@@ -18,27 +18,33 @@ static inline uint64_t orkd_fnv(const void *p, size_t n){
     return h;
 }
 
-/* Send one orkd_hdr (16B — atomic on a stream socket at this size) with an optional SCM_RIGHTS fd. 0/-1. */
-static inline int orkd_send_hdr_fd(int sock, const struct orkd_hdr *h, int fd){
+#define ORKD_MAX_FDS 4   /* per-message SCM_RIGHTS fd cap (A, C, ...) */
+
+/* Send one orkd_hdr (16B — atomic on a stream socket) with 0..nfd SCM_RIGHTS fds. 0/-1. */
+static inline int orkd_send_hdr_fds(int sock, const struct orkd_hdr *h, const int *fds, int nfd){
+    if (nfd > ORKD_MAX_FDS) nfd = ORKD_MAX_FDS;
     struct iovec iov; iov.iov_base = (void *)h; iov.iov_len = sizeof *h;
-    char cbuf[CMSG_SPACE(sizeof(int))];
+    char cbuf[CMSG_SPACE(sizeof(int) * ORKD_MAX_FDS)];
     struct msghdr msg; memset(&msg, 0, sizeof msg); msg.msg_iov = &iov; msg.msg_iovlen = 1;
-    if (fd >= 0){
-        msg.msg_control = cbuf; msg.msg_controllen = sizeof cbuf;
+    if (nfd > 0){
+        msg.msg_control = cbuf; msg.msg_controllen = CMSG_SPACE(sizeof(int) * nfd);
         struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
-        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(c), &fd, sizeof fd);
+        c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS; c->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
+        memcpy(CMSG_DATA(c), fds, sizeof(int) * nfd);
     }
     ssize_t r; while ((r = sendmsg(sock, &msg, 0)) < 0 && errno == EINTR){}
     return r == (ssize_t)sizeof *h ? 0 : -1;
 }
+static inline int orkd_send_hdr_fd(int sock, const struct orkd_hdr *h, int fd){
+    return orkd_send_hdr_fds(sock, h, &fd, fd >= 0 ? 1 : 0);
+}
 
-/* recvmsg exactly one orkd_hdr, capturing an optional SCM_RIGHTS fd into *fdout (-1 if none). 1 ok / 0 EOF / -1. */
-static inline int orkd_recv_hdr_fd(int sock, struct orkd_hdr *h, int *fdout){
-    *fdout = -1;
+/* recvmsg exactly one orkd_hdr, capturing up to maxfd SCM_RIGHTS fds into fds[]; *nfd = count. 1 ok / 0 EOF / -1. */
+static inline int orkd_recv_hdr_fds(int sock, struct orkd_hdr *h, int *fds, int maxfd, int *nfd){
+    *nfd = 0;
     char *p = (char *)h; size_t need = sizeof *h, got = 0;
     while (got < need){
-        char cbuf[CMSG_SPACE(sizeof(int))];
+        char cbuf[CMSG_SPACE(sizeof(int) * ORKD_MAX_FDS)];
         struct iovec iov; iov.iov_base = p + got; iov.iov_len = need - got;
         struct msghdr msg; memset(&msg, 0, sizeof msg);
         msg.msg_iov = &iov; msg.msg_iovlen = 1; msg.msg_control = cbuf; msg.msg_controllen = sizeof cbuf;
@@ -47,7 +53,8 @@ static inline int orkd_recv_hdr_fd(int sock, struct orkd_hdr *h, int *fdout){
         if (r < 0){ if (errno == EINTR) continue; return -1; }
         for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c))
             if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_RIGHTS){
-                int f; memcpy(&f, CMSG_DATA(c), sizeof f); if (*fdout >= 0) close(*fdout); *fdout = f;
+                int n = (int)((c->cmsg_len - CMSG_LEN(0)) / sizeof(int));
+                for (int i = 0; i < n; i++){ int f; memcpy(&f, CMSG_DATA(c) + i * sizeof(int), sizeof f); if (*nfd < maxfd) fds[(*nfd)++] = f; else close(f); }
             }
         got += (size_t)r;
     }

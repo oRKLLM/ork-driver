@@ -45,6 +45,10 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
  * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */
 int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* Full zero-copy: A read AND C written by reference (both shared dma-bufs; no A/C bytes over the socket).
+ * Single-core on the daemon (output zero-copy is not multi-core-safe). 0 = ok, <0 = error (-2 = no dma-heap). */
+int orkd_run_i8_zc2(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+
 /* Free a resident weight (also freed automatically when the client disconnects). 0 = ok, <0 = error. */
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id);
 

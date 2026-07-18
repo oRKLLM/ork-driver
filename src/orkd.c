@@ -126,6 +126,30 @@ static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
     send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);   /* PACK_OK = generic handle-op ack */
     return 0;
 }
+/* #2b-2 step 3b: FULL zero-copy RUN — A read AND C written by reference. Client shares A+C dma-bufs (two fds
+ * via SCM_RIGHTS); orkd imports both, runs with C written IN PLACE (ORK_ZC_OUT, set at startup → dma_find(C)
+ * hit) so NO C byte-transfer either way. Forced SINGLE-CORE: output zero-copy is unsafe under concurrent
+ * multi-core (the per-core coherency bsyncs don't serialize with the NPU writes — AGENTS.md ZC-OUT caveat).
+ * Client invalidates C (DMA_BUF_SYNC START|READ) before reading. Reply carries no C payload. */
+static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, uint64_t tag){
+    struct orkd_run rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0){ if (a_fd >= 0) close(a_fd); if (c_fd >= 0) close(c_fd); return -1; }
+    struct cweight *cw = NULL;
+    for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == rq.weight_id){ cw = &cl->wt[i]; break; }
+    if (!cw || a_fd < 0 || c_fd < 0){ if (a_fd >= 0) close(a_fd); if (c_fd >= 0) close(c_fd); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "need A+C fds" : "unknown weight"); return 0; }
+    size_t alen = (size_t)rq.M * cw->K, cn = (size_t)rq.M * cw->N;
+    void *A = ork_dma_import_fd(npu, a_fd, alen);
+    if (!A){ close(a_fd); close(c_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
+    void *C = ork_dma_import_fd(npu, c_fd, cn * 4);
+    if (!C){ ork_dma_free(npu, A); close(c_fd); send_error(cl->fd, tag, ORKD_EOOM, "import C"); return 0; }
+    ork_npu_set_core_budget(npu, 1);                 /* ZC-OUT is single-core-safe only */
+    int rc = ork_mm_run_i8(npu, cw->w, (int)rq.M, (const int8_t *)A, (int32_t *)C);   /* A read + C written zero-copy */
+    ork_npu_set_core_budget(npu, 0);                 /* restore: all cores */
+    ork_dma_free(npu, A); ork_dma_free(npu, C);      /* closes a_fd, c_fd */
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.weight_id; hh.rc = rc;
+    send_msg(cl->fd, ORKD_RUN_OK, tag, &hh, sizeof hh);   /* NO C payload — C is in the client's shared buffer */
+    return 0;
+}
 /* #2b-2 step 3: ZERO-COPY RUN (input A by reference). The client shares A as a dma-buf fd (SCM_RIGHTS);
  * orkd PRIME-imports it into the NPU's IOMMU domain and ork_mm_run_i8 reads A IN PLACE (dma_find hit =
  * validated input zero-copy) — no A byte-transfer over the socket. C is still returned over the socket here
@@ -227,6 +251,9 @@ int main(void){
     if (bind(lfd, (struct sockaddr*)&sa, sizeof sa) < 0){ perror("orkd: bind"); return 1; }
     if (listen(lfd, 16) < 0){ perror("orkd: listen"); return 1; }
 
+    setenv("ORK_ZC_OUT", "1", 1);              /* enable output zero-copy: a run whose C is an imported dma-buf
+                                                * (dma_find hit) writes it in place; malloc'd C (socket runs) is
+                                                * a dma_find miss -> unaffected. RUN_ZC2 forces single-core (safe). */
     ork_npu *npu = ork_npu_init();             /* orkd OWNS the NPU for its whole lifetime (#2a) */
     int cores = npu ? ork_npu_cores(npu) : 0;
     unsigned idle_ms = orkd_idle_ms();
@@ -266,9 +293,9 @@ int main(void){
         }
         for (int i = 0; i < nc; i++){
             if (!(pfd[i+1].revents & (POLLIN|POLLHUP|POLLERR))) continue;
-            int drop = 0, recvd_fd = -1;
+            int drop = 0, recvd_fds[2] = { -1, -1 }, recvd_nfd = 0;
             struct orkd_hdr h;
-            int rr = orkd_recv_hdr_fd(cl[i].fd, &h, &recvd_fd);   /* recvmsg: captures any SCM_RIGHTS dma-buf fd */
+            int rr = orkd_recv_hdr_fds(cl[i].fd, &h, recvd_fds, 2, &recvd_nfd);   /* recvmsg: captures up to 2 SCM_RIGHTS fds (A,C) */
             if (rr <= 0){ drop = 1; }          /* EOF (incl. abrupt client death) or error */
             else switch (h.type){
                 case ORKD_HELLO: {
@@ -286,11 +313,12 @@ int main(void){
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fd, h.tag) < 0) drop = 1; recvd_fd = -1; break;
-                case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fd, h.tag) < 0) drop = 1; recvd_fd = -1; break;
+                case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
+                case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
+                case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }
-            if (recvd_fd >= 0) close(recvd_fd);   /* stray fd on a non-dmabuf message — don't leak it */
+            for (int f = 0; f < 2; f++) if (recvd_fds[f] >= 0) close(recvd_fds[f]);   /* stray fds not consumed by a handler */
             if (drop){
                 if (cl[i].hello && refs) refs--;
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
