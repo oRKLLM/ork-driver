@@ -370,3 +370,27 @@ hit it (its bsync was a hard barrier). Fix, gated on the decode/stream regime (a
 `make test` runs contended the single-stream NPU -> soft-reset/60s job timeouts (the "o/g-u/q-v whack-a-mole"
 was CONTENTION, not code). Recovered via graceful `sudo reboot` (~10s). ALWAYS `pgrep` the prior make test
 gone before launching another.
+
+---
+## 2026-07-18 (cont.) — doorbell submit-race retry + a BOARD-DEGRADATION lesson
+
+**+ Transient submit-rejection retry (rknpu_submit_ioctl).** The per-op NONBLOCK doorbell can have a submit to
+a core whose PRIOR job hasn't retired (completion IRQ not fired) rejected EINVAL/EBUSY — a GENERAL, pre-existing
+in-suite race (surfaces on ANY doorbell user: run_stream, run_i8 colsplit, fp16 bmm — confirmed at pristine
+2210d84). Fix: on EINVAL/EBUSY, re-issue the same regcmd/task up to 20x with a 50us backoff BEFORE the heavy
+self-heal reset; a retry that lands needs no reset (a reset clears warm -> cold miscompute). General robustness.
+
+**★ BOARD-DEGRADATION LESSON (cost me many cycles).** My contention mistakes (launching a 2nd `make test` while
+a prior one's binaries lingered — a poll timeout != the nohup'd make finished) wedged the NPU repeatedly. After
+enough soft-reset/job-abort churn the NPU DEGRADES: even `test_matmul`/`test_bmm` ALONE start failing errno=22 /
+hanging — and TWO graceful reboots did NOT clear it. A full PLUG POWER-CYCLE (graceful poweroff -> plug off ~12s
+-> on; recovered ~12s, no SPI corruption) DID clear it. On the healthy board, `033f1c2`+retry passes the FULL
+`make test` cleanly (TEST_BMM/STREAM INTERLEAVE/SSD all OK). So the late-session "run_stream is unreliable"
+verdict was largely a DEGRADING BOARD, not the codebase — #1 (run_stream_i8) + #6 (hardening) + retry are solid.
+RULES: (1) before launching `make test`, `pgrep` the prior one is fully GONE (binaries too, not just make);
+(2) if standalone basic tests flake, suspect board degradation -> power-cycle, don't chase the code.
+
+**#2 fp16 stream: still PENDING.** The reroute is fine but the fp16 doorbell K-guard/sched extension had a real
+bug (K=2048 -> sched=0 -> deterministic hang; K>=128 pow2 including 2048 must stay sched=1). Reverted. Redo the
+sched formula (keep sched=1 for the K>=128 shapes the doorbell already handled; sched=0 only for the small-K it
+genuinely needs) + re-validate on a healthy board.

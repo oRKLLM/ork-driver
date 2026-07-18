@@ -684,6 +684,18 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
                 * whether a 2nd NONBLOCK submit QUEUES (returns ~5us) or SERIALIZES (blocks ~compute) on the busy NPU. */
     if (rc < 0) {
         int e = errno;
+        /* TRANSIENT SUBMIT-REJECTION RETRY (before the heavy self-heal reset). The doorbell is per-op NONBLOCK,
+         * so a submit to a core whose PRIOR job has not yet retired (its completion IRQ hasn't fired) is rejected
+         * EINVAL/EBUSY — a GENERAL, pre-existing in-suite race (surfaces on any doorbell user under back-to-back
+         * ops: run_stream, run_i8 colsplit, fp16 bmm). The prior job retires within microseconds, so re-issue the
+         * SAME regcmd/task a few times with a short backoff; a retry that lands needs NO reset (a reset clears
+         * warm -> cold miscompute) and the output still lands. Only fall through to the reset if it stays wedged. */
+        if (e == EINVAL || e == EBUSY) {
+            for (int _r = 0; _r < 20 && rc < 0; _r++) { struct timespec _ts = {0, 50000}; nanosleep(&_ts, NULL);
+                rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub); }
+            if (rc >= 0) return rc;   /* retired + landed */
+            errno = e;
+        }
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
                 rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
                 g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import);
