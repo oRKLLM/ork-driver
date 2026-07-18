@@ -68,10 +68,29 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 
 struct client { int fd; int hello; uint32_t id; };
 
+/* Detach so an auto-spawned orkd outlives the client that fork+exec'd it: double-fork + setsid (reparent to
+ * init, no controlling terminal), stdio -> /dev/null + stderr -> <runtime>/orkd.log. The intermediate
+ * processes exit fast so the spawning client's waitpid reaps them immediately. ORKD_FOREGROUND skips this
+ * (tests / debugging). Called BEFORE the flock so the surviving daemon grandchild owns the lock. */
+static void daemonize(void){
+    if (getenv("ORKD_FOREGROUND")) return;
+    pid_t p = fork(); if (p < 0) return; if (p > 0) _exit(0);
+    setsid();
+    p = fork(); if (p > 0) _exit(0);              /* not a session leader -> can't reacquire a tty */
+    if (chdir("/") < 0) {}
+    char logp[256]; snprintf(logp, sizeof logp, "%s/orkd.log", orkd_runtime_dir());
+    int nul = open("/dev/null", O_RDWR);
+    int lg  = open(logp, O_CREAT|O_WRONLY|O_APPEND, 0600);
+    if (nul >= 0){ dup2(nul, 0); dup2(nul, 1); if (nul > 2) close(nul); }
+    if (lg  >= 0){ dup2(lg, 2);  if (lg  > 2) close(lg); }
+}
+
 int main(void){
     char sockpath[256], pidpath[256];
     orkd_sock_path(sockpath, sizeof sockpath);
     orkd_pidfile_path(pidpath, sizeof pidpath);
+
+    daemonize();                                   /* detach first; the surviving grandchild takes the flock */
 
     /* Single-instance: hold an exclusive flock on the pidfile. A losing racer (two clients both auto-spawned an
      * orkd) exits cleanly here and its client then connects to the winner's socket. */
