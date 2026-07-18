@@ -357,6 +357,12 @@ static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
 #define ORK_IOVA_NDOM 64
 static size_t g_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
 static long g_bcreate_n, g_bimport_n, g_bdestroy_n;   /* cumulative alloc/free counts (ORK_PRESUBMIT_TRACE leak diag) */
+/* ORK_IMPORT_TRACE: flushed per-phase trace of every dma-buf IMPORT (bimport) + the weight-level import
+ * entrypoints. Each line is fflush'd so if an ioctl HANGS (D-state), the LAST printed line names the exact
+ * stuck phase (DMA_HEAP_ALLOC / mmap / PRIME_FD / MEM_CREATE), domain, size, and cumulative counts. Off by
+ * default (0 cost). Used to root-cause the weight-import D-state hang without guessing. */
+static int imp_trace(void){ static int t=-1; if(t<0){ const char*e=getenv("ORK_IMPORT_TRACE"); t=e?atoi(e):0; } return t; }
+static long g_imp_wn;   /* weight-import call counter (which weight is being imported when a hang hits) */
 /* NPU on-chip SRAM total (bytes), queried once at init. 0 => the kernel/DTB did NOT allocate SRAM to the
  * NPU (stock config, no CONFIG_ROCKCHIP_RKNPU_SRAM / no rkvdec0_sram reassignment). bcreate uses this to
  * fail a TRY_ALLOC_SRAM request over to DRAM so the submit path is portable across kernels/DTBs. */
@@ -471,22 +477,28 @@ static void dmabuf_sync(int heap_fd,uint64_t flags){
     if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
 }
 static struct buf bimport(int fd,size_t size,int domain){
+    int tr=imp_trace();
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
     size_t sz=pgup(size);
+    int dtr=ork_dom(domain);   /* domain id for the trace (final `dom` computed post-mmap, same value) */
+    if(tr){ fprintf(stderr,"[IMP] bimport dom=%d sz=%zuKB (imp#%ld, dom_bytes=%zuMB): DMA_HEAP_ALLOC...\n",dtr,sz>>10,g_bimport_n,g_iova_bytes[dtr>=0&&dtr<ORK_IOVA_NDOM?dtr:0]>>20); fflush(stderr); }
     double _t = g_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
     if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC"); return (struct buf){0}; }
     if(g_load_prof){ g_lp_alloc += ork_now_us()-_t; _t=ork_now_us(); }
     int dbuf=(int)a.fd;
+    if(tr){ fprintf(stderr,"[IMP]   alloc ok (fd=%d) -> mmap...\n",dbuf); fflush(stderr); }
     void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
     if(g_load_prof){ g_lp_mmap += ork_now_us()-_t; }
     int dom=ork_dom(domain);
     if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
     if(g_load_prof) _t=ork_now_us();
+    if(tr){ fprintf(stderr,"[IMP]   mmap ok -> PRIME_FD_TO_HANDLE...\n"); fflush(stderr); }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(g_load_prof){ g_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
+    if(tr){ fprintf(stderr,"[IMP]   prime ok (handle=%u) -> MEM_CREATE...\n",ph.handle); fflush(stderr); }
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(g_load_prof){ g_lp_create += ork_now_us()-_t; g_lp_nchunk++; g_lp_bytes+=sz; }
@@ -494,6 +506,7 @@ static struct buf bimport(int fd,size_t size,int domain){
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     live_add(fd,b.handle,b.obj);
     g_bimport_n++;
+    if(tr){ fprintf(stderr,"[IMP]   MEM_CREATE ok dma=0x%llx -> bimport DONE (imp#%ld dom_bytes=%zuMB)\n",(unsigned long long)b.dma,g_bimport_n,g_iova_bytes[dom>=0&&dom<ORK_IOVA_NDOM?dom:0]>>20); fflush(stderr); }
     return b;
 }
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
@@ -1797,7 +1810,10 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
+    g_imp_wn++;
+    if(imp_trace()){ fprintf(stderr,"[IMP] ===== weight #%ld load_i8_import K=%d N=%d Sk=%d Sn=%d tiles=%d need=%zuMB dom=%d =====\n",g_imp_wn,K,N,Sk,Sn,Sk*Sn,need>>20,w->domain); fflush(stderr); }
     ork_dom_prime(c, w->domain);   /* establish a non-0 domain with a native anchor BEFORE importing into it */
+    if(imp_trace()){ fprintf(stderr,"[IMP]   dom_prime done, entering %s import\n", getenv("ORK_NO_CONSOLIDATE_IMPORT")?"PER-TILE":"CONSOLIDATED-CHUNK"); fflush(stderr); }
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     /* SIZE-BOUNDED CONSOLIDATED IMPORT (default on; ORK_NO_CONSOLIDATE_IMPORT disables): pack this weight's
      * tiles into a HANDFUL of moderate (~ORK_IMPORT_CHUNK_MB, default 16MB) imported dma-buf CHUNKS; each tile
