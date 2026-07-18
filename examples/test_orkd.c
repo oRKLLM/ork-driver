@@ -27,17 +27,22 @@ static int one(orkd_conn *c, int M, int K, int N){
     for (int m = 0; m < M; m++) for (int n = 0; n < N; n++){
         long a = 0; for (int k = 0; k < K; k++) a += (long)A[m*K+k] * B[k*N+n]; ref[m*N+n] = (int32_t)a;
     }
+    int32_t *Cz = malloc((size_t)M*N*4);
     uint64_t w = orkd_pack_i8(c, K, N, B);
     int bad = 0;
-    if (!w){ printf("  pack FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
+    if (!w || !Cz){ printf("  pack/alloc FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
     else {
-        int rc = orkd_run_i8(c, w, M, K, N, A, C);
+        int rc  = orkd_run_i8(c, w, M, K, N, A, C);       /* socket transfer */
+        int rcz = orkd_run_i8_zc(c, w, M, K, N, A, Cz);   /* A zero-copy (dma-buf by reference) */
         orkd_free_weight(c, w);
         if (rc){ printf("  run FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rc); bad = 1; }
-        else for (int i = 0; i < M*N; i++) if (C[i] != ref[i]){ if (bad < 3) printf("  MISMATCH M=%d K=%d N=%d [%d] got=%d want=%d\n", M, K, N, i, C[i], ref[i]); bad++; }
+        else for (int i = 0; i < M*N; i++) if (C[i] != ref[i]){ if (bad < 3) printf("  MISMATCH(socket) M=%d K=%d N=%d [%d] got=%d want=%d\n", M, K, N, i, C[i], ref[i]); bad++; }
+        if (rcz == -2){ printf("  (zero-copy skipped: no dma-heap)\n"); }
+        else if (rcz){ printf("  run-zc FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rcz); bad = 1; }
+        else for (int i = 0; i < M*N; i++) if (Cz[i] != ref[i]){ if (bad < 6) printf("  MISMATCH(zero-copy) M=%d K=%d N=%d [%d] got=%d want=%d\n", M, K, N, i, Cz[i], ref[i]); bad++; }
     }
-    if (!bad) printf("  ok M=%d K=%d N=%d (%d/%d)\n", M, K, N, M*N, M*N);
-    free(A); free(B); free(C); free(ref);
+    if (!bad) printf("  ok M=%d K=%d N=%d (%d/%d) [socket + zero-copy-A]\n", M, K, N, M*N, M*N);
+    free(A); free(B); free(C); free(ref); free(Cz);
     return bad ? 1 : 0;
 }
 

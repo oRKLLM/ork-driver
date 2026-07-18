@@ -68,6 +68,19 @@ static inline int orkd_dmaheap_alloc(size_t size){
     close(hf);
     return rc == 0 ? (int)d.fd : -1;
 }
+/* dma-buf CPU cache sync (cross-process coherency for the cacheable system heap). Defs mirror the uABI. */
+#ifndef DMA_BUF_IOCTL_SYNC
+struct dma_buf_sync { uint64_t flags; };
+#define DMA_BUF_SYNC_READ  (1 << 0)
+#define DMA_BUF_SYNC_WRITE (2 << 0)
+#define DMA_BUF_SYNC_START (0 << 2)
+#define DMA_BUF_SYNC_END   (1 << 2)
+#define DMA_BUF_IOCTL_SYNC _IOW('b', 0, struct dma_buf_sync)
+#endif
+/* Clean CPU writes -> device: call after the producer fills a buffer, before the NPU reads it (A/weights). */
+static inline void orkd_dmabuf_clean(int fd){ struct dma_buf_sync s; s.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_WRITE; ioctl(fd, DMA_BUF_IOCTL_SYNC, &s); }
+/* Invalidate CPU cache <- device: call before the consumer reads a buffer the NPU just wrote (C/output). */
+static inline void orkd_dmabuf_invalidate(int fd){ struct dma_buf_sync s; s.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ; ioctl(fd, DMA_BUF_IOCTL_SYNC, &s); }
 #endif /* __linux__ */
 
 #endif /* ORKD_SHM_H */
