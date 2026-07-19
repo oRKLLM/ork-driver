@@ -72,7 +72,7 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 #define ORKD_MAX_WEIGHTS 64
 #define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
 
-struct cweight { uint64_t id; ork_w *w; int K, N; };
+struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
 struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; };
 
 /* drain n bytes into the void — keeps the stream in sync when a request can't be serviced */
@@ -86,8 +86,10 @@ static int drain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > size
  * (higher = sooner). v1 = single-threaded + priority + adaptive row-slice; domain-grouping, per-client
  * domains, and a dedicated dispatch thread are follow-ons. */
 enum { ORKD_QMAX = 256, ORKD_QUANTUM_ROWS = 64 };
+/* element size of A for a wire dtype (int8=1B, fp16=2B); C is 4B for both (int32 / fp32) */
+static int orkd_esz_a(int wire_dt){ return wire_dt == ORKD_DT_F16 ? 2 : 1; }
 struct work {
-    int used, fd, type, M, K, N, m0, rc;
+    int used, fd, type, M, K, N, m0, rc, dtype;
     uint32_t prio; uint64_t tag, seq, weight_id;
     int8_t *A; int32_t *C;          /* A/C: socket-malloc'd unless the matching *_imp is set (zero-copy import) */
     void *A_imp, *C_imp;            /* imported dma-bufs to ork_dma_free (NULL => socket-malloc'd A/C) */
@@ -122,14 +124,15 @@ static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_pack pk;
     if (readn(cl->fd, &pk, sizeof pk) <= 0) return -1;
     if (pk.bytes == 0 || pk.bytes > ORKD_MAX_BYTES){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EPROTO, "bad pack size"); return 0; }
-    if (pk.dtype != ORKD_DT_I8){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_ENOSYS, "only int8 (#2b-1)"); return 0; }
+    if (pk.dtype != ORKD_DT_I8 && pk.dtype != ORKD_DT_F16){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_ENOSYS, "int8/fp16 only"); return 0; }
     int8_t *wbuf = malloc(pk.bytes);
     if (!wbuf){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EOOM, "pack alloc"); return 0; }
     if (readn(cl->fd, wbuf, pk.bytes) <= 0){ free(wbuf); return -1; }
-    ork_w *w = ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
+    ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
+                                         : ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
     free(wbuf);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
-    if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)pk.K, (int)pk.N }; }
+    if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)pk.K, (int)pk.N, (int)pk.dtype }; }
     else { if (w) ork_mm_free(npu, w); hh.rc = -1; }
     send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);
     return 0;
@@ -143,12 +146,12 @@ static int handle_run(struct client *cl, ork_npu *npu, uint64_t tag){
     int8_t *A = malloc(rq.abytes ? rq.abytes : 1);
     if (!A){ drain(cl->fd, rq.abytes); send_error(cl->fd, tag, ORKD_EOOM, "A alloc"); return 0; }
     if (rq.abytes && readn(cl->fd, A, rq.abytes) <= 0){ free(A); return -1; }
-    if (!cw || rq.abytes != (uint32_t)((size_t)rq.M * cw->K)){ free(A); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "A size mismatch" : "unknown weight"); return 0; }
+    if (!cw || rq.abytes != (uint32_t)((size_t)rq.M * cw->K * orkd_esz_a(cw->dtype))){ free(A); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "A size mismatch" : "unknown weight"); return 0; }
     int32_t *C = malloc((size_t)rq.M * cw->N * 4);
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ free(A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->A = A; w->C = C;   /* enqueued; the scheduler dispatches it */
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = A; w->C = C;   /* enqueued; the scheduler dispatches it */
     return 0;
 }
 static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
@@ -170,7 +173,7 @@ static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, u
     struct cweight *cw = NULL;
     for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == rq.weight_id){ cw = &cl->wt[i]; break; }
     if (!cw || a_fd < 0 || c_fd < 0){ if (a_fd >= 0) close(a_fd); if (c_fd >= 0) close(c_fd); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "need A+C fds" : "unknown weight"); return 0; }
-    size_t alen = (size_t)rq.M * cw->K, cn = (size_t)rq.M * cw->N;
+    size_t alen = (size_t)rq.M * cw->K * orkd_esz_a(cw->dtype), cn = (size_t)rq.M * cw->N;
     void *A = ork_dma_import_fd(npu, a_fd, alen);
     if (!A){ close(a_fd); close(c_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
     void *C = ork_dma_import_fd(npu, c_fd, cn * 4);
@@ -178,7 +181,7 @@ static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, u
     struct work *w = wk_alloc();
     if (!w){ ork_dma_free(npu, A); ork_dma_free(npu, C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC2; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N;
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype;
     w->A = (int8_t *)A; w->A_imp = A; w->C = (int32_t *)C; w->C_imp = C;   /* dispatch: A read + C written in place, single-core */
     return 0;
 }
@@ -192,14 +195,14 @@ static int handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag
     struct cweight *cw = NULL;
     for (int i = 0; i < cl->nw; i++) if (cl->wt[i].id == rq.weight_id){ cw = &cl->wt[i]; break; }
     if (!cw || a_fd < 0){ if (a_fd >= 0) close(a_fd); send_error(cl->fd, tag, cw ? ORKD_EPROTO : ORKD_EBADH, cw ? "no A fd" : "unknown weight"); return 0; }
-    size_t alen = (size_t)rq.M * cw->K;
+    size_t alen = (size_t)rq.M * cw->K * orkd_esz_a(cw->dtype);
     void *A = ork_dma_import_fd(npu, a_fd, alen);    /* import A into the NPU domain (takes a_fd ownership) */
     if (!A){ close(a_fd); send_error(cl->fd, tag, ORKD_EOOM, "import A"); return 0; }
     int32_t *C = malloc((size_t)rq.M * cw->N * 4);
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ ork_dma_free(npu, A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->A = (int8_t *)A; w->A_imp = A; w->C = C;   /* A zero-copy; C over socket */
+    w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = (int8_t *)A; w->A_imp = A; w->C = C;   /* A zero-copy; C over socket */
     return 0;
 }
 /* #2b-2 step 1: prove cross-process dma-buf sharing. The client sent a dma-heap fd (SCM_RIGHTS); mmap it here
@@ -244,7 +247,11 @@ static void dispatch_one(ork_npu *npu, struct client *cl, int nc){
     int q = (g_qn == 1) ? remaining : (remaining < ORKD_QUANTUM_ROWS ? remaining : ORKD_QUANTUM_ROWS);   /* adaptive */
     int zc2 = (w->type == ORKD_RUN_ZC2);
     if (zc2) ork_npu_set_core_budget(npu, 1);        /* output zero-copy is single-core-safe only */
-    int r = ork_mm_run_i8(npu, ow, q, (const int8_t *)(w->A + (size_t)w->m0 * w->K), w->C + (size_t)w->m0 * w->N);
+    int esz = orkd_esz_a(w->dtype);
+    const void *Aoff = (const char *)w->A + (size_t)w->m0 * w->K * esz;   /* A byte-offset (int8=1B, fp16=2B/elem) */
+    int32_t *Coff = w->C + (size_t)w->m0 * w->N;                          /* C elem-offset (int32/fp32 both 4B) */
+    int r = (w->dtype == ORKD_DT_F16) ? ork_mm_run(npu, ow, q, (const ork_f16 *)Aoff, (float *)Coff)
+                                      : ork_mm_run_i8(npu, ow, q, (const int8_t *)Aoff, Coff);
     if (zc2) ork_npu_set_core_budget(npu, 0);
     if (r && !w->rc) w->rc = r;
     w->m0 += q;

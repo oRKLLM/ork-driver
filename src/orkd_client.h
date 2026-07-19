@@ -41,6 +41,10 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B);
 /* Run int8 A[M,K] x weight -> C[M,N] (int32), computed on the daemon's NPU. 0 = ok, <0 = error. */
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* fp16 counterparts (Path B increment 2): B/A are fp16 (passed as void*), C is fp32. Pack returns id>0 / 0. */
+uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);
+int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C);
+
 /* Like orkd_run_i8 but A is passed BY REFERENCE: placed in a shared dma-buf and read zero-copy by the NPU
  * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */
 int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
