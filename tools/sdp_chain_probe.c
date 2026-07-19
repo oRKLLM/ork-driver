@@ -69,6 +69,33 @@ static int seq_mc_test(ork_npu *c, int G, int nc){
     return ok?0:1;
 }
 
+/* Stage 4: drive ork_submit_seq with GROUPED ops — 2 independent [mm->ewmul->mm] chains (group 1, group 2) —
+ * so the scheduler routes the contiguous group>0 run to ork_dyn_begin_seq_i8_mc (no blocking SW break). */
+static int submit_seq_grouped_test(ork_npu *c){
+    const int M=8, K=512, N=64, mult=0x4000, shift=14, G=2;
+    int8_t *W=malloc((size_t)K*N); for(int i=0;i<K*N;i++) W[i]=1;
+    ork_w *w=ork_mm_pack_i8(c,K,N,W); free(W); if(!w){ printf("[submit-grp] pack failed\n"); return 1; }
+    int8_t *A0=malloc((size_t)M*K); for(int i=0;i<M*K;i++) A0[i]=1;
+    int8_t (*A1)[512]=malloc((size_t)G*512), (*B1)[512]=malloc((size_t)G*512), (*ref)[512]=malloc((size_t)G*512);
+    int32_t (*C0)[512]=malloc((size_t)G*512*4), (*C2)[512]=malloc((size_t)G*512*4); int8_t (*O)[512]=malloc((size_t)G*512);
+    ork_seq_op ops[6]; memset(ops,0,sizeof ops);
+    for(int g=0; g<G; g++){ unsigned s=2000u+g*11u;
+        for(int i=0;i<M*N;i++){ A1[g][i]=(int8_t)(((s=s*1103515245u+12345u)>>20&7))-3; B1[g][i]=(int8_t)(((s=s*1103515245u+12345u)>>20&7))-3; }
+        for(int i=0;i<M*N;i++){ long v=lround((long)A1[g][i]*B1[g][i]*mult/(double)(1<<shift)); ref[g][i]=(int8_t)(v>127?127:v<-128?-128:v); }
+        ops[3*g+0]=(ork_seq_op){.kind=ORK_OP_MM_I8,   .w=w, .M=M, .N=N, .A=A0, .C=C0[g], .group=g+1};
+        ops[3*g+1]=(ork_seq_op){.kind=ORK_OP_EWMUL_I8,.M=M,.N=N, .A=A1[g], .B=B1[g], .C=O[g], .mult=mult, .shift=shift, .group=g+1};
+        ops[3*g+2]=(ork_seq_op){.kind=ORK_OP_MM_I8,   .w=w, .M=M, .N=N, .A=A0, .C=C2[g], .group=g+1};
+    }
+    int rc=ork_submit_seq(c,ops,6);
+    int ok=(rc==0);
+    for(int g=0; g<G; g++){ int n0=0,n2=0,ne=0;
+        for(int i=0;i<M*N;i++){ if(C0[g][i]==K)n0++; if(C2[g][i]==K)n2++; if(O[g][i]==ref[g][i])ne++; }
+        if(!(n0==M*N&&n2==M*N&&ne==M*N)){ ok=0; printf("[submit-grp] group %d BAD mm0=%d ew=%d mm2=%d /%d\n",g,n0,ne,n2,M*N); } }
+    printf("[submit-grp] rc=%d  ork_submit_seq(2 grouped [mm->ewmul->mm] chains) -> %s\n", rc, ok?"OK":"BAD");
+    free(A0);free(A1);free(B1);free(ref);free(C0);free(C2);free(O);
+    return ok?0:1;
+}
+
 int main(void){
     ork_npu *c=ork_npu_init();
     if(!c){ fprintf(stderr,"init failed\n"); return 2; }
@@ -80,8 +107,9 @@ int main(void){
     printf("[seq-hetero] rc=%d  all bit-exact=%s\n", rc2, okh?"OK":"BAD");
     int api=seq_api_test(c);
     int mc=seq_mc_test(c,3,3);
+    int grp=submit_seq_grouped_test(c);
     ork_npu_free(c);
-    int pass = (rc==0&&t0&&t1&&rc2==0&&okh&&api==0&&mc==0);
-    printf("VERDICT: %s\n", pass?"int8 SDP chains ride the NONBLOCK doorbell, single + multi-core (Stage 3). PASS":"FAIL");
+    int pass = (rc==0&&t0&&t1&&rc2==0&&okh&&api==0&&mc==0&&grp==0);
+    printf("VERDICT: %s\n", pass?"int8 SDP rides the doorbell via ork_submit_seq grouping (Stage 4). PASS":"FAIL");
     return pass?0:1;
 }

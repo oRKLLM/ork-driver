@@ -12479,6 +12479,25 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     for(int i=0;i<n && !ret;i++){
         const ork_seq_op *o=&ops[i];
         if((int)o->kind<0||(int)o->kind>=ORK_OP_NKIND){ ret=-2; break; }
+        /* GROUPED RUN (Stage 4): a maximal contiguous run of group>0 ops rides ork_dyn_begin_seq_i8_mc — a
+         * group-id change delimits INDEPENDENT chains (spread across cores). group==0 (default) never enters
+         * here, so the legacy per-op path below is byte-identical for existing callers. Ineligible run (engine
+         * returns NULL: non-int8 / M>64 / kind not yet supported / terminal-not-matmul) => SW-run each op. */
+        if(o->group>0){
+            SEQ_FLUSH_HW(); if(ret) break;
+            int j=i; while(j<n && ops[j].group>0) j++;              /* run [i,j) */
+            int gs[ORK_SEQ_HWBATCH+1]; int ng=0; gs[0]=0;
+            for(int p=i+1;p<j;p++) if(ops[p].group!=ops[p-1].group) gs[++ng]=p-i;
+            gs[++ng]=j-i;
+            ork_dyn_chain *h = (j-i<=ORK_SEQ_HWBATCH) ? ork_dyn_begin_seq_i8_mc(c, j-i, &ops[i], ng, gs, 0) : NULL;
+            if(getenv("ORK_SEQ_DEBUG")) fprintf(stderr,"[seq] grouped run [%d,%d) ng=%d -> %s\n", i,j,ng, h?"seq-chain":"SW-fallback");
+            if(h){ if(ork_dyn_seq_end(h)) ret=-1; }
+            else { for(int p=i;p<j && !ret;p++){ const ork_seq_op *op=&ops[p]; const struct ork_seq_class *pcl=&SEQ_CLASS[op->kind];
+                    if(pcl->hw && seq_hw_ok(op)){ ork_mm_task_i8 t1={op->w,op->M,(const int8_t*)op->A,(int32_t*)op->C};
+                        ork_dyn_chain *hh=ork_dyn_begin_mc(c,1,&t1,0); if(hh){ if(ork_dyn_end(hh)<0){} } else { ork_npu_enter(c,DT_I8,XP_MC_MM,OCK_SW); if(ork_mm_run_i8(c,op->w,op->M,op->A,op->C))ret=-1; } }
+                    else { int mk=(pcl->marker==SEQ_KEEPDT)?c->last_dt:pcl->marker; ork_npu_enter(c,mk,pcl->profile,pcl->chain); if(!pcl->fn){ret=-3;break;} if(pcl->fn(c,op))ret=-1; } } }
+            i=j-1; continue;                                        /* for-loop i++ lands at j */
+        }
         const struct ork_seq_class *cl=&SEQ_CLASS[o->kind];
         int dom = o->w ? o->w->domain : 0;
         if(cl->hw && seq_hw_ok(o)){

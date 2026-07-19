@@ -864,6 +864,12 @@ typedef struct {
     double      in_scale, out_scale;  /* SDP scales: silu/gelu in/out; add uses in_scale as a_scale + b_scale/out_scale */
     double      b_scale;              /* SDP add: b operand scale (a_scale = in_scale) */
     int         mult, shift;          /* SDP ewmul_i8 requant (out = clamp(A*B*mult>>shift)) */
+    int         group;                /* dependency grouping (default 0 = ungrouped, legacy per-op scheduling).
+                                       * >0: CONTIGUOUS ops sharing a group id form ONE sequential chain (kept on
+                                       * one core, in order); a group-id change starts a new INDEPENDENT chain.
+                                       * A contiguous run of group>0 ops rides ork_dyn_begin_seq_i8_mc — SDP ops
+                                       * stay in the doorbell chain instead of forcing a blocking SW break. The
+                                       * run's terminal op (each group's last) must be a matmul (sentinel). */
 } ork_seq_op;
 /* Run the n-op sequence in order, HW-batching + SW-breaking as above. 0/ok, -1 a submit failed/wedged,
  * -2 bad args, -3 an op-kind whose dispatch is not yet wired (documented TODO row, e.g. SILU_F16). */
