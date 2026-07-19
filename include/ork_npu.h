@@ -868,6 +868,12 @@ typedef struct {
 /* Run the n-op sequence in order, HW-batching + SW-breaking as above. 0/ok, -1 a submit failed/wedged,
  * -2 bad args, -3 an op-kind whose dispatch is not yet wired (documented TODO row, e.g. SILU_F16). */
 int          ork_submit_seq(ork_npu *ctx, const ork_seq_op *ops, int n);
+/* Heterogeneous single-core NONBLOCK chain: run ONE group of int8 ops (matmul + int8 SDP, e.g. EWMUL_I8) as one
+ * PC-chain; terminal MUST be a matmul (its int32 sentinel gates completion). Returns a handle (drain with
+ * ork_dyn_seq_end) or NULL if ineligible (non-int8 / M>64 / non-conforming K / terminal not a matmul / kind not
+ * yet supported) — caller then runs the ops via the SW break. The scheduler slices a sequence into groups. */
+ork_dyn_chain *ork_dyn_begin_seq_i8(ork_npu *ctx, int n, const ork_seq_op *ops);
+int          ork_dyn_seq_end(ork_dyn_chain *h);   /* poll terminal sentinel + per-op copy-back; 0/ok,-1 timeout,-2 bad */
 
 /* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
  * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before

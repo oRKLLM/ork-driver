@@ -9169,6 +9169,14 @@ struct ork_dyn_chain {
     struct rknpu_submit mc_subs[ORK_MAXCORE];
     int        mc_Pc[ORK_MAXCORE];
     unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    /* SEQ chain (ork_dyn_begin_seq_i8 — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
+     * all ops share ONE output scratch; per-op layout/esz differ (matmul int32 dense, SDP int8 EWCUBE). */
+    int        seq;             /* 1 = built by begin_seq_i8 */
+    int        seq_term;        /* op index whose terminal int32 last-col sentinel gates completion */
+    struct buf seq_out;         /* shared output scratch for all seq ops (freed in seq_end) */
+    uint8_t    oesz8[1024];     /* per-op output element bytes: 4=int32 matmul, 1=int8 SDP */
+    uint8_t    ocube[1024];     /* per-op output layout: 1=EWCUBE (SDP), 0=dense [M,N] (matmul) */
+    size_t     ooff[1024];      /* per-op byte offset into seq_out */
 };
 /* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
  * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
@@ -9832,6 +9840,113 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             for (long e=0;e<(long)Mx*Nx;e++){ volatile int32_t*db=(volatile int32_t*)(h->outptr[x]+e); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); (void)*db; } }
     }
     return h;
+}
+
+/* ================= HETEROGENEOUS SINGLE-CORE NONBLOCK CHAIN (ork_dyn_begin_seq_i8) =================
+ * Run ONE group of int8 ops [matmul + int8 SDP ...] as one core's PC-chain on begin_mc's recipe (mc_ensure
+ * mrc/maf + a chain-owned warmed output scratch, clean-before, 64B-aligned program slots, per-op forward
+ * descriptor), NONBLOCK, ping-pong OFF (an SDP task is present). The TERMINAL op MUST be a matmul — its int32
+ * 0x7fffffff last-col sentinel gates completion (int8 SDP output has no free poison). ork_dyn_seq_end() polls
+ * the terminal + does per-op copy-back (matmul int32 dense; SDP int8 EWCUBE de-marshalled). Returns NULL if
+ * ineligible (caller then runs the ops via the SW break). Stage 2: MM_I8 + EWMUL_I8; ADD/SILU/GELU follow.
+ * SINGLE group / single core here; the scheduler slices a sequence into groups and (Stage 3) spreads them. */
+#define ORK_SEQCUBE(m,n,MM) (((n)/16)*((MM)*16) + (m)*16 + ((n)%16))   /* NVDLA atom-16 SDP cube */
+ork_dyn_chain *ork_dyn_begin_seq_i8(ork_npu *c, int n, const ork_seq_op *ops){
+    if(!c||n<1||n>256||!ops) return NULL;
+    if(!ork_ppu_fuse_enabled(c)) return NULL;
+    /* eligibility + sizing (maf staging bytes, output scratch bytes) */
+    size_t afneed=0, outneed=0; unsigned dom=0; int have_dom=0;
+    for(int i=0;i<n;i++){ const ork_seq_op *o=&ops[i];
+        if(o->kind==ORK_OP_MM_I8){ ork_w *w=o->w;
+            if(!w||w->dtype!=DT_I8||w->Sn!=1||w->Sk!=1||w->K%512||w->K>4096) return NULL;
+            if(o->M<1||o->M>64) return NULL;
+            if(!have_dom){ dom=w->domain; have_dom=1; } else if((unsigned)w->domain!=dom) return NULL;
+            afneed += (size_t)o->M*w->K; outneed += (size_t)o->M*w->N*4; }
+        else if(o->kind==ORK_OP_EWMUL_I8){
+            if(o->M<1||o->M>64||o->N<16||(o->N&15)) return NULL;
+            if(o->mult<0||o->mult>0x7fff||o->shift<0||o->shift>31) return NULL;
+            afneed += (size_t)2*o->M*o->N; outneed += (size_t)o->M*o->N; }
+        else return NULL; }                              /* unsupported kind -> SW break */
+    if(ops[n-1].kind!=ORK_OP_MM_I8) return NULL;         /* terminal must be a sentinel-pollable matmul */
+    if(mc_ensure(c,1)) return NULL;
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    if(have_dom && (dom!=c->dom_active || (dom && !c->dom_save))) dom_activate(c, dom);
+    int fd=c->fd, CBUF=c->soc->cbuf_elems;
+    struct buf *AF=&c->maf[0], *RC=&c->mrc[0];
+    if(afneed>AF->size){ bdestroy(fd,AF); *AF=bcreate(fd,afneed,0x403,c->dom_active); if(!AF->cpu) return NULL; }
+    if((size_t)n*REGCMD_I8_N*4 > RC->size || (size_t)n*sizeof(struct rknpu_task) > c->mtk[0].size) return NULL;
+    ork_dyn_chain *h=calloc(1,sizeof *h); if(!h) return NULL;
+    h->c=c; h->S=n; h->P=n; h->mc=0; h->seq=1; h->seq_term=n-1; h->dom=have_dom?dom:0;
+    h->seq_out=bcreate(fd, outneed<4096?4096:outneed, 0x403, c->dom_active);
+    if(!h->seq_out.cpu){ free(h); return NULL; }
+    memset(h->seq_out.cpu,0,h->seq_out.size);
+    uint32_t *base=(uint32_t*)RC->cpu; memset(base,0,(size_t)n*REGCMD_I8_N*4);
+    struct rknpu_task *tk=(struct rknpu_task*)c->mtk[0].cpu; memset(tk,0,(size_t)n*sizeof *tk);
+    size_t astage=0, coff=0; int has_sdp=0;
+    for(int i=0;i<n;i++){ const ork_seq_op *o=&ops[i]; uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
+        int regcfg, enable, dslot;
+        if(o->kind==ORK_OP_MM_I8){ ork_w *w=o->w; int K=w->K,N=w->N,M=o->M;
+            memcpy((char*)AF->cpu+astage, o->A, (size_t)M*K); uint32_t adma=(uint32_t)(AF->dma+astage); astage+=(size_t)M*K;
+            uint32_t wdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+            synth_i8(rc,M,K,N,adma,wdma,(uint32_t)(h->seq_out.dma+coff),1,CBUF,0);
+            regcfg=108; enable=0xd; dslot=216;
+            h->outptr[i]=(int32_t*)((char*)h->seq_out.cpu+coff); h->oM[i]=M; h->nout[i]=M*N; h->oesz8[i]=4; h->ocube[i]=0;
+            h->ooff[i]=coff; h->dst[i]=(int32_t*)o->C; coff+=(size_t)M*N*4;
+        } else { /* ORK_OP_EWMUL_I8 */ int M=o->M,N=o->N; has_sdp=1;
+            int8_t *a=(int8_t*)((char*)AF->cpu+astage), *b=a+(size_t)M*N; const int8_t *ha=o->A,*hb=o->B;
+            for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++){ a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn]; b[ORK_SEQCUBE(m,nn,M)]=hb[m*N+nn]; }
+            uint32_t adma=(uint32_t)(AF->dma+astage), bdma=(uint32_t)(AF->dma+astage+(size_t)M*N); astage+=(size_t)2*M*N;
+            memcpy(rc,REGCMD_MUL,REGCMD_MUL_N*4); set_mul_geom(rc,REGCMD_MUL_N,M,N);
+            setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+coff)); setr(rc,REGCMD_MUL_N,0x2001,0x5018,adma); setr(rc,REGCMD_MUL_N,0x2001,0x5038,bdma);
+            setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)o->mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)o->shift);
+            setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0);
+            regcfg=69; enable=0x18; dslot=138;
+            h->outptr[i]=(int32_t*)((char*)h->seq_out.cpu+coff); h->oM[i]=M; h->nout[i]=M*N; h->oesz8[i]=1; h->ocube[i]=1;
+            h->ooff[i]=coff; h->dst[i]=o->C; coff+=(size_t)M*N;
+        }
+        if(i<n-1){ int nextcfg=(ops[i+1].kind==ORK_OP_MM_I8)?108:69; int amt=(nextcfg+3)/2;
+            uint64_t nx=RC->dma + (size_t)(i+1)*REGCMD_I8_N*4;
+            rc[dslot]  =0x0010 | ((uint32_t)(nx&0xffff)<<16); rc[dslot+1]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
+            rc[dslot+2]=0x0014 | ((uint32_t)amt<<16);         rc[dslot+3]=(0x0101u<<16); }
+        memcpy((char*)base+(size_t)i*REGCMD_I8_N*4, rc, (o->kind==ORK_OP_MM_I8?REGCMD_I8_N:REGCMD_MUL_N)*4);
+        tk[i].enable_mask=enable; tk[i].int_mask=0x300; tk[i].int_clear=0x1ffff; tk[i].regcfg_amount=regcfg;
+        tk[i].regcmd_addr=(uint32_t)(RC->dma+(size_t)i*REGCMD_I8_N*4);
+    }
+    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->mtk[0],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: no dirty CPU line evicts over NPU writes */
+    /* seed the terminal matmul's per-row last-col int32 sentinel */
+    { int ti=h->seq_term; int M=h->oM[ti], N=h->nout[ti]/(M?M:1); volatile int32_t*o=(volatile int32_t*)((char*)h->seq_out.cpu+h->ooff[ti]);
+      for(int m=0;m<M;m++){ volatile int32_t*db=&o[(size_t)m*N+(N-1)]; *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+      __asm__ volatile("dsb ish":::"memory"); }
+    ork_install_term();
+    struct rknpu_submit s; memset(&s,0,sizeof s);
+    s.flags = has_sdp ? (0x1u|0x2u) : (ork_ppflags()|0x2u);   /* PC|NONBLOCK; ping-pong OFF if an SDP task present */
+    s.task_number=(uint32_t)n; s.task_obj_addr=c->mtk[0].obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=mm_timeout_ms();
+    s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)n};
+    if(rknpu_submit_ioctl(fd,&s,c->dom_active)){ bdestroy(fd,&h->seq_out); free(h); return NULL; }
+    return h;
+}
+/* Drain a seq chain: poll the terminal matmul sentinel, then per-op copy-back (matmul int32 dense; SDP int8
+ * EWCUBE de-marshalled to row-major). Frees the chain. 0/ok, -1 timeout (partial), -2 bad-arg. */
+int ork_dyn_seq_end(ork_dyn_chain *h){
+    if(!h||!h->seq) return -2;
+    ork_npu *c=h->c; int fd=c->fd; int rc=0;
+    int ti=h->seq_term; int Mt=h->oM[ti], Nt=h->nout[ti]/(Mt?Mt:1);
+    volatile int32_t *o=(volatile int32_t*)((char*)h->seq_out.cpu+h->ooff[ti]);
+    g_in_doorbell=1; double t0=ork_now_us(); int landed=0;
+    for(;;){ int done=1; for(int m=0;m<Mt;m++){ volatile int32_t*db=&o[(size_t)m*Nt+(Nt-1)]; __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){done=0;break;} }
+        if(done){landed=1;break;} if(g_ork_term||ork_now_us()-t0>3e6) break; }
+    g_in_doorbell=0;
+    if(!landed) rc=-1;
+    bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
+    for(int i=0;i<h->S;i++){ if(!h->dst[i]) continue; int M=h->oM[i], N=h->nout[i]/(M?M:1);
+        if(h->oesz8[i]==4){ memcpy(h->dst[i], (char*)h->seq_out.cpu+h->ooff[i], (size_t)M*N*4); }
+        else { const int8_t*src=(const int8_t*)((char*)h->seq_out.cpu+h->ooff[i]); int8_t*dst=(int8_t*)h->dst[i];
+            for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=src[ORK_SEQCUBE(m,nn,M)]; } }
+    bdestroy(fd,&h->seq_out); free(h);
+    if(g_ork_term){ int k=0; sigaction(SIGTERM,&g_prev_sig[k],NULL); raise(SIGTERM); }
+    return rc;
 }
 /* SPIN-KEEP-ALIVE PROBE — validates the persistent-job mechanism. Program 0 is a CIRCULAR spin (its next
  * descriptor points back to itself) writing a dedicated spin slot, keeping the job alive on one core WITHOUT
