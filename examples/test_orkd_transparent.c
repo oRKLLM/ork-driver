@@ -164,6 +164,57 @@ static int one_seq(ork_npu *c){
     free(Ba);free(Bc);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);free(ea);free(eb);free(ec);free(er);
     return bad ? 1 : 0;
 }
+/* FULL-vocabulary heterogeneous sequence through the stack (ork_submit_seq): int8 mm (doorbell batch) |
+ * silu_i8 (SW break) | int8 mm (resume) | ewmul_i8 (break) | add_f16 (break) | gelu_i8 (break) | int4 mm
+ * (dtype-switch doorbell). Each op independent; validated vs its own reference. Exercises the extended
+ * SEQ_CLASS + ORKD_SEQ so every op kind self-manages batch/break/resume, direct AND routed. */
+static int one_seq_full(ork_npu *c){
+    int Ki=512, Ni=64, Mi=8, Ms=8, Ns=64, K4=64, N4=64;
+    int8_t *Ba=malloc(Ki*Ni),*Bc=malloc(Ki*Ni),*Aa=malloc(Mi*Ki),*Ac=malloc(Mi*Ki);
+    int32_t *Ca=malloc(Mi*Ni*4),*Cc=malloc(Mi*Ni*4),*Ra=malloc(Mi*Ni*4),*Rc=malloc(Mi*Ni*4);
+    int8_t *si=malloc(Ms*Ns),*so=malloc(Ms*Ns),*sr=malloc(Ms*Ns),*gi=malloc(Ms*Ns),*go=malloc(Ms*Ns),*gr=malloc(Ms*Ns);
+    int8_t *ea=malloc(Ms*Ns),*eb=malloc(Ms*Ns),*eo=malloc(Ms*Ns),*er8=malloc(Ms*Ns);
+    ork_f16 *fa=malloc(Ms*Ns*2),*fb=malloc(Ms*Ns*2),*fo=malloc(Ms*Ns*2); float *fr=malloc(Ms*Ns*4);
+    int8_t *B4=malloc(K4*N4),*A4=malloc(K4); int32_t *C4=malloc(N4*4),*R4=malloc(N4*4);
+    double is=0.06, os=0.06; int emult=16384, eshift=14;
+    g=7;
+    for(int i=0;i<Mi*Ki;i++)Aa[i]=r8(); for(int i=0;i<Ki*Ni;i++)Ba[i]=r8();
+    for(int i=0;i<Mi*Ki;i++)Ac[i]=r8(); for(int i=0;i<Ki*Ni;i++)Bc[i]=r8();
+    for(int m=0;m<Mi;m++)for(int n=0;n<Ni;n++){long a=0;for(int k=0;k<Ki;k++)a+=(long)Aa[m*Ki+k]*Ba[k*Ni+n];Ra[m*Ni+n]=(int)a;}
+    for(int m=0;m<Mi;m++)for(int n=0;n<Ni;n++){long a=0;for(int k=0;k<Ki;k++)a+=(long)Ac[m*Ki+k]*Bc[k*Ni+n];Rc[m*Ni+n]=(int)a;}
+    for(int i=0;i<Ms*Ns;i++)si[i]=r8(); for(int i=0;i<Ms*Ns;i++){double x=si[i]*is,y=x/(1.0+exp(-x));sr[i]=clip8(lround(y/os));}
+    for(int i=0;i<Ms*Ns;i++)gi[i]=r8(); for(int i=0;i<Ms*Ns;i++){double x=gi[i]*is,y=0.5*x*(1.0+erf(x/1.4142135623730951));gr[i]=clip8(lround(y/os));}
+    for(int i=0;i<Ms*Ns;i++){ea[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; eb[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3;}
+    for(int i=0;i<Ms*Ns;i++)er8[i]=clip8(lround((long)ea[i]*eb[i]*emult/(double)(1<<eshift)));
+    for(int i=0;i<Ms*Ns;i++)fa[i]=rf(); for(int i=0;i<Ms*Ns;i++)fb[i]=rf(); for(int i=0;i<Ms*Ns;i++)fr[i]=(float)fa[i]+(float)fb[i];
+    for(int i=0;i<K4*N4;i++)B4[i]=r4(); for(int i=0;i<K4;i++)A4[i]=r4();
+    for(int n=0;n<N4;n++){long a=0;for(int k=0;k<K4;k++)a+=(long)A4[k]*B4[k*N4+n];R4[n]=(int)a;}
+    ork_w *wa=ork_mm_pack_i8(c,Ki,Ni,Ba),*wc=ork_mm_pack_i8(c,Ki,Ni,Bc),*w4=ork_mm_pack_i4(c,K4,N4,B4);
+    ork_seq_op ops[7]; memset(ops,0,sizeof ops);
+    ops[0].kind=ORK_OP_MM_I8;   ops[0].w=wa; ops[0].M=Mi; ops[0].A=Aa; ops[0].C=Ca;
+    ops[1].kind=ORK_OP_SILU_I8;  ops[1].M=Ms; ops[1].N=Ns; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os;
+    ops[2].kind=ORK_OP_MM_I8;   ops[2].w=wc; ops[2].M=Mi; ops[2].A=Ac; ops[2].C=Cc;
+    ops[3].kind=ORK_OP_EWMUL_I8; ops[3].M=Ms; ops[3].N=Ns; ops[3].A=ea; ops[3].B=eb; ops[3].C=eo; ops[3].mult=emult; ops[3].shift=eshift;
+    ops[4].kind=ORK_OP_ADD_F16;  ops[4].M=Ms; ops[4].N=Ns; ops[4].A=fa; ops[4].B=fb; ops[4].C=fo;
+    ops[5].kind=ORK_OP_GELU_I8;  ops[5].M=Ms; ops[5].N=Ns; ops[5].A=gi; ops[5].C=go; ops[5].in_scale=is; ops[5].out_scale=os;
+    ops[6].kind=ORK_OP_MM_I4;   ops[6].w=w4; ops[6].M=1;  ops[6].A=A4; ops[6].C=C4;
+    int rc=ork_submit_seq(c,ops,7), bad=0;
+    if(rc){ printf("  seqfull run FAIL rc=%d\n",rc); bad=1; }
+    else {
+        for(int i=0;i<Mi*Ni;i++) if(Ca[i]!=Ra[i]||Cc[i]!=Rc[i]){ if(bad<3)printf("  seqfull i8 MISMATCH [%d]\n",i); bad++; }
+        for(int i=0;i<Ms*Ns;i++){ int d=so[i]-sr[i]; if(d<0)d=-d; if(d>2){if(bad<3)printf("  seqfull silu [%d] %d!=%d\n",i,so[i],sr[i]);bad++;} }
+        for(int i=0;i<Ms*Ns;i++){ int d=go[i]-gr[i]; if(d<0)d=-d; if(d>2){if(bad<3)printf("  seqfull gelu [%d] %d!=%d\n",i,go[i],gr[i]);bad++;} }
+        for(int i=0;i<Ms*Ns;i++){ int d=eo[i]-er8[i]; if(d<0)d=-d; if(d>1){if(bad<3)printf("  seqfull ewmul [%d] %d!=%d\n",i,eo[i],er8[i]);bad++;} }
+        for(int i=0;i<Ms*Ns;i++){ float d=fabsf((float)fo[i]-fr[i]),t=fabsf(fr[i])*0.03f+0.1f; if(d>t){if(bad<3)printf("  seqfull addf16 [%d]\n",i);bad++;} }
+        for(int i=0;i<N4;i++) if(C4[i]!=R4[i]){ if(bad<3)printf("  seqfull i4 [%d] %d!=%d\n",i,C4[i],R4[i]); bad++; }
+    }
+    if(!bad) printf("  ok seqfull  n=7 (i8|silu_i8|i8|ewmul_i8|add_f16|gelu_i8|i4)\n");
+    ork_mm_free(c,wa); ork_mm_free(c,wc); ork_mm_free(c,w4);
+    free(Ba);free(Bc);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);
+    free(si);free(so);free(sr);free(gi);free(go);free(gr);
+    free(ea);free(eb);free(eo);free(er8);free(fa);free(fb);free(fo);free(fr);free(B4);free(A4);free(C4);free(R4);
+    return bad?1:0;
+}
 int main(void){
     ork_npu *c = ork_npu_init();
     if (!c){ printf("init FAIL\n"); return 1; }
@@ -187,6 +238,7 @@ int main(void){
     bad |= sdp_add_f16(c);
     bad |= one_chain(c);
     bad |= one_seq(c);
+    bad |= one_seq_full(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;

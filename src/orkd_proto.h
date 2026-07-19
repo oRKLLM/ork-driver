@@ -148,8 +148,8 @@ struct orkd_seq_op {     /* one op in the sequence; kind == ork_seq_kind. weight
     uint32_t M, N;
     uint64_t weight_id;
     uint32_t abytes, bbytes, cbytes;   /* input A / input B / output C byte sizes for this op */
-    uint32_t pad;
-    double   in_scale, out_scale;      /* SDP activation scales; ignored by matmul/ewmul kinds */
+    int32_t  mult, shift;              /* SDP ewmul_i8 requant */
+    double   in_scale, out_scale, b_scale;   /* SDP scales (silu/gelu in/out; add uses in=a_scale + b_scale/out) */
 };
 struct orkd_sdp {        /* stateless SDP op: nin input payloads follow (each M*N*in_esz), reply carries M*N*out_esz */
     uint32_t op;         /* enum orkd_sdp_op */

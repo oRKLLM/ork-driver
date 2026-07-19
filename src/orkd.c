@@ -255,7 +255,7 @@ static int handle_seq(struct client *cl, ork_npu *npu, uint64_t tag){
         struct orkd_seq_op *o = &ops[i];
         if ((size_t)inoff + o->abytes + o->bbytes > sh.in_total){ ok = 0; break; }
         seq[i].kind = (ork_seq_kind)o->kind; seq[i].M = (int)o->M; seq[i].N = (int)o->N;
-        seq[i].in_scale = o->in_scale; seq[i].out_scale = o->out_scale;
+        seq[i].in_scale = o->in_scale; seq[i].out_scale = o->out_scale; seq[i].b_scale = o->b_scale; seq[i].mult = o->mult; seq[i].shift = o->shift;
         if (o->weight_id){   /* matmul op: resolve the resident weight in this client's table */
             struct cweight *cw = NULL;
             for (int j = 0; j < cl->nw; j++) if (cl->wt[j].id == o->weight_id){ cw = &cl->wt[j]; break; }
