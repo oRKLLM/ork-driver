@@ -57,10 +57,14 @@ enum orkd_msg_type {
     /* ---- fused int8 matmul chain (S resident weights, one PC-chained submit) ---- */
     ORKD_CHAIN        = 38, /* client->daemon: {orkd_chain_hdr} + S*{orkd_chain_task} + concatenated A payloads -> ork_mm_run_chain_i8 */
     ORKD_CHAIN_OK     = 39, /* daemon->client: {orkd_handle} + concatenated C payloads (task order, each M*N*4) when rc==0 */
+    /* ---- heterogeneous op-sequence submit (ork_submit_seq): batch doorbell-eligible ops, break to SW, resume ---- */
+    ORKD_SEQ          = 40, /* client->daemon: {orkd_seq_hdr} + n*{orkd_seq_op} + concatenated inputs (A[,B] per op) -> ork_submit_seq */
+    ORKD_SEQ_OK       = 41, /* daemon->client: {orkd_handle} + concatenated C payloads (op order, each op's cbytes) when rc==0 */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
 #define ORKD_CHAIN_MAX 256   /* max tasks in one chained submit */
+#define ORKD_SEQ_MAX   512   /* max ops in one submitted sequence */
 
 /* SDP op selector for orkd_sdp.op. Only the bit-exact-class ops are wired (int16 silu/add are experimental). */
 enum orkd_sdp_op {
@@ -132,6 +136,20 @@ struct orkd_chain_task {
     uint64_t weight_id;
     uint32_t M;
     uint32_t abytes;     /* = M*K for this task's resident weight; daemon validates against its cweight K */
+};
+struct orkd_seq_hdr {    /* n orkd_seq_op descriptors follow, then in_total bytes of inputs (A then B per op, op order) */
+    uint32_t n;
+    uint32_t flags;      /* reserved */
+    uint32_t in_total;   /* sum over ops of (abytes + bbytes) */
+    uint32_t pad;
+};
+struct orkd_seq_op {     /* one op in the sequence; kind == ork_seq_kind. weight_id=0 for weightless (SDP) kinds */
+    uint32_t kind;
+    uint32_t M, N;
+    uint64_t weight_id;
+    uint32_t abytes, bbytes, cbytes;   /* input A / input B / output C byte sizes for this op */
+    uint32_t pad;
+    double   in_scale, out_scale;      /* SDP activation scales; ignored by matmul/ewmul kinds */
 };
 struct orkd_sdp {        /* stateless SDP op: nin input payloads follow (each M*N*in_esz), reply carries M*N*out_esz */
     uint32_t op;         /* enum orkd_sdp_op */

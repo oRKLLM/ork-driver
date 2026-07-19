@@ -293,6 +293,36 @@ int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *t){
     return hh.rc;
 }
 
+int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
+    if (!c || c->fd < 0 || n < 1 || n > ORKD_SEQ_MAX || !o) return -1;
+    uint64_t in_total = 0, c_total = 0;
+    for (int i = 0; i < n; i++){ if (!o[i].A || !o[i].C || (o[i].bbytes && !o[i].B)) return -1;
+        in_total += (uint64_t)o[i].abytes + o[i].bbytes; c_total += o[i].cbytes; }
+    if (in_total > 0xffffffffu) return -1;
+    struct orkd_seq_hdr sh; memset(&sh, 0, sizeof sh); sh.n = (uint32_t)n; sh.in_total = (uint32_t)in_total;
+    uint32_t plen = (uint32_t)(sizeof sh + (size_t)n * sizeof(struct orkd_seq_op) + in_total);
+    struct orkd_hdr h = { ORKD_SEQ, plen, 11 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &sh, sizeof sh)) return -1;
+    for (int i = 0; i < n; i++){ struct orkd_seq_op w; memset(&w, 0, sizeof w);
+        w.kind = o[i].kind; w.M = (uint32_t)o[i].M; w.N = (uint32_t)o[i].N; w.weight_id = o[i].weight_id;
+        w.abytes = o[i].abytes; w.bbytes = o[i].bbytes; w.cbytes = o[i].cbytes; w.in_scale = o[i].in_scale; w.out_scale = o[i].out_scale;
+        if (wn(c->fd, &w, sizeof w)) return -1; }
+    for (int i = 0; i < n; i++){ if (wn(c->fd, o[i].A, o[i].abytes)) return -1; if (o[i].bbytes && wn(c->fd, o[i].B, o[i].bbytes)) return -1; }
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_SEQ_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, cb = (size_t)c_total;
+    if (hh.rc == 0){
+        if (rh.len < consumed + cb){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        for (int i = 0; i < n; i++) if (o[i].cbytes && rn(c->fd, o[i].C, o[i].cbytes) <= 0) return -1;
+        consumed += cb;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id){
     if (!c || c->fd < 0) return -1;
     struct orkd_handle req; memset(&req, 0, sizeof req); req.id = weight_id;

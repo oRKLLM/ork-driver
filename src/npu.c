@@ -11990,6 +11990,25 @@ static int seq_hw_ok(const ork_seq_op *o){
 #define ORK_SEQ_HWBATCH 256   /* max ops per doorbell submit (well under ork_dyn_begin_mc's 1024 cap) */
 int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     if(!c||n<0||(n>0&&!ops)) return -2;
+    if(c->daemon){   /* Path B: run the whole sequence on the daemon — it does the batch/break/resume on its NPU */
+        if(n==0) return 0;
+        orkd_seq_op_c *so=calloc((size_t)n,sizeof *so); if(!so) return -2;
+        int ok=1;
+        for(int i=0;i<n && ok;i++){ const ork_seq_op *o=&ops[i]; ork_w *w=o->w;
+            so[i].kind=(uint32_t)o->kind; so[i].M=o->M; so[i].in_scale=o->in_scale; so[i].out_scale=o->out_scale;
+            so[i].A=o->A; so[i].B=o->B; so[i].C=o->C;
+            switch(o->kind){
+              case ORK_OP_MM_I8:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
+              case ORK_OP_MM_F16: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
+              case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
+              case ORK_OP_EWMUL_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;
+              default: ok=0; break;   /* e.g. SILU_F16: not yet daemon-routable (mirrors the direct -3 TODO row) */
+            }
+        }
+        int rc = ok ? orkd_submit_seq(c->daemon, n, so) : -3;
+        free(so);
+        return rc;
+    }
     ork_mm_task_i8 batch[ORK_SEQ_HWBATCH]; int nb=0, bdom=0, bdt=0;
     int ret=0;
     /* Flush the accumulated HW run as ONE doorbell submit (begin_mc owns its own mode enter). A run is one
