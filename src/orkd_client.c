@@ -184,6 +184,44 @@ int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const vo
     return hh.rc;
 }
 
+/* int4 pack/run (Path B increment 3). int4 values live byte-per-value in int8 ([-8,7]) so the wire is IDENTICAL
+ * to int8 (A=M*K bytes, C=M*N*4); only dtype=ORKD_DT_I4 differs, telling orkd to ork_mm_pack_i4 / ork_mm_run_i4. */
+uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B){
+    if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
+    uint32_t bytes = (uint32_t)((size_t)K * N);
+    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I4; pk.bytes = bytes;
+    struct orkd_hdr h = { ORKD_PACK, (uint32_t)(sizeof pk + bytes), 3 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &pk, sizeof pk) || wn(c->fd, B, bytes)) return 0;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return 0;
+    if (rh.type != ORKD_PACK_OK){ if (rh.len) cdrain(c->fd, rh.len); return 0; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return 0;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc == 0 ? hh.id : 0;
+}
+
+int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
+    if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
+    uint32_t abytes = (uint32_t)((size_t)M * K);
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes;
+    struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_RUN_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, cbytes = (size_t)M * N * 4;
+    if (hh.rc == 0){
+        if (rh.len < consumed + cbytes){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        if (rn(c->fd, C, cbytes) <= 0) return -1;
+        consumed += cbytes;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id){
     if (!c || c->fd < 0) return -1;
     struct orkd_handle req; memset(&req, 0, sizeof req); req.id = weight_id;

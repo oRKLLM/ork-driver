@@ -124,11 +124,12 @@ static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_pack pk;
     if (readn(cl->fd, &pk, sizeof pk) <= 0) return -1;
     if (pk.bytes == 0 || pk.bytes > ORKD_MAX_BYTES){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EPROTO, "bad pack size"); return 0; }
-    if (pk.dtype != ORKD_DT_I8 && pk.dtype != ORKD_DT_F16){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_ENOSYS, "int8/fp16 only"); return 0; }
+    if (pk.dtype != ORKD_DT_I8 && pk.dtype != ORKD_DT_F16 && pk.dtype != ORKD_DT_I4){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_ENOSYS, "int8/fp16/int4 only"); return 0; }
     int8_t *wbuf = malloc(pk.bytes);
     if (!wbuf){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EOOM, "pack alloc"); return 0; }
     if (readn(cl->fd, wbuf, pk.bytes) <= 0){ free(wbuf); return -1; }
     ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
+             : (pk.dtype == ORKD_DT_I4)  ? ork_mm_pack_i4(npu, (int)pk.K, (int)pk.N, wbuf)
                                          : ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
     free(wbuf);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
@@ -251,6 +252,7 @@ static void dispatch_one(ork_npu *npu, struct client *cl, int nc){
     const void *Aoff = (const char *)w->A + (size_t)w->m0 * w->K * esz;   /* A byte-offset (int8=1B, fp16=2B/elem) */
     int32_t *Coff = w->C + (size_t)w->m0 * w->N;                          /* C elem-offset (int32/fp32 both 4B) */
     int r = (w->dtype == ORKD_DT_F16) ? ork_mm_run(npu, ow, q, (const ork_f16 *)Aoff, (float *)Coff)
+          : (w->dtype == ORKD_DT_I4)  ? ork_mm_run_i4(npu, ow, q, (const int8_t *)Aoff, Coff)
                                       : ork_mm_run_i8(npu, ow, q, (const int8_t *)Aoff, Coff);
     if (zc2) ork_npu_set_core_budget(npu, 0);
     if (r && !w->rc) w->rc = r;
