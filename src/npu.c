@@ -10358,6 +10358,93 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
     return rr;
 }
 
+/* STAGE 1 PROBE — heterogeneous NONBLOCK chain on the begin_mc RECIPE (not chain_progs). Builds [matmul ->
+ * ewmul(int8 SDP, middle) -> matmul] as ONE core's PC-chain in mrc[0]/maf[0] + a warmed OUTPUT scratch (fresh
+ * bcreate + clean-before, exactly like begin_mc's cold mcc — the 79f809c coherency fix that chain_progs never
+ * got), NONBLOCK submit (ping-pong OFF for the SDP), completion via the TERMINAL matmul's int32 sentinel poll.
+ * Proves the SDP-doorbell mechanism produces bit-exact matmul AND ewmul output (the thing the chain_progs-based
+ * nb probe could not — its matmuls were empty on the superseded fresh-buffer path). *ok = all three bit-exact. */
+int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
+    if(ok)*ok=0;
+    if(!c||!ork_ppu_fuse_enabled(c)) return -3;
+    int fd=c->fd, M=8, K=512, N=64, mult=0x4000, shift=14, CBUF=c->soc->cbuf_elems;
+    #define SEWC(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    if(mc_ensure(c,1)) return -1;
+    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    /* pack an all-ones int8 weight [K,N] -> C = K everywhere */
+    int8_t *wb=malloc((size_t)K*N); if(!wb) return -2; for(int i=0;i<K*N;i++) wb[i]=1;
+    ork_w *w=ork_mm_pack_i8(c,K,N,wb); free(wb); if(!w) return -2;
+    uint32_t wdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+    /* ewmul inputs + CPU ref (int8) */
+    int8_t r1[512],s1[512],ref1[512]; uint32_t g=555;
+    for(int i=0;i<M*N;i++){ r1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; s1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; }
+    for(int i=0;i<M*N;i++){ long v=lround((long)r1[i]*s1[i]*mult/(double)(1<<shift)); ref1[i]=(int8_t)(v>127?127:v<-128?-128:v); }
+    /* stage into maf[0]: matmul A [M,K] all-ones @0 (shared by both matmuls); ewmul A/B cube-laid after it */
+    struct buf *AF=&c->maf[0], *RC=&c->mrc[0];
+    size_t offA=0, offEwA=(size_t)M*K, offEwB=offEwA+(size_t)M*N;
+    if(offEwB+(size_t)M*N > AF->size) { return -2; }
+    memset(AF->cpu,0,offEwB+(size_t)M*N);
+    { int8_t*a=(int8_t*)AF->cpu; for(int i=0;i<M*K;i++) a[offA+i]=1;
+      for(int m=0;m<M;m++)for(int n=0;n<N;n++){ a[offEwA+SEWC(m,n)]=r1[m*N+n]; a[offEwB+SEWC(m,n)]=s1[m*N+n]; } }
+    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* output scratch: matmul0 [M,N]i32 @0, ewmul [M,N]i8 @2048, matmul2 [M,N]i32 @2560 */
+    size_t oMM0=0, oEW=(size_t)M*N*4, oMM2=oEW+(size_t)M*N;
+    struct buf OUT=bcreate(fd,8192,0x403,c->dom_active); if(!OUT.cpu) return -2;
+    memset(OUT.cpu,0,8192);
+    uint32_t o0=(uint32_t)(OUT.dma+oMM0), oe=(uint32_t)(OUT.dma+oEW), o2=(uint32_t)(OUT.dma+oMM2);
+    /* build 3 programs at 224-word (64B-aligned) slots in mrc[0] */
+    uint32_t *base=(uint32_t*)RC->cpu; memset(base,0,3*(size_t)REGCMD_I8_N*4);
+    uint32_t am=(uint32_t)(AF->dma+offA);
+    { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
+      synth_i8(rc,M,K,N,am,wdma,o0,1,CBUF,0);                                  /* prog0 matmul -> o0 */
+      uint64_t nx=RC->dma + (size_t)1*REGCMD_I8_N*4; int amt=(69+3)/2;         /* -> prog1 (SDP regcfg 69) */
+      rc[216]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[217]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
+      rc[218]=0x0014|((uint32_t)amt<<16);         rc[219]=(0x0101u<<16);
+      memcpy(base+0*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
+    { uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc); set_mul_geom(rc,REGCMD_MUL_N,M,N);
+      setr(rc,REGCMD_MUL_N,0x1001,0x4020,oe); setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)(AF->dma+offEwA)); setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)(AF->dma+offEwB));
+      setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
+      setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0);
+      uint64_t nx=RC->dma + (size_t)2*REGCMD_I8_N*4; int amt=(108+3)/2;        /* -> prog2 (matmul regcfg 108) */
+      rc[138]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[139]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
+      rc[140]=0x0014|((uint32_t)amt<<16);         rc[141]=(0x0101u<<16);
+      memcpy(base+1*REGCMD_I8_N, rc, REGCMD_MUL_N*4); }
+    { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
+      synth_i8(rc,M,K,N,am,wdma,o2,1,CBUF,0);                                  /* prog2 matmul -> o2 (TERMINAL) */
+      memcpy(base+2*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
+    bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->mtk[0].cpu; memset(tk,0,3*sizeof *tk);
+    tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=(uint32_t)(RC->dma+0*REGCMD_I8_N*4);
+    tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=(uint32_t)(RC->dma+1*REGCMD_I8_N*4);
+    tk[2].enable_mask=0xd;  tk[2].int_mask=0x300; tk[2].int_clear=0x1ffff; tk[2].regcfg_amount=108; tk[2].regcmd_addr=(uint32_t)(RC->dma+2*REGCMD_I8_N*4);
+    bsync(fd,&c->mtk[0],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    /* clean-before: whole OUT to DRAM (no dirty CPU line evicts over the NPU writes — begin_mc's cold recipe) */
+    bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* seed the TERMINAL matmul (prog2 @ o2) last-col-per-row int32 sentinel */
+    volatile int32_t *t2=(volatile int32_t*)((char*)OUT.cpu+oMM2);
+    for(int m=0;m<M;m++){ volatile int32_t*db=&t2[(size_t)m*N+(N-1)]; *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    struct rknpu_submit s; memset(&s,0,sizeof s);
+    s.flags=0x1u|0x2u;   /* PC | NONBLOCK; ping-pong OFF (SDP present) */
+    s.task_number=3; s.task_obj_addr=c->mtk[0].obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=mm_timeout_ms();
+    s.subcore_task[0]=(struct rknpu_subcore_task){0,3};
+    int e=rknpu_submit_ioctl(fd,&s,c->dom_active);
+    int okall=0;
+    if(e==0){ double t0=ork_now_us(); int landed=0;
+        for(;;){ int done=1; for(int m=0;m<M;m++){ volatile int32_t*db=&t2[(size_t)m*N+(N-1)]; __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){done=0;break;} } if(done){landed=1;break;} if(ork_now_us()-t0>3e6)break; }
+        if(landed){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE);
+            int32_t*c0=(int32_t*)((char*)OUT.cpu+oMM0), *c2=(int32_t*)((char*)OUT.cpu+oMM2); int8_t*ew=(int8_t*)((char*)OUT.cpu+oEW);
+            int n0=0,n2=0,ne=0;
+            for(int i=0;i<M*N;i++){ if(c0[i]==K)n0++; if(c2[i]==K)n2++; }
+            for(int m=0;m<M;m++)for(int n=0;n<N;n++) if(ew[SEWC(m,n)]==ref1[m*N+n]) ne++;
+            if(getenv("ORK_SEQ_DBG")) fprintf(stderr,"[seq-hetero] matmul0 #==K=%d/%d  ewmul #match=%d/%d  matmul2 #==K=%d/%d\n",n0,M*N,ne,M*N,n2,M*N);
+            okall = (n0==M*N) && (ne==M*N) && (n2==M*N); } }
+    if(ok)*ok=okall;
+    bdestroy(fd,&OUT);
+    #undef SEWC
+    return e?-1:0;
+}
+
 /* PROBE (int8 SDP on the HW-chain): can a standalone SDP op (ewmul, enable=0x18, regcfg=69) be a MIDDLE program
  * in a PC-chain, walking FORWARD through its next-descriptor? Decode of the vendor's working SDP chain
  * (regcmd_softmax_f16.h SM_TASK0) proved REGCMD_MUL is ALREADY chain-native: its tail (words 138..145) is
