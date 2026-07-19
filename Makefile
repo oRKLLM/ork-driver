@@ -22,7 +22,7 @@ CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activa
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
-COBJ    := $(CORE:.c=.o)
+COBJ    := $(CORE:.c=.o) src/orkd_client.o   # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD). Not in CORE/ATTEST — it's RPC transport, not an NPU-output source.
 # Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
@@ -534,6 +534,11 @@ orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_prot
 # (links orkd_client, not COBJ). Standalone, NOT in `make test` (would contend with direct-NPU examples).
 test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+
+# test_orkd_transparent — Path B: NORMAL ork_npu API, bit-exact direct vs routed-through-orkd (ORK_USE_ORKD).
+# Links COBJ (which now includes orkd_client.o for the transparent route). Board tool, not in `make test`.
+test_orkd_transparent: examples/test_orkd_transparent.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
