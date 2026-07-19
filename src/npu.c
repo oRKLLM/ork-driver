@@ -12440,7 +12440,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
         int ok=1;
         for(int i=0;i<n && ok;i++){ const ork_seq_op *o=&ops[i]; ork_w *w=o->w;
             so[i].kind=(uint32_t)o->kind; so[i].M=o->M; so[i].in_scale=o->in_scale; so[i].out_scale=o->out_scale;
-            so[i].b_scale=o->b_scale; so[i].mult=o->mult; so[i].shift=o->shift;
+            so[i].b_scale=o->b_scale; so[i].mult=o->mult; so[i].shift=o->shift; so[i].group=o->group;
             so[i].A=o->A; so[i].B=o->B; so[i].C=o->C;
             switch(o->kind){
               case ORK_OP_MM_I8:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;

@@ -57,7 +57,7 @@ int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *tasks);
 /* Heterogeneous op-sequence submit (Path B increment 6): ork_submit_seq run on the daemon (batch doorbell-
  * eligible ops onto the spine, break to SW for the rest, resume). The library fills this from its ork_seq_op[]
  * + weight proxies; the shim is pure transport (uses the provided sizes/pointers, no op-kind semantics). */
-typedef struct { uint32_t kind; uint64_t weight_id; int M, N; uint32_t abytes, bbytes, cbytes; int mult, shift; double in_scale, out_scale, b_scale; const void *A, *B; void *C; } orkd_seq_op_c;
+typedef struct { uint32_t kind; uint64_t weight_id; int M, N; uint32_t abytes, bbytes, cbytes; int mult, shift, group; double in_scale, out_scale, b_scale; const void *A, *B; void *C; } orkd_seq_op_c;
 int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *ops);
 
 /* SDP activation ops (Path B increment 4): stateless one-shot on the daemon's NPU. fp16 operands are void*. */
