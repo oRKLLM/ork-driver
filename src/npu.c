@@ -9125,6 +9125,15 @@ struct ork_dyn_chain {
     int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
                                  * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
                                  * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
+    int        mc_nc;           /* DIAG/RECOVER (ork_dyn_begin_mc only; 0 elsewhere): core count for this round */
+    int        mc_rc[8];        /* DIAG: per-core submit-ioctl return code (0 = accepted) */
+    uint64_t   dma_rw0;         /* NPU cumulative dma_rw BEFORE the round; delta = HW work (0 => never dispatched) */
+    /* RECOVER context: ork_dyn_end resubmits the round on a not-dispatched miss (the ~1/4000 concurrent
+     * NONBLOCK dispatch race). c->maf/mrc/mtk[i] still hold the round's data (not reused until end), so the
+     * stashed submits replay it. int8 only (mc_dt); fp16 drains in-submit. */
+    struct rknpu_submit mc_subs[ORK_MAXCORE];
+    int        mc_Pc[ORK_MAXCORE];
+    unsigned   mc_dom; int mc_seed_all; int mc_dt;
 };
 /* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
  * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
@@ -9509,6 +9518,11 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         c->mwarm[i] = 1;
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], w->domain);
     }
+    /* Stash the round context so ork_dyn_end recovers a dropped colsplit round (the M=1 int8 decode path also
+     * hits the ~1/2000 doorbell-drop: one core's N-column slice never lands, leaving its re-seeded sentinel
+     * column = SENT). colsplit is int8-only; hardened (M<=64) = full-surface seed, matching mc_recover_resubmit. */
+    h->mc_nc = nc; h->mc_dt = DT_I8; h->mc_dom = w->domain; h->mc_seed_all = hardened;
+    for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
     return h;
 }
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
@@ -9725,10 +9739,17 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } \
         else { for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } } __asm__ volatile("dsb ish":::"memory"); } while (0)
-    #define ORK_MC_ROUND() do { for (int i = 0; i < nc; i++) if (Pc[i]) { \
+    #define ORK_MC_ROUND() do { h->mc_nc = nc; h->dma_rw0 = ork_npu_dma_rw(c); for (int i = 0; i < nc; i++) if (Pc[i]) { \
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
-        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); } } while (0)
+        subs[i].timeout = mm_timeout_ms(); { int _rc = rknpu_submit_ioctl(fd, &subs[i], dom); if (i < 8) h->mc_rc[i] = _rc; } } } while (0)
+    /* Clean the whole per-op output surface to DRAM (dedup by buffer) so no dirty CPU line can evict over the
+     * NPU's writes; marks the cores warm. Re-runnable (used by the cold clean-before AND the dispatch-recover). */
+    #define ORK_MC_CLEAN() do { struct buf *_cl[1024]; int _ncl = 0; \
+        for (int x = 0; x < S; x++) { struct buf *b = h->outbuf[x]; int seen = 0; \
+            for (int j = 0; j < _ncl; j++) if (_cl[j] == b) seen = 1; \
+            if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (_ncl < 1024) _cl[_ncl++] = b; } } \
+        for (int i = 0; i < nc; i++) c->mwarm[i] = 1; } while (0)
     int cold = 0; for (int i = 0; i < nc; i++) if (Pc[i] && !c->mwarm[i]) cold = 1;
     /* INTERLEAVE-SAFE (decode/stream, all tasks M<=64): this output surface (per-core scratch or resident C) is
      * reused across doorbell ops interleaved in the decode loop (e.g. run_stream groups between single run_i8),
@@ -9737,23 +9758,20 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * cold path. Prefill (M>64) is not interleaved and keeps cold-only (the per-op full clean costs latency at
      * large M — mirrors colsplit's M<=64 hardening gate). */
     int allsmall = 1; for (int i = 0; i < S; i++) if (tasks[i].M > 64) { allsmall = 0; break; }
-    if (cold || allsmall) {
-        /* COLD FRESH-BUFFER COHERENCY (the real cold bug — NOT a pipeline-warm issue; blocking vs NONBLOCK is
-         * irrelevant). The first cold call writes into a FRESHLY bcreate'd output scratch (c->mcc[i], or a
-         * fresh caller DMA buffer): its CPU cache holds dirty/uninitialized lines. The NPU writes the result
-         * to DRAM, then those dirty lines evict and OVERWRITE ~half of it with zeros -> O0[0]=0, partial-K
-         * look (this is exactly the ORK_ZC_OUT class fixed in 3fad74a: clean-before + invalidate-after). Warm
-         * calls don't hit it because the prior end()'s FROM_DEVICE bsync already invalidated the scratch. The
-         * fp16 branch's ORK_MC_SEED already cleans every element (dc cvac); int8 seeds only last-cols, leaving
-         * the interior dirty. Fix: clean the whole output surface to DRAM BEFORE the round so no dirty CPU line
-         * can evict over the NPU's writes. Then a single NONBLOCK round is correct — no throwaway/dummy round,
-         * no blocking. (end() does the invalidate-after via its FROM_DEVICE bsync.) */
-        struct buf *cleaned[1024]; int ncl = 0;
-        for (int x = 0; x < S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
-            for (int j = 0; j < ncl; j++) if (cleaned[j] == b) seen = 1;
-            if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cleaned[ncl++] = b; } }
-        for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
-    }
+    /* COLD FRESH-BUFFER COHERENCY (the real cold bug — NOT a pipeline-warm issue; blocking vs NONBLOCK is
+     * irrelevant). The first cold call writes into a FRESHLY bcreate'd output scratch (c->mcc[i], or a fresh
+     * caller DMA buffer): its CPU cache holds dirty/uninitialized lines. The NPU writes the result to DRAM,
+     * then those dirty lines evict and OVERWRITE ~half of it with zeros (the ORK_ZC_OUT class, fixed in
+     * 3fad74a: clean-before + invalidate-after). Also forced EVERY round in the interleaved decode/stream
+     * regime (allsmall = all M<=64): a reused output surface can hold a dirty CPU line that evicts over the
+     * NPU write and resurrects a mid/last-col SENT (test_stream_interleave). Prefill (M>64) is cold-only. */
+    if (cold || allsmall) ORK_MC_CLEAN();
+    /* Stash the round context so ork_dyn_end can RESUBMIT it on a not-dispatched miss (the ~1/4000 concurrent
+     * NONBLOCK dispatch race; see mc_recover_resubmit + the ork_dyn_end recover loop). int8 only (fp16 drains
+     * in-submit below). c->maf/mrc/mtk[i] hold this round's data and aren't reused until end(), so a resubmit
+     * from the stashed subs[] is valid. */
+    h->mc_dom = dom; h->mc_seed_all = seed_all; h->mc_dt = dt;
+    for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
     ORK_MC_SEED();
     ORK_MC_ROUND();   /* single NONBLOCK round, cold or warm (the doorbell win) */
     if (dt == DT_F16) {
@@ -9952,6 +9970,29 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
     rcp[218] = 0x0014;   /* 0x0014 | amount 0 => sequencer stops after program `at` */
     __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
     return 0; }
+/* Resubmit an mc int8 round whose outputs never landed. The concurrent per-core NONBLOCK dispatch occasionally
+ * DROPS the whole round (every submit returns rc=0, yet no output sentinel ever clears — the ~1/2000-4000
+ * intermittent race; note dma_rw/int_status read 0-always on this kernel so "not dispatched" can't be proven,
+ * only "never landed"). RESET clears the lost dispatch/job state, then re-clean (cold coherency) + re-seed +
+ * resubmit from the stashed per-core submits (c->maf/mrc/mtk[i] still hold this round's program — the chain owns
+ * them until end()). int8 only; validated bit-exact by tools/mc_miss_repro. */
+static void mc_recover_resubmit(ork_dyn_chain *h){
+    ork_npu *c = h->c; int fd = c->fd;
+    struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+    { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }   /* let the reset fully settle before resubmit — a resubmit into a not-yet-quiesced NPU re-drops (sticky miss) */
+    struct buf *cl[1024]; int ncl = 0;                                    /* re-clean output surfaces to DRAM */
+    for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
+        for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
+        if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
+    for (int x = 0; x < h->S; x++) { int Mx = h->oM[x]?h->oM[x]:1, Nx = h->nout[x]?h->nout[x]/Mx:h->N;   /* re-seed sentinels */
+        if (h->mc_seed_all) for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+n); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+        else for (int m=0;m<Mx;m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+(Nx-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        h->mc_subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }
+}
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     /* SPIN TEARDOWN (safety): a persistent spin tail keeps re-reading the scratch/regcmd after the real outputs
@@ -9967,25 +10008,42 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     }
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
-    double t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
     g_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on g_ork_term and drains before the process ends */
-    int edone[1024]; for (int i = 0; i < h->S; i++) edone[i] = 0;   /* per-entry done cache: stop re-polling (re-civac'ing) a core once it's complete */
-    for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
-        if (n >= h->S) break;                               /* all tasks, all rows */
-        if (g_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
-        /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
-         * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
-         * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
-        if (n != lastn) { lastn = n; lastchg = ork_now_us(); }
-        else if (!h->mc && ork_now_us() - lastchg > 500.0) break;   /* single-core only: no progress => halted */
-        double el = ork_now_us() - t0;
-        if (el > 3e6) break;
-        /* HEAVY-JOB BACKOFF: after a tight window that fully covers dispatch-bound work (decode ~<1ms), sleep
-         * briefly between polls so the busy-poll's per-row civac stops contending with a large NPU writeback
-         * (the M>1 prefill regression: M=256 was 2.8x slower under a pure spin). Decode stays tight (el<1ms =>
-         * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
-        if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
-    int last = ork_dyn_progress(h);
+    int edone[1024];
+    int last = -1;
+    int recov_max = (h->mc_nc > 0 && h->mc_dt == DT_I8) ? 6 : 0;   /* only an mc int8 round can be resubmitted (context stashed in h); a few retries clear a sticky/correlated drop */
+    double t0 = ork_now_us();
+    for (int recov = 0; ; recov++) {
+        t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
+        for (int i = 0; i < h->S; i++) edone[i] = 0;   /* per-entry done cache: stop re-polling (re-civac'ing) a core once it's complete */
+        /* miss-detection timeout: a real mc int8 stream/decode op lands well under 300ms, so a sentinel still
+         * stuck at that mark is the dropped-round miss (detect fast, resubmit cheap). Non-recoverable chains
+         * (single-core, fp16, exhausted retries) keep the full 3s completion wait. */
+        double miss_to = (recov < recov_max) ? 300000.0 : 3e6;
+        for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
+            if (n >= h->S) break;                               /* all tasks, all rows */
+            if (g_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
+            /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
+             * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
+             * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
+            if (n != lastn) { lastn = n; lastchg = ork_now_us(); }
+            else if (!h->mc && ork_now_us() - lastchg > 500.0) break;   /* single-core only: no progress => halted */
+            double el = ork_now_us() - t0;
+            if (el > miss_to) break;
+            /* HEAVY-JOB BACKOFF: after a tight window that fully covers dispatch-bound work (decode ~<1ms), sleep
+             * briefly between polls so the busy-poll's per-row civac stops contending with a large NPU writeback
+             * (the M>1 prefill regression: M=256 was 2.8x slower under a pure spin). Decode stays tight (el<1ms =>
+             * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
+            if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        last = ork_dyn_progress(h);
+        if (last >= h->S - 1 || g_ork_term) break;            /* all done, or interrupted */
+        if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */
+            if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER] mc int8 round output never landed (attempt %d) — reset + resubmit\n", recov);
+            mc_recover_resubmit(h);
+            continue;
+        }
+        break;   /* recovery exhausted / not recoverable -> fall through to trace + auto-dump */
+    }
     if (getenv("ORK_DYN_TRACE")) { double _el = ork_now_us() - t0; int _nd = 0; for (int i = 0; i < h->S; i++) _nd += edone[i];
         fprintf(stderr, "[dyn_end] S=%d mc=%d done=%d/%d last=%d elapsed=%.0fus %s\n", h->S, h->mc, _nd, h->S, last, _el,
             _nd < h->S ? "INCOMPLETE(timeout/term)" : "all-done");
@@ -9997,7 +10055,16 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
      * dispatch/completion failure — capture the stuck-descriptor post-mortem before the state is lost. Skip
      * intentionally-truncated chains (spin_end = bulk-terminated by design). This is the forcing function:
      * every path we move onto the spine auto-reports its misses, pointing at the doorbell fix. */
-    if (last < h->S - 1 && !h->spin_end) ork_dyn_dump(h, "ork_dyn_end incomplete (doorbell miss)");
+    if (last < h->S - 1 && !h->spin_end) {
+        if (h->mc_nc > 0) {   /* DIAG: per-core submit rc (all 0 = the accepted-but-never-dispatched doorbell-drop, after
+                               * mc_recover_resubmit's retries also failed). NOTE: dma_rw/int_status read 0-always on this
+                               * kernel, so they are NOT diagnostic — the output sentinel (this miss) is the only signal. */
+            fprintf(stderr, "[MC-DIAG] nc=%d submit_rc=[", h->mc_nc);
+            for (int i = 0; i < h->mc_nc && i < 8; i++) fprintf(stderr, "%d ", h->mc_rc[i]);
+            fprintf(stderr, "] (recover exhausted; dma_rw/int_status unreliable on this kernel)\n");
+        }
+        ork_dyn_dump(h, "ork_dyn_end incomplete (doorbell miss)");
+    }
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
