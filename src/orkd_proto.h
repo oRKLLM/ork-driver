@@ -56,8 +56,9 @@ enum orkd_msg_type {
 
 /* dtype for orkd_pack.dtype (wire-stable; decoupled from the library's internal enum). #2b-1 = int8 only. */
 enum orkd_dtype {
-    ORKD_DT_I8  = 1,   /* int8 A·B -> int32 C (ork_mm_pack_i8 / ork_mm_run_i8) */
-    ORKD_DT_F16 = 2,   /* fp16 -> fp32 (not yet wired) */
+    ORKD_DT_I8  = 1,   /* int8 A·B -> int32 C  (ork_mm_pack_i8  / ork_mm_run_i8)  — A=M*K bytes, C=M*N*4 */
+    ORKD_DT_F16 = 2,   /* fp16 A·B -> fp32 C   (ork_mm_pack     / ork_mm_run)     — A=M*K*2 bytes, C=M*N*4 */
+    ORKD_DT_I4  = 3,   /* int4 A·B -> int32 C  (ork_mm_pack_i4  / ork_mm_run_i4)  — int4 in int8 [-8,7], wire = int8 */
 };
 
 /* error codes carried in orkd_error.code */

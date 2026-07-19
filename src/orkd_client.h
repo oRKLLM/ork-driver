@@ -45,6 +45,10 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);
 int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C);
 
+/* int4 counterparts (Path B increment 3): int4 in int8 [-8,7], C is int32 (wire = int8). */
+uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B);
+int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+
 /* Like orkd_run_i8 but A is passed BY REFERENCE: placed in a shared dma-buf and read zero-copy by the NPU
  * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */
 int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);

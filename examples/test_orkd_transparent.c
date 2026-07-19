@@ -13,6 +13,7 @@
 #include <stdlib.h>
 static uint32_t g = 7;
 static int8_t  r8(void){ g = g*1103515245u + 12345u; return (int8_t)(((g>>16)&0x7f) - 40); }
+static int8_t  r4(void){ g = g*1103515245u + 12345u; return (int8_t)(((g>>18)&0xf) - 8); }              /* int4 [-8,7] */
 static ork_f16 rf(void){ g = g*1103515245u + 12345u; return (ork_f16)((float)((int)((g>>17)&0xff) - 128) / 96.0f); }
 
 static int one_i8(ork_npu *c, int M, int K, int N){
@@ -46,6 +47,21 @@ static int one_f16(ork_npu *c, int M, int K, int N){
     free(A); free(B); free(C); free(ref);
     return bad ? 1 : 0;
 }
+static int one_i4(ork_npu *c, int M, int K, int N){
+    int8_t *A = malloc((size_t)M*K), *B = malloc((size_t)K*N);
+    int32_t *C = malloc((size_t)M*N*4), *ref = malloc((size_t)M*N*4);
+    g = 7; for (int i=0;i<M*K;i++) A[i]=r4(); for (int i=0;i<K*N;i++) B[i]=r4();
+    for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; ref[m*N+n]=(int)a; }
+    ork_w *w = ork_mm_pack_i4(c, K, N, B);
+    int bad = 0;
+    if (!w){ printf("  i4 pack FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
+    else { int rc = ork_mm_run_i4(c, w, M, A, C); ork_mm_free(c, w);
+        if (rc){ printf("  i4 run FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rc); bad = 1; }
+        else for (int i=0;i<M*N;i++) if (C[i]!=ref[i]){ if (bad<3) printf("  i4 MISMATCH M=%d K=%d N=%d [%d] %d!=%d\n", M,K,N,i,C[i],ref[i]); bad++; } }
+    if (!bad) printf("  ok i4  M=%d K=%d N=%d\n", M, K, N);
+    free(A); free(B); free(C); free(ref);
+    return bad ? 1 : 0;
+}
 int main(void){
     ork_npu *c = ork_npu_init();
     if (!c){ printf("init FAIL\n"); return 1; }
@@ -58,6 +74,9 @@ int main(void){
     bad |= one_f16(c, 8, 128, 64);
     bad |= one_f16(c, 1, 64, 32);
     bad |= one_f16(c, 64, 512, 64);
+    bad |= one_i4 (c, 8, 64, 64);
+    bad |= one_i4 (c, 1, 64, 64);
+    bad |= one_i4 (c, 32, 128, 64);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
