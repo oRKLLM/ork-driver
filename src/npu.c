@@ -6157,9 +6157,19 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    /* NONBLOCK DOORBELL (spine uniformity + system latency): a blocking submit stalls this thread in-kernel for
+     * the whole op (uninterruptible, D-state-wedge-prone; in orkd it also blocks servicing other clients).
+     * Submit NONBLOCK with ping-pong OFF, and detect completion by a FULL-SURFACE poll of the fp16 output seeded
+     * with an out-of-range poison (inf = 0x7c00, impossible for a bounded ewmul). fp16 write-order isn't
+     * last-element-last, so poll the WHOLE cube (the int4/matmul poll technique). No timer — the poison is a real
+     * completion signal. (int8 SDP output has no free poison value; those need a trailing witness task instead.) */
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); *db=0x7c00; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ double cap=(double)ew_timeout_ms()*1000.0;
+        for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
@@ -6960,9 +6970,14 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+    /* NONBLOCK DOORBELL (spine uniformity): ping-pong OFF + full-surface fp16 inf-poison poll — see ork_npu_ewmul_f16. */
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); *db=0x7c00; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+    __asm__ volatile("dsb ish":::"memory");
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,-1)){ double cap=(double)ew_timeout_ms()*1000.0;
+        for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
+        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     /* scratch persists (ppu_scratch3) — not destroyed */
