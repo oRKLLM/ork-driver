@@ -49,6 +49,14 @@ int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const vo
 uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B);
 int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* SDP activation ops (Path B increment 4): stateless one-shot on the daemon's NPU. fp16 operands are void*. */
+int orkd_silu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);
+int orkd_gelu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);
+int orkd_ewmul_i8(orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, int mult, int shift, int8_t *out);
+int orkd_ewmul_f16(orkd_conn *c, const void *a, const void *b, int M, int N, void *out);
+int orkd_add_i8  (orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, double a_scale, double b_scale, double out_scale, int8_t *out);
+int orkd_add_f16 (orkd_conn *c, const void *a, const void *b, int M, int N, void *out);
+
 /* Like orkd_run_i8 but A is passed BY REFERENCE: placed in a shared dma-buf and read zero-copy by the NPU
  * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */
 int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);

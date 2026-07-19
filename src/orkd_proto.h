@@ -51,7 +51,20 @@ enum orkd_msg_type {
     ORKD_DMABUF_OK    = 33, /* daemon->client: {orkd_dmabuf} echo — rc=0 + checksum orkd computed from the shared buffer */
     ORKD_RUN_ZC       = 34, /* client->daemon: {orkd_run} + A dma-buf fd (SCM_RIGHTS): A read ZERO-COPY in place; reply RUN_OK + C bytes */
     ORKD_RUN_ZC2      = 35, /* client->daemon: {orkd_run} + [A_fd, C_fd] (SCM_RIGHTS): A read + C WRITTEN zero-copy in place; reply RUN_OK, NO C payload */
+    /* ---- SDP activation ops (stateless one-shot: no resident weight) ---- */
+    ORKD_SDP          = 36, /* client->daemon: {orkd_sdp} + nin input payloads -> run silu/gelu/ewmul/add on the NPU */
+    ORKD_SDP_OK       = 37, /* daemon->client: {orkd_handle} + output payload (M*N*out_esz) when rc==0 */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
+};
+
+/* SDP op selector for orkd_sdp.op. Only the bit-exact-class ops are wired (int16 silu/add are experimental). */
+enum orkd_sdp_op {
+    ORKD_SDP_SILU_I8   = 1,   /* unary  i8->i8  (ork_npu_silu_i8:  in_scale,out_scale) */
+    ORKD_SDP_GELU_I8   = 2,   /* unary  i8->i8  (ork_npu_gelu_i8:  in_scale,out_scale) */
+    ORKD_SDP_EWMUL_I8  = 3,   /* binary i8->i8  (ork_npu_ewmul_i8: mult,shift)         */
+    ORKD_SDP_EWMUL_F16 = 4,   /* binary f16->f16(ork_npu_ewmul_f16: no scale)          */
+    ORKD_SDP_ADD_I8    = 5,   /* binary i8->i8  (ork_npu_add_i8:   a_scale,b_scale,out_scale) */
+    ORKD_SDP_ADD_F16   = 6,   /* binary f16->f16(ork_npu_add_f16:  no scale)           */
 };
 
 /* dtype for orkd_pack.dtype (wire-stable; decoupled from the library's internal enum). #2b-1 = int8 only. */
@@ -102,6 +115,17 @@ struct orkd_run {
 struct orkd_handle {
     uint64_t id;         /* weight id / result marker */
     int32_t  rc;         /* 0 ok, <0 error */
+    uint32_t pad;
+};
+struct orkd_sdp {        /* stateless SDP op: nin input payloads follow (each M*N*in_esz), reply carries M*N*out_esz */
+    uint32_t op;         /* enum orkd_sdp_op */
+    uint32_t M, N;
+    uint32_t nin;        /* 1 = unary (silu/gelu), 2 = binary (ewmul/add) */
+    uint32_t in_esz;     /* input element size (1 int8, 2 fp16) */
+    uint32_t out_esz;    /* output element size */
+    int32_t  mult, shift;    /* ewmul_i8 requant */
+    double   in_scale, out_scale, a_scale, b_scale;   /* silu/gelu use in/out; add uses a/b/out */
+    uint32_t inbytes;    /* total input payload = nin*M*N*in_esz */
     uint32_t pad;
 };
 struct orkd_error {
