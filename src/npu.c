@@ -3087,6 +3087,22 @@ static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc
 static int run_i4_incr_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* STRATEGY C multi-core, defined below */
 static int run_i4_bchain(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: chain H-row batches, one weight load */
 static int run_i4_cbatch(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: compact-task batch (CBATCH) */
+static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
+int ork_dyn_end(ork_dyn_chain *h);
+/* TASK #4: multi-M int4 onto the NONBLOCK doorbell spine. Decompose the M rows of one int4 weight into a chain
+ * of M=1 int4 programs distributed across cores via ork_dyn_begin_mc_i4 (the validated M=1 int4 doorbell: full-
+ * surface int16 seed+poll, int16->int32 widen, and — task #4 — the same drop-recover as int8). Bit-identical to
+ * per-row. Single-slice only (the doorbell's envelope); returns -4 (caller falls back to blocking run_i4_mc) for
+ * wide-N/K or when the M-program chain doesn't fit the per-core regcmd/task buffers. */
+static int run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+    ork_mm_task_i8 *tk = malloc((size_t)M * sizeof *tk); if(!tk) return -4;
+    for(int m=0;m<M;m++) tk[m]=(ork_mm_task_i8){ w, 1, A + (size_t)m*w->K, C + (size_t)m*w->N };
+    ork_dyn_chain *h = ork_dyn_begin_mc_i4(c, M, tk, nc);
+    free(tk);
+    if(!h) return -4;   /* shape/buffer limit -> caller uses blocking run_i4_mc */
+    int d = ork_dyn_end(h);
+    return (d == M-1) ? 0 : -1;
+}
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd) return orkd_run_i4(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: int4 run on the daemon */
     if(!w||w->dtype!=DT_I4) return -1;
@@ -3104,6 +3120,10 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(bchain && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_bchain(c,w,M,A,C); if(r!=-4) return r; }
     static int cbatch=-1; if(cbatch<0){const char*e=getenv("ORK_I4_CBATCH"); cbatch=(e&&atoi(e))?1:0;}
     if(cbatch && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_cbatch(c,w,M,A,C); if(r!=-4) return r; }
+    /* TASK #4 DEFAULT: multi-M int4 rides the doorbell spine (per-row chain via ork_dyn_begin_mc_i4). ORK_I4_NODB=1
+     * reverts to the blocking run_i4_mc. Single-slice only; -4 => fall back (wide-N/K or chain too big for buffers). */
+    static int i4db=-1; if(i4db<0){const char*e=getenv("ORK_I4_NODB"); i4db=(e&&atoi(e))?0:1;}
+    if(i4db && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -9397,6 +9417,10 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
+    /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
+     * esz==2 branch of mc_recover_resubmit re-seeds the full int16 surface). */
+    h->mc_nc = nc; h->mc_dt = DT_I4; h->mc_dom = dom;
+    for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
 }
 
@@ -9975,7 +9999,7 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
  * intermittent race; note dma_rw/int_status read 0-always on this kernel so "not dispatched" can't be proven,
  * only "never landed"). RESET clears the lost dispatch/job state, then re-clean (cold coherency) + re-seed +
  * resubmit from the stashed per-core submits (c->maf/mrc/mtk[i] still hold this round's program — the chain owns
- * them until end()). int8 only; validated bit-exact by tools/mc_miss_repro. */
+ * them until end()). int8 (esz=4, int32 SENT) AND int4 (esz=2, full-surface int16 SENT16); validated by mc_miss_repro. */
 static void mc_recover_resubmit(ork_dyn_chain *h){
     ork_npu *c = h->c; int fd = c->fd;
     struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
@@ -9984,7 +10008,10 @@ static void mc_recover_resubmit(ork_dyn_chain *h){
     for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
         for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
         if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
-    for (int x = 0; x < h->S; x++) { int Mx = h->oM[x]?h->oM[x]:1, Nx = h->nout[x]?h->nout[x]/Mx:h->N;   /* re-seed sentinels */
+    if (h->esz == 2) {   /* int4: int16 output, full-surface SENT16 (write-order not last-col-last) */
+        for (int x = 0; x < h->S; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+            for (int e = 0; e < no; e++){ o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
+    } else for (int x = 0; x < h->S; x++) { int Mx = h->oM[x]?h->oM[x]:1, Nx = h->nout[x]?h->nout[x]/Mx:h->N;   /* re-seed sentinels */
         if (h->mc_seed_all) for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+n); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
         else for (int m=0;m<Mx;m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+(Nx-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
@@ -10011,7 +10038,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     g_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on g_ork_term and drains before the process ends */
     int edone[1024];
     int last = -1;
-    int recov_max = (h->mc_nc > 0 && h->mc_dt == DT_I8) ? 6 : 0;   /* only an mc int8 round can be resubmitted (context stashed in h); a few retries clear a sticky/correlated drop */
+    int recov_max = (h->mc_nc > 0 && (h->mc_dt == DT_I8 || h->mc_dt == DT_I4)) ? 6 : 0;   /* mc int8/int4 rounds carry stashed context to resubmit; a few retries clear a sticky/correlated drop */
     double t0 = ork_now_us();
     for (int recov = 0; ; recov++) {
         t0 = ork_now_us(); int lastn = -1; double lastchg = t0;

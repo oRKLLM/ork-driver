@@ -33,6 +33,19 @@ int main(void){
     signal(SIGALRM,watchdog); alarm(60);
     ork_npu *c=ork_npu_init(); if(!c){ printf("no NPU\n"); return 0; }
     if(getenv("ORK_REPRO_NC1") && atoi(getenv("ORK_REPRO_NC1"))){ ork_npu_set_core_budget(c,1); printf("  (NC1: core_budget forced to 1 -> single-core rounds)\n"); }
+    if(getenv("ORK_REPRO_I4") && atoi(getenv("ORK_REPRO_I4"))){   /* TASK #4: stress the multi-M int4 doorbell route */
+        int M=16,K=512,N=256; int8_t *A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t *C=malloc((size_t)M*N*4),*R=malloc((size_t)M*N*4);
+        uint32_t s=7; for(int i=0;i<M*K;i++)A[i]=(int8_t)(((s=s*1103515245u+12345u)>>18&0xf))-8; for(int i=0;i<K*N;i++)B[i]=(int8_t)(((s=s*1103515245u+12345u)>>18&0xf))-8;
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)A[m*K+k]*B[k*N+n];R[m*N+n]=(int)a;}
+        ork_w *w=ork_mm_pack_i4(c,K,N,B); if(!w){printf("i4 pack failed\n");return 1;}
+        printf("  (I4 mode: %d iters of int4 M=%d K=%d N=%d via doorbell)\n", iters, M, K, N);
+        for(int it=0; it<iters; it++){ g_iter=it;
+            int rc=ork_mm_run_i4(c,w,M,A,C); int bad = rc?1:0;
+            if(!bad) for(int i=0;i<M*N;i++) if(C[i]!=R[i]){ fprintf(stderr,"i4 MISMATCH @iter=%d [%d] got=%d want=%d\n",it,i,C[i],R[i]); bad=1; break; }
+            if(bad){ fprintf(stderr,"*** i4 FIRST MISS at iter %d (rc=%d) ***\n",it,rc); ork_npu_free(c); return 1; }
+            alarm(60); if(it && it%500==0){ printf("  ok through iter %d\n",it); fflush(stdout); } }
+        printf("SURVIVED %d iters with NO miss (int4)\n", iters); ork_npu_free(c); return 0;
+    }
     int8_t *A=calloc(2048,1); for(int i=0;i<2048;i++) A[i]=(int8_t)((i*7+3)&0x3f);
     WT o,q,k,v,g,u;
     mk(c,&o,2048,2048,A); mk(c,&q,2048,2048,A); mk(c,&k,2048,1024,A); mk(c,&v,2048,1024,A);
