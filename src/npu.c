@@ -24,6 +24,7 @@
 #include <dlfcn.h>
 #include <signal.h>
 #include "rknpu_ioctl.h"
+#include "orkd_client.h"   /* Path B: transparent orkd client routing (gated by ORK_USE_ORKD) */
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
 #include "regcmd_i4.h"
@@ -131,7 +132,7 @@ struct ork_dom_scratch {
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget;
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
@@ -194,7 +195,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
@@ -1327,6 +1328,15 @@ int ork_npu_force_fault(ork_npu *c){
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
+    /* Path B: transparent orkd client. ORK_USE_ORKD set (and not the daemon itself, which sets ORKD_IS_DAEMON)
+     * -> connect/auto-spawn orkd and route ork_mm_* through it; NO local NPU open (the daemon owns it). The ops
+     * check c->daemon. Falls back to the direct NPU if the connect fails. */
+    { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
+      if(ud && atoi(ud) && !(isd && atoi(isd))){
+        orkd_conn *dc=orkd_connect();
+        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
+            if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u)\n",orkd_soc_cores(dc)); return c; }
+        fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();
     g_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
@@ -1369,7 +1379,8 @@ static void ssm_pool_free(ork_npu *c);   /* fwd: defined near ork_ssm_scan_f32 *
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 static void ork_npu_xprof_dump(void);
-void ork_npu_free(ork_npu *c){ if(!c)return; int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
+void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
+    int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
     if(g_ork_prof){
@@ -1694,7 +1705,9 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
-ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){ return pack(c,K,N,B,DT_I8);  }
+ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
+    if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; return w; }   /* Path B: pack resident in the daemon */
+    return pack(c,K,N,B,DT_I8);  }
 
 /* ---- int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom) ----
  * A gmax-selected "fp16" layer wants UNQUANTIZED activations (fp16 A, no act-quant error) but does NOT
@@ -2900,6 +2913,7 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4);
  * are VIEWS into a single dedicated buffer (grouped-i4, own_buf_valid=1) reclaim that one buffer. */
 void ork_mm_free(ork_npu *c, ork_w *w){
     if(!w) return;
+    if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w); return; }   /* Path B: free the daemon-resident weight */
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
@@ -4813,6 +4827,7 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
     return run(c,w,M,A,C);
 }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+    if(w && w->is_orkd) return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: run on the daemon */
     if(w->dtype!=DT_I8) return -1;
     if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real

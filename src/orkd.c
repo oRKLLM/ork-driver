@@ -304,6 +304,7 @@ int main(void){
     if (bind(lfd, (struct sockaddr*)&sa, sizeof sa) < 0){ perror("orkd: bind"); return 1; }
     if (listen(lfd, 16) < 0){ perror("orkd: listen"); return 1; }
 
+    setenv("ORKD_IS_DAEMON", "1", 1);          /* Path B: orkd's OWN ork_npu_init takes the DIRECT NPU path, not the client route (no self-loop) */
     setenv("ORK_ZC_OUT", "1", 1);              /* enable output zero-copy: a run whose C is an imported dma-buf
                                                 * (dma_find hit) writes it in place; malloc'd C (socket runs) is
                                                 * a dma_find miss -> unaffected. RUN_ZC2 forces single-core (safe). */
