@@ -553,6 +553,11 @@ test_orkd_multi: tools/test_orkd_multi.c $(COBJ)
 test_orkd_2conn: tools/test_orkd_2conn.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# Multi-consumer SEQ proof: two connections, each submits a grouped op-sequence (board tool, not in `make test`).
+# sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./test_orkd_2conn_seq [iters]
+test_orkd_2conn_seq: tools/test_orkd_2conn_seq.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.
 mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
