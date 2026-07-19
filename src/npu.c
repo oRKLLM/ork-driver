@@ -12054,14 +12054,24 @@ struct ork_seq_class { uint8_t hw; int marker, profile, chain; ork_seq_disp fn; 
 /* --- SW dispatch shims: adapt the generic ork_seq_op to each reliable driver function's signature --- */
 static int seq_disp_i8_mm  (ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i8(c,o->w,o->M,(const int8_t*)o->A,(int32_t*)o->C); }
 static int seq_disp_f16_mm (ork_npu *c,const ork_seq_op *o){ ork_mm_task_f16 t={o->w,o->M,(const f16*)o->A,(float*)o->C}; return ork_mm_run_stream_f16(c,1,&t); }
-static int seq_disp_i4_mm  (ork_npu *c,const ork_seq_op *o){ ork_mm_task_i4 t={o->w,o->M,(const int8_t*)o->A,(int32_t*)o->C}; return ork_mm_run_stream_i4(c,1,&t); }
+static int seq_disp_i4_mm  (ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i4(c,o->w,o->M,(const int8_t*)o->A,(int32_t*)o->C); }   /* multi-M rides the #4 doorbell route inside run_i4 */
 static int seq_disp_ewmul_f16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_ewmul_f16(c,(const f16*)o->A,(const f16*)o->B,o->M,o->N,(f16*)o->C,&us); }
+static int seq_disp_silu_i8 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_silu_i8(c,(const int8_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*)o->C,&us); }
+static int seq_disp_gelu_i8 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_gelu_i8(c,(const int8_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*)o->C,&us); }
+static int seq_disp_ewmul_i8(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_ewmul_i8(c,(const int8_t*)o->A,(const int8_t*)o->B,o->M,o->N,o->mult,o->shift,(int8_t*)o->C,&us); }
+static int seq_disp_add_i8  (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_add_i8(c,(const int8_t*)o->A,(const int8_t*)o->B,o->M,o->N,o->in_scale,o->b_scale,o->out_scale,(int8_t*)o->C,&us); }
+static int seq_disp_add_f16 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_add_f16(c,(const f16*)o->A,(const f16*)o->B,o->M,o->N,(f16*)o->C,&us); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
   /* ORK_OP_MM_I4   */ { 1, 5/*I4_STRM*/,XP_I4_STREAM, OCK_SW, seq_disp_i4_mm    },
-  /* ORK_OP_SILU_F16*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, NULL /*TODO: fp16 SiLU needs a per-(in,out)-scale LUT plumbed through ork_seq_op — ork_npu_probe_silu_std_f16(idx_off,cfg,lut,nlut)*/ },
+  /* ORK_OP_SILU_F16*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, NULL /*TODO: fp16 SiLU needs a per-(in,out)-scale LUT plumbed through ork_seq_op*/ },
   /* ORK_OP_EWMUL_F16*/{ 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_ewmul_f16 },
+  /* ORK_OP_SILU_I8 */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_silu_i8  },
+  /* ORK_OP_GELU_I8 */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_gelu_i8  },
+  /* ORK_OP_EWMUL_I8*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_ewmul_i8 },
+  /* ORK_OP_ADD_I8  */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_add_i8   },
+  /* ORK_OP_ADD_F16 */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_add_f16  },
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
@@ -12090,13 +12100,16 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
         int ok=1;
         for(int i=0;i<n && ok;i++){ const ork_seq_op *o=&ops[i]; ork_w *w=o->w;
             so[i].kind=(uint32_t)o->kind; so[i].M=o->M; so[i].in_scale=o->in_scale; so[i].out_scale=o->out_scale;
+            so[i].b_scale=o->b_scale; so[i].mult=o->mult; so[i].shift=o->shift;
             so[i].A=o->A; so[i].B=o->B; so[i].C=o->C;
             switch(o->kind){
               case ORK_OP_MM_I8:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_F16: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
-              case ORK_OP_EWMUL_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;
-              default: ok=0; break;   /* e.g. SILU_F16: not yet daemon-routable (mirrors the direct -3 TODO row) */
+              case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
+              case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
+              case ORK_OP_EWMUL_I8: case ORK_OP_ADD_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].bbytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 binary SDP */
+              default: ok=0; break;   /* SILU_F16: not yet routable (mirrors the direct -3 TODO row) */
             }
         }
         int rc = ok ? orkd_submit_seq(c->daemon, n, so) : -3;

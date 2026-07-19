@@ -840,6 +840,11 @@ typedef enum {
     ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K] (HOST mem), C int32[M,N]  (HW doorbell if M==1 & single-slice, else SW run_stream_i4) */
     ORK_OP_SILU_F16,    /* fp16 SiLU activation (SDP): A fp16[M,N] -> C fp16[M,N]   (SW SDP; needs LUT — TODO row) */
     ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_npu_ewmul_f16) */
+    ORK_OP_SILU_I8,     /* int8 SiLU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_npu_silu_i8) */
+    ORK_OP_GELU_I8,     /* int8 GELU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_npu_gelu_i8) */
+    ORK_OP_EWMUL_I8,    /* int8 elementwise mul (SDP): A*B i8[M,N] -> C i8[M,N] (mult,shift; SW: ork_npu_ewmul_i8) */
+    ORK_OP_ADD_I8,      /* int8 elementwise add (SDP): A+B i8[M,N] -> C i8[M,N] (a_scale=in,b_scale,out_scale; SW: ork_npu_add_i8) */
+    ORK_OP_ADD_F16,     /* fp16 elementwise add (SDP): A+B f16[M,N] -> C f16[M,N] (SW: ork_npu_add_f16) */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef struct {
@@ -847,9 +852,11 @@ typedef struct {
     ork_w      *w;                 /* matmul weight (NULL for weightless SDP ops) */
     int         M, N;              /* M rows; N is taken from w for matmuls, supplied here for weightless SDP ops */
     const void *A;                 /* primary input (int8/fp16 A, or SDP operand) */
-    const void *B;                 /* second SDP operand (ewmul "up"); NULL otherwise */
+    const void *B;                 /* second SDP operand (ewmul/add); NULL otherwise */
     void       *C;                 /* output */
-    double      in_scale, out_scale;  /* SDP activation scales (LUT ops); ignored by matmul/ewmul kinds */
+    double      in_scale, out_scale;  /* SDP scales: silu/gelu in/out; add uses in_scale as a_scale + b_scale/out_scale */
+    double      b_scale;              /* SDP add: b operand scale (a_scale = in_scale) */
+    int         mult, shift;          /* SDP ewmul_i8 requant (out = clamp(A*B*mult>>shift)) */
 } ork_seq_op;
 /* Run the n-op sequence in order, HW-batching + SW-breaking as above. 0/ok, -1 a submit failed/wedged,
  * -2 bad args, -3 an op-kind whose dispatch is not yet wired (documented TODO row, e.g. SILU_F16). */

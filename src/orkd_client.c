@@ -305,7 +305,8 @@ int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &sh, sizeof sh)) return -1;
     for (int i = 0; i < n; i++){ struct orkd_seq_op w; memset(&w, 0, sizeof w);
         w.kind = o[i].kind; w.M = (uint32_t)o[i].M; w.N = (uint32_t)o[i].N; w.weight_id = o[i].weight_id;
-        w.abytes = o[i].abytes; w.bbytes = o[i].bbytes; w.cbytes = o[i].cbytes; w.in_scale = o[i].in_scale; w.out_scale = o[i].out_scale;
+        w.abytes = o[i].abytes; w.bbytes = o[i].bbytes; w.cbytes = o[i].cbytes;
+        w.mult = o[i].mult; w.shift = o[i].shift; w.in_scale = o[i].in_scale; w.out_scale = o[i].out_scale; w.b_scale = o[i].b_scale;
         if (wn(c->fd, &w, sizeof w)) return -1; }
     for (int i = 0; i < n; i++){ if (wn(c->fd, o[i].A, o[i].abytes)) return -1; if (o[i].bbytes && wn(c->fd, o[i].B, o[i].bbytes)) return -1; }
     struct orkd_hdr rh;
