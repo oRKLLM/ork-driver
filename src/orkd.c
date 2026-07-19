@@ -232,6 +232,52 @@ static int handle_chain(struct client *cl, ork_npu *npu, uint64_t tag){
     free(mt); free(Cs); free(cb); free(ts); free(ablob);
     return werr ? -1 : 0;
 }
+/* Heterogeneous op-sequence submit: reconstruct an ork_seq_op[] (resident weights by id + received A/B buffers
+ * + allocated C) and run ork_submit_seq, which batches maximal runs of doorbell-eligible ops onto the spine,
+ * breaks the chain to the SW path at each op that can't be chained, then resumes. Runs INLINE (one bounded
+ * sequence; the single-threaded daemon serializes it on the single-stream NPU). C's returned concatenated. */
+static int handle_seq(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_seq_hdr sh;
+    if (readn(cl->fd, &sh, sizeof sh) <= 0) return -1;
+    int n = (int)sh.n;
+    size_t osz = (size_t)(n > 0 ? n : 0) * sizeof(struct orkd_seq_op);
+    if (n < 1 || n > ORKD_SEQ_MAX || sh.in_total > ORKD_MAX_BYTES){ drain(cl->fd, osz + sh.in_total); send_error(cl->fd, tag, ORKD_EPROTO, "bad seq"); return 0; }
+    struct orkd_seq_op *ops = malloc(osz);
+    if (!ops){ drain(cl->fd, osz + sh.in_total); send_error(cl->fd, tag, ORKD_EOOM, "seq ops"); return 0; }
+    if (readn(cl->fd, ops, osz) <= 0){ free(ops); return -1; }
+    uint8_t *inblob = malloc(sh.in_total ? sh.in_total : 1);
+    if (!inblob){ free(ops); drain(cl->fd, sh.in_total); send_error(cl->fd, tag, ORKD_EOOM, "seq in"); return 0; }
+    if (sh.in_total && readn(cl->fd, inblob, sh.in_total) <= 0){ free(ops); free(inblob); return -1; }
+    ork_seq_op *seq = calloc((size_t)n, sizeof *seq);
+    void **Cs = calloc((size_t)n, sizeof *Cs);
+    size_t inoff = 0, ctot = 0; int ok = (seq && Cs);
+    for (int i = 0; ok && i < n; i++){
+        struct orkd_seq_op *o = &ops[i];
+        if ((size_t)inoff + o->abytes + o->bbytes > sh.in_total){ ok = 0; break; }
+        seq[i].kind = (ork_seq_kind)o->kind; seq[i].M = (int)o->M; seq[i].N = (int)o->N;
+        seq[i].in_scale = o->in_scale; seq[i].out_scale = o->out_scale;
+        if (o->weight_id){   /* matmul op: resolve the resident weight in this client's table */
+            struct cweight *cw = NULL;
+            for (int j = 0; j < cl->nw; j++) if (cl->wt[j].id == o->weight_id){ cw = &cl->wt[j]; break; }
+            if (!cw){ ok = 0; break; }
+            seq[i].w = cw->w;
+        }
+        seq[i].A = inblob + inoff; inoff += o->abytes;
+        seq[i].B = o->bbytes ? inblob + inoff : NULL; inoff += o->bbytes;
+        Cs[i] = malloc(o->cbytes ? o->cbytes : 1);
+        if (!Cs[i]){ ok = 0; break; }
+        seq[i].C = Cs[i]; ctot += o->cbytes;
+    }
+    int rc = ok ? ork_submit_seq(npu, seq, n) : -2;
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
+    int payload = (rc == 0);
+    struct orkd_hdr rh = { ORKD_SEQ_OK, (uint32_t)(sizeof hh + (payload ? ctot : 0)), tag };
+    int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
+    if (!werr && payload) for (int i = 0; i < n && !werr; i++) werr = writen(cl->fd, Cs[i], ops[i].cbytes);
+    if (Cs) for (int i = 0; i < n; i++) free(Cs[i]);
+    free(seq); free(Cs); free(ops); free(inblob);
+    return werr ? -1 : 0;
+}
 /* #2b-2 step 3b: FULL zero-copy RUN — A read AND C written by reference. Client shares A+C dma-bufs (two fds
  * via SCM_RIGHTS); orkd imports both, runs with C written IN PLACE (ORK_ZC_OUT, set at startup → dma_find(C)
  * hit) so NO C byte-transfer either way. Forced SINGLE-CORE: output zero-copy is unsafe under concurrent
@@ -448,6 +494,7 @@ int main(void){
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_CHAIN:if (handle_chain(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_SEQ:  if (handle_seq (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;

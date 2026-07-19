@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 static uint32_t g = 7;
 static int8_t  r8(void){ g = g*1103515245u + 12345u; return (int8_t)(((g>>16)&0x7f) - 40); }
 static int8_t  r4(void){ g = g*1103515245u + 12345u; return (int8_t)(((g>>18)&0xf) - 8); }              /* int4 [-8,7] */
@@ -132,6 +133,37 @@ static int one_chain(ork_npu *c){
     for (int i=0;i<S;i++){ ork_mm_free(c,w[i]); free(A[i]); free(B[i]); free(C[i]); free(ref[i]); }
     return bad ? 1 : 0;
 }
+/* heterogeneous op sequence: int8 mm (doorbell) | ewmul_f16 (SW break) | int8 mm (resume) — exercises
+ * ork_submit_seq's batch/break/resume through orkd. Each op independent; validated vs its own reference. */
+static int one_seq(ork_npu *c){
+    int K = 512, N = 64, M = 8;
+    int8_t *Ba=malloc(K*N),*Bc=malloc(K*N),*Aa=malloc(M*K),*Ac=malloc(M*K);
+    int32_t *Ca=malloc(M*N*4),*Cc=malloc(M*N*4),*Ra=malloc(M*N*4),*Rc=malloc(M*N*4);
+    ork_f16 *ea=malloc(M*N*2),*eb=malloc(M*N*2),*ec=malloc(M*N*2); float *er=malloc(M*N*4);
+    g = 7;
+    for (int i=0;i<M*K;i++) Aa[i]=r8(); for (int i=0;i<K*N;i++) Ba[i]=r8();
+    for (int i=0;i<M*K;i++) Ac[i]=r8(); for (int i=0;i<K*N;i++) Bc[i]=r8();
+    for (int i=0;i<M*N;i++) ea[i]=rf(); for (int i=0;i<M*N;i++) eb[i]=rf();
+    for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Aa[m*K+k]*Ba[k*N+n]; Ra[m*N+n]=(int)a; }
+    for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Ac[m*K+k]*Bc[k*N+n]; Rc[m*N+n]=(int)a; }
+    for (int i=0;i<M*N;i++) er[i]=(float)ea[i]*(float)eb[i];
+    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba), *wc=ork_mm_pack_i8(c,K,N,Bc);
+    ork_seq_op ops[3]; memset(ops,0,sizeof ops);
+    ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;        ops[0].A=Aa; ops[0].C=Ca;
+    ops[1].kind=ORK_OP_EWMUL_F16;             ops[1].M=M; ops[1].N=N; ops[1].A=ea; ops[1].B=eb; ops[1].C=ec;
+    ops[2].kind=ORK_OP_MM_I8;    ops[2].w=wc; ops[2].M=M;        ops[2].A=Ac; ops[2].C=Cc;
+    int rc = ork_submit_seq(c, ops, 3), bad = 0;
+    if (rc){ printf("  seq run FAIL rc=%d\n", rc); bad = 1; }
+    else {
+        for (int i=0;i<M*N;i++) if (Ca[i]!=Ra[i]){ if (bad<3) printf("  seq op0(i8) MISMATCH [%d] %d!=%d\n",i,Ca[i],Ra[i]); bad++; }
+        for (int i=0;i<M*N;i++){ float d=fabsf((float)ec[i]-er[i]), t=fabsf(er[i])*0.03f+0.1f; if (d>t){ if (bad<3) printf("  seq op1(ewmul) MISMATCH [%d] %.3f!=%.3f\n",i,(float)ec[i],er[i]); bad++; } }
+        for (int i=0;i<M*N;i++) if (Cc[i]!=Rc[i]){ if (bad<3) printf("  seq op2(i8) MISMATCH [%d] %d!=%d\n",i,Cc[i],Rc[i]); bad++; }
+    }
+    if (!bad) printf("  ok seq       n=3 (i8 | ewmul_f16 break | i8 resume)\n");
+    ork_mm_free(c,wa); ork_mm_free(c,wc);
+    free(Ba);free(Bc);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);free(ea);free(eb);free(ec);free(er);
+    return bad ? 1 : 0;
+}
 int main(void){
     ork_npu *c = ork_npu_init();
     if (!c){ printf("init FAIL\n"); return 1; }
@@ -154,6 +186,7 @@ int main(void){
     bad |= sdp_add_i8(c);
     bad |= sdp_add_f16(c);
     bad |= one_chain(c);
+    bad |= one_seq(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
