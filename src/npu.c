@@ -1704,7 +1704,9 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
-ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){ return pack(c,K,N,B,DT_F16); }
+ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
+    if(c && c->daemon){ uint64_t id=orkd_pack_f16(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_F16; return w; }   /* Path B: fp16 pack in the daemon */
+    return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; return w; }   /* Path B: pack resident in the daemon */
     return pack(c,K,N,B,DT_I8);  }
@@ -4822,6 +4824,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     memcpy(C,c->cres,need); return 0;
 }
 int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
+    if(w && w->is_orkd) return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: fp16 run on the daemon */
     if(w->dtype!=DT_F16)return -1;
     if(check_overlap("ork_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K * 2, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     return run(c,w,M,A,C);
