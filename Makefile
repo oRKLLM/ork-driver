@@ -543,6 +543,16 @@ test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_pro
 test_orkd_transparent: examples/test_orkd_transparent.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# Multi-tenant orkd proof: forks N client processes sharing one daemon (board tool, not in `make test`).
+# sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./test_orkd_multi [nclients] [iters]
+test_orkd_multi: tools/test_orkd_multi.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Multi-consumer proof: ONE process, TWO orkd connections, interleaved (board tool, not in `make test`).
+# sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./test_orkd_2conn [iters]
+test_orkd_2conn: tools/test_orkd_2conn.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.
 mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
