@@ -8670,7 +8670,20 @@ enum { OP_MM32=0, OP_MM8=1, OP_SILU=2, OP_EWMUL=3 };   /* ork_chain_op.kind valu
 struct chain_silu_spec { const ork_chain_op *ops; int task; int sdp_task; int r_mult, r_shift; int gate_mult, gate_shift; uint32_t out_bias, idx_off, cfg4064, cfg4068; const int16_t *lut; int nlut; };
 
 static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss);
-int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) { return run_chain_i8_impl(c, S, tasks, NULL); }
+int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if (c && c->daemon){   /* Path B: fused chain on the daemon (all task weights are daemon-resident is_orkd) */
+        if (S < 1) return -2;
+        orkd_chain_task_c *ct = malloc((size_t)S * sizeof *ct);
+        if (!ct) return -1;
+        int ok = 1;
+        for (int i = 0; i < S; i++){ ork_w *w = tasks[i].w;
+            if (!w || !w->is_orkd){ ok = 0; break; }
+            ct[i].weight_id = w->orkd_id; ct[i].M = tasks[i].M; ct[i].K = w->K; ct[i].N = w->N; ct[i].A = tasks[i].A; ct[i].C = tasks[i].C; }
+        int rc = ok ? orkd_run_chain_i8(c->daemon, S, ct) : -2;
+        free(ct);
+        return rc;
+    }
+    return run_chain_i8_impl(c, S, tasks, NULL); }
 
 /* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
  * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu

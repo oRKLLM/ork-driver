@@ -49,6 +49,11 @@ int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const vo
 uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B);
 int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* Fused int8 matmul chain (Path B increment 5): S resident weights, one PC-chained submit on the daemon.
+ * The library fills this from its ork_mm_task_i8[] + orkd weight proxies (K,N from the proxy). */
+typedef struct { uint64_t weight_id; int M, K, N; const int8_t *A; int32_t *C; } orkd_chain_task_c;
+int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *tasks);
+
 /* SDP activation ops (Path B increment 4): stateless one-shot on the daemon's NPU. fp16 operands are void*. */
 int orkd_silu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);
 int orkd_gelu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);

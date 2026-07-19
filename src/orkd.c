@@ -192,6 +192,46 @@ static int handle_sdp(struct client *cl, ork_npu *npu, uint64_t tag){
     free(in); free(out);
     return 0;
 }
+/* Fused int8 matmul chain: S resident weights run as one PC-chained submit (ork_mm_run_chain_i8). Each task's
+ * weight is resolved by id in THIS client's table; A payloads arrive concatenated (task order), C payloads are
+ * returned concatenated. Run INLINE (a chain is one bounded submit; the single-threaded daemon serializes it). */
+static int handle_chain(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_chain_hdr ch;
+    if (readn(cl->fd, &ch, sizeof ch) <= 0) return -1;
+    int S = (int)ch.S;
+    size_t tsz = (size_t)(S > 0 ? S : 0) * sizeof(struct orkd_chain_task);
+    if (S < 1 || S > ORKD_CHAIN_MAX || ch.abytes_total > ORKD_MAX_BYTES){ drain(cl->fd, tsz + ch.abytes_total); send_error(cl->fd, tag, ORKD_EPROTO, "bad chain"); return 0; }
+    struct orkd_chain_task *ts = malloc(tsz);
+    if (!ts){ drain(cl->fd, tsz + ch.abytes_total); send_error(cl->fd, tag, ORKD_EOOM, "chain tasks"); return 0; }
+    if (readn(cl->fd, ts, tsz) <= 0){ free(ts); return -1; }
+    uint8_t *ablob = malloc(ch.abytes_total ? ch.abytes_total : 1);
+    if (!ablob){ free(ts); drain(cl->fd, ch.abytes_total); send_error(cl->fd, tag, ORKD_EOOM, "chain A"); return 0; }
+    if (ch.abytes_total && readn(cl->fd, ablob, ch.abytes_total) <= 0){ free(ts); free(ablob); return -1; }
+    /* build the daemon-side task array: resolve each weight, point A into ablob, allocate a C per task */
+    ork_mm_task_i8 *mt = calloc((size_t)S, sizeof *mt);
+    int32_t **Cs = calloc((size_t)S, sizeof *Cs);
+    size_t *cb = calloc((size_t)S, sizeof *cb);   /* per-task C bytes = M*N*4 */
+    size_t aoff = 0, ctot = 0; int ok = (mt && Cs && cb), rc = 0;
+    for (int i = 0; ok && i < S; i++){
+        struct cweight *cw = NULL;
+        for (int j = 0; j < cl->nw; j++) if (cl->wt[j].id == ts[i].weight_id){ cw = &cl->wt[j]; break; }
+        if (!cw || cw->dtype != ORKD_DT_I8 || ts[i].abytes != (uint32_t)((size_t)ts[i].M * cw->K) || aoff + ts[i].abytes > ch.abytes_total){ ok = 0; break; }
+        cb[i] = (size_t)ts[i].M * cw->N * 4;
+        Cs[i] = malloc(cb[i]);
+        if (!Cs[i]){ ok = 0; break; }
+        mt[i].w = cw->w; mt[i].M = (int)ts[i].M; mt[i].A = (const int8_t *)(ablob + aoff); mt[i].C = Cs[i];
+        aoff += ts[i].abytes; ctot += cb[i];
+    }
+    if (ok) rc = ork_mm_run_chain_i8(npu, S, mt);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = ok ? rc : -1;
+    int payload = (ok && rc == 0);
+    struct orkd_hdr rh = { ORKD_CHAIN_OK, (uint32_t)(sizeof hh + (payload ? ctot : 0)), tag };
+    int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
+    if (!werr && payload) for (int i = 0; i < S && !werr; i++) werr = writen(cl->fd, Cs[i], cb[i]);
+    if (Cs) for (int i = 0; i < S; i++) free(Cs[i]);
+    free(mt); free(Cs); free(cb); free(ts); free(ablob);
+    return werr ? -1 : 0;
+}
 /* #2b-2 step 3b: FULL zero-copy RUN — A read AND C written by reference. Client shares A+C dma-bufs (two fds
  * via SCM_RIGHTS); orkd imports both, runs with C written IN PLACE (ORK_ZC_OUT, set at startup → dma_find(C)
  * hit) so NO C byte-transfer either way. Forced SINGLE-CORE: output zero-copy is unsafe under concurrent
@@ -407,6 +447,7 @@ int main(void){
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_CHAIN:if (handle_chain(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;

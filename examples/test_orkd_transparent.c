@@ -113,6 +113,25 @@ static int sdp_add_f16(ork_npu *c){
     int bad = rc ? (printf("  add_f16 run FAIL rc=%d\n", rc),1) : chkf("add_f16",M,N,out,ref);
     free(a); free(b); free(out); free(ref); return bad;
 }
+/* fused int8 matmul chain: S independent matmuls (own weight, varying M) in one submit; each output vs int32 ref */
+static int one_chain(ork_npu *c){
+    enum { S = 4 };
+    int Ms[S] = {1, 8, 16, 4}, K = 512, N = 64;
+    int8_t *A[S], *B[S]; int32_t *C[S], *ref[S]; ork_w *w[S]; ork_mm_task_i8 t[S];
+    g = 7;
+    for (int i=0;i<S;i++){
+        A[i]=malloc((size_t)Ms[i]*K); B[i]=malloc((size_t)K*N); C[i]=malloc((size_t)Ms[i]*N*4); ref[i]=malloc((size_t)Ms[i]*N*4);
+        for (int j=0;j<Ms[i]*K;j++) A[i][j]=r8(); for (int j=0;j<K*N;j++) B[i][j]=r8();
+        for (int m=0;m<Ms[i];m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)A[i][m*K+k]*B[i][k*N+n]; ref[i][m*N+n]=(int)a; }
+        w[i]=ork_mm_pack_i8(c,K,N,B[i]); t[i].w=w[i]; t[i].M=Ms[i]; t[i].A=A[i]; t[i].C=C[i];
+    }
+    int rc = ork_mm_run_chain_i8(c, S, t), bad = 0;
+    if (rc){ printf("  chain run FAIL rc=%d\n", rc); bad = 1; }
+    else for (int i=0;i<S;i++) for (int j=0;j<Ms[i]*N;j++) if (C[i][j]!=ref[i][j]){ if (bad<3) printf("  chain MISMATCH task %d [%d] %d!=%d\n", i,j,C[i][j],ref[i][j]); bad++; }
+    if (!bad) printf("  ok chain     S=%d (varying M)\n", S);
+    for (int i=0;i<S;i++){ ork_mm_free(c,w[i]); free(A[i]); free(B[i]); free(C[i]); free(ref[i]); }
+    return bad ? 1 : 0;
+}
 int main(void){
     ork_npu *c = ork_npu_init();
     if (!c){ printf("init FAIL\n"); return 1; }
@@ -134,6 +153,7 @@ int main(void){
     bad |= sdp_ewmul_f16(c);
     bad |= sdp_add_i8(c);
     bad |= sdp_add_f16(c);
+    bad |= one_chain(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
