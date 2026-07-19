@@ -72,6 +72,9 @@ test_submit_seq: tools/test_submit_seq.c $(COBJ)
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+sdp_chain_probe: tools/sdp_chain_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE/calibration probe: sweeps K to find this SoC's single-submit K-tile ceiling (int8).
 # Not in `all`/`test` — it intentionally wedges the NPU past the cap (recoverable).
 ksubmit_probe: tools/ksubmit_probe.c $(CORE)

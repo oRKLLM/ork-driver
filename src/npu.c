@@ -10310,7 +10310,12 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
      * unwarms so the WARM-UP reps below fire; DT_I8<->DT_I8_CHAIN is not a real mode change (keepwarm). */
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_HW);
     size_t off[1024], total=0;
-    for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; off[i]=total; total+=(size_t)progs[i].nwords; }
+    /* Each task's regcmd MUST start on a 64-byte (16-word) boundary — the HW chain-walk hangs "entering" a
+     * misaligned successor task (vendor RE: tight packing landed a task at +80 mod 128 and hung; the vendor
+     * lays every task 64B-aligned). Matmul-only chains never tripped this (REGCMD_I8_N=224w=896B is 64B-aligned,
+     * so contiguous packing stays aligned), but a 146-word SDP task (584B) knocks every following task off the
+     * boundary. Round each task's start up to 16 words. */
+    for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; total=(total+15)&~(size_t)15; off[i]=total; total+=(size_t)progs[i].nwords; }
     if(total*4 > c->regcmd.size || (size_t)n*sizeof(struct rknpu_task) > c->task.size) return -2;
     uint32_t *base=(uint32_t*)c->regcmd.cpu;
     for(int i=0;i<n;i++){
@@ -10351,6 +10356,77 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
         if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] submit rep %d -> %d (errno=%d)\n",rep,e,errno); }
     c->warmed = 1;
     return rr;
+}
+
+/* PROBE (int8 SDP on the HW-chain): can a standalone SDP op (ewmul, enable=0x18, regcfg=69) be a MIDDLE program
+ * in a PC-chain, walking FORWARD through its next-descriptor? Decode of the vendor's working SDP chain
+ * (regcmd_softmax_f16.h SM_TASK0) proved REGCMD_MUL is ALREADY chain-native: its tail (words 138..145) is
+ * byte-identical in STRUCTURE to SM_TASK0 — a terminal descriptor at word 138 (=2*regcfg; next-addr 0 / amt 0)
+ * followed by the 0x0041/0x0018/0x0081 op-enable trailer. So the port is NOT a template change; it is feeding
+ * SDP progs (desc_slot=138) through the PROVEN ork_npu_chain_progs (which already handles SDP: per-prog
+ * desc_slot + has_sdp ping-pong-off + reps=2 cold warm-up). Chains [ewmul0(desc_slot=138) -> ewmul1(last)] and
+ * verifies BOTH outputs vs the CPU ref: *t0_ok = the middle SDP op computed correctly carrying a forward
+ * descriptor; *t1_ok = the chain WALKED forward through the SDP op's slot. Both ok => int8 SDP HW-chains. */
+int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
+    if(t0_ok)*t0_ok=0; if(t1_ok)*t1_ok=0;
+    if(!c||!ork_ppu_fuse_enabled(c)) return -3;
+    int fd=c->fd, M=8, N=64, mult=0x4000, shift=14;
+    #define EWC(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
+    size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
+    struct buf A0=bcreate(fd,sz,0x403,-1),B0=bcreate(fd,sz,0x403,-1),O0=bcreate(fd,sz,0x403,-1);
+    struct buf A1=bcreate(fd,sz,0x403,-1),B1=bcreate(fd,sz,0x403,-1),O1=bcreate(fd,sz,0x403,-1);
+    if(!A0.cpu||!B0.cpu||!O0.cpu||!A1.cpu||!B1.cpu||!O1.cpu){ bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1); return -2; }
+    int8_t r0[512],s0[512],r1[512],s1[512],ref0[512],ref1[512]; uint32_t g=12345;
+    for(int i=0;i<M*N;i++){ r0[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; s0[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3;
+                            r1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; s1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; }
+    for(int i=0;i<M*N;i++){ long v0=lround((long)r0[i]*s0[i]*mult/(double)(1<<shift)),v1=lround((long)r1[i]*s1[i]*mult/(double)(1<<shift));
+                            ref0[i]=(int8_t)(v0>127?127:v0<-128?-128:v0); ref1[i]=(int8_t)(v1>127?127:v1<-128?-128:v1); }
+    memset(A0.cpu,0,sz);memset(B0.cpu,0,sz);memset(O0.cpu,0,sz);memset(A1.cpu,0,sz);memset(B1.cpu,0,sz);memset(O1.cpu,0,sz);
+    int8_t*a0=A0.cpu,*b0=B0.cpu,*a1=A1.cpu,*b1=B1.cpu;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ a0[EWC(m,n)]=r0[m*N+n]; b0[EWC(m,n)]=s0[m*N+n]; a1[EWC(m,n)]=r1[m*N+n]; b1[EWC(m,n)]=s1[m*N+n]; }
+    bsync(fd,&A0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O0,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&A1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O1,RKNPU_MEM_SYNC_TO_DEVICE);
+    /* build the two ewmul regcmds exactly like the standalone ork_npu_ewmul_i8 (geom + addrs + scale) */
+    uint32_t rc0[REGCMD_MUL_N],rc1[REGCMD_MUL_N];
+    memcpy(rc0,REGCMD_MUL,sizeof rc0); set_mul_geom(rc0,REGCMD_MUL_N,M,N);
+    setr(rc0,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O0.dma); setr(rc0,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A0.dma); setr(rc0,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B0.dma);
+    setr(rc0,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc0,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
+    setr(rc0,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc0,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc0,REGCMD_MUL_N,0x1001,0x4074,0);
+    memcpy(rc1,REGCMD_MUL,sizeof rc1); set_mul_geom(rc1,REGCMD_MUL_N,M,N);
+    setr(rc1,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O1.dma); setr(rc1,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A1.dma); setr(rc1,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B1.dma);
+    setr(rc1,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc1,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
+    setr(rc1,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc1,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc1,REGCMD_MUL_N,0x1001,0x4074,0);
+    /* THE PORT: SDP progs through the proven chainer. ewmul0 is a MIDDLE program (desc_slot=138 = the chain-native
+     * descriptor slot decoded from SM_TASK0); ewmul1 is the terminal (desc_slot=-1). chain_progs writes ewmul0's
+     * forward descriptor at 138, detects enable!=0xd -> ping-pong OFF, and does the reps=2 cold warm-up. */
+    /* HYPOTHESIS: a HW chain must BEGIN with a matmul (enable=0xd) task — the kernel programs the PC from task0,
+     * and every working chain (FFN, chain_mm_silu) starts with a matmul; an SDP task0 (this probe's earlier form,
+     * and the vendor's hardware-chained softmax) HANGS. So prepend an all-ones matmul task0; ewmul0 becomes a true
+     * MIDDLE SDP task (carries the fwd descriptor at 138 like the FFN chain's silu). ORK_SDP_NOMM=1 = old SDP-first
+     * form (control). Matmul: M=8,K=64,N=64, A=c->Af all-ones, W all-ones -> C=K=64 (sanity, not read by ewmul). */
+    int nomm=!!getenv("ORK_SDP_NOMM"); int CBUF=c->soc->cbuf_elems, MK=8*64, KN=64*64;
+    struct buf W=bcreate(fd,(size_t)KN,0x403,-1), C=bcreate(fd,(size_t)8*64*4,0x403,-1);
+    static uint32_t rmm[REGCMD_I8_N];
+    if(!nomm){
+        if(!W.cpu||!C.cpu){ bdestroy(fd,&W);bdestroy(fd,&C);bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1); return -2; }
+        { int8_t*wb=W.cpu; for(int i=0;i<KN;i++)wb[i]=1; int8_t*ad=c->Af.cpu; for(int i=0;i<MK;i++)ad[i]=1; }
+        memset(C.cpu,0,(size_t)8*64*4);
+        bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&C,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+        act(fd,RKNPU_ACT_RESET,0);
+        synth_i8(rmm,8,64,64,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)C.dma,1,CBUF,0);
+    }
+    ork_chain_prog progs[3]={ {rmm,REGCMD_I8_N,0xd,108,216}, {rc0,REGCMD_MUL_N,0x18,69,138}, {rc1,REGCMD_MUL_N,0x18,69,-1} };
+    /* dom=-1 (default domain) to MATCH the bcreate(...,-1) buffers + c->regcmd/c->task (a domain-0 submit
+     * mismatches them, see ork_npu_chain_selftest). nomm control: SDP-first 2-task chain (expected to hang). */
+    int rc = nomm ? ork_npu_chain_progs(c,2,progs+1,-1) : ork_npu_chain_progs(c,3,progs,-1);
+    if(rc==0){ bsync(fd,&O0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&O1,RKNPU_MEM_SYNC_FROM_DEVICE);
+        int ok0=1,ok1=1;
+        for(int m=0;m<M;m++)for(int n=0;n<N;n++){ if(*(int8_t*)((char*)O0.cpu+EWC(m,n))!=ref0[m*N+n])ok0=0; if(*(int8_t*)((char*)O1.cpu+EWC(m,n))!=ref1[m*N+n])ok1=0; }
+        if(t0_ok)*t0_ok=ok0; if(t1_ok)*t1_ok=ok1; }
+    bdestroy(fd,&W);bdestroy(fd,&C);
+    bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1);
+    #undef EWC
+    return rc;
 }
 
 /* CHAIN ASSEMBLER self-test: chain TWO plain int8 matmuls via ork_npu_chain_progs and verify BOTH tasks
