@@ -873,7 +873,11 @@ int          ork_submit_seq(ork_npu *ctx, const ork_seq_op *ops, int n);
  * ork_dyn_seq_end) or NULL if ineligible (non-int8 / M>64 / non-conforming K / terminal not a matmul / kind not
  * yet supported) — caller then runs the ops via the SW break. The scheduler slices a sequence into groups. */
 ork_dyn_chain *ork_dyn_begin_seq_i8(ork_npu *ctx, int n, const ork_seq_op *ops);
-int          ork_dyn_seq_end(ork_dyn_chain *h);   /* poll terminal sentinel + per-op copy-back; 0/ok,-1 timeout,-2 bad */
+/* Multi-core: groups = contiguous op slices [gstart[g],gstart[g+1]); gstart[0]=0, gstart[ngroups]=n. Each group
+ * is a dependent chain (terminal op = matmul); INDEPENDENT groups are load-balanced whole onto nc cores (nc<=0
+ * = all) and run in parallel. Drain with ork_dyn_seq_end (polls every core's terminal). NULL if ineligible. */
+ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *ctx, int n, const ork_seq_op *ops, int ngroups, const int *gstart, int nc);
+int          ork_dyn_seq_end(ork_dyn_chain *h);   /* poll every core's terminal sentinel + per-op copy-back; 0/ok,-1 timeout,-2 bad */
 
 /* Like ork_mm_run_chain_i8 but task[gate_task] gets a FUSED int8 SiLU output stage (set_i8_silu): its C
  * receives int8 silu(gate) (M*N bytes) instead of int32; the silu LUT is streamed to SDP SRAM once before
