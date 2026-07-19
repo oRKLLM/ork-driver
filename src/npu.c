@@ -6070,6 +6070,7 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
  * set_mul_geom (M,N reprogrammed from the captured M=8/N=64 op). N must be a multiple of 16 (channel atom).
  * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i8(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;             /* N multiple of the int8 atom (16) */
@@ -6113,6 +6114,7 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
  * arbitrary M,N (N a multiple of 8); rk3588-gated. up/silu/out are fp16 bit-patterns (ork_f16).
  * 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_f16(c->daemon,up,silu,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the fp16 atom (8) */
@@ -6901,6 +6903,7 @@ int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,
  * in/out int8 [M*N], N%16==0; rk3588-gated. 0/ok,-1,-2,-3. */
 int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                    double a_scale,double b_scale,double out_scale,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_add_i8(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)||out_scale<=0) return -2;
     double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
@@ -6915,6 +6918,7 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
 /* On-NPU fp16 element-wise ADD (residual): out[m][n] = a[m][n] + b[m][n] in fp16 via the 2-input SDP ALU=add op
  * (REGCMD_ADD_F16, gain 1). NVDLA fp16 cube (atom-8, 2-byte). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_add_f16(c->daemon,a,b,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
@@ -7713,10 +7717,12 @@ static int act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N
  * requested (in_scale,out_scale), loads it, and runs the op (2 submits). in/out int8 [M*N], N%16==0.
  * rk3588-gated. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_silu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_silu_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i8(c,silu_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU GELU (int8): same standalone activation-LUT op, GELU curve. Bit-exact-class like SiLU. */
 int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_gelu_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i8(c,gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU rsqrt (int8) — RMSNorm building block: out = clamp_i8(round( rsqrt(in*in_scale)/out_scale )). */

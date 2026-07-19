@@ -222,6 +222,48 @@ int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
     return hh.rc;
 }
 
+/* SDP ops (Path B increment 4). One generic wire call (ORKD_SDP) + typed wrappers so the library routes
+ * ork_npu_silu_i8 / gelu_i8 / ewmul_i8 / ewmul_f16 / add_i8 / add_f16 without exposing the op enum. */
+static int orkd_sdp_call(orkd_conn *c, uint32_t op, int M, int N, int nin, int in_esz, int out_esz,
+                         int mult, int shift, double in_scale, double out_scale, double a_scale, double b_scale,
+                         const void *a, const void *b, void *out){
+    if (!c || c->fd < 0 || M <= 0 || N <= 0 || !a || !out || (nin == 2 && !b)) return -1;
+    size_t half = (size_t)M * N * in_esz, outb = (size_t)M * N * out_esz;
+    struct orkd_sdp sp; memset(&sp, 0, sizeof sp);
+    sp.op = op; sp.M = (uint32_t)M; sp.N = (uint32_t)N; sp.nin = (uint32_t)nin;
+    sp.in_esz = (uint32_t)in_esz; sp.out_esz = (uint32_t)out_esz;
+    sp.mult = mult; sp.shift = shift; sp.in_scale = in_scale; sp.out_scale = out_scale; sp.a_scale = a_scale; sp.b_scale = b_scale;
+    sp.inbytes = (uint32_t)(half * nin);
+    struct orkd_hdr h = { ORKD_SDP, (uint32_t)(sizeof sp + sp.inbytes), 9 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &sp, sizeof sp) || wn(c->fd, a, half)) return -1;
+    if (nin == 2 && wn(c->fd, b, half)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_SDP_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh;
+    if (hh.rc == 0){
+        if (rh.len < consumed + outb){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        if (rn(c->fd, out, outb) <= 0) return -1;
+        consumed += outb;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+int orkd_silu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double is, double os, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_SILU_I8, M, N, 1, 1, 1, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_gelu_i8 (orkd_conn *c, const int8_t *in, int M, int N, double is, double os, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_GELU_I8, M, N, 1, 1, 1, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_ewmul_i8(orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, int mult, int shift, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_EWMUL_I8, M, N, 2, 1, 1, mult, shift, 0, 0, 0, 0, a, b, out); }
+int orkd_ewmul_f16(orkd_conn *c, const void *a, const void *b, int M, int N, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_EWMUL_F16, M, N, 2, 2, 2, 0, 0, 0, 0, 0, 0, a, b, out); }
+int orkd_add_i8  (orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, double as, double bs, double os, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_ADD_I8, M, N, 2, 1, 1, 0, 0, 0, os, as, bs, a, b, out); }
+int orkd_add_f16 (orkd_conn *c, const void *a, const void *b, int M, int N, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_ADD_F16, M, N, 2, 2, 2, 0, 0, 0, 0, 0, 0, a, b, out); }
+
 int orkd_free_weight(orkd_conn *c, uint64_t weight_id){
     if (!c || c->fd < 0) return -1;
     struct orkd_handle req; memset(&req, 0, sizeof req); req.id = weight_id;

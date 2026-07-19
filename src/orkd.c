@@ -163,6 +163,35 @@ static int handle_free(struct client *cl, ork_npu *npu, uint64_t tag){
     send_msg(cl->fd, ORKD_PACK_OK, tag, &hh, sizeof hh);   /* PACK_OK = generic handle-op ack */
     return 0;
 }
+/* Stateless SDP activation op (silu/gelu/ewmul/add). Run INLINE (not queued): one-shot + tiny (M=8,N=64 geometry)
+ * and the daemon is single-threaded, so it's still serialized on the single-stream NPU with any queued matmul
+ * quanta. nin input payloads follow the struct (concatenated); reply = orkd_handle + the M*N*out_esz output. */
+static int handle_sdp(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_sdp sp;
+    if (readn(cl->fd, &sp, sizeof sp) <= 0) return -1;
+    size_t half = (size_t)sp.M * sp.N * sp.in_esz, inb = sp.inbytes, outb = (size_t)sp.M * sp.N * sp.out_esz;
+    if (!sp.M || !sp.N || inb > ORKD_MAX_BYTES || inb != half * (sp.nin ? sp.nin : 1)){ drain(cl->fd, sp.inbytes); send_error(cl->fd, tag, ORKD_EPROTO, "bad sdp payload"); return 0; }
+    uint8_t *in = malloc(inb ? inb : 1), *out = malloc(outb ? outb : 1);
+    if (!in || !out){ free(in); free(out); drain(cl->fd, sp.inbytes); send_error(cl->fd, tag, ORKD_EOOM, "sdp alloc"); return 0; }
+    if (inb && readn(cl->fd, in, inb) <= 0){ free(in); free(out); return -1; }
+    const uint8_t *a = in, *b = in + half;   /* binary: second operand is the second half */
+    int rc;
+    switch (sp.op){
+        case ORKD_SDP_SILU_I8:   rc = ork_npu_silu_i8 (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_GELU_I8:   rc = ork_npu_gelu_i8 (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_EWMUL_I8:  rc = ork_npu_ewmul_i8(npu, (const int8_t *)a, (const int8_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int8_t *)out, NULL); break;
+        case ORKD_SDP_EWMUL_F16: rc = ork_npu_ewmul_f16(npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
+        case ORKD_SDP_ADD_I8:    rc = ork_npu_add_i8  (npu, (const signed char *)a, (const signed char *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_ADD_F16:   rc = ork_npu_add_f16 (npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
+        default: rc = -100;
+    }
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
+    int payload = (rc == 0);
+    struct orkd_hdr rh = { ORKD_SDP_OK, (uint32_t)(sizeof hh + (payload ? outb : 0)), tag };
+    (void)!(writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh) || (payload && writen(cl->fd, out, outb)));
+    free(in); free(out);
+    return 0;
+}
 /* #2b-2 step 3b: FULL zero-copy RUN — A read AND C written by reference. Client shares A+C dma-bufs (two fds
  * via SCM_RIGHTS); orkd imports both, runs with C written IN PLACE (ORK_ZC_OUT, set at startup → dma_find(C)
  * hit) so NO C byte-transfer either way. Forced SINGLE-CORE: output zero-copy is unsafe under concurrent
@@ -377,6 +406,7 @@ int main(void){
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
