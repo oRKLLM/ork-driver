@@ -44,8 +44,8 @@ $(TESTS): %: %.c $(COBJ)
 # driven STANDALONE. NEGATIVE RESULT on RK3588 — the PPU does not activate from an isolated
 # replay (output buffer comes back unwritten). Kept as a runnable ground-truth probe; exits
 # nonzero by design. See wiki Exp-2026-06-24-PPU-LUT-Silicon-Verification.
-test_ppu_lut: examples/test_ppu_lut.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_ppu_lut: examples/test_ppu_lut.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # --- library for embedding in other projects (e.g. llama.cpp-rockchip, FFI bindings) ---
 lib: libork_npu.a libork_npu.so
@@ -81,64 +81,64 @@ sdp_chain_probe: tools/sdp_chain_probe.c $(COBJ)
 
 # RE/calibration probe: sweeps K to find this SoC's single-submit K-tile ceiling (int8).
 # Not in `all`/`test` — it intentionally wedges the NPU past the cap (recoverable).
-ksubmit_probe: tools/ksubmit_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ksubmit_probe: tools/ksubmit_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE/calibration probe: ork-current vs rkllm-captured M-tile mode, bit-exact + effective GOPS.
-mtile_probe: tools/mtile_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mtile_probe: tools/mtile_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Tiling AUTOTUNER: per-shape tiling-config search (cores x M/N/K-tile), bit-exact-gated + GOPS.
-autotune: tools/autotune.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+autotune: tools/autotune.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Pack-time SiLU calibrator: search the fused-output register space (R/cfg4068/bias) vs a silu ref.
-silu_calibrate: tools/silu_calibrate.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu_calibrate: tools/silu_calibrate.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # validate the raised fused-SiLU M-tile cap (mg_max*64) by self-consistency vs forced mc=64.
-fused_mtile_check: tools/fused_mtile_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+fused_mtile_check: tools/fused_mtile_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # validate the INT32-output fused SiLU (silu emitted at int32 precision vs int8) against CPU silu.
-silu32_check: tools/silu32_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu32_check: tools/silu32_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # decide if a fused fp16 gate+SiLU beats baseline int8-gate + CPU-silu (validated ops, no wedge risk).
-f16_gate_bench: tools/f16_gate_bench.c $(CORE)
-	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(CORE) -lm
+f16_gate_bench: tools/f16_gate_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(COBJ) -lm
 
 # smoke-test the fp16 fused gate+SiLU primitive (runs? silu-shaped?).
-silu_f16_check: tools/silu_f16_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu_f16_check: tools/silu_f16_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # validate int8 JIT-inflate to fp16 (emulated W8A16) is bit-exact vs a direct fp16 pack.
-jit_inflate_check: tools/jit_inflate_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+jit_inflate_check: tools/jit_inflate_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # accuracy of the fp16 gate+SiLU (fused-LUT vs plain-matmul+CPU-silu) vs a CPU fp32 reference.
-f16_gate_acc: tools/f16_gate_acc.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+f16_gate_acc: tools/f16_gate_acc.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # reproduce the int8<->fp16 mode-switch instability (blocker b) in isolation, up an M ladder.
-mode_switch_probe: tools/mode_switch_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mode_switch_probe: tools/mode_switch_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE the CNA precision field (0x100c): map INT8/INT16/FP16 encoding by fuzzing proc/in precision bits.
-i16_precision_probe: tools/i16_precision_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i16_precision_probe: tools/i16_precision_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # ork-native fused SiLU: build ork's own silu LUT for its own matmul program (correct silu, ~1 int8).
-silu_native: tools/silu_native.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu_native: tools/silu_native.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Matmul-level benchmark: fused-SiLU output stage vs plain matmul + the CPU-silu handoff it replaces.
-silu_bench: tools/silu_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu_bench: tools/silu_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # EW-mul (SwiGLU dual-input) board diagnostic: runs the spliced 126-reg fused EW-mul op + dumps numerics.
-ewmul_probe: tools/ewmul_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ewmul_probe: tools/ewmul_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Streaming/persist diagnostics (board only). dma_probe is standalone (raw rknpu ioctls): measures the
 # NPU's ~4 GiB IOVA window. stream_probe proves ork_mm_free reclaims IOVA. persist_probe proves the
@@ -149,35 +149,35 @@ dma_probe: tools/dma_probe.c
 # multiple IOMMU domains (iommu_domain_id field) — single domain caps ~4 GiB, 8 domains reach ~32 GiB.
 domain_probe: tools/domain_probe.c
 	$(CC) $(CFLAGS) -o $@ $<
-stream_probe: tools/stream_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
-persist_probe: tools/persist_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+stream_probe: tools/stream_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+persist_probe: tools/persist_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 # Zero-copy weight IMPORT + fixed-slot streaming validation/measurement (board only; needs dma-heap).
-zerocopy_import_test: tools/zerocopy_import_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+zerocopy_import_test: tools/zerocopy_import_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 # int4 prefetch-inflate streaming probe: does a background fill+map of slot N+1 hide behind submit(N)?
-stream_prefetch_probe: tools/stream_prefetch_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+stream_prefetch_probe: tools/stream_prefetch_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 # domain_correct: multi-domain int8 run is bit-exact vs CPU ref (per-weight IOMMU domain threading).
-domain_correct: tools/domain_correct.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+domain_correct: tools/domain_correct.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 # grouped_i4_leak: pack/free a grouped-int4 weight in a loop; RSS/IOVA must stay flat (ork_mm_free reclaim).
-grouped_i4_leak: tools/grouped_i4_leak.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+grouped_i4_leak: tools/grouped_i4_leak.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE probe: hunt the weight stride register for in-place K-slicing of a full-K buffer.
-slice_probe: tools/slice_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+slice_probe: tools/slice_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE probe: derive the w4a16 (int4 weight x fp16 activation) regcmd by sweeping vs a CPU reference
 # (the runtime won't expose int4 on this board; the NPU does it — we emit the regcmd directly).
-i4_probe: tools/i4_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i4_probe: tools/i4_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # load a real GGUF Q4_K model, dequant a weight, run it on the NPU (requantized to int8/W8A8).
-gguf_q4k: tools/gguf_q4k.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+gguf_q4k: tools/gguf_q4k.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Tier 4a: does a Hadamard rotation make int4 (W4A4) accurate? Pure CPU math (no NPU) — compares the
 # int4 matmul quant error vs the fp32 reference, plain vs Hadamard-rotated. See ROADMAP Tier 4.
@@ -191,50 +191,50 @@ hadamard_real: tools/hadamard_real.c
 
 # Tier 4b: time PER-CHANNEL int4 (full-K single submit) vs grouped int4 (K/G submits) vs int8 —
 # does per-channel int4 reach int8 speed (kill the grouped submit explosion)? Needs the NPU.
-int4_bench: tools/int4_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+int4_bench: tools/int4_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Tier 4b RE: probe whether the int4 regcmd does multi-M in one submit + brute-force the output layout.
-i4_multim_probe: tools/i4_multim_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i4_multim_probe: tools/i4_multim_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Tier 4b RE: exhaustive register fuzzer for undocumented int4 multi-M row execution.
-i4_multim_fuzz: tools/i4_multim_fuzz.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i4_multim_fuzz: tools/i4_multim_fuzz.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # find the int8 prefill correctness bug: exact int8 matmul vs CPU ref across real model shapes/M/cores.
-prefill_check: tools/prefill_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+prefill_check: tools/prefill_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE/calibration probe: sweeps registers to find vector/PPU instructions
-vec_fuzz: tools/vec_fuzz.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+vec_fuzz: tools/vec_fuzz.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Diagnostic (NOT in `make test`): anatomy of the post-NPU-fence latency gap (submit/bsync/copy + NEON consume).
-fence_probe: tools/fence_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+fence_probe: tools/fence_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Diagnostic (NOT in `make test`): speculative-decoding economics — M-batch amortization of the GEMV
 # submit floor + the CPU accept/reject gate cost. Mock data (structural overhead, not model quality).
-test_speculative_bridge: tools/test_speculative_bridge.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_speculative_bridge: tools/test_speculative_bridge.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE diagnostic (NOT in `make test`): fuller-slice replay of the captured RKNN Sigmoid PPU op.
 # Reconstructs the full 5-buffer topology from examples/sigmoid_slice.h (extracted from the SDK
 # trace) to test whether populating the LUT/PWL config buffers (handles 4 & 5) makes the PPU write.
-slice_replay: tools/slice_replay.c $(CORE) examples/sigmoid_slice.h
-	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(CORE) -lm
+slice_replay: tools/slice_replay.c $(COBJ) examples/sigmoid_slice.h
+	$(CC) $(CFLAGS) -Iexamples -o $@ $< $(COBJ) -lm
 
 # RE probe: does batching tasks per RKNPU_SUBMIT amortize the per-matmul submit-latency floor?
-batch_probe: tools/batch_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+batch_probe: tools/batch_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # apples-to-apples: SAME int8 matmul via ork-driver vs the closed RKNN matmul API (librknnrt).
 # Not in `all`/`test` — needs librknnrt.so + rknn_matmul_api.h present. Point RKNN_DIR at them.
 #   make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters]
 RKNN_DIR ?= /tmp/rknn
-rknn_vs_ork: tools/rknn_vs_ork.c $(CORE)
-	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< $(CORE) -L$(RKNN_DIR) -lrknnrt -lm
+rknn_vs_ork: tools/rknn_vs_ork.c $(COBJ)
+	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< $(COBJ) -L$(RKNN_DIR) -lrknnrt -lm
 
 # calibration: drive the closed RKNN matmul API with B_quant_type per-channel(1) vs per-group(2) to
 # probe whether per-K-group dequant is a single hardware submit. Needs librknnrt (RKNN_DIR). Not in all/test.
@@ -251,88 +251,88 @@ mc_prof: tools/mc_prof.c $(COBJ)
 
 # decode-pipeline validator: CPU int4 bulk || NPU int8 share overlapped — aggregate win at M=1? Not in all/test.
 # -march=native: ork_native_cpu.h uses vdotq_s32 (dotprod ISA), which the default CFLAGS march may not enable.
-hybrid_decode_probe: tools/hybrid_decode_probe.c $(CORE)
-	$(CC) $(CFLAGS) -march=native -Iinclude -o $@ $< $(CORE) -lm -lpthread
+hybrid_decode_probe: tools/hybrid_decode_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=native -Iinclude -o $@ $< $(COBJ) -lm -lpthread
 
 # per-op doorbell progress probe: can the host see per-op chain completions by polling? Not in all/test.
-doorbell_id_probe: tools/doorbell_id_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+doorbell_id_probe: tools/doorbell_id_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # diagnostic: ceiling of within-backend CPU/NPU overlap (quant/deq pipelined behind NPU run). Not in all/test.
-overlap_probe: tools/overlap_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+overlap_probe: tools/overlap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: decode async-overlap hypothesis — real 7B M=1 matmuls, sync vs async-pipelined w/ CPU prep. Not in all/test.
-async_decode_probe: tools/async_decode_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+async_decode_probe: tools/async_decode_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # diagnostic: M-sweep over real 7B decode projections — does per-verified-token cost amortize for M>1
 # batched verify (spec-decode)? 1-core vs 3-core scaling per M. Not in all/test.
-batch_verify_probe: tools/batch_verify_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+batch_verify_probe: tools/batch_verify_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # diagnostic: per-submit DMA cache-maintenance (bsync) cost across output sizes — bounds the
 # cacheability/DISABLE_FLUSH lever (API lead #3). Not in all/test.
-bsync_cost_probe: tools/bsync_cost_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+bsync_cost_probe: tools/bsync_cost_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # diagnostic: time a batched chain single-core vs cross-core fan-out (ORK_CHAIN_MC). Throughput only.
-chain_bench: tools/chain_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_bench: tools/chain_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: static gated "exhaustive MoE ring" — all experts in one chained submit, per-token zero-mask
-test_exhaustive_moe: tools/test_exhaustive_moe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_exhaustive_moe: tools/test_exhaustive_moe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: isolate ork_mm_pack_i8_f32 (NEON f32->int8) vs pack_i8 on identical logical weights
-pack_f32_probe: tools/pack_f32_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+pack_f32_probe: tools/pack_f32_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic (P5.3): can a CPU prefetch thread hide per-slice streaming prep (int4->int8 inflate + tile
 # into a reused DMA buffer) behind the NPU computing the previous slice? Splits prep into inflate vs tile.
-prefetch_headroom: tools/prefetch_headroom.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+prefetch_headroom: tools/prefetch_headroom.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: verify (bit-identical tiles + exact matmul) + bench the DIRECT int4->int8-tiled inflate
 # (ORK_DIRECT_I4, no f32 round-trip) vs the int4->f32->tile path, UNIFORM and NF4.
-direct_i4_test: tools/direct_i4_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+direct_i4_test: tools/direct_i4_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic (Phase-5 M0 gate): is a sparse-MoE expert FFN GEMM on the NPU (DIRECT int4-NF4 inflate +
 # cacheable tiled buf, single + chained) now competitive with a NEON int8 CPU GEMM? vs the old f32 repack.
-moe_expert_probe: tools/moe_expert_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+moe_expert_probe: tools/moe_expert_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # adversarial verify of the 21ms-floor claim: LFM2.5 expert dims at M=1, RESIDENT int8 weights,
 # run_i8 vs run_chain_i8 vs run_stream_i8 vs CPU NEON i8.
-moe_m1_probe: tools/moe_m1_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+moe_m1_probe: tools/moe_m1_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # FEASIBILITY: does an NPU expert submit OVERLAP with CPU expert compute at M=1, and does a
 # concurrent split beat the CPU-fused MoE? (LFM2.5/Qwen3.6 decode shapes; crossing isolated.)
-moe_concurrent_probe: tools/moe_concurrent_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+moe_concurrent_probe: tools/moe_concurrent_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # BATCHED (M>1) extension of moe_concurrent_probe: at what batch size M does NPU||CPU distributed
 # expert execution beat the CPU-fused MoE? Sweeps M=1..128, best NPU/CPU split per M; crossing tracked.
 # -march=native: enable ARM SDOT (asimddp) so the CPU baseline (T_cpu_all) uses the same int8 dot kernel
 # llama.cpp uses on RK3588 — a FAIR baseline, not the slower vmull/vpadal fallback.
-moe_batched_probe: tools/moe_batched_probe.c $(CORE)
-	$(CC) $(CFLAGS) -march=native -o $@ $< $(CORE) -lm -lpthread
+moe_batched_probe: tools/moe_batched_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=native -o $@ $< $(COBJ) -lm -lpthread
 
 # diagnostic (P5.3 follow-on): does filling the resident NPU dma_buf from DISK (mmap warm/cold, pread cold)
 # add a penalty vs RAM, and how much cheaper is the pre-tiled int8 fill than the int4 inflate+tile path?
-disk_stream_bench: tools/disk_stream_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+disk_stream_bench: tools/disk_stream_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: can we break the ~1.06 GB/s weight dma_buf fill wall? A/B write-combine (0x401) vs cacheable
 # (0x403) vs NEON streaming-store fills, each with an NPU-read correctness check vs a CPU int8 reference.
-dmabuf_fill_probe: tools/dmabuf_fill_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+dmabuf_fill_probe: tools/dmabuf_fill_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # diagnostic: Tier 4a per-group Hadamard for W4A4, validated end-to-end ON THE NPU (plain vs rotated RMS)
-hadamard_i4_npu: tools/hadamard_i4_npu.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+hadamard_i4_npu: tools/hadamard_i4_npu.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # install the public header + both libs (override PREFIX=/path as needed)
 install: libork_npu.a libork_npu.so
@@ -427,49 +427,49 @@ clean:
 
 .PHONY: all lib install test clean check-attest
 
-attn_cost: tools/attn_cost.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+attn_cost: tools/attn_cost.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-attn_cost7b: tools/attn_cost7b.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+attn_cost7b: tools/attn_cost7b.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # RE: dump one single-core int8 ork matmul's regcmd (ORK_TRACE=1) for the weight-residence diff vs rknn.
-ork_trace_mm: tools/ork_trace_mm.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+ork_trace_mm: tools/ork_trace_mm.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # RE: reproduce the mixed-K cross-matmul state interaction (layer/model fail at cbuf raise).
-seq_check: tools/seq_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+seq_check: tools/seq_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # diagnostic: fast SAMPLED correctness for shapes whose full O(M*N*K) CPU ref takes minutes (wide-K,
 # e.g. ffn_down M=256 K=18944) — the slow ref masks NPU health and trips test/probe timeouts. Not in all/test.
-sparse_check: tools/sparse_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+sparse_check: tools/sparse_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # diagnostic: fp16 matmul correctness at a chosen (M,K,N,cores), sampled. Used to validate the fp16
 # M-scheduler row ceiling (sched=1 miscomputes >8 rows at K>=2048; single-core vs multi-core). Not in all/test.
-fp16_sparse_check: tools/fp16_sparse_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+fp16_sparse_check: tools/fp16_sparse_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # RE: round-robin single-core (run_stream) vs barrier multi-core, at R=32 (cbuf reinstated).
-rr_experiment: tools/rr_experiment.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+rr_experiment: tools/rr_experiment.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # RE: reproduce the fp16 layer/model failure at cbuf raise (multi-core fp16 matmul + CPU ref).
-fp16_check: tools/fp16_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lpthread -lm
+fp16_check: tools/fp16_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lpthread -lm
 
 # calibrate the fp16 fused SiLU (measure R/idx(gate), build curve, validate).
-silu_f16_calib: tools/silu_f16_calib.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+silu_f16_calib: tools/silu_f16_calib.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # sweep the bounded-Gmax fp16 fused-SiLU builder across the in-model gate range (bulk vs full error).
-f16_gmax_sweep: tools/f16_gmax_sweep.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+f16_gmax_sweep: tools/f16_gmax_sweep.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # probe whether the fp16 fused-SiLU index can reach the UPPER LUT bank (idx>514) under any register config.
-f16_bank_probe: tools/f16_bank_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+f16_bank_probe: tools/f16_bank_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # --- RE tooling for cross-NPU bring-up (board-only diagnostics; not in all/test) ---
 # NPU on-chip SRAM: total/free size query + allocation-usability probe. See README
@@ -486,72 +486,72 @@ test_norm: examples/test_norm.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
 # round-robin cross-core decode probe.
-rr_decode_probe: tools/rr_decode_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+rr_decode_probe: tools/rr_decode_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # IOMMU-domain concurrency probe (NPU || CPU overlap).
-domain_concur_probe: tools/domain_concur_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+domain_concur_probe: tools/domain_concur_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # layer-pipeline probe.
-layer_pipeline_probe: tools/layer_pipeline_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+layer_pipeline_probe: tools/layer_pipeline_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # on-die fused-activation harness (PPU/SDP chain RE).
-test_fused_activation: tests/test_fused_activation.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_fused_activation: tests/test_fused_activation.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # on-NPU norm: fused reduce+rsqrt (ork_mm_build_f16_rsqrt_lut) validated vs CPU 1/sqrt. Board+PPU only.
-test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
-dom_switch_probe: tools/re/dom_switch_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
-softmax_replay: tools/re/softmax_replay.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+softmax_replay: tools/re/softmax_replay.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-i4cpu_check: tools/re/i4cpu_check.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i4cpu_check: tools/re/i4cpu_check.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # first real int16 matmul via the fp16 run path + 0x100c=INT16 fuzz-override, vs a CPU int16 reference.
-i16_matmul_test: tools/i16_matmul_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i16_matmul_test: tools/i16_matmul_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # is the on-NPU int16 SiLU accurate enough to fix the gmax-gate coherence (vs CPU fp32 silu)?
-i16_silu_acc: tools/i16_silu_acc.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i16_silu_acc: tools/i16_silu_acc.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # where does the on-NPU int16 activation op wedge (M vs N vs M*N)? — to size act_lut_i16 internal tiling
-i16_shape_probe: tools/i16_shape_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i16_shape_probe: tools/i16_shape_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # PHASE 0 chained-FFN: does the NPU walk a heterogeneous matmul(0xd)->int16-silu(0x18) 2-task chain in one submit?
-chain_probe: tools/chain_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_probe: tools/chain_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # CHAIN ASSEMBLER increment 1: data-connected matmul(int16-out)->silu bridge in one PC-chain
-chain_gatesilu_probe: tools/chain_gatesilu_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_gatesilu_probe: tools/chain_gatesilu_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # CHAIN ASSEMBLER increment 1 (corrected): [gate*silu -> up] one submit via run_chain_i8 + set_i8_silu
-chain_gu_silu_probe: tools/chain_gu_silu_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_gu_silu_probe: tools/chain_gu_silu_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # PHASE 1 chained-FFN RE: does an int8 matmul emit correct int16 via set_i16_out (the on-NPU requant handoff)?
-i16out_probe: tools/i16out_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+i16out_probe: tools/i16out_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-bmm_probe: tools/bmm_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+bmm_probe: tools/bmm_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # Phase-1 GATE G1: decisive fusion micro-bench — fused mixed chunk chain (1 submit) vs the same ops as
 # N separate submits, at a floor-dominated shape. Proves fusion clears the submit floor before the big build.
-ssd_fusion_bench: tools/ssd_fusion_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ssd_fusion_bench: tools/ssd_fusion_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-floor_decomp: tools/floor_decomp.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+floor_decomp: tools/floor_decomp.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 mode_probe: tools/mode_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
@@ -611,148 +611,148 @@ mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
-ssd_layer_bench: tools/ssd_layer_bench.c $(CORE)
-	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(CORE) -lm -lpthread
+ssd_layer_bench: tools/ssd_layer_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(COBJ) -lm -lpthread
 
-ssd_cumba_exp: tools/ssd_cumba_exp.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ssd_cumba_exp: tools/ssd_cumba_exp.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-softmax_probe: tools/softmax_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+softmax_probe: tools/softmax_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-softmax_cost: tools/softmax_cost.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+softmax_cost: tools/softmax_cost.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-rope_probe: tools/rope_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+rope_probe: tools/rope_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-two_stream_f16_probe: tools/two_stream_f16_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+two_stream_f16_probe: tools/two_stream_f16_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-softmax_reduce_probe: tools/softmax_reduce_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+softmax_reduce_probe: tools/softmax_reduce_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-sdp_max_fuzz: tools/sdp_max_fuzz.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+sdp_max_fuzz: tools/sdp_max_fuzz.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-max_reduce_probe: tools/max_reduce_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+max_reduce_probe: tools/max_reduce_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-bs_scale_probe: tools/bs_scale_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+bs_scale_probe: tools/bs_scale_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-tnorm_probe: tools/tnorm_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+tnorm_probe: tools/tnorm_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-chain_mm_perchan_probe: tools/chain_mm_perchan_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_mm_perchan_probe: tools/chain_mm_perchan_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-chain_mm_perchan_f16_probe: tools/chain_mm_perchan_f16_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+chain_mm_perchan_f16_probe: tools/chain_mm_perchan_f16_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-f16_mm_f16out_probe: tools/f16_mm_f16out_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+f16_mm_f16out_probe: tools/f16_mm_f16out_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-mm_perchan_f16_fused_probe: tools/mm_perchan_f16_fused_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mm_perchan_f16_fused_probe: tools/mm_perchan_f16_fused_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-mul_perchan_f16_contig_probe: tools/mul_perchan_f16_contig_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mul_perchan_f16_contig_probe: tools/mul_perchan_f16_contig_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-reshape_probe: tools/reshape_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+reshape_probe: tools/reshape_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-requant_i32_probe: tools/requant_i32_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+requant_i32_probe: tools/requant_i32_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-mm_perchan_f16_probe: tools/mm_perchan_f16_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mm_perchan_f16_probe: tools/mm_perchan_f16_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-mm_perchan_f16_diag_probe: tools/mm_perchan_f16_diag_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mm_perchan_f16_diag_probe: tools/mm_perchan_f16_diag_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-stridedA_bmm_probe: tools/stridedA_bmm_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+stridedA_bmm_probe: tools/stridedA_bmm_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-perchan_bench: tools/perchan_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+perchan_bench: tools/perchan_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-doorbell_prof: tools/doorbell_prof.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+doorbell_prof: tools/doorbell_prof.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-overlap_prof: tools/overlap_prof.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+overlap_prof: tools/overlap_prof.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # split-tensor CPU+NPU decode probe: NEON sdot CPU GEMV needs armv8.2 +dotprod (A76).
-split_matmul_probe: tools/split_matmul_probe.c $(CORE)
-	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+split_matmul_probe: tools/split_matmul_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(COBJ) -lm -lpthread
 
 # MoE expert-split CPU+NPU probe (NEON sdot needs +dotprod).
-split_expert_probe: tools/split_expert_probe.c $(CORE)
-	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+split_expert_probe: tools/split_expert_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(COBJ) -lm -lpthread
 
 # per-op NPU-vs-CPU profiler (NEON sdot needs +dotprod).
-op_profile: tools/op_profile.c $(CORE)
-	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(CORE) -lm -lpthread
+op_profile: tools/op_profile.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(COBJ) -lm -lpthread
 
-qkv_chain_probe: tools/qkv_chain_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+qkv_chain_probe: tools/qkv_chain_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # CPU-only int4-vs-int8 memory-bound GEMV (no NPU). NEON +dotprod.
 cpu_i4_vs_i8: tools/cpu_i4_vs_i8.c
 	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< -lpthread
 
-jit_i4_i8_probe: tools/jit_i4_i8_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+jit_i4_i8_probe: tools/jit_i4_i8_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # static-ID doorbell probe: can one address show the current op ID? Not in all/test.
-static_id_probe: tools/static_id_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+static_id_probe: tools/static_id_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # RE probe: does the PC sequencer read chain descriptors from DRAM at exec-time (steerable) or pre-cache? Not in all/test.
-steer_probe: tools/steer_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+steer_probe: tools/steer_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # dynamic-submit API test: begin/progress/halt/end (NONBLOCK chain, per-op doorbell, mid-flight early-exit). Not in all/test.
-ork_dyn_test: tools/ork_dyn_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_test: tools/ork_dyn_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # P1b/G1: N-tiling (Sn>1) on the doorbell — bit-exact vs CPU int32 ref, column-varying weights
-ork_dyn_ntile_test: tools/ork_dyn_ntile_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_ntile_test: tools/ork_dyn_ntile_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # fp16-doorbell priming/persistence probe (int8-primes-fp16 hypothesis for the mixed-precision async pipeline)
-ork_dyn_f16_interleave: tools/ork_dyn_f16_interleave.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_f16_interleave: tools/ork_dyn_f16_interleave.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # fp16 doorbell-vs-chain regcmd/submit dump-and-diff (RE: crack fp16 HW-chaining). Not in all/test.
-f16_dumpdiff: tools/f16_dumpdiff.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+f16_dumpdiff: tools/f16_dumpdiff.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # SRAM-vs-DRAM contention probe: is NPU-on-SRAM a separate memory path from CPU-on-DRAM? (partition test)
-sram_bw_probe: tools/sram_bw_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm -lpthread
+sram_bw_probe: tools/sram_bw_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
-ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # persistent-job spin keep-alive + mid-flight redirect probe. Not in all/test.
-dyn_spin_probe: tools/dyn_spin_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+dyn_spin_probe: tools/dyn_spin_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # precompiled-program cache (regime A) vs synth-every-call bench. Not in all/test.
-ork_pc_bench: tools/ork_pc_bench.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_pc_bench: tools/ork_pc_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-ork_pc_sram_probe: tools/ork_pc_sram_probe.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_pc_sram_probe: tools/ork_pc_sram_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-ork_dyn_spin_test: tools/ork_dyn_spin_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_spin_test: tools/ork_dyn_spin_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-ork_dyn_spin_diag: tools/ork_dyn_spin_diag.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+ork_dyn_spin_diag: tools/ork_dyn_spin_diag.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-risky_dump_test: tools/risky_dump_test.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+risky_dump_test: tools/risky_dump_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
