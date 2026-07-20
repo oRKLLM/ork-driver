@@ -579,6 +579,11 @@ test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_pro
 orkd_ring_probe: tools/orkd_ring_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/orkd_ring.h src/orkd_shm.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
 
+# orkd_2proc — genuine TWO-PROCESS orkd proof: fork()+exec()s N separate client binaries (default ./test_orkd)
+# concurrently against one daemon. Plain launcher (no orkd libs; execs the children). Board tool, not in `make test`.
+orkd_2proc: tools/orkd_2proc.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 # test_orkd_transparent — Path B: NORMAL ork_npu API, bit-exact direct vs routed-through-orkd (ORK_USE_ORKD).
 # Links COBJ (which now includes orkd_client.o for the transparent route). Board tool, not in `make test`.
 test_orkd_transparent: examples/test_orkd_transparent.c $(COBJ)
