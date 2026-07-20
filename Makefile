@@ -386,6 +386,38 @@ test-only: $(filter $(EXAMPLES) $(TESTS),$(T))
 	fail=0; for t in $(T); do echo "== $$t"; timeout $(TEST_TIMEOUT) sudo ./$$t || fail=1; done; \
 	if [ $$fail -eq 0 ]; then echo "SUBSET PASSED"; else echo "SUBSET FAILED"; exit 1; fi
 
+# A-suite (orkd "first client" milestone): run the ROUTABLE subset of the test suite through ONE orkd daemon.
+# Each example is UNCHANGED and self-validates vs its golden/CPU reference — only the NPU-access path changes
+# (direct ioctl -> orkd RPC) via ORK_USE_ORKD=1. ONE daemon is spun up, survives the whole run (a large
+# ORKD_IDLE_MS bridges the inter-test gaps so it does NOT idle-reap between examples), and is torn down after;
+# the daemon's PID is asserted stable across the run to prove a single persistent daemon serviced every test.
+#   ROUTABLE = every NPU op the example issues is on the orkd RPC surface: matmul (int8 quant/test_speed,
+#   fp16 layer/decode/model) + SDP (ewmul i8/f16). CPU-only test_activations rides along.
+#   OUT OF SCOPE (stay under plain `make test`, direct NPU): internal entrypoints not yet on the RPC surface —
+#   run_stream_* (test_matmul/test_stream_interleave/test_affinity), int4 chain/stream/grouped/i4a8
+#   (test_chain_i4/i4/perplexity_i4/test_matmul), bmm + ssm (test_bmm*/test_ssd_chunk_npu/test_mode_transition),
+#   int16 SDP + gelu/exp/rsqrt (test_ewmul_i16/test_silu/test_add/test_gelu), and the probe/perf tools.
+# Run on the SBC, one at a time, no concurrent make: sudo make test-orkd  (or via ssh run_in_background).
+ORKD_SUITE := test_activations quant layer decode model test_ewmul_i8 test_ewmul_f16
+test-orkd: $(ORKD_SUITE) orkd
+	@echo "== A-suite: routable test subset through ONE orkd (first-client milestone) =="; \
+	sudo pkill -x orkd 2>/dev/null; sleep 1; \
+	echo "-- spinning up one orkd (idle-reap bridged; ORKD_IDLE_MS=600000)"; \
+	sudo env ORKD_IDLE_MS=600000 ./orkd; sleep 1; \
+	pid0=$$(pgrep -x orkd | head -1); \
+	if [ -z "$$pid0" ]; then echo "orkd failed to start"; exit 1; fi; \
+	echo "-- orkd up, pid=$$pid0"; \
+	fail=0; \
+	for t in "test_activations" "quant" "layer" "decode" "model 1" "model 12" "test_ewmul_i8" "test_ewmul_f16"; do \
+	  echo "== [orkd] $$t"; timeout $(TEST_TIMEOUT) sudo env ORK_USE_ORKD=1 ORKD_BIN=$$PWD/orkd ./$$t || fail=1; \
+	  pidn=$$(pgrep -x orkd | head -1); \
+	  if [ "$$pidn" != "$$pid0" ]; then echo "FAIL: orkd pid changed ($$pid0 -> $$pidn) — daemon did not persist across the run"; fail=1; fi; \
+	done; \
+	echo "-- tearing down orkd (SIGTERM)"; sudo pkill -TERM -x orkd 2>/dev/null; sleep 2; \
+	if pgrep -x orkd >/dev/null; then echo "WARN: orkd survived SIGTERM — forcing"; sudo pkill -x orkd; fi; \
+	if [ $$fail -eq 0 ]; then echo "A-SUITE (orkd) PASSED — routable subset self-validated through one persistent daemon"; \
+	  else echo "A-SUITE (orkd) FAILED"; exit 1; fi
+
 bench-llama:
 	@echo "== Running two-turn conversation integration benchmark via llama-server =="
 	@LLAMA_SERVER_BIN=$(HOME)/llama.cpp/build/bin/llama-server tools/bench_two_turn.sh

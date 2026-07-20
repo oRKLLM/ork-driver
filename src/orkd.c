@@ -69,7 +69,11 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
     send_msg(fd, ORKD_ERROR, tag, &e, sizeof e);
 }
 
-#define ORKD_MAX_WEIGHTS 64
+/* Per-client resident-weight table. A real model client packs one weight per matmul per layer and holds them
+ * all resident (e.g. `model 12` = 7 matmuls x 12 layers = 84), and ork_w_free (no ctx) can't send a daemon-free
+ * RPC so weights are reclaimed only on the client's socket-EOF — so this must comfortably exceed a model's
+ * full resident set, not just a handful. */
+#define ORKD_MAX_WEIGHTS 512
 #define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
 
 struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
