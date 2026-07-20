@@ -148,6 +148,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
     int dom_active; int dom_seen[ORK_MAXDOM];
     int dom_next;   /* direct-mode domain allocator counter (ork_npu_domain_alloc hands out 1,2,3,…); Path B asks the daemon instead */
+    int db_flying_dom;   /* MULTI-DOMAIN WEDGE GUARD: domain of an mc doorbell round that stayed STUCK (recovery-exhausted) — a phantom in-flight submit lives there; -1 = none. dom_activate quiesces before a cross-domain switch when >=0 so the kernel's switch-idle-wait can't race it. Set/cleared in ork_dyn_end. */
     /* Per-domain native "anchor": one small NATIVE bcreate per non-0 domain, allocated BEFORE any dma-buf
      * import is mapped into that domain. The kernel rknpu driver sets up a domain's IOVA allocator / page
      * table lazily on its FIRST buffer, and that path misbehaves when the first buffer is an IMPORTED
@@ -576,6 +577,13 @@ static void act(int fd,uint32_t f,uint32_t v){
         else fprintf(stderr,"[ork] ACT_RESET #%ld ra=%p\n",++n,ra); } }
     struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
 
+/* Invalidate all warm state after a global ACT_RESET (the physical NPU was cooled, so every domain's software
+ * warm flags — active + parked — are now stale; force a re-warm on next use of each). */
+static void dom_cool(ork_npu *c){
+    c->warmed=0; memset(c->mwarm,0,sizeof c->mwarm);
+    if(c->dom_save) for(int d=0;d<ORK_MAXDOM;d++){ c->dom_save[d].warmed=0; memset(c->dom_save[d].mwarm,0,sizeof c->dom_save[d].mwarm); }
+}
+
 /* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
  * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
  * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
@@ -584,6 +592,18 @@ static void act(int fd,uint32_t f,uint32_t v){
 static void dom_activate(ork_npu *c,int dom){
     if(dom<0||dom>=ORK_MAXDOM) dom=0;
     if(dom==c->dom_active) return;
+    /* MULTI-DOMAIN WEDGE GUARD (pairs with ork_dyn_end + mc_recover_resubmit). If a prior mc doorbell round
+     * stayed STUCK (its recovery exhausted — the ~1/2400 doorbell-miss), a phantom submit is still in flight in
+     * db_flying_dom. Switching the IOMMU domain now would race the kernel's switch-idle-wait against that phantom
+     * and time out ("switch iommu domain time out", reboot-persistent). Quiesce first: ACT_RESET + settle (mirror
+     * mc_recover_resubmit) so the NPU is idle before the switch, cool the now-stale warm flags, clear the flag.
+     * No-op in normal operation (clean rounds clear db_flying_dom to -1, so this never fires — the 67k-clean path). */
+    if(c->db_flying_dom>=0){
+        struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a);
+        struct timespec ts={0,1000000}; nanosleep(&ts,NULL);
+        dom_cool(c);
+        c->db_flying_dom=-1;
+    }
     if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
@@ -1340,7 +1360,7 @@ ork_npu *ork_npu_init(void){
     { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
       if(ud && atoi(ud) && !(isd && atoi(isd))){
         orkd_conn *dc=orkd_connect();
-        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
+        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->db_flying_dom=-1; g_npu_ctx=c;
             if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
             if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc)); return c; }
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
@@ -1357,7 +1377,7 @@ ork_npu *ork_npu_init(void){
       if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
           fprintf(stderr,"[ork] NPU SRAM: %u KiB %s\n",(unsigned)(g_sram_total>>10),
                   g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->db_flying_dom=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
@@ -10235,6 +10255,10 @@ int ork_dyn_seq_end(ork_dyn_chain *h){
         if(done){landed=1;break;} if(g_ork_term||ork_now_us()-t0>3e6) break; }
     g_in_doorbell=0;
     if(!landed) rc=-1;
+    /* MULTI-DOMAIN WEDGE GUARD (pairs with dom_activate): a STUCK SEQ round (no landed sentinel — the doorbell
+     * miss, and the SEQ path has no in-place recovery) leaves a phantom submit in h->dom. Flag its domain so the
+     * next cross-domain dom_activate quiesces (ACT_RESET) before switching. Clean drain clears it to -1. */
+    c->db_flying_dom = landed ? -1 : h->dom;
     bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int i=0;i<h->S;i++){ if(!h->dst[i]) continue; int M=h->oM[i], N=h->nout[i]/(M?M:1);
         if(h->oesz8[i]==4){ memcpy(h->dst[i], (char*)h->seq_out.cpu+h->ooff[i], (size_t)M*N*4); }
@@ -10500,6 +10524,10 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         }
         break;   /* recovery exhausted / not recoverable -> fall through to trace + auto-dump */
     }
+    /* MULTI-DOMAIN WEDGE GUARD (pairs with dom_activate): a STUCK mc round (recovery exhausted, last<S-1) leaves a
+     * phantom in-flight submit in mc_dom — flag its domain so the next cross-domain dom_activate quiesces before
+     * switching. A clean drain clears it to -1 (the normal path — so the guard never fires in normal operation). */
+    if (h->mc_nc > 0) h->c->db_flying_dom = (last >= h->S - 1) ? -1 : (int)h->mc_dom;
     if (getenv("ORK_DYN_TRACE")) { double _el = ork_now_us() - t0; int _nd = 0; for (int i = 0; i < h->S; i++) _nd += edone[i];
         fprintf(stderr, "[dyn_end] S=%d mc=%d done=%d/%d last=%d elapsed=%.0fus %s\n", h->S, h->mc, _nd, h->S, last, _el,
             _nd < h->S ? "INCOMPLETE(timeout/term)" : "all-done");

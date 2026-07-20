@@ -610,6 +610,11 @@ test_orkd_2conn_seq: tools/test_orkd_2conn_seq.c $(COBJ)
 orkd_dom_api: tools/orkd_dom_api.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# dom_switch_stress — high-count alternating-domain loop to reproduce the ~1/2400 kernel switch-idle-wait race.
+# sudo env ORK_PRESUBMIT_TRACE=/tmp/presub.log ./dom_switch_stress 12000
+dom_switch_stress: tools/dom_switch_stress.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.
 mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
