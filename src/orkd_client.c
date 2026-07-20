@@ -18,7 +18,7 @@
 #define ORKD_CONNECT_TRIES 200          /* * 15ms ~= 3s to let an auto-spawned daemon bind */
 #define ORKD_CONNECT_BACKOFF_NS (15*1000*1000L)
 
-struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio;
+struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio; uint32_t pack_domain;
                    struct orkd_ring *ring; int ring_fd; uint32_t ring_next; };  /* A-ring: low-latency shm transport */
 
 /* live connections, for the atexit clean-BYE (small fixed set; a process rarely holds many) */
@@ -102,6 +102,38 @@ int orkd_ping(orkd_conn *c){
 }
 
 void orkd_set_priority(orkd_conn *c, unsigned prio){ if (c) c->prio = prio; }
+
+/* Client-managed IOMMU domains. orkd_domain_alloc asks the daemon for an isolated pool domain (coordinated so
+ * clients don't collide); orkd_set_pack_domain then makes subsequent packs (orkd_pack_*) land the weight there.
+ * orkd_domain_free returns it. All held domains are also reclaimed automatically when the connection drops. */
+void orkd_set_pack_domain(orkd_conn *c, uint32_t domain){ if (c) c->pack_domain = domain; }
+
+int orkd_domain_alloc(orkd_conn *c){
+    if (!c || c->fd < 0) return -1;
+    struct orkd_hdr h = { ORKD_DOM_REQ, 0, 7 };
+    if (wn(c->fd, &h, sizeof h)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_DOM_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc == 0 ? (int)hh.id : -1;
+}
+int orkd_domain_free(orkd_conn *c, int domain){
+    if (!c || c->fd < 0 || domain <= 0) return -1;
+    struct orkd_handle rq; memset(&rq, 0, sizeof rq); rq.id = (uint64_t)domain;
+    struct orkd_hdr h = { ORKD_DOM_REL, (uint32_t)sizeof rq, 7 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq)) return -1;
+    if (c->pack_domain == (uint32_t)domain) c->pack_domain = 0;   /* stop packing into a freed domain */
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_DOM_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc;
+}
 
 /* A-ring: attach a shared low-latency ring. Allocates the region (memfd), maps it, passes the fd to the daemon
  * over the control socket (SCM_RIGHTS), and awaits RING_OK. Returns 0 iff both sides mapped it. After this,
@@ -195,7 +227,7 @@ static void cdrain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > si
 uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
     if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
     uint32_t bytes = (uint32_t)((size_t)K * N);
-    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I8; pk.bytes = bytes;
+    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I8; pk.bytes = bytes; pk.domain = c->pack_domain;
     struct orkd_hdr h = { ORKD_PACK, (uint32_t)(sizeof pk + bytes), 3 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &pk, sizeof pk) || wn(c->fd, B, bytes)) return 0;
     struct orkd_hdr rh;
@@ -234,7 +266,7 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B){
     if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
     uint32_t bytes = (uint32_t)((size_t)K * N * 2);
-    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_F16; pk.bytes = bytes;
+    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_F16; pk.bytes = bytes; pk.domain = c->pack_domain;
     struct orkd_hdr h = { ORKD_PACK, (uint32_t)(sizeof pk + bytes), 3 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &pk, sizeof pk) || wn(c->fd, B, bytes)) return 0;
     struct orkd_hdr rh;
@@ -272,7 +304,7 @@ int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const vo
 uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B){
     if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
     uint32_t bytes = (uint32_t)((size_t)K * N);
-    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I4; pk.bytes = bytes;
+    struct orkd_pack pk; memset(&pk, 0, sizeof pk); pk.K = (uint32_t)K; pk.N = (uint32_t)N; pk.dtype = ORKD_DT_I4; pk.bytes = bytes; pk.domain = c->pack_domain;
     struct orkd_hdr h = { ORKD_PACK, (uint32_t)(sizeof pk + bytes), 3 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &pk, sizeof pk) || wn(c->fd, B, bytes)) return 0;
     struct orkd_hdr rh;
@@ -346,6 +378,23 @@ int orkd_add_i8  (orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, 
     return orkd_sdp_call(c, ORKD_SDP_ADD_I8, M, N, 2, 1, 1, 0, 0, 0, os, as, bs, a, b, out); }
 int orkd_add_f16 (orkd_conn *c, const void *a, const void *b, int M, int N, void *out){
     return orkd_sdp_call(c, ORKD_SDP_ADD_F16, M, N, 2, 2, 2, 0, 0, 0, 0, 0, 0, a, b, out); }
+/* remaining i8 activations + the int16 activation/ewmul/add family (in/out int16 as void*) */
+int orkd_rsqrt_i8(orkd_conn *c, const int8_t *in, int M, int N, double is, double os, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_RSQRT_I8, M, N, 1, 1, 1, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_exp_i8  (orkd_conn *c, const int8_t *in, int M, int N, double is, double os, int8_t *out){
+    return orkd_sdp_call(c, ORKD_SDP_EXP_I8, M, N, 1, 1, 1, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_silu_i16(orkd_conn *c, const void *in, int M, int N, double is, double os, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_SILU_I16, M, N, 1, 2, 2, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_gelu_i16(orkd_conn *c, const void *in, int M, int N, double is, double os, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_GELU_I16, M, N, 1, 2, 2, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_rsqrt_i16(orkd_conn *c, const void *in, int M, int N, double is, double os, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_RSQRT_I16, M, N, 1, 2, 2, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_exp_i16 (orkd_conn *c, const void *in, int M, int N, double is, double os, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_EXP_I16, M, N, 1, 2, 2, 0, 0, is, os, 0, 0, in, NULL, out); }
+int orkd_ewmul_i16(orkd_conn *c, const void *a, const void *b, int M, int N, int mult, int shift, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_EWMUL_I16, M, N, 2, 2, 2, mult, shift, 0, 0, 0, 0, a, b, out); }
+int orkd_add_i16 (orkd_conn *c, const void *a, const void *b, int M, int N, double as, double bs, double os, void *out){
+    return orkd_sdp_call(c, ORKD_SDP_ADD_I16, M, N, 2, 2, 2, 0, 0, 0, os, as, bs, a, b, out); }
 
 int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *t){
     if (!c || c->fd < 0 || S < 1 || S > ORKD_CHAIN_MAX || !t) return -1;

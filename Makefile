@@ -392,13 +392,14 @@ test-only: $(filter $(EXAMPLES) $(TESTS),$(T))
 # ORKD_IDLE_MS bridges the inter-test gaps so it does NOT idle-reap between examples), and is torn down after;
 # the daemon's PID is asserted stable across the run to prove a single persistent daemon serviced every test.
 #   ROUTABLE = every NPU op the example issues is on the orkd RPC surface: matmul (int8 quant/test_speed,
-#   fp16 layer/decode/model) + SDP (ewmul i8/f16). CPU-only test_activations rides along.
+#   fp16 layer/decode/model) + the full SDP/activation family (ewmul i8/f16/i16, add i8/f16/i16, silu/gelu i8/i16,
+#   rsqrt/exp i8/i16). CPU-only test_activations rides along.
 #   OUT OF SCOPE (stay under plain `make test`, direct NPU): internal entrypoints not yet on the RPC surface —
 #   run_stream_* (test_matmul/test_stream_interleave/test_affinity), int4 chain/stream/grouped/i4a8
 #   (test_chain_i4/i4/perplexity_i4/test_matmul), bmm + ssm (test_bmm*/test_ssd_chunk_npu/test_mode_transition),
-#   int16 SDP + gelu/exp/rsqrt (test_ewmul_i16/test_silu/test_add/test_gelu), and the probe/perf tools.
+#   and the probe/perf tools. Extending to those is the next RPC-surface increment.
 # Run on the SBC, one at a time, no concurrent make: sudo make test-orkd  (or via ssh run_in_background).
-ORKD_SUITE := test_activations quant layer decode model test_ewmul_i8 test_ewmul_f16
+ORKD_SUITE := test_activations quant layer decode model test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_gelu test_add
 test-orkd: $(ORKD_SUITE) orkd
 	@echo "== A-suite: routable test subset through ONE orkd (first-client milestone) =="; \
 	sudo pkill -x orkd 2>/dev/null; sleep 1; \
@@ -602,6 +603,11 @@ test_orkd_2conn: tools/test_orkd_2conn.c $(COBJ)
 # Multi-consumer SEQ proof: two connections, each submits a grouped op-sequence (board tool, not in `make test`).
 # sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./test_orkd_2conn_seq [iters]
 test_orkd_2conn_seq: tools/test_orkd_2conn_seq.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# orkd_dom_api — validate client-managed IOMMU domains (ork_npu_domain_alloc/free + set_pack_domain), direct or
+# routed: sudo ./orkd_dom_api  |  sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./orkd_dom_api
+orkd_dom_api: tools/orkd_dom_api.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.

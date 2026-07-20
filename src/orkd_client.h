@@ -27,6 +27,13 @@ int orkd_ping(orkd_conn *c);
  * work; ties broken by domain affinity then FIFO). Carried in orkd_run.flags. Default 0. */
 void orkd_set_priority(orkd_conn *c, unsigned prio);
 
+/* Client-managed IOMMU domains. orkd_domain_alloc requests an isolated domain from the daemon's coordinated
+ * pool (returns id>0, or <0 if exhausted); orkd_set_pack_domain routes subsequent orkd_pack_* into it (0 =
+ * shared/default); orkd_domain_free returns it (also auto-reclaimed on disconnect). */
+int  orkd_domain_alloc(orkd_conn *c);
+int  orkd_domain_free(orkd_conn *c, int domain);
+void orkd_set_pack_domain(orkd_conn *c, uint32_t domain);
+
 /* A-ring: attach a shared-memory ring for LOW-LATENCY submits (removes the per-op socket round-trip). 0 = ok.
  * The ring transport is precision-agnostic (dtype is per-op); the socket stays for control + oversized fallback. */
 int orkd_ring_setup(orkd_conn *c);
@@ -85,6 +92,14 @@ int orkd_ewmul_i8(orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, 
 int orkd_ewmul_f16(orkd_conn *c, const void *a, const void *b, int M, int N, void *out);
 int orkd_add_i8  (orkd_conn *c, const int8_t *a, const int8_t *b, int M, int N, double a_scale, double b_scale, double out_scale, int8_t *out);
 int orkd_add_f16 (orkd_conn *c, const void *a, const void *b, int M, int N, void *out);
+int orkd_rsqrt_i8(orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);
+int orkd_exp_i8  (orkd_conn *c, const int8_t *in, int M, int N, double in_scale, double out_scale, int8_t *out);
+int orkd_silu_i16(orkd_conn *c, const void *in, int M, int N, double in_scale, double out_scale, void *out);   /* in/out int16 */
+int orkd_gelu_i16(orkd_conn *c, const void *in, int M, int N, double in_scale, double out_scale, void *out);
+int orkd_rsqrt_i16(orkd_conn *c, const void *in, int M, int N, double in_scale, double out_scale, void *out);
+int orkd_exp_i16 (orkd_conn *c, const void *in, int M, int N, double in_scale, double out_scale, void *out);
+int orkd_ewmul_i16(orkd_conn *c, const void *a, const void *b, int M, int N, int mult, int shift, void *out);
+int orkd_add_i16 (orkd_conn *c, const void *a, const void *b, int M, int N, double a_scale, double b_scale, double out_scale, void *out);
 
 /* Like orkd_run_i8 but A is passed BY REFERENCE: placed in a shared dma-buf and read zero-copy by the NPU
  * (no A byte-transfer over the socket). C still returns over the socket. 0 = ok, <0 = error (-2 = no dma-heap). */

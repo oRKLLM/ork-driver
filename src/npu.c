@@ -147,6 +147,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
     int dom_active; int dom_seen[ORK_MAXDOM];
+    int dom_next;   /* direct-mode domain allocator counter (ork_npu_domain_alloc hands out 1,2,3,…); Path B asks the daemon instead */
     /* Per-domain native "anchor": one small NATIVE bcreate per non-0 domain, allocated BEFORE any dma-buf
      * import is mapped into that domain. The kernel rknpu driver sets up a domain's IOVA allocator / page
      * table lazily on its FIRST buffer, and that path misbehaves when the first buffer is an IMPORTED
@@ -1508,7 +1509,24 @@ void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set
  * run time ork_mm_run* submits that weight's matmuls against the same domain automatically. Activation/
  * output scratch follows the most-recently-set pack domain. domain<0 reverts to the process default
  * (env ORK_IOMMU_DOMAIN, else 0). Domains are created lazily by the kernel on first use. */
-void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(c) c->pack_domain = domain<0 ? -1 : domain; }
+void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(!c) return; c->pack_domain = domain<0 ? -1 : domain;
+    if(c->daemon) orkd_set_pack_domain(c->daemon, domain<0 ? 0u : (uint32_t)domain); }   /* Path B: route the domain to the daemon so orkd_pack lands the weight there */
+
+/* Allocate an IOMMU domain to pack weights into (isolation + a full ~4 GiB IOVA window each). Path B: request
+ * one from orkd's coordinated pool (returns id>0, or <0 if exhausted). Direct: hand out a local id (1,2,…).
+ * Make it the pack target with ork_npu_set_pack_domain; return it with ork_npu_domain_free. */
+int ork_npu_domain_alloc(ork_npu *c){
+    if(!c) return -1;
+    if(c->daemon) return orkd_domain_alloc(c->daemon);
+    if(c->dom_next < 1) c->dom_next = 1;
+    if(c->dom_next >= ORK_MAXDOM) return -1;
+    return c->dom_next++;
+}
+int ork_npu_domain_free(ork_npu *c,int domain){
+    if(!c || domain<=0) return -1;
+    if(c->daemon) return orkd_domain_free(c->daemon, domain);
+    return 0;   /* direct mode: domains aren't pooled — a weight's buffers free with the weight */
+}
 int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   /* current pack domain (save/restore around a domain-targeted alloc) */
 /* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
  * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
@@ -6242,6 +6260,7 @@ int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const 
  * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. GENERALIZED to arbitrary
  * M,N (N a multiple of 8); rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i16(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
@@ -7027,6 +7046,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
  * arbitrary unequal scales approximate. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
                     double a_scale,double b_scale,double out_scale,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_add_i16(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)||out_scale<=0) return -2;
@@ -7799,10 +7819,12 @@ int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,doub
 }
 /* On-NPU rsqrt (int8) — RMSNorm building block: out = clamp_i8(round( rsqrt(in*in_scale)/out_scale )). */
 int ork_npu_rsqrt_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_rsqrt_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i8(c,rsqrt_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU exp (int8) — softmax building block: out = clamp_i8(round( exp(in*in_scale)/out_scale )). */
 int ork_npu_exp_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_exp_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i8(c,exp_f,in,M,N,in_scale,out_scale,out,us);
 }
 
@@ -8285,18 +8307,22 @@ static int act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int
     return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
 }
 int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_silu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i16(c,silu_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU GELU (int16 / w16a16i): same activation-LUT op, GELU curve. RKNN-class accuracy like SiLU int16. */
 int ork_npu_gelu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_gelu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i16(c,gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU rsqrt (int16) — RMSNorm building block. RKNN-class accuracy. */
 int ork_npu_rsqrt_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_rsqrt_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i16(c,rsqrt_f,in,M,N,in_scale,out_scale,out,us);
 }
 /* On-NPU exp (int16) — softmax building block. RKNN-class accuracy. */
 int ork_npu_exp_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    if(c && c->daemon){ if(us)*us=0; return orkd_exp_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i16(c,exp_f,in,M,N,in_scale,out_scale,out,us);
 }
 

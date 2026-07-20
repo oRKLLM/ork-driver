@@ -81,6 +81,7 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 
 struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
 struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain;
+                unsigned owned_dom;   /* bitmask of IOMMU domains this client requested via ORKD_DOM_REQ (bits 1..POOL); released on drop */
                 struct orkd_ring *ring; int ring_fd; uint32_t ring_tail; };  /* A-ring: attached low-latency shm transport */
 
 /* A-sched: PER-CLIENT IOMMU DOMAINS (opt-in, ORKD_PER_CLIENT_DOMAINS=1). Intent: pack each client's resident
@@ -89,21 +90,23 @@ struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGH
  * groups equal-priority work by domain to amortize the scratch-swap). Default OFF -> all clients share domain 0,
  * byte-identical to the proven single-domain path (validated: make test + test-orkd + multi-consumer all PASS).
  *
- * ★ ENABLING IT IS NOT YET VIABLE (2026-07-19): with the flag ON, the doorbell SEQ path fails immediately
- * (submit_seq FAIL, no wedge). Root cause: ork_dyn_begin_seq_i8_mc dom_activate's the weight's domain, but its
- * multi-core scratch (c->mrc/mtk/maf) is CTX-GLOBAL (allocated by mc_ensure, shared across all clients' seqs)
- * and is NOT part of the per-domain scratch swap (npu.c dom_activate swaps the single-core scratch, not the mc
- * pools). So a submit in domain d references task/regcmd buffers that live in domain 0 -> mismatch. The plain
- * RUN path (ork_mm_run, which auto-swaps per w->domain) is likely fine but untested here. Making this viable
- * needs PER-DOMAIN mc scratch pools (or extending the scratch swap to the mc buffers) — a scoped multi-domain
- * follow-on ([[multi-domain-runtime]] territory). Left gated-OFF + plumbed, not removed. */
-#define ORKD_DOMAIN_POOL 8                    /* domains 1..8 handed out per client; 0 = shared/default */
-static int g_per_client_dom = 0;              /* set from ORKD_PER_CLIENT_DOMAINS at startup */
+ * ★ VALIDATED 2026-07-20: multi-domain WORKS. The earlier "NOT YET VIABLE" note (an mc-scratch theory) was
+ * wrong — the real blocker was that the standalone SDP/activation leaf helpers hardcoded iommu_domain_id=-1
+ * (npu.c) so a chained SDP submitted in domain 0 against dom-1 buffers -> errno 110; fixed by threading
+ * c->dom_active through them (commit 21441d0). test_orkd_2conn_seq with ORKD_PER_CLIENT_DOMAINS=1 now passes
+ * bit-exact (4 clients, own domains). TWO ways to get an isolated domain: (a) AUTO — ORKD_PER_CLIENT_DOMAINS=1
+ * assigns one per client on accept (dom_alloc); (b) EXPLICIT — the client requests one via ORKD_DOM_REQ
+ * (dom_alloc_explicit, works regardless of the env knob) and packs into it (orkd_pack.domain). Both draw from
+ * the same g_dom_inuse pool; all a client's domains (auto + requested) are released on drop. */
+#define ORKD_DOMAIN_POOL 8                    /* domains 1..8 handed out; 0 = shared/default */
+static int g_per_client_dom = 0;              /* ORKD_PER_CLIENT_DOMAINS: auto-assign a domain per client on accept */
 static unsigned char g_dom_inuse[ORKD_DOMAIN_POOL + 1];   /* index 1..POOL; 0 unused (always-available shared) */
-static int dom_alloc(void){                   /* grab a free domain for a new client; pool-exhausted -> 0 (shared) */
-    if (!g_per_client_dom) return 0;
+static int dom_alloc_explicit(void){          /* grab a free pool domain (for an explicit ORKD_DOM_REQ) -> 1..POOL, or 0 if exhausted */
     for (int d = 1; d <= ORKD_DOMAIN_POOL; d++) if (!g_dom_inuse[d]){ g_dom_inuse[d] = 1; return d; }
     return 0;
+}
+static int dom_alloc(void){                   /* auto per-client domain on accept (gated by the env knob); 0 = shared */
+    return g_per_client_dom ? dom_alloc_explicit() : 0;
 }
 static void dom_release(int d){ if (d >= 1 && d <= ORKD_DOMAIN_POOL) g_dom_inuse[d] = 0; }
 static int g_active_dom = 0;                   /* domain of the last-dispatched work (what the NPU is warmed to) */
@@ -172,7 +175,14 @@ static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
     int8_t *wbuf = malloc(pk.bytes);
     if (!wbuf){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EOOM, "pack alloc"); return 0; }
     if (readn(cl->fd, wbuf, pk.bytes) <= 0){ free(wbuf); return -1; }
-    ork_npu_set_pack_domain(npu, cl->domain);   /* land this client's weight in its own IOMMU domain (0 = shared) */
+    /* CLIENT-CHOSEN DOMAIN: pk.domain>0 means the client explicitly requested this domain (ORKD_DOM_REQ) and is
+     * packing into it — validate it's one they own. pk.domain==0 falls back to the auto per-client domain
+     * (cl->domain, 0 unless ORKD_PER_CLIENT_DOMAINS). The weight lands here; its RUNs inherit it via w->domain. */
+    int pdom = (int)pk.domain;
+    if (pdom > 0){
+        if (pdom > ORKD_DOMAIN_POOL || !(cl->owned_dom & (1u << pdom))){ free(wbuf); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
+    } else pdom = cl->domain;
+    ork_npu_set_pack_domain(npu, pdom);
     ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
              : (pk.dtype == ORKD_DT_I4)  ? ork_mm_pack_i4(npu, (int)pk.K, (int)pk.N, wbuf)
                                          : ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
@@ -230,6 +240,14 @@ static int handle_sdp(struct client *cl, ork_npu *npu, uint64_t tag){
         case ORKD_SDP_EWMUL_F16: rc = ork_npu_ewmul_f16(npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
         case ORKD_SDP_ADD_I8:    rc = ork_npu_add_i8  (npu, (const signed char *)a, (const signed char *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (signed char *)out, NULL); break;
         case ORKD_SDP_ADD_F16:   rc = ork_npu_add_f16 (npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
+        case ORKD_SDP_RSQRT_I8:  rc = ork_npu_rsqrt_i8(npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_EXP_I8:    rc = ork_npu_exp_i8  (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_SILU_I16:  rc = ork_npu_silu_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_GELU_I16:  rc = ork_npu_gelu_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_RSQRT_I16: rc = ork_npu_rsqrt_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_EXP_I16:   rc = ork_npu_exp_i16 (npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_EWMUL_I16: rc = ork_npu_ewmul_i16(npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int16_t *)out, NULL); break;
+        case ORKD_SDP_ADD_I16:   rc = ork_npu_add_i16 (npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (int16_t *)out, NULL); break;
         default: rc = -100;
     }
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
@@ -394,6 +412,28 @@ static int handle_dmabuf(struct client *cl, ork_npu *npu, int dfd, uint64_t tag)
     send_msg(cl->fd, ORKD_DMABUF_OK, tag, &out, sizeof out);
     return 0;
 }
+/* CLIENT-MANAGED IOMMU DOMAINS: hand out / return pool domains so a client can pack its weights into its own
+ * isolated ~4 GiB IOVA window (rk_iommu v2's cap is per-domain). orkd coordinates the pool (g_dom_inuse) so no
+ * two clients collide; the client tracks the ids it holds and packs into them via orkd_pack.domain. All of a
+ * client's domains are released automatically on drop (see the drop path in the main loop). */
+static int handle_dom_req(struct client *cl, uint64_t tag){
+    int d = dom_alloc_explicit();
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh);
+    if (d > 0){ cl->owned_dom |= (1u << d); hh.id = (uint64_t)d; hh.rc = 0; }
+    else hh.rc = -1;                                     /* pool exhausted */
+    send_msg(cl->fd, ORKD_DOM_OK, tag, &hh, sizeof hh);
+    return 0;
+}
+static int handle_dom_rel(struct client *cl, uint64_t tag){
+    struct orkd_handle rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0) return -1;
+    int d = (int)rq.id;
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.id;
+    if (d >= 1 && d <= ORKD_DOMAIN_POOL && (cl->owned_dom & (1u << d))){ cl->owned_dom &= ~(1u << d); dom_release(d); hh.rc = 0; }
+    else hh.rc = -1;                                     /* not a domain this client owns */
+    send_msg(cl->fd, ORKD_DOM_OK, tag, &hh, sizeof hh);
+    return 0;
+}
 /* A-ring: attach a client's shared ring. The region fd arrived via SCM_RIGHTS on the ORKD_RING_SETUP header;
  * mmap it, validate the layout (magic + geometry the client and daemon must agree on), and keep the mapping.
  * From here ring_service() busy-polls this ring for requests, bypassing the socket for the hot submit path. */
@@ -548,6 +588,15 @@ int main(void){
     uint32_t next_id = 1, refs = 0;
     long idle_since = now_ms();                /* refs==0 since this time */
 
+    /* A-ring IDLE-BACKOFF: an attached ring is polled from shared memory (no fd to block on), so servicing it
+     * means busy-spinning (timeout=0) — which pegs a core even when no submits are coming. Instead SPIN only for
+     * a short hot window after the ring's last activity (covers a decode burst's inter-op gaps at ~µs latency),
+     * then BACK OFF to a small poll timeout so an idle ring costs ~nothing (wakes every backoff_ms to re-check).
+     * Cold-start latency after idle is bounded by backoff_ms; the first op re-enters the hot window. Tunable. */
+    long ring_hot = now_ms(), ring_spin_ms = 3, ring_backoff_ms = 2;
+    { const char *e = getenv("ORKD_RING_SPIN_MS"); if (e && *e){ long v = atol(e); if (v >= 0) ring_spin_ms = v; }
+      e = getenv("ORKD_RING_BACKOFF_MS"); if (e && *e){ long v = atol(e); if (v > 0) ring_backoff_ms = v; } }
+
     while (!g_stop){
         struct pollfd pfd[ORKD_MAX_CLIENTS + 1];
         pfd[0].fd = lfd; pfd[0].events = POLLIN;
@@ -557,7 +606,11 @@ int main(void){
         for (int i = 0; i < nc; i++) if (cl[i].ring) nring++;
 
         int timeout = -1;                      /* block indefinitely while we have subscribers */
-        if (g_qn > 0 || nring > 0) timeout = 0;/* queued work OR an attached ring: poll non-blocking, then service */
+        if (g_qn > 0) timeout = 0;             /* queued work: poll non-blocking, then dispatch a quantum */
+        else if (nring > 0){                   /* attached ring: spin the hot window, then back off (idle-backoff) */
+            long ring_idle = now_ms() - ring_hot;
+            timeout = (ring_idle < ring_spin_ms) ? 0 : (int)ring_backoff_ms;
+        }
         else if (refs == 0){
             long left = (long)idle_ms - (now_ms() - idle_since);
             timeout = left > 0 ? (int)left : 0;
@@ -577,7 +630,7 @@ int main(void){
         if (pfd[0].revents & POLLIN){          /* new connection */
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0){
-                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; cl[nc].domain = dom_alloc(); cl[nc].ring = NULL; cl[nc].ring_fd = 0; cl[nc].ring_tail = 0; nc++; }
+                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; cl[nc].domain = dom_alloc(); cl[nc].owned_dom = 0; cl[nc].ring = NULL; cl[nc].ring_fd = 0; cl[nc].ring_tail = 0; nc++; }
                 else { send_error(cfd, 0, ORKD_EOOM, "too many clients"); close(cfd); }
             }
         }
@@ -617,6 +670,8 @@ int main(void){
                 case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RING_SETUP: if (handle_ring_setup(&cl[i], recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
+                case ORKD_DOM_REQ: if (handle_dom_req(&cl[i], h.tag) < 0) drop = 1; break;
+                case ORKD_DOM_REL: if (handle_dom_rel(&cl[i], h.tag) < 0) drop = 1; break;
                 default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }
             for (int f = 0; f < 2; f++) if (recvd_fds[f] >= 0) close(recvd_fds[f]);   /* stray fds not consumed by a handler */
@@ -624,14 +679,15 @@ int main(void){
                 if (cl[i].hello && refs) refs--;
                 wk_purge_fd(npu, cl[i].fd);    /* drop this client's queued work (prevents fd-reuse aliasing) */
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
-                dom_release(cl[i].domain);     /* return the client's IOMMU domain to the pool */
+                dom_release(cl[i].domain);     /* return the client's auto IOMMU domain to the pool */
+                for (int d = 1; d <= ORKD_DOMAIN_POOL; d++) if (cl[i].owned_dom & (1u << d)) dom_release(d);   /* + any it explicitly requested (leak-safe) */
                 close(cl[i].fd);
                 cl[i] = cl[nc-1]; nc--;        /* compact; NO i-- (slot i's pollfd is now stale — service next tick) */
                 if (refs == 0) idle_since = now_ms();
             }
         }
         if (g_qn > 0) dispatch_one(npu, cl, nc);   /* one quantum of the highest-priority queued run per tick */
-        if (nring > 0) ring_service(npu, cl, nc);  /* A-ring: drain ready ring requests (busy-poll consumer) */
+        if (nring > 0 && ring_service(npu, cl, nc)) ring_hot = now_ms();   /* A-ring: drain ready requests; refresh the hot window on any activity (idle-backoff) */
     }
 
     if (npu) ork_npu_free(npu);                /* release NPU/IOMMU cleanly */

@@ -120,6 +120,11 @@ void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
 int          ork_npu_pack_domain(const ork_npu *ctx);   /* current pack domain (for save/restore) */
 void         ork_npu_activate_domain(ork_npu *ctx, int domain);   /* make domain active (establish); alloc in-domain buffers after this */
 int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
+/* Client-managed IOMMU domains. ork_npu_domain_alloc reserves a domain (Path B: from orkd's coordinated pool
+ * so multi-process clients don't collide; direct: a local id). Pack into it with ork_npu_set_pack_domain, then
+ * ork_npu_domain_free when done (also auto-reclaimed when the context/connection is freed). id>0 ok, <0 error. */
+int          ork_npu_domain_alloc(ork_npu *ctx);
+int          ork_npu_domain_free(ork_npu *ctx, int domain);
 
 /**
  * @brief Allocate an NPU-coherent, CPU-mapped buffer for zero-copy activations/outputs.

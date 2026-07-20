@@ -63,6 +63,10 @@ enum orkd_msg_type {
 
     ORKD_RING_SETUP   = 42, /* client->daemon: {orkd_ring_setup} + a shared-region fd (SCM_RIGHTS): attach the low-latency ring */
     ORKD_RING_OK      = 43, /* daemon->client: {orkd_handle} rc=0 iff the ring attached (magic/size validated)                  */
+    /* ---- client-managed IOMMU domains (client requests a domain id from the daemon's pool, then packs into it) ---- */
+    ORKD_DOM_REQ      = 44, /* client->daemon: request an isolated IOMMU domain from the pool (no payload)               */
+    ORKD_DOM_OK       = 45, /* daemon->client: {orkd_handle} id=domain (1..POOL) when rc==0, rc<0 if the pool is exhausted */
+    ORKD_DOM_REL      = 46, /* client->daemon: {orkd_handle} id=domain to release back to the pool (reply ORKD_DOM_OK)   */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -77,6 +81,14 @@ enum orkd_sdp_op {
     ORKD_SDP_EWMUL_F16 = 4,   /* binary f16->f16(ork_npu_ewmul_f16: no scale)          */
     ORKD_SDP_ADD_I8    = 5,   /* binary i8->i8  (ork_npu_add_i8:   a_scale,b_scale,out_scale) */
     ORKD_SDP_ADD_F16   = 6,   /* binary f16->f16(ork_npu_add_f16:  no scale)           */
+    ORKD_SDP_SILU_I16  = 7,   /* unary  i16->i16 (ork_npu_silu_i16: in_scale,out_scale) */
+    ORKD_SDP_GELU_I16  = 8,   /* unary  i16->i16 (ork_npu_gelu_i16) */
+    ORKD_SDP_RSQRT_I16 = 9,   /* unary  i16->i16 (ork_npu_rsqrt_i16) */
+    ORKD_SDP_EXP_I16   = 10,  /* unary  i16->i16 (ork_npu_exp_i16) */
+    ORKD_SDP_EWMUL_I16 = 11,  /* binary i16->i16 (ork_npu_ewmul_i16: mult,shift) */
+    ORKD_SDP_ADD_I16   = 12,  /* binary i16->i16 (ork_npu_add_i16:  a_scale,b_scale,out_scale) */
+    ORKD_SDP_RSQRT_I8  = 13,  /* unary  i8->i8  (ork_npu_rsqrt_i8:  in_scale,out_scale) */
+    ORKD_SDP_EXP_I8    = 14,  /* unary  i8->i8  (ork_npu_exp_i8:   in_scale,out_scale) */
 };
 
 /* dtype for orkd_pack.dtype (wire-stable; decoupled from the library's internal enum). #2b-1 = int8 only. */
@@ -116,6 +128,7 @@ struct orkd_pack {
     uint32_t K, N;       /* weight dims */
     uint32_t dtype;      /* enum-matching ork_w dtype */
     uint32_t bytes;      /* weight blob size in the passed dma-buf */
+    uint32_t domain;     /* client-chosen IOMMU domain to pack this weight into (0 = shared/default; must be one the client requested via ORKD_DOM_REQ) */
 };
 struct orkd_run {
     uint64_t weight_id;
