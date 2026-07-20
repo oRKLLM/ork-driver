@@ -27,6 +27,13 @@ int orkd_ping(orkd_conn *c);
  * work; ties broken by domain affinity then FIFO). Carried in orkd_run.flags. Default 0. */
 void orkd_set_priority(orkd_conn *c, unsigned prio);
 
+/* A-ring: attach a shared-memory ring for LOW-LATENCY submits (removes the per-op socket round-trip). 0 = ok.
+ * After this, orkd_run_i8_ring runs the hot path over the ring; the socket stays for control + fallback. */
+int orkd_ring_setup(orkd_conn *c);
+/* Run int8 A[M,K] x weight -> C[M,N] (int32) via the ring. 0 ok / <0 error (-2 = too big for a slot, use the
+ * socket orkd_run_i8 instead). Requires orkd_ring_setup() first. */
+int orkd_run_i8_ring(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+
 /* Graceful deregister (BYE) + close + free. Safe on NULL. */
 void orkd_disconnect(orkd_conn *c);
 

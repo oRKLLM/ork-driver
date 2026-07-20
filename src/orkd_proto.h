@@ -60,6 +60,9 @@ enum orkd_msg_type {
     /* ---- heterogeneous op-sequence submit (ork_submit_seq): batch doorbell-eligible ops, break to SW, resume ---- */
     ORKD_SEQ          = 40, /* client->daemon: {orkd_seq_hdr} + n*{orkd_seq_op} + concatenated inputs (A[,B] per op) -> ork_submit_seq */
     ORKD_SEQ_OK       = 41, /* daemon->client: {orkd_handle} + concatenated C payloads (op order, each op's cbytes) when rc==0 */
+
+    ORKD_RING_SETUP   = 42, /* client->daemon: {orkd_ring_setup} + a shared-region fd (SCM_RIGHTS): attach the low-latency ring */
+    ORKD_RING_OK      = 43, /* daemon->client: {orkd_handle} rc=0 iff the ring attached (magic/size validated)                  */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -125,6 +128,9 @@ struct orkd_handle {
     uint64_t id;         /* weight id / result marker */
     int32_t  rc;         /* 0 ok, <0 error */
     uint32_t pad;
+};
+struct orkd_ring_setup { /* A-ring: attach a shared ring. The region fd rides SCM_RIGHTS on the ORKD_RING_SETUP hdr. */
+    uint64_t bytes;      /* size of the shared region (== ORKD_RING_BYTES; the daemon validates magic after mmap) */
 };
 struct orkd_chain_hdr {  /* S orkd_chain_task descriptors follow, then abytes_total bytes of concatenated A (task order) */
     uint32_t S;

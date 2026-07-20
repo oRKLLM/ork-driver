@@ -574,6 +574,11 @@ orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_prot
 test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
 
+# orkd_ring_probe — A-ring validation + latency bench (socket RPC vs the shared-memory ring, bit-exact + us/op).
+# Pure client (links orkd_client, not COBJ). Board tool, not in `make test`.
+orkd_ring_probe: tools/orkd_ring_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/orkd_ring.h src/orkd_shm.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+
 # test_orkd_transparent — Path B: NORMAL ork_npu API, bit-exact direct vs routed-through-orkd (ORK_USE_ORKD).
 # Links COBJ (which now includes orkd_client.o for the transparent route). Board tool, not in `make test`.
 test_orkd_transparent: examples/test_orkd_transparent.c $(COBJ)

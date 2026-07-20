@@ -14,7 +14,10 @@
 
 #include "orkd_proto.h"
 #include "orkd_shm.h"
+#include "orkd_ring.h"
 #include "ork_npu.h"
+
+#include <stdatomic.h>
 
 #include <errno.h>
 #include <sys/mman.h>
@@ -77,7 +80,8 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 #define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
 
 struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
-struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain; };
+struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain;
+                struct orkd_ring *ring; int ring_fd; uint32_t ring_tail; };  /* A-ring: attached low-latency shm transport */
 
 /* A-sched: PER-CLIENT IOMMU DOMAINS (opt-in, ORKD_PER_CLIENT_DOMAINS=1). Intent: pack each client's resident
  * weights into a distinct iommu domain -> isolation + a full ~4 GiB IOVA window each (rk_iommu v2 cap is
@@ -390,10 +394,62 @@ static int handle_dmabuf(struct client *cl, ork_npu *npu, int dfd, uint64_t tag)
     send_msg(cl->fd, ORKD_DMABUF_OK, tag, &out, sizeof out);
     return 0;
 }
+/* A-ring: attach a client's shared ring. The region fd arrived via SCM_RIGHTS on the ORKD_RING_SETUP header;
+ * mmap it, validate the layout (magic + geometry the client and daemon must agree on), and keep the mapping.
+ * From here ring_service() busy-polls this ring for requests, bypassing the socket for the hot submit path. */
+static int handle_ring_setup(struct client *cl, int rfd, uint64_t tag){
+    struct orkd_ring_setup rs;
+    if (readn(cl->fd, &rs, sizeof rs) <= 0){ if (rfd >= 0) close(rfd); return -1; }
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = -1;
+    if (rfd >= 0 && rs.bytes == ORKD_RING_BYTES && !cl->ring){
+        void *m = mmap(NULL, ORKD_RING_BYTES, PROT_READ|PROT_WRITE, MAP_SHARED, rfd, 0);
+        if (m != MAP_FAILED){
+            struct orkd_ring *r = (struct orkd_ring *)m;
+            if (r->magic == ORKD_RING_MAGIC && r->nslots == ORKD_RING_SLOTS && r->slot_data == ORKD_RING_SLOT_DATA){
+                cl->ring = r; cl->ring_fd = rfd; cl->ring_tail = 0; rfd = -1; hh.rc = 0;
+            } else munmap(m, ORKD_RING_BYTES);
+        }
+    }
+    if (rfd >= 0) close(rfd);
+    send_msg(cl->fd, ORKD_RING_OK, tag, &hh, sizeof hh);
+    return 0;
+}
+static int32_t g_ring_c[ORKD_RING_SLOT_DATA / 4];   /* daemon-side C scratch (single-threaded; one reused buffer) */
+/* Consume ready requests from every attached ring (SPSC: this daemon is the sole consumer; ring_tail is its
+ * cursor). Bounded to nslots per ring per call so a saturated ring can't starve the socket/other clients.
+ * Returns 1 if any work ran (keeps the loop spinning hot), 0 if all rings were idle. */
+static int ring_service(ork_npu *npu, struct client *cl, int nc){
+    int did = 0;
+    for (int ci = 0; ci < nc; ci++){
+        struct orkd_ring *r = cl[ci].ring; if (!r) continue;
+        for (int b = 0; b < (int)r->nslots; b++){
+            struct orkd_ring_slot *s = &r->slot[cl[ci].ring_tail % r->nslots];
+            if (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_REQ) break;   /* acquire: see A */
+            ork_w *w = NULL;
+            for (int j = 0; j < cl[ci].nw; j++) if (cl[ci].wt[j].id == s->weight_id){ w = cl[ci].wt[j].w; break; }
+            int M = (int)s->M, N = (int)s->N; size_t cbytes = (size_t)M * N * 4;
+            int rc;
+            if (!w || cbytes > sizeof g_ring_c || s->abytes > r->slot_data) rc = -1;
+            else {
+                int8_t *A = (int8_t *)s->data;   /* A read in place; C into the reused scratch, then copied back */
+                rc = (s->dtype == ORKD_DT_F16) ? ork_mm_run(npu, w, M, (const ork_f16 *)A, (float *)g_ring_c)
+                   : (s->dtype == ORKD_DT_I4)  ? ork_mm_run_i4(npu, w, M, A, g_ring_c)
+                                               : ork_mm_run_i8(npu, w, M, A, g_ring_c);
+                if (rc == 0) memcpy(s->data, g_ring_c, cbytes);
+            }
+            s->rc = rc; s->cbytes = (uint32_t)cbytes;
+            atomic_store_explicit(&s->state, ORKD_SLOT_RESP, memory_order_release);   /* publish result: data-then-flag */
+            cl[ci].ring_tail++; did = 1;
+        }
+    }
+    return did;
+}
 /* free all of a client's resident weights on BYE / socket-EOF — the leak-safe reclaim (a crashed client can't leak) */
 static void client_reclaim(struct client *cl, ork_npu *npu){
     for (int i = 0; i < cl->nw; i++) ork_mm_free(npu, cl->wt[i].w);
     cl->nw = 0;
+    if (cl->ring){ munmap(cl->ring, ORKD_RING_BYTES); cl->ring = NULL; }
+    if (cl->ring_fd > 0){ close(cl->ring_fd); cl->ring_fd = -1; }
 }
 
 /* dispatch ONE quantum of the highest-priority queued item; reply + free when its last rows land.
@@ -497,15 +553,18 @@ int main(void){
         pfd[0].fd = lfd; pfd[0].events = POLLIN;
         for (int i = 0; i < nc; i++){ pfd[i+1].fd = cl[i].fd; pfd[i+1].events = POLLIN; }
 
+        int nring = 0;                         /* A-ring: # of clients with an attached ring (busy-poll if any) */
+        for (int i = 0; i < nc; i++) if (cl[i].ring) nring++;
+
         int timeout = -1;                      /* block indefinitely while we have subscribers */
-        if (g_qn > 0) timeout = 0;             /* work queued: poll non-blocking, then dispatch a quantum */
+        if (g_qn > 0 || nring > 0) timeout = 0;/* queued work OR an attached ring: poll non-blocking, then service */
         else if (refs == 0){
             long left = (long)idle_ms - (now_ms() - idle_since);
             timeout = left > 0 ? (int)left : 0;
         }
         int pr = poll(pfd, (nfds_t)(nc+1), timeout);
         if (pr < 0){ if (errno == EINTR) continue; perror("orkd: poll"); break; }
-        if (pr == 0 && g_qn == 0){             /* pure idle timeout: reap if no subscribers */
+        if (pr == 0 && g_qn == 0 && nring == 0){   /* pure idle timeout: reap if no subscribers */
             if (refs == 0 && now_ms() - idle_since >= (long)idle_ms){
                 fprintf(stderr, "[orkd] idle %ums, no subscribers -> reap\n", idle_ms);
                 break;
@@ -518,7 +577,7 @@ int main(void){
         if (pfd[0].revents & POLLIN){          /* new connection */
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0){
-                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; cl[nc].domain = dom_alloc(); nc++; }
+                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; cl[nc].domain = dom_alloc(); cl[nc].ring = NULL; cl[nc].ring_fd = 0; cl[nc].ring_tail = 0; nc++; }
                 else { send_error(cfd, 0, ORKD_EOOM, "too many clients"); close(cfd); }
             }
         }
@@ -557,6 +616,7 @@ int main(void){
                 case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
+                case ORKD_RING_SETUP: if (handle_ring_setup(&cl[i], recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 default: send_error(cl[i].fd, h.tag, ORKD_EPROTO, "unknown message"); break;
             }
             for (int f = 0; f < 2; f++) if (recvd_fds[f] >= 0) close(recvd_fds[f]);   /* stray fds not consumed by a handler */
@@ -571,6 +631,7 @@ int main(void){
             }
         }
         if (g_qn > 0) dispatch_one(npu, cl, nc);   /* one quantum of the highest-priority queued run per tick */
+        if (nring > 0) ring_service(npu, cl, nc);  /* A-ring: drain ready ring requests (busy-poll consumer) */
     }
 
     if (npu) ork_npu_free(npu);                /* release NPU/IOMMU cleanly */

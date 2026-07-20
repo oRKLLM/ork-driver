@@ -2,10 +2,13 @@
 #include "orkd_client.h"
 #include "orkd_proto.h"
 #include "orkd_shm.h"
+#include "orkd_ring.h"
 
 #include <errno.h>
+#include <stdatomic.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -15,7 +18,8 @@
 #define ORKD_CONNECT_TRIES 200          /* * 15ms ~= 3s to let an auto-spawned daemon bind */
 #define ORKD_CONNECT_BACKOFF_NS (15*1000*1000L)
 
-struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio; };
+struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio;
+                   struct orkd_ring *ring; int ring_fd; uint32_t ring_next; };  /* A-ring: low-latency shm transport */
 
 /* live connections, for the atexit clean-BYE (small fixed set; a process rarely holds many) */
 static orkd_conn *g_live[16];
@@ -26,6 +30,7 @@ static int wn(int fd, const void *b, size_t n){
     while (k < n){ ssize_t r = write(fd, p+k, n-k); if (r < 0){ if (errno==EINTR) continue; return -1; } k += (size_t)r; }
     return 0;
 }
+static void cdrain(int fd, size_t n);   /* fwd: defined below, used by orkd_ring_setup above it */
 static int rn(int fd, void *b, size_t n){
     char *p = b; size_t k = 0;
     while (k < n){ ssize_t r = read(fd, p+k, n-k); if (r == 0) return 0; if (r < 0){ if (errno==EINTR) continue; return -1; } k += (size_t)r; }
@@ -98,8 +103,66 @@ int orkd_ping(orkd_conn *c){
 
 void orkd_set_priority(orkd_conn *c, unsigned prio){ if (c) c->prio = prio; }
 
+/* A-ring: attach a shared low-latency ring. Allocates the region (memfd), maps it, passes the fd to the daemon
+ * over the control socket (SCM_RIGHTS), and awaits RING_OK. Returns 0 iff both sides mapped it. After this,
+ * orkd_run_i8_ring bypasses the socket for the hot submit path. Idempotent-ish: a second call is a no-op (0). */
+int orkd_ring_setup(orkd_conn *c){
+    if (!c || c->fd < 0) return -1;
+    if (c->ring) return 0;
+    int mfd = (int)syscall(SYS_memfd_create, "orkd_ring", 0u);
+    if (mfd < 0) return -1;
+    if (ftruncate(mfd, (off_t)ORKD_RING_BYTES) < 0){ close(mfd); return -1; }
+    void *m = mmap(NULL, ORKD_RING_BYTES, PROT_READ|PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (m == MAP_FAILED){ close(mfd); return -1; }
+    struct orkd_ring *r = (struct orkd_ring *)m;
+    memset(r, 0, sizeof *r);
+    r->magic = ORKD_RING_MAGIC; r->nslots = ORKD_RING_SLOTS; r->slot_data = ORKD_RING_SLOT_DATA;
+    struct orkd_ring_setup rs; memset(&rs, 0, sizeof rs); rs.bytes = ORKD_RING_BYTES;
+    struct orkd_hdr h = { ORKD_RING_SETUP, (uint32_t)sizeof rs, 6 };
+    if (orkd_send_hdr_fd(c->fd, &h, mfd) || wn(c->fd, &rs, sizeof rs)){ munmap(m, ORKD_RING_BYTES); close(mfd); return -1; }
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0 || rh.type != ORKD_RING_OK){ if (rh.len) cdrain(c->fd, rh.len); munmap(m, ORKD_RING_BYTES); close(mfd); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0 || hh.rc != 0){ munmap(m, ORKD_RING_BYTES); close(mfd); return -1; }
+    c->ring = r; c->ring_fd = mfd; c->ring_next = 0;
+    return 0;
+}
+
+/* Hot path: submit one int8/fp16/int4 matmul through the ring (no socket). A copied in, C copied out; the daemon
+ * busy-polls the slot, runs the matmul, writes C in place. 0 ok / <0 error (incl. -2 = too big for a slot ->
+ * caller should fall back to the socket path). dtype is a wire ORKD_DT_*. */
+static int ring_run(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype,
+                    const void *A, size_t abytes, void *C, size_t cbytes){
+    if (!c || !c->ring) return -1;
+    struct orkd_ring *r = c->ring;
+    if (abytes > r->slot_data || cbytes > r->slot_data) return -2;   /* fall back to socket */
+    struct orkd_ring_slot *s = &r->slot[c->ring_next % r->nslots];
+    /* wait for the slot to be free (synchronous client: it should already be EMPTY) */
+    while (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_EMPTY){
+        if (atomic_load_explicit(&r->stop, memory_order_acquire)) return -1;
+    }
+    s->weight_id = weight_id; s->M = (uint32_t)M; s->K = (uint32_t)K; s->N = (uint32_t)N; s->dtype = dtype;
+    s->abytes = (uint32_t)abytes; s->cbytes = (uint32_t)cbytes; s->rc = 0;
+    if (abytes) memcpy(s->data, A, abytes);
+    atomic_store_explicit(&s->state, ORKD_SLOT_REQ, memory_order_release);   /* publish: data-then-flag */
+    c->ring_next++;
+    while (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_RESP){
+        if (atomic_load_explicit(&r->stop, memory_order_acquire)) return -1;
+    }
+    int rc = s->rc;
+    if (rc == 0 && cbytes) memcpy(C, s->data, cbytes);
+    atomic_store_explicit(&s->state, ORKD_SLOT_EMPTY, memory_order_release);  /* release the slot */
+    return rc;
+}
+int orkd_run_i8_ring(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
+    if (!c || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
+    return ring_run(c, weight_id, M, K, N, ORKD_DT_I8, A, (size_t)M*K, C, (size_t)M*N*4);
+}
+
 void orkd_disconnect(orkd_conn *c){
     if (!c) return;
+    if (c->ring){ atomic_store_explicit(&c->ring->stop, 1u, memory_order_release); munmap(c->ring, ORKD_RING_BYTES); c->ring = NULL; }
+    if (c->ring_fd > 0){ close(c->ring_fd); c->ring_fd = -1; }
     if (c->fd >= 0){ struct orkd_hdr h = { ORKD_BYE, 0, 0 }; (void)wn(c->fd, &h, sizeof h); close(c->fd); c->fd = -1; }
     for (int i = 0; i < g_nlive; i++) if (g_live[i] == c){ g_live[i] = g_live[--g_nlive]; break; }
     free(c);
