@@ -452,11 +452,11 @@ static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->s
  * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
 static int ppu_scratch3(ork_npu *c,size_t sz){
     if(sz<4096) sz=4096;
-    if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu) return 0;
+    if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu && c->ppu_a.domain==c->dom_active) return 0;   /* realloc if the active domain changed (persistent scratch must live in c->dom_active) */
     bdestroy(c->fd,&c->ppu_a); bdestroy(c->fd,&c->ppu_b); bdestroy(c->fd,&c->ppu_o);
-    c->ppu_a=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
-    c->ppu_b=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_b.cpu){bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
-    c->ppu_o=bcreate(c->fd,sz,0x403,-1); if(!c->ppu_o.cpu){bdestroy(c->fd,&c->ppu_a);bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
+    c->ppu_a=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
+    c->ppu_b=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_b.cpu){bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
+    c->ppu_o=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_o.cpu){bdestroy(c->fd,&c->ppu_a);bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
     c->ppu_sz=sz; return 0;
 }
 
@@ -6128,15 +6128,15 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
  * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i8(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;             /* N multiple of the int8 atom (16) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* NVDLA cube, atom=16, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;                    /* int8 cube = M*N bytes */
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=up[m*N+n]; bc[p]=silu[m*N+n]; }
@@ -6158,7 +6158,7 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=oc[EWCUBE(m,n)]; if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
@@ -6172,15 +6172,15 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
  * 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_f16(c->daemon,up,silu,M,N,out); }   /* Path B: SDP on the daemon */
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the fp16 atom (8) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* BYTE offset, fp16 atom=8, surf_stride=M*16 */
     const uint16_t *u16=(const uint16_t*)up,*s16=(const uint16_t*)silu; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* fp16 cube = M*N*2 bytes */
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
@@ -6204,7 +6204,7 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ double cap=(double)ew_timeout_ms()*1000.0;
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
         for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6242,15 +6242,15 @@ int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const 
  * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. GENERALIZED to arbitrary
  * M,N (N a multiple of 8); rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
 int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* 2-byte atom=8 cube (fp16/int16), surf_stride=M*16 */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* int16 cube = M*N*2 bytes */
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
@@ -6271,7 +6271,7 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
@@ -6285,14 +6285,14 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
  * ALU-mode regs (0x4040/0x4048/0x4070) stay from the template. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
 int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                          int mult,int shift,uint32_t bscale,int za,int zb,int zo,int8_t *out,double *us){
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=a[m*N+n]; bc[p]=b[m*N+n]; }
@@ -6315,7 +6315,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
@@ -6986,7 +6986,7 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
  * (REGCMD_ADD_F16, gain 1). NVDLA fp16 cube (atom-8, 2-byte). in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_add_f16(c->daemon,a,b,M,N,out); }   /* Path B: SDP on the daemon */
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
@@ -7012,7 +7012,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ double cap=(double)ew_timeout_ms()*1000.0;
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
         for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7027,7 +7027,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
  * arbitrary unequal scales approximate. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
                     double a_scale,double b_scale,double out_scale,int16_t *out,double *us){
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)||out_scale<=0) return -2;
     double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
@@ -7037,9 +7037,9 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
@@ -7070,7 +7070,7 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
@@ -7091,16 +7091,16 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
                            int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,
                            uint32_t cfg4064,uint32_t cfg4068,const int16_t *lut,int nlut,
                            int8_t *out,double *us){
-    int fd=c->fd;
+    int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* int8 atom-16 cube, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
+    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[EWCUBE(m,n)]=in[m*N+n];
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7117,7 +7117,7 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,-1)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) WEDGED\n"); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(rknpu_submit_ioctl(fd,&sub,dom)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) WEDGED\n"); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
       if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) ok\n");
     }
 
@@ -7141,7 +7141,7 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
     #undef EWCUBE
@@ -7210,7 +7210,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
     #undef EWCUBEH
