@@ -396,6 +396,9 @@ static void daemonize(void){
     int lg  = open(logp, O_CREAT|O_WRONLY|O_APPEND, 0600);
     if (nul >= 0){ dup2(nul, 0); dup2(nul, 1); if (nul > 2) close(nul); }
     if (lg  >= 0){ dup2(lg, 2);  if (lg  > 2) close(lg); }
+    /* stderr -> a regular file is FULLY buffered by default, so log lines are lost if the daemon is SIGKILL'd
+     * (e.g. a wedge post-mortem — exactly when the log matters). Line-buffer it so each line hits the file. */
+    setvbuf(stderr, NULL, _IOLBF, 0);
 }
 
 int main(void){
