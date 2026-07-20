@@ -470,6 +470,8 @@ int main(void){
             continue;
         }
 
+        int npoll = nc;                        /* # of client fds poll() examined THIS tick (before accept grows nc) */
+
         if (pfd[0].revents & POLLIN){          /* new connection */
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0){
@@ -477,7 +479,14 @@ int main(void){
                 else { send_error(cfd, 0, ORKD_EOOM, "too many clients"); close(cfd); }
             }
         }
-        for (int i = 0; i < nc; i++){
+        /* Service ONLY the client fds poll() examined (i < npoll). A connection accepted just above sits at
+         * index >= npoll and its pollfd slot was never filled by poll() — reading pfd[i+1].revents there is
+         * uninitialized stack garbage, and a spurious POLLIN would make the daemon recvmsg on a client that
+         * hasn't spoken yet and BLOCK the whole single-threaded loop. New clients are serviced next tick (poll
+         * includes them once nc has grown). THIS was the >=3-consumer hang: more accepts -> more chances to read
+         * a stale revents and deadlock. On a drop we compact but must NOT re-examine slot i (its pollfd is now
+         * stale for the moved-in client) — it too is serviced next tick. */
+        for (int i = 0; i < npoll && i < nc; i++){
             if (!(pfd[i+1].revents & (POLLIN|POLLHUP|POLLERR))) continue;
             int drop = 0, recvd_fds[2] = { -1, -1 }, recvd_nfd = 0;
             struct orkd_hdr h;
@@ -513,7 +522,7 @@ int main(void){
                 wk_purge_fd(npu, cl[i].fd);    /* drop this client's queued work (prevents fd-reuse aliasing) */
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
                 close(cl[i].fd);
-                cl[i] = cl[nc-1]; nc--; i--;   /* compact */
+                cl[i] = cl[nc-1]; nc--;        /* compact; NO i-- (slot i's pollfd is now stale — service next tick) */
                 if (refs == 0) idle_since = now_ms();
             }
         }
