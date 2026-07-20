@@ -615,6 +615,10 @@ orkd_dom_api: tools/orkd_dom_api.c $(COBJ)
 dom_switch_stress: tools/dom_switch_stress.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# dom_pack_stress — cross-domain bcreate wedge repro (alternating-domain pack+free). settle off -> should wedge.
+dom_pack_stress: tools/dom_pack_stress.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.
 mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread

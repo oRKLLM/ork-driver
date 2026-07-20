@@ -25,18 +25,22 @@ static void ref_i8(int M,int K,int N,const int8_t*A,const int8_t*B,int32_t*C){
 
 int main(int argc,char**argv){
     int iters = argc>1 ? atoi(argv[1]) : 12000;
-    const int M=8, K=512, N=64;
+    int M = argc>2 ? atoi(argv[2]) : 8;      /* op size is sweepable: a bigger op has a longer retirement tail, */
+    int K = argc>3 ? atoi(argv[3]) : 512;    /* which should widen the switch-idle-wait race window (hunt lever) */
+    int N = argc>4 ? atoi(argv[4]) : 64;
+    if(M<1||K%32||N%32){ fprintf(stderr,"bad dims M=%d K=%d N=%d (K%%32==0,N%%32==0)\n",M,K,N); return 2; }
     ork_npu *c = ork_npu_init();
     if(!c){ fprintf(stderr,"init failed\n"); return 2; }
     int d1 = ork_npu_domain_alloc(c), d2 = ork_npu_domain_alloc(c);
     if(d1<=0||d2<=0||d1==d2){ fprintf(stderr,"domain_alloc failed d1=%d d2=%d\n",d1,d2); return 2; }
 
+    int noref = getenv("ORK_NO_REF") && atoi(getenv("ORK_NO_REF"));   /* skip the O(M·N·K) CPU ref (slow for big ops) — wedge/miss still caught by run_i8 rc; used for the size-sweep hunt */
     int8_t *B1=malloc((size_t)K*N), *B2=malloc((size_t)K*N), *A=malloc((size_t)M*K);
-    int32_t *C=malloc((size_t)M*N*4), *R1=malloc((size_t)M*N*4), *R2=malloc((size_t)M*N*4);
+    int32_t *C=malloc((size_t)M*N*4), *R1=noref?NULL:malloc((size_t)M*N*4), *R2=noref?NULL:malloc((size_t)M*N*4);
     g_s=0x1111u; for(int i=0;i<K*N;i++) B1[i]=rnd8();
     g_s=0x2222u; for(int i=0;i<K*N;i++) B2[i]=rnd8();
     g_s=0x3333u; for(int i=0;i<M*K;i++) A[i]=rnd8();
-    ref_i8(M,K,N,A,B1,R1); ref_i8(M,K,N,A,B2,R2);
+    if(!noref){ ref_i8(M,K,N,A,B1,R1); ref_i8(M,K,N,A,B2,R2); }
 
     ork_npu_set_pack_domain(c,d1); ork_w *w1=ork_mm_pack_i8(c,K,N,B1);
     ork_npu_set_pack_domain(c,d2); ork_w *w2=ork_mm_pack_i8(c,K,N,B2);
@@ -49,7 +53,7 @@ int main(int argc,char**argv){
         int32_t *ref = (i&1) ? R2 : R1;
         int rc = ork_mm_run_i8(c, w, M, A, C);
         if(rc!=0){ printf("*** WEDGE at iter %d (after %d clean switches): run_i8 rc=%d (dom %d) ***\n", i, switches, rc, (i&1)?d2:d1); fflush(stdout); return 1; }
-        if(memcmp(C,ref,(size_t)M*N*4)!=0){ printf("*** MISMATCH at iter %d (dom %d) after %d clean switches ***\n", i, (i&1)?d2:d1, switches); fflush(stdout); return 1; }
+        if(!noref && memcmp(C,ref,(size_t)M*N*4)!=0){ printf("*** MISMATCH at iter %d (dom %d) after %d clean switches ***\n", i, (i&1)?d2:d1, switches); fflush(stdout); return 1; }
         switches++;
         if(i && i%1000==0){ printf("  %d iters ok (%d switches)\n", i, switches); fflush(stdout); }
     }

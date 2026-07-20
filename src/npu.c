@@ -20,6 +20,7 @@
 #include <sched.h>
 #include <time.h>
 #include <math.h>
+#include <sys/prctl.h>   /* PR_SET_TIMERSLACK — trim the default 50µs nanosleep slack so short settles are precise */
 #include <errno.h>
 #include <dlfcn.h>
 #include <signal.h>
@@ -351,6 +352,17 @@ static int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("
  * sub->iommu_domain_id from a parameter. The pack-path default for the ggml-ork caller lives on
  * the ork_npu ctx (c->pack_domain), read once per pack to stamp w->domain. dom<0 => default. */
 static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
+/* RETIREMENT-SETTLE gating: the domain the kernel IOMMU was last switched to (by a submit or a cross-domain
+ * MEM_CREATE). The rare "switch iommu domain time out" wedge fires ONLY on a MEM_CREATE that crosses domains
+ * (dmesg always pairs it with gem_object_create), never on a plain submit-switch (validated: 1M submit-only
+ * switches clean with no settle). So the settle is gated to cross-domain bcreate below, not every switch. */
+static int g_active_iommu_dom = 0;
+/* Settle µs before a cross-domain MEM_CREATE. Small INSURANCE floor (10µs, precise now timer slack is 1µs), NOT
+ * a validated minimum: the wedge is not reproducible on demand (~1.44M ops across submit/bcreate/SEQ paths ran
+ * clean with settle=0), so "necessary" is unmeasurable — this just sits cheaply at the plausible-mechanism site.
+ * Tunable ORK_DOM_SETTLE_US (0=off). */
+static long dom_settle_us(void){ static long v=-2; if(v==-2){ const char*e=getenv("ORK_DOM_SETTLE_US"); v=(e&&*e)?atol(e):10; if(v<0)v=0; } return v; }
+static void dom_settle(void){ long su=dom_settle_us(); if(su>0){ struct timespec ts={0, su*1000}; nanosleep(&ts,NULL); } }
 /* ---- IOVA WEDGE GUARD -----------------------------------------------------------------------
  * The rk_iommu v2 IOVA window is 32-bit (~4 GiB) PER iommu_domain_id, and the kernel rknpu driver
  * FAULTS inside MEM_CREATE (rknpu_iommu_dma_map_sg -> rknpu_gem_object_create) when that window is
@@ -426,6 +438,14 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
      * (SRAM full/contended), retry once in DRAM below. Keeps the async submit path portable. */
     if((flags & RKNPU_MEM_TRY_ALLOC_SRAM) && g_sram_total==0) flags &= ~RKNPU_MEM_TRY_ALLOC_SRAM;
     if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
+    /* RETIREMENT SETTLE (cross-domain MEM_CREATE only) — UNVALIDATED cheap insurance. Every observed
+     * "switch iommu domain time out" wedge paired with a gem_object_create error, i.e. it fired on a MEM_CREATE
+     * that switches the IOMMU domain — plausibly racing a prior op's not-yet-retired task (no userspace retirement
+     * signal here; int_status/dma_rw read 0-always). BUT the wedge is NOT reproducible on demand: ~1.44M ops across
+     * the submit / bcreate / SEQ paths ran clean with settle=0, and the wedge is persistent-until-reboot (one rare
+     * event poisons all later multi-domain ops, which inflated its apparent frequency). So this settle is a small
+     * cheap hedge at the plausible site, not a proven fix. Only crosses-domain fires it -> single-domain pays 0. */
+    if(dom != g_active_iommu_dom) dom_settle();
     struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){
         if(flags & RKNPU_MEM_TRY_ALLOC_SRAM){   /* SRAM path faulted -> DRAM failover (retry once, same IOVA reservation) */
@@ -438,6 +458,7 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
     if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
     struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
+    g_active_iommu_dom = dom;   /* this MEM_CREATE switched the kernel IOMMU to `dom` */
     live_add(fd,b.handle,b.obj);
     g_bcreate_n++;
     return b;
@@ -583,8 +604,6 @@ static void dom_cool(ork_npu *c){
     c->warmed=0; memset(c->mwarm,0,sizeof c->mwarm);
     if(c->dom_save) for(int d=0;d<ORK_MAXDOM;d++){ c->dom_save[d].warmed=0; memset(c->dom_save[d].mwarm,0,sizeof c->dom_save[d].mwarm); }
 }
-/* Retirement-settle (µs) applied before EVERY cross-domain switch — see dom_activate. Default 50µs; 0 disables. */
-static long dom_settle_us(void){ static long v=-2; if(v==-2){ const char*e=getenv("ORK_DOM_SETTLE_US"); v=(e&&*e)?atol(e):50; if(v<0)v=0; } return v; }
 
 /* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
  * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
@@ -606,13 +625,9 @@ static void dom_activate(ork_npu *c,int dom){
         dom_cool(c);
         c->db_flying_dom=-1;
     }
-    /* RETIREMENT SETTLE (every cross-domain switch). The just-finished op in the OLD domain landed its output
-     * sentinel (our completion signal) before its task RETIRES in the kernel's view — and this kernel exposes no
-     * userspace retirement signal (int_status/dma_rw read 0-always). The kernel's switch-idle-wait then rarely
-     * (~1/50k switches, measured) races that un-retired tail and times out ("switch iommu domain time out",
-     * reboot-persistent). A short settle lets the tail retire before we switch. Only on a real switch (not
-     * same-domain), so no cost in single-domain use. Tunable/disable: ORK_DOM_SETTLE_US (default 50µs, 0=off). */
-    { long su=dom_settle_us(); if(su>0){ struct timespec ts={0, su*1000}; nanosleep(&ts,NULL); } }
+    /* NOTE: the retirement settle for the cross-domain wedge lives in bcreate() (gated to cross-domain MEM_CREATE,
+     * the only op that wedges — submit-switches are safe), NOT here. dom_activate's own fresh-domain regcmd/task/Af
+     * allocs go through bcreate() and get it there. This switch's subsequent submits don't need a settle. */
     if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
@@ -708,6 +723,7 @@ static void trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) du
 
 static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
+    g_active_iommu_dom = sub->iommu_domain_id;   /* the submit switches the kernel IOMMU to this domain (gates the next cross-domain bcreate's settle) */
     if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
     /* PRE-SUBMIT fsync'd trace (ORK_PRESUBMIT_TRACE=<path>): write this submit's full context to disk AND
@@ -1379,6 +1395,7 @@ ork_npu *ork_npu_init(void){
     g_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
+    prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default is 50µs): makes the retirement settle + doorbell backoffs precise, not +50µs slack-taxed */
     act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in bcreate (see g_sram_total). */
     { struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_TOTAL_SRAM_SIZE;
