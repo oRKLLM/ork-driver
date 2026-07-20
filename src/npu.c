@@ -583,6 +583,8 @@ static void dom_cool(ork_npu *c){
     c->warmed=0; memset(c->mwarm,0,sizeof c->mwarm);
     if(c->dom_save) for(int d=0;d<ORK_MAXDOM;d++){ c->dom_save[d].warmed=0; memset(c->dom_save[d].mwarm,0,sizeof c->dom_save[d].mwarm); }
 }
+/* Retirement-settle (µs) applied before EVERY cross-domain switch — see dom_activate. Default 50µs; 0 disables. */
+static long dom_settle_us(void){ static long v=-2; if(v==-2){ const char*e=getenv("ORK_DOM_SETTLE_US"); v=(e&&*e)?atol(e):50; if(v<0)v=0; } return v; }
 
 /* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
  * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
@@ -604,6 +606,13 @@ static void dom_activate(ork_npu *c,int dom){
         dom_cool(c);
         c->db_flying_dom=-1;
     }
+    /* RETIREMENT SETTLE (every cross-domain switch). The just-finished op in the OLD domain landed its output
+     * sentinel (our completion signal) before its task RETIRES in the kernel's view — and this kernel exposes no
+     * userspace retirement signal (int_status/dma_rw read 0-always). The kernel's switch-idle-wait then rarely
+     * (~1/50k switches, measured) races that un-retired tail and times out ("switch iommu domain time out",
+     * reboot-persistent). A short settle lets the tail retire before we switch. Only on a real switch (not
+     * same-domain), so no cost in single-domain use. Tunable/disable: ORK_DOM_SETTLE_US (default 50µs, 0=off). */
+    { long su=dom_settle_us(); if(su>0){ struct timespec ts={0, su*1000}; nanosleep(&ts,NULL); } }
     if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
