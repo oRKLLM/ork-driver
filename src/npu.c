@@ -445,7 +445,13 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
      * the submit / bcreate / SEQ paths ran clean with settle=0, and the wedge is persistent-until-reboot (one rare
      * event poisons all later multi-domain ops, which inflated its apparent frequency). So this settle is a small
      * cheap hedge at the plausible site, not a proven fix. Only crosses-domain fires it -> single-domain pays 0. */
-    if(dom != g_active_iommu_dom) dom_settle();
+    if(dom != g_active_iommu_dom){
+        /* ORK_BCREATE_TRACE: fsync'd log of every cross-domain MEM_CREATE (the wedge-prone op). If the ioctl below
+         * hard-wedges, the LAST line on disk names the culprit alloc (domain transition + size + prior op). */
+        if(getenv("ORK_BCREATE_TRACE")){ static FILE*bt=NULL; static long bn=0; if(!bt)bt=fopen(getenv("ORK_BCREATE_TRACE"),"w");
+            if(bt){ fprintf(bt,"#%ld xdom-bcreate dom %d<-%d size=%zu | last op=%s K=%d N=%d\n",++bn,dom,g_active_iommu_dom,need,g_last_op?g_last_op:"?",g_last_K,g_last_N); fflush(bt); fsync(fileno(bt)); } }
+        dom_settle();
+    }
     struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){
         if(flags & RKNPU_MEM_TRY_ALLOC_SRAM){   /* SRAM path faulted -> DRAM failover (retry once, same IOVA reservation) */
@@ -10515,6 +10521,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
     g_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on g_ork_term and drains before the process ends */
+    /* ORK_FORCE_RECOVER=N (diagnostic): force a SPURIOUS mc_recover_resubmit (global ACT_RESET + resubmit in the
+     * round's domain) every N mc rounds, to stress the recovery path in a multi-domain context WITHOUT waiting for
+     * a real ~1/2400 doorbell miss — tests whether the reset+cross-domain-resubmit is what wedges the IOMMU. */
+    if (h->mc_nc > 0){ const char *fr=getenv("ORK_FORCE_RECOVER"); if(fr&&*fr){ int fn=atoi(fr);
+        static long fc=0; if(fn>0 && (fc++ % fn)==0){ if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[FORCE-RECOVER] spurious resubmit (dom %u)\n",h->mc_dom); mc_recover_resubmit(h); } } }
     int edone[1024];
     int last = -1;
     int recov_max = (h->mc_nc > 0 && (h->mc_dt == DT_I8 || h->mc_dt == DT_I4)) ? 6 : 0;   /* mc int8/int4 rounds carry stashed context to resubmit; a few retries clear a sticky/correlated drop */

@@ -619,6 +619,16 @@ dom_switch_stress: tools/dom_switch_stress.c $(COBJ)
 dom_pack_stress: tools/dom_pack_stress.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# dom_race_stress — the retirement-race repro: run(d1) then xdom pack(d2) each iter (submit-then-cross-domain
+# -bcreate, the combination the isolated loops miss). Also the per-lifecycle body for dom_teardown_hunt.sh.
+dom_race_stress: tools/dom_race_stress.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# dom_chain_stress — drive the REAL doorbell-chain API (ork_submit_seq grouped -> ork_dyn_begin_seq_i8_mc)
+# across two domains for a large op count. sudo env ORK_DOM_SETTLE_US=0 ./dom_chain_stress 1000000
+dom_chain_stress: tools/dom_chain_stress.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # mc_miss_repro — tight repro of the multi-core doorbell-miss flake (stop-on-first-miss, [MC-DIAG]). Board tool.
 mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
