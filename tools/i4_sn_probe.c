@@ -10,12 +10,16 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int run_case(ork_npu *c, int K, int N, int M){
+static int run_case(ork_npu *c, int K, int N, int M, int mag){
     int8_t *B=malloc((size_t)K*N), *A=malloc((size_t)M*K);
     int32_t *C=malloc((size_t)M*N*4), *R=malloc((size_t)M*N*4);
     if(!B||!A||!C||!R){ free(B);free(A);free(C);free(R); return 2; }
     unsigned g=0x51ce4;
-    #define I4() ((int8_t)(((g=g*1103515245u+12345u)>>20&0xf)-8))   /* [-8,7] */
+    /* mag=8 => full [-8,7]; mag=1 => {-1,0,1} (used for Sk>1: keeps a 10752-wide K-slice int16 partial in range
+     * so the CPU int reference is valid — the HW int16 accumulator overflows large data at Kp=10752, same as
+     * the blocking run_i4_mc, so full-range wide-K would diverge from the int64 CPU ref, not a doorbell bug). */
+    #define I4() (mag>=8 ? (int8_t)(((g=g*1103515245u+12345u)>>20&0xf)-8) \
+                         : (int8_t)((int)(((g=g*1103515245u+12345u)>>20) % (2*mag+1)) - mag))
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=I4();
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=I4();
     ork_w *w=ork_mm_pack_i4(c,K,N,B);
@@ -38,12 +42,17 @@ static int run_case(ork_npu *c, int K, int N, int M){
 
 int main(void){
     ork_npu *c=ork_npu_init(); if(!c){ fprintf(stderr,"init failed\n"); return 2; }
-    printf("A1: int4 Sn>1 (wide-N) on the doorbell (%s):\n", getenv("ORK_I4_NODB")?"ORK_I4_NODB=1 blocking ref":"default doorbell");
+    printf("int4 multi-slice on the doorbell (%s):\n", getenv("ORK_I4_NODB")?"ORK_I4_NODB=1 blocking ref":"default doorbell");
     int bad=0;
-    bad |= run_case(c, 512,  8192,  4);   /* Sn=1 (control — single slice) */
-    bad |= run_case(c, 512,  16384, 4);   /* Sn=2 — A1 */
-    bad |= run_case(c, 512,  18944, 2);   /* Sn=3 (FFN-ish width) — A1, partial last slice */
-    bad |= run_case(c, 1024, 24576, 3);   /* Sn=3, larger K */
+    /* A1 — N-tile (Sn>1), full-range values (Kp<=1024 => int16 partial in range) */
+    bad |= run_case(c, 512,  8192,  4, 8);   /* Sn=1 (control) */
+    bad |= run_case(c, 512,  16384, 4, 8);   /* Sn=2 */
+    bad |= run_case(c, 512,  18944, 2, 8);   /* Sn=3, partial last slice */
+    bad |= run_case(c, 1024, 24576, 3, 8);   /* Sn=3, larger K */
+    /* A2 — K-split (Sk>1, K>10752), small values so the 10752-wide int16 partial stays in range vs CPU */
+    bad |= run_case(c, 21504, 8192,  2, 1);  /* Sk=2, Sn=1 — pure K-split */
+    bad |= run_case(c, 21504, 16384, 2, 1);  /* Sk=2, Sn=2 — K-split x N-tile combined */
+    bad |= run_case(c, 32256, 8192,  2, 1);  /* Sk=3 */
     ork_npu_free(c);
     printf("I4_SN_PROBE: %s\n", bad?"FAIL":"PASS");
     return bad?1:0;

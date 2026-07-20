@@ -3124,7 +3124,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * reverts to the blocking run_i4_mc. Sk==1 (single K-group); A1 added Sn>1 (each row's N-slices = chained
      * column-slice programs). -4 => fall back (K-split/grouped, or chain too big for the per-core buffers). */
     static int i4db=-1; if(i4db<0){const char*e=getenv("ORK_I4_NODB"); i4db=(e&&atoi(e))?0:1;}
-    if(i4db && M>=2 && w->Sk==1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }
+    if(i4db && M>=2){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }   /* A1 Sn>1 + A2 Sk>1 supported; begin_mc_i4 -4s an over-large chain -> blocking run_i4_mc */
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -9384,7 +9384,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
 static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
-        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk != 1) return NULL;   /* int4 HW chain: M=1, Sk==1 (single K-group); A1: Sn>1 N-tiled (each row emits Sn chained column-slice programs) */
+        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk > 16) return NULL;   /* int4 HW chain: M=1; A1: Sn>1 N-tiled; A2: Sk>1 K-split (int16 partials summed in end) — Sk bounded (per-row A-slice array) */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* one submit => one domain */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
@@ -9395,49 +9395,55 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     unsigned dom = tasks[0].w->domain;
     /* int4 ALWAYS copy-back: per-core in-domain int16 scratch (M=1 => N int16/op), widened in end() */
     for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
-        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].w->N * 2;
+        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].w->N * tasks[p].w->Sk * 2;   /* Sk int16 partial blocks/row (A2 K-split; Sk==1 => N int16) */
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
-    int NMAX = c->soc->nmax;
+    int NMAX = c->soc->nmax, KS = ORK_I4_KS;
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     for (int i = 0; i < nc; i++) {
         int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
         if (P < 1) { Pc[i] = 0; continue; }
-        /* PROGRAM count decoupled from row-task count: an Sn>1 row emits Sn chained column-slice programs. */
-        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn;
+        /* PROGRAM count decoupled from row-task count: a row emits Sn*Sk programs (N-slices x K-slices). */
+        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn * tasks[p].w->Sk;
         Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         size_t astage = 0, coff = 0; int pp = 0;
         for (int p = lo; p < hi; p++) {
-            const ork_mm_task_i8 *t = &tasks[p]; ork_w *w = t->w; int K = w->K, N = w->N, Sn = w->Sn;
-            size_t asz = (size_t)K / 2;                  /* int4 activation: 0.5 B/elem, tiled (not memcpy); shared by the row's N-slices */
-            if (astage + asz > AF->size) { free(h); return NULL; }
-            tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, 0, K);
-            uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;
-            /* A1 N-TILE: one program per N-slice (columns [n0,n0+Nc)); each writes Nc int16 at its column
-             * offset in the row's [N] int16 output => the drain widens the full [N] row unchanged (Sk==1, so
-             * still a plain raw-accumulator int16 -> int32, no per-group scale). */
+            const ork_mm_task_i8 *t = &tasks[p]; ork_w *w = t->w; int K = w->K, N = w->N, Sn = w->Sn, Sk = w->Sk;
+            /* A2 K-SPLIT: stage this row's Sk activation K-slices (each Kp nibbles, 0.5 B/elem), shared by the
+             * row's N-slices. Sk<=16 (guarded above); each slice reads A[:, ks*KS : ks*KS+Kp]. */
+            uint32_t aslice[16];
+            for (int ks = 0; ks < Sk; ks++) { int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; size_t asz = (size_t)Kp / 2;
+                if (astage + asz > AF->size) { free(h); return NULL; }
+                tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
+                aslice[ks] = (uint32_t)(AF->dma + astage); astage += asz; }
+            /* A1 N-tile x A2 K-split: one program per (N-slice ns, K-slice ks). The row's output is Sk blocks
+             * of [N] int16 (block ks = the K-slice-ks partial; column-slices write their [Nc] within it); the
+             * drain SUMS the Sk blocks per column -> int32 C (oSk). Sk==1 => one block = A1's plain widen. */
             for (int ns = 0; ns < Sn; ns++) {
                 int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
-                uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)n0 * 2);   /* this slice's columns, int16 */
-                uint32_t bdma = (uint32_t)w->Bb[(size_t)ns].dma;              /* Sk==1 => Bb[ns] is N-slice ns */
-                memset(rc, 0, sizeof rc);
-                synth_i4(rc, 1, K, Nc, adma, bdma, cdma);
-                if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
-                if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
-                    rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
-                    rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
-                memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
-                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-                tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */
-                tk[pp] = tt; pp++;
+                for (int ks = 0; ks < Sk; ks++) {
+                    int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS;
+                    uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)ks * N * 2 + (size_t)n0 * 2);   /* block ks, columns [n0,n0+Nc) */
+                    uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + ks].dma;                          /* weight N-slice ns, K-slice ks */
+                    memset(rc, 0, sizeof rc);
+                    synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
+                    if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */
+                    tk[pp] = tt; pp++;
+                }
             }
             int gi = p;
             h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
-            h->nout[gi] = N; h->oM[gi] = 1;   /* full row = N int16 spanning the Sn column-slices */
-            coff += (size_t)N * 2;
+            h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk;   /* Sk int16 partial blocks of [N]; end() sums -> int32 C */
+            coff += (size_t)Sk * N * 2;
         }
         memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj;
@@ -10289,13 +10295,19 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     int NMAXe = h->c->soc->nmax;
     for (int i = 0; i < h->S; i++) if (h->dst[i]) { int no = h->nout[i] ? h->nout[i] : h->N;
         int Me = h->oM[i] ? h->oM[i] : 1, Ne = no / Me;
-        /* K-SPLIT ACCUMULATE: scratch holds oSk partial [M,N] blocks ([ks][m][n]); sum over ks into C[M,N]. */
+        /* K-SPLIT ACCUMULATE: scratch holds oSk partial [M,N] blocks ([ks][m][n]); sum over ks into C[M,N].
+         * esz==2 (int4, A2): the partials are int16 (widen-sum -> int32); else (int8) int32 partials (unchanged). */
         if (h->oSk[i] > 1) {
-            int Sk = h->oSk[i], Nn = no / (Sk * Me); const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];
+            int Sk = h->oSk[i], Nn = no / (Sk * Me); int32_t *d = h->dst[i];
             size_t ds = h->ostride[i] > 0 ? (size_t)h->ostride[i] : (size_t)Nn;   /* colsplit wide-K: land the summed [M,Ncore] in C's columns at row-stride N */
-            for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
-                int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
-                d[(size_t)m * ds + n] = (int32_t)acc; }
+            if (h->esz == 2) { const int16_t *src = (const int16_t*)h->outptr[i];
+                for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
+                    int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
+                    d[(size_t)m * ds + n] = (int32_t)acc; } }
+            else { const int32_t *src = (const int32_t*)h->outptr[i];
+                for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
+                    int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
+                    d[(size_t)m * ds + n] = (int32_t)acc; } }
         }
         else
         /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into
@@ -12431,8 +12443,8 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
 static int seq_hw_ok(const ork_seq_op *o){
     if(o->kind!=ORK_OP_MM_I8 && o->kind!=ORK_OP_MM_F16 && o->kind!=ORK_OP_MM_I4) return 0;
     ork_w *w=o->w; if(!w||w->Sn!=1) return 0;
-    if(o->kind==ORK_OP_MM_I4){                 /* int4: M=1 single-slice (begin_mc_i4) */
-        if(w->dtype!=DT_I4||o->M!=1||w->Sk!=1) return 0;
+    if(o->kind==ORK_OP_MM_I4){                 /* int4: M=1 (begin_mc_i4; A1 Sn>1 + A2 Sk>1 supported, Sk<=16) */
+        if(w->dtype!=DT_I4||o->M!=1||w->Sk>16) return 0;
         return 1;
     }
     if(o->M<1||o->M>64) return 0;
