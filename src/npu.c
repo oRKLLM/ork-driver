@@ -3088,6 +3088,8 @@ static int run_i4_incr_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,i
 static int run_i4_bchain(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: chain H-row batches, one weight load */
 static int run_i4_cbatch(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: compact-task batch (CBATCH) */
 static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
+static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
+static int ork_dyn_grouped_end(ork_dyn_chain *h);  /* B: grouped-int4 float scale-accumulate drain */
 int ork_dyn_end(ork_dyn_chain *h);
 /* TASK #4: multi-M int4 onto the NONBLOCK doorbell spine. Decompose the M rows of one int4 weight into a chain
  * of M=1 int4 programs distributed across cores via ork_dyn_begin_mc_i4 (the validated M=1 int4 doorbell: full-
@@ -4651,6 +4653,11 @@ static void *i4_mcworker_g(void *vp){
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    /* B: DEFAULT route grouped int4 through the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float
+     * scale-accumulate drain). ORK_I4G_NODB=1 reverts to the blocking i4_mcworker_g; NULL (chain/scratch too
+     * big) also falls through. */
+    { static int i4gdb=-1; if(i4gdb<0){const char*e=getenv("ORK_I4G_NODB"); i4gdb=(e&&atoi(e))?0:1;}
+      if(i4gdb){ ork_dyn_chain *hg=ork_dyn_begin_mc_i4_grouped(c,M,w,A,aScale,bScale,C,0); if(hg) return ork_dyn_grouped_end(hg)?-1:0; } }
     int fd=c->fd, NB=w->N/64, nc=budget(c, M);
     if(nc>NB)nc=NB;
     if(nc>c->soc->cores)nc=c->soc->cores;
@@ -9170,6 +9177,12 @@ struct ork_dyn_chain {
     struct rknpu_submit mc_subs[ORK_MAXCORE];
     int        mc_Pc[ORK_MAXCORE];
     unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
+     * blocks scaled + FLOAT-accumulated — C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]. */
+    int          i4g;              /* 1 = grouped-int4 float drain */
+    const float *i4g_aS, *i4g_bS;  /* activation scale (M*Sk), weight scale (Sk*N) — caller host arrays */
+    float       *i4g_Cf;           /* float output C[M,N] */
+    int          i4g_N, i4g_Sk;    /* N + group count */
     /* SEQ chain (ork_dyn_begin_seq_i8 — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
      * all ops share ONE output scratch; per-op layout/esz differ (matmul int32 dense, SDP int8 EWCUBE). */
     int        seq;             /* 1 = built by begin_seq_i8 */
@@ -9464,6 +9477,100 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     h->mc_nc = nc; h->mc_dt = DT_I4; h->mc_dom = dom;
     for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
+}
+
+/* ============ B: GROUPED int4 (W4A4 per-K-group scales) on the NONBLOCK doorbell ============
+ * ork_mm_run_i4_grouped's doorbell path. Row-decomposed (M=1 tasks across cores); each row emits Sn*Sk programs
+ * (K-slice = gsize G, Sk = K/G groups). Output = Sk int16 partial blocks of [N] per row. Unlike A2's int-sum,
+ * the drain (ork_dyn_grouped_end) FLOAT scale-accumulates: C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]
+ * (matches i4_mcworker_g). NULL if ineligible (chain/scratch too big) -> caller uses the blocking i4_mcworker_g. */
+static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A,
+                                                  const float *aScale, const float *bScale, float *Cf, int nc) {
+    if (!w || w->dtype != DT_I4 || !w->gsize || M < 1 || M > 1024) return NULL;
+    int G = w->gsize, K = w->K, N = w->N, Sn = w->Sn, Sk = w->Sk;   /* grouped: Sk = K/G groups */
+    (void)K;
+    if (Sk > 256) return NULL;                                       /* bounds the per-row aslice[]/program count */
+    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > M) nc = M;
+    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
+    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
+    if (mc_ensure(c, nc)) return NULL;
+    int fd = c->fd, NMAX = c->soc->nmax;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = M; h->P = M; h->N = N; h->dom = w->domain; h->reserve = M; h->mc = 1; h->esz = 2;
+    h->i4g = 1; h->i4g_aS = aScale; h->i4g_bS = bScale; h->i4g_Cf = Cf; h->i4g_N = N; h->i4g_Sk = Sk;
+    unsigned dom = w->domain;
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) continue;
+        size_t osz = (size_t)P * Sk * N * 2;                         /* rows-on-core x Sk int16 blocks of [N] */
+        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
+    uint32_t rc[REGCMD_I4_N];
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) { Pc[i]=0; continue; }
+        int Pcore = P * Sn * Sk; Pc[i] = Pcore;
+        if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        size_t astage = 0, coff = 0; int pp = 0;
+        for (int m = lo; m < hi; m++) { const int8_t *Arow = A + (size_t)m * w->K;
+            uint32_t aslice[256];                                    /* this row's Sk group A-slices (each G nibbles) */
+            for (int g = 0; g < Sk; g++) { size_t asz = (size_t)G / 2;
+                if (astage + asz > AF->size) { free(h); return NULL; }
+                tile_i4_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
+                aslice[g] = (uint32_t)(AF->dma + astage); astage += asz; }
+            for (int ns = 0; ns < Sn; ns++) { int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                for (int g = 0; g < Sk; g++) {
+                    uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)g * N * 2 + (size_t)n0 * 2);   /* block g, cols [n0,n0+Nc) */
+                    uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + g].dma;
+                    memset(rc, 0, sizeof rc);
+                    synth_i4(rc, 1, G, Nc, aslice[g], bdma, cdma);
+                    if (validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;
+                    tk[pp] = tt; pp++;
+                } }
+            int gi = m; h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = NULL;
+            h->nout[gi] = Sk * N; h->oM[gi] = 1;                     /* Sk int16 partial blocks; grouped_end float-accumulates */
+            coff += (size_t)Sk * N * 2;
+        }
+        memset(&subs[i], 0, sizeof subs[i]);
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj; subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
+    }
+    for (int x = 0; x < M; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+        for (int e = 0; e < no; e++) { o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }
+    for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
+    ork_install_term();
+    return h;
+}
+/* Drain the grouped-int4 doorbell: poll all rows' Sk*N int16 partials, then FLOAT scale-accumulate into C[M,N]. */
+static int ork_dyn_grouped_end(ork_dyn_chain *h) {
+    if (!h || !h->i4g) return -2;
+    ork_npu *c = h->c; int fd = c->fd, rc = 0;
+    g_in_doorbell = 1; double t0 = ork_now_us(); int landed = 0;
+    for (;;) { int alld = 1; for (int x = 0; x < h->S && alld; x++) if (!ork_dyn_done_i(h, x)) alld = 0;
+        if (alld) { landed = 1; break; } if (g_ork_term || ork_now_us() - t0 > 3e6) break; }
+    g_in_doorbell = 0; if (!landed) rc = -1;
+    struct buf *done[1024]; int nd = 0;
+    for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
+        for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
+        if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    int N = h->i4g_N, Sk = h->i4g_Sk; const float *aS = h->i4g_aS, *bS = h->i4g_bS; float *Cf = h->i4g_Cf;
+    for (int m = 0; m < h->S; m++) { const int16_t *blk = (const int16_t*)h->outptr[m]; float *cr = Cf + (size_t)m * N;
+        for (int n = 0; n < N; n++) { float acc = 0;
+            for (int g = 0; g < Sk; g++) acc += aS[(size_t)m*Sk+g] * bS[(size_t)g*N+n] * (float)blk[(size_t)g*N+n];
+            cr[n] = acc; } }
+    __asm__ volatile("dsb ish":::"memory");
+    free(h);
+    if (g_ork_term) { sigaction(SIGTERM, &g_prev_sig[0], NULL); raise(SIGTERM); }
+    return rc;
 }
 
 /* P3: sub-nmax N-COLUMN tiling across cores on the NONBLOCK doorbell (int8, Sn==1, K<=4096 Bf, M 1..64).
