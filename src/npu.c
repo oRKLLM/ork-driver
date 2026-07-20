@@ -11006,39 +11006,25 @@ done2:
  * Numerically identical to ork_bmm_fp16 (same synth matmul, same fp16 operands) — just one ioctl. */
 int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||nb<1||nb>64||M<1||K<1||N<1||K%32||N%16) return -2;
-    int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=-1,ret=0;
+    /* B3 (chain_progs retirement): the batch of nb independent fp16 matmuls now rides the NONBLOCK-doorbell
+     * fp16 PC-chain (ork_mm_run_stream_f16_chain) instead of the legacy ork_npu_chain_progs. The stream primitive
+     * owns staging + warm/reset (enters DT_F16/XP_STREAM_F16 — fp16 content tracked AS fp16, unifying this with
+     * the other fp16 scan stages; the old path entered DT_I8_CHAIN, whose "genuine int8->fp16 switch needs a
+     * reset" caveat this removes). Spreads the batch across cores rather than one core-0 chain. Bit-exact
+     * (test_bmm_fused: fused == per-op ork_bmm_fp16 == CPU). chain_progs stays for the tools/ RE probes. */
     ork_w **w=calloc(nb,sizeof(ork_w*));
-    struct buf Ab=bcreate(fd,(size_t)nb*M*K*2,0x403,dom), Cb=bcreate(fd,(size_t)nb*M*N*4,0x403,dom);
-    uint32_t *rcs=calloc((size_t)nb*REGCMD_I8_N,4);
-    ork_chain_prog *progs=malloc((size_t)nb*sizeof(ork_chain_prog));
-    if(!w||!Ab.cpu||!Cb.cpu||!rcs||!progs){ ret=-3; goto done3; }
-    memcpy(Ab.cpu,A,(size_t)nb*M*K*2); memset(Cb.cpu,0,(size_t)nb*M*N*4);
-    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* Reset/warm is OWNED by ork_npu_chain_progs (ACT_RESETs on entry from a non-chain state, keeps
-     * last_dt=DT_I8_CHAIN + warmed across calls). A redundant per-call reset here was the ~100x slowdown:
-     * it set last_dt=DT_F16 so chain_progs re-ACT_RESET + did 2 warmup reps EVERY call. Dropping it lets
-     * subsequent fp16 chains stay warm (reps=1, no reset). Caveat: assumes any prior chain was also fp16
-     * (true for the all-fp16 SSD scan); a genuine int8->fp16 chain switch would still need a reset. */
-    /* fp16 SCHED (root-caused 2026-07-12, wiki regcmd-ISA-Reference "shape boundaries"): bare synth() with
-     * sched=1 formerly ZEROED the output for K<96 (K=32/64) — the sched=1 0x201:0x1040 K-reduction-schedule
-     * formula (base=177-15*(K/256-1)) OVERSHOOTS the template default (0xB1) as K drops below 256 (0xBC@K64,
-     * 0xBE@K32) and selects an invalid K-reduction atom -> zero/garbage. run()/mcworker avoid it by only
-     * using sched=1 for pow2 K in [128,2048); below that sched=0 keeps the template 0x1040 (correct for
-     * K<=256, bit-exact validated). Match that predicate here so the scan's K=64 stages compute correctly.
-     * (Single M-tile: mc=M; the SSD scan is M<=64 <= the K-dependent chunk, so no M-tiling needed.) */
-    int sched = (K&(K-1))==0 && K>=128 && K<2048;
+    ork_mm_task_f16 *tk=malloc((size_t)nb*sizeof(ork_mm_task_f16));
+    if(!w||!tk){ free(w); free(tk); return -3; }
+    int ret=0;
     for(int b=0;b<nb;b++){
         w[b]=ork_mm_pack(c,K,N,B+(size_t)b*K*N);
         if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done3; }
-        uint32_t *rc=rcs+(size_t)b*REGCMD_I8_N;
-        synth(rc,M,K,N,(uint32_t)(Ab.dma+(size_t)b*M*K*2),(uint32_t)w[b]->Bb[0].dma,(uint32_t)(Cb.dma+(size_t)b*M*N*4),sched,CBUF);
-        progs[b]=(ork_chain_prog){rc,REGCMD_I8_N,0xd,108,216};
+        tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N};
     }
-    ret=ork_npu_chain_progs(c,nb,progs,dom);
-    if(!ret){ bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)nb*M*N*4); }
+    ret=ork_mm_run_stream_f16_chain(c,nb,tk);
 done3:
-    if(w) for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
-    bdestroy(fd,&Ab);bdestroy(fd,&Cb); free(w);free(rcs);free(progs);
+    for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
+    free(w); free(tk);
     return ret;
 }
 
