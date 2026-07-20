@@ -181,6 +181,10 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* int16 variant: with the gain-1 index params (0x4068 low16=0x1000) idx = in + 512 (integer, no LUT
      * interpolation -> bit-exact), usable for |in| < 512. silu_idx16[in+512] = measured LUT index (-1 if none). */
     int silu_idx16_ok; short silu_idx16[4096];
+    /* B2 terminal-SDP: a tiny resident int8 witness weight (K=512,N=16, zeros). A seq group ending in an SDP op
+     * gets this witness matmul appended as its terminal so the group HW-chains (the SDP rides the chain; the
+     * witness's int32 sentinel gates completion). Lazy-packed once; freed at teardown. */
+    ork_w *seq_witness;
     /* persistent SSM-scan scratch pool (ork_ssm_scan_f32): the 4*nh fp16 scratch weights + all CPU staging
      * buffers, REUSED across calls at the same (nc,nr,nh) shape to avoid per-call MEM_CREATE/MEM_DESTROY churn
      * — that churn (4*nh scratch alloc/free per call) dominated the in-model scan (~10x the warm cost). CS is
@@ -1383,6 +1387,7 @@ void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshallin
 static void ork_npu_xprof_dump(void);
 void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
     int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
+    if(c->seq_witness){ ork_mm_free(c, c->seq_witness); c->seq_witness=NULL; }   /* B2 terminal-SDP witness weight */
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
     if(g_ork_prof){
@@ -12572,6 +12577,15 @@ static int seq_hw_ok(const ork_seq_op *o){
     return 1;
 }
 #define ORK_SEQ_HWBATCH 256   /* max ops per doorbell submit (well under ork_dyn_begin_mc's 1024 cap) */
+/* B2 terminal-SDP: lazily pack a tiny int8 witness weight (K=512,N=16, zeros). Appended as a group's terminal
+ * matmul so an SDP-ending group HW-chains (its int32 sentinel gates completion). NULL if pack fails (-> caller
+ * SW-breaks, as before). Resident on the ctx; freed at teardown. */
+static ork_w *seq_ensure_witness(ork_npu *c){
+    if(c->seq_witness) return c->seq_witness;
+    static const int8_t wz[512*16] = {0};   /* all-zero weight (read-only, shared) */
+    c->seq_witness = ork_mm_pack_i8(c, 512, 16, wz);
+    return c->seq_witness;
+}
 int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     if(!c||n<0||(n>0&&!ops)) return -2;
     if(c->daemon){   /* Path B: run the whole sequence on the daemon — it does the batch/break/resume on its NPU */
@@ -12629,7 +12643,33 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
             int gs[ORK_SEQ_HWBATCH+1]; int ng=0; gs[0]=0;
             for(int p=i+1;p<j;p++) if(ops[p].group!=ops[p-1].group) gs[++ng]=p-i;
             gs[++ng]=j-i;
-            ork_dyn_chain *h = (j-i<=ORK_SEQ_HWBATCH) ? ork_dyn_begin_seq_i8_mc(c, j-i, &ops[i], ng, gs, 0) : NULL;
+            /* B2 terminal-SDP: a group ending in a non-matmul (SDP) op can't provide the terminal int32 sentinel.
+             * If any group in this run ends in SDP, splice a tiny witness matmul as that group's terminal so the
+             * SDP rides the HW chain (the witness's sentinel gates completion; its output is discarded). Yields the
+             * proven mm->...->SDP->mm chain shape (no new hardware surface). Falls back to SW if the witness can't
+             * pack or the augmented run exceeds the batch cap. */
+            int need_w=0; for(int g=0;g<ng;g++) if(ops[i+gs[g+1]-1].kind!=ORK_OP_MM_I8) need_w=1;
+            ork_dyn_chain *h=NULL;
+            if(!need_w){
+                h = (j-i<=ORK_SEQ_HWBATCH) ? ork_dyn_begin_seq_i8_mc(c, j-i, &ops[i], ng, gs, 0) : NULL;
+            } else {
+                ork_w *ww = seq_ensure_witness(c);
+                if(ww){
+                    static ork_seq_op ao[ORK_SEQ_HWBATCH]; int ags[ORK_SEQ_HWBATCH+1]; int an=0, ang=0; ags[0]=0;
+                    static const int8_t wa[512]={0}; static int32_t wc[16];   /* witness A (zeros) / C (scratch, discarded) */
+                    int of=0;
+                    for(int g=0;g<ng && !of;g++){
+                        for(int p=gs[g];p<gs[g+1];p++){ if(an>=ORK_SEQ_HWBATCH){of=1;break;} ao[an++]=ops[i+p]; }
+                        if(!of && ops[i+gs[g+1]-1].kind!=ORK_OP_MM_I8){                       /* append the witness terminal */
+                            if(an>=ORK_SEQ_HWBATCH){of=1;break;}
+                            memset(&ao[an],0,sizeof ao[an]); ao[an].kind=ORK_OP_MM_I8; ao[an].w=ww; ao[an].M=1;
+                            ao[an].A=wa; ao[an].C=wc; an++;
+                        }
+                        ags[++ang]=an;
+                    }
+                    if(!of) h = ork_dyn_begin_seq_i8_mc(c, an, ao, ang, ags, 0);
+                }
+            }
             if(getenv("ORK_SEQ_DEBUG")) fprintf(stderr,"[seq] grouped run [%d,%d) ng=%d -> %s\n", i,j,ng, h?"seq-chain":"SW-fallback");
             if(h){ if(ork_dyn_seq_end(h)) ret=-1; }
             else { for(int p=i;p<j && !ret;p++){ const ork_seq_op *op=&ops[p]; const struct ork_seq_class *pcl=&SEQ_CLASS[op->kind];

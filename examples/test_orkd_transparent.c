@@ -195,6 +195,34 @@ static int one_seq_grouped(ork_npu *c){
     free(Ba);free(Aa);free(Ac);free(ua);free(va);free(eo);free(er);free(Ca);free(Cc);free(Ra);free(Rc);
     return bad ? 1 : 0;
 }
+/* B2 terminal-SDP: a grouped chain ENDING in an SDP op [mm -> ewmul_i8]. The group's terminal is the SDP (no
+ * int32 sentinel), so the builder splices a witness matmul as the terminal -> the SDP HW-chains. Same in
+ * direct + routed mode; bit-exact vs CPU. */
+static int one_seq_grouped_sdp_term(ork_npu *c){
+    int K=512, N=64, M=8, mult=0x4000, shift=14;
+    int8_t *Ba=malloc(K*N),*Aa=malloc(M*K),*ua=malloc(M*N),*va=malloc(M*N),*eo=malloc(M*N),*er=malloc(M*N);
+    int32_t *Ca=malloc(M*N*4),*Ra=malloc(M*N*4);
+    g=29;
+    for (int i=0;i<M*K;i++) Aa[i]=r8(); for (int i=0;i<K*N;i++) Ba[i]=r8();
+    for (int i=0;i<M*N;i++) ua[i]=(int8_t)((g=g*1103515245u+12345u)>>20&7)-3;
+    for (int i=0;i<M*N;i++) va[i]=(int8_t)((g=g*1103515245u+12345u)>>20&7)-3;
+    for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Aa[m*K+k]*Ba[k*N+n]; Ra[m*N+n]=(int)a; }
+    for (int i=0;i<M*N;i++){ long v=lround((long)ua[i]*va[i]*mult/(double)(1<<shift)); er[i]=(int8_t)(v>127?127:v<-128?-128:v); }
+    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_seq_op ops[2]; memset(ops,0,sizeof ops);
+    ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
+    ops[1].kind=ORK_OP_EWMUL_I8;              ops[1].M=M; ops[1].N=N; ops[1].A=ua; ops[1].B=va; ops[1].C=eo; ops[1].mult=mult; ops[1].shift=shift; ops[1].group=1;
+    int rc=ork_submit_seq(c,ops,2), bad=0;
+    if (rc){ printf("  seq-grp-sdpterm run FAIL rc=%d\n", rc); bad=1; }
+    else {
+        for (int i=0;i<M*N;i++) if (Ca[i]!=Ra[i]){ if(bad<3) printf("  seq-grp-sdpterm mm MISMATCH [%d] %d!=%d\n",i,Ca[i],Ra[i]); bad++; }
+        for (int i=0;i<M*N;i++) if (eo[i]!=er[i]){ if(bad<3) printf("  seq-grp-sdpterm ewmul MISMATCH [%d] %d!=%d\n",i,eo[i],er[i]); bad++; }
+    }
+    if (!bad) printf("  ok seq-grp-sdpterm  n=2 grouped [i8 -> ewmul_i8] (SDP terminal -> witness matmul, HW-chained)\n");
+    ork_mm_free(c,wa);
+    free(Ba);free(Aa);free(ua);free(va);free(eo);free(er);free(Ca);free(Ra);
+    return bad ? 1 : 0;
+}
 /* FULL-vocabulary heterogeneous sequence through the stack (ork_submit_seq): int8 mm (doorbell batch) |
  * silu_i8 (SW break) | int8 mm (resume) | ewmul_i8 (break) | add_f16 (break) | gelu_i8 (break) | int4 mm
  * (dtype-switch doorbell). Each op independent; validated vs its own reference. Exercises the extended
@@ -271,6 +299,7 @@ int main(void){
     bad |= one_seq(c);
     bad |= one_seq_full(c);
     bad |= one_seq_grouped(c);
+    bad |= one_seq_grouped_sdp_term(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
