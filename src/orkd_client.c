@@ -131,32 +131,50 @@ int orkd_ring_setup(orkd_conn *c){
 /* Hot path: submit one int8/fp16/int4 matmul through the ring (no socket). A copied in, C copied out; the daemon
  * busy-polls the slot, runs the matmul, writes C in place. 0 ok / <0 error (incl. -2 = too big for a slot ->
  * caller should fall back to the socket path). dtype is a wire ORKD_DT_*. */
-static int ring_run(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype,
-                    const void *A, size_t abytes, void *C, size_t cbytes){
-    if (!c || !c->ring) return -1;
+int orkd_has_ring(orkd_conn *c){ return c && c->ring ? 1 : 0; }
+
+/* A is int8/int4 (1B/elem) or fp16 (2B/elem); C is always 4B/elem (int32/fp32). */
+static size_t ring_esz_a(uint32_t dtype){ return dtype == ORKD_DT_F16 ? 2 : 1; }
+
+/* ASYNC, precision-agnostic. submit enqueues one op (any dtype) into a free slot WITHOUT blocking and returns a
+ * ticket (the slot index) to collect later; -2 = won't fit a slot or the ring is full (caller waits / falls back
+ * to the socket). collect blocks (spins) until that ticket's result lands, copies C, frees the slot. Up to
+ * ORKD_RING_SLOTS ops can be in flight — that is the pipeline depth: while the daemon runs op N, the client fills
+ * op N+1's slot, so the per-op transport (memcpy + handshake) overlaps NPU compute instead of serializing. */
+int orkd_ring_submit(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype, const void *A){
+    if (!c || !c->ring || M <= 0 || K <= 0 || N <= 0 || !A) return -1;
     struct orkd_ring *r = c->ring;
-    if (abytes > r->slot_data || cbytes > r->slot_data) return -2;   /* fall back to socket */
-    struct orkd_ring_slot *s = &r->slot[c->ring_next % r->nslots];
-    /* wait for the slot to be free (synchronous client: it should already be EMPTY) */
-    while (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_EMPTY){
-        if (atomic_load_explicit(&r->stop, memory_order_acquire)) return -1;
-    }
+    size_t abytes = (size_t)M * K * ring_esz_a(dtype), cbytes = (size_t)M * N * 4;
+    if (abytes > r->slot_data || cbytes > r->slot_data) return -2;   /* op too big for a slot -> use the socket */
+    uint32_t idx = c->ring_next % r->nslots;
+    struct orkd_ring_slot *s = &r->slot[idx];
+    if (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_EMPTY) return -2;  /* ring full: collect first */
     s->weight_id = weight_id; s->M = (uint32_t)M; s->K = (uint32_t)K; s->N = (uint32_t)N; s->dtype = dtype;
     s->abytes = (uint32_t)abytes; s->cbytes = (uint32_t)cbytes; s->rc = 0;
-    if (abytes) memcpy(s->data, A, abytes);
+    memcpy(s->data, A, abytes);
     atomic_store_explicit(&s->state, ORKD_SLOT_REQ, memory_order_release);   /* publish: data-then-flag */
     c->ring_next++;
+    return (int)idx;
+}
+int orkd_ring_collect(orkd_conn *c, int ticket, void *C){
+    if (!c || !c->ring || ticket < 0 || ticket >= (int)c->ring->nslots || !C) return -1;
+    struct orkd_ring_slot *s = &c->ring->slot[ticket];
     while (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_RESP){
-        if (atomic_load_explicit(&r->stop, memory_order_acquire)) return -1;
+        if (atomic_load_explicit(&c->ring->stop, memory_order_acquire)) return -1;
     }
     int rc = s->rc;
-    if (rc == 0 && cbytes) memcpy(C, s->data, cbytes);
+    if (rc == 0 && s->cbytes) memcpy(C, s->data, s->cbytes);   /* cbytes is daemon-authoritative (== M*N*4) */
     atomic_store_explicit(&s->state, ORKD_SLOT_EMPTY, memory_order_release);  /* release the slot */
     return rc;
 }
+/* Synchronous convenience (submit + immediately collect) — precision-agnostic; kept for the probe/back-compat. */
+int orkd_ring_run(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype, const void *A, void *C){
+    int t = orkd_ring_submit(c, weight_id, M, K, N, dtype, A);
+    if (t < 0) return t;
+    return orkd_ring_collect(c, t, C);
+}
 int orkd_run_i8_ring(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
-    if (!c || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
-    return ring_run(c, weight_id, M, K, N, ORKD_DT_I8, A, (size_t)M*K, C, (size_t)M*N*4);
+    return orkd_ring_run(c, weight_id, M, K, N, ORKD_DT_I8, A, C);
 }
 
 void orkd_disconnect(orkd_conn *c){

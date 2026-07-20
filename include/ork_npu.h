@@ -404,6 +404,15 @@ int          ork_mm_run_i8_out8(ork_npu *ctx, ork_w *w, int M, const int8_t *A, 
 /* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+
+/* Async pipelined submit (orkd client + ring only; ORK_USE_ORKD=1 ORK_ORKD_RING=1). ork_mm_submit enqueues one
+ * matmul for w (any precision — dtype taken from w) WITHOUT blocking and returns a ticket; ork_mm_collect(ticket)
+ * copies C when it lands. Returns <0 if unavailable (no ring, or the op is too big for a ring slot — use the
+ * synchronous ork_mm_run* which auto-falls back to the socket). Keeping several ops in flight (up to the ring
+ * depth) overlaps each op's transport with the NPU compute of the ones ahead — the decode-pipeline path.
+ * A is int8/int4 (1B/elem) or fp16 (2B/elem); C is int32/fp32 (4B/elem), sized M*N by the caller. */
+int          ork_mm_submit(ork_npu *ctx, ork_w *w, int M, const void *A);
+int          ork_mm_collect(ork_npu *ctx, int ticket, void *C);
 /* grouped int4 (per-group W4A4 dequant): A int4 [M*K] ([-8,7] in int8); aScale [M*(K/G)] (per row,
  * per group), bScale [(K/G)*N] (per group, per channel). C fp32 [M*N] = dequantized result. Pair
  * with ork_mm_pack_i4_grouped. (Cost: K/G submits/core — larger G = fewer submits, coarser scale.) */

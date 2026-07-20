@@ -28,11 +28,18 @@ int orkd_ping(orkd_conn *c);
 void orkd_set_priority(orkd_conn *c, unsigned prio);
 
 /* A-ring: attach a shared-memory ring for LOW-LATENCY submits (removes the per-op socket round-trip). 0 = ok.
- * After this, orkd_run_i8_ring runs the hot path over the ring; the socket stays for control + fallback. */
+ * The ring transport is precision-agnostic (dtype is per-op); the socket stays for control + oversized fallback. */
 int orkd_ring_setup(orkd_conn *c);
-/* Run int8 A[M,K] x weight -> C[M,N] (int32) via the ring. 0 ok / <0 error (-2 = too big for a slot, use the
- * socket orkd_run_i8 instead). Requires orkd_ring_setup() first. */
-int orkd_run_i8_ring(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
+int orkd_has_ring(orkd_conn *c);   /* 1 if a ring is attached (the hot path can use it) */
+
+/* ASYNC pipeline (precision-agnostic). submit enqueues one op (dtype = ORKD_DT_I8/F16/I4) into a free slot and
+ * returns a ticket without blocking (-2 = too big for a slot or ring full -> socket / collect first); collect
+ * blocks until that ticket lands and copies C. Up to ORKD_RING_SLOTS in flight = the pipeline depth. */
+int orkd_ring_submit(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype, const void *A);
+int orkd_ring_collect(orkd_conn *c, int ticket, void *C);
+/* Synchronous convenience: submit + collect (any dtype). */
+int orkd_ring_run(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint32_t dtype, const void *A, void *C);
+int orkd_run_i8_ring(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);  /* int8 shorthand */
 
 /* Graceful deregister (BYE) + close + free. Safe on NULL. */
 void orkd_disconnect(orkd_conn *c);

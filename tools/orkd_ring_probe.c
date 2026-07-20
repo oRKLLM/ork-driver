@@ -6,6 +6,8 @@
  *   make orkd orkd_ring_probe && sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./orkd_ring_probe [M] [K] [N] [iters]
  */
 #include "orkd_client.h"
+#include "orkd_proto.h"
+#include "orkd_ring.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,10 +48,26 @@ int main(int argc, char **argv){
     long t0 = now_ns(); for (int i = 0; i < iters; i++) if (orkd_run_i8(c, wid, M, K, N, A, Cs)) return 3; long ts = now_ns() - t0;
     long t1 = now_ns(); for (int i = 0; i < iters; i++) if (orkd_run_i8_ring(c, wid, M, K, N, A, Cr)) return 3; long tr = now_ns() - t1;
 
-    double us_s = ts / 1e3 / iters, us_r = tr / 1e3 / iters;
-    printf("orkd_ring_probe M=%d K=%d N=%d iters=%d  BIT-EXACT ✓\n", M, K, N, iters);
-    printf("  socket RPC : %7.2f us/op\n", us_s);
-    printf("  shm ring   : %7.2f us/op   (%.2fx, %.2f us saved/op)\n", us_r, us_s / us_r, us_s - us_r);
+    /* PIPELINED: keep a window of W ops in flight (submit-ahead, then collect) so each op's transport overlaps
+     * the NPU compute of the ones ahead. Batches of W = full ring depth. */
+    const int W = ORKD_RING_SLOTS;
+    int tk[ORKD_RING_SLOTS];
+    long t2 = now_ns();
+    for (int done = 0; done < iters; ){
+        int b = (iters - done < W) ? (iters - done) : W;
+        for (int j = 0; j < b; j++){ tk[j] = orkd_ring_submit(c, wid, M, K, N, ORKD_DT_I8, A); if (tk[j] < 0) return 3; }
+        for (int j = 0; j < b; j++){ if (orkd_ring_collect(c, tk[j], Cr)) return 3; }
+        done += b;
+    }
+    long tp = now_ns() - t2;
+    int badp = 0; for (int i = 0; i < M * N; i++) if (Cs[i] != Cr[i]) badp++;   /* pipelined result still matches */
+    if (badp){ fprintf(stderr, "PIPELINED MISMATCH: %d/%d\n", badp, M * N); return 1; }
+
+    double us_s = ts / 1e3 / iters, us_r = tr / 1e3 / iters, us_p = tp / 1e3 / iters;
+    printf("orkd_ring_probe M=%d K=%d N=%d iters=%d  BIT-EXACT ✓ (sync + pipelined)\n", M, K, N, iters);
+    printf("  socket RPC        : %7.2f us/op\n", us_s);
+    printf("  shm ring (sync)   : %7.2f us/op   (%.2fx vs socket, %.2f us saved)\n", us_r, us_s / us_r, us_s - us_r);
+    printf("  shm ring (pipe W=%d): %6.2f us/op   (%.2fx vs socket, %.2fx vs sync-ring)\n", W, us_p, us_s / us_p, us_r / us_p);
     orkd_disconnect(c);
     return 0;
     #undef R8

@@ -25,6 +25,7 @@
 #include <signal.h>
 #include "rknpu_ioctl.h"
 #include "orkd_client.h"   /* Path B: transparent orkd client routing (gated by ORK_USE_ORKD) */
+#include "orkd_proto.h"    /* ORKD_DT_* wire dtypes for the transparent ring transport */
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
 #include "regcmd_i4.h"
@@ -1335,7 +1336,8 @@ ork_npu *ork_npu_init(void){
       if(ud && atoi(ud) && !(isd && atoi(isd))){
         orkd_conn *dc=orkd_connect();
         if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
-            if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u)\n",orkd_soc_cores(dc)); return c; }
+            if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
+            if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc)); return c; }
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();
@@ -3108,8 +3110,23 @@ static int run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C
     int d = ork_dyn_end(h);
     return (d == M-1) ? 0 : -1;
 }
+/* Async pipelined submit (precision-agnostic) — orkd+ring mode only. Enqueue one matmul for w WITHOUT blocking
+ * and get a ticket; ork_mm_collect(ticket) reads C later. Returns <0 if unavailable (no ring, or the op is too
+ * big for a ring slot — use the synchronous ork_mm_run* instead). Keeping several ops in flight lets each op's
+ * transport (memcpy + handshake) overlap the NPU compute of the ones ahead of it — the decode pipeline. */
+int ork_mm_submit(ork_npu *c, ork_w *w, int M, const void *A){
+    if(!c || !c->daemon || !w || !w->is_orkd || !orkd_has_ring(c->daemon)) return -1;
+    uint32_t dt = w->dtype==DT_F16 ? ORKD_DT_F16 : w->dtype==DT_I4 ? ORKD_DT_I4 : ORKD_DT_I8;
+    return orkd_ring_submit(c->daemon, w->orkd_id, M, w->K, w->N, dt, A);
+}
+int ork_mm_collect(ork_npu *c, int ticket, void *C){
+    if(!c || !c->daemon) return -1;
+    return orkd_ring_collect(c->daemon, ticket, C);
+}
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
-    if(w && w->is_orkd) return orkd_run_i4(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: int4 run on the daemon */
+    if(w && w->is_orkd){   /* Path B: int4 run on the daemon — ring transport if attached, else socket */
+        if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I4,A,C); if(r!=-2) return r; }
+        return orkd_run_i4(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(!w||w->dtype!=DT_I4) return -1;
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
@@ -4857,13 +4874,17 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     memcpy(C,c->cres,need); return 0;
 }
 int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
-    if(w && w->is_orkd) return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: fp16 run on the daemon */
+    if(w && w->is_orkd){   /* Path B: fp16 run on the daemon — ring transport if attached (any precision), else socket */
+        if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_F16,A,C); if(r!=-2) return r; }
+        return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_F16)return -1;
     if(check_overlap("ork_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K * 2, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     return run(c,w,M,A,C);
 }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
-    if(w && w->is_orkd) return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C);   /* Path B: run on the daemon */
+    if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
+        if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I8,A,C); if(r!=-2) return r; }
+        return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_I8) return -1;
     if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real
