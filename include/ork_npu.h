@@ -866,6 +866,7 @@ typedef enum {
     ORK_OP_EWMUL_I8,    /* int8 elementwise mul (SDP): A*B i8[M,N] -> C i8[M,N] (mult,shift; SW: ork_npu_ewmul_i8) */
     ORK_OP_ADD_I8,      /* int8 elementwise add (SDP): A+B i8[M,N] -> C i8[M,N] (a_scale=in,b_scale,out_scale; SW: ork_npu_add_i8) */
     ORK_OP_ADD_F16,     /* fp16 elementwise add (SDP): A+B f16[M,N] -> C f16[M,N] (SW: ork_npu_add_f16) */
+    ORK_OP_SILU_I16,    /* int16 SiLU (SDP): A i16[M,N] -> C i16[M,N] (in_scale,out_scale; SW: ork_npu_silu_i16) — the ACCURATE higher-precision SiLU (fp16 SiLU is not viable on this NPU: fused=garbage-PPL, standalone SDP=broken) */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef struct {

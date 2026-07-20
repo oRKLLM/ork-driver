@@ -223,6 +223,39 @@ static int one_seq_grouped_sdp_term(ork_npu *c){
     free(Ba);free(Aa);free(ua);free(va);free(eo);free(er);free(Ca);free(Ra);
     return bad ? 1 : 0;
 }
+/* B1 int16 SiLU HW-chained: grouped [mm_i8 -> silu_i16 -> mm_i8] — the silu is MID-chain, riding the doorbell
+ * chain via the LUT-load prologue + silu-compute chain task (single-core, resident LUT). silu has its own int16
+ * input (the shear that would feed it from the matmul is dead). Verify all three outputs (silu RKNN-class tol). */
+static int one_seq_grouped_silu16(ork_npu *c){
+    int K=512, N=64, M=8; double is=0.0001, os=0.0001;
+    int8_t *Ba=malloc(K*N),*Aa=malloc(M*K),*Ac=malloc(M*K);
+    int32_t *Ca=malloc(M*N*4),*Cc=malloc(M*N*4),*Ra=malloc(M*N*4),*Rc=malloc(M*N*4);
+    int16_t *si=malloc(M*N*2),*so=malloc(M*N*2),*sr=malloc(M*N*2);
+    g=41;
+    for(int i=0;i<M*K;i++)Aa[i]=r8(); for(int i=0;i<K*N;i++)Ba[i]=r8(); for(int i=0;i<M*K;i++)Ac[i]=r8();
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Aa[m*K+k]*Ba[k*N+n];Ra[m*N+n]=(int)a;}
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Ac[m*K+k]*Ba[k*N+n];Rc[m*N+n]=(int)a;}
+    for(int i=0;i<M*N;i++) si[i]=(int16_t)(-20000 + (int)((40000LL*((i*97)%(M*N)))/(M*N)));
+    for(int i=0;i<M*N;i++){ double x=si[i]*is,y=x/(1.0+exp(-x)); long q=lround(y/os); if(q>32767)q=32767; if(q<-32768)q=-32768; sr[i]=(int16_t)q; }
+    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_seq_op ops[3]; memset(ops,0,sizeof ops);
+    ops[0].kind=ORK_OP_MM_I8;     ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
+    ops[1].kind=ORK_OP_SILU_I16;               ops[1].M=M; ops[1].N=N; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os; ops[1].group=1;
+    ops[2].kind=ORK_OP_MM_I8;     ops[2].w=wa; ops[2].M=M;             ops[2].A=Ac; ops[2].C=Cc; ops[2].group=1;
+    int rc=ork_submit_seq(c,ops,3), bad=0;
+    if(rc){ printf("  seq-grp-silu16 run FAIL rc=%d\n",rc); bad=1; }
+    else {
+        long maxref=1; for(int i=0;i<M*N;i++){ long r2=labs(sr[i]); if(r2>maxref)maxref=r2; } long tol=2+(long)(0.01*maxref);
+        for(int i=0;i<M*N;i++) if(Ca[i]!=Ra[i]){ if(bad<3)printf("  silu16 mm0 [%d] %d!=%d\n",i,Ca[i],Ra[i]); bad++; }
+        for(int i=0;i<M*N;i++) if(Cc[i]!=Rc[i]){ if(bad<3)printf("  silu16 mm2 [%d] %d!=%d\n",i,Cc[i],Rc[i]); bad++; }
+        int sbad=0; long smx=0; for(int i=0;i<M*N;i++){ long d=labs((long)so[i]-sr[i]); if(d>smx)smx=d; if(d>tol){ if(sbad<3)printf("  silu16 [%d] %d!=%d (d=%ld tol=%ld)\n",i,so[i],sr[i],d,tol); sbad++; } } bad+=sbad;
+        if(!sbad) printf("  (silu16 max|err|=%ld tol=%ld)\n", smx, tol);
+    }
+    if(!bad) printf("  ok seq-grp-silu16  n=3 grouped [i8 -> silu_i16 -> i8] (int16 SiLU HW-chained)\n");
+    ork_mm_free(c,wa);
+    free(Ba);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);free(si);free(so);free(sr);
+    return bad?1:0;
+}
 /* FULL-vocabulary heterogeneous sequence through the stack (ork_submit_seq): int8 mm (doorbell batch) |
  * silu_i8 (SW break) | int8 mm (resume) | ewmul_i8 (break) | add_f16 (break) | gelu_i8 (break) | int4 mm
  * (dtype-switch doorbell). Each op independent; validated vs its own reference. Exercises the extended
@@ -300,6 +333,7 @@ int main(void){
     bad |= one_seq_full(c);
     bad |= one_seq_grouped(c);
     bad |= one_seq_grouped_sdp_term(c);
+    bad |= one_seq_grouped_silu16(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;

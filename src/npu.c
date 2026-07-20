@@ -8259,16 +8259,15 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
  * and samples silu there, so the op's interpolation lands on silu at the exact grid. RKNN-class accuracy.
  * in/out int16 [M*N], N%8==0. rk3588-gated. 0/ok,-1 wedged,-2 bad shape,-3 SoC. */
-static int act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+/* Build the int16 activation LUT curve for `f` at (in_scale,out_scale) into lut[1030]. Calibrates the idx map
+ * once per ctx (a STANDALONE probe — must run outside any chain). 0/ok. Shared by act_lut_i16 (standalone) and
+ * the HW-chained silu prologue in ork_dyn_begin_seq_i8_mc. */
+static int build_act_lut16(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
     if(silu_calibrate_idx16(c)) return -1;
-    /* q_in(k): for each integer idx k, average the q_in of the samples that measured idx==k (dense sampling
-     * gives ~8 samples/idx at R=1 — exactly the op's grid, no R shift). Then LUT[k]=f(q_in(k)*in_scale)/os. */
     static double qsum[1030]; static int qn[1030];
     for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
     for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
-    int16_t lut[1030]; int lo=-1,hi=-1;
+    int lo=-1,hi=-1;
     for(int k=0;k<1030;k++){ if(qn[k]){ if(lo<0)lo=k; hi=k;
         double q_in=qsum[k]/qn[k]; double val=f(q_in*in_scale)/out_scale; long q=lround(val);
         if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(int16_t)q; } else lut[k]=0; }
@@ -8276,6 +8275,13 @@ static int act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int
     for(int k=0;k<lo;k++)lut[k]=lut[lo]; for(int k=hi+1;k<1030;k++)lut[k]=lut[hi];
     for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
+    return 0;
+}
+static int act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    int16_t lut[1030];
+    if(build_act_lut16(c,f,in_scale,out_scale,lut)) return -1;
     return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
 }
 int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
@@ -9219,9 +9225,11 @@ struct ork_dyn_chain {
     int        seq_nc;          /* seq cores in this round (1 = single-core; >1 = groups spread across cores) */
     int        seq_term_c[ORK_MAXCORE];   /* per-core terminal op index (its last program, a matmul = sentinel) */
     struct buf seq_out;         /* shared output scratch for all seq ops (freed in seq_end) */
-    uint8_t    oesz8[1024];     /* per-op output element bytes: 4=int32 matmul, 1=int8 SDP */
-    uint8_t    ocube[1024];     /* per-op output layout: 1=EWCUBE (SDP), 0=dense [M,N] (matmul) */
+    uint8_t    oesz8[1024];     /* per-op output element bytes: 4=int32 matmul, 1=int8 SDP, 2=int16 SDP (silu) */
+    uint8_t    ocube[1024];     /* per-op output layout: 1=EWCUBE-i8 (int8 SDP), 2=EWCUBEH-i16 (int16 SDP), 0=dense [M,N] (matmul) */
     size_t     ooff[1024];      /* per-op byte offset into seq_out */
+    struct buf silu_lrc, silu_lsc;   /* int16-SiLU HW-chain: the LUT-load regcmd + SRAM buffers, resident across the chain; freed in seq_end */
+    int        silu_lut;        /* 1 = a silu LUT-load prologue ran (Lrc/Lsc valid) */
 };
 /* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
  * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
@@ -10017,6 +10025,9 @@ static int seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom){
         if(o->M<1||o->M>64||o->N<16||(o->N&15)) return 0;
         if(o->mult<0||o->mult>0x7fff||o->shift<0||o->shift>31) return 0;
         return 1; }
+    if(o->kind==ORK_OP_SILU_I16){                                  /* int16 SiLU: HW-chained activation-LUT SDP task */
+        if(o->M<1||o->M>64||o->N<8||(o->N&7)) return 0;            /* atom-8 int16 cube (N%8) */
+        return 1; }
     return 0; }
 /* build op `gi` as program `pp` (per-core slot in RC) writing its output at seq_out byte-offset *coff; chain
  * it forward to the core's NEXT program (nx_pp>=0) or terminate (nx_pp<0). Records h's per-op output tracking. */
@@ -10030,6 +10041,20 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         rcw=REGCMD_I8_N; dslot=216; regcfg=108; enable=0xd;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=4; h->ocube[gi]=0;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*4;
+    } else if(o->kind==ORK_OP_SILU_I16){ int M=o->M,N=o->N;   /* int16 SiLU activation-LUT SDP task (reads the resident LUT) */
+        #define EWCUBEH_S(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* int16 atom-8, 2-byte cube (== M*N*2 bytes for N%8) */
+        char *a=(char*)AF->cpu+*astage; const int16_t *ha=(const int16_t*)o->A;
+        for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) *(int16_t*)(a+EWCUBEH_S(m,nn))=ha[m*N+nn];
+        uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N*2;
+        memcpy(rc,REGCMD_SILU_STD_I16,REGCMD_SILU_STD_I16_N*4); set_mul_geom(rc,REGCMD_SILU_STD_I16_N,M,N);
+        setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
+        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+*coff)); setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5018,adma);
+        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0);
+        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+        rcw=REGCMD_SILU_STD_I16_N; dslot=138; regcfg=69; enable=0x18;
+        h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=2; h->ocube[gi]=2;
+        h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*2;
+        #undef EWCUBEH_S
     } else { int M=o->M,N=o->N;
         int8_t *a=(int8_t*)((char*)AF->cpu+*astage), *b=a+(size_t)M*N; const int8_t *ha=o->A,*hb=o->B;
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++){ a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn]; b[ORK_SEQCUBE(m,nn,M)]=hb[m*N+nn]; }
@@ -10060,8 +10085,15 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     if(gstart[0]!=0||gstart[ngroups]!=n) return NULL;
     unsigned dom=0; int have_dom=0; int has_sdp=0;
     for(int i=0;i<n;i++){ if(!seq_op_ok(&ops[i],&dom,&have_dom)) return NULL; if(ops[i].kind!=ORK_OP_MM_I8) has_sdp=1; }
-    for(int g=0;g<ngroups;g++){ if(gstart[g+1]<=gstart[g]) return NULL; if(ops[gstart[g+1]-1].kind!=ORK_OP_MM_I8) return NULL; }  /* each group terminal = matmul */
+    for(int g=0;g<ngroups;g++){ if(gstart[g+1]<=gstart[g]) return NULL; if(ops[gstart[g+1]-1].kind!=ORK_OP_MM_I8) return NULL; }  /* each group terminal = matmul (SDP terminal -> B2 witness upstream) */
+    /* int16 SiLU HW-chain: one resident SDP LUT per chain, so all silu ops must share (in_scale,out_scale), and
+     * force SINGLE-CORE (one SDP SRAM to load). A prologue LUT-load runs below before the chain submit. */
+    int has_silu=0; double silu_is=0, silu_os=0;
+    for(int i=0;i<n;i++) if(ops[i].kind==ORK_OP_SILU_I16){
+        if(!has_silu){ has_silu=1; silu_is=ops[i].in_scale; silu_os=ops[i].out_scale; }
+        else if(ops[i].in_scale!=silu_is || ops[i].out_scale!=silu_os) return NULL; }
     if(nc<1||nc>c->soc->cores) nc=c->soc->cores; if(nc>ngroups) nc=ngroups;
+    if(has_silu) nc=1;
     /* greedy load-balance: assign each group to the least-loaded core (cost ~ matmul weight-DMA K*N + SDP M*N) */
     long load[ORK_MAXCORE]; int core_of[256]; for(int i=0;i<nc;i++)load[i]=0;
     for(int g=0;g<ngroups;g++){ long cost=0; for(int i=gstart[g];i<gstart[g+1];i++){ const ork_seq_op*o=&ops[i];
@@ -10077,6 +10109,7 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     for(int g=0;g<ngroups;g++){ int i=core_of[g];
         for(int p=gstart[g];p<gstart[g+1];p++){ const ork_seq_op*o=&ops[p]; Pc[i]++;
             if(o->kind==ORK_OP_MM_I8){ afn[i]+=(size_t)o->M*o->w->K; outneed+=(size_t)o->M*o->w->N*4; }
+            else if(o->kind==ORK_OP_SILU_I16){ afn[i]+=(size_t)o->M*o->N*2; outneed+=(size_t)o->M*o->N*2; }   /* int16 unary */
             else { afn[i]+=(size_t)2*o->M*o->N; outneed+=(size_t)o->M*o->N; } } }
     for(int i=0;i<nc;i++){ if((size_t)Pc[i]*REGCMD_I8_N*4>c->mrc[i].size || (size_t)Pc[i]*sizeof(struct rknpu_task)>c->mtk[i].size) return NULL;
         if(afn[i]>c->maf[i].size){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,afn[i],0x403,c->dom_active); if(!c->maf[i].cpu) return NULL; } }
@@ -10085,6 +10118,26 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     h->seq_out=bcreate(fd, outneed<4096?4096:outneed, 0x403, c->dom_active);
     if(!h->seq_out.cpu){ free(h); return NULL; }
     memset(h->seq_out.cpu,0,h->seq_out.size);
+    /* int16-SiLU HW-chain prologue: load the silu curve into SDP SRAM ONCE (ping-pong OFF — the #35 LUT
+     * SRAM-commit race), resident across the chain. build_act_lut16's calibration is a STANDALONE probe, run
+     * here BEFORE the chain submit (cached after the first call). Lrc/Lsc stay alive until seq_end. */
+    if(has_silu){
+        int16_t lut[1030];
+        if(build_act_lut16(c, silu_f, silu_is, silu_os, lut)){ bdestroy(fd,&h->seq_out); free(h); return NULL; }
+        h->silu_lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active);
+        h->silu_lsc=bcreate(fd,4096,0x403,c->dom_active);
+        if(!h->silu_lrc.cpu||!h->silu_lsc.cpu){ if(h->silu_lrc.cpu)bdestroy(fd,&h->silu_lrc); if(h->silu_lsc.cpu)bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; }
+        memcpy(h->silu_lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
+        setr((uint32_t*)h->silu_lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)h->silu_lsc.dma);
+        { uint32_t*lr=(uint32_t*)h->silu_lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
+            lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
+        bsync(fd,&h->silu_lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+        { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=h->silu_lrc.dma;
+          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x1;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+          if(rknpu_submit_ioctl(fd,&ls,c->dom_active)){ bdestroy(fd,&h->silu_lrc); bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; } }
+        h->silu_lut=1;
+    }
     size_t coff=0;
     struct rknpu_submit subs[ORK_MAXCORE];
     for(int i=0;i<nc;i++){ struct buf *RC=&c->mrc[i], *AF=&c->maf[i];
@@ -10142,8 +10195,11 @@ int ork_dyn_seq_end(ork_dyn_chain *h){
     bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int i=0;i<h->S;i++){ if(!h->dst[i]) continue; int M=h->oM[i], N=h->nout[i]/(M?M:1);
         if(h->oesz8[i]==4){ memcpy(h->dst[i], (char*)h->seq_out.cpu+h->ooff[i], (size_t)M*N*4); }
+        else if(h->oesz8[i]==2){ const char*src=(const char*)h->seq_out.cpu+h->ooff[i]; int16_t*dst=(int16_t*)h->dst[i];   /* int16 EWCUBEH (atom-8, 2-byte) -> row-major */
+            for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=*(const int16_t*)(src + ((size_t)(nn/8)*(M*16) + (size_t)m*16 + (size_t)(nn%8)*2)); }
         else { const int8_t*src=(const int8_t*)((char*)h->seq_out.cpu+h->ooff[i]); int8_t*dst=(int8_t*)h->dst[i];
             for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=src[ORK_SEQCUBE(m,nn,M)]; } }
+    if(h->silu_lut){ bdestroy(fd,&h->silu_lrc); bdestroy(fd,&h->silu_lsc); }   /* release the resident LUT buffers */
     bdestroy(fd,&h->seq_out); free(h);
     if(g_ork_term){ int k=0; sigaction(SIGTERM,&g_prev_sig[k],NULL); raise(SIGTERM); }
     return rc;
@@ -12542,6 +12598,7 @@ static int seq_disp_f16_mm (ork_npu *c,const ork_seq_op *o){ ork_mm_task_f16 t={
 static int seq_disp_i4_mm  (ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i4(c,o->w,o->M,(const int8_t*)o->A,(int32_t*)o->C); }   /* multi-M rides the #4 doorbell route inside run_i4 */
 static int seq_disp_ewmul_f16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_ewmul_f16(c,(const f16*)o->A,(const f16*)o->B,o->M,o->N,(f16*)o->C,&us); }
 static int seq_disp_silu_i8 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_silu_i8(c,(const int8_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*)o->C,&us); }
+static int seq_disp_silu_i16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_silu_i16(c,(const int16_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int16_t*)o->C,&us); }
 static int seq_disp_gelu_i8 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_gelu_i8(c,(const int8_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*)o->C,&us); }
 static int seq_disp_ewmul_i8(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_ewmul_i8(c,(const int8_t*)o->A,(const int8_t*)o->B,o->M,o->N,o->mult,o->shift,(int8_t*)o->C,&us); }
 static int seq_disp_add_i8  (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_add_i8(c,(const int8_t*)o->A,(const int8_t*)o->B,o->M,o->N,o->in_scale,o->b_scale,o->out_scale,(int8_t*)o->C,&us); }
@@ -12557,6 +12614,7 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_EWMUL_I8*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_ewmul_i8 },
   /* ORK_OP_ADD_I8  */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_add_i8   },
   /* ORK_OP_ADD_F16 */ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_add_f16  },
+  /* ORK_OP_SILU_I16*/ { 0, SEQ_KEEPDT, XP_SDP,        OCK_SW, seq_disp_silu_i16 },
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
@@ -12602,6 +12660,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
               case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
+              case ORK_OP_SILU_I16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* int16 unary SDP */
               case ORK_OP_EWMUL_I8: case ORK_OP_ADD_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].bbytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 binary SDP */
               default: ok=0; break;   /* SILU_F16: not yet routable (mirrors the direct -3 TODO row) */
             }
