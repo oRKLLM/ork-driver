@@ -77,7 +77,32 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 #define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
 
 struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
-struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; };
+struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain; };
+
+/* A-sched: PER-CLIENT IOMMU DOMAINS (opt-in, ORKD_PER_CLIENT_DOMAINS=1). Intent: pack each client's resident
+ * weights into a distinct iommu domain -> isolation + a full ~4 GiB IOVA window each (rk_iommu v2 cap is
+ * per-domain). The plumbing is complete (per-client domain stamped on every pack + on struct work; wk_pick
+ * groups equal-priority work by domain to amortize the scratch-swap). Default OFF -> all clients share domain 0,
+ * byte-identical to the proven single-domain path (validated: make test + test-orkd + multi-consumer all PASS).
+ *
+ * ★ ENABLING IT IS NOT YET VIABLE (2026-07-19): with the flag ON, the doorbell SEQ path fails immediately
+ * (submit_seq FAIL, no wedge). Root cause: ork_dyn_begin_seq_i8_mc dom_activate's the weight's domain, but its
+ * multi-core scratch (c->mrc/mtk/maf) is CTX-GLOBAL (allocated by mc_ensure, shared across all clients' seqs)
+ * and is NOT part of the per-domain scratch swap (npu.c dom_activate swaps the single-core scratch, not the mc
+ * pools). So a submit in domain d references task/regcmd buffers that live in domain 0 -> mismatch. The plain
+ * RUN path (ork_mm_run, which auto-swaps per w->domain) is likely fine but untested here. Making this viable
+ * needs PER-DOMAIN mc scratch pools (or extending the scratch swap to the mc buffers) — a scoped multi-domain
+ * follow-on ([[multi-domain-runtime]] territory). Left gated-OFF + plumbed, not removed. */
+#define ORKD_DOMAIN_POOL 8                    /* domains 1..8 handed out per client; 0 = shared/default */
+static int g_per_client_dom = 0;              /* set from ORKD_PER_CLIENT_DOMAINS at startup */
+static unsigned char g_dom_inuse[ORKD_DOMAIN_POOL + 1];   /* index 1..POOL; 0 unused (always-available shared) */
+static int dom_alloc(void){                   /* grab a free domain for a new client; pool-exhausted -> 0 (shared) */
+    if (!g_per_client_dom) return 0;
+    for (int d = 1; d <= ORKD_DOMAIN_POOL; d++) if (!g_dom_inuse[d]){ g_dom_inuse[d] = 1; return d; }
+    return 0;
+}
+static void dom_release(int d){ if (d >= 1 && d <= ORKD_DOMAIN_POOL) g_dom_inuse[d] = 0; }
+static int g_active_dom = 0;                   /* domain of the last-dispatched work (what the NPU is warmed to) */
 
 /* drain n bytes into the void — keeps the stream in sync when a request can't be serviced */
 static int drain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > sizeof b ? sizeof b : n; if (readn(fd, b, k) <= 0) return -1; n -= k; } return 0; }
@@ -87,13 +112,15 @@ static int drain(int fd, size_t n){ char b[4096]; while (n){ size_t k = n > size
  * dispatches ONE quantum (row-slice) of the highest-priority item per tick, re-servicing sockets between
  * quanta so a long run yields. CONTENTION-ADAPTIVE: with one queued item, run the whole thing (throughput);
  * with others waiting, slice to ORKD_QUANTUM_ROWS so they interleave (fairness). Priority from orkd_run.flags
- * (higher = sooner). v1 = single-threaded + priority + adaptive row-slice; domain-grouping, per-client
- * domains, and a dedicated dispatch thread are follow-ons. */
+ * (higher = sooner). Single-threaded + priority + adaptive row-slice + DOMAIN-GROUPING (equal-priority work is
+ * ordered to prefer the active IOMMU domain, amortizing the scratch-swap) + opt-in PER-CLIENT DOMAINS. A
+ * dedicated dispatch thread is deliberately NOT used: the row-slice quantum already bounds socket-I/O latency to
+ * one quantum, and the NPU is single-stream, so a thread would add concurrency risk with no throughput gain. */
 enum { ORKD_QMAX = 256, ORKD_QUANTUM_ROWS = 64 };
 /* element size of A for a wire dtype (int8=1B, fp16=2B); C is 4B for both (int32 / fp32) */
 static int orkd_esz_a(int wire_dt){ return wire_dt == ORKD_DT_F16 ? 2 : 1; }
 struct work {
-    int used, fd, type, M, K, N, m0, rc, dtype;
+    int used, fd, type, M, K, N, m0, rc, dtype, domain;
     uint32_t prio; uint64_t tag, seq, weight_id;
     int8_t *A; int32_t *C;          /* A/C: socket-malloc'd unless the matching *_imp is set (zero-copy import) */
     void *A_imp, *C_imp;            /* imported dma-bufs to ork_dma_free (NULL => socket-malloc'd A/C) */
@@ -114,10 +141,19 @@ static struct work *wk_alloc(void){
     return NULL;
 }
 static void wk_purge_fd(ork_npu *npu, int fd){ for (int i = 0; i < ORKD_QMAX; i++) if (g_q[i].used && g_q[i].fd == fd) wk_free(npu, &g_q[i]); }
-static struct work *wk_pick(void){   /* highest prio, then FIFO (min seq) */
+/* Scheduler pick order: (1) PRIORITY (higher first) — a latency-sensitive client preempts across domains;
+ * (2) DOMAIN AFFINITY among equal priority — prefer work already in the active domain so we don't pay a
+ * scratch-swap when a same-domain item is waiting (amortizes the multi-domain cost); (3) FIFO (min seq).
+ * With per-client domains OFF everything is domain 0, so (2) is a no-op and this is the proven prio+FIFO order. */
+static struct work *wk_pick(void){
     struct work *best = NULL;
     for (int i = 0; i < ORKD_QMAX; i++){ struct work *w = &g_q[i]; if (!w->used) continue;
-        if (!best || w->prio > best->prio || (w->prio == best->prio && w->seq < best->seq)) best = w; }
+        if (!best){ best = w; continue; }
+        if (w->prio != best->prio){ if (w->prio > best->prio) best = w; continue; }
+        int wa = (w->domain == g_active_dom), ba = (best->domain == g_active_dom);
+        if (wa != ba){ if (wa) best = w; continue; }
+        if (w->seq < best->seq) best = w;
+    }
     return best;
 }
 
@@ -132,9 +168,11 @@ static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
     int8_t *wbuf = malloc(pk.bytes);
     if (!wbuf){ drain(cl->fd, pk.bytes); send_error(cl->fd, tag, ORKD_EOOM, "pack alloc"); return 0; }
     if (readn(cl->fd, wbuf, pk.bytes) <= 0){ free(wbuf); return -1; }
+    ork_npu_set_pack_domain(npu, cl->domain);   /* land this client's weight in its own IOMMU domain (0 = shared) */
     ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
              : (pk.dtype == ORKD_DT_I4)  ? ork_mm_pack_i4(npu, (int)pk.K, (int)pk.N, wbuf)
                                          : ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
+    ork_npu_set_pack_domain(npu, 0);            /* restore default for any non-client-scoped pack */
     free(wbuf);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
     if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)pk.K, (int)pk.N, (int)pk.dtype }; }
@@ -156,6 +194,7 @@ static int handle_run(struct client *cl, ork_npu *npu, uint64_t tag){
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ free(A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->domain = ork_w_domain(cw->w);   /* scheduler domain-grouping key (== this client's domain) */
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = A; w->C = C;   /* enqueued; the scheduler dispatches it */
     return 0;
 }
@@ -301,6 +340,7 @@ static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, u
     struct work *w = wk_alloc();
     if (!w){ ork_dma_free(npu, A); ork_dma_free(npu, C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC2; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->domain = ork_w_domain(cw->w);
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype;
     w->A = (int8_t *)A; w->A_imp = A; w->C = (int32_t *)C; w->C_imp = C;   /* dispatch: A read + C written in place, single-core */
     return 0;
@@ -322,6 +362,7 @@ static int handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ ork_dma_free(npu, A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
+    w->domain = ork_w_domain(cw->w);
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = (int8_t *)A; w->A_imp = A; w->C = C;   /* A zero-copy; C over socket */
     return 0;
 }
@@ -363,6 +404,7 @@ static void dispatch_one(ork_npu *npu, struct client *cl, int nc){
     for (int i = 0; i < nc; i++) if (cl[i].fd == w->fd){ alive = 1; for (int j = 0; j < cl[i].nw; j++) if (cl[i].wt[j].id == w->weight_id){ ow = cl[i].wt[j].w; break; } break; }
     if (!alive){ wk_free(npu, w); return; }          /* client gone: drop silently */
     if (!ow){ send_error(w->fd, w->tag, ORKD_EBADH, "weight freed"); wk_free(npu, w); return; }
+    g_active_dom = w->domain;                        /* the run below auto-swaps the NPU to this weight's domain */
     int remaining = w->M - w->m0;
     int q = (g_qn == 1) ? remaining : (remaining < ORKD_QUANTUM_ROWS ? remaining : ORKD_QUANTUM_ROWS);   /* adaptive */
     int zc2 = (w->type == ORKD_RUN_ZC2);
@@ -442,8 +484,9 @@ int main(void){
     ork_npu *npu = ork_npu_init();             /* orkd OWNS the NPU for its whole lifetime (#2a) */
     int cores = npu ? ork_npu_cores(npu) : 0;
     unsigned idle_ms = orkd_idle_ms();
-    fprintf(stderr, "[orkd] up pid=%d sock=%s idle=%ums npu=%s cores=%d\n",
-            (int)getpid(), sockpath, idle_ms, npu ? "ok" : "FAILED", cores);
+    g_per_client_dom = getenv("ORKD_PER_CLIENT_DOMAINS") != NULL;   /* A-sched: opt-in per-client IOMMU domains */
+    fprintf(stderr, "[orkd] up pid=%d sock=%s idle=%ums npu=%s cores=%d per_client_dom=%d\n",
+            (int)getpid(), sockpath, idle_ms, npu ? "ok" : "FAILED", cores, g_per_client_dom);
 
     struct client cl[ORKD_MAX_CLIENTS]; int nc = 0;
     uint32_t next_id = 1, refs = 0;
@@ -475,7 +518,7 @@ int main(void){
         if (pfd[0].revents & POLLIN){          /* new connection */
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0){
-                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; nc++; }
+                if (nc < ORKD_MAX_CLIENTS){ cl[nc].fd = cfd; cl[nc].hello = 0; cl[nc].id = 0; cl[nc].nw = 0; cl[nc].next_wid = 0; cl[nc].domain = dom_alloc(); nc++; }
                 else { send_error(cfd, 0, ORKD_EOOM, "too many clients"); close(cfd); }
             }
         }
@@ -521,6 +564,7 @@ int main(void){
                 if (cl[i].hello && refs) refs--;
                 wk_purge_fd(npu, cl[i].fd);    /* drop this client's queued work (prevents fd-reuse aliasing) */
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
+                dom_release(cl[i].domain);     /* return the client's IOMMU domain to the pool */
                 close(cl[i].fd);
                 cl[i] = cl[nc-1]; nc--;        /* compact; NO i-- (slot i's pollfd is now stale — service next tick) */
                 if (refs == 0) idle_since = now_ms();

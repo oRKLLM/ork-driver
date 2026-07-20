@@ -105,6 +105,11 @@ int          ork_npu_validated(const ork_npu *ctx);
  */
 void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 
+/* orkd scheduler priority for this context's subsequent submits (higher = dispatched sooner among queued work;
+ * ties broken by IOMMU-domain affinity then FIFO). Only meaningful when routed through orkd (ORK_USE_ORKD);
+ * a no-op on a direct-NPU context. Default 0. */
+void         ork_npu_set_priority(ork_npu *ctx, unsigned prio);
+
 /* Per-weight NPU IOMMU domain placement. The rk_iommu 32-bit IOVA window (~4 GiB) is per
  * iommu_domain_id, so a model larger than 4 GiB can stay FULLY resident (no streaming, no per-token
  * map/unmap) by placing its weights across several domains. Call this before ork_mm_pack_i8 /

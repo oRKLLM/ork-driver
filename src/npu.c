@@ -1490,6 +1490,9 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
 /* policy: cap the cores the auto-tuner may use for a matmul (n<=0 → all soc cores). The library
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
+/* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
+ * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
+void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
 
 /* PER-WEIGHT IOMMU DOMAIN PLACEMENT. The rk_iommu 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, so a
  * model larger than 4 GiB stays fully resident (no streaming) by spreading its weights over domains.

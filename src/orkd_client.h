@@ -23,6 +23,10 @@ orkd_conn *orkd_connect(void);
 /* Liveness round-trip (PING/PONG). 0 = ok, <0 = error/dead. */
 int orkd_ping(orkd_conn *c);
 
+/* Scheduler priority for this connection's subsequent RUN submits (higher = dispatched sooner among queued
+ * work; ties broken by domain affinity then FIFO). Carried in orkd_run.flags. Default 0. */
+void orkd_set_priority(orkd_conn *c, unsigned prio);
+
 /* Graceful deregister (BYE) + close + free. Safe on NULL. */
 void orkd_disconnect(orkd_conn *c);
 

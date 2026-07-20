@@ -15,7 +15,7 @@
 #define ORKD_CONNECT_TRIES 200          /* * 15ms ~= 3s to let an auto-spawned daemon bind */
 #define ORKD_CONNECT_BACKOFF_NS (15*1000*1000L)
 
-struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; };
+struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio; };
 
 /* live connections, for the atexit clean-BYE (small fixed set; a process rarely holds many) */
 static orkd_conn *g_live[16];
@@ -96,6 +96,8 @@ int orkd_ping(orkd_conn *c){
     return 0;
 }
 
+void orkd_set_priority(orkd_conn *c, unsigned prio){ if (c) c->prio = prio; }
+
 void orkd_disconnect(orkd_conn *c){
     if (!c) return;
     if (c->fd >= 0){ struct orkd_hdr h = { ORKD_BYE, 0, 0 }; (void)wn(c->fd, &h, sizeof h); close(c->fd); c->fd = -1; }
@@ -127,7 +129,7 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -166,7 +168,7 @@ uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B){
 int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K * 2);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -204,7 +206,7 @@ uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B){
 int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -382,7 +384,7 @@ int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const 
     if (am == MAP_FAILED){ close(afd); return -3; }
     memcpy(am, A, abytes);
     orkd_dmabuf_clean(afd);                          /* flush A to device before the NPU reads it */
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio;
     struct orkd_hdr h = { ORKD_RUN_ZC, (uint32_t)sizeof rq, 7 };
     if (orkd_send_hdr_fd(c->fd, &h, afd) || wn(c->fd, &rq, sizeof rq)){ munmap(am, abytes); close(afd); return -1; }
     struct orkd_hdr rh;
@@ -417,7 +419,7 @@ int orkd_run_i8_zc2(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const
     void *cm = mmap(NULL, cbytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
     if (am == MAP_FAILED || cm == MAP_FAILED){ if (am != MAP_FAILED) munmap(am, abytes); if (cm != MAP_FAILED) munmap(cm, cbytes); close(afd); close(cfd); return -3; }
     memcpy(am, A, abytes); orkd_dmabuf_clean(afd);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio;
     struct orkd_hdr h = { ORKD_RUN_ZC2, (uint32_t)sizeof rq, 8 };
     int fds[2] = { afd, cfd };
     int rc = -1;
