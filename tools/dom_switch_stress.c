@@ -31,6 +31,7 @@ int main(int argc,char**argv){
     if(M<1||K%32||N%32){ fprintf(stderr,"bad dims M=%d K=%d N=%d (K%%32==0,N%%32==0)\n",M,K,N); return 2; }
     ork_npu *c = ork_npu_init();
     if(!c){ fprintf(stderr,"init failed\n"); return 2; }
+    if(!ork_npu_uses_orkd(c)){ fprintf(stderr,"%s: REFUSING direct NPU access — the single-stream NPU wedges under concurrent direct use. Route through orkd: sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd %s <args>\n", argv[0], argv[0]); ork_npu_free(c); return 3; }
     int d1 = ork_npu_domain_alloc(c), d2 = ork_npu_domain_alloc(c);
     if(d1<=0||d2<=0||d1==d2){ fprintf(stderr,"domain_alloc failed d1=%d d2=%d\n",d1,d2); return 2; }
 

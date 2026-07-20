@@ -27,7 +27,11 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  * a short git hash ("MAJOR.MINOR.PATCH+g<hash>") when built with -DORK_GIT_HASH (the Makefile injects
  * it where git is available).
  */
-#define ORK_NPU_VERSION "0.7.7"
+#define ORK_NPU_VERSION "1.0.0"
+/* On-disk .orkpack format version — DECOUPLED from the library MAJOR. Bump this ONLY when the persisted bytes'
+ * meaning changes (tile layout/geometry or quant rule); it stays at the MAJOR of the last format-changing
+ * release. The 1.0.0 release did NOT change the format, so it stays 0 (existing .orkpacks remain valid). */
+#define ORK_PACK_FORMAT_VERSION 0u
 /** @brief Runtime library version. @return "MAJOR.MINOR.PATCH" or "MAJOR.MINOR.PATCH+g<hash>". */
 const char  *ork_npu_version(void);
 
@@ -35,10 +39,10 @@ const char  *ork_npu_version(void);
  * @brief On-disk pack-format (.orkpack) compatibility token — the library's MAJOR version.
  *
  * A persisted weight (ork_w_dump / ork_w_dump_i4a8) is only binary-compatible with builds that share
- * this value. It is deliberately the MAJOR component of ORK_NPU_VERSION, because a change that alters
- * the persisted bytes' meaning is by definition NOT backward-compatible and therefore REQUIRES a major
- * bump — while MINOR/PATCH releases are backward-compatible and keep existing .orkpacks valid. What
- * mandates a major bump: a resident tile LAYOUT / geometry change (K-slice size, the SoC output-width
+ * this value (ORK_PACK_FORMAT_VERSION). It tracks the MAJOR of the last format-changing release but is
+ * DECOUPLED from ORK_NPU_VERSION's MAJOR (a library major bump that does NOT touch the on-disk bytes — e.g.
+ * the 1.0.0 stability release — keeps this at its prior value so existing .orkpacks stay valid). Bump it
+ * only on a real persisted-bytes change: a resident tile LAYOUT / geometry change (K-slice size, the SoC output-width
  * cap / N-tiling, the 32x32 block or Bb dump order) or a weight QUANT change (int8/int4 scale rule,
  * int4 nibble packing, NF4 codebook).
  *
@@ -120,6 +124,7 @@ void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
 int          ork_npu_pack_domain(const ork_npu *ctx);   /* current pack domain (for save/restore) */
 void         ork_npu_activate_domain(ork_npu *ctx, int domain);   /* make domain active (establish); alloc in-domain buffers after this */
 int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
+int          ork_npu_uses_orkd(const ork_npu *ctx);   /* 1 = context routes through orkd (serialized); 0 = direct single-stream NPU */
 /* Client-managed IOMMU domains. ork_npu_domain_alloc reserves a domain (Path B: from orkd's coordinated pool
  * so multi-process clients don't collide; direct: a local id). Pack into it with ork_npu_set_pack_domain, then
  * ork_npu_domain_free when done (also auto-reclaimed when the context/connection is freed). id>0 ok, <0 error. */

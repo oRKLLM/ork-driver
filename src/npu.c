@@ -1535,6 +1535,7 @@ int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   
  * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
 void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) dom_activate(c, domain<0?0:domain); }
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
+int  ork_npu_uses_orkd(const ork_npu *c){ return (c && c->daemon) ? 1 : 0; }   /* 1 = this ctx routes through orkd (serialized); 0 = DIRECT NPU (single-stream — don't run concurrent direct processes) */
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
@@ -8748,7 +8749,7 @@ const char *ork_npu_version(void){
 
 /* .orkpack compat token = library MAJOR version (atoi stops at the first '.'): a format-breaking change
  * requires a major bump, while minor/patch stay backward-compatible. See ork_npu.h. */
-uint32_t ork_pack_format_version(void){ return (uint32_t)atoi(ORK_NPU_VERSION); }
+uint32_t ork_pack_format_version(void){ return ORK_PACK_FORMAT_VERSION; }   /* decoupled from the library MAJOR — bump only on a real on-disk format change (see ork_npu.h) */
 
 /* Max M rows a single full-K int8 submit handles at this K (mirrors run()'s M>1 Bf tiling, npu.c
  * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
