@@ -10028,6 +10028,9 @@ static int seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom){
     if(o->kind==ORK_OP_SILU_I16){                                  /* int16 SiLU: HW-chained activation-LUT SDP task */
         if(o->M<1||o->M>64||o->N<8||(o->N&7)) return 0;            /* atom-8 int16 cube (N%8) */
         return 1; }
+    if(o->kind==ORK_OP_SILU_I8){                                   /* int8 SiLU: HW-chained activation-LUT SDP task */
+        if(o->M<1||o->M>64||o->N<16||(o->N&15)) return 0;         /* atom-16 int8 cube (N%16) */
+        return 1; }
     return 0; }
 /* build op `gi` as program `pp` (per-core slot in RC) writing its output at seq_out byte-offset *coff; chain
  * it forward to the core's NEXT program (nx_pp>=0) or terminate (nx_pp<0). Records h's per-op output tracking. */
@@ -10055,6 +10058,18 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=2; h->ocube[gi]=2;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*2;
         #undef EWCUBEH_S
+    } else if(o->kind==ORK_OP_SILU_I8){ int M=o->M,N=o->N;   /* int8 SiLU activation-LUT SDP task (atom-16 cube, reads resident LUT) */
+        int8_t *a=(int8_t*)((char*)AF->cpu+*astage); const int8_t *ha=o->A;
+        for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn];
+        uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N;
+        memcpy(rc,REGCMD_SILU_STD,REGCMD_SILU_STD_N*4); set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
+        setr(rc,REGCMD_SILU_STD_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_N,0x2001,0x5038,0);
+        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+*coff)); setr(rc,REGCMD_SILU_STD_N,0x2001,0x5018,adma);
+        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4088,14); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4080,0);
+        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4110,ORK_SILU_IDXOFF); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4064,ORK_SILU_C4064); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4068,ORK_SILU_C4068);
+        rcw=REGCMD_SILU_STD_N; dslot=138; regcfg=69; enable=0x18;
+        h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=1; h->ocube[gi]=1;
+        h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N;
     } else { int M=o->M,N=o->N;
         int8_t *a=(int8_t*)((char*)AF->cpu+*astage), *b=a+(size_t)M*N; const int8_t *ha=o->A,*hb=o->B;
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++){ a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn]; b[ORK_SEQCUBE(m,nn,M)]=hb[m*N+nn]; }
@@ -10088,10 +10103,10 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     for(int g=0;g<ngroups;g++){ if(gstart[g+1]<=gstart[g]) return NULL; if(ops[gstart[g+1]-1].kind!=ORK_OP_MM_I8) return NULL; }  /* each group terminal = matmul (SDP terminal -> B2 witness upstream) */
     /* int16 SiLU HW-chain: one resident SDP LUT per chain, so all silu ops must share (in_scale,out_scale), and
      * force SINGLE-CORE (one SDP SRAM to load). A prologue LUT-load runs below before the chain submit. */
-    int has_silu=0; double silu_is=0, silu_os=0;
-    for(int i=0;i<n;i++) if(ops[i].kind==ORK_OP_SILU_I16){
-        if(!has_silu){ has_silu=1; silu_is=ops[i].in_scale; silu_os=ops[i].out_scale; }
-        else if(ops[i].in_scale!=silu_is || ops[i].out_scale!=silu_os) return NULL; }
+    int has_silu=0, silu_kind=0; double silu_is=0, silu_os=0;
+    for(int i=0;i<n;i++) if(ops[i].kind==ORK_OP_SILU_I16 || ops[i].kind==ORK_OP_SILU_I8){
+        if(!has_silu){ has_silu=1; silu_kind=ops[i].kind; silu_is=ops[i].in_scale; silu_os=ops[i].out_scale; }
+        else if(ops[i].kind!=silu_kind || ops[i].in_scale!=silu_is || ops[i].out_scale!=silu_os) return NULL; }  /* one resident LUT/chain */
     if(nc<1||nc>c->soc->cores) nc=c->soc->cores; if(nc>ngroups) nc=ngroups;
     if(has_silu) nc=1;
     /* greedy load-balance: assign each group to the least-loaded core (cost ~ matmul weight-DMA K*N + SDP M*N) */
@@ -10110,6 +10125,7 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
         for(int p=gstart[g];p<gstart[g+1];p++){ const ork_seq_op*o=&ops[p]; Pc[i]++;
             if(o->kind==ORK_OP_MM_I8){ afn[i]+=(size_t)o->M*o->w->K; outneed+=(size_t)o->M*o->w->N*4; }
             else if(o->kind==ORK_OP_SILU_I16){ afn[i]+=(size_t)o->M*o->N*2; outneed+=(size_t)o->M*o->N*2; }   /* int16 unary */
+            else if(o->kind==ORK_OP_SILU_I8){ afn[i]+=(size_t)o->M*o->N; outneed+=(size_t)o->M*o->N; }        /* int8 unary */
             else { afn[i]+=(size_t)2*o->M*o->N; outneed+=(size_t)o->M*o->N; } } }
     for(int i=0;i<nc;i++){ if((size_t)Pc[i]*REGCMD_I8_N*4>c->mrc[i].size || (size_t)Pc[i]*sizeof(struct rknpu_task)>c->mtk[i].size) return NULL;
         if(afn[i]>c->maf[i].size){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,afn[i],0x403,c->dom_active); if(!c->maf[i].cpu) return NULL; } }
@@ -10122,8 +10138,9 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
      * SRAM-commit race), resident across the chain. build_act_lut16's calibration is a STANDALONE probe, run
      * here BEFORE the chain submit (cached after the first call). Lrc/Lsc stay alive until seq_end. */
     if(has_silu){
-        int16_t lut[1030];
-        if(build_act_lut16(c, silu_f, silu_is, silu_os, lut)){ bdestroy(fd,&h->seq_out); free(h); return NULL; }
+        int16_t lut[1030];   /* the LUT loader (REGCMD_SILU_LUT) is common; only the curve values + compute idx params differ by precision */
+        if(silu_kind==ORK_OP_SILU_I16){ if(build_act_lut16(c, silu_f, silu_is, silu_os, lut)){ bdestroy(fd,&h->seq_out); free(h); return NULL; } }
+        else { if(silu_calibrate_idx(c)){ bdestroy(fd,&h->seq_out); free(h); return NULL; } silu_build_curve(c, silu_f, silu_is, silu_os, lut); }
         h->silu_lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active);
         h->silu_lsc=bcreate(fd,4096,0x403,c->dom_active);
         if(!h->silu_lrc.cpu||!h->silu_lsc.cpu){ if(h->silu_lrc.cpu)bdestroy(fd,&h->silu_lrc); if(h->silu_lsc.cpu)bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; }

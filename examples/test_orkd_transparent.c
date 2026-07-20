@@ -256,6 +256,35 @@ static int one_seq_grouped_silu16(ork_npu *c){
     free(Ba);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);free(si);free(so);free(sr);
     return bad?1:0;
 }
+/* B1 int8 SiLU HW-chained: grouped [mm_i8 -> silu_i8 -> mm_i8] — same as silu16 but int8 (atom-16 cube). */
+static int one_seq_grouped_silu8(ork_npu *c){
+    int K=512, N=64, M=8; double is=0.0625, os=0.0625;
+    int8_t *Ba=malloc(K*N),*Aa=malloc(M*K),*Ac=malloc(M*K),*si=malloc(M*N),*so=malloc(M*N),*sr=malloc(M*N);
+    int32_t *Ca=malloc(M*N*4),*Cc=malloc(M*N*4),*Ra=malloc(M*N*4),*Rc=malloc(M*N*4);
+    g=53;
+    for(int i=0;i<M*K;i++)Aa[i]=r8(); for(int i=0;i<K*N;i++)Ba[i]=r8(); for(int i=0;i<M*K;i++)Ac[i]=r8();
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Aa[m*K+k]*Ba[k*N+n];Ra[m*N+n]=(int)a;}
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Ac[m*K+k]*Ba[k*N+n];Rc[m*N+n]=(int)a;}
+    for(int i=0;i<M*N;i++) si[i]=(int8_t)(((i*7)%256)-128);
+    for(int i=0;i<M*N;i++){ double x=si[i]*is,y=x/(1.0+exp(-x)); long q=lround(y/os); if(q>127)q=127; if(q<-128)q=-128; sr[i]=(int8_t)q; }
+    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_seq_op ops[3]; memset(ops,0,sizeof ops);
+    ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
+    ops[1].kind=ORK_OP_SILU_I8;               ops[1].M=M; ops[1].N=N; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os; ops[1].group=1;
+    ops[2].kind=ORK_OP_MM_I8;    ops[2].w=wa; ops[2].M=M;             ops[2].A=Ac; ops[2].C=Cc; ops[2].group=1;
+    int rc=ork_submit_seq(c,ops,3), bad=0;
+    if(rc){ printf("  seq-grp-silu8 run FAIL rc=%d\n",rc); bad=1; }
+    else {
+        for(int i=0;i<M*N;i++) if(Ca[i]!=Ra[i]){ if(bad<3)printf("  silu8 mm0 [%d]\n",i); bad++; }
+        for(int i=0;i<M*N;i++) if(Cc[i]!=Rc[i]){ if(bad<3)printf("  silu8 mm2 [%d]\n",i); bad++; }
+        int sbad=0,smx=0; for(int i=0;i<M*N;i++){ int d=abs((int)so[i]-sr[i]); if(d>smx)smx=d; if(d>2){ if(sbad<3)printf("  silu8 [%d] %d!=%d\n",i,so[i],sr[i]); sbad++; } } bad+=sbad;
+        if(!sbad) printf("  (silu8 max|err|=%d tol=2)\n", smx);
+    }
+    if(!bad) printf("  ok seq-grp-silu8   n=3 grouped [i8 -> silu_i8 -> i8] (int8 SiLU HW-chained)\n");
+    ork_mm_free(c,wa);
+    free(Ba);free(Aa);free(Ac);free(Ca);free(Cc);free(Ra);free(Rc);free(si);free(so);free(sr);
+    return bad?1:0;
+}
 /* FULL-vocabulary heterogeneous sequence through the stack (ork_submit_seq): int8 mm (doorbell batch) |
  * silu_i8 (SW break) | int8 mm (resume) | ewmul_i8 (break) | add_f16 (break) | gelu_i8 (break) | int4 mm
  * (dtype-switch doorbell). Each op independent; validated vs its own reference. Exercises the extended
@@ -334,6 +363,7 @@ int main(void){
     bad |= one_seq_grouped(c);
     bad |= one_seq_grouped_sdp_term(c);
     bad |= one_seq_grouped_silu16(c);
+    bad |= one_seq_grouped_silu8(c);
     ork_npu_free(c);
     printf("%s\n", bad ? "FAILED" : "ALL OK");
     return bad ? 1 : 0;
