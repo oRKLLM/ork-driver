@@ -246,8 +246,8 @@ submit_introspect.so: tools/submit_introspect.c
 	$(CC) -shared -fPIC -O2 -o $@ $< -ldl
 
 # diagnostic: why does large-M (prefill) multi-core barely scale? per-core copy/submit/acc split.
-mc_prof: tools/mc_prof.c $(CORE)
-	$(CC) $(CFLAGS) -o $@ $< $(CORE) -lm
+mc_prof: tools/mc_prof.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # decode-pipeline validator: CPU int4 bulk || NPU int8 share overlapped — aggregate win at M=1? Not in all/test.
 # -march=native: ork_native_cpu.h uses vdotq_s32 (dotprod ISA), which the default CFLAGS march may not enable.
