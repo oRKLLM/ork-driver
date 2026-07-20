@@ -3121,9 +3121,10 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     static int cbatch=-1; if(cbatch<0){const char*e=getenv("ORK_I4_CBATCH"); cbatch=(e&&atoi(e))?1:0;}
     if(cbatch && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_cbatch(c,w,M,A,C); if(r!=-4) return r; }
     /* TASK #4 DEFAULT: multi-M int4 rides the doorbell spine (per-row chain via ork_dyn_begin_mc_i4). ORK_I4_NODB=1
-     * reverts to the blocking run_i4_mc. Single-slice only; -4 => fall back (wide-N/K or chain too big for buffers). */
+     * reverts to the blocking run_i4_mc. Sk==1 (single K-group); A1 added Sn>1 (each row's N-slices = chained
+     * column-slice programs). -4 => fall back (K-split/grouped, or chain too big for the per-core buffers). */
     static int i4db=-1; if(i4db<0){const char*e=getenv("ORK_I4_NODB"); i4db=(e&&atoi(e))?0:1;}
-    if(i4db && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }
+    if(i4db && M>=2 && w->Sk==1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
@@ -9383,7 +9384,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
 static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
-        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sn != 1 || w->Sk != 1) return NULL;   /* int4 HW chain: M=1, single-slice */
+        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk != 1) return NULL;   /* int4 HW chain: M=1, Sk==1 (single K-group); A1: Sn>1 N-tiled (each row emits Sn chained column-slice programs) */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* one submit => one domain */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
@@ -9398,40 +9399,50 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
+    int NMAX = c->soc->nmax;
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     for (int i = 0; i < nc; i++) {
         int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
-        Pc[i] = P; if (P < 1) continue;
-        if ((size_t)P * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)P * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        if (P < 1) { Pc[i] = 0; continue; }
+        /* PROGRAM count decoupled from row-task count: an Sn>1 row emits Sn chained column-slice programs. */
+        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn;
+        Pc[i] = Pcore;
+        if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
-        size_t astage = 0, coff = 0;
-        for (int p = 0; p < P; p++) {
-            const ork_mm_task_i8 *t = &tasks[lo+p]; ork_w *w = t->w; int K = w->K, N = w->N;
-            size_t asz = (size_t)K / 2;                  /* int4 activation: 0.5 B/elem, tiled (not memcpy) */
+        size_t astage = 0, coff = 0; int pp = 0;
+        for (int p = lo; p < hi; p++) {
+            const ork_mm_task_i8 *t = &tasks[p]; ork_w *w = t->w; int K = w->K, N = w->N, Sn = w->Sn;
+            size_t asz = (size_t)K / 2;                  /* int4 activation: 0.5 B/elem, tiled (not memcpy); shared by the row's N-slices */
             if (astage + asz > AF->size) { free(h); return NULL; }
             tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, 0, K);
             uint32_t adma = (uint32_t)(AF->dma + astage); astage += asz;
-            uint32_t cdma = (uint32_t)(CC->dma + coff);   /* int16 scratch (always copy-back) */
-            uint32_t bdma = (uint32_t)w->Bb[0].dma;
-            memset(rc, 0, sizeof rc);
-            synth_i4(rc, 1, K, N, adma, bdma, cdma);
-            if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
-            if (p < P - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I4_N * 4;
-                rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
-                rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
-            memcpy((char*)RC->cpu + (size_t)p * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
-            struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-            tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I4_N * 4;   /* int4 = 116 regs */
-            tk[p] = tt;
-            int gi = lo + p;
+            /* A1 N-TILE: one program per N-slice (columns [n0,n0+Nc)); each writes Nc int16 at its column
+             * offset in the row's [N] int16 output => the drain widens the full [N] row unchanged (Sk==1, so
+             * still a plain raw-accumulator int16 -> int32, no per-group scale). */
+            for (int ns = 0; ns < Sn; ns++) {
+                int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)n0 * 2);   /* this slice's columns, int16 */
+                uint32_t bdma = (uint32_t)w->Bb[(size_t)ns].dma;              /* Sk==1 => Bb[ns] is N-slice ns */
+                memset(rc, 0, sizeof rc);
+                synth_i4(rc, 1, K, Nc, adma, bdma, cdma);
+                if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
+                    rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */
+                tk[pp] = tt; pp++;
+            }
+            int gi = p;
             h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
-            h->nout[gi] = N; h->oM[gi] = 1;
+            h->nout[gi] = N; h->oM[gi] = 1;   /* full row = N int16 spanning the Sn column-slices */
             coff += (size_t)N * 2;
         }
         memset(&subs[i], 0, sizeof subs[i]);
-        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = P; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj;
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
-        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
     }
     /* seed the FULL int16 output surface (clean-before-write for fresh/reused scratch; = the probe's fix) */
     for (int x = 0; x < S; x++) { int N = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];

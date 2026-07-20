@@ -72,6 +72,10 @@ test_submit_seq: tools/test_submit_seq.c $(COBJ)
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# A1: int4 Sn>1 (wide-N N-tiled) on the doorbell — bit-exact vs CPU + blocking ref. Board tool, not in make test.
+i4_sn_probe: tools/i4_sn_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 sdp_chain_probe: tools/sdp_chain_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
