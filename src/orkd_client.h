@@ -74,6 +74,14 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
  * id>0 / 0 on failure. */
 uint64_t orkd_import_i8(orkd_conn *c, int K, int N, int bb_fd, int bf_fd, uint64_t bb_bytes, uint64_t bf_bytes);
 
+/* Coalesced FFN inner (ORKD_FFN): the whole SwiGLU [gate->silu->up->glu->down] as ONE daemon chain submit
+ * against 3 resident weights (Wg[K,Nff], Wu[K,Nff], Wd[Nff,Kd]). A = M*K int8 (ffn-norm out); out = M*Kd
+ * int32 (down). mult/shift = per-op int32->int8 requant; in/out_scale = silu LUT scales. 0/ok, <0 error. */
+int orkd_ffn_i8(orkd_conn *c, uint64_t gate_id, uint64_t up_id, uint64_t down_id,
+                int M, int K, int Nff, int Kd,
+                int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
+                double in_scale, double out_scale, const int8_t *A, int32_t *out);
+
 /* fp16 counterparts (Path B increment 2): B/A are fp16 (passed as void*), C is fp32. Pack returns id>0 / 0. */
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);
 int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C);

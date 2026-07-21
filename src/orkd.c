@@ -187,6 +187,45 @@ static int handle_import(struct client *cl, ork_npu *npu, int bb_fd, int bf_fd, 
     send_msg(cl->fd, ORKD_IMPORT_OK, tag, &hh, sizeof hh);
     return 0;
 }
+/* ORKD_FFN: the whole SwiGLU FFN inner as ONE coalesced on-NPU chain (ork_mm_run_chain_i8_ffn, SDP-op
+ * address-aliasing) against 3 resident weights. Fixed op-list: gate MM8(x,Wg) -> silu -> up MM8(x,Wu) ->
+ * glu ewmul -> down MM32(glu,Wd). One socket round-trip + one submit for the entire inner; intermediates
+ * never leave the NPU. Reply = the down output (M*Kd int32). ork_mm_run_chain_i8_ffn stages A/C internally
+ * and dom_activates the weights' domain, so no domain setup here. Runs INLINE (single-stream serialized). */
+static int handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_ffn f;
+    if (readn(cl->fd, &f, sizeof f) <= 0) return -1;
+    if (f.abytes > ORKD_MAX_BYTES){ drain(cl->fd, f.abytes); send_error(cl->fd, tag, ORKD_EPROTO, "ffn A too big"); return 0; }
+    int8_t *A = malloc(f.abytes ? f.abytes : 1);
+    if (!A){ drain(cl->fd, f.abytes); send_error(cl->fd, tag, ORKD_EOOM, "ffn A"); return 0; }
+    if (f.abytes && readn(cl->fd, A, f.abytes) <= 0){ free(A); return -1; }
+    struct cweight *cg = NULL, *cu = NULL, *cd = NULL;
+    for (int j = 0; j < cl->nw; j++){ uint64_t id = cl->wt[j].id;
+        if (id == f.gate_id) cg = &cl->wt[j]; if (id == f.up_id) cu = &cl->wt[j]; if (id == f.down_id) cd = &cl->wt[j]; }
+    int M = (int)f.M, K = (int)f.K, Nff = (int)f.Nff, Kd = (int)f.Kd;
+    if (!cg || !cu || !cd || M < 1 || K < 1 || Nff < 1 || Kd < 1 || f.abytes != (uint32_t)((size_t)M * K)){
+        free(A); send_error(cl->fd, tag, (cg && cu && cd) ? ORKD_EPROTO : ORKD_EBADH, "ffn weight/dim"); return 0; }
+    /* int8 intermediates ride in the low bytes of int32 slots (matches ork_mm_run_chain_i8_ffn's C usage); down is int32 */
+    size_t isz = (size_t)M * Nff * 4, dsz = (size_t)M * Kd * 4;
+    int32_t *Cg = malloc(isz), *Cs = malloc(isz), *Cu = malloc(isz), *Ch = malloc(isz), *Cd = malloc(dsz);
+    if (!Cg || !Cs || !Cu || !Ch || !Cd){ free(A); free(Cg); free(Cs); free(Cu); free(Ch); free(Cd); send_error(cl->fd, tag, ORKD_EOOM, "ffn scratch"); return 0; }
+    ork_mm_task_i8 t[5] = {
+        { cg->w, M, A, Cg }, { cg->w, M, A, Cs }, { cu->w, M, A, Cu }, { cg->w, M, A, Ch }, { cd->w, M, A, Cd } };
+    ork_chain_op ops[5] = {
+        { 1, -1, 0, f.gate_mult, f.gate_shift },   /* gate MM8 (reads A)               */
+        { 2,  0, 0, 0, 0 },                        /* silu(gate = t0)                  */
+        { 1, -1, 0, f.up_mult, f.up_shift },       /* up MM8 (reads A)                 */
+        { 3,  1, 2, f.glu_mult, f.glu_shift },     /* glu = silu(t1) * up(t2)          */
+        { 0,  3, 0, 0, 0 } };                      /* down MM32 (reads glu = t3)       */
+    int rc = ork_mm_run_chain_i8_ffn(npu, 5, t, ops, f.in_scale, f.out_scale);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
+    int payload = (rc == 0);
+    struct orkd_hdr rh = { ORKD_FFN_OK, (uint32_t)(sizeof hh + (payload ? dsz : 0)), tag };
+    int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
+    if (!werr && payload) werr = writen(cl->fd, Cd, dsz);
+    free(A); free(Cg); free(Cs); free(Cu); free(Ch); free(Cd);
+    return werr ? -1 : 0;
+}
 /* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
  * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
  * so a RUN in flight never puts orkd in D-state -> orkd stays SIGTERM-clean and never blocks system shutdown. */
@@ -687,6 +726,7 @@ int main(void){
                 case ORKD_BYE:  drop = 1; break;
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_IMPORT: if (handle_import(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
+                case ORKD_FFN: if (handle_ffn(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;

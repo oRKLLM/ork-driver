@@ -561,6 +561,10 @@ orkd: src/orkd.c src/orkd_proto.h $(COBJ)
 orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
 
+# orkd_ffn_probe — coalesced FFN inner routed THROUGH orkd (ORKD_FFN). Pure client (daemon has the chain). Board tool.
+orkd_ffn_probe: tools/orkd_ffn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+
 # test_orkd — first orkd client: int8 matmuls THROUGH the daemon, self-validated vs CPU ref. Pure client
 # (links orkd_client, not COBJ). Standalone, NOT in `make test` (would contend with direct-NPU examples).
 test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h

@@ -72,6 +72,11 @@ enum orkd_msg_type {
      * alloc — the bytes live in the client's dma-buf). This is the "client manages its own IOVA" weight path. */
     ORKD_IMPORT       = 47, /* client->daemon: {orkd_import} + pre-tiled weight dma-buf fd (SCM_RIGHTS) -> resident weight (views into it) */
     ORKD_IMPORT_OK    = 48, /* daemon->client: {orkd_handle} weight id                                            */
+    /* ---- coalesced FFN inner: the whole SwiGLU [gate->silu->up->glu->down] as ONE on-NPU chain submit
+     * (ork_mm_run_chain_i8_ffn, SDP-op address-aliasing) against 3 resident weights. The transport win: one
+     * socket round-trip + one submit for the entire FFN inner, intermediates never leave the NPU. */
+    ORKD_FFN          = 49, /* client->daemon: {orkd_ffn} + A payload (M*K int8) -> coalesced FFN inner chain    */
+    ORKD_FFN_OK       = 50, /* daemon->client: {orkd_handle} + down output payload (M*Kd int32) when rc==0        */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -144,6 +149,18 @@ struct orkd_import {     /* TWO pre-tiled weight dma-buf fds ride SCM_RIGHTS on 
     uint32_t domain;     /* client-chosen IOMMU domain to import into (0 = shared/default; must be owned) */
     uint64_t bb_bytes;   /* bytes in the Bb dma-buf (fds[0]) — sum of page-padded Bb tiles */
     uint64_t bf_bytes;   /* bytes in the Bf dma-buf (fds[1]); 0 = no Bf (only fds[0] passed) */
+};
+struct orkd_ffn {       /* the A payload (M*K int8, ffn-norm output) follows the struct. Reply = the down output (M*Kd int32).
+                         * Fixed SwiGLU op-list built daemon-side: gate MM8(x,Wg)->silu->up MM8(x,Wu)->glu ewmul->down MM32(glu,Wd). */
+    uint64_t gate_id, up_id, down_id;   /* resident weight ids: Wg[K,Nff], Wu[K,Nff], Wd[Nff,Kd] */
+    uint32_t M, K, Nff, Kd;             /* dims (K%512 && K<=4096; Nff%512 && Nff%32; Kd%16) */
+    uint32_t domain;                    /* client-chosen IOMMU domain for the chain (0 = weights' pack domain) */
+    int32_t  gate_mult, gate_shift;     /* gate MM8 int32->int8 requant */
+    int32_t  up_mult, up_shift;         /* up MM8 requant */
+    int32_t  glu_mult, glu_shift;       /* glu ewmul requant */
+    double   in_scale, out_scale;       /* silu LUT scales (real_gate = acc*in_scale; int8 = silu(real)/out_scale) */
+    uint32_t abytes;                    /* = M*K (int8 A) */
+    uint32_t pad;
 };
 struct orkd_run {
     uint64_t weight_id;

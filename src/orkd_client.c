@@ -264,6 +264,36 @@ uint64_t orkd_import_i8(orkd_conn *c, int K, int N, int bb_fd, int bf_fd, uint64
     return hh.rc == 0 ? hh.id : 0;
 }
 
+/* Coalesced FFN inner (ORKD_FFN): the whole SwiGLU [gate->silu->up->glu->down] as ONE daemon-side chain
+ * submit against 3 resident weights. Sends A (M*K int8), receives the down output (M*Kd int32). 0/ok, <0 err. */
+int orkd_ffn_i8(orkd_conn *c, uint64_t gate_id, uint64_t up_id, uint64_t down_id,
+                int M, int K, int Nff, int Kd,
+                int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
+                double in_scale, double out_scale, const int8_t *A, int32_t *out){
+    if (!c || c->fd < 0 || M <= 0 || K <= 0 || Nff <= 0 || Kd <= 0 || !A || !out) return -1;
+    struct orkd_ffn f; memset(&f, 0, sizeof f);
+    f.gate_id = gate_id; f.up_id = up_id; f.down_id = down_id;
+    f.M = (uint32_t)M; f.K = (uint32_t)K; f.Nff = (uint32_t)Nff; f.Kd = (uint32_t)Kd; f.domain = c->op_domain;
+    f.gate_mult = gate_mult; f.gate_shift = gate_shift; f.up_mult = up_mult; f.up_shift = up_shift; f.glu_mult = glu_mult; f.glu_shift = glu_shift;
+    f.in_scale = in_scale; f.out_scale = out_scale;
+    uint32_t abytes = (uint32_t)((size_t)M * K); f.abytes = abytes;
+    struct orkd_hdr h = { ORKD_FFN, (uint32_t)(sizeof f + abytes), 49 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &f, sizeof f) || wn(c->fd, A, abytes)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_FFN_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, dbytes = (size_t)M * Kd * 4;
+    if (hh.rc == 0){
+        if (rh.len < consumed + dbytes){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        if (rn(c->fd, out, dbytes) <= 0) return -1;
+        consumed += dbytes;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);
