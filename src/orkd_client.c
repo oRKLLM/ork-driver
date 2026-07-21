@@ -244,6 +244,26 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
     return hh.rc == 0 ? hh.id : 0;
 }
 
+/* Import client-owned, PRE-TILED weight dma-buf(s) into the daemon (ORKD_IMPORT). fds ride SCM_RIGHTS on the
+ * header: bb_fd (Bb tiles) always, bf_fd (full-K Bf, its own buffer) when bf_bytes>0. The daemon maps them
+ * into this client's pack_domain (Bf into its OWN obj) and returns a weight id. 0 on failure. The caller keeps
+ * ownership of the fds (may close them after this returns — the daemon dup'd via SCM_RIGHTS). */
+uint64_t orkd_import_i8(orkd_conn *c, int K, int N, int bb_fd, int bf_fd, uint64_t bb_bytes, uint64_t bf_bytes){
+    if (!c || c->fd < 0 || K <= 0 || N <= 0 || bb_fd < 0) return 0;
+    struct orkd_import im; memset(&im, 0, sizeof im);
+    im.K = (uint32_t)K; im.N = (uint32_t)N; im.dtype = ORKD_DT_I8; im.domain = c->pack_domain; im.bb_bytes = bb_bytes; im.bf_bytes = bf_bytes;
+    int fds[2]; int nfd = 0; fds[nfd++] = bb_fd; if (bf_fd >= 0 && bf_bytes) fds[nfd++] = bf_fd;
+    struct orkd_hdr h = { ORKD_IMPORT, (uint32_t)sizeof im, 47 };
+    if (orkd_send_hdr_fds(c->fd, &h, fds, nfd) || wn(c->fd, &im, sizeof im)) return 0;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return 0;
+    if (rh.type != ORKD_IMPORT_OK){ if (rh.len) cdrain(c->fd, rh.len); return 0; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return 0;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc == 0 ? hh.id : 0;
+}
+
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);

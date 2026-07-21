@@ -164,6 +164,29 @@ static struct work *wk_pick(void){
     return best;
 }
 
+/* ORKD_IMPORT: the client passed a PRE-TILED weight dma-buf fd (SCM_RIGHTS). Import it into the client's
+ * domain as a resident weight whose Bb/Bf tiles are VIEWS into it — no tiling, no daemon-owned buffer, the
+ * bytes stay in the client's dma-buf (client manages its own IOVA). ork_mm_adopt_imported_i8 ALWAYS consumes
+ * `dbuf` (stored in own_buf on success, closed on failure), so this handler never closes it after the call. */
+static int handle_import(struct client *cl, ork_npu *npu, int bb_fd, int bf_fd, uint64_t tag){
+    struct orkd_import im;
+    if (readn(cl->fd, &im, sizeof im) <= 0){ if (bb_fd >= 0) close(bb_fd); if (bf_fd >= 0) close(bf_fd); return -1; }
+    if (bb_fd < 0){ if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EPROTO, "import: missing fd"); return 0; }
+    if (im.dtype != ORKD_DT_I8){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_ENOSYS, "import int8 only"); return 0; }
+    if (!im.bb_bytes || im.bb_bytes > ORKD_MAX_BYTES || im.bf_bytes > ORKD_MAX_BYTES){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EPROTO, "import bad size"); return 0; }
+    int pdom = (int)im.domain;
+    if (pdom > 0){
+        if (pdom > ORKD_DOMAIN_POOL || !(cl->owned_dom & (1u << pdom))){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
+    } else pdom = cl->domain;
+    ork_npu_set_pack_domain(npu, pdom);
+    ork_w *w = ork_mm_adopt_imported_i8(npu, (int)im.K, (int)im.N, bb_fd, bf_fd, (size_t)im.bb_bytes, (size_t)im.bf_bytes);
+    ork_npu_set_pack_domain(npu, 0);            /* restore default */
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh);
+    if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)im.K, (int)im.N, (int)ORKD_DT_I8 }; }
+    else { if (w) ork_mm_free(npu, w); hh.rc = -1; }   /* adopt ALWAYS consumes both fds; on w!=NULL, free reclaims the imports */
+    send_msg(cl->fd, ORKD_IMPORT_OK, tag, &hh, sizeof hh);
+    return 0;
+}
 /* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
  * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
  * so a RUN in flight never puts orkd in D-state -> orkd stays SIGTERM-clean and never blocks system shutdown. */
@@ -663,6 +686,7 @@ int main(void){
                 case ORKD_PING: send_msg(cl[i].fd, ORKD_PONG, h.tag, NULL, 0); break;
                 case ORKD_BYE:  drop = 1; break;
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_IMPORT: if (handle_import(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;

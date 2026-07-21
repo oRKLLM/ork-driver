@@ -69,6 +69,11 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B);
 /* Run int8 A[M,K] x weight -> C[M,N] (int32), computed on the daemon's NPU. 0 = ok, <0 = error. */
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
 
+/* Import client-owned PRE-TILED int8 weight dma-buf(s) (fds via SCM_RIGHTS) into the daemon, resident in this
+ * client's pack_domain. bb_fd = Bb tiles; bf_fd = full-K Bf in its OWN buffer (pass -1 / bf_bytes=0 for none).
+ * id>0 / 0 on failure. */
+uint64_t orkd_import_i8(orkd_conn *c, int K, int N, int bb_fd, int bf_fd, uint64_t bb_bytes, uint64_t bf_bytes);
+
 /* fp16 counterparts (Path B increment 2): B/A are fp16 (passed as void*), C is fp32. Pack returns id>0 / 0. */
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);
 int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C);

@@ -1818,6 +1818,23 @@ size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
         off+=tsz; }}
     return off;
 }
+/* Produce the Bf (full-K re-tiled) blob for weight B[K,N] straight from raw row-major int8, PURE-CPU — the
+ * on-disk companion to ork_w_dump_i8_cpu so a .orkpack can carry Bf and the loader skips the runtime rebuild.
+ * Layout: Sn page-padded tiles; tile ns = pgup(K*Nc), holding [nt][ktf][32][32] over the FULL K (KTf=K/32).
+ * Byte-identical to the load-time Bf rebuild / ork_mm_repack_i8's Bf tiling. Only the Bf run envelope
+ * (K%512==0 && K<=4096) has a Bf; returns 0 otherwise. Pass out=NULL to size. */
+size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    if(!c || !B || (K%512) || K>4096 || (N%32)) return 0;
+    int NMAX=c->soc->nmax, Sn=(N+NMAX-1)/NMAX, KTf=K/32;
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32; size_t tsz=pgup((size_t)K*Nc);
+        if(out){ if(off+tsz>cap) return 0;
+            int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)]; }
+        off+=tsz; }
+    return off;
+}
 /* NPU-availability gate for the hybrid pack scheduler: return 1 if the NPU appears IN USE (any core
  * loaded above a small threshold), 0 if idle. Reads the kernel's rolling per-core load counter. A
  * hybrid conversion routes a weight to the NPU tile/pack path ONLY when this is 0, so a background
@@ -1970,6 +1987,127 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
                            (size_t)KT*32*32);}
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); if(g_load_prof) g_lp_bf+=ork_now_us()-_bf;}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    return w;
+}
+
+/* ---- ORKD_IMPORT: client-owned resident weight (client allocs the dma-buf, daemon only maps it) ----
+ * The client (which has NO NPU fd under orkd) allocates a plain dma-heap buffer, fills it with the PRE-TILED
+ * .orkpack bytes, and hands the fd to the daemon; the daemon PRIME-imports it into the client's domain and
+ * lays the resident tiles as base+offset VIEWS. This keeps ALL weight residency client-side (client manages
+ * its IOVA domains) — the daemon never tiles, never allocs a weight buffer, never owns the bytes. */
+
+/* CLIENT: allocate a dma-heap buffer of `size` bytes, mmap it R/W, and (via DMA_BUF_SYNC_START) ready it for
+ * CPU fill. Returns the dma-buf fd (>=0) and sets *ptr to the mapping; -1 on failure. No NPU touched. The
+ * caller fills *ptr then calls ork_dmabuf_seal(fd) to flush before passing the fd to the daemon. */
+int ork_dmabuf_alloc(size_t size, void **ptr){
+    int hf=dmaheap_open(); if(hf<0) return -1;
+    size_t sz=pgup(size);
+    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
+    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(client)"); return -1; }
+    int dbuf=(int)a.fd;
+    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
+    if(p==MAP_FAILED){ perror("mmap(client dmabuf)"); close(dbuf); return -1; }
+    dmabuf_sync(dbuf,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+    if(ptr) *ptr=p;
+    return dbuf;
+}
+/* CLIENT: flush the CPU-written bytes so the NPU (via the daemon's IOMMU import) sees them. */
+void ork_dmabuf_seal(int dbuf){ if(dbuf>=0) dmabuf_sync(dbuf,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); }
+
+/* DAEMON: adopt client-passed pre-tiled int8 weight dma-buf(s) as a resident weight WITHOUT tiling or
+ * allocating weight bytes — PRIME-import into the current pack_domain and lay tiles as base+offset VIEWS.
+ * `bb_fd` holds the Bb tiles; `bf_fd` (>=0) holds the full-K Bf region in ITS OWN import so Bf has its own
+ * IOMMU obj — matching pack()/load_i8, NOT a view into Bb (a shared-obj Bf wedges the base-matmul doorbell:
+ * soft-reset recovery loop). Each import is one own_bufs[] chunk (freed once by ork_mm_free); the tile views
+ * carry heap_fd=-1 so the Bf free-loop skips them. Returns the ork_w (owns=0) or NULL. ALWAYS consumes both
+ * fds. The client already CPU-flushed the bytes (ork_dmabuf_seal), so no sync here. */
+ork_w *ork_mm_adopt_imported_i8(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_t bb_bytes,size_t bf_bytes){
+    if(K%32 || N%32 || bb_fd<0 || !c){ if(bb_fd>=0) close(bb_fd); if(bf_fd>=0) close(bf_fd); return NULL; }
+    /* DEFAULT = NATIVE MATERIALIZE. Cross-process PRIME-imported (bimport_fd) weight buffers WEDGE the CHAINED
+     * prefill submit (CDMA chain-walker + imported buffer = kernel watchdog reset / D-state hard wedge — HW/kernel
+     * limit, confirmed: even a single imported buffer chained over M-tiles wedges; decode's single submit is fine).
+     * So we materialize the client's pre-tiled bytes into NATIVE residence (ork_mm_load_i8: mmap the shared fd +
+     * bcreate + memcpy + native per-N-slice Bf rebuild) — the proven-chaining layout. Still meets the goal: orkpack
+     * loads, NO live-convert / NO tiling / NO socket transfer (fd-passed, one memcpy from the shared page cache),
+     * client still chooses the domain. NOT zero-copy. True zero-copy needs a non-chained/coalesced submit structure
+     * (the on-NPU coalesced-chain RE) — set ORK_ADOPT_ZC to use the (wedge-prone) zero-copy VIEW path for that work. */
+    if(!getenv("ORK_ADOPT_ZC")){
+        size_t sz=pgup(bb_bytes); void *p=mmap(NULL,sz,PROT_READ,MAP_SHARED,bb_fd,0);
+        close(bb_fd); if(bf_fd>=0) close(bf_fd);            /* bf ignored — ork_mm_load_i8 rebuilds Bf natively */
+        if(p==MAP_FAILED) return NULL;
+        ork_w *w=ork_mm_load_i8(c,K,N,p,bb_bytes);         /* native bcreate + copy + native Bf (uses c->pack_domain) */
+        munmap(p,sz);
+        return w;
+    }
+    /* ---- ORK_ADOPT_ZC: pure zero-copy VIEW path (page-cache-backed, client-owned) — WEDGES chained prefill;
+     * kept for the coalesced-chain zero-copy work (task #20). ---- */
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t bbneed=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; bbneed+=pgup((size_t)Kp*Nc);}}
+    if(bb_bytes<bbneed){ close(bb_fd); if(bf_fd>=0) close(bf_fd); return NULL; }
+    int dom=ork_dom(c->pack_domain);
+    ork_dom_prime(c,dom);                            /* native anchor BEFORE importing into a non-0 domain */
+    struct buf bbimp=bimport_fd(c->fd,bb_fd,bb_bytes,dom);
+    if(!bbimp.cpu){ close(bb_fd); if(bf_fd>=0) close(bf_fd); return NULL; }   /* bimport_fd doesn't close on failure */
+    ork_w *w=calloc(1,sizeof *w); if(!w){ bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); return NULL; }
+    w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=0; w->domain=dom;
+    w->own_bufs=calloc(2,sizeof(struct buf)); w->n_own_bufs=0;   /* [0]=Bb import [1]=Bf import; ork_mm_free bdestroys each */
+    if(!w->own_bufs){ bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); free(w); return NULL; }
+    w->own_bufs[w->n_own_bufs++]=bbimp;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    if(!w->Bb){ ork_mm_free(c,w); if(bf_fd>=0) close(bf_fd); return NULL; }
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; size_t ts=pgup((size_t)Kp*Nc);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+        b->handle=bbimp.handle; b->obj=bbimp.obj; b->dma=bbimp.dma+off; b->cpu=(char*)bbimp.cpu+off; b->size=ts; b->domain=dom; b->heap_fd=-1;
+        off+=ts;}}
+    /* Bf: its OWN import (separate obj). Views into it carry heap_fd=-1 so ork_mm_free skips them and reclaims
+     * the one Bf import via own_bufs[1]. On any Bf failure, Bf=NULL (base matmuls then 501-error, surfacing it)
+     * but the weight itself stays valid (Bb resident). */
+    if(bf_fd>=0 && bf_bytes){
+        size_t bfneed=0; for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; bfneed+=pgup((size_t)K*Nc);}
+        if(bf_bytes>=bfneed){
+            struct buf bfimp=bimport_fd(c->fd,bf_fd,bf_bytes,dom);
+            if(bfimp.cpu){
+                w->own_bufs[w->n_own_bufs++]=bfimp;
+                w->Bf=calloc(Sn,sizeof(struct buf));
+                if(w->Bf){ size_t fo=0;
+                    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; size_t fs=pgup((size_t)K*Nc);
+                        struct buf*bf=&w->Bf[ns];
+                        bf->handle=bfimp.handle; bf->obj=bfimp.obj; bf->dma=bfimp.dma+fo; bf->cpu=(char*)bfimp.cpu+fo; bf->size=fs; bf->domain=dom; bf->heap_fd=-1;
+                        fo+=fs;} }
+            } else close(bf_fd);   /* Bf import failed: drop Bf, keep the weight (Bb resident) */
+        } else close(bf_fd);
+    } else if(bf_fd>=0) close(bf_fd);
+    return w;
+}
+
+/* CLIENT orchestrator (orkd path): allocate a dma-buf, copy the PRE-TILED blob (Bb tiles, optionally followed
+ * by the full-K Bf region at bf_off) into it, seal it, and hand the fd to the daemon (ORKD_IMPORT) which
+ * imports it into this client's pack_domain as a resident weight (views into the client's buffer). Returns an
+ * is_orkd ork_w handle (orkd_id) or NULL. `n` = blob bytes; bf_off = Bf region offset (0 = no Bf). The daemon
+ * dup's the fd via SCM_RIGHTS, so the client's local mapping/fd are released here. */
+ork_w *ork_mm_import_i8(ork_npu *c,int K,int N,const void *blob,size_t n,size_t bf_off){
+    if(!c || !c->daemon || !blob || K<=0 || N<=0 || !n) return NULL;
+    size_t bb_bytes = bf_off ? bf_off : n;          /* Bb = blob[0..bf_off); Bf = blob[bf_off..n) */
+    size_t bf_bytes = bf_off ? (n - bf_off) : 0;
+    /* Bb dma-buf */
+    void *pbb=NULL; int bb_fd=ork_dmabuf_alloc(bb_bytes,&pbb);
+    if(bb_fd<0) return NULL;
+    memcpy(pbb,blob,bb_bytes); ork_dmabuf_seal(bb_fd);
+    /* Bf dma-buf (separate buffer so the daemon imports it into its OWN obj) */
+    void *pbf=NULL; int bf_fd=-1;
+    if(bf_bytes){ bf_fd=ork_dmabuf_alloc(bf_bytes,&pbf);
+        if(bf_fd<0){ munmap(pbb,pgup(bb_bytes)); close(bb_fd); return NULL; }
+        memcpy(pbf,(const char*)blob+bf_off,bf_bytes); ork_dmabuf_seal(bf_fd); }
+    uint64_t id=orkd_import_i8(c->daemon,K,N,bb_fd,bf_fd,(uint64_t)bb_bytes,(uint64_t)bf_bytes);
+    munmap(pbb,pgup(bb_bytes)); close(bb_fd);        /* daemon holds its own SCM_RIGHTS dups */
+    if(bf_fd>=0){ munmap(pbf,pgup(bf_bytes)); close(bf_fd); }
+    if(!id) return NULL;
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain);
     return w;
 }
 
@@ -2951,9 +3089,12 @@ void ork_mm_free(ork_npu *c, ork_w *w){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
     }
-    /* Bf is ALWAYS its own per-N-slice bcreate/bimport (never a view), even when Bb is consolidated into
-     * own_buf — so reclaim it whenever present, independent of owns. */
-    if(c && w->Bf) for(int i=0;i<w->Sn;i++) if(w->Bf[i].cpu) bdestroy(c->fd,&w->Bf[i]);
+    /* Bf is normally its own per-N-slice bcreate/bimport (never a view), even when Bb is consolidated into
+     * own_buf — so reclaim it whenever present, independent of owns. EXCEPTION: ork_mm_adopt_imported_i8 lays
+     * Bf as base+offset VIEWS into a dedicated Bf import (own_bufs[1]); those carry heap_fd=-1 and must NOT be
+     * individually destroyed (the backing import is reclaimed once via own_bufs below). Native Bf has heap_fd>=0. */
+    if(c && w->Bf) for(int i=0;i<w->Sn;i++)
+        if(w->Bf[i].cpu && w->Bf[i].heap_fd>=0) bdestroy(c->fd,&w->Bf[i]);
     /* dedicated single-buffer weights (grouped-i4, or consolidated int8): Bb[] entries are VIEWS (share
      * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
      * of a sub-pointer). Reclaims IOVA. */
@@ -4119,15 +4260,28 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * parity, once the ork_dyn_end heavy-job poll backoff removed the busy-poll civac contention with the NPU
      * writeback (M=256 was 2.8x slower on a pure spin; now at parity). Consolidates decode AND prefill submits
      * onto the spine (dump/self-heal coverage). No legacy fallback — git is the recovery. */
+    /* COMPLETE MIGRATION: int8 multi-core matmul runs ONLY on the NONBLOCK doorbell — the blocking mcworker
+     * fallback is a wedge-prone footgun (a doorbell miss self-heals; a blocking-submit miss hard-wedges the NPU
+     * and needs a reboot). The doorbell's PRECISE verified bound is <=64 rows/program: base (Sn==1,K<=4096) M-tiles
+     * internally to mg_max*64; wide-N (Sn>1, N-strided) and wide-K (K>4096, K-split) are verified to M<=64/program,
+     * so we ADAPT prefill by M-tiling into <=64-row doorbell submits (rows are independent -> bit-exact). A shape
+     * outside the envelope returns an ERROR — we never silently fall to the blocking path. */
     { int i8 = (dt==DT_I8 && (w->N/32)>=2 && nc>1);
-      int r_base = i8 && w->Sn==1 && w->K<=4096 && w->Bf;               /* any M */
-      int r_wideN = i8 && M==1 && w->Sn>1 && w->K<=4096 && w->Bf;       /* wide-N decode (ffn_gate/up) */
-      int r_wideK = i8 && M==1 && w->Sn==1 && w->K>4096;                /* wide-K decode (ffn_down) */
+      int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;   /* any M (internal mg_max*64 M-tiling) */
+      int r_wideN = i8 && w->Sn>1  && w->K<=4096 && w->Bf;   /* wide-N (ffn gate/up, N>nmax): N-strided */
+      int r_wideK = i8 && w->Sn==1 && w->K>4096;             /* wide-K (ffn down, K>4096): per-K-slice accumulate */
       if(r_base || r_wideN || r_wideK){
+        /* ONE doorbell submit: ork_dyn_begin_mc -> ork_dyn_begin_colsplit auto-decomposes base (M-tiled),
+         * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
-        if(!h) return -1;
-        ork_dyn_end(h); return 0;
+        if(!h) return -1;                              /* outside the verified envelope: reject, never wedge-fallback */
+        return ork_dyn_end(h) < 0 ? -1 : 0;
+      }
+      if(i8){   /* int8 multi-core shape matching no doorbell envelope (e.g. Sn>1 && K>4096, or missing Bf): reject */
+        fprintf(stderr, "[ork] ERROR: int8 M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
+                "blocking fallback (would risk an unrecoverable NPU wedge)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
+        return -1;
       } }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
@@ -4912,6 +5066,11 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op so the daemon zero-copy-swaps to it */
+        /* ZERO-COPY transport (ORK_ORKD_ZC): A+C ride SCM_RIGHTS dma-buf fds; the daemon reads A / writes C IN
+         * PLACE (no ~M*K + M*N*4 byte-copy over the socket). Measures the transport delta on the big prefill ops
+         * (the socket/ring paths copy). -2 = no dma-heap -> fall back to the copy path. */
+        static int zc = -1; if(zc<0) zc = getenv("ORK_ORKD_ZC") ? 1 : 0;
+        if(zc){ int r=orkd_run_i8_zc2(c->daemon, w->orkd_id, M, w->K, w->N, A, C); if(r!=-2) return r; }
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I8,A,C); if(r!=-2) return r; }
         return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_I8) return -1;
@@ -9300,9 +9459,12 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
         for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e]==ORK_DYN_SENT16) return 0; }
         return 1; }
     int NMAXd = h->c->soc->nmax;
-    if (h->oSk[i] > 1) {   /* K-SPLIT: output is oSk partial [M,N] blocks; poll the FULL partial surface (the
-        * partials' write-order isn't last-col-last across blocks) — done only when every partial word landed. */
+    if (h->oSk[i] > 1) {   /* K-SPLIT: oSk partial [M,N] blocks are one PC-chain (programs run sequentially), so the
+        * LAST program's last word (base[no-1]) lands LAST -> an O(1) completion GATE. Only once it lands do the
+        * full-surface VERIFY (covers any residual per-block lag). Was a full O(no) civac scan EVERY poll iteration,
+        * pathological on the large wide-K prefill surface (~524K words -> ~10 t/s ffn_down). */
         volatile int32_t *base = (volatile int32_t*)h->outptr[i];
+        __asm__ volatile("dc civac,%0"::"r"(&base[no-1]):"memory"); if (base[no-1]==ORK_DYN_SENT) return 0;   /* fast gate */
         for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
         return 1; }
     if (M > 1 && Nx > NMAXd) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
@@ -9672,22 +9834,36 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
         struct buf *CC = &c->mcc[i]; int c1 = t1 * nt_sz;
-        if (K > 4096) {   /* WIDE-K colsplit (ffn_down; M==1, Sn==1): per-core K-split — Sk partial [1,Ncore]
-            * programs over this core's column range, end() SUMS them into C[c0:c1) at row-stride N. */
+        if (K > 4096) {   /* WIDE-K colsplit (ffn_down; Sn==1, ANY M): per-core K-split — Sk*(M-tile) partial
+            * [mc,Ncore] programs over this core's column range; end() SUMS the Sk [M,Ncore] partials into
+            * C[c0:c1) at row-stride N (ork_dyn_end oSk accumulate, [ks][m][n] layout). M>1: A's K-slice rows are
+            * strided by the FULL K, but synth reads A contiguous [mc,Kp], so gather A[M,K] -> AF as a per-slice-
+            * contiguous [Sk][M][Kp] layout first. Each K-slice's Kp<=KS gives an mg_max*64 cap >=320, so M<=256
+            * prefill fits one program/slice; M-tiled defensively for larger M. */
             int KS = int8_ks(c);
-            size_t ksz = (size_t)w->Sk * Ncore * 4;
+            size_t ksz = (size_t)w->Sk * M * Ncore * 4;
             if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
                 if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; CC = &c->mcc[i]; }
-            int np2 = 0;
+            { int8_t *afg = (int8_t*)AF->cpu; size_t goff = 0;   /* gather A[M,K] -> [Sk][M][Kp] (per-slice contiguous per row) */
+              for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+                  for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, (const int8_t*)t->A + (size_t)m*K + k0, (size_t)Kp);
+                  goff += (size_t)M*Kp; }
+              bsync(fd, AF, RKNPU_MEM_SYNC_TO_DEVICE); }
+            int np2 = 0; size_t goff = 0;
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
-                if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+                int kcap = mtile_cap(Kp); if (kcap < 1) kcap = 1;   /* rows/program for this K-slice */
                 uint32_t wbase = (uint32_t)(w->Bb[ks].dma + (uint64_t)(c0 / nt_sz) * Kp * nt_sz);   /* K-slice ks weight, column sub-range */
-                memset(rc, 0, sizeof rc);
-                synth_i8(rc, 1, Kp, Ncore, adma + (uint32_t)k0, wbase, (uint32_t)(CC->dma + (size_t)ks * Ncore * 4), sched, CBUF, 0);   /* [1,Ncore] partial ks */
-                if (validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
-                memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
-                np2++;
+                for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M - m0 < kcap) ? (M - m0) : kcap;
+                    if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+                    memset(rc, 0, sizeof rc);
+                    synth_i8(rc, mc, Kp, Ncore, (uint32_t)(AF->dma + goff + (size_t)m0*Kp), wbase,
+                             (uint32_t)(CC->dma + ((size_t)ks * M + m0) * Ncore * 4), sched, CBUF, 0);   /* [mc,Ncore] rows [m0,+mc) of partial ks */
+                    if (validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                    np2++;
+                }
+                goff += (size_t)M*Kp;
             }
             for (int p = 0; p < np2; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
                 if (p < np2 - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
@@ -9695,7 +9871,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                     pr[218] = 0x0014 | (0x0037u << 16);       pr[219] = (0x0101 << 16); }
                 struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
                 tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
-            h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * Ncore; h->oM[i] = 1; h->oSk[i] = w->Sk;
+            h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
             h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* accumulate -> C columns at row-stride N */
             Pc[i] = np2;
             memset(&subs[i], 0, sizeof subs[i]);
@@ -9746,7 +9922,13 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
      * same as begin_mc's plain-int8 path). Cheap at small M. PREFILL (M>64, large output) is not interleaved,
      * so keep the original last-col seed + cold-only clean — the per-op full-buffer flush tripped test_speed's
      * latency floor at M=512. Bit-exact either way; this only changes the completion barrier, not the math. */
-    int hardened = (M <= 64);
+    /* FULL-surface SENT seed + clean-before when the done-check polls the full surface (not per-row last-col):
+     * (a) M<=64 interleaved decode/stream; (b) WIDE-K (K>4096) — oSk partial [Sk][M][Ncore] surface, done only
+     * when every partial word lands; (c) WIDE-N (Sn>1, M>1) — Sn scatter blocks whose write-order isn't
+     * last-col-last. Without this the M>64 last-col seed mismatches the full-surface poll -> completion misses ->
+     * 3s cap -> recover-resubmit stall (measured ~10 t/s on ffn_down). The per-op full flush is small vs the
+     * wide K-split/scatter compute. Plain base (Sn==1,K<=4096,M>64) keeps the cheap last-col seed. */
+    int hardened = (M <= 64) || (w->K > 4096) || (w->Sn > 1);
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
@@ -9778,8 +9960,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * mcworker (their multi-slice/K-split done + strided writes are unverified at M>1). */
     { const ork_w *cw = tasks[0].w; int cM = tasks[0].M, ci8 = (cw->dtype == DT_I8 && (cw->N / 32) >= 2);
       int c_base = ci8 && cw->Sn == 1 && cw->K <= 4096 && cw->Bf;
-      int c_wideN = ci8 && cM == 1 && cw->Sn > 1 && cw->K <= 4096 && cw->Bf;
-      int c_wideK = ci8 && cM == 1 && cw->Sn == 1 && cw->K > 4096;
+      int c_wideN = ci8 && cw->Sn > 1 && cw->K <= 4096 && cw->Bf;   /* any M: colsplit base path M-tiles + N-slices */
+      int c_wideK = ci8 && cw->Sn == 1 && cw->K > 4096;             /* any M: colsplit wide-K M-tiles the K-slice programs */
+      (void)cM;
       if (S == 1 && nc > 1 && (c_base || c_wideN || c_wideK)) return ork_dyn_begin_colsplit(c, &tasks[0], nc); }
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;

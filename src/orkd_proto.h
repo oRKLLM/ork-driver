@@ -67,6 +67,11 @@ enum orkd_msg_type {
     ORKD_DOM_REQ      = 44, /* client->daemon: request an isolated IOMMU domain from the pool (no payload)               */
     ORKD_DOM_OK       = 45, /* daemon->client: {orkd_handle} id=domain (1..POOL) when rc==0, rc<0 if the pool is exhausted */
     ORKD_DOM_REL      = 46, /* client->daemon: {orkd_handle} id=domain to release back to the pool (reply ORKD_DOM_OK)   */
+    /* ---- client-owned resident weight: the client allocs a dma-buf, fills it with PRE-TILED .orkpack bytes,
+     * and passes the fd (SCM_RIGHTS); the daemon only IMPORTs it into the client's domain (no tiling, no daemon
+     * alloc — the bytes live in the client's dma-buf). This is the "client manages its own IOVA" weight path. */
+    ORKD_IMPORT       = 47, /* client->daemon: {orkd_import} + pre-tiled weight dma-buf fd (SCM_RIGHTS) -> resident weight (views into it) */
+    ORKD_IMPORT_OK    = 48, /* daemon->client: {orkd_handle} weight id                                            */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -129,6 +134,16 @@ struct orkd_pack {
     uint32_t dtype;      /* enum-matching ork_w dtype */
     uint32_t bytes;      /* weight blob size in the passed dma-buf */
     uint32_t domain;     /* client-chosen IOMMU domain to pack this weight into (0 = shared/default; must be one the client requested via ORKD_DOM_REQ) */
+};
+struct orkd_import {     /* TWO pre-tiled weight dma-buf fds ride SCM_RIGHTS on the ORKD_IMPORT hdr (out of band):
+                          * fds[0] = Bb tiles, fds[1] = Bf full-K region (omitted / bf_bytes==0 if no Bf). Bf gets its
+                          * OWN import (own obj) — matching pack()/load_i8 — NOT a view into Bb (that wedges the base
+                          * doorbell). Tile layout within each buffer is deterministic from (K,N). */
+    uint32_t K, N;       /* weight dims (Sk=(K+1023)/1024, Sn=ceil(N/nmax)) */
+    uint32_t dtype;      /* enum orkd_dtype (ORKD_DT_I8 only for now) */
+    uint32_t domain;     /* client-chosen IOMMU domain to import into (0 = shared/default; must be owned) */
+    uint64_t bb_bytes;   /* bytes in the Bb dma-buf (fds[0]) — sum of page-padded Bb tiles */
+    uint64_t bf_bytes;   /* bytes in the Bf dma-buf (fds[1]); 0 = no Bf (only fds[0] passed) */
 };
 struct orkd_run {
     uint64_t weight_id;

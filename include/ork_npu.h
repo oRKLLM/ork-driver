@@ -170,6 +170,19 @@ void        *ork_dma_import_fd(ork_npu *ctx, int dmabuf_fd, size_t size);
  * read-only across every submit. ork_mm_free / ork_w_free release the imports (MEM_DESTROY + close fd). */
 ork_w       *ork_mm_load_i8_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
+/* ---- ORKD_IMPORT: client-owned resident weight (client allocs the dma-buf, daemon only maps it) ----
+ * CLIENT (no NPU fd): ork_dmabuf_alloc reserves a dma-heap buffer + mmaps it R/W (returns the fd, sets *ptr);
+ * fill *ptr with the PRE-TILED .orkpack bytes, then ork_dmabuf_seal(fd) flushes it. Pass the fd to the daemon
+ * (SCM_RIGHTS). DAEMON: ork_mm_adopt_imported_i8 PRIME-imports the fd into the current pack_domain and lays
+ * Bb (+ optional Bf at bf_off) as base+offset VIEWS — no tiling, no weight alloc, bytes stay in the client's
+ * buffer. total = buffer bytes; bf_off = byte offset of the full-K Bf region (0 = none). NULL on mismatch. */
+int          ork_dmabuf_alloc(size_t size, void **ptr);   /* -> dma-buf fd (>=0), *ptr = mapping; -1 on failure */
+void         ork_dmabuf_seal(int dmabuf_fd);              /* flush CPU writes so the imported NPU view sees them */
+ork_w       *ork_mm_adopt_imported_i8(ork_npu *ctx, int K, int N, int bb_fd, int bf_fd, size_t bb_bytes, size_t bf_bytes);
+/* CLIENT orchestrator (orkd): alloc dma-buf, copy the pre-tiled blob (Bb [+ Bf at bf_off]), seal, and send the
+ * fd to the daemon (ORKD_IMPORT). Returns an is_orkd weight handle. n = blob bytes; bf_off = Bf offset (0=none). */
+ork_w       *ork_mm_import_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n, size_t bf_off);
+
 /**
  * @brief Pack + upload B[K,N] (row-major) into the NPU-resident tile layout; reuse across runs (fp16).
  * @param K Inner/contraction dim. Must be K%32==0.
@@ -276,6 +289,9 @@ size_t       ork_w_dump(const ork_w *w, void *out, size_t cap);
  * DMA — the NPU is needed only at load time. Building a .orkpack is a pure-CPU, all-cores job; this
  * avoids the serial bcreate/bsync round-trip. out=NULL → return the byte size. K%32, N%32. */
 size_t       ork_w_dump_i8_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
+/* CPU Bf (full-K re-tiled) blob for the .orkpack — byte-identical to the load-time Bf rebuild. 0 unless the
+ * Bf run envelope (K%512==0 && K<=4096). Pass out=NULL to size. Lets a .orkpack carry Bf (no runtime rebuild). */
+size_t       ork_w_dump_bf_i8_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
 ork_w       *ork_mm_load_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* COMPACT int4 PERSIST (the streaming consumer for a mixed .orkpack): dump the COMPACT int4 nibble store
  * + per-channel scales (~half of the int8 ork_w_dump), and reload it straight into NPU DMA, inflating the
