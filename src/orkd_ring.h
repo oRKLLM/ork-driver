@@ -34,7 +34,7 @@ struct orkd_ring_slot {
     uint32_t M, K, N, dtype;
     uint32_t abytes, cbytes;
     int32_t  rc;
-    uint32_t _pad;
+    uint32_t domain;                               /* client-chosen IOMMU domain for this op (0 = the weight's pack-time domain) */
     uint8_t  data[ORKD_RING_SLOT_DATA];            /* A (abytes) on request; C (cbytes) on response */
 };
 

@@ -33,6 +33,9 @@ void orkd_set_priority(orkd_conn *c, unsigned prio);
 int  orkd_domain_alloc(orkd_conn *c);
 int  orkd_domain_free(orkd_conn *c, int domain);
 void orkd_set_pack_domain(orkd_conn *c, uint32_t domain);
+/* v2: domain the daemon activates for the NEXT op-submit (run/ring/chain/seq). The library sets it from the
+ * weight's domain before each routed submit, so every op/chain carries its domain id. 0 = weight's pack-time domain. */
+void orkd_set_op_domain(orkd_conn *c, uint32_t domain);
 
 /* A-ring: attach a shared-memory ring for LOW-LATENCY submits (removes the per-op socket round-trip). 0 = ok.
  * The ring transport is precision-agnostic (dtype is per-op); the socket stays for control + oversized fallback. */

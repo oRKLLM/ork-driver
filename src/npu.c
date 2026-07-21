@@ -1736,10 +1736,10 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
-    if(c && c->daemon){ uint64_t id=orkd_pack_f16(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_F16; return w; }   /* Path B: fp16 pack in the daemon */
+    if(c && c->daemon){ uint64_t id=orkd_pack_f16(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_F16; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: fp16 pack in the daemon (remember the domain so runs carry it) */
     return pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
-    if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; return w; }   /* Path B: pack resident in the daemon */
+    if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: pack resident in the daemon (remember the domain so runs carry it) */
     return pack(c,K,N,B,DT_I8);  }
 
 /* ---- int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom) ----
@@ -3151,6 +3151,7 @@ int ork_mm_collect(ork_npu *c, int ticket, void *C){
 }
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int4 run on the daemon — ring transport if attached, else socket */
+        orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op */
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I4,A,C); if(r!=-2) return r; }
         return orkd_run_i4(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(!w||w->dtype!=DT_I4) return -1;
@@ -4901,6 +4902,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
 }
 int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
     if(w && w->is_orkd){   /* Path B: fp16 run on the daemon — ring transport if attached (any precision), else socket */
+        orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op */
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_F16,A,C); if(r!=-2) return r; }
         return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_F16)return -1;
@@ -4909,6 +4911,7 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
 }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
+        orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op so the daemon zero-copy-swaps to it */
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I8,A,C); if(r!=-2) return r; }
         return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_I8) return -1;
@@ -8786,6 +8789,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         for (int i = 0; i < S; i++){ ork_w *w = tasks[i].w;
             if (!w || !w->is_orkd){ ok = 0; break; }
             ct[i].weight_id = w->orkd_id; ct[i].M = tasks[i].M; ct[i].K = w->K; ct[i].N = w->N; ct[i].A = tasks[i].A; ct[i].C = tasks[i].C; }
+        if (ok) orkd_set_op_domain(c->daemon, (uint32_t)tasks[0].w->domain);   /* v2: a chain is single-domain — carry it (co-resident tasks share it) */
         int rc = ok ? orkd_run_chain_i8(c->daemon, S, ct) : -2;
         free(ct);
         return rc;
@@ -12711,6 +12715,8 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               default: ok=0; break;   /* SILU_F16: not yet routable (mirrors the direct -3 TODO row) */
             }
         }
+        if(ok){ int sdom=0; for(int i=0;i<n;i++) if(ops[i].w && ops[i].w->is_orkd){ sdom=ops[i].w->domain; break; }   /* v2: carry the sequence's domain (its matmul weights share one) */
+                orkd_set_op_domain(c->daemon, (uint32_t)sdom); }
         int rc = ok ? orkd_submit_seq(c->daemon, n, so) : -3;
         free(so);
         return rc;

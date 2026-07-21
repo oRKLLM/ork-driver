@@ -19,6 +19,8 @@
 #define ORKD_CONNECT_BACKOFF_NS (15*1000*1000L)
 
 struct orkd_conn { int fd; uint32_t client_id; uint32_t soc_cores; uint32_t prio; uint32_t pack_domain;
+                   uint32_t op_domain;   /* v2: IOMMU domain stamped on the NEXT op-submit (run/ring/chain/seq); set by orkd_set_op_domain
+                                          * right before a submit (the library sources it from the weight's domain). 0 = weight's pack-time domain. */
                    struct orkd_ring *ring; int ring_fd; uint32_t ring_next; };  /* A-ring: low-latency shm transport */
 
 /* live connections, for the atexit clean-BYE (small fixed set; a process rarely holds many) */
@@ -107,6 +109,9 @@ void orkd_set_priority(orkd_conn *c, unsigned prio){ if (c) c->prio = prio; }
  * clients don't collide); orkd_set_pack_domain then makes subsequent packs (orkd_pack_*) land the weight there.
  * orkd_domain_free returns it. All held domains are also reclaimed automatically when the connection drops. */
 void orkd_set_pack_domain(orkd_conn *c, uint32_t domain){ if (c) c->pack_domain = domain; }
+/* v2: set the domain the daemon should activate for the NEXT op-submit. The library calls this from each routed
+ * run/chain/seq wrapper with the weight's domain, so every op/chain submitted carries its domain id. */
+void orkd_set_op_domain(orkd_conn *c, uint32_t domain){ if (c) c->op_domain = domain; }
 
 int orkd_domain_alloc(orkd_conn *c){
     if (!c || c->fd < 0) return -1;
@@ -182,7 +187,7 @@ int orkd_ring_submit(orkd_conn *c, uint64_t weight_id, int M, int K, int N, uint
     struct orkd_ring_slot *s = &r->slot[idx];
     if (atomic_load_explicit(&s->state, memory_order_acquire) != ORKD_SLOT_EMPTY) return -2;  /* ring full: collect first */
     s->weight_id = weight_id; s->M = (uint32_t)M; s->K = (uint32_t)K; s->N = (uint32_t)N; s->dtype = dtype;
-    s->abytes = (uint32_t)abytes; s->cbytes = (uint32_t)cbytes; s->rc = 0;
+    s->abytes = (uint32_t)abytes; s->cbytes = (uint32_t)cbytes; s->rc = 0; s->domain = c->op_domain;
     memcpy(s->data, A, abytes);
     atomic_store_explicit(&s->state, ORKD_SLOT_REQ, memory_order_release);   /* publish: data-then-flag */
     c->ring_next++;
@@ -242,7 +247,7 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio; rq.domain = c->op_domain;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -281,7 +286,7 @@ uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B){
 int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const void *A, float *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K * 2);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio; rq.domain = c->op_domain;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -319,7 +324,7 @@ uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B){
 int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = abytes; rq.flags = c->prio; rq.domain = c->op_domain;
     struct orkd_hdr h = { ORKD_RUN, (uint32_t)(sizeof rq + abytes), 4 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, A, abytes)) return -1;
     struct orkd_hdr rh;
@@ -402,7 +407,7 @@ int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *t){
     for (int i = 0; i < S; i++){ if (t[i].M <= 0 || t[i].K <= 0 || t[i].N <= 0 || !t[i].A || !t[i].C) return -1;
         atot += (size_t)t[i].M * t[i].K; ctot += (size_t)t[i].M * t[i].N * 4; }
     if (atot > 0xffffffffu) return -1;
-    struct orkd_chain_hdr ch; memset(&ch, 0, sizeof ch); ch.S = (uint32_t)S; ch.abytes_total = (uint32_t)atot;
+    struct orkd_chain_hdr ch; memset(&ch, 0, sizeof ch); ch.S = (uint32_t)S; ch.abytes_total = (uint32_t)atot; ch.domain = c->op_domain;
     uint32_t plen = (uint32_t)(sizeof ch + (size_t)S * sizeof(struct orkd_chain_task) + atot);
     struct orkd_hdr h = { ORKD_CHAIN, plen, 10 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &ch, sizeof ch)) return -1;
@@ -431,7 +436,7 @@ int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
     for (int i = 0; i < n; i++){ if (!o[i].A || !o[i].C || (o[i].bbytes && !o[i].B)) return -1;
         in_total += (uint64_t)o[i].abytes + o[i].bbytes; c_total += o[i].cbytes; }
     if (in_total > 0xffffffffu) return -1;
-    struct orkd_seq_hdr sh; memset(&sh, 0, sizeof sh); sh.n = (uint32_t)n; sh.in_total = (uint32_t)in_total;
+    struct orkd_seq_hdr sh; memset(&sh, 0, sizeof sh); sh.n = (uint32_t)n; sh.in_total = (uint32_t)in_total; sh.domain = c->op_domain;
     uint32_t plen = (uint32_t)(sizeof sh + (size_t)n * sizeof(struct orkd_seq_op) + in_total);
     struct orkd_hdr h = { ORKD_SEQ, plen, 11 };
     if (wn(c->fd, &h, sizeof h) || wn(c->fd, &sh, sizeof sh)) return -1;
@@ -514,7 +519,7 @@ int orkd_run_i8_zc(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const 
     if (am == MAP_FAILED){ close(afd); return -3; }
     memcpy(am, A, abytes);
     orkd_dmabuf_clean(afd);                          /* flush A to device before the NPU reads it */
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio; rq.domain = c->op_domain;
     struct orkd_hdr h = { ORKD_RUN_ZC, (uint32_t)sizeof rq, 7 };
     if (orkd_send_hdr_fd(c->fd, &h, afd) || wn(c->fd, &rq, sizeof rq)){ munmap(am, abytes); close(afd); return -1; }
     struct orkd_hdr rh;
@@ -549,7 +554,7 @@ int orkd_run_i8_zc2(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const
     void *cm = mmap(NULL, cbytes, PROT_READ | PROT_WRITE, MAP_SHARED, cfd, 0);
     if (am == MAP_FAILED || cm == MAP_FAILED){ if (am != MAP_FAILED) munmap(am, abytes); if (cm != MAP_FAILED) munmap(cm, cbytes); close(afd); close(cfd); return -3; }
     memcpy(am, A, abytes); orkd_dmabuf_clean(afd);
-    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio;
+    struct orkd_run rq; memset(&rq, 0, sizeof rq); rq.weight_id = weight_id; rq.M = (uint32_t)M; rq.abytes = 0; rq.flags = c->prio; rq.domain = c->op_domain;
     struct orkd_hdr h = { ORKD_RUN_ZC2, (uint32_t)sizeof rq, 8 };
     int fds[2] = { afd, cfd };
     int rc = -1;

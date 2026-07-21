@@ -21,7 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ORKD_PROTO_VERSION 1u
+#define ORKD_PROTO_VERSION 2u   /* v2: op-submit messages (run/chain/seq + ring slot) carry a client-chosen domain id */
 
 /* Socket path: $XDG_RUNTIME_DIR/orkd.sock if set, else /tmp/orkd-<uid>.sock. orkd_sock_path() (below) resolves
  * it identically for daemon (bind) and client (connect) so both agree without configuration. */
@@ -135,7 +135,7 @@ struct orkd_run {
     uint32_t M;
     uint32_t flags;      /* reserved (chain kind, etc.) */
     uint32_t abytes;     /* size of the A payload that follows (= M*K int8); lets orkd drain even on a bad id */
-    uint32_t pad;
+    uint32_t domain;     /* client-chosen IOMMU domain to run this op in (0 = use the weight's pack-time domain); the daemon zero-copy-swaps to it before the submit */
 };
 struct orkd_handle {
     uint64_t id;         /* weight id / result marker */
@@ -149,7 +149,7 @@ struct orkd_chain_hdr {  /* S orkd_chain_task descriptors follow, then abytes_to
     uint32_t S;
     uint32_t flags;      /* reserved (chain kind) */
     uint32_t abytes_total;
-    uint32_t pad;
+    uint32_t domain;     /* client-chosen IOMMU domain for the whole chain (0 = the tasks' pack-time domain); a chain is single-core, so one domain */
 };
 struct orkd_chain_task {
     uint64_t weight_id;
@@ -160,7 +160,7 @@ struct orkd_seq_hdr {    /* n orkd_seq_op descriptors follow, then in_total byte
     uint32_t n;
     uint32_t flags;      /* reserved */
     uint32_t in_total;   /* sum over ops of (abytes + bbytes) */
-    uint32_t pad;
+    uint32_t domain;     /* client-chosen IOMMU domain for the sequence (0 = the ops' pack-time domain) */
 };
 struct orkd_seq_op {     /* one op in the sequence; kind == ork_seq_kind. weight_id=0 for weightless (SDP) kinds */
     uint32_t kind;

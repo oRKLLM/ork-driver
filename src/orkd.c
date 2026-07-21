@@ -208,7 +208,9 @@ static int handle_run(struct client *cl, ork_npu *npu, uint64_t tag){
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ free(A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->domain = ork_w_domain(cw->w);   /* scheduler domain-grouping key (== this client's domain) */
+    /* v2: the client stamps the op's domain (== where it packed this weight); honor it, else fall back to the
+     * weight's resident domain. The scheduler dom_activates w->domain (zero-copy swap) before dispatch. */
+    w->domain = rq.domain ? (int)rq.domain : ork_w_domain(cw->w);
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = A; w->C = C;   /* enqueued; the scheduler dispatches it */
     return 0;
 }
@@ -362,7 +364,7 @@ static int handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, u
     struct work *w = wk_alloc();
     if (!w){ ork_dma_free(npu, A); ork_dma_free(npu, C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC2; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->domain = ork_w_domain(cw->w);
+    w->domain = rq.domain ? (int)rq.domain : ork_w_domain(cw->w);   /* v2: honor the client-stamped op domain */
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype;
     w->A = (int8_t *)A; w->A_imp = A; w->C = (int32_t *)C; w->C_imp = C;   /* dispatch: A read + C written in place, single-core */
     return 0;
@@ -384,7 +386,7 @@ static int handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag
     struct work *w = C ? wk_alloc() : NULL;
     if (!C || !w){ ork_dma_free(npu, A); free(C); send_error(cl->fd, tag, ORKD_EOOM, "queue full"); return 0; }
     w->fd = cl->fd; w->type = ORKD_RUN_ZC; w->tag = tag; w->prio = rq.flags; w->weight_id = rq.weight_id;
-    w->domain = ork_w_domain(cw->w);
+    w->domain = rq.domain ? (int)rq.domain : ork_w_domain(cw->w);   /* v2: honor the client-stamped op domain */
     w->M = (int)rq.M; w->K = cw->K; w->N = cw->N; w->dtype = cw->dtype; w->A = (int8_t *)A; w->A_imp = A; w->C = C;   /* A zero-copy; C over socket */
     return 0;
 }
