@@ -527,20 +527,11 @@ i16_silu_acc: tools/i16_silu_acc.c $(COBJ)
 i16_shape_probe: tools/i16_shape_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-# PHASE 0 chained-FFN: does the NPU walk a heterogeneous matmul(0xd)->int16-silu(0x18) 2-task chain in one submit?
-chain_probe: tools/chain_probe.c $(COBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
-
-# CHAIN ASSEMBLER increment 1: data-connected matmul(int16-out)->silu bridge in one PC-chain
-chain_gatesilu_probe: tools/chain_gatesilu_probe.c $(COBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
-
-# CHAIN ASSEMBLER increment 1 (corrected): [gate*silu -> up] one submit via run_chain_i8 + set_i8_silu
+# CHAIN ASSEMBLER increment 1 (corrected): [gate*silu -> up] one submit via run_chain_i8 + set_i8_silu.
+# (The ABANDONED set_i16_out/chain_progs PC-chain probes — chain_probe, chain_gatesilu_probe, i16out_probe —
+#  were removed: that path wedges the NPU. The working chain assembler is the doorbell seq (ork_submit_seq).
+#  See CHAIN_ASSEMBLER_WIP.md's superseded banner.)
 chain_gu_silu_probe: tools/chain_gu_silu_probe.c $(COBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
-
-# PHASE 1 chained-FFN RE: does an int8 matmul emit correct int16 via set_i16_out (the on-NPU requant handoff)?
-i16out_probe: tools/i16out_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 bmm_probe: tools/bmm_probe.c $(COBJ)
