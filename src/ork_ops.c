@@ -11,11 +11,13 @@
 #include <string.h>
 
 /* (enum, "industry name") — the ONE list. Keep in enum order for readability; order is not load-bearing
- * (the table is enum-indexed). Names are C-identifier form: <op>[_<dtype>], dtype in {i4,i8,i16,i32,f16}. */
+ * (the table is enum-indexed). Naming (see the convention block in ork_npu.h): WEIGHTED ops (matmul family)
+ * use WxAy quant notation (w8a8/w16a16/w4a4); weightless SDP/elementwise/norm ops keep a <op>_<dtype> suffix
+ * (dtype in {i4,i8,i16,i32,f16}) since WxAy does not apply without a weight. */
 #define ORK_OP_LIST(X) \
-    X(ORK_OP_MM_I8,                    "matmul_i8")                  \
-    X(ORK_OP_MM_F16,                   "matmul_f16")                 \
-    X(ORK_OP_MM_I4,                    "matmul_i4")                  \
+    X(ORK_OP_MM_I8,                    "matmul_w8a8")                \
+    X(ORK_OP_MM_F16,                   "matmul_w16a16")              \
+    X(ORK_OP_MM_I4,                    "matmul_w4a4")                \
     X(ORK_OP_SILU_F16,                 "silu_f16")                   \
     X(ORK_OP_EWMUL_F16,                "mul_f16")                    \
     X(ORK_OP_SILU_I8,                  "silu_i8")                    \
@@ -24,7 +26,7 @@
     X(ORK_OP_ADD_I8,                   "add_i8")                     \
     X(ORK_OP_ADD_F16,                  "add_f16")                    \
     X(ORK_OP_SILU_I16,                 "silu_i16")                   \
-    X(ORK_OP_MM_I4_GROUPED,            "matmul_i4_grouped")          \
+    X(ORK_OP_MM_I4_GROUPED,            "matmul_w4a4_grouped")        \
     X(ORK_OP_GELU_I16,                 "gelu_i16")                   \
     X(ORK_OP_RSQRT_I8,                 "rsqrt_i8")                   \
     X(ORK_OP_EXP_I8,                   "exp_i8")                     \
@@ -34,15 +36,15 @@
     X(ORK_OP_MUL_PERCHANNEL_I8,        "mul_perchannel_i8")          \
     X(ORK_OP_MUL_PERCHANNEL_F16,       "mul_perchannel_f16")         \
     X(ORK_OP_MUL_PERCHANNEL_I16,       "mul_perchannel_i16")         \
-    X(ORK_OP_MATMUL_PERCHANNEL_F16,    "matmul_perchannel_f16")      \
+    X(ORK_OP_MATMUL_PERCHANNEL_F16,    "matmul_perchannel_w16a16")   \
     X(ORK_OP_REQUANTIZE_PERCHANNEL_I32,"requantize_perchannel_i32")  \
     X(ORK_OP_SOFTMAX_F16,              "softmax_f16")                \
     X(ORK_OP_REDUCEMAX_I8,             "reducemax_i8")               \
     X(ORK_OP_RESHAPE_F16,              "reshape_f16")                \
     X(ORK_OP_ROPE_NEOX_F16,            "rope_neox_f16")              \
-    X(ORK_OP_MATMUL_SILU_I8,           "matmul_silu_i8")             \
-    X(ORK_OP_MATMUL_REQUANT_I8,        "matmul_requant_i8")          \
-    X(ORK_OP_MATMUL_SILU_I32,          "matmul_silu_i32")            \
+    X(ORK_OP_MATMUL_SILU_I8,           "matmul_silu_w8a8")           \
+    X(ORK_OP_MATMUL_REQUANT_I8,        "matmul_requant_w8a8")        \
+    X(ORK_OP_MATMUL_SILU_I32,          "matmul_silu_w8a8_i32out")    \
     X(ORK_OP_RMSNORM_F16,              "rmsnorm_f16")                \
     X(ORK_OP_L2NORM_F16,               "l2norm_f16")
 
@@ -114,15 +116,15 @@ ORK_ASSERT_CHAIN_STEP(ORK_OP_MM_F16,   ORK_OP_MUL_PERCHANNEL_F16);  /* chain_mat
 
 /* ============================ composite (multi-op) name registry ============================ */
 #define ORK_COMPOSITE_LIST(X) \
-    X(ORK_COMPOSITE_CHAIN_MATMUL_I8,             "chain_matmul_i8")             \
-    X(ORK_COMPOSITE_FFN_SWIGLU_I8,               "ffn_swiglu_i8")               \
-    X(ORK_COMPOSITE_FFN_GATE_SILU_I8,            "ffn_gate_silu_i8")            \
-    X(ORK_COMPOSITE_FFN_GATE_SDPSILU_I8,         "ffn_gate_sdpsilu_i8")         \
-    X(ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_F16, "chain_matmul_perchannel_f16") \
-    X(ORK_COMPOSITE_SEQ,                         "seq")                         \
-    X(ORK_COMPOSITE_MIXCHAIN_F16_I16,            "mixchain_f16_i16")            \
-    X(ORK_COMPOSITE_BMM_FUSED_F16,               "bmm_fused_f16")               \
-    X(ORK_COMPOSITE_REPLAY_FULL_F16,             "replay_full_f16")
+    X(ORK_COMPOSITE_CHAIN_MATMUL_W8A8,            "chain_matmul_w8a8")            \
+    X(ORK_COMPOSITE_FFN_SWIGLU_W8A8,              "ffn_swiglu_w8a8")              \
+    X(ORK_COMPOSITE_FFN_GATE_SILU_W8A8,           "ffn_gate_silu_w8a8")           \
+    X(ORK_COMPOSITE_FFN_GATE_SDPSILU_W8A8,        "ffn_gate_sdpsilu_w8a8")        \
+    X(ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_W16A16,"chain_matmul_perchannel_w16a16") \
+    X(ORK_COMPOSITE_SEQ,                          "seq")                          \
+    X(ORK_COMPOSITE_MATMUL_SILU_W16A16_I16SILU,   "matmul_silu_w16a16_i16silu")   \
+    X(ORK_COMPOSITE_MATMUL_BATCHED_FUSED_W16A16,  "matmul_batched_fused_w16a16")  \
+    X(ORK_COMPOSITE_GRAPH_REPLAY_F16,             "graph_replay_f16")
 
 static const char *const ork_composite_names[ORK_COMPOSITE_NKIND] = {
 #define X(e, n) [e] = n,

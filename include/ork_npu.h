@@ -943,25 +943,33 @@ const char  *ork_impl_mode_name(ork_impl_mode m);/* enum -> "hw_chained"; NULL i
 /* Composite (multi-op) primitives — one submit combining several ops. Supported set derived from PRE-SESSION
  * examples (origin/main) only; DEAD/unvalidated chains (chain_mm_perchan_i16 = hangs, chain_gatesilu_i16 =
  * no pre-session example) are intentionally absent. */
+/* NAMING CONVENTION (hybrid — this NPU is not industry-standard and has severe limitations, so we borrow
+ * standards where they map and use NPU-specific qualifiers where they don't):
+ *   - WEIGHTED ops (matmul / FFN): WxAy quantization notation (industry-standard) — W<weight-bits>A<act-bits>,
+ *     e.g. w8a8 (int8/int8), w16a16 (fp16), w4a4 (int4). This is the speed/quality axis.
+ *   - MIXED precision: append a component qualifier naming the higher-precision (sensitive) part, e.g.
+ *     `_f16gate` (fp16 gate matmul while the rest is int8), `_i16silu` (int16 SiLU). This is how a
+ *     speed-for-quality optimization is expressed: base WxAy + which component is kept precise.
+ *   - SDP / elementwise ops (no weights): WxAy does not apply → keep the dtype suffix (_i8/_i16/_f16).
+ *   - Non-op mechanisms named for what they do (graph_replay), not the internal fn (was "replay"/"bmm"). */
 typedef enum {
-    ORK_COMPOSITE_CHAIN_MATMUL_I8 = 0,        /* batch of independent int8 matmuls (ork_mm_run_chain_i8)              example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_SWIGLU_I8,              /* int8 SwiGLU FFN inner (ork_mm_run_chain_i8_ffn)                     example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_GATE_SILU_I8,           /* FFN, fused gate-SiLU output stage (ork_mm_run_chain_i8_gsilu)       example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_GATE_SDPSILU_I8,        /* FFN, gate matmul + standalone SDP SiLU (ork_mm_run_chain_i8_sdpsilu) example: chain_gu_silu_probe */
-    ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_F16,/* fp16 matmul -> per-channel scale chain (ork_npu_chain_mm_perchan_f16) example: chain_mm_perchan_f16_probe */
-    ORK_COMPOSITE_SEQ,                        /* heterogeneous op sequence (ork_submit_seq)                          example: test_submit_seq / sdp_chain_probe */
-    /* --- mixed-precision / batched composites (added 2026-07-22; the derivation initially missed these) --- */
-    ORK_COMPOSITE_MIXCHAIN_F16_I16,           /* MIXED precision: fp16 matmul + int16 SiLU in ONE PC-chain — per-task
-                                               * precision on the shared 2-byte datapath. The quality-path building
-                                               * block: fp16 on the sensitive gate/SiLU, int16/int8 elsewhere.
-                                               * (ork_ssd_probe_mixchain)                        example: mixchain_probe */
-    ORK_COMPOSITE_BMM_FUSED_F16,              /* fp16 FUSED batched-matmul chain (attention / SSD A.V)
+    ORK_COMPOSITE_CHAIN_MATMUL_W8A8 = 0,      /* batch of independent int8 matmuls (ork_mm_run_chain_i8)              example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_SWIGLU_W8A8,            /* int8 SwiGLU FFN inner (ork_mm_run_chain_i8_ffn)                     example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SILU_W8A8,         /* FFN, fused gate-SiLU output stage (ork_mm_run_chain_i8_gsilu)       example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SDPSILU_W8A8,      /* FFN, gate matmul + standalone SDP SiLU (ork_mm_run_chain_i8_sdpsilu) example: chain_gu_silu_probe */
+    ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_W16A16,/* fp16 matmul -> per-channel scale chain (ork_npu_chain_mm_perchan_f16) example: chain_mm_perchan_f16_probe */
+    ORK_COMPOSITE_SEQ,                        /* heterogeneous op sequence, any precision (ork_submit_seq)           example: test_submit_seq / sdp_chain_probe */
+    /* --- mixed-precision / batched composites (added 2026-07-22) --- */
+    ORK_COMPOSITE_MATMUL_SILU_W16A16_I16SILU, /* MIXED: fp16 matmul (w16a16) + int16 SiLU (_i16silu) fused in ONE
+                                               * PC-chain — the quality-path building block (fp16 on the sensitive
+                                               * gate matmul, int16 SiLU). (ork_ssd_probe_mixchain)  example: mixchain_probe */
+    ORK_COMPOSITE_MATMUL_BATCHED_FUSED_W16A16,/* fp16 fused batched matmul (attention / SSD A.V)
                                                * (ork_bmm_fp16_fused)               example: test_bmm_fused / ssd_fusedchain_probe */
-    ORK_COMPOSITE_REPLAY_FULL_F16,            /* full fp16 op-graph replay (ork_npu_replay_full_f16)  example: replay_f16_full_test */
+    ORK_COMPOSITE_GRAPH_REPLAY_F16,           /* fp16 op-graph replay mechanism (ork_npu_replay_full_f16) example: replay_f16_full_test */
     ORK_COMPOSITE_NKIND
 } ork_composite;
-const char   *ork_composite_name(ork_composite k);              /* enum -> "ffn_swiglu_i8"; NULL if out of range */
-ork_composite ork_composite_from_name(const char *name);        /* "ffn_swiglu_i8" -> enum; ORK_COMPOSITE_NKIND if unknown */
+const char   *ork_composite_name(ork_composite k);              /* enum -> "ffn_swiglu_w8a8"; NULL if out of range */
+ork_composite ork_composite_from_name(const char *name);        /* "ffn_swiglu_w8a8" -> enum; ORK_COMPOSITE_NKIND if unknown */
 
 /* regcmd -> op binding: which ork_op (and impl mode) a REGCMD_* byte template implements. Every REGCMD_*
  * base template in the driver MUST have a binding (enforced by check_registry.sh — 0 orphan regcmds), so no
@@ -1135,6 +1143,15 @@ int          ork_mm_run_chain_i8_sdpsilu(ork_npu *ctx, int S, const ork_mm_task_
 typedef struct { int kind; int in0, in1; int mult, shift; } ork_chain_op;
 int          ork_mm_run_chain_i8_ffn(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
                                      const ork_chain_op *ops, double in_scale, double out_scale);
+/* ORKD coalesced SwiGLU FFN: run the whole [gate->silu->up->glu->down] inner as ONE daemon-side HW-chained
+ * submit (ORKD_FFN / orkd_ffn_i8) against the 3 ALREADY-RESIDENT weights (wg/wu/wd must be daemon-imported —
+ * is_orkd — e.g. from the orkpack; no re-import). A = int8 activation [M,K]; out = int32 down output [M,Kd].
+ * Requant is identity (0x4000/14) + in_scale/out_scale, matching ork_mm_run_chain_i8_ffn. This is the
+ * per-tensor int8 coalesced path (fast; one submit instead of per-op). Returns -3 if no daemon or any weight
+ * is not resident (caller should fall back to the fd-local ork_mm_run_chain_i8_ffn). */
+int          ork_mm_ffn_orkd(ork_npu *ctx, ork_w *wg, ork_w *wu, ork_w *wd,
+                             int M, int K, int Nff, int Kd, double in_scale, double out_scale,
+                             const int8_t *A, int32_t *out);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE
