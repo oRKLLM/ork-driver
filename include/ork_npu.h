@@ -963,8 +963,17 @@ ork_op ork_regcmd_op(const char *regcmd_name, ork_impl_mode *mode_out);
  * transition that wedges the NPU is DISALLOWed structurally, not discovered at runtime (this replaces the
  * heuristic get_node_chain_type/seq_hw_ok path that let an unvalidated transition hang). */
 typedef enum {
-    ORK_CHAIN_DISALLOW = 0,  /* do NOT chain; run as independent submits with a mode reset between (always
-                              * correct — the safe baseline, and the DEFAULT for any pair not yet validated). */
+    ORK_CHAIN_DISALLOW = 0,  /* do NOT chain with the CURRENT driver config; run as independent submits with a
+                              * mode reset between (always correct — the safe baseline, and the DEFAULT for any
+                              * pair not yet validated). IMPORTANT: a DISALLOW from a mode_probe fix=none wedge
+                              * means the transition is unsafe with the transition config we CURRENTLY apply
+                              * (ork_npu_enter/XSPEC profile + regcmd) — it is NOT necessarily a hardware limit.
+                              * Many DISALLOW pairs are a MISSING/WRONG transition template: e.g. matmul->int8-SDP
+                              * wedges as separate submits (no int8-SDP-tuned XSPEC profile), yet the SAME
+                              * transition is HW-safe in a PC-chain (FFN gate->silu). Such pairs are candidates
+                              * for a transition-template fix — test mode_probe fix=RESET; if safe, add that
+                              * reset/profile to ork_npu_enter and UPGRADE the cell to SW. Treat DISALLOW as
+                              * "unsupported by our config (yet)", not "the NPU can't". */
     ORK_CHAIN_SW,            /* SW-chain: sequence the two ops without a HW handoff (validated safe to
                               * sequence, but not HW-chainable). Fallback for pairs that can't HW-chain. */
     ORK_CHAIN_HW,            /* HW-chain: the two ops ride ONE PC-chain / doorbell-seq submit (validated

@@ -25,6 +25,17 @@ op→op transition may combine: `HW` (one PC-chain), `SW` (safe as separate back
 - Pending/uncampaigned: A=int16/fp16/int8-SDP as contaminator (rows 2–14) were not reached; perchan/softmax/
   reshape/rope have no mode_probe harness. Those transitions stay DISALLOW.
 
+**DISALLOW is a driver-config verdict, not a hardware one.** A `fix=none` wedge means the transition is
+unsafe with the transition template we CURRENTLY apply (`ork_npu_enter`/`XSPEC` profile + regcmd) — the NPU
+may well support it with the right config. Strong evidence for `matmul→int8-SDP`: (a) it is **HW-safe in a
+PC-chain** (the FFN gate→silu, `chain_gu_silu_probe`), so the NPU can do it; (b) the int8-SDP ops never got
+the transition tuning the int16-SDP ops did — `XP_SDP` was validated "SDP→matmul safe, no reset" *for the
+int16/fp16 SDP ops only*. So the separate-submit `matmul→int8-SDP` wedge is a **missing/wrong int8-SDP
+transition template**, not a HW limit. **Fix path** (do NOT brute-force fix=none again — it hard-wedges):
+run `mode_probe A B 2` (fix=RESET) on a wedged pair; if RESET makes it safe, add that reset/profile to
+`ork_npu_enter` for `matmul→int8-SDP` and UPGRADE the cell `DISALLOW→SW`. Treat every DISALLOW as a candidate
+driver fix, not a dead end.
+
 ## How to read / maintain this registry (probe-verdict anchored)
 
 - **Status is anchored to a probe — enforced at build time.** Every `PROVEN` / `PARTIAL` /
