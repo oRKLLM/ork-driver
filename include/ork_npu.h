@@ -1019,7 +1019,20 @@ ork_chain_rule ork_chain_lookup(ork_op from, ork_op to);   /* validated transiti
     X(ORK_OP_ADD_F16,  ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_MM_I8,    ORK_CHAIN_SW) \
     X(ORK_OP_ADD_F16,  ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_SILU_I16, ORK_CHAIN_SW) \
     X(ORK_OP_ADD_F16,  ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
-    X(ORK_OP_ADD_F16,  ORK_OP_ADD_F16,  ORK_CHAIN_SW)
+    X(ORK_OP_ADD_F16,  ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    /* --- campaign 2 (2026-07-21, int8-SDP ops added to mode_probe): fp16-matmul -> the remaining int16 SDP
+     *     ops are SW-safe; matmul -> int8-SDP HARD-WEDGES (validated: MM_F16->SILU_I8 hung, MM_F16->GELU_I8
+     *     hard-wedged the NPU, MM_I8->SILU_I8 hung). matmul->int8-SDP is a mode-switch hazard for BOTH fp16
+     *     and int8 matmul — whereas matmul->int16-SDP is safe. The remaining matmul->int8-SDP pairs are
+     *     DISALLOW-by-default (unlisted); the ones below are listed explicitly to document the VALIDATED
+     *     wedge (so ORK_ASSERT_CHAIN_STEP reports "DISALLOWed" rather than "unvalidated"). --- */ \
+    X(ORK_OP_MM_F16,   ORK_OP_GELU_I16, ORK_CHAIN_SW) X(ORK_OP_MM_F16,   ORK_OP_ADD_I16,  ORK_CHAIN_SW) \
+    X(ORK_OP_MM_F16,   ORK_OP_SILU_I8,  ORK_CHAIN_DISALLOW) /* fp16-matmul -> int8-SDP: hung (NO_OUTPUT); no HW chain proven */ \
+    X(ORK_OP_MM_F16,   ORK_OP_GELU_I8,  ORK_CHAIN_DISALLOW) /* fp16-matmul -> int8-SDP: HARD-WEDGE (power-cycle) */
+    /* NOTE: MM_I8->SILU_I8 (int8-matmul -> int8-SiLU) is listed HW above (the FFN gate->silu PC-chain,
+     * chain_gu_silu_probe). mode_probe's SEPARATE-submit MM_I8->SILU_I8 HUNG, but that's the SW path — the op
+     * IS HW-chainable in one submit (how the FFN uses it), so HW stands. Separate-submit int8-matmul->int8-SDP
+     * is NOT SW-safe (do not downgrade the FFN's HW pair to SW). */
 
 /* Named enum constants per validated pair — usable in _Static_assert (unlike a const-array index). */
 enum {

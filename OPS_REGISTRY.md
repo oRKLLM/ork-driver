@@ -9,15 +9,21 @@ op is broken or missing, check here first — it may already be solved, or alrea
 
 `ork_chain_table` (ork_ops.c, single-sourced from `ORK_CHAIN_LIST` in ork_npu.h) records how each ordered
 op→op transition may combine: `HW` (one PC-chain), `SW` (safe as separate back-to-back submits), `DISALLOW`
-(default for unvalidated pairs — run independently). Census: **HW=6, SW=48, DISALLOW=787** of 841.
-- **SW=48** from the `mode_probe A B 0` (fix=none) campaign: all 49 ordered pairs among {matmul_f16,
-  matmul_i8, exp_i16, silu_i16, mul_i16, mul_f16, add_f16} ran **SAFE** (no wedge), one fresh process each,
-  board recovered clean (D-state 0). So DISALLOW is RARE — none in this core subset.
+(default for unvalidated pairs — run independently). Census: **HW=6, SW=50, DISALLOW=785** of 841.
+- **SW** from the `mode_probe A B 0` (fix=none) campaigns: all 49 pairs among {matmul_f16, matmul_i8,
+  exp_i16, silu_i16, mul_i16, mul_f16, add_f16} SAFE; plus `matmul_f16→{gelu_i16, add_i16}` SAFE.
 - **HW=6** from the chain probes (chain_gu_silu_probe FFN inner + mm_perchan_f16_probe).
-- **Correction**: `matmul_i8→mul_i16` is **SW** (sequenceable), NOT DISALLOW — only its *HW* 2-input-SDP
-  chain hangs (chain_mm_perchan_probe). SW ≠ HW: separate-submit safety is distinct from PC-chain safety.
-- Pending: the other 22 ops (perchan/softmax/reshape/rope/…) are uncampaigned → their transitions stay
-  DISALLOW until a campaign validates them.
+- **`matmul → int8-SDP` = DISALLOW (validated HARD-WEDGE, campaign 2 2026-07-21)**: `MM_F16→SILU_I8` hung,
+  `MM_F16→GELU_I8` **hard-wedged the NPU** (needed a power-cycle), `MM_I8→SILU_I8` hung (D-state). It's a
+  fp16/int8-matmul → int8-SDP mode-switch hazard — whereas `matmul → int16-SDP` is all-SAFE (so the int16
+  SDP path is the safe one; prefer it over int8-SDP in chains). **Cost 3 power-cycles to establish; do NOT
+  re-run the int8-SDP transition campaign.** The int8-SDP ops are broadly wedge-prone as post-matmul
+  separate-submit victims — left DISALLOW-by-default.
+- **SW ≠ HW**: separate-submit safety ≠ PC-chain safety. `matmul_i8→mul_i16` is SW (only its *HW* 2-input SDP
+  chain hangs). Conversely `matmul_i8→silu_i8` is **HW** (the FFN gate→silu PC-chain, chain_gu_silu_probe)
+  even though its *separate-submit* (SW) path hangs in mode_probe — the HW capability is what the table records.
+- Pending/uncampaigned: A=int16/fp16/int8-SDP as contaminator (rows 2–14) were not reached; perchan/softmax/
+  reshape/rope have no mode_probe harness. Those transitions stay DISALLOW.
 
 ## How to read / maintain this registry (probe-verdict anchored)
 

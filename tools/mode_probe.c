@@ -33,8 +33,12 @@
 #include <math.h>
 #include <time.h>
 
-enum { OP_MM_F16=0, OP_MM_I8, OP_EXP_I16, OP_SILU_I16, OP_EWMUL_I16, OP_EWMUL_F16, OP_ADD_F16, NOP };
-static const char *OPNAME[NOP]={"MM_F16","MM_I8","EXP_I16","SILU_I16","EWMUL_I16","EWMUL_F16","ADD_F16"};
+enum { OP_MM_F16=0, OP_MM_I8, OP_EXP_I16, OP_SILU_I16, OP_EWMUL_I16, OP_EWMUL_F16, OP_ADD_F16,
+       /* SDP-family ops added 2026-07-21 to extend the transition campaign (matmul-weight/perchan/softmax/
+        * reshape/rope ops don't fit this simple A->B harness): */
+       OP_SILU_I8, OP_GELU_I8, OP_GELU_I16, OP_RSQRT_I8, OP_EXP_I8, OP_EWMUL_I8, OP_ADD_I8, OP_ADD_I16, NOP };
+static const char *OPNAME[NOP]={"MM_F16","MM_I8","EXP_I16","SILU_I16","EWMUL_I16","EWMUL_F16","ADD_F16",
+       "SILU_I8","GELU_I8","GELU_I16","RSQRT_I8","EXP_I8","EWMUL_I8","ADD_I8","ADD_I16"};
 static int is_mm(int op){ return op==OP_MM_F16 || op==OP_MM_I8; }
 
 static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e3 + t.tv_nsec/1e6; }
@@ -95,6 +99,31 @@ static int op_add_f16(ork_npu *c){
         for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(ork_f16)0.5f; b[i]=(ork_f16)0.25f; } }
     return ork_npu_add_f16(c,a,b,SDP_M,SDP_N,o,NULL)?1:0;
 }
+/* --- SDP-family ops added 2026-07-21 (int8 activations + int8/int16 elementwise; same SDP_MxN shape) --- */
+static int op_silu_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
+    if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-64+i%128); }
+    return ork_npu_silu_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+static int op_gelu_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
+    if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-64+i%128); }
+    return ork_npu_gelu_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+static int op_gelu_i16(ork_npu *c){ static int16_t *in=NULL,*out=NULL;
+    if(!in){ in=malloc((size_t)SDP_M*SDP_N*2); out=malloc((size_t)SDP_M*SDP_N*2); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int16_t)(-2000+8*i); }
+    return ork_npu_gelu_i16(c,in,SDP_M,SDP_N,4.0/32768.0,1.0/32768.0,out,NULL)?1:0; }
+static int op_rsqrt_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
+    if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(1+i%126); }   /* positive for rsqrt */
+    return ork_npu_rsqrt_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+static int op_exp_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
+    if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-127+i%128); }
+    return ork_npu_exp_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+static int op_ewmul_i8(ork_npu *c){ static int8_t *a=NULL,*b=NULL,*o=NULL;
+    if(!a){ a=malloc(SDP_M*SDP_N); b=malloc(SDP_M*SDP_N); o=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int8_t)(10+i%100); b[i]=(int8_t)(5+i%50); } }
+    return ork_npu_ewmul_i8(c,a,b,SDP_M,SDP_N,16384,14,o,NULL)?1:0; }
+static int op_add_i8(ork_npu *c){ static int8_t *a=NULL,*b=NULL,*o=NULL;
+    if(!a){ a=malloc(SDP_M*SDP_N); b=malloc(SDP_M*SDP_N); o=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int8_t)(10+i%100); b[i]=(int8_t)(5+i%50); } }
+    return ork_npu_add_i8(c,a,b,SDP_M,SDP_N,1.0/128,1.0/128,1.0/128,o,NULL)?1:0; }
+static int op_add_i16(ork_npu *c){ static int16_t *a=NULL,*b=NULL,*o=NULL;
+    if(!a){ a=malloc((size_t)SDP_M*SDP_N*2); b=malloc((size_t)SDP_M*SDP_N*2); o=malloc((size_t)SDP_M*SDP_N*2); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int16_t)(100+i); b[i]=(int16_t)(200-i); } }
+    return ork_npu_add_i16(c,a,b,SDP_M,SDP_N,1.0/32768.0,1.0/32768.0,1.0/32768.0,o,NULL)?1:0; }
 static int run_op(ork_npu *c,int op){
     switch(op){
         case OP_MM_F16:    return op_mm_f16(c);
@@ -104,6 +133,14 @@ static int run_op(ork_npu *c,int op){
         case OP_EWMUL_I16: return op_ewmul_i16(c);
         case OP_EWMUL_F16: return op_ewmul_f16(c);
         case OP_ADD_F16:   return op_add_f16(c);
+        case OP_SILU_I8:   return op_silu_i8(c);
+        case OP_GELU_I8:   return op_gelu_i8(c);
+        case OP_GELU_I16:  return op_gelu_i16(c);
+        case OP_RSQRT_I8:  return op_rsqrt_i8(c);
+        case OP_EXP_I8:    return op_exp_i8(c);
+        case OP_EWMUL_I8:  return op_ewmul_i8(c);
+        case OP_ADD_I8:    return op_add_i8(c);
+        case OP_ADD_I16:   return op_add_i16(c);
     }
     return -1;
 }
