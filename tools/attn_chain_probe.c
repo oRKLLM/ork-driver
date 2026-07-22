@@ -150,6 +150,8 @@ int main(int argc,char**argv){
 
     /* coherence */
     int anyrc=0; for(int i=0;i<ri;i++) if(rc[i]) anyrc=1;
+    { static const char*L[]={"rmsnorm","Q=xn.Wq","K=xn.Wk","V=xn.Wv","rope(Q)","rope(K)","scores=Q.K^T","rowmax","exp","Sigma=e.ones","av=P.V","O=av.Wo","y=x+O"};
+      for(int i=0;i<ri;i++) if(rc[i]||getenv("ORK_DUMP_RC")) printf("    op[%2d] %-14s rc=%d\n", i, i<(int)(sizeof L/sizeof*L)?L[i]:"?", rc[i]); }
     double me=0,sae=0; int bad=0;
     for(size_t i=0;i<(size_t)N*d;i++){ double e=fabs((double)y[i]-(double)ref[i]); sae+=e; if(e>me)me=e; if(e>3e-2*(fabs((double)ref[i])+1e-2)) bad++; }
     printf("  %d seq ops, all rc==0: %s | max|err|=%.3e mae=%.3e  %s (%d/%d off)\n",
