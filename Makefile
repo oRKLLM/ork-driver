@@ -565,6 +565,10 @@ orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_prot
 orkd_ffn_probe: tools/orkd_ffn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
 
+# i16out_fix_probe — root-cause the set_i16_out standalone wedge (int16 matmul output stage). Board tool, wedge-prone.
+i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # test_orkd — first orkd client: int8 matmuls THROUGH the daemon, self-validated vs CPU ref. Pure client
 # (links orkd_client, not COBJ). Standalone, NOT in `make test` (would contend with direct-NPU examples).
 test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
@@ -775,4 +779,8 @@ ork_dyn_spin_diag: tools/ork_dyn_spin_diag.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 risky_dump_test: tools/risky_dump_test.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# chain_i16silu_probe — validate fixed set_i16_out feeds the int16 SiLU (matmul-i16-out -> silu bridge). Board.
+chain_i16silu_probe: tools/chain_i16silu_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

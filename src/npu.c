@@ -860,11 +860,22 @@ static void set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
  * on-NPU int32->int16 requant that lets the matmul feed the int16 silu inside one chain. */
 static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
-    unsigned r10=getenv("ORK_I16OUT_4010")?strtoul(getenv("ORK_I16OUT_4010"),0,0):0x0000;   /* int16 precision (int8=0, int32=0x8000) */
-    unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0248;   /* int16 row byte-stride (int8 0x0124, int32 0x07fc) */
-    unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;   /* element size = 2 bytes (int8 0x20, int32 0x80) */
+    /* SOLVED (wedge + layout) 2026-07-21 via i16out_fix_probe layout sweep: the int16 output stage now writes
+     * COMPACT CONTIGUOUS int16 (row-major m*N+n, M*N*2 bytes, 128/128 correct, no stall, no buffer overflow).
+     *  - 0x4010=0x20000000: OUT_PRECISION=int16 (bits[31:29]=1). The old 0x0000 (=int8 precision) while emitting
+     *    2-byte elements was the WDMA terminal-count/precision MISMATCH that STALLED the op (the standalone wedge).
+     *  - 0x4038=(s/8-1)|(N/8-1): the ORIGINAL comment's INTENDED "N/8 (2x denser than int32)" — the old code had
+     *    a typo N/16 in the low half (-> wrong width -> stall). (N/4 = the fp16 value = a wasteful 2N-wide surface
+     *    that overflows M*N*2 buffers; N/8 is the compact one.)
+     *  - 0x4050=0x36e, 0x40c0=0x40: the 2-byte surface (0x248 was wrong/int8-ish -> partial/stall).
+     * NOTE: output is LINEAR (m*N+n), NOT the EWCUBEH cube the standalone int16 SiLU stages its host input into;
+     * feeding it to the SiLU in a chain needs the SiLU input geom set to read linear (or the int8-bridge template). */
+    unsigned r10=getenv("ORK_I16OUT_4010")?strtoul(getenv("ORK_I16OUT_4010"),0,0):0x20000000;
+    unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0000036e;
+    unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;
+    unsigned r38=getenv("ORK_I16OUT_4038")?strtoul(getenv("ORK_I16OUT_4038"),0,0):(unsigned)((((s/8)-1)<<16)|((N/8)-1));
     setr(rc,REGCMD_I8_N,0x1001,0x4010,r10);
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/8)-1)<<16)|((N/16)-1));                          /* int16 group stride: 2x denser than int32 (N/8) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,r38);
     setr(rc,REGCMD_I8_N,0x1001,0x4050,r50);
     setr(rc,REGCMD_I8_N,0x1001,0x40c0,rc0);
     setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);
@@ -5713,8 +5724,10 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 output: M*N*2 bytes */
-    memset(O.cpu,0,(size_t)M*N*2); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    size_t obytes=getenv("ORK_I16_OBYTES")?strtoul(getenv("ORK_I16_OBYTES"),0,0):(size_t)M*N*2;  /* enlarge to capture a strided layout */
+    if(obytes<(size_t)M*N*2) obytes=(size_t)M*N*2;
+    struct buf O=bcreate(fd,obytes,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 output */
+    memset(O.cpu,0,obytes); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
@@ -5743,7 +5756,13 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
         double t0=ork_now_us();
         if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1; }
+    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1;
+        if(getenv("ORK_MM_DUMPOUT")){ /* LAYOUT MAP: caller made values distinct; print int16-slot -> value for every nonzero slot in the (enlarged) O */
+            const int16_t*oc=O.cpu; long ns=(long)(obytes/2); int shown=0; long firstrow_end=-1, secondrow_start=-1; int prev=-1;
+            fprintf(stderr,"[i16map] obytes=%zu (%ld slots), M=%d N=%d — nonzero slots:\n",obytes,ns,M,N);
+            for(long i=0;i<ns;i++){ int v=oc[i]; if(v!=0){ if(shown<64) fprintf(stderr,"  [%ld]=%d",i,v);
+                if(prev>=0 && v<prev && secondrow_start<0){ firstrow_end=i-1; secondrow_start=i; } prev=v; shown++; if(shown%8==0&&shown<=64)fprintf(stderr,"\n"); } }
+            fprintf(stderr,"\n[i16map] total nonzero=%d  (row-wrap at slot ~%ld => row byte-stride ~%ld)\n",shown,secondrow_start,secondrow_start*2); } }
     else if(getenv("ORK_MM_DUMPOUT")){ /* partial-write signature: how far did the WDMA get before the stall? */
         bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); int16_t*oc=O.cpu; long last=-1; int tot=0,rows=0;
         for(long i=0;i<(long)M*N;i++) if(oc[i]){ tot++; if(i>last)last=i; }
