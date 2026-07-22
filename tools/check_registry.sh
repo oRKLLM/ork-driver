@@ -62,5 +62,17 @@ awk -F'|' -v arts="$arts_re" '
   END { exit bad ? 3 : 0 }
 ' "$REG" || fail=1
 
-[ "$fail" = 0 ] && echo "check-registry: OK — every status is probe-anchored; all cited probes/ops exist"
+# --- 4) regcmd -> op binding: every REGCMD_* base template in npu.c must bind to an op in ork_ops.c -------
+# Enforces "0 ops not exported": a regcmd byte template that isn't declared as the implementation of some
+# ork_op (in ORK_REGCMD_BIND) is an orphan — an op the SDK can't name. New regcmd with no binding => fail.
+if [ -f src/ork_ops.c ]; then
+  regcmds=$(grep -oE '\bREGCMD_[A-Z0-9_]+\b' src/npu.c 2>/dev/null | grep -vE '_N$' | sort -u)
+  for rc in $regcmds; do
+    grep -qE "\"$rc\"" src/ork_ops.c && continue
+    echo "check-registry: FAIL — regcmd '$rc' has no op binding in src/ork_ops.c (ORK_REGCMD_BIND) — orphan regcmd / unexported op"
+    fail=1
+  done
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op"
 exit $fail

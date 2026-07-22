@@ -1,3 +1,13 @@
+/* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
+ * Duplicate of the pre-session probe chain_gatesilu_probe (both drive ork_npu_chain_gatesilu_i16). Its
+ * "BRIDGE WORKS" verdict CONTRADICTS the pre-session abandoned/wedge verdict ONLY because it runs against the
+ * UNMERGED set_i16_out change (6fb8b9f) — so it is NOT independent validation and is NOT a source for the SDK
+ * supported-op derivation (origin/main examples only). Delete once the int16 bridge is validated against a
+ * merged baseline. Builds as a no-op stub unless ORK_DEPRECATED_PROBES is defined. */
+#ifndef ORK_DEPRECATED_PROBES
+#include <stdio.h>
+int main(void){ fprintf(stderr,"[deprecated] chain_i16silu_probe: quarantined duplicate of chain_gatesilu_probe (build -DORK_DEPRECATED_PROBES to run)\n"); return 0; }
+#else
 /* chain_i16silu_probe — validate the FIXED set_i16_out feeds the int16 SiLU (the matmul-i16-out -> int16-silu
  * data bridge, the gating step for the fp16/int16-quality coalesced FFN). ork_npu_chain_gatesilu_i16 does
  * gate=A*B (int8 matmul, set_i16_out -> int16 G) then silu(G) -> O, with the silu reading G's buffer directly.
@@ -35,3 +45,4 @@ int main(void){
     ork_npu_free(c);
     return sbad==0?0:2;
 }
+#endif /* ORK_DEPRECATED_PROBES */

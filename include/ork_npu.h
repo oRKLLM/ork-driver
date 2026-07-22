@@ -893,8 +893,119 @@ typedef enum {
     ORK_OP_ADD_I8,      /* int8 elementwise add (SDP): A+B i8[M,N] -> C i8[M,N] (a_scale=in,b_scale,out_scale; SW: ork_npu_add_i8) */
     ORK_OP_ADD_F16,     /* fp16 elementwise add (SDP): A+B f16[M,N] -> C f16[M,N] (SW: ork_npu_add_f16) */
     ORK_OP_SILU_I16,    /* int16 SiLU (SDP): A i16[M,N] -> C i16[M,N] (in_scale,out_scale; SW: ork_npu_silu_i16) — the ACCURATE higher-precision SiLU (fp16 SiLU is not viable on this NPU: fused=garbage-PPL, standalone SDP=broken) */
+    /* --- ops beyond the seq-scheduler subset (values >=11 append-only, ABI-stable). These are supported,
+     * PROVEN ops (each backed by a working probe/example — see OPS_REGISTRY.md) that the SDK addresses by
+     * enum + industry name (ork_op_name / ork_op_from_name); not all are seq-dispatchable (their SEQ_CLASS
+     * row has fn=NULL). "op = the meaning"; the regcmd impl is chosen by ork_impl_mode. --- */
+    ORK_OP_MM_I4_GROUPED,          /* float-grouped int4 matmul (ork_mm_run_i4_grouped)             example: i4 / int4_bench */
+    ORK_OP_GELU_I16,               /* int16 GELU (SDP; ork_npu_gelu_i16)                            example: test_gelu */
+    ORK_OP_RSQRT_I8,               /* int8 rsqrt (SDP; ork_npu_rsqrt_i8)                            example: test_gelu / op_profile */
+    ORK_OP_EXP_I8,                 /* int8 exp (SDP; ork_npu_exp_i8)                                example: test_gelu / op_profile */
+    ORK_OP_EXP_I16,                /* int16 exp (SDP; ork_npu_exp_i16)                              example: test_ssd_chunk_npu / mode_probe */
+    ORK_OP_MUL_I16,                /* int16 elementwise mul (SDP; ork_npu_ewmul_i16) — EXPERIMENTAL example: test_ewmul_i16 */
+    ORK_OP_ADD_I16,                /* int16 elementwise add (SDP; ork_npu_add_i16) — EXPERIMENTAL   example: test_add / add16_probe */
+    ORK_OP_MUL_PERCHANNEL_I8,      /* per-channel scale int8 (SDP; ork_npu_mul_perchan_i8)          example: bs_scale_probe */
+    ORK_OP_MUL_PERCHANNEL_F16,     /* per-channel scale fp16 (SDP; ork_npu_mul_perchan_f16)         example: bs_scale_probe */
+    ORK_OP_MUL_PERCHANNEL_I16,     /* per-channel scale int16 (SDP; ork_npu_mul_perchan_i16)        example: bs_scale_probe */
+    ORK_OP_MATMUL_PERCHANNEL_F16,  /* fp16 matmul -> per-channel scale (ork_npu_mm_perchan_f16)     example: mm_perchan_f16_probe */
+    ORK_OP_REQUANTIZE_PERCHANNEL_I32,/* int32->int16 per-channel requant (ork_npu_requant_perchan_i32) — PARTIAL  example: requant_i32_probe */
+    ORK_OP_SOFTMAX_F16,            /* fp16 softmax (replay; ork_npu_replay_softmax_f16)             example: softmax_probe / softmax_replay */
+    ORK_OP_REDUCEMAX_I8,           /* int8 row-max reduction (ork_npu_row_max_i8)                   example: max_reduce_probe */
+    ORK_OP_RESHAPE_F16,            /* fp16 reshape/permute (ork_npu_replay_reshape_f16)             example: reshape_probe */
+    ORK_OP_ROPE_NEOX_F16,          /* fp16 NEOX RoPE (ork_npu_rope_neox_f16)                        example: rope_probe */
+    ORK_OP_MATMUL_SILU_I8,         /* int8 matmul + fused SiLU output stage (ork_mm_run_i8_silu)    example: fused_silu_test */
+    ORK_OP_MATMUL_REQUANT_I8,      /* int8 matmul + int8 requant output stage (ork_mm_run_i8_out8)  example: fused_ffn_probe */
     ORK_OP_NKIND
 } ork_seq_kind;
+typedef ork_seq_kind ork_op;       /* canonical SDK op enum; ork_seq_kind is the historical name (the seq scheduler is one consumer) */
+
+/* Execution mode selecting WHICH regcmd implementation of an op runs. The SDK submits an op/composite by
+ * enum + mode; the driver resolves the regcmd (a hw-chained op and a standalone op share one ork_op value
+ * but different regcmd byte templates). */
+typedef enum {
+    ORK_IMPL_STANDALONE = 0,   /* one op, its own submit (blocking or doorbell) */
+    ORK_IMPL_HW_CHAINED,       /* op rides a HW PC-chain / doorbell-seq alongside others */
+    ORK_IMPL_SW_CHAINED,       /* op runs in a software-broken sequence (ork_submit_seq SW path) */
+    ORK_IMPL_NMODE
+} ork_impl_mode;
+
+/* Industry-standard op name <-> enum resolution (SDK-exported). Names follow ONNX where a primitive exists
+ * (matmul/mul/add/softmax/gelu/exp/reshape/reducemax) and community LLM conventions otherwise (silu/rsqrt/
+ * rope/requantize/perchannel), dtype as a C-identifier suffix (_i8/_i16/_i4/_f16). */
+const char  *ork_op_name(ork_op k);              /* enum -> "silu_i16"; NULL if out of range */
+ork_op       ork_op_from_name(const char *name); /* "silu_i16" -> enum; ORK_OP_NKIND if unknown */
+const char  *ork_impl_mode_name(ork_impl_mode m);/* enum -> "hw_chained"; NULL if out of range */
+
+/* Composite (multi-op) primitives — one submit combining several ops. Supported set derived from PRE-SESSION
+ * examples (origin/main) only; DEAD/unvalidated chains (chain_mm_perchan_i16 = hangs, chain_gatesilu_i16 =
+ * no pre-session example) are intentionally absent. */
+typedef enum {
+    ORK_COMPOSITE_CHAIN_MATMUL_I8 = 0,        /* batch of independent int8 matmuls (ork_mm_run_chain_i8)              example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_SWIGLU_I8,              /* int8 SwiGLU FFN inner (ork_mm_run_chain_i8_ffn)                     example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SILU_I8,           /* FFN, fused gate-SiLU output stage (ork_mm_run_chain_i8_gsilu)       example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SDPSILU_I8,        /* FFN, gate matmul + standalone SDP SiLU (ork_mm_run_chain_i8_sdpsilu) example: chain_gu_silu_probe */
+    ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_F16,/* fp16 matmul -> per-channel scale chain (ork_npu_chain_mm_perchan_f16) example: chain_mm_perchan_f16_probe */
+    ORK_COMPOSITE_SEQ,                        /* heterogeneous op sequence (ork_submit_seq)                          example: test_submit_seq / sdp_chain_probe */
+    ORK_COMPOSITE_NKIND
+} ork_composite;
+const char   *ork_composite_name(ork_composite k);              /* enum -> "ffn_swiglu_i8"; NULL if out of range */
+ork_composite ork_composite_from_name(const char *name);        /* "ffn_swiglu_i8" -> enum; ORK_COMPOSITE_NKIND if unknown */
+
+/* regcmd -> op binding: which ork_op (and impl mode) a REGCMD_* byte template implements. Every REGCMD_*
+ * base template in the driver MUST have a binding (enforced by check_registry.sh — 0 orphan regcmds), so no
+ * regcmd exists that isn't the implementation of an exported op. Returns ORK_OP_NKIND if the name is unbound. */
+ork_op ork_regcmd_op(const char *regcmd_name, ork_impl_mode *mode_out);
+
+/* --- Deterministic op->op chaining: a validated LOOKUP, never an algorithm. ------------------------------
+ * How two consecutive ops may combine is decided by a table, not by heuristics. Every (from,to) permutation
+ * is exhaustively validated on-silicon (tools/mode_probe transition matrix) and its result baked into
+ * ork_chain_table[from][to]. The chain assembler asks ork_chain_lookup(from,to) and obeys it — so a
+ * transition that wedges the NPU is DISALLOWed structurally, not discovered at runtime (this replaces the
+ * heuristic get_node_chain_type/seq_hw_ok path that let an unvalidated transition hang). */
+typedef enum {
+    ORK_CHAIN_DISALLOW = 0,  /* do NOT chain; run as independent submits with a mode reset between (always
+                              * correct — the safe baseline, and the DEFAULT for any pair not yet validated). */
+    ORK_CHAIN_SW,            /* SW-chain: sequence the two ops without a HW handoff (validated safe to
+                              * sequence, but not HW-chainable). Fallback for pairs that can't HW-chain. */
+    ORK_CHAIN_HW,            /* HW-chain: the two ops ride ONE PC-chain / doorbell-seq submit (validated
+                              * safe AND fast). */
+    ORK_CHAIN_NRULE
+} ork_chain_rule;
+ork_chain_rule ork_chain_lookup(ork_op from, ork_op to);   /* validated transition rule; DISALLOW if unknown */
+
+/* SINGLE SOURCE for op->op chain rules. One X-macro emits BOTH the runtime table (ork_ops.c) AND named enum
+ * constants ORK_CR__<from>__<to> — because C cannot index a const array in a constant expression, compile-time
+ * checks need the rules as enum constants (which ARE constant expressions). List every VALIDATED pair (HW/SW
+ * and explicit DISALLOW); unlisted pairs default to DISALLOW at runtime. Each pair is validated by the
+ * exhaustive op->op campaign (tools/mode_probe); the seeds here are the ones already proven in OPS_REGISTRY. */
+#define ORK_CHAIN_LIST(X) \
+    X(ORK_OP_MM_I8,    ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* matmul->matmul run (generic adjacent fusion; chain_gu_silu_probe) */ \
+    X(ORK_OP_MM_I8,    ORK_OP_SILU_I8,  ORK_CHAIN_HW)  /* FFN: gate matmul -> SiLU  (chain_gu_silu_probe) */ \
+    X(ORK_OP_SILU_I8,  ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* FFN: SiLU -> up matmul */ \
+    X(ORK_OP_MM_I8,    ORK_OP_EWMUL_I8, ORK_CHAIN_HW)  /* FFN: up matmul -> GLU mul */ \
+    X(ORK_OP_EWMUL_I8, ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* FFN: GLU mul -> down matmul */ \
+    X(ORK_OP_MM_F16,   ORK_OP_MUL_PERCHANNEL_F16, ORK_CHAIN_HW) /* attn A.V -> per-channel scale (mm_perchan_f16_probe) */ \
+    X(ORK_OP_MM_I8,    ORK_OP_MUL_I16,  ORK_CHAIN_DISALLOW) /* int16 2-input SDP not chain-safe: HANGS (chain_mm_perchan_probe) */
+
+/* Named enum constants per validated pair — usable in _Static_assert (unlike a const-array index). */
+enum {
+#define X(f, t, r) ORK_CR__##f##__##t = (r),
+    ORK_CHAIN_LIST(X)
+#undef X
+    ORK_CR__SENTINEL = 0
+};
+/* Compile-time rule for a statically-known transition. Undeclared for an unlisted (never-validated) pair ->
+ * referencing it is a compile error, so a static chain over an unvalidated transition won't build. */
+#define ORK_CHAIN_RULE(f, t) ORK_CR__##f##__##t
+/* Assert a statically-declared chain STEP is chainable (HW or SW). Fails to compile on DISALLOW/unvalidated —
+ * this is how the SDK's fixed composites are validated at build time (no runtime failing check needed). */
+#define ORK_ASSERT_CHAIN_STEP(f, t) \
+    _Static_assert(ORK_CHAIN_RULE(f, t) != ORK_CHAIN_DISALLOW, \
+        "chain step " #f " -> " #t " is DISALLOWed or unvalidated")
+
+/* Single generic submit surface (declared after ork_seq_op, below): the SDK addresses ops by enum + mode;
+ * the driver resolves the regcmd impl and validates each transition via ork_chain_lookup. See ork_submit /
+ * ork_submit_chain after the ork_seq_op definition. */
 typedef struct {
     ork_seq_kind kind;
     ork_w      *w;                 /* matmul weight (NULL for weightless SDP ops) */
@@ -915,6 +1026,15 @@ typedef struct {
 /* Run the n-op sequence in order, HW-batching + SW-breaking as above. 0/ok, -1 a submit failed/wedged,
  * -2 bad args, -3 an op-kind whose dispatch is not yet wired (documented TODO row, e.g. SILU_F16). */
 int          ork_submit_seq(ork_npu *ctx, const ork_seq_op *ops, int n);
+/* Generic enum-driven submit surface (see the ork_op / ork_impl_mode / ork_chain_lookup design above).
+ * ork_submit runs ONE op via its dispatch (mode advisory for a single op — chaining is ork_submit_chain).
+ * ork_submit_chain PARTITIONS the sequence at every DISALLOW transition (those ops run as separate submits,
+ * never chained) and routes each maximal run through ork_submit_seq — it never FAILS on a transition (a
+ * disallowed pair is split, not rejected; correctness is guaranteed by the table + the compile-time composite
+ * asserts, since orkd + SDK ship together). Returns: 0 ok; -3 an op has no generic dispatch (use its typed
+ * ork_npu_* entry); -2 bad args/op; -1 a submit failed. */
+int          ork_submit(ork_npu *ctx, ork_op op, ork_impl_mode mode, const ork_seq_op *args);
+int          ork_submit_chain(ork_npu *ctx, const ork_seq_op *ops, int n);
 /* Heterogeneous single-core NONBLOCK chain: run ONE group of int8 ops (matmul + int8 SDP, e.g. EWMUL_I8) as one
  * PC-chain; terminal MUST be a matmul (its int32 sentinel gates completion). Returns a handle (drain with
  * ork_dyn_seq_end) or NULL if ineligible (non-int8 / M>64 / non-conforming K / terminal not a matmul / kind not

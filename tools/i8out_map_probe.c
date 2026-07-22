@@ -1,3 +1,11 @@
+/* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
+ * Duplicate of the pre-session probes test_mm_i8_out8 / silu_bench (all drive ork_npu_probe_i8_out8). Not an
+ * independent-validation source for the SDK supported-op derivation (origin/main examples only). Delete once
+ * no longer referenced. Builds as a no-op stub unless ORK_DEPRECATED_PROBES is defined. */
+#ifndef ORK_DEPRECATED_PROBES
+#include <stdio.h>
+int main(void){ fprintf(stderr,"[deprecated] i8out_map_probe: quarantined duplicate of test_mm_i8_out8 (build -DORK_DEPRECATED_PROBES to run)\n"); return 0; }
+#else
 /* i8out_map_probe — does the WORKING int8 matmul output stage (set_i8_out8) write int8-LINEAR or int8-CUBE?
  * Crafts acc(m,n)=n+32m (unique 0..127, fits int8), identity requant, reads C[M*N] int8 and tests both the
  * linear (m*N+n) and ORK_SEQCUBE ((n/16)*(M*16)+m*16+(n%16)) layouts. Answers whether the int16 output (which
@@ -32,3 +40,4 @@ int main(void){
     ork_npu_free(c);
     return rc==0?0:1;
 }
+#endif /* ORK_DEPRECATED_PROBES */

@@ -13017,6 +13017,38 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
     return ret;
 }
 
+/* Generic enum-driven submit (header: ork_submit). Single op -> its SEQ_CLASS standalone dispatch, mirroring
+ * the per-op path in ork_submit_seq (enter() then the reliable SW dispatch fn). Ops without a seq dispatch fn
+ * (the >=11 SDP/perchan/replay ops) return -3 here; they are reached via their typed ork_npu_* entry points
+ * until the (op x mode) -> regcmd impl registry is wired. mode is advisory for a single op — HW/SW chaining is
+ * decided per-transition by ork_submit_chain via the ork_chain_lookup table. */
+int ork_submit(ork_npu *c, ork_op op, ork_impl_mode mode, const ork_seq_op *args){
+    if((int)op<0 || (int)op>=ORK_OP_NKIND || !args) return -2;
+    (void)mode;
+    ork_seq_op o=*args; o.kind=op;
+    const struct ork_seq_class *cl=&SEQ_CLASS[op];
+    if(!cl->fn) return -3;                                  /* no generic dispatch — use the typed ork_npu_* entry */
+    int mk=(cl->marker==SEQ_KEEPDT)?c->last_dt:cl->marker;
+    ork_npu_enter(c,mk,cl->profile,cl->chain);
+    return cl->fn(c,&o) ? -1 : 0;
+}
+
+/* Deterministic chain submit: the table decides, and there is NO failing check. A DISALLOW transition is a
+ * hard PARTITION boundary — the two ops go into separate runs (independent submits), never chained. So a
+ * wedge-prone pair is split, not rejected: the routing always produces correct output and cannot fail on a
+ * transition. (orkd + SDK ship together and the op set is fixed, so a runtime "reject" would only re-check
+ * what the table + the fixed composite asserts already guarantee.) Each maximal run goes to ork_submit_seq,
+ * which HW-batches / SW-breaks within it. Returns the first real submit error, if any. */
+int ork_submit_chain(ork_npu *c, const ork_seq_op *ops, int n){
+    if(!ops || n<0) return -2;
+    int start=0, ret=0;
+    for(int i=0;i<n && !ret;i++){
+        int boundary = (i+1==n) || (ork_chain_lookup(ops[i].kind, ops[i+1].kind)==ORK_CHAIN_DISALLOW);
+        if(boundary){ ret = ork_submit_seq(c, ops+start, i-start+1); start = i+1; }   /* run [start,i] */
+    }
+    return ret;
+}
+
 /* ---- BATCHED DYNAMIC GEMM (attention / GDN-chunk primitive) --------------------------------------
  * C[b] = A[b][M,K] * B[b][K,N] for each of nbatch batches. Both operands are dynamic activations, so
  * B[b] is packed fresh each batch (unlike the resident-weight ork_mm_run* paths). Correctness-first:

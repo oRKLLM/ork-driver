@@ -1,3 +1,12 @@
+/* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
+ * Duplicate of the pre-session probe i16out_probe (both drive ork_npu_probe_i16_out). Its result depends on
+ * the UNMERGED set_i16_out change (6fb8b9f), so it is NOT independent validation and is NOT a source for the
+ * SDK supported-op derivation (origin/main examples only). Delete once the int16 output stage is validated
+ * against a merged baseline. Builds as a no-op stub unless ORK_DEPRECATED_PROBES is defined. */
+#ifndef ORK_DEPRECATED_PROBES
+#include <stdio.h>
+int main(void){ fprintf(stderr,"[deprecated] i16out_fix_probe: quarantined duplicate of i16out_probe (build -DORK_DEPRECATED_PROBES to run)\n"); return 0; }
+#else
 /* i16out_fix_probe — root-cause + MAP the int16 matmul output stage (set_i16_out). Runs an int8 matmul with
  * the int16 output stage (ork_npu_probe_i16_out) using inputs crafted so acc(m,n)=n+32m is UNIQUE per (m,n),
  * so each raw-buffer int16 slot decodes to exactly one (m,n) -> reveals the output tile layout directly.
@@ -36,3 +45,4 @@ int main(void){
     ork_npu_free(c);
     return rc==0?0:1;
 }
+#endif /* ORK_DEPRECATED_PROBES */

@@ -18,7 +18,7 @@ ifneq ($(GIT_HASH),)
 CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
-CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c
+CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c src/ork_ops.c
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
@@ -572,7 +572,7 @@ orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_prot
 orkd_ffn_probe: tools/orkd_ffn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
 
-# i16out_fix_probe — root-cause the set_i16_out standalone wedge (int16 matmul output stage). Board tool, wedge-prone.
+# i16out_fix_probe — DEPRECATED/QUARANTINED (dup of i16out_probe; validates unmerged set_i16_out). Stub unless -DORK_DEPRECATED_PROBES.
 i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
@@ -788,10 +788,10 @@ ork_dyn_spin_diag: tools/ork_dyn_spin_diag.c $(COBJ)
 risky_dump_test: tools/risky_dump_test.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-# chain_i16silu_probe — validate fixed set_i16_out feeds the int16 SiLU (matmul-i16-out -> silu bridge). Board.
+# chain_i16silu_probe — DEPRECATED/QUARANTINED (dup of chain_gatesilu_probe; PASS depends on unmerged set_i16_out). Stub unless -DORK_DEPRECATED_PROBES.
 chain_i16silu_probe: tools/chain_i16silu_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-# i8out_map_probe — does set_i8_out8 write int8-linear or int8-cube? (bridge-template check). Board.
+# i8out_map_probe — DEPRECATED/QUARANTINED (dup of test_mm_i8_out8). Stub unless -DORK_DEPRECATED_PROBES.
 i8out_map_probe: tools/i8out_map_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
