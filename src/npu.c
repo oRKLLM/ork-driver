@@ -12936,6 +12936,9 @@ static int seq_disp_rsqrt_i16      (ork_npu *c,const ork_seq_op *o){ double us; 
 /* NEOX RoPE (task #20 attention chain): x[nrow,hd] -> out. Weightless; internally ewmul_f16+ewmul_f16+add_f16
  * (self-contained SW-break). Field overload: pos[] (per-row positions) via o->B, freq_base via o->in_scale. */
 static int seq_disp_rope_neox_f16  (ork_npu *c,const ork_seq_op *o){ return ork_npu_rope_neox_f16 (c,(const f16*)o->A,o->N,o->M,(const int*)o->B,o->in_scale,(f16*)o->C); }
+/* RMSNorm (task #20 layer chain): x[M,n] -> out, per-channel gain via o->B, eps via o->in_scale. Weightless
+ * matmul-wise (the gain is an SDP operand, not a packed ork_w); self-contained SW-break. */
+static int seq_disp_rmsnorm_f16    (ork_npu *c,const ork_seq_op *o){ return ork_npu_rmsnorm_f16   (c,o->M,o->N,(const f16*)o->A,(const f16*)o->B,(float)o->in_scale,(f16*)o->C); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
@@ -12960,6 +12963,7 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   [ORK_OP_MUL_PERCHANNEL_I8]  = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_mul_perchan_i8  },
   [ORK_OP_RSQRT_I16]          = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rsqrt_i16       },
   [ORK_OP_ROPE_NEOX_F16]      = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rope_neox_f16   },
+  [ORK_OP_RMSNORM_F16]        = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rmsnorm_f16     },
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW

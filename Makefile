@@ -79,6 +79,11 @@ test_submit_seq: tools/test_submit_seq.c $(COBJ)
 softmax_seq_probe: tools/softmax_seq_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# task #20: attention core (QK^T -> softmax -> A.V) assembled as an ork_submit_seq pipeline, coherence vs CPU.
+# Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./attn_chain_probe [Nq] [Nk] [d]
+attn_chain_probe: tools/attn_chain_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # int4 NONBLOCK-doorbell viability probe: ork_dyn_i4_probe (NONBLOCK + int16-sentinel) vs the blocking
 # ork_mm_run_chain_i4 reference. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 200 ./i4_doorbell_probe
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)
