@@ -978,14 +978,48 @@ ork_chain_rule ork_chain_lookup(ork_op from, ork_op to);   /* validated transiti
  * checks need the rules as enum constants (which ARE constant expressions). List every VALIDATED pair (HW/SW
  * and explicit DISALLOW); unlisted pairs default to DISALLOW at runtime. Each pair is validated by the
  * exhaustive op->op campaign (tools/mode_probe); the seeds here are the ones already proven in OPS_REGISTRY. */
+/* HW pairs = ride one PC-chain (proven by the chain probes). SW pairs = safe to SEQUENCE as separate
+ * submits (proven by the mode_probe 7-op transition campaign, 2026-07-21: all 49 ordered pairs among
+ * {matmul_f16, matmul_i8, exp_i16, silu_i16, mul_i16, mul_f16, add_f16} ran fix=none with no wedge on a
+ * fresh process each, board recovered). NOTE: matmul_i8->mul_i16 is SW (sequenceable) even though its *HW*
+ * 2-input-SDP chain HANGS (chain_mm_perchan_probe) — DISALLOW means "can't even sequence", which the
+ * campaign found for NONE of these pairs. Pairs among the other (uncampaigned) ops stay unlisted = DISALLOW. */
 #define ORK_CHAIN_LIST(X) \
-    X(ORK_OP_MM_I8,    ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* matmul->matmul run (generic adjacent fusion; chain_gu_silu_probe) */ \
-    X(ORK_OP_MM_I8,    ORK_OP_SILU_I8,  ORK_CHAIN_HW)  /* FFN: gate matmul -> SiLU  (chain_gu_silu_probe) */ \
+    /* --- HW-chainable (one PC-chain) --- */ \
+    X(ORK_OP_MM_I8,    ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* matmul->matmul run (adjacent fusion; chain_gu_silu_probe) */ \
+    X(ORK_OP_MM_I8,    ORK_OP_SILU_I8,  ORK_CHAIN_HW)  /* FFN: gate matmul -> SiLU */ \
     X(ORK_OP_SILU_I8,  ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* FFN: SiLU -> up matmul */ \
     X(ORK_OP_MM_I8,    ORK_OP_EWMUL_I8, ORK_CHAIN_HW)  /* FFN: up matmul -> GLU mul */ \
     X(ORK_OP_EWMUL_I8, ORK_OP_MM_I8,    ORK_CHAIN_HW)  /* FFN: GLU mul -> down matmul */ \
     X(ORK_OP_MM_F16,   ORK_OP_MUL_PERCHANNEL_F16, ORK_CHAIN_HW) /* attn A.V -> per-channel scale (mm_perchan_f16_probe) */ \
-    X(ORK_OP_MM_I8,    ORK_OP_MUL_I16,  ORK_CHAIN_DISALLOW) /* int16 2-input SDP not chain-safe: HANGS (chain_mm_perchan_probe) */
+    /* --- SW-chainable (separate-submit safe; mode_probe campaign 2026-07-21, all fix=none SAFE) --- */ \
+    X(ORK_OP_MM_F16,   ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_MM_F16,   ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_MM_F16,   ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_MM_F16,   ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_MM_F16,   ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_MM_F16,   ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_MM_F16,   ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_MM_I8,    ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_MM_I8,    ORK_OP_EXP_I16,  ORK_CHAIN_SW) \
+    X(ORK_OP_MM_I8,    ORK_OP_SILU_I16, ORK_CHAIN_SW) X(ORK_OP_MM_I8,    ORK_OP_MUL_I16,  ORK_CHAIN_SW) \
+    X(ORK_OP_MM_I8,    ORK_OP_EWMUL_F16,ORK_CHAIN_SW) X(ORK_OP_MM_I8,    ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_EXP_I16,  ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_EXP_I16,  ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_EXP_I16,  ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_EXP_I16,  ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_EXP_I16,  ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_EXP_I16,  ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_EXP_I16,  ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_SILU_I16, ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_SILU_I16, ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_SILU_I16, ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_SILU_I16, ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_SILU_I16, ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_SILU_I16, ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_SILU_I16, ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_MUL_I16,  ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_MUL_I16,  ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_MUL_I16,  ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_MUL_I16,  ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_MUL_I16,  ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_MUL_I16,  ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_MUL_I16,  ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_EWMUL_F16,ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_EWMUL_F16,ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_EWMUL_F16,ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_EWMUL_F16,ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_EWMUL_F16,ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_EWMUL_F16,ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_EWMUL_F16,ORK_OP_ADD_F16,  ORK_CHAIN_SW) \
+    X(ORK_OP_ADD_F16,  ORK_OP_MM_F16,   ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_MM_I8,    ORK_CHAIN_SW) \
+    X(ORK_OP_ADD_F16,  ORK_OP_EXP_I16,  ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_SILU_I16, ORK_CHAIN_SW) \
+    X(ORK_OP_ADD_F16,  ORK_OP_MUL_I16,  ORK_CHAIN_SW) X(ORK_OP_ADD_F16,  ORK_OP_EWMUL_F16,ORK_CHAIN_SW) \
+    X(ORK_OP_ADD_F16,  ORK_OP_ADD_F16,  ORK_CHAIN_SW)
 
 /* Named enum constants per validated pair — usable in _Static_assert (unlike a const-array index). */
 enum {

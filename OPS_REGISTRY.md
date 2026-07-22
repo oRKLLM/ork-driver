@@ -5,6 +5,20 @@ The point of this file is to stop re-derivation: every op/chain/handler that has
 tried is listed here with its **status** and the **probe that proves it**. If you think an
 op is broken or missing, check here first — it may already be solved, or already known-dead.
 
+## Chain-transition matrix (op→op) — validated by mode_probe campaign 2026-07-21
+
+`ork_chain_table` (ork_ops.c, single-sourced from `ORK_CHAIN_LIST` in ork_npu.h) records how each ordered
+op→op transition may combine: `HW` (one PC-chain), `SW` (safe as separate back-to-back submits), `DISALLOW`
+(default for unvalidated pairs — run independently). Census: **HW=6, SW=48, DISALLOW=787** of 841.
+- **SW=48** from the `mode_probe A B 0` (fix=none) campaign: all 49 ordered pairs among {matmul_f16,
+  matmul_i8, exp_i16, silu_i16, mul_i16, mul_f16, add_f16} ran **SAFE** (no wedge), one fresh process each,
+  board recovered clean (D-state 0). So DISALLOW is RARE — none in this core subset.
+- **HW=6** from the chain probes (chain_gu_silu_probe FFN inner + mm_perchan_f16_probe).
+- **Correction**: `matmul_i8→mul_i16` is **SW** (sequenceable), NOT DISALLOW — only its *HW* 2-input-SDP
+  chain hangs (chain_mm_perchan_probe). SW ≠ HW: separate-submit safety is distinct from PC-chain safety.
+- Pending: the other 22 ops (perchan/softmax/reshape/rope/…) are uncampaigned → their transitions stay
+  DISALLOW until a campaign validates them.
+
 ## How to read / maintain this registry (probe-verdict anchored)
 
 - **Status is anchored to a probe — enforced at build time.** Every `PROVEN` / `PARTIAL` /
