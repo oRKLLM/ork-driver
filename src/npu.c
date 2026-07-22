@@ -1412,6 +1412,13 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
         if(g_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
                                    g_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/g_prof_submits, g_prof_submit_chained,
                                    g_prof_i8_calls?(double)g_prof_submits/g_prof_i8_calls:0.0);
+        /* HW-vs-poll split (task #19): run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
+         * poll/idle = run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
+        if(g_fd_n) fprintf(stderr,"[ork FD-SPLIT] run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
+                                   g_prof_i8_us/1e3, g_fd_n, g_fd_ioctl_us/1e3, 100.0*g_fd_ioctl_us/(g_prof_i8_us+1e-9),
+                                   g_fd_hw_us/1e3, 100.0*g_fd_hw_us/(g_prof_i8_us+1e-9),
+                                   (g_prof_i8_us-g_fd_ioctl_us)/1e3, 100.0*(g_prof_i8_us-g_fd_ioctl_us)/(g_prof_i8_us+1e-9),
+                                   g_fd_ioctl_us/g_fd_n, g_fd_hw_us/g_fd_n);
     }
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
