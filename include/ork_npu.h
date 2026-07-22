@@ -946,6 +946,14 @@ typedef enum {
     ORK_COMPOSITE_FFN_GATE_SDPSILU_I8,        /* FFN, gate matmul + standalone SDP SiLU (ork_mm_run_chain_i8_sdpsilu) example: chain_gu_silu_probe */
     ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_F16,/* fp16 matmul -> per-channel scale chain (ork_npu_chain_mm_perchan_f16) example: chain_mm_perchan_f16_probe */
     ORK_COMPOSITE_SEQ,                        /* heterogeneous op sequence (ork_submit_seq)                          example: test_submit_seq / sdp_chain_probe */
+    /* --- mixed-precision / batched composites (added 2026-07-22; the derivation initially missed these) --- */
+    ORK_COMPOSITE_MIXCHAIN_F16_I16,           /* MIXED precision: fp16 matmul + int16 SiLU in ONE PC-chain — per-task
+                                               * precision on the shared 2-byte datapath. The quality-path building
+                                               * block: fp16 on the sensitive gate/SiLU, int16/int8 elsewhere.
+                                               * (ork_ssd_probe_mixchain)                        example: mixchain_probe */
+    ORK_COMPOSITE_BMM_FUSED_F16,              /* fp16 FUSED batched-matmul chain (attention / SSD A.V)
+                                               * (ork_bmm_fp16_fused)               example: test_bmm_fused / ssd_fusedchain_probe */
+    ORK_COMPOSITE_REPLAY_FULL_F16,            /* full fp16 op-graph replay (ork_npu_replay_full_f16)  example: replay_f16_full_test */
     ORK_COMPOSITE_NKIND
 } ork_composite;
 const char   *ork_composite_name(ork_composite k);              /* enum -> "ffn_swiglu_i8"; NULL if out of range */

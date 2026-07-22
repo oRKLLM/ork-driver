@@ -116,7 +116,10 @@ ORK_ASSERT_CHAIN_STEP(ORK_OP_MM_F16,   ORK_OP_MUL_PERCHANNEL_F16);  /* chain_mat
     X(ORK_COMPOSITE_FFN_GATE_SILU_I8,            "ffn_gate_silu_i8")            \
     X(ORK_COMPOSITE_FFN_GATE_SDPSILU_I8,         "ffn_gate_sdpsilu_i8")         \
     X(ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_F16, "chain_matmul_perchannel_f16") \
-    X(ORK_COMPOSITE_SEQ,                         "seq")
+    X(ORK_COMPOSITE_SEQ,                         "seq")                         \
+    X(ORK_COMPOSITE_MIXCHAIN_F16_I16,            "mixchain_f16_i16")            \
+    X(ORK_COMPOSITE_BMM_FUSED_F16,               "bmm_fused_f16")               \
+    X(ORK_COMPOSITE_REPLAY_FULL_F16,             "replay_full_f16")
 
 static const char *const ork_composite_names[ORK_COMPOSITE_NKIND] = {
 #define X(e, n) [e] = n,
