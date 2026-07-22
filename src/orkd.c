@@ -37,6 +37,8 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int s){ (void)s; g_stop = 1; }
+static uint64_t g_orkd_submits = 0;     /* always-on: total compute ops the daemon has served (socket + A-ring) */
+static uint64_t g_orkd_ring_wraps = 0;  /* always-on: total A-ring wraps (a client's ring_tail crossing nslots) */
 
 static long now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000L + t.tv_nsec/1000000L; }
 
@@ -544,6 +546,7 @@ static int ring_service(ork_npu *npu, struct client *cl, int nc){
             s->rc = rc; s->cbytes = (uint32_t)cbytes;
             atomic_store_explicit(&s->state, ORKD_SLOT_RESP, memory_order_release);   /* publish result: data-then-flag */
             cl[ci].ring_tail++; did = 1;
+            g_orkd_submits++; if (cl[ci].ring_tail % r->nslots == 0) g_orkd_ring_wraps++;
         }
     }
     return did;
@@ -683,7 +686,8 @@ int main(void){
         if (pr < 0){ if (errno == EINTR) continue; perror("orkd: poll"); break; }
         if (pr == 0 && g_qn == 0 && nring == 0){   /* pure idle timeout: reap if no subscribers */
             if (refs == 0 && now_ms() - idle_since >= (long)idle_ms){
-                fprintf(stderr, "[orkd] idle %ums, no subscribers -> reap\n", idle_ms);
+                fprintf(stderr, "[orkd] idle %ums, no subscribers -> reap (submits=%llu ring_wraps=%llu)\n", idle_ms,
+                        (unsigned long long)g_orkd_submits, (unsigned long long)g_orkd_ring_wraps);
                 break;
             }
             continue;
@@ -726,14 +730,14 @@ int main(void){
                 case ORKD_BYE:  drop = 1; break;
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_IMPORT: if (handle_import(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
-                case ORKD_FFN: if (handle_ffn(&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_RUN:  if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_FFN: g_orkd_submits++; if (handle_ffn(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_RUN:  g_orkd_submits++; if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_SDP:  if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_CHAIN:if (handle_chain(&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_SEQ:  if (handle_seq (&cl[i], npu, h.tag) < 0) drop = 1; break;
-                case ORKD_RUN_ZC: if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
-                case ORKD_RUN_ZC2: if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
+                case ORKD_SDP:  g_orkd_submits++; if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_CHAIN: g_orkd_submits++; if (handle_chain(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_SEQ:  g_orkd_submits++; if (handle_seq (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_RUN_ZC: g_orkd_submits++; if (handle_run_zc(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
+                case ORKD_RUN_ZC2: g_orkd_submits++; if (handle_run_zc2(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_DMABUF_PROBE: if (handle_dmabuf(&cl[i], npu, recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_RING_SETUP: if (handle_ring_setup(&cl[i], recvd_fds[0], h.tag) < 0) drop = 1; recvd_fds[0] = -1; break;
                 case ORKD_DOM_REQ: if (handle_dom_req(&cl[i], h.tag) < 0) drop = 1; break;
@@ -759,6 +763,7 @@ int main(void){
     if (npu) ork_npu_free(npu);                /* release NPU/IOMMU cleanly */
     close(lfd); unlink(sockpath);
     flock(pidfd, LOCK_UN); close(pidfd); unlink(pidpath);
-    fprintf(stderr, "[orkd] down\n");
+    fprintf(stderr, "[orkd] down (submits=%llu ring_wraps=%llu)\n",
+            (unsigned long long)g_orkd_submits, (unsigned long long)g_orkd_ring_wraps);
     return 0;
 }
