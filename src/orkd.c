@@ -610,6 +610,28 @@ static void daemonize(void){
     setvbuf(stderr, NULL, _IOLBF, 0);
 }
 
+/* Prime the NPU cold paths before serving so a client's first op is never cold. Notably the int16
+ * activation-LUT calibration (silu_calibrate_idx16) is lazy and can wedge if its first run is the first op
+ * AFTER a multi-core matmul (OPS_REGISTRY): here we run a tiny exp_i16 FIRST (clean calibration, no prior
+ * matmul) then a tiny fp16 matmul (SW-stream path). Uses ork_submit_seq — the exact serving dispatch. Both
+ * results discarded; best-effort (non-fatal). Disable with ORKD_NO_WARMUP. */
+static void orkd_warmup(ork_npu *npu){
+    if (!npu || getenv("ORKD_NO_WARMUP")) return;
+    enum { WN = 32 };
+    int16_t ein[WN], eout[WN]; for (int i = 0; i < WN; i++) ein[i] = (int16_t)(500 + i);
+    ork_f16 bf[WN*WN]; for (int i = 0; i < WN*WN; i++) bf[i] = (ork_f16)1.0f;
+    ork_f16 af[WN];    for (int i = 0; i < WN; i++)    af[i] = (ork_f16)1.0f;
+    float cf[WN];
+    ork_w *wf = ork_mm_pack(npu, WN, WN, bf);
+    ork_seq_op ops[2] = {
+        { .kind = ORK_OP_EXP_I16, .M = 1, .N = WN, .A = ein, .C = eout, .in_scale = 1.0/1024.0, .out_scale = 1.0/32000.0 },
+        { .kind = ORK_OP_MM_F16,  .w = wf, .M = 1, .A = af, .C = cf },
+    };
+    int rc = ork_submit_seq(npu, ops, wf ? 2 : 1);
+    if (wf) ork_mm_free(npu, wf);
+    fprintf(stderr, "[orkd] warmup rc=%d (int16-LUT calibration + fp16 matmul primed)\n", rc);
+}
+
 int main(void){
     char sockpath[256], pidpath[256];
     orkd_sock_path(sockpath, sizeof sockpath);
@@ -650,6 +672,7 @@ int main(void){
     g_per_client_dom = getenv("ORKD_PER_CLIENT_DOMAINS") != NULL;   /* A-sched: opt-in per-client IOMMU domains */
     fprintf(stderr, "[orkd] up pid=%d sock=%s idle=%ums npu=%s cores=%d per_client_dom=%d\n",
             (int)getpid(), sockpath, idle_ms, npu ? "ok" : "FAILED", cores, g_per_client_dom);
+    orkd_warmup(npu);                          /* prime cold paths (int16-LUT calibration + matmul) before serving */
 
     struct client cl[ORKD_MAX_CLIENTS]; int nc = 0;
     uint32_t next_id = 1, refs = 0;
