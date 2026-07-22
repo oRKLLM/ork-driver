@@ -13011,6 +13011,14 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
               case ORK_OP_SILU_I16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* int16 unary SDP */
               case ORK_OP_EWMUL_I8: case ORK_OP_ADD_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].bbytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 binary SDP */
+              /* --- attention seq ops (task #20): weightless SDP; daemon reconstructs generically -> Path A adapters.
+               * B carries: mul_perchan/rmsnorm per-channel vector[N]; rope pos[M] (int). --- */
+              case ORK_OP_REDUCEMAX_I8:       so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N);   so[i].cbytes=(uint32_t)o->M; break;                                                          /* int8 [M,N] -> row-max [M] */
+              case ORK_OP_EXP_I16: case ORK_OP_RSQRT_I16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;                             /* int16 unary SDP */
+              case ORK_OP_MUL_PERCHANNEL_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break; /* f16 A[M,N] * b[N] */
+              case ORK_OP_MUL_PERCHANNEL_I8:  so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N);   so[i].bbytes=(uint32_t)((size_t)o->N);   so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* i8  A[M,N] * b[N] */
+              case ORK_OP_ROPE_NEOX_F16:      so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*sizeof(int)); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break; /* f16 x[M,hd], pos[M] via B */
+              case ORK_OP_RMSNORM_F16:        so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* f16 x[M,n], gain[n] via B */
               default: ok=0; break;   /* SILU_F16: not yet routable (mirrors the direct -3 TODO row) */
             }
         }
