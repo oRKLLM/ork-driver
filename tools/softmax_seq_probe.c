@@ -1,4 +1,4 @@
-/* softmax_seq_probe — task #20: validate the softmax seq adapters + end-to-end on-NPU softmax coherence.
+/* softmax_seq_probe — task #20: validate the softmax + rope seq adapters + end-to-end on-NPU softmax coherence.
  *
  * Wires the three newly-added seq dispatch adapters (REDUCEMAX_I8, MUL_PERCHANNEL_F16, RSQRT_I16) and
  * confirms (a) each dispatches correctly through ork_submit_seq (1-op seq) vs a CPU reference, and (b) the
@@ -142,7 +142,30 @@ int main(int argc,char**argv){
         free(X);free(ref);free(q8);free(maxq);free(xi);free(ei);free(ef);free(ones);free(ss);free(P);
     }
 
-    printf("%s\n", fail? "FAIL — a softmax seq stage miscomputed" : "PASS — softmax seq adapters dispatch + compose coherently");
+    /* ---- Stage 5: ROPE_NEOX_F16 as a 1-op seq vs CPU NEOX RoPE ---------------------------------------
+     * Field overload (see seq_disp_rope_neox_f16): pos[] via o->B, freq_base via o->in_scale. */
+    {
+        int nrow=32, hd=128, hd2=hd/2; double freq_base=10000.0;
+        ork_f16 *X=malloc((size_t)nrow*hd*sizeof(ork_f16)), *Cn=malloc((size_t)nrow*hd*sizeof(ork_f16));
+        int *pos=malloc((size_t)nrow*sizeof(int));
+        for(int r=0;r<nrow;r++) pos[r]=r+1;
+        for(size_t i=0;i<(size_t)nrow*hd;i++){ X[i]=(ork_f16)(frand()*2.f-1.f); Cn[i]=(ork_f16)-1e30f; }
+        ork_seq_op op={ .kind=ORK_OP_ROPE_NEOX_F16, .M=nrow, .N=hd, .A=X, .B=pos, .C=Cn, .in_scale=freq_base };
+        int rc=ork_submit_seq(c,&op,1);
+        int bad=0; float me=0;
+        for(int r=0;r<nrow;r++){ double p=(double)pos[r];
+            for(int i=0;i<hd2;i++){ double th=p*pow(freq_base,-2.0*(double)i/(double)hd); float cc=(float)cos(th),ss=(float)sin(th);
+                float x0=(float)X[(size_t)r*hd+i], x1=(float)X[(size_t)r*hd+i+hd2];
+                float w0=x0*cc - x1*ss, w1=x1*cc + x0*ss;
+                float g0=(float)Cn[(size_t)r*hd+i], g1=(float)Cn[(size_t)r*hd+i+hd2];
+                float e0=fabsf(g0-w0), e1=fabsf(g1-w1); if(e0>me)me=e0; if(e1>me)me=e1;
+                if(e0>1e-2f*(fabsf(w0)+1.f)) bad++; if(e1>1e-2f*(fabsf(w1)+1.f)) bad++; } }
+        printf("  [5] ROPE_NEOX_F16 (seq)     : rc=%d  %s (max|err|=%.2e, %d/%d bad)\n", rc, (rc==0&&!bad)?"OK":"MISMATCH", me, bad, nrow*hd);
+        if(rc||bad) fail=1;
+        free(X);free(Cn);free(pos);
+    }
+
+    printf("%s\n", fail? "FAIL — a softmax/rope seq stage miscomputed" : "PASS — softmax + rope seq adapters dispatch + compose coherently");
     ork_npu_free(c);
     return fail;
 }
