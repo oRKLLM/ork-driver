@@ -919,6 +919,7 @@ typedef enum {
     ORK_OP_MATMUL_SILU_I32,        /* int8 matmul + fused SiLU, INT32 output (un-requantized; ork_mm_run_i8_silu32) example: silu32_check */
     ORK_OP_RMSNORM_F16,            /* fp16 RMSNorm — every transformer layer (ork_npu_rmsnorm_f16)  example: test_bmm */
     ORK_OP_L2NORM_F16,             /* fp16 L2 normalize (ork_npu_l2norm_f16)                        example: test_bmm */
+    ORK_OP_RSQRT_I16,              /* int16 rsqrt (SDP; ork_npu_rsqrt_i16) — RMSNorm 1/√ + softmax 1/Σ  example: silu_i16 family (rsqrt/exp/gelu/silu int16 LUT) */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef ork_seq_kind ork_op;       /* canonical SDK op enum; ork_seq_kind is the historical name (the seq scheduler is one consumer) */

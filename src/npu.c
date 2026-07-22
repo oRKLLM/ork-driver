@@ -12925,6 +12925,14 @@ static int seq_disp_gelu_i16(ork_npu *c,const ork_seq_op *o){ double us; return 
 static int seq_disp_rsqrt_i8(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_rsqrt_i8 (c,(const int8_t*) o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*) o->C,&us); }
 static int seq_disp_exp_i8  (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_exp_i8   (c,(const int8_t*) o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*) o->C,&us); }
 static int seq_disp_exp_i16 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_exp_i16  (c,(const int16_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int16_t*)o->C,&us); }
+/* Softmax / RMSNorm normalize primitives (task #20 attention & full-layer chain). row-max: softmax max-shift
+ * (reduce N->1). mul_perchan: the normalize A*b with b=1/Σ per query (also A.V per-channel scale, RMSNorm affine)
+ * — 2-input, takes the per-channel vector via o->B. rsqrt_i16: 1/Σ (softmax, via rsqrt(Σ²)) and 1/√mean² (RMSNorm),
+ * the accurate int16 LUT variant mirroring seq_disp_rsqrt_i8. */
+static int seq_disp_reducemax_i8   (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_row_max_i8   (c,(const int8_t*) o->A,o->M,o->N,(int8_t*) o->C,&us); }
+static int seq_disp_mul_perchan_f16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_mul_perchan_f16(c,(const f16*)    o->A,(const f16*)    o->B,o->M,o->N,(f16*)    o->C,&us); }
+static int seq_disp_mul_perchan_i8 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_mul_perchan_i8 (c,(const int8_t*) o->A,(const int8_t*) o->B,o->M,o->N,o->mult,o->shift,(int8_t*) o->C,&us); }
+static int seq_disp_rsqrt_i16      (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_rsqrt_i16     (c,(const int16_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int16_t*)o->C,&us); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
@@ -12943,6 +12951,11 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   [ORK_OP_RSQRT_I8] = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rsqrt_i8 },
   [ORK_OP_EXP_I8]   = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_exp_i8   },
   [ORK_OP_EXP_I16]  = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_exp_i16  },
+  /* softmax / RMSNorm normalize seq subset (task #20) — each self-contained SDP op; SW-break dispatch. */
+  [ORK_OP_REDUCEMAX_I8]       = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_reducemax_i8    },
+  [ORK_OP_MUL_PERCHANNEL_F16] = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_mul_perchan_f16 },
+  [ORK_OP_MUL_PERCHANNEL_I8]  = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_mul_perchan_i8  },
+  [ORK_OP_RSQRT_I16]          = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rsqrt_i16       },
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW

@@ -74,6 +74,11 @@ rknpu_bench: tools/rknpu_bench.c
 test_submit_seq: tools/test_submit_seq.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# task #20: softmax seq adapters (REDUCEMAX_I8 / MUL_PERCHANNEL_F16 / RSQRT_I16) + end-to-end on-NPU softmax
+# coherence. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./softmax_seq_probe [M] [n]
+softmax_seq_probe: tools/softmax_seq_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # int4 NONBLOCK-doorbell viability probe: ork_dyn_i4_probe (NONBLOCK + int16-sentinel) vs the blocking
 # ork_mm_run_chain_i4 reference. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 200 ./i4_doorbell_probe
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)

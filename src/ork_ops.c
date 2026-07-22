@@ -46,7 +46,8 @@
     X(ORK_OP_MATMUL_REQUANT_I8,        "matmul_requant_w8a8")        \
     X(ORK_OP_MATMUL_SILU_I32,          "matmul_silu_w8a8_i32out")    \
     X(ORK_OP_RMSNORM_F16,              "rmsnorm_f16")                \
-    X(ORK_OP_L2NORM_F16,               "l2norm_f16")
+    X(ORK_OP_L2NORM_F16,               "l2norm_f16")                 \
+    X(ORK_OP_RSQRT_I16,                "rsqrt_i16")
 
 static const char *const ork_op_names[ORK_OP_NKIND] = {
 #define X(e, n) [e] = n,
