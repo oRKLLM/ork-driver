@@ -32,7 +32,14 @@ ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused
 TESTS    :=
 
-all: $(EXAMPLES) $(TESTS)
+all: check-registry $(EXAMPLES) $(TESTS)
+
+# Build-time gate: OPS_REGISTRY.md must not cite nonexistent probes/ops, and every
+# PROVEN/PARTIAL/DEAD status must be backed by a probe (or an explicit no-probe note).
+# Makes "a status with no probe is a red flag" a compile-time failure, not a doc a human
+# has to remember to read. Pure text check (no NPU) — see tools/check_registry.sh.
+check-registry:
+	@sh tools/check_registry.sh
 
 $(EXAMPLES): %: examples/%.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
@@ -426,7 +433,7 @@ bench-llama:
 clean:
 	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so src/*.o src/soc/*.o
 
-.PHONY: all lib install test clean check-attest
+.PHONY: all lib install test clean check-attest check-registry
 
 attn_cost: tools/attn_cost.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

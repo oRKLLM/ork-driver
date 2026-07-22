@@ -75,6 +75,26 @@ Before committing, check whether the change needs doc updates:
 
 This keeps the docs reflecting reality so the next agent doesn't reverse-engineer what changed.
 
+### Op capability registry — consult BEFORE touching any op
+
+[`OPS_REGISTRY.md`](OPS_REGISTRY.md) is the **index of truth** for which NPU ops/chains/handlers
+exist and what state each is in (`PROVEN` / `PARTIAL` / `DEAD` / `WIP`). **Read it before you
+reverse-engineer, re-fix, or build on any op** — most "novel" NPU work has already been tried, and
+the registry says whether it worked, which probe proves it, and what to use instead. It exists
+specifically to stop the recurring pattern of re-deriving solved (or known-dead) paths.
+
+Rules that keep it from rotting into another stale doc:
+- **Status is probe-anchored, and it's enforced at build time.** Every `PROVEN`/`PARTIAL`/`DEAD`
+  row must name a probe (or explicitly say `(no ... probe)`), and every probe/op it cites must
+  exist. `make check-registry` (run automatically by `make all`, no NPU needed —
+  `tools/check_registry.sh`) **fails the build** otherwise. A status with no probe is not a
+  red flag you have to notice while reading — it's a compile error.
+- **Status changes only after a probe re-run**, never from a code reading or hunch.
+- **Touching an op = updating its row in the SAME commit.** If you change an op's behavior, re-run
+  its probe and edit the registry row alongside the code (this is part of §"Documentation review").
+- The `*_WIP.md` docs are backstory/detail; the registry is the index. When they disagree, a probe
+  re-run settles it (see the registry's CONTRADICTIONS section).
+
 ### WIP recovery doc for long debugging sessions
 
 During any multi-step debugging or hardware-RE session (anything that spans many board runs or
