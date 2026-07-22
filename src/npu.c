@@ -4285,9 +4285,17 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * so we ADAPT prefill by M-tiling into <=64-row doorbell submits (rows are independent -> bit-exact). A shape
      * outside the envelope returns an ERROR — we never silently fall to the blocking path. */
     { int i8 = (dt==DT_I8 && (w->N/32)>=2 && nc>1);
-      int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;   /* any M (internal mg_max*64 M-tiling) */
-      int r_wideN = i8 && w->Sn>1  && w->K<=4096 && w->Bf;   /* wide-N (ffn gate/up, N>nmax): N-strided */
-      int r_wideK = i8 && w->Sn==1 && w->K>4096;             /* wide-K (ffn down, K>4096): per-K-slice accumulate */
+      /* PREFILL REGRESSION FIX: 23af039 extended the doorbell colsplit to M>1 wide-N/wide-K, which regressed
+       * prefill ~15x (155->10 t/s) — the wide-K ffn_down colsplit does per-K-slice partial submits + HOST
+       * gather/accumulate, vs the mcworker's CHAIN-PREFILL/CHAIN-KSPLIT (all K-slices in ONE PC-chain per core,
+       * HW-accumulate, weight streamed once). Restore the M==1 (decode-only) gate on wide-N/wide-K so M>1
+       * PREFILL falls through to the mcworker path below (the bdc6f7a 155 t/s path, still intact). r_base
+       * (Sn==1,K<=4096) stays any-M — it was any-M and fast at 155 t/s. ORK_COLSPLIT_MGT1=1 opts M>1 back
+       * onto the doorbell colsplit (the 23af039 behavior) for comparison. */
+      int mgt1 = getenv("ORK_COLSPLIT_MGT1") != NULL;
+      int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;               /* any M (internal mg_max*64 M-tiling) */
+      int r_wideN = i8 && (M==1||mgt1) && w->Sn>1 && w->K<=4096 && w->Bf; /* wide-N (ffn gate/up): doorbell for DECODE; M>1 -> mcworker */
+      int r_wideK = i8 && (M==1||mgt1) && w->Sn==1 && w->K>4096;          /* wide-K (ffn down): doorbell for DECODE; M>1 -> mcworker */
       if(r_base || r_wideN || r_wideK){
         /* ONE doorbell submit: ork_dyn_begin_mc -> ork_dyn_begin_colsplit auto-decomposes base (M-tiled),
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
@@ -4296,11 +4304,12 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if(!h) return -1;                              /* outside the verified envelope: reject, never wedge-fallback */
         return ork_dyn_end(h) < 0 ? -1 : 0;
       }
-      if(i8){   /* int8 multi-core shape matching no doorbell envelope (e.g. Sn>1 && K>4096, or missing Bf): reject */
-        fprintf(stderr, "[ork] ERROR: int8 M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
+      if(i8 && M==1){   /* DECODE i8 with no doorbell envelope (rare, e.g. Sn>1 && K>4096): reject (no safe decode fallback) */
+        fprintf(stderr, "[ork] ERROR: int8 decode M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
                 "blocking fallback (would risk an unrecoverable NPU wedge)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
         return -1;
-      } }
+      }
+      /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
 
