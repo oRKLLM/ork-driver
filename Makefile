@@ -784,3 +784,7 @@ risky_dump_test: tools/risky_dump_test.c $(COBJ)
 # chain_i16silu_probe — validate fixed set_i16_out feeds the int16 SiLU (matmul-i16-out -> silu bridge). Board.
 chain_i16silu_probe: tools/chain_i16silu_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# i8out_map_probe — does set_i8_out8 write int8-linear or int8-cube? (bridge-template check). Board.
+i8out_map_probe: tools/i8out_map_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
