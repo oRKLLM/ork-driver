@@ -9439,6 +9439,8 @@ struct ork_dyn_chain {
     struct rknpu_submit mc_subs[ORK_MAXCORE];
     int        mc_Pc[ORK_MAXCORE];
     unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
+                             * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
     /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
      * blocks scaled + FLOAT-accumulated — C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]. */
     int          i4g;              /* 1 = grouped-int4 float drain */
@@ -9848,6 +9850,41 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
  * op-partition would otherwise pin a single op to one core). Scratch+copy-back (not direct output): multi-core
  * direct output to a shared resident C is the unsafe ZC-OUT-multicore case; the copy-back after poll is
  * single-threaded => coherent. */
+/* DOORBELL wide-K fix (ORK_COLSPLIT_PARALLEL): each core submits AND polls its OWN core on its own pool thread
+ * (barrier-synced fire), mirroring the mcworker/stream_worker. CRITICAL: the per-core poll is O(1) — just the
+ * last output word — NOT ork_dyn_done_i's O(no) full-surface civac scan; 3 threads full-scanning ~190K words
+ * each thrash the memory bus against the NPU writeback and serialize it (that was the earlier failure). The
+ * one-time full-surface VERIFY still happens in ork_dyn_end after all cores land (recovery lives there too). */
+struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; };
+static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
+    if (a->active) {
+        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (a->hardened || !c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        c->mwarm[i] = 1;
+    }
+    /* NO barrier + BLOCKING submit — EXACTLY the mcworker: 3 pool threads, each does a blocking submit on its
+     * core and the kernel-waits (no userspace poll). ORK_COLSPLIT_NB flips to nonblock+poll for comparison. */
+    if (a->active) {
+        int nb = getenv("ORK_COLSPLIT_NB") != NULL;
+        if (!nb) a->subs[i].flags &= ~0x2u;   /* blocking (default here) */
+        a->subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
+        if (nb) { volatile int32_t *o = (volatile int32_t*)a->h->outptr[i]; int no = a->h->nout[i];
+            double pt = ork_now_us();
+            for (;;) { __asm__ volatile("dc civac,%0"::"r"(&o[no-1]):"memory");
+                if (o[no-1] != ORK_DYN_SENT) {   /* O(1) gate: last word landed -> full-surface VERIFY once (the
+                    * K-split partial surface's write-order isn't last-word-last, so confirm EVERY word before
+                    * declaring done — else the host-accumulate reads a premature partial = wrong output). Cheap:
+                    * only scans once the gate passes (near-done), and each thread scans ONLY its own core. */
+                    int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
+                    if (all) break;
+                }
+                double el = ork_now_us() - pt; if (el > 3e6) break;
+                if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
+        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    return NULL;
+}
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
     int nt_sz = 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col tiles 32 wide; mcap rows/program; NMAX_C = N-slice width */
@@ -9969,6 +10006,17 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
             volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } }
     __asm__ volatile("dsb ish":::"memory");
+    if (nc > 1 && getenv("ORK_COLSPLIT_PARALLEL")) {   /* per-core submit + O(1) poll on own pool thread (ork_csub_worker) */
+        struct ork_csub cs[ORK_MAXCORE];
+        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened, Pc[i] != 0 };
+        npu_pool_ensure(c);
+        pthread_mutex_lock(&c->pmu); c->pjob = cs; c->pjob_nc = nc; c->pjob_fn = ork_csub_worker;
+        c->pjob_stride = sizeof(struct ork_csub); c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+        pthread_mutex_unlock(&c->pmu);
+        ork_csub_worker(&cs[0]);   /* core 0 on this thread; cores 1..nc-1 on pool threads */
+        pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
+        h->prepolled = 1;   /* workers already submitted + drained every core; ork_dyn_end skips its poll */
+    } else
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -10694,7 +10742,8 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     int last = -1;
     int recov_max = (h->mc_nc > 0 && (h->mc_dt == DT_I8 || h->mc_dt == DT_I4)) ? 6 : 0;   /* mc int8/int4 rounds carry stashed context to resubmit; a few retries clear a sticky/correlated drop */
     double t0 = ork_now_us();
-    for (int recov = 0; ; recov++) {
+    if (h->prepolled) { last = h->S - 1; for (int i = 0; i < h->S; i++) edone[i] = 1; }   /* parallel colsplit: workers already drained all cores — skip the redundant poll (its miss-timeout was the ~500ms stall) */
+    else for (int recov = 0; ; recov++) {
         t0 = ork_now_us(); int lastn = -1; double lastchg = t0;
         for (int i = 0; i < h->S; i++) edone[i] = 0;   /* per-entry done cache: stop re-polling (re-civac'ing) a core once it's complete */
         /* miss-detection timeout: a real mc int8 stream/decode op lands well under 300ms, so a sentinel still
