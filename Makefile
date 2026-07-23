@@ -861,3 +861,7 @@ fused_resident_probe: tools/fused_resident_probe.c $(COBJ)
 
 kpad_qkt_probe: tools/kpad_qkt_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# exp_biased_probe — scalar global-max-biased exp_i8 (stable softmax numerator, no per-row op). Board+PPU.
+exp_biased_probe: tools/exp_biased_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

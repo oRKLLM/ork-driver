@@ -8074,25 +8074,36 @@ static int silu_calibrate_idx(ork_npu *c){
 }
 
 /* build a LUT curve at the calibrated indices for f(v*in_scale)/out_scale (R=1); interp gaps, hold ends */
-static void silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
+/* build the SDP activation LUT for f((vv-bias)*in_scale)/out_scale over int8 index vv. bias is a scalar shift
+ * in int8-input units (0 for the plain curve). Used by softmax's scalar GLOBAL-max subtract: exp((x-max)*sc)
+ * keeps the argument <=0 (output in (0,1]) so int8 exp never overflows — a scalar bias is bakeable into the
+ * LUT (unlike a per-row max, which would need the dead per-channel-add), and the constant cancels in P=e/Sum. */
+static void silu_build_curve_biased(ork_npu *c,double(*f)(double),double in_scale,double out_scale,double bias,int16_t *lut){
     int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
     for(int vv=-128;vv<128;vv++){ int idx=c->silu_idx[(uint8_t)vv]; if(idx<0||idx>1029)continue;
-        double val=f(vv*in_scale)/out_scale; long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768;
+        double val=f((vv-bias)*in_scale)/out_scale; long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768;
         lut[idx]=(int16_t)q; set[idx]=1; }
     int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
     if(lo<0)return; for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
     for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
         lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
 }
+static void silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
+    silu_build_curve_biased(c,f,in_scale,out_scale,0.0,lut);   /* plain curve = no bias */
+}
 
-/* Generic int8 pointwise activation via the standalone SDP LUT op: out = clamp_i8(round( f(in*in_scale)/out_scale )).
- * The op is activation-agnostic (the LUT contents define f); calibrate idx once, build f's curve, run. */
-static int act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+/* Generic int8 pointwise activation via the standalone SDP LUT op: out = clamp_i8(round( f((in-bias)*in_scale)/out_scale )).
+ * The op is activation-agnostic (the LUT contents define f); calibrate idx once, build f's curve, run. bias is a
+ * scalar shift in int8-input units (0 for plain). */
+static int act_lut_i8_biased(ork_npu *c,double(*f)(double),double bias,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     if(silu_calibrate_idx(c)) return -1;
-    int16_t lut[1030]; silu_build_curve(c,f,in_scale,out_scale,lut);
+    int16_t lut[1030]; silu_build_curve_biased(c,f,in_scale,out_scale,bias,lut);
     return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
+}
+static int act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+    return act_lut_i8_biased(c,f,0.0,in,M,N,in_scale,out_scale,out,us);
 }
 
 /* Public on-NPU SiLU (int8): out[m*N+n] = clamp_i8(round( silu(in[m][n]*in_scale) / out_scale )) via the
@@ -8117,6 +8128,13 @@ int ork_npu_rsqrt_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,dou
 int ork_npu_exp_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_exp_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return act_lut_i8(c,exp_f,in,M,N,in_scale,out_scale,out,us);
+}
+/* On-NPU exp with a scalar GLOBAL-max subtract baked into the LUT: out = clamp_i8(round( exp((in-max)*in_scale)/out_scale )).
+ * The softmax numerator with numerically-stable max-subtract, WITHOUT a per-row op: max is the scalar global max
+ * (>= every row max, so every argument (in-max)<=0 => exp in (0,1], no int8 overflow), and the constant cancels
+ * in P=e/Sum. `max` is in int8-input units (the int8 score value). Direct only for now (Path B TODO). */
+int ork_npu_exp_i8_biased(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,double max,int8_t *out,double *us){
+    return act_lut_i8_biased(c,exp_f,max,in,M,N,in_scale,out_scale,out,us);
 }
 
 /* int16 index params = RKNN's CAPTURED int16 SiLU index params (from REGCMD_SILU_STD_I16). Their gain (~0.008)

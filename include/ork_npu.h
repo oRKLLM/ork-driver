@@ -708,6 +708,9 @@ int          ork_npu_rsqrt_i8(ork_npu *ctx, const signed char *in, int M, int N,
 int          ork_npu_rsqrt_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
 /* On-NPU exp (int8/int16) — softmax building block, activation-LUT (exp curve): out=clamp(round(exp(in*is)/os)). */
 int          ork_npu_exp_i8(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, signed char *out, double *us);
+/* exp with a scalar GLOBAL-max subtract baked into the LUT: out = clamp_i8(round( exp((in-max)*in_scale)/out_scale )).
+ * Softmax numerator with stable max-subtract but NO per-row op (max = scalar global max in int8-input units). */
+int          ork_npu_exp_i8_biased(ork_npu *ctx, const signed char *in, int M, int N, double in_scale, double out_scale, double max, signed char *out, double *us);
 int          ork_npu_exp_i16(ork_npu *ctx, const short *in, int M, int N, double in_scale, double out_scale, short *out, double *us);
 /* Composed fused softmax over each row of [M][n] (fp16): out = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU:
  * exp (ork_npu_exp_i16) + the Σ reduction (reduce-matmul) run on the NPU, max + normalize on CPU; falls back
