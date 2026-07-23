@@ -136,6 +136,7 @@ struct ork_dom_scratch {
 };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded;   /* fused-chain LUT cache: persist the LUT buffers + patched contents across calls; chain_lut_devloaded tracks whether the SDP SRAM still holds it (invalidated on reset) so ORK_CHAIN_LUT_STICKY can skip the per-call reload submit */
+    int chain_task_P;   /* fused-chain task-config cache: the P-program task array is stable per chain shape and re-bsync'd every call; cache it (keyed on P) so a sticky homogeneous loop skips the rebuild+bsync (valid only when the LUT-load — which shares c->task — was ALSO skipped, i.e. sticky) */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
@@ -9466,17 +9467,27 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // One rknpu_task per program (P total, PC-chained), one single-core submit.
     int submit_ok = 0;
     struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
-    for (int p = 0; p < P; p++) {   // default: matmul task
-        t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
-        t[p].regcfg_amount = 108;
-        t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
-    }
-    for (int i = 0; i < S; i++) {   // SDP tasks (silu/ewmul): enable 0x18, regcfg 69 (single program at prog_off[i])
-        int k = CHAIN_KIND(i);
-        if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
-    }
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    /* task-config cache: the P-program array (enable/regcfg/regcmd_addr — all shape-stable, regcmd_addr fixed
+     * to c->regcmd.dma) is identical every call for a fixed chain. Skip the rebuild+bsync when sticky + the
+     * shape (P) is unchanged AND the LUT-load (which shares c->task) was skipped (chain_lut_devloaded stays 1
+     * only under sticky) — so c->task still holds this array. Any reset/foreign submit invalidates via P mismatch
+     * or the devloaded flag. */
+    { static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
+      int cached = sticky && c->chain_lut_devloaded && c->chain_task_P==P;
+      if(!cached){
+        memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
+        for (int p = 0; p < P; p++) {   // default: matmul task
+            t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
+            t[p].regcfg_amount = 108;
+            t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
+        }
+        for (int i = 0; i < S; i++) {   // SDP tasks (silu/ewmul): enable 0x18, regcfg 69 (single program at prog_off[i])
+            int k = CHAIN_KIND(i);
+            if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
+        }
+        bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        c->chain_task_P = P;
+      } }
     static int tc = -2;
     if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
