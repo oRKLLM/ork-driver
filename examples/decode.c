@@ -28,55 +28,54 @@ static void softmax(float*x,int n){ ork_softmax_f32(x,n); }
 
 typedef struct { float*Kc,*Vc; int len; } kv_t;   /* cache holds KVd = NKV*HD per position */
 
-/* ---- NPU decode attention (round-robin across heads) --------------------------------------------------------
- * One decode step's attention for ALL query heads, dispatched CONCURRENTLY across the NPU cores: each head is one
- * fused [QK^T -> exp -> Sigma-reduce, e.V] int8 chain, and the NH chains are round-robined over the cores via
- * ork_mm_run_chains_rr. The softmax numerator (e) and the denominator (Sigma) come back separately; we normalize
- * (att = e.V / Sigma) on the host. Cores are assumed WARM (the surrounding Q/K/V/O projection matmuls warm them
- * every step via the multi-core matmul path — see the "chain-only probe warming vs typical path" note).
+/* ---- NPU decode attention: HOST-SPLIT (NPU matmuls + full-precision host softmax) — Tier 12e ----------------
+ * One decode step's attention for ALL query heads. The two HEAVY matmuls run on the NPU per head (QK^T, then the
+ * weighted e.V); the CHEAP [1,L] softmax (per-head max-subtract + exp + normalize) runs on the HOST in fp. This
+ * is what ENABLES the NPU branch for real scores: because the host owns the softmax it does a genuine per-head
+ * max-subtraction, so the path is CORRECT for ARBITRARY scores — no scores<=0 precondition, no int8-exp
+ * approximation, no idx_off RE. (The single-submit FUSED chain / ork_mm_run_chains_rr stays reserved for PREFILL,
+ * where large Nq makes on-chip exp worthwhile and its idx_off max-bias is the open RE track — roadmap Tier 12e.)
+ * Cores are warmed by the surrounding projection matmuls. Returns 0 ok, <0 on error (gate falls back to CPU).
  *
- * !!! NUMERIC PRECONDITION — POST-MAX DOMAIN !!!  The fused chain computes QK^T and feeds exp ON-CHIP, with no host
- * step between them, so it cannot subtract each head's max score before exp. exp(int8 score) only fits [0,1] when
- * scores are <= 0. Real decode scores are arbitrary, so this path is correct ONLY once per-head max-subtraction is
- * added. TODO(max-bias): fold the per-head max into the QK^T output-stage requant bias (needs a first-pass max, or
- * a chain exp op that reads an external host-max-subtracted int8 score buffer). Until then this branch is gated OFF
- * by default (see ORK_ATTN_NPU_MIN_CTX below) and is exercised only by tools/attn_decode_bench_probe, which
- * constructs post-max-safe inputs. Returns 0 on success, <0 on dispatch error. */
+ * NOTE(overhead): dispatches 2 matmuls/head SEQUENTIALLY and repacks K^T/V each step (the KV cache grows per
+ * token). For long context the matmuls dominate and the NPU wins (attn_decode_bench_probe); the per-step pack +
+ * per-head submit overhead is exactly what the Tier 12d doorbell dispatcher will amortize (resident K/V + heads
+ * dispatched concurrently). The int8 matmul 0x1040 schedule zeroes output for K<256, so the e.V matmul (K=L) needs
+ * L>=256 — guarded below; shorter contexts return -3 so the gate stays on CPU (which is faster there anyway). */
 static int attn_decode_npu(ork_npu*ctx,const Cfg*c,const float*q,const kv_t*kv,float*att,int pos){
-    int NH=c->NH,NKV=c->NKV,HD=c->HD,KVd=NKV*HD,grp=NH/NKV, L=pos+1, Lp=(L+511)&~511, Kp=512, Nq=1;
-    /* chain graph: [0]=QK^T(int8 requant), [1]=exp(reads 0), [2]=Sigma via ones-weight(reads 1), [3]=e.V(reads 1) */
-    ork_chain_op ops[4]={ {1,-1,0,0x4000,16}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
-    double in_scale=0.0625, out_scale=1.0/127.0;
-    /* crude symmetric int8 quant of this step's Q and the cached K/V (per-tensor absmax). TODO(calib): per-head /
-     * per-channel scales + the sqrt(HD) attention scale folded into r_mult, instead of this bench-grade absmax. */
-    float qmax=1e-6f; for(int i=0;i<NH*HD;i++){ float a=fabsf(q[i]); if(a>qmax)qmax=a; }
-    float kmax=1e-6f,vmax=1e-6f; for(int j=0;j<L;j++)for(int e=0;e<KVd;e++){ float ka=fabsf(kv->Kc[(size_t)j*KVd+e]),va=fabsf(kv->Vc[(size_t)j*KVd+e]); if(ka>kmax)kmax=ka; if(va>vmax)vmax=va; }
-    float qs=127.0f/qmax, ks=127.0f/kmax, vs=127.0f/vmax;
-    ork_w *w_ones=NULL, **w_kt=calloc(NH,sizeof*w_kt), **w_v=calloc(NH,sizeof*w_v);
-    int8_t **Qp=calloc(NH,sizeof*Qp); int32_t **scb=calloc(NH,sizeof*scb),**eb=calloc(NH,sizeof*eb),**ss=calloc(NH,sizeof*ss),**avb=calloc(NH,sizeof*avb);
-    ork_mm_task_i8 **chains=calloc(NH,sizeof*chains); int *S=calloc(NH,sizeof*S); int rc=0;
-    { int8_t *o=malloc((size_t)Lp*32); memset(o,0,(size_t)Lp*32); for(int j=0;j<L;j++)for(int n=0;n<32;n++)o[(size_t)j*32+n]=1; w_ones=ork_mm_pack_i8(ctx,Lp,32,o); free(o); }
-    for(int hh=0;hh<NH && !rc;hh++){ int kvh=hh/grp;
-        int8_t *KTp=calloc((size_t)Kp*Lp,1), *Vp=calloc((size_t)Lp*HD,1);
-        for(int e=0;e<HD;e++)for(int j=0;j<L;j++) KTp[(size_t)e*Lp+j]=(int8_t)lrintf(kv->Kc[(size_t)j*KVd+kvh*HD+e]*ks);
+    int NH=c->NH,NKV=c->NKV,HD=c->HD,KVd=NKV*HD,grp=NH/NKV, L=pos+1, Kp=512, rc=0;
+    if(L<256) return -3;   /* e.V contraction K=L below the int8 0x1040 sched floor -> let the gate use CPU */
+    float scale=1.0f/sqrtf((float)HD);
+    int8_t *Qp=calloc((size_t)Kp,1), *KTp=malloc((size_t)Kp*L), *Vp=malloc((size_t)L*HD), *w8=malloc((size_t)L);
+    int32_t *scores=malloc((size_t)L*4), *attv=malloc((size_t)HD*4); double *sc=malloc((size_t)L*sizeof(double));
+    if(!Qp||!KTp||!Vp||!w8||!scores||!attv||!sc){ rc=-2; goto done; }
+    for(int hh=0; hh<NH && !rc; hh++){ int kvh=hh/grp;
+        /* per-head symmetric int8 quant scales (absmax over this head's Q and this kv-head's K/V slice) */
+        float qmax=1e-6f,kmax=1e-6f,vmax=1e-6f;
+        for(int e=0;e<HD;e++){ float a=fabsf(q[(size_t)hh*HD+e]); if(a>qmax)qmax=a; }
+        for(int j=0;j<L;j++)for(int e=0;e<HD;e++){ float ka=fabsf(kv->Kc[(size_t)j*KVd+kvh*HD+e]),va=fabsf(kv->Vc[(size_t)j*KVd+kvh*HD+e]); if(ka>kmax)kmax=ka; if(va>vmax)vmax=va; }
+        float qs=127.0f/qmax, ks=127.0f/kmax, vs=127.0f/vmax;
+        /* NPU pass 1 — QK^T: W=K^T[Kp,L] int8 (head_dim zero-padded to Kp), A=Q[1,Kp] int8 -> scores[1,L] int32 */
+        for(int e=0;e<HD;e++)for(int j=0;j<L;j++) KTp[(size_t)e*L+j]=(int8_t)lrintf(kv->Kc[(size_t)j*KVd+kvh*HD+e]*ks);
+        memset(Qp,0,Kp); for(int e=0;e<HD;e++) Qp[e]=(int8_t)lrintf(q[(size_t)hh*HD+e]*qs);
+        ork_w *wkt=ork_mm_pack_i8(ctx,Kp,L,KTp); if(!wkt){ rc=-2; break; }
+        ork_mm_task_i8 t1={ wkt,1,Qp,scores }; rc=ork_mm_run_chain_i8(ctx,1,&t1); ork_w_free(wkt); if(rc) break;
+        /* HOST softmax (fp, REAL per-head max-subtraction) — the piece the fused chain can't do */
+        double mx=-1e300; for(int j=0;j<L;j++){ sc[j]=(double)scores[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
+        double Z=0; for(int j=0;j<L;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
+        /* normalize, then quantize weights with ws=127/max(weight): softmax weights are ~1/L (tiny), so a fixed
+         * ws=127 would round them all to 0 (int8 underflow). Scale by the max so the peak weight hits 127. */
+        double wmax=0; for(int j=0;j<L;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; }
+        double ws=127.0/(wmax>1e-9?wmax:1.0);
+        for(int j=0;j<L;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
+        /* NPU pass 2 — e.V: W=V[L,HD] int8, A=weights[1,L] int8 -> att[1,HD] int32 */
         for(int j=0;j<L;j++)for(int e=0;e<HD;e++) Vp[(size_t)j*HD+e]=(int8_t)lrintf(kv->Vc[(size_t)j*KVd+kvh*HD+e]*vs);
-        Qp[hh]=calloc((size_t)Nq*Kp,1); for(int e=0;e<HD;e++) Qp[hh][e]=(int8_t)lrintf(q[hh*HD+e]*qs);
-        w_kt[hh]=ork_mm_pack_i8(ctx,Kp,Lp,KTp); w_v[hh]=ork_mm_pack_i8(ctx,Lp,HD,Vp); free(KTp); free(Vp);
-        if(!w_kt[hh]||!w_v[hh]||!w_ones){ rc=-2; break; }
-        scb[hh]=calloc((size_t)Nq*Lp,4); eb[hh]=calloc((size_t)Nq*Lp,4); ss[hh]=calloc((size_t)Nq*32,4); avb[hh]=calloc((size_t)Nq*HD,4);
-        chains[hh]=malloc(4*sizeof(ork_mm_task_i8)); S[hh]=4;
-        chains[hh][0]=(ork_mm_task_i8){ w_kt[hh],Nq,Qp[hh],scb[hh] };
-        chains[hh][1]=(ork_mm_task_i8){ w_kt[hh],Nq,(int8_t*)scb[hh],eb[hh] };
-        chains[hh][2]=(ork_mm_task_i8){ w_ones,Nq,(int8_t*)eb[hh],ss[hh] };
-        chains[hh][3]=(ork_mm_task_i8){ w_v[hh],Nq,(int8_t*)eb[hh],avb[hh] };
+        ork_w *wv=ork_mm_pack_i8(ctx,L,HD,Vp); if(!wv){ rc=-2; break; }
+        ork_mm_task_i8 t2={ wv,1,w8,attv }; rc=ork_mm_run_chain_i8(ctx,1,&t2); ork_w_free(wv); if(rc) break;
+        for(int e=0;e<HD;e++) att[(size_t)hh*HD+e]=(float)((double)attv[e]/(ws*vs));  /* de-quant: weight-scale ws * V-scale vs */
     }
-    if(!rc) rc=ork_mm_run_chains_rr(ctx,NH,(const ork_mm_task_i8*const*)chains,S,ops,in_scale,out_scale);
-    if(!rc){ for(int hh=0;hh<NH;hh++){ double Sn=(double)ss[hh][0]; if(Sn<=0)Sn=1;
-        for(int e=0;e<HD;e++) att[hh*HD+e]=(float)((double)avb[hh][e]/Sn/vs); } }   /* de-quant V scale */
-    for(int hh=0;hh<NH;hh++){ if(w_kt[hh])ork_w_free(w_kt[hh]); if(w_v[hh])ork_w_free(w_v[hh]);
-        free(Qp[hh]);free(scb[hh]);free(eb[hh]);free(ss[hh]);free(avb[hh]);free(chains[hh]); }
-    if(w_ones){ ork_w_free(w_ones); }
-    free(w_kt);free(w_v);free(Qp);free(scb);free(eb);free(ss);free(avb);free(chains);free(S);
+done:
+    free(Qp);free(KTp);free(Vp);free(w8);free(scores);free(attv);free(sc);
     return rc;
 }
 
@@ -110,19 +109,23 @@ static void step(ork_npu*ctx,const Cfg*c,const float*x1,float*y1,kv_t*kv,const f
      * Threshold is env-tunable (ORK_ATTN_NPU_MIN_CTX) for experiments; the default keeps short contexts — and this
      * file's tiny SEQ=16 validation — on the CPU path so decode's existing NPU-vs-CPU check is unaffected.
      *
+     * The NPU branch (attn_decode_npu) is now the HOST-SPLIT path — NPU matmuls + full-precision host softmax —
+     * so it is CORRECT for arbitrary scores (real per-head max-subtraction), not just the post-max domain. It is
+     * enabled by the gate; the threshold is purely the perf crossover, not a correctness guard (attn_decode_npu
+     * additionally self-guards L>=256 for the int8 sched floor and returns -3 -> CPU below that).
      * TODO(doorbell-dispatcher): replace this static, per-call, either/or CPU-vs-NPU branch with the DOORBELL
      * HETEROGENEOUS DISPATCHER — one scheduler owning BOTH the CPU worker pool AND the NPU cores, routing each
      * unit of work (per head, or per layer) to CPU or NPU by context length AND live occupancy/queue depth, so
      * long-context heads stream to the NPU while short ones run on CPU, OVERLAPPED rather than exclusive. The
-     * context-length test here becomes one input to that router's cost model.
-     * TODO(max-bias): the NPU branch (attn_decode_npu) is numerically valid ONLY in the post-max (scores<=0)
-     * domain — the fused chain has no per-head max-subtraction (see that function). Enable it for arbitrary
-     * scores only after max-subtraction + the sqrt(HD)/calibrated scales land; until then the default threshold
-     * keeps it dormant and it is exercised only by the post-max-safe benchmark probe. */
-    static int npu_min_ctx = -1;
-    if (npu_min_ctx < 0) { const char*e=getenv("ORK_ATTN_NPU_MIN_CTX"); npu_min_ctx = e ? atoi(e) : 512; }
+     * context-length test here becomes one input to that router's cost model. (Roadmap Tier 12d.) */
+    /* Default DISABLED (0). The NPU branch is numerically READY (host-split, coherent for arbitrary scores), but
+     * it repacks K^T/V every step — that per-step packing is ~15x the matmul cost and makes it perf-NEGATIVE vs
+     * CPU until K/V are kept RESIDENT (pack-once + append), which is the Tier 12d dispatcher work. So it stays off
+     * by default; set ORK_ATTN_NPU_MIN_CTX=<ctx> to force-enable it above a context length for experiments. */
+    static int npu_min_ctx = -2;
+    if (npu_min_ctx == -2) { const char*e=getenv("ORK_ATTN_NPU_MIN_CTX"); npu_min_ctx = e ? atoi(e) : 0; }
     int used_npu = 0;
-    if (useNPU && (pos+1) >= npu_min_ctx) used_npu = (attn_decode_npu(ctx,c,q,kv,att,pos) == 0);
+    if (useNPU && npu_min_ctx > 0 && (pos+1) >= npu_min_ctx) used_npu = (attn_decode_npu(ctx,c,q,kv,att,pos) == 0);
     if (!used_npu) {   /* CPU scalar softmax attention: default path, and the fallback when the gate is closed/errs */
       for(int hh=0;hh<NH;hh++){int kvh=hh/grp; float sc[SEQ];
         for(int j=0;j<=pos;j++){float dt=0;for(int e=0;e<HD;e++)dt+=q[hh*HD+e]*kv->Kc[(size_t)j*KVd+kvh*HD+e];sc[j]=dt*scale;}
