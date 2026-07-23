@@ -208,7 +208,10 @@ ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);
  * so decode attention keeps the KV packed and only the matmuls run per token. Run with M=1, K/N=Lmax (keys beyond
  * the current length are zero -> contribute nothing); the caller does the [1,len] softmax on the host. HD%32,
  * Lmax%32, Lmax<=nmax. Local NPU only. See src/npu.c for the tiling + scale contract (per-key ks / single vs). */
+#ifndef ORK_KV_RESIDENT_T
+#define ORK_KV_RESIDENT_T
 typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; uint64_t orkd_kv; } ork_kv_resident;
+#endif
 ork_kv_resident *ork_kv_resident_alloc(ork_npu *ctx, int HD, int Lmax);
 int              ork_kv_append(ork_npu *ctx, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow);
 void             ork_kv_resident_free(ork_npu *ctx, ork_kv_resident *kv);

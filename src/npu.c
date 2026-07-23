@@ -212,8 +212,13 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; };
-/* Tier 12f resident-KV handle — MUST match the typedef in include/ork_npu.h (npu.c doesn't include that header). */
+/* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
+ * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
+ * so the guard makes this local copy defer to it (identical shape either way — no conflicting-types). */
+#ifndef ORK_KV_RESIDENT_T
+#define ORK_KV_RESIDENT_T
 typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; uint64_t orkd_kv; } ork_kv_resident;
+#endif
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
