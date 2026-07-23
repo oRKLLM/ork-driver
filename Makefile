@@ -838,3 +838,6 @@ reqi8_probe: tools/reqi8_probe.c $(COBJ)
 
 qkvrope_probe: tools/qkvrope_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+oresidual_probe: tools/oresidual_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
