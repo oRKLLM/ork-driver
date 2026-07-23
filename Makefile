@@ -847,3 +847,6 @@ i16out_seq_probe: tools/i16out_seq_probe.c $(COBJ)
 
 fused_exp_probe: tools/fused_exp_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+fused_act_probe: tools/fused_act_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
