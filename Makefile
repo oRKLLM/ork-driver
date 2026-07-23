@@ -875,3 +875,6 @@ softmax_i8_split_probe: tools/softmax_i8_split_probe.c $(COBJ)
 
 minimal_i8mm_probe: tools/minimal_i8mm_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+swreduce_probe: tools/swreduce_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

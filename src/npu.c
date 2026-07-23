@@ -5044,6 +5044,14 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         }   /* result already in C's DMA buffer */
         memcpy(C,c->cres,need); return 0;
     }
+    /* Establish the MATMUL task for submit1_db explicitly (int8). This path only refreshes c->regcmd contents
+     * and had RELIED on c->task persisting as a matmul from a prior submit — but a preceding SDP/LUT op (e.g.
+     * exp_i8 in the resident softmax chain) overwrites c->task with enable_mask=0x1d + its own regcmd, so the
+     * following matmul submit ran the SDP task instead -> stale/garbage output (reproduced direct:
+     * swreduce_probe T2 = MM_I8 after exp_i8). Set it here so the matmul never inherits an SDP task. */
+    if(dt==DT_I8){ struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+        t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma;
+        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
         int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
