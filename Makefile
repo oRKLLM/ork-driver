@@ -844,3 +844,6 @@ oresidual_probe: tools/oresidual_probe.c $(COBJ)
 
 i16out_seq_probe: tools/i16out_seq_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+fused_exp_probe: tools/fused_exp_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
