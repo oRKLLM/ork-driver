@@ -823,3 +823,9 @@ chain_i16silu_probe: tools/chain_i16silu_probe.c $(COBJ)
 # i8out_map_probe — DEPRECATED/QUARANTINED (dup of test_mm_i8_out8). Stub unless -DORK_DEPRECATED_PROBES.
 i8out_map_probe: tools/i8out_map_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# task #20 (A1 path B): symmetric int8 softmax reduce (exp_i8 -> MM_I8) — no mixed-precision bridge.
+# direct:  sudo env ORK_MM_TIMEOUT=3000 ./int8reduce_probe
+# orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./int8reduce_probe
+int8reduce_probe: tools/int8reduce_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

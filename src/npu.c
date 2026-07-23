@@ -13046,7 +13046,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               case ORK_OP_MM_F16_F16OUT: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*2); break;   /* fp16 output */
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
-              case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
+              case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: case ORK_OP_EXP_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
               case ORK_OP_SILU_I16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* int16 unary SDP */
               case ORK_OP_EWMUL_I8: case ORK_OP_ADD_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].bbytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 binary SDP */
               /* --- attention seq ops (task #20): weightless SDP; daemon reconstructs generically -> Path A adapters.
