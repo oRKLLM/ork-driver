@@ -858,3 +858,6 @@ fused_softmax_probe: tools/fused_softmax_probe.c $(COBJ)
 # Board+PPU tool — sudo env ORK_MM_TIMEOUT=3000 timeout 60 ./fused_resident_probe [M] [d] [n]
 fused_resident_probe: tools/fused_resident_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+kpad_qkt_probe: tools/kpad_qkt_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
