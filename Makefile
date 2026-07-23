@@ -853,3 +853,8 @@ fused_act_probe: tools/fused_act_probe.c $(COBJ)
 
 fused_softmax_probe: tools/fused_softmax_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# fused_resident_probe — pack-once/run-many resident fused activation (calibration factored out of per-call).
+# Board+PPU tool — sudo env ORK_MM_TIMEOUT=3000 timeout 60 ./fused_resident_probe [M] [d] [n]
+fused_resident_probe: tools/fused_resident_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

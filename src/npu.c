@@ -202,7 +202,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; };
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
@@ -3102,7 +3102,7 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4);
  * are VIEWS into a single dedicated buffer (grouped-i4, own_buf_valid=1) reclaim that one buffer. */
 void ork_mm_free(ork_npu *c, ork_w *w){
     if(!w) return;
-    if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w); return; }   /* Path B: free the daemon-resident weight */
+    if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w->fa_lut); free(w); return; }   /* Path B: free the daemon-resident weight */
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
@@ -3120,7 +3120,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     /* size-bounded consolidated import: Bb[] entries are views into own_bufs[] chunks — destroy each chunk. */
     if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) bdestroy(c->fd,&w->own_bufs[i]);
     free(w->own_bufs);
-    free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w);
+    free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w->fa_lut); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
@@ -5489,28 +5489,49 @@ static double f16lut_rsqrt(double x, void *ctx){ struct f16lut_rsqrt_ctx *p=ctx;
 struct f16act_neg { double (*fn)(double,void*); void *ctx; };
 static double f16act_negtramp(double u, void *p){ struct f16act_neg *q=p; return q->fn(-u,q->ctx); }
 
-int ork_mm_run_f16_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
-                       double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
-    if(!ork_ppu_fuse_enabled(c)) return -2;
-    if(!c||!B||!A||!C||!fn||K%32||N%16||M<1||in_hi<=in_lo) return -2;
-    /* SINGLE-SIGNED only: the fp16 SDP index spreads for negative acc only, so acc=scale*(A·B) must be kept
-     * negative across the whole output range. Positive-input fns (rsqrt of ss): pack -S*B (acc=-S*x<0).
-     * Negative-input fns (softmax exp of scores-max<=0): build g(u)=fn(-u) over positive u and pack +S*B
-     * (acc=+S*x<0). Mixed-sign output can't be served by one fp16 LUT (needs two) -> -2. */
+/* PACK-ONCE fused-activation weight: calibrate the fn PWL LUT over [in_lo,in_hi] and pack the S-scaled weight,
+ * baking BOTH into the resident ork_w (w->fa_lut / w->fa_osc). This factors the calibration OUT of the per-call
+ * path so a fused-activation matmul can be RESIDENT — packed once, run many times via ork_mm_run_f16_fused_act
+ * (no per-call LUT rebuild / re-pack), which is what lets fused exp/rsqrt/silu compose in a resident seq (a
+ * standalone re-pack every call defeats residency). Same single-signed constraint as ork_mm_run_f16_act:
+ * in_lo>=0 (positive-input, pack -S*B) or in_hi<=0 (negative-input via neg-trampoline, pack +S*B); mixed -> NULL.
+ * The returned weight carries fn baked in — the run path needs NO fn pointer (so it crosses a socket/seq op). */
+ork_w *ork_mm_pack_f16_fused_act(ork_npu *c, int K, int N, const ork_f16 *B,
+                                 double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
+    if(!ork_ppu_fuse_enabled(c)) return NULL;
+    if(!c||!B||!fn||K%32||N%16||in_hi<=in_lo) return NULL;
     double packsign, blo, bhi; double (*bfn)(double,void*); void *bctx; struct f16act_neg neg;
     if(in_lo >= 0){ bfn=fn; bctx=fnctx; blo=in_lo; bhi=in_hi; packsign=-1.0; }
     else if(in_hi <= 0){ neg.fn=fn; neg.ctx=fnctx; bfn=f16act_negtramp; bctx=&neg; blo=-in_hi; bhi=-in_lo; packsign=+1.0; }
-    else return -2;   /* mixed sign — unsupported by the single-signed fp16 index */
-    int16_t *lut=malloc(1030*sizeof(int16_t)); if(!lut) return -1;
+    else return NULL;   /* mixed sign — unsupported by the single-signed fp16 index */
+    int16_t *lut=malloc(1030*sizeof(int16_t)); if(!lut) return NULL;
     double S=0,R=0,osc=0;
-    if(ork_mm_build_f16_lut(c,bfn,bctx,blo,bhi,lut,&S,&R,&osc)){ free(lut); return -2; }
-    ork_f16 *Bs=malloc((size_t)K*N*sizeof(ork_f16)); if(!Bs){ free(lut); return -1; }
+    if(ork_mm_build_f16_lut(c,bfn,bctx,blo,bhi,lut,&S,&R,&osc)){ free(lut); return NULL; }
+    ork_f16 *Bs=malloc((size_t)K*N*sizeof(ork_f16)); if(!Bs){ free(lut); return NULL; }
     for(size_t i=0;i<(size_t)K*N;i++) Bs[i]=(ork_f16)(packsign*S*(double)(float)B[i]);   /* acc = packsign*S*(A·B) < 0 */
     ork_w *w=ork_mm_pack(c,K,N,Bs); free(Bs);
-    if(!w){ free(lut); return -1; }
-    int rc = ork_mm_run_f16_silu(c,w,M,A,C,0,0xffffc000u,0x56391100u,lut,1030);   /* matmul + fused LUT, 1 submit */
-    if(rc==0) for(size_t i=0;i<(size_t)M*N;i++) C[i]=(float)((double)C[i]*osc);   /* recover fn(A·B) */
-    ork_mm_free(c,w); free(lut);
+    if(!w){ free(lut); return NULL; }
+    w->fa_lut=lut; w->fa_osc=osc;   /* baked into the resident weight; freed by ork_mm_free */
+    return w;
+}
+
+/* RUN a pre-packed fused-activation weight: C = fn(A·B) in ONE submit, reusing the resident LUT/scale. The
+ * fused-activation twin of ork_mm_run_stream_f16 — no calibration, no re-pack. -2 if w has no baked LUT. */
+int ork_mm_run_f16_fused_act(ork_npu *c, ork_w *w, int M, const ork_f16 *A, float *C){
+    if(!c||!w||!A||!C||M<1) return -2;
+    if(!w->fa_lut) return -2;   /* not a fused-activation weight (use ork_mm_pack_f16_fused_act) */
+    int rc = ork_mm_run_f16_silu(c,w,M,A,C,0,0xffffc000u,0x56391100u,w->fa_lut,1030);   /* matmul + fused LUT, 1 submit */
+    if(rc==0){ double osc=w->fa_osc; for(size_t i=0;i<(size_t)M*w->N;i++) C[i]=(float)((double)C[i]*osc); }   /* recover fn(A·B) */
+    return rc;
+}
+
+int ork_mm_run_f16_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
+                       double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
+    if(!A||!C||M<1) return -2;
+    ork_w *w=ork_mm_pack_f16_fused_act(c,K,N,B,fn,fnctx,in_lo,in_hi);   /* calibrate + pack (one-shot) */
+    if(!w) return -2;
+    int rc=ork_mm_run_f16_fused_act(c,w,M,A,C);
+    ork_mm_free(c,w);
     return rc;
 }
 

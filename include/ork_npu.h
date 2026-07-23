@@ -406,6 +406,13 @@ int          ork_mm_build_f16_lut(ork_npu *ctx, double (*fn)(double, void *), vo
  * N%16<=nmax. rk3588 PPU-fuse-gated. 0/ok, -2 shape/SoC(PPU off), -1 wedge/alloc. */
 int          ork_mm_run_f16_act(ork_npu *ctx, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
                                 double (*fn)(double, void *), void *fnctx, double in_lo, double in_hi);
+/* PACK-ONCE / RUN-MANY split of the fused activation, for RESIDENT reuse (fused exp/rsqrt/silu in a seq): pack
+ * bakes the calibrated LUT + out-scale into the weight (ork_mm_pack_f16_fused_act), run replays it with no
+ * re-pack (ork_mm_run_f16_fused_act, C[M,N]=fn(A·B), one submit). Same single-signed band rule as _act; the
+ * run path carries no fn pointer (crosses a seq/socket). NULL/-2 on bad shape/mixed-sign/no-baked-LUT. */
+ork_w       *ork_mm_pack_f16_fused_act(ork_npu *ctx, int K, int N, const ork_f16 *B,
+                                       double (*fn)(double, void *), void *fnctx, double in_lo, double in_hi);
+int          ork_mm_run_f16_fused_act(ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, float *C);
 /* Calibrate the fp16 fused SiLU for a gate spanning [-Gmax,Gmax] (caps Gmax → the fp16 spread band, then
  * ork_mm_build_f16_lut). silu(gate)=C_out*out_scale; pack the gate weight as -S*W. See Exp-2026-07-05. */
 int          ork_mm_build_f16_silu_lut(ork_npu *ctx, double Gmax, short *lut,
