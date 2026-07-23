@@ -13032,7 +13032,7 @@ static int seq_disp_add_f16 (ork_npu *c,const ork_seq_op *o){ double us; return 
 /* Uniform single-input SDP activations beyond the original seq subset (same (in,M,N,in_scale,out_scale,out) shape). */
 static int seq_disp_gelu_i16(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_gelu_i16(c,(const int16_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int16_t*)o->C,&us); }
 static int seq_disp_rsqrt_i8(ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_rsqrt_i8 (c,(const int8_t*) o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*) o->C,&us); }
-static int seq_disp_exp_i8  (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_exp_i8   (c,(const int8_t*) o->A,o->M,o->N,o->in_scale,o->out_scale,(int8_t*) o->C,&us); }
+static int seq_disp_exp_i8  (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_exp_i8_biased(c,(const int8_t*) o->A,o->M,o->N,o->in_scale,o->out_scale,o->b_scale,(int8_t*) o->C,&us); }  /* b_scale = scalar max-bias (0 = plain exp) */
 static int seq_disp_exp_i16 (ork_npu *c,const ork_seq_op *o){ double us; return ork_npu_exp_i16  (c,(const int16_t*)o->A,o->M,o->N,o->in_scale,o->out_scale,(int16_t*)o->C,&us); }
 /* Softmax / RMSNorm normalize primitives (task #20 attention & full-layer chain). row-max: softmax max-shift
  * (reduce N->1). mul_perchan: the normalize A*b with b=1/Σ per query (also A.V per-channel scale, RMSNorm affine)

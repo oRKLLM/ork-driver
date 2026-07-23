@@ -865,3 +865,7 @@ kpad_qkt_probe: tools/kpad_qkt_probe.c $(COBJ)
 # exp_biased_probe — scalar global-max-biased exp_i8 (stable softmax numerator, no per-row op). Board+PPU.
 exp_biased_probe: tools/exp_biased_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# softmax_i8_seq_probe — resident int8 softmax island as one seq (K-pad QK^T -> biased exp -> reduce). Board+PPU.
+softmax_i8_seq_probe: tools/softmax_i8_seq_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
