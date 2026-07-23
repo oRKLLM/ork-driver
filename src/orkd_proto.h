@@ -21,7 +21,7 @@
 #include <string.h>
 #include <unistd.h>
 
-#define ORKD_PROTO_VERSION 2u   /* v2: op-submit messages (run/chain/seq + ring slot) carry a client-chosen domain id */
+#define ORKD_PROTO_VERSION 3u   /* v3: seq ops can back-reference a prior op's resident output (a_src/b_src/c_keep, A2 intermediate residency); v2: op-submit messages carry a client-chosen domain id */
 
 /* Socket path: $XDG_RUNTIME_DIR/orkd.sock if set, else /tmp/orkd-<uid>.sock. orkd_sock_path() (below) resolves
  * it identically for daemon (bind) and client (connect) so both agree without configuration. */
@@ -202,6 +202,11 @@ struct orkd_seq_op {     /* one op in the sequence; kind == ork_seq_kind. weight
     int32_t  mult, shift;              /* SDP ewmul_i8 requant */
     int32_t  group;                    /* dependency grouping (0 = ungrouped; >0 = chain id, see ork_seq_op.group) */
     double   in_scale, out_scale, b_scale;   /* SDP scales (silu/gelu in/out; add uses in=a_scale + b_scale/out) */
+    /* A2 intermediate residency (v3): 0 = input uploaded / output returned (default = pre-v3 behavior).
+     * a_src/b_src = j+1 -> this op's A/B is the resident output buffer of op j (not uploaded). c_keep = 1 ->
+     * this op's output stays resident on the daemon (consumed by a later op), not shipped back. */
+    int32_t  a_src, b_src;
+    uint32_t c_keep;
 };
 struct orkd_sdp {        /* stateless SDP op: nin input payloads follow (each M*N*in_esz), reply carries M*N*out_esz */
     uint32_t op;         /* enum orkd_sdp_op */

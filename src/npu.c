@@ -13022,6 +13022,14 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               default: ok=0; break;   /* SILU_F16: not yet routable (mirrors the direct -3 TODO row) */
             }
         }
+        /* A2 intermediate residency: an op's A/B pointing at a PRIOR op's C (same buffer) means "consume that
+         * op's output on-device" — skip the re-upload (a_src/b_src=j+1) and keep the referenced output resident
+         * (c_keep, not shipped back). Callers express a resident dependent chain by aliasing buffers (which is
+         * already required for the direct path); un-aliased (final) outputs are still returned. n==1 seqs and
+         * non-aliasing callers get a_src/b_src/c_keep=0 => byte-identical to pre-v3. */
+        if(ok) for(int i=0;i<n;i++) for(int j=0;j<i;j++){
+            if(ops[i].A && ops[i].A==ops[j].C){ so[i].a_src=j+1; so[j].c_keep=1; }
+            if(ops[i].B && ops[i].B==ops[j].C){ so[i].b_src=j+1; so[j].c_keep=1; } }
         if(ok){ int sdom=0; for(int i=0;i<n;i++) if(ops[i].w && ops[i].w->is_orkd){ sdom=ops[i].w->domain; break; }   /* v2: carry the sequence's domain (its matmul weights share one) */
                 orkd_set_op_domain(c->daemon, (uint32_t)sdom); }
         int rc = ok ? orkd_submit_seq(c->daemon, n, so) : -3;

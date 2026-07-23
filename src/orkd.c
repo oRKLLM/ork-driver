@@ -384,7 +384,8 @@ static int handle_seq(struct client *cl, ork_npu *npu, uint64_t tag){
     size_t inoff = 0, ctot = 0; int ok = (seq && Cs);
     for (int i = 0; ok && i < n; i++){
         struct orkd_seq_op *o = &ops[i];
-        if ((size_t)inoff + o->abytes + o->bbytes > sh.in_total){ ok = 0; break; }
+        size_t need = (o->a_src ? 0 : o->abytes) + (o->b_src ? 0 : o->bbytes);   /* A2: referenced inputs aren't in the uploaded blob */
+        if ((size_t)inoff + need > sh.in_total){ ok = 0; break; }
         seq[i].kind = (ork_seq_kind)o->kind; seq[i].M = (int)o->M; seq[i].N = (int)o->N;
         seq[i].in_scale = o->in_scale; seq[i].out_scale = o->out_scale; seq[i].b_scale = o->b_scale; seq[i].mult = o->mult; seq[i].shift = o->shift; seq[i].group = (int)o->group;
         if (o->weight_id){   /* matmul op: resolve the resident weight in this client's table */
@@ -393,18 +394,21 @@ static int handle_seq(struct client *cl, ork_npu *npu, uint64_t tag){
             if (!cw){ ok = 0; break; }
             seq[i].w = cw->w;
         }
-        seq[i].A = inblob + inoff; inoff += o->abytes;
-        seq[i].B = o->bbytes ? inblob + inoff : NULL; inoff += o->bbytes;
+        /* A2: a_src/b_src = j+1 -> input is op j's resident output buffer (Cs[j]); else uploaded in the blob. */
+        if (o->a_src){ if (o->a_src > i){ ok = 0; break; } seq[i].A = Cs[o->a_src - 1]; }
+        else { seq[i].A = inblob + inoff; inoff += o->abytes; }
+        if (o->b_src){ if (o->b_src > i){ ok = 0; break; } seq[i].B = Cs[o->b_src - 1]; }
+        else { seq[i].B = o->bbytes ? inblob + inoff : NULL; inoff += o->bbytes; }
         Cs[i] = malloc(o->cbytes ? o->cbytes : 1);
         if (!Cs[i]){ ok = 0; break; }
-        seq[i].C = Cs[i]; ctot += o->cbytes;
+        seq[i].C = Cs[i]; if (!o->c_keep) ctot += o->cbytes;   /* c_keep => stays resident, not shipped back */
     }
     int rc = ok ? ork_submit_seq(npu, seq, n) : -2;
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
     int payload = (rc == 0);
     struct orkd_hdr rh = { ORKD_SEQ_OK, (uint32_t)(sizeof hh + (payload ? ctot : 0)), tag };
     int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
-    if (!werr && payload) for (int i = 0; i < n && !werr; i++) werr = writen(cl->fd, Cs[i], ops[i].cbytes);
+    if (!werr && payload) for (int i = 0; i < n && !werr; i++) if (!ops[i].c_keep) werr = writen(cl->fd, Cs[i], ops[i].cbytes);   /* A2: skip resident intermediates */
     if (Cs) for (int i = 0; i < n; i++) free(Cs[i]);
     free(seq); free(Cs); free(ops); free(inblob);
     return werr ? -1 : 0;

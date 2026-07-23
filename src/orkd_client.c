@@ -483,8 +483,12 @@ int orkd_run_chain_i8(orkd_conn *c, int S, const orkd_chain_task_c *t){
 int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
     if (!c || c->fd < 0 || n < 1 || n > ORKD_SEQ_MAX || !o) return -1;
     uint64_t in_total = 0, c_total = 0;
-    for (int i = 0; i < n; i++){ if (!o[i].A || !o[i].C || (o[i].bbytes && !o[i].B)) return -1;
-        in_total += (uint64_t)o[i].abytes + o[i].bbytes; c_total += o[i].cbytes; }
+    for (int i = 0; i < n; i++){                       /* A2: a_src/b_src>0 => input is a resident prior output (not uploaded); c_keep => output stays resident (not returned) */
+        int up_a = (o[i].a_src == 0), up_b = (o[i].b_src == 0 && o[i].bbytes != 0);
+        if ((up_a && !o[i].A) || (up_b && !o[i].B) || (!o[i].c_keep && !o[i].C)) return -1;
+        if (up_a) in_total += o[i].abytes;
+        if (up_b) in_total += o[i].bbytes;
+        if (!o[i].c_keep) c_total += o[i].cbytes; }
     if (in_total > 0xffffffffu) return -1;
     struct orkd_seq_hdr sh; memset(&sh, 0, sizeof sh); sh.n = (uint32_t)n; sh.in_total = (uint32_t)in_total; sh.domain = c->op_domain;
     uint32_t plen = (uint32_t)(sizeof sh + (size_t)n * sizeof(struct orkd_seq_op) + in_total);
@@ -494,8 +498,10 @@ int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
         w.kind = o[i].kind; w.M = (uint32_t)o[i].M; w.N = (uint32_t)o[i].N; w.weight_id = o[i].weight_id;
         w.abytes = o[i].abytes; w.bbytes = o[i].bbytes; w.cbytes = o[i].cbytes;
         w.mult = o[i].mult; w.shift = o[i].shift; w.group = o[i].group; w.in_scale = o[i].in_scale; w.out_scale = o[i].out_scale; w.b_scale = o[i].b_scale;
+        w.a_src = o[i].a_src; w.b_src = o[i].b_src; w.c_keep = (uint32_t)o[i].c_keep;
         if (wn(c->fd, &w, sizeof w)) return -1; }
-    for (int i = 0; i < n; i++){ if (wn(c->fd, o[i].A, o[i].abytes)) return -1; if (o[i].bbytes && wn(c->fd, o[i].B, o[i].bbytes)) return -1; }
+    for (int i = 0; i < n; i++){ if (o[i].a_src == 0 && wn(c->fd, o[i].A, o[i].abytes)) return -1;
+        if (o[i].b_src == 0 && o[i].bbytes && wn(c->fd, o[i].B, o[i].bbytes)) return -1; }
     struct orkd_hdr rh;
     if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
     if (rh.type != ORKD_SEQ_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
@@ -504,7 +510,7 @@ int orkd_submit_seq(orkd_conn *c, int n, const orkd_seq_op_c *o){
     size_t consumed = sizeof hh, cb = (size_t)c_total;
     if (hh.rc == 0){
         if (rh.len < consumed + cb){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
-        for (int i = 0; i < n; i++) if (o[i].cbytes && rn(c->fd, o[i].C, o[i].cbytes) <= 0) return -1;
+        for (int i = 0; i < n; i++) if (!o[i].c_keep && o[i].cbytes && rn(c->fd, o[i].C, o[i].cbytes) <= 0) return -1;
         consumed += cb;
     }
     if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
