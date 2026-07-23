@@ -135,9 +135,10 @@ struct ork_dom_scratch {
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
-    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded; int chain_lut_core;   /* fused-chain LUT cache: persist the LUT buffers + patched contents across calls; chain_lut_devloaded tracks whether the SDP SRAM still holds it (invalidated on reset); chain_lut_core = which core's SDP holds it (step-1 core-parameterize: the LUT-load + chain submit run on the same core, so switching cores reloads) — ORK_CHAIN_LUT_STICKY skips the per-call reload only when core+LUT match */
-    int chain_core;     /* fused-chain target core (step-1 core-parameterize): the LUT-load + chain submit both run here; 0 default = core 0 (unchanged), settable via ork_npu_set_chain_core for round-robin (one chain per core) */
-    int chain_task_P;   /* fused-chain task-config cache: the P-program task array is stable per chain shape and re-bsync'd every call; cache it (keyed on P) so a sticky homogeneous loop skips the rebuild+bsync (valid only when the LUT-load — which shares c->task — was ALSO skipped, i.e. sticky) */
+    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded[ORK_MAXCORE];   /* fused-chain LUT cache: chain_Lrc/Lsc hold the (shared) patched LUT DRAM; chain_lut_devloaded[core] tracks whether THAT core's physically-per-core SDP LUT SRAM still holds the current LUT. Any-core-strategy (single/rr/multi): the scheduler picks the core, we cache per-core. Invalidated for a core on reset; for ALL cores when the LUT identity (chain_lut_p) changes. ORK_CHAIN_LUT_STICKY skips the per-core reload when that core is still resident */
+    int chain_core;     /* fused-chain target core when the caller pins one (rr scheduler sets it per dispatch); <0 or default 0 = core 0. The scheduler owns core selection; the per-core caches above/below make any choice cache-correct */
+    int chain_task_P[ORK_MAXCORE];   /* fused-chain task-config cache, per-core: the P-program task array is stable per chain shape; cache it (keyed on P per core) so a sticky homogeneous loop skips the rebuild+bsync. c->task DRAM is shared, so a hit ALSO requires chain_task_owner==core (no other core's LUT-load/rebuild clobbered it since) */
+    int chain_task_owner;   /* which core's task array currently sits in the shared c->task DRAM (-1 = none/clobbered); guards the shared-buffer task cache under core-alternation */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
@@ -1355,7 +1356,7 @@ ork_npu *ork_npu_init(void){
     { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
       if(ud && atoi(ud) && !(isd && atoi(isd))){
         orkd_conn *dc=orkd_connect();
-        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
+        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->chain_task_owner=-1; g_npu_ctx=c;
             if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
             if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc)); return c; }
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
@@ -1373,7 +1374,7 @@ ork_npu *ork_npu_init(void){
       if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
           fprintf(stderr,"[ork] NPU SRAM: %u KiB %s\n",(unsigned)(g_sram_total>>10),
                   g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->chain_task_owner=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
@@ -1522,13 +1523,13 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 /* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
- * round-robin, but NON-0 CORES ARE NOT YET SAFE: the chain's scratch + warm state (regcmd/task/Af/Cc/cres)
- * are core-0-oriented, so submitting on core 1/2 against them HARD-WEDGES the NPU (needs a physical power-
- * cycle — verified 2026-07-23). Core-param is coupled to per-core scratch (round-robin step 2). Until step 2
- * lands, this CLAMPS to core 0 (non-0 warns, not honored) so it can't wedge. Step 2 removes the clamp. */
+ * round-robin: the scheduler pins each dispatched chain to a core and the per-core LUT/task caches
+ * (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) keep every core cache-correct. PRECONDITION: the
+ * target core must already be WARM (c->mwarm[core]) — a cold core wedges on its first chain submit (the bare
+ * direct path only warms core 0 via the chain's own reps=2; orkd's multi-core matmul path warms all cores
+ * before the scheduler dispatches, so this holds in production). Invalid core ids fall back to 0. */
 void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
-    if(core!=0) fprintf(stderr,"[ork] ork_npu_set_chain_core(%d) IGNORED: non-0 cores need per-core scratch (round-robin step 2); clamped to 0\n",core);
-    c->chain_core=0; }
+    c->chain_core = (core>=0 && core<c->soc->cores) ? core : 0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
  * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
 void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
@@ -4255,7 +4256,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
-    if(rst){ act(fd,RKNPU_ACT_RESET,0); c->chain_lut_devloaded=0; }   /* a reset clears the SDP LUT SRAM -> force a reload */
+    if(rst){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_devloaded[i]=0; c->chain_task_owner=-1; }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
     int wclr=0;
     switch(x->wc){
       case WC_NOTKW:         wclr=!kw; break;
@@ -9465,33 +9466,35 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                   int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
                   lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
             bsync(fd, &c->chain_Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
-            c->chain_lut_p = ss->lut; c->chain_lut_devloaded = 0;
+            /* LUT identity changed -> every core's resident SDP SRAM copy is now stale */
+            c->chain_lut_p = ss->lut; for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_devloaded[i]=0;
         }
-        /* load the LUT into core cc's SDP SRAM; skip only if sticky AND it's already resident on THIS core */
-        if (!(sticky && c->chain_lut_devloaded && c->chain_lut_core==cc)) {
+        /* load the LUT into core cc's (physically per-core) SDP SRAM; skip only if sticky AND already resident on cc */
+        if (!(sticky && c->chain_lut_devloaded[cc])) {
             struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
             lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=c->chain_Lrc.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            c->chain_task_owner=-1;   /* the LUT-load just memset the shared c->task DRAM -> no chain array resides there now */
             struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
             ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
             /* step-2: the LUT-load is the FIRST submit on core cc; on a cold core it wedges before the main
              * submit's reps=2 warm can run. Warm it in place (reps=2 discard-first) when this core is cold. */
             int lreps = c->mwarm[cc] ? 1 : 2;
             for (int lr=0; lr<lreps; lr++) if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { if(lr==lreps-1){ ok=-1; goto cleanup; } }
-            c->chain_lut_devloaded = 1; c->chain_lut_core = cc;
+            c->chain_lut_devloaded[cc] = 1;
         }
     }
 
     // One rknpu_task per program (P total, PC-chained), one single-core submit.
     int submit_ok = 0;
     struct rknpu_task *t = c->task.cpu;
-    /* task-config cache: the P-program array (enable/regcfg/regcmd_addr — all shape-stable, regcmd_addr fixed
-     * to c->regcmd.dma) is identical every call for a fixed chain. Skip the rebuild+bsync when sticky + the
-     * shape (P) is unchanged AND the LUT-load (which shares c->task) was skipped (chain_lut_devloaded stays 1
-     * only under sticky) — so c->task still holds this array. Any reset/foreign submit invalidates via P mismatch
-     * or the devloaded flag. */
+    /* task-config cache (per-core): the P-program array (enable/regcfg/regcmd_addr — all shape-stable, regcmd_addr
+     * fixed to c->regcmd.dma) is identical every call for a fixed chain shape. Skip the rebuild+bsync when sticky +
+     * the LUT is resident on this core AND the shape (chain_task_P[cc]) matches AND the shared c->task DRAM still
+     * holds THIS core's array (chain_task_owner==cc — any other core's LUT-load or rebuild since would have clobbered
+     * it). Reset invalidates via devloaded[] + owner; a foreign core's touch invalidates via owner. */
     { static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
-      int cached = sticky && c->chain_lut_devloaded && c->chain_lut_core==chain_cc && c->chain_task_P==P;
+      int cached = sticky && c->chain_lut_devloaded[chain_cc] && c->chain_task_owner==chain_cc && c->chain_task_P[chain_cc]==P;
       if(!cached){
         memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
         for (int p = 0; p < P; p++) {   // default: matmul task
@@ -9504,7 +9507,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
         }
         bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        c->chain_task_P = P;
+        c->chain_task_P[chain_cc] = P; c->chain_task_owner = chain_cc;   /* this core's array now owns the shared c->task DRAM */
       } }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     // ping-pong OFF (0x1) for any silu chain (SDP/LUT task present) so a bank swap doesn't race the LUT SRAM
