@@ -38,6 +38,9 @@ int main(int argc,char**argv){
     ork_mm_task_i8 tasks[4] = { { w_kt,Nq,Qp,scb }, { w_kt,Nq,(int8_t*)scb,eb }, { w_ones,Nq,(int8_t*)eb,ss }, { w_v,Nq,(int8_t*)eb,avb } };
     ork_chain_op ops[4] = { {1,-1,0,r_mult,r_shift}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
     int fail=0;
+    /* NO explicit warm: the chain establishes its own mode on the first submit (core 0), then runs on any core.
+     * A run_multicore matmul right before the chain WEDGES (mode/pipeline switch conflict — verified 2026-07-23),
+     * so do NOT prime cores with a plain matmul. Round-robin = chain-first on core 0, then cycle 1/2. */
     for(int core=0; core<3; core++){
         ork_npu_set_chain_core(c, core);
         memset(ss,0,(size_t)Nq*32*4); memset(avb,0,(size_t)Nq*dv*4);

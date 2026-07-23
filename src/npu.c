@@ -1524,10 +1524,12 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 /* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
  * round-robin: the scheduler pins each dispatched chain to a core and the per-core LUT/task caches
- * (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) keep every core cache-correct. PRECONDITION: the
- * target core must already be WARM (c->mwarm[core]) — a cold core wedges on its first chain submit (the bare
- * direct path only warms core 0 via the chain's own reps=2; orkd's multi-core matmul path warms all cores
- * before the scheduler dispatches, so this holds in production). Invalid core ids fall back to 0. */
+ * (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) keep every core cache-correct wherever it lands.
+ * ⚠️ CROSS-CORE IS UNVALIDATED and wedges in the bare direct path: ork_npu_init only brings up core 0, so a
+ * chain submit on core 1/2 HARD-WEDGES the IOMMU (verified 2026-07-23, 4 power-cycles; neither a per-core warm
+ * nor a preceding run_multicore matmul fixes it — the matmul mode-switch right before a chain also wedges).
+ * The per-core CACHING here is correct and core-0-validated; whether cores 1/2 can run the chain at all is an
+ * open question that must be answered INSIDE orkd (full daemon init), NOT bare probes. Invalid ids fall to 0. */
 void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
     c->chain_core = (core>=0 && core<c->soc->cores) ? core : 0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
