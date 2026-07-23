@@ -135,6 +135,7 @@ struct ork_dom_scratch {
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
+    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded;   /* fused-chain LUT cache: persist the LUT buffers + patched contents across calls; chain_lut_devloaded tracks whether the SDP SRAM still holds it (invalidated on reset) so ORK_CHAIN_LUT_STICKY can skip the per-call reload submit */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
@@ -4244,7 +4245,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
-    if(rst) act(fd,RKNPU_ACT_RESET,0);
+    if(rst){ act(fd,RKNPU_ACT_RESET,0); c->chain_lut_devloaded=0; }   /* a reset clears the SDP LUT SRAM -> force a reload */
     int wclr=0;
     switch(x->wc){
       case WC_NOTKW:         wclr=!kw; break;
@@ -9168,7 +9169,11 @@ int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
     if (S < 1 || !ops) return -2;
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (silu_calibrate_idx(c)) return -1;
-    static int16_t lut[1030]; silu_build_curve(c, exp_f, in_scale, out_scale, lut);
+    /* build-once: the exp curve depends only on (in_scale,out_scale); skip the host rebuild when unchanged so
+     * the static lut CONTENTS are stable across calls (which is what makes run_chain_i8_impl's pointer-keyed
+     * LUT cache correct). */
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1;
+    if (in_scale != c_is || out_scale != c_os) { silu_build_curve(c, exp_f, in_scale, out_scale, lut); c_is=in_scale; c_os=out_scale; }
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     return run_chain_i8_impl(c, S, tasks, &ss);
@@ -9426,22 +9431,36 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // FUSED-SiLU LUT-load: stream the gate task's silu LUT into SDP SRAM ONCE before the chain (enable 0x18,
     // ping-pong OFF). It persists into the chain submit; the gate task's set_i8_silu output stage reads it.
     if (do_lut) {
-        Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
-        Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
-        if (!Lrc.cpu || !Lsc.cpu) { ok = -2; goto cleanup; }
-        memcpy(Lrc.cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
-        setr((uint32_t*)Lrc.cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)Lsc.dma);
-        { uint32_t *lr=(uint32_t*)Lrc.cpu; int j=0;
-          for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
-              int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
-              lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
-        bsync(fd, &Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
-        { struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
-          lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=Lrc.dma;
-          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-          struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
-          ls.core_mask=RKNPU_CORE0_MASK; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; } }
+        /* LUT-build-once cache: persist Lrc/Lsc in the ctx and re-patch only when the LUT changes; with
+         * ORK_CHAIN_LUT_STICKY also skip the load submit when the SDP SRAM still holds this LUT (unchanged +
+         * no reset since) — saves the ~148us/call load on tight same-LUT loops (decode / round-robin). The
+         * buffer+patch cache is always safe; the load-skip is opt-in because another LUT-loading op between
+         * calls would clobber the SDP SRAM without our knowledge (the caller guarantees a homogeneous loop). */
+        static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
+        if (!c->chain_Lrc.cpu) {   /* one-time alloc, persists for the ctx lifetime */
+            c->chain_Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
+            c->chain_Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
+            if (!c->chain_Lrc.cpu || !c->chain_Lsc.cpu) { ok = -2; goto cleanup; }
+        }
+        if (c->chain_lut_p != ss->lut) {   /* (re)build Lrc contents only when the LUT identity changes */
+            memcpy(c->chain_Lrc.cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
+            setr((uint32_t*)c->chain_Lrc.cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)c->chain_Lsc.dma);
+            { uint32_t *lr=(uint32_t*)c->chain_Lrc.cpu; int j=0;
+              for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
+                  int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
+                  lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
+            bsync(fd, &c->chain_Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
+            c->chain_lut_p = ss->lut; c->chain_lut_devloaded = 0;
+        }
+        if (!(sticky && c->chain_lut_devloaded)) {   /* load the LUT into SDP SRAM (skip only if sticky + still resident) */
+            struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
+            lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=c->chain_Lrc.dma;
+            bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
+            ls.core_mask=RKNPU_CORE0_MASK; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+            if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
+            c->chain_lut_devloaded = 1;
+        }
     }
 
     // One rknpu_task per program (P total, PC-chained), one single-core submit.
