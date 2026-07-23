@@ -9127,7 +9127,7 @@ enum { OP_MM32=0, OP_MM8=1, OP_SILU=2, OP_EWMUL=3 };   /* ork_chain_op.kind valu
  * sdp_task = single standalone int8 silu-SDP op reading the PREVIOUS task's output (legacy 2-task path). -1=off. */
 struct chain_silu_spec { const ork_chain_op *ops; int task; int sdp_task; int r_mult, r_shift; int gate_mult, gate_shift; uint32_t out_bias, idx_off, cfg4064, cfg4068; const int16_t *lut; int nlut; };
 
-static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss);
+static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core);
 int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (c && c->daemon){   /* Path B: fused chain on the daemon (all task weights are daemon-resident is_orkd) */
         if (S < 1) return -2;
@@ -9142,7 +9142,7 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         free(ct);
         return rc;
     }
-    return run_chain_i8_impl(c, S, tasks, NULL); }
+    return run_chain_i8_impl(c, S, tasks, NULL, -1); }
 
 /* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
  * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
@@ -9152,7 +9152,7 @@ int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, in
                               const int16_t *lut, int nlut) {
     if (gate_task < 0 || gate_task >= S || !lut) return -2;
     struct chain_silu_spec ss = { NULL, gate_task, -1, r_mult, r_shift, 0, 0, out_bias, idx_off, 0, cfg4068, lut, nlut };
-    return run_chain_i8_impl(c, S, tasks, &ss);
+    return run_chain_i8_impl(c, S, tasks, &ss, -1);
 }
 
 /* OPTION B: chain [... -> gate matmul(int8-out) -> silu-SDP -> ...] where task[sdp_task] is a STANDALONE int8
@@ -9168,7 +9168,7 @@ int ork_mm_run_chain_i8_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     static int16_t lut[1030]; silu_build_curve(c, silu_f, in_scale, out_scale, lut);   /* same curve as act_lut_i8 */
     struct chain_silu_spec ss = { NULL, -1, sdp_task, 0x4000, 14, gate_mult, gate_shift, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return run_chain_i8_impl(c, S, tasks, &ss);
+    return run_chain_i8_impl(c, S, tasks, &ss, -1);
 }
 
 /* GENERAL heterogeneous FFN chain: per-task ops[] (OP_MM32/OP_MM8/OP_SILU/OP_EWMUL); SDP tasks read prior
@@ -9184,7 +9184,7 @@ int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
     static int16_t lut[1030]; silu_build_curve(c, silu_f, in_scale, out_scale, lut);
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return run_chain_i8_impl(c, S, tasks, &ss);
+    return run_chain_i8_impl(c, S, tasks, &ss, -1);
 }
 /* Same heterogeneous chain, but the SDP activation task (kind 2) applies EXP instead of SiLU — the HW-chained
  * softmax numerator: [QK^T(1) -> exp(2, in0=0) -> reduce(0, reads exp)] as ONE submit, e kept on-chip. Scores
@@ -9201,10 +9201,10 @@ int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
     if (in_scale != c_is || out_scale != c_os) { silu_build_curve(c, exp_f, in_scale, out_scale, lut); c_is=in_scale; c_os=out_scale; }
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return run_chain_i8_impl(c, S, tasks, &ss);
+    return run_chain_i8_impl(c, S, tasks, &ss, -1);
 }
 
-static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss) {
+static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
@@ -9214,7 +9214,10 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
 
     /* step-1 core-parameterize: the whole chain (LUT-load + program submit) runs on this one core, so
      * round-robin can place independent chains on different cores. Default 0 = core 0 (unchanged). */
-    int chain_cc = (c->chain_core>=0 && c->chain_core<c->soc->cores) ? c->chain_core : 0;
+    /* force_core>=0 (concurrent rr dispatch: the pool worker passes its own core) overrides the ctx's
+     * chain_core; force_core<0 uses the (clamped) c->chain_core as before. */
+    int chain_cc = (force_core>=0 && force_core<c->soc->cores) ? force_core
+                 : ((c->chain_core>=0 && c->chain_core<c->soc->cores) ? c->chain_core : 0);
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
      * allocs per-call scratch, so it must only be used to batch S>1 independent matmuls. */
@@ -9285,7 +9288,10 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // keepwarm (line 3501). Without this, entering the chain from a plain int8 op re-warmed every call
     // (reps=2), which is the per-layer thrash that made HW-chaining the FFN a net loss. Only a NON-int8
     // predecessor (fp16/int4) needs the reset+re-warm.
-    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, ss ? OCK_FUSED : OCK_HW);  /* fused static graph (in-chain SDP/LUT) when ss!=NULL, else pure-matmul hw chain */
+    /* ork_npu_enter mutates SHARED mode state (last_dt, possible ACT_RESET) — under concurrent rr dispatch
+     * (force_core>=0) N workers would race it and a reset mid-flight on a sibling core wedges. The rr wrapper
+     * (ork_mm_run_chains_rr) enters the mode ONCE single-threaded before dispatch; workers skip it here. */
+    if (force_core < 0) ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, ss ? OCK_FUSED : OCK_HW);  /* fused static graph (in-chain SDP/LUT) when ss!=NULL, else pure-matmul hw chain */
 
     // 3. Resolve buffers and cache coherency
     struct buf tmp_A[1024];
@@ -9616,6 +9622,54 @@ cleanup:
     }
     bdestroy(fd, &Lrc); bdestroy(fd, &Lsc);   /* fused-SiLU LUT buffers (no-op when ss==NULL: {0}) */
     return ok;
+}
+
+/* ============ CONCURRENT ROUND-ROBIN CHAIN DISPATCH (ork_mm_run_chains_rr) — increment 2 ============
+ * Prefill throughput: N independent fused exp-softmax-numerator chains dispatched across ALL NPU cores at once
+ * (chain -> core via atomic work-stealing), each on its OWN per-core scratch (chain_rc/tk/lrc/lsc[core]) so there
+ * is NO cross-core DRAM sharing. Targets ~3x over single-core for a deep prefill queue. Shared mode state
+ * (ork_npu_enter) + the domain are established ONCE here single-threaded; workers pass force_core>=0 so
+ * run_chain_i8_impl skips the re-enter (racing the mode reset would wedge a sibling core). Chains are homogeneous:
+ * same op graph (ops[]) + scales + domain; each carries its own S-task array (chains[i]). */
+struct chainrr_w { ork_npu *c; int core; int nchains; const ork_mm_task_i8 *const *chains; const int *S; const struct chain_silu_spec *ss; int *ctr; int rc; };
+static void *chainrr_worker(void *vp){
+    struct chainrr_w *a=vp; pin_big_core(a->core); a->rc=0; int k;
+    while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->nchains){
+        int r=run_chain_i8_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
+        if(r) a->rc=r;
+    }
+    return NULL;
+}
+/* Run `nchains` fused exp chains round-robin across the cores (concurrent). chains[i] = that chain's S[i]-task
+ * array; ops = the shared op graph; (in_scale,out_scale) the shared exp requant. Returns 0/ok, <0 err (first
+ * failing chain's code). PRECONDITION: cores must be WARM (a prior matmul on each) — a cold core's first submit
+ * wedges; a chain-only caller should warm via a multi-core matmul first (see chainrr_conc_probe). Local NPU only. */
+int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                         const ork_chain_op *ops, double in_scale, double out_scale){
+    if(!c || nchains<1 || !chains || !S || !ops) return -2;
+    if(c->daemon) return -3;                     /* local NPU only (the daemon owns its own scheduler) */
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(silu_calibrate_idx(c)) return -1;
+    for(int i=0;i<nchains;i++){ if(S[i]<1 || !chains[i]) return -2; }
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1;   /* stable contents -> pointer-keyed per-core LUT cache stays valid */
+    if(in_scale!=c_is || out_scale!=c_os){ silu_build_curve(c, exp_f, in_scale, out_scale, lut); c_is=in_scale; c_os=out_scale; }
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
+    /* establish SHARED state ONCE single-threaded (workers skip via force_core>=0): domain + int8-chain mode */
+    if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
+        dom_activate(c, chains[0][0].w->domain);
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
+    npu_pool_ensure(c);
+    struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
+    return rc;
 }
 
 /* ================= DYNAMIC STEERED SUBMISSION API (validated by tools/steer_probe + doorbell_id_probe) =====

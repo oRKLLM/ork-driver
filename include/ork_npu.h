@@ -1171,6 +1171,11 @@ int          ork_mm_run_chain_i8_ffn(ork_npu *ctx, int S, const ork_mm_task_i8 *
  * ONE submit, intermediates on-chip. Scores must be <=0 (post-max domain). 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int          ork_mm_run_chain_i8_ffn_exp(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
                                          const ork_chain_op *ops, double in_scale, double out_scale);
+/* CONCURRENT round-robin: dispatch `nchains` homogeneous fused-exp chains across all NPU cores at once (one per
+ * core, atomic work-stealing), each on its own per-core scratch. chains[i]=that chain's S[i]-task array; ops the
+ * shared op graph; scales the shared exp requant. Prefill throughput (~3x). Cores must be WARM first. 0/ok,<0 err. */
+int          ork_mm_run_chains_rr(ork_npu *ctx, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                                  const ork_chain_op *ops, double in_scale, double out_scale);
 /* ORKD coalesced SwiGLU FFN: run the whole [gate->silu->up->glu->down] inner as ONE daemon-side HW-chained
  * submit (ORKD_FFN / orkd_ffn_i8) against the 3 ALREADY-RESIDENT weights (wg/wu/wd must be daemon-imported —
  * is_orkd — e.g. from the orkpack; no re-import). A = int8 activation [M,K]; out = int32 down output [M,Kd].
