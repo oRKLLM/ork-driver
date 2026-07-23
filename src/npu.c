@@ -5616,6 +5616,42 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
     return rc_ret;
 }
 
+/* int8 matmul with INT16 requant output (set_i16_out): C = clamp_i16(round((A·W)*mult/2^shift)) [M*N] int16,
+ * COMPACT-LINEAR (m*N+n) — which is exactly the CONTIGUOUS host layout the int16 SDP seq adapters read, so a
+ * seq [MM_I8_OUT16 -> exp_i16/silu_i16] carries int16 forward RESIDENT (A2) with NO hardware PC-chain and NO
+ * layout bridge (sidesteps the set_i16_out chaining fragility). K%512 (int8 requant small-K limit). Twin of
+ * ork_mm_run_i8_out8. 0/ok, -1 wedged, -2 dims, -3 SoC. */
+int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int mult,int shift){
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(w->dtype!=DT_I8 || !w->Bf) return -2;
+    int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
+    if(K%512 || K>4096 || N%32) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
+    int chunk=fused_mtile(K,M);
+    size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX*2;                 /* int16 output = 2 bytes/elem */
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    int rc_ret=0;
+    for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        uint64_t wbase=w->Bf[ns].dma; bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+            int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
+            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            uint32_t rc[REGCMD_I8_N];
+            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            set_i16_out(rc,Nc,0,mult,shift);                                  /* int32 acc -> int16 LINEAR out */
+            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+              t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
+              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(submit1(c)){ rc_ret=-1; break; }
+            short*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];   /* int16 LINEAR readback */
+        }
+    }
+    return rc_ret;
+}
+
 /* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
  * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
  * weights. Returns 0 if the submit completed (C[N] int32 valid), -1 if it wedged (K over the
@@ -12978,6 +13014,8 @@ static int seq_disp_f16_mm_f16out  (ork_npu *c,const ork_seq_op *o){ return ork_
 /* A1 int8: matmul with int8 requant output (int8 in, int8 out) — the all-int8 softmax island's int8 x-max
  * broadcast (max_i8 . -ones -> -max_bc int8) + any int8 matmul->SDP feed. mult/shift via o->mult/o->shift. */
 static int seq_disp_matmul_requant_i8(ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i8_out8(c,o->w,o->M,(const int8_t*)o->A,(int8_t*)o->C,o->mult,o->shift); }
+/* int8 matmul -> int16 compact-linear out (set_i16_out); feeds an int16 SDP op resident, no PC-chain bridge. */
+static int seq_disp_matmul_i16out_i8(ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i8_out16(c,o->w,o->M,(const int8_t*)o->A,(short*)o->C,o->mult,o->shift); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
@@ -13005,6 +13043,7 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   [ORK_OP_RMSNORM_F16]        = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rmsnorm_f16     },
   [ORK_OP_MM_F16_F16OUT]      = { 0, SEQ_KEEPDT, XP_STREAM_F16, OCK_SW, seq_disp_f16_mm_f16out }, /* matmul w/ fp16 out; hw=0 (own submit, not the f32 doorbell) */
   [ORK_OP_MATMUL_REQUANT_I8]  = { 0, SEQ_KEEPDT, XP_MC_MM,      OCK_SW, seq_disp_matmul_requant_i8 }, /* int8 matmul -> int8 requant out; hw=0 (own submit) */
+  [ORK_OP_MATMUL_I16OUT_I8]   = { 0, SEQ_KEEPDT, XP_MC_MM,      OCK_SW, seq_disp_matmul_i16out_i8 }, /* int8 matmul -> int16 compact-linear out; hw=0 */
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
@@ -13049,6 +13088,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               case ORK_OP_MM_F16: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_F16_F16OUT: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*2); break;   /* fp16 output */
               case ORK_OP_MATMUL_REQUANT_I8: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K); so[i].cbytes=(uint32_t)((size_t)o->M*w->N); break;   /* int8 in, int8 out */
+              case ORK_OP_MATMUL_I16OUT_I8: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*2); break;   /* int8 in, int16 out */
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
               case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: case ORK_OP_EXP_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */

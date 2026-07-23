@@ -427,6 +427,9 @@ int          ork_mm_run_i8_ewmul(ork_npu *ctx, ork_w *w, int M, const int8_t *A,
  * Keeps intermediates int8 on the NPU (the "up" projection feeding a chained FFN-inner EW-mul). */
 int          ork_mm_run_i8_out8(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int8_t *C,
                                 int mult, int shift);
+/* int8 matmul with INT16 requant output (set_i16_out): C=clamp_i16(round((A·W)*mult/2^shift)) [M*N] int16,
+ * COMPACT-LINEAR — feeds an int16 SDP seq op resident with no PC-chain/layout bridge. K%512. */
+int          ork_mm_run_i8_out16(ork_npu *ctx, ork_w *w, int M, const int8_t *A, short *C, int mult, int shift);
 /* int4 (W4A4): A int4 ([-8,7] in int8, row-major), C int32 raw sum — apply scales:
  * C_real[m][n] = aScale[m]*bScale[n]*C[m][n]. Run dtype must match the pack dtype. 0 ok / negative err. */
 int          ork_mm_run_i4(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
@@ -921,6 +924,7 @@ typedef enum {
     ORK_OP_L2NORM_F16,             /* fp16 L2 normalize (ork_npu_l2norm_f16)                        example: test_bmm */
     ORK_OP_RSQRT_I16,              /* int16 rsqrt (SDP; ork_npu_rsqrt_i16) — RMSNorm 1/√ + softmax 1/Σ  example: silu_i16 family (rsqrt/exp/gelu/silu int16 LUT) */
     ORK_OP_MM_F16_F16OUT,          /* fp16 matmul with CONTIGUOUS fp16 output (ork_mm_run_f16_f16out) — A1 bridge: feeds an fp16 SDP op with no f32→f16 narrow  example: f16out_probe */
+    ORK_OP_MATMUL_I16OUT_I8,       /* int8 matmul with INT16 compact-linear output (ork_mm_run_i8_out16) — feeds an int16 SDP op resident, no PC-chain  example: i16out_seq_probe */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef ork_seq_kind ork_op;       /* canonical SDK op enum; ork_seq_kind is the historical name (the seq scheduler is one consumer) */
