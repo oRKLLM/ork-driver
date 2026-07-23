@@ -111,6 +111,7 @@ void         ork_npu_set_core_budget(ork_npu *ctx, int n);
 /* Pin the fused chain (run_chain_i8_*) to one NPU core (LUT-load + submit run there). Default 0. For
  * round-robin, place independent chains on different cores. Out-of-range -> 0. */
 void         ork_npu_set_chain_core(ork_npu *ctx, int core);
+void         ork_npu_set_chain_core_unsafe(ork_npu *ctx, int core);   /* TEST-ONLY: pin chain core, no clamp; caller must have brought the core online first (see npu.c) */
 
 /* orkd scheduler priority for this context's subsequent submits (higher = dispatched sooner among queued work;
  * ties broken by IOMMU-domain affinity then FIFO). Only meaningful when routed through orkd (ORK_USE_ORKD);

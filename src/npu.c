@@ -1533,6 +1533,12 @@ void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>
 void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
     if(core!=0) fprintf(stderr,"[ork] ork_npu_set_chain_core(%d) IGNORED: cross-core chain needs per-core buffer routing (round-robin increment 1); clamped to 0\n",core);
     c->chain_core=0; }
+/* TEST-ONLY (round-robin increment 1 bring-up experiment): pin the chain core WITHOUT the clamp. UNSAFE unless
+ * the caller has already brought core `core` online (e.g. a multi-core matmul that warms cores 0..nc-1); a bare
+ * submit to an un-brought-up core wedges the IOMMU. Used by chainrr_probe to validate the per-core cache on
+ * each core sequentially. Not for production callers — those go through the clamped setter + the scheduler. */
+void ork_npu_set_chain_core_unsafe(ork_npu *c,int core){ if(!c)return;
+    c->chain_core = (core>=0 && core<c->soc->cores) ? core : 0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
  * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
 void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
@@ -9478,7 +9484,11 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             c->chain_task_owner=-1;   /* the LUT-load just memset the shared c->task DRAM -> no chain array resides there now */
             struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
-            ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+            ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms();
+            /* ALL THREE subcore_task[] must be populated even for a single core (npu.c:3365): on core_mask=1<<cc
+             * the kernel commits subcore_task[cc]; leaving it zero NULL-derefs rknpu_job_subcore_commit and wedges.
+             * This LUT-load previously set only [0] -> fine on core 0, but the FIRST submit on core 1/2 wedged. */
+            ls.subcore_task[0]=ls.subcore_task[1]=ls.subcore_task[2]=(struct rknpu_subcore_task){0,1};
             if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
             c->chain_lut_devloaded[cc] = 1;
         }

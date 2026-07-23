@@ -896,3 +896,6 @@ scorest_probe: tools/scorest_probe.c $(COBJ)
 
 chaincore_probe: tools/chaincore_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+chainrr_probe: tools/chainrr_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
