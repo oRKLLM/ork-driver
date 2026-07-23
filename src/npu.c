@@ -8030,8 +8030,8 @@ static double exp_f(double x){ return exp(x); }                                 
  * — do the build ONCE per (registers) and reuse the lut across matmuls of the same scale. Pick r_mult/r_shift
  * so R ~= 660*in_scale (the matmul's acc range then spans silu's transition band). out_bias MUST be 0 (the
  * validated config; the ramp readback assumes it). Fills lut[1030]. 0/ok, -1 fail. */
-int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
-                          int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
+static int chain_build_lut_fn(ork_npu*c, double(*fn)(double), double in_scale, double out_scale,
+                              int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
     const int K=512, N=64;
     signed char *A=malloc(K), *B=calloc(1,(size_t)K*N); int8_t *C=malloc(N);
     int16_t *ramp=malloc(1030*2); int *acc=malloc(N*sizeof(int)), *idx=malloc(N*sizeof(int));
@@ -8049,7 +8049,7 @@ int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
     /* pass 2: build ork's silu LUT at the measured indices; interp gaps, hold at ends */
     int *set=calloc(1030,sizeof(int)); for(int i=0;i<1030;i++)lut[i]=0;
     for(int n=0;n<N;n++){ int i=idx[n]; if(i<0||i>1029)continue;
-        double v=silu_f(acc[n]*in_scale)/out_scale/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768;
+        double v=fn(acc[n]*in_scale)/out_scale/R; long q=lround(v); if(q>32767)q=32767; if(q<-32768)q=-32768;
         lut[i]=(int16_t)q; set[i]=1; }
     int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
     if(lo<0){ free(A);free(B);free(C);free(ramp);free(acc);free(idx);free(set); return -1; }
@@ -8058,6 +8058,17 @@ int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
         lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
     free(A);free(B);free(C);free(ramp);free(acc);free(idx);free(set);
     return 0;
+}
+int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
+                          int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
+    return chain_build_lut_fn(c, silu_f, in_scale, out_scale, r_mult, r_shift, cfg4068, lut);
+}
+/* Fused EXP LUT for the coalesced chain output stage (softmax): lut[idx(acc)] = clamp(exp(acc*in_scale)/out_scale/R).
+ * Same 2-pass calibration as silu; scores must be <=0 (post-max softmax domain) so exp in (0,1] fits int8 (acc>0
+ * entries clamp). Lets run_chain_i8_gsilu HW-chain exp onto the score matmul in ONE submit. 0/ok,-1 fail. */
+int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
+                               int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
+    return chain_build_lut_fn(c, exp_f, in_scale, out_scale, r_mult, r_shift, cfg4068, lut);
 }
 
 /* Constant SDP index params for the standalone activation-LUT op (from the RKNN SiLU capture). The op's
@@ -9145,6 +9156,19 @@ int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (silu_calibrate_idx(c)) return -1;
     static int16_t lut[1030]; silu_build_curve(c, silu_f, in_scale, out_scale, lut);
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
+                                  ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    return run_chain_i8_impl(c, S, tasks, &ss);
+}
+/* Same heterogeneous chain, but the SDP activation task (kind 2) applies EXP instead of SiLU — the HW-chained
+ * softmax numerator: [QK^T(1) -> exp(2, in0=0) -> reduce(0, reads exp)] as ONE submit, e kept on-chip. Scores
+ * must be <=0 (post-max domain) so exp in (0,1] fits int8. Only differs from _ffn by the curve fn. 0/ok,-1,-2,-3. */
+int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+                                const ork_chain_op *ops, double in_scale, double out_scale) {
+    if (S < 1 || !ops) return -2;
+    if (!ork_ppu_fuse_enabled(c)) return -3;
+    if (silu_calibrate_idx(c)) return -1;
+    static int16_t lut[1030]; silu_build_curve(c, exp_f, in_scale, out_scale, lut);
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     return run_chain_i8_impl(c, S, tasks, &ss);

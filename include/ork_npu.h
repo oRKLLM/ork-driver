@@ -496,6 +496,10 @@ int          ork_npu_probe_i16_out(ork_npu *ctx, int M, int K, int N, const int8
  * 0/ok, -1 fail. See tools/silu_native.c. */
 int          ork_mm_silu_build_lut(ork_npu *ctx, double in_scale, double out_scale,
                                    int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut);
+/* Fused EXP LUT for the coalesced chain (softmax): HW-chains exp onto the score matmul via run_chain_i8_gsilu.
+ * Scores must be <=0 (post-max domain). Same signature/calibration as the silu LUT. 0/ok, -1 fail. */
+int          ork_mm_chain_build_exp_lut(ork_npu *ctx, double in_scale, double out_scale,
+                                        int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut);
 
 /* PPU FUSED SiLU (step 2): full-K int8 matmul with SiLU applied on-chip via the LUT output stage. Two
  * sequential submits (LUT-load into PPU SRAM, then matmul reading it). A[M*K],B[K*N] int8; C[M*N] int8.
@@ -1159,6 +1163,10 @@ int          ork_mm_run_chain_i8_sdpsilu(ork_npu *ctx, int S, const ork_mm_task_
 typedef struct { int kind; int in0, in1; int mult, shift; } ork_chain_op;
 int          ork_mm_run_chain_i8_ffn(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
                                      const ork_chain_op *ops, double in_scale, double out_scale);
+/* Same chain, but the kind-2 SDP task applies EXP (softmax numerator) — HW-chains [QK^T -> exp -> reduce] in
+ * ONE submit, intermediates on-chip. Scores must be <=0 (post-max domain). 0/ok,-1 wedge,-2 dims,-3 SoC. */
+int          ork_mm_run_chain_i8_ffn_exp(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
+                                         const ork_chain_op *ops, double in_scale, double out_scale);
 /* ORKD coalesced SwiGLU FFN: run the whole [gate->silu->up->glu->down] inner as ONE daemon-side HW-chained
  * submit (ORKD_FFN / orkd_ffn_i8) against the 3 ALREADY-RESIDENT weights (wg/wu/wd must be daemon-imported —
  * is_orkd — e.g. from the orkpack; no re-import). A = int8 activation [M,K]; out = int32 down output [M,Kd].

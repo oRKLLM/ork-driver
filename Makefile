@@ -878,3 +878,6 @@ minimal_i8mm_probe: tools/minimal_i8mm_probe.c $(COBJ)
 
 swreduce_probe: tools/swreduce_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+chainexp_probe: tools/chainexp_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
