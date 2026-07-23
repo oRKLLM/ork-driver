@@ -96,6 +96,12 @@ orkd_seq_probe: tools/orkd_seq_probe.c $(COBJ)
 orkd_resident_probe: tools/orkd_resident_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# task #20 (A1): fp16 matmul with contiguous fp16 output (ORK_OP_MM_F16_F16OUT) — bridge-free matmul->SDP.
+# direct:  sudo env ORK_MM_TIMEOUT=3000 ./f16out_probe
+# orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./f16out_probe
+f16out_probe: tools/f16out_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # int4 NONBLOCK-doorbell viability probe: ork_dyn_i4_probe (NONBLOCK + int16-sentinel) vs the blocking
 # ork_mm_run_chain_i4 reference. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 200 ./i4_doorbell_probe
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)

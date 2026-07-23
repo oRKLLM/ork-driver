@@ -6002,6 +6002,40 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     return ok;
 }
 
+/* A1 (task #20): fp16 matmul with CONTIGUOUS fp16 output, consuming a PACKED resident ork_w (w->Bb) via the
+ * PROVEN vendor fp16-out stage (set_f16_out_fp16in, default contiguous). The point: a matmul's output is fp16
+ * [M,N] directly — so it feeds an fp16 SDP op with NO f32->f16 host narrow between them, making the pair
+ * ADJACENT (A2 can then keep the intermediate resident). Single-tile (M<=64, single-slice), single-core; it
+ * runs its OWN submit (not the f32-out doorbell), so its SEQ_CLASS row is hw=0 (per-op SW dispatch). This is
+ * the twin of ork_npu_probe_f16_mm_f16out but weight = w->Bb (resident) instead of a raw-B rebuild.
+ * 0/ok, -1 submit-fail, -2 dims. */
+int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out){
+    if(!c||!w||!A||!out) return -2;
+    if(w->dtype!=DT_F16||w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks, N<=nmax) */
+    int K=w->K, N=w->N, fd=c->fd, CBUF=c->soc->cbuf_elems;
+    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);   /* activate the weight's IOMMU domain */
+    size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
+    struct buf O=bcreate(fd,osz,0x403,w->domain); if(!O.cpu) return -1; memset(O.cpu,0,osz);
+    uint16_t *ad=c->Af.cpu; const uint16_t *as=(const uint16_t*)A; for(int j=0;j<M*K;j++) ad[j]=as[j];   /* stage A (contiguous fp16) */
+    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                          /* prime fp16 pipeline (keep-warm-aware) */
+    uint32_t rc[REGCMD_N];
+    int sched=((K&(K-1))==0 && K>=128 && K<2048);                            /* run_stream_f16 rule; small K => 0 */
+    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
+    set_f16_out_fp16in(rc,M,N);                                              /* PROVEN vendor fp16-out stage (default CONTIGUOUS) */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj;
+    sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=mm_timeout_ms();
+    int ok=-1;
+    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }   /* fp16 cold 2-pass re-warm */
+    if(ok==0){ uint16_t *od=(uint16_t*)out, *os=(uint16_t*)O.cpu; for(size_t i=0;i<(size_t)M*N;i++) od[i]=os[i]; }   /* CONTIGUOUS fp16 readback */
+    bdestroy(fd,&O);
+    return ok;
+}
+
 /* ZERO-COPY STRIDED activation fp16 matmul — the densify-drop primitive for attention. A is logical [M][K] but
  * stored at row pitch `apitch` (apitch>=K, apitch%8==0) in a DEVICE (DMA) buffer; the NPU reads it DIRECTLY via
  * CNA LINE_STRIDE (0x107c=apitch/8), with NO host->Af gather. This is what a permuted-Q / KV-cache-view feeds:
@@ -12939,6 +12973,8 @@ static int seq_disp_rope_neox_f16  (ork_npu *c,const ork_seq_op *o){ return ork_
 /* RMSNorm (task #20 layer chain): x[M,n] -> out, per-channel gain via o->B, eps via o->in_scale. Weightless
  * matmul-wise (the gain is an SDP operand, not a packed ork_w); self-contained SW-break. */
 static int seq_disp_rmsnorm_f16    (ork_npu *c,const ork_seq_op *o){ return ork_npu_rmsnorm_f16   (c,o->M,o->N,(const f16*)o->A,(const f16*)o->B,(float)o->in_scale,(f16*)o->C); }
+/* A1: fp16 matmul with contiguous fp16 output (packed w) — SW-dispatch (own submit, not the f32-out doorbell). */
+static int seq_disp_f16_mm_f16out  (ork_npu *c,const ork_seq_op *o){ return ork_mm_run_f16_f16out (c,o->w,o->M,(const f16*)o->A,(f16*)o->C); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
@@ -12964,6 +13000,7 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   [ORK_OP_RSQRT_I16]          = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rsqrt_i16       },
   [ORK_OP_ROPE_NEOX_F16]      = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rope_neox_f16   },
   [ORK_OP_RMSNORM_F16]        = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rmsnorm_f16     },
+  [ORK_OP_MM_F16_F16OUT]      = { 0, SEQ_KEEPDT, XP_STREAM_F16, OCK_SW, seq_disp_f16_mm_f16out }, /* matmul w/ fp16 out; hw=0 (own submit, not the f32 doorbell) */
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
@@ -13006,6 +13043,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
             switch(o->kind){
               case ORK_OP_MM_I8:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_F16: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
+              case ORK_OP_MM_F16_F16OUT: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*2); break;   /* fp16 output */
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
               case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */

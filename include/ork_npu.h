@@ -920,6 +920,7 @@ typedef enum {
     ORK_OP_RMSNORM_F16,            /* fp16 RMSNorm — every transformer layer (ork_npu_rmsnorm_f16)  example: test_bmm */
     ORK_OP_L2NORM_F16,             /* fp16 L2 normalize (ork_npu_l2norm_f16)                        example: test_bmm */
     ORK_OP_RSQRT_I16,              /* int16 rsqrt (SDP; ork_npu_rsqrt_i16) — RMSNorm 1/√ + softmax 1/Σ  example: silu_i16 family (rsqrt/exp/gelu/silu int16 LUT) */
+    ORK_OP_MM_F16_F16OUT,          /* fp16 matmul with CONTIGUOUS fp16 output (ork_mm_run_f16_f16out) — A1 bridge: feeds an fp16 SDP op with no f32→f16 narrow  example: f16out_probe */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef ork_seq_kind ork_op;       /* canonical SDK op enum; ork_seq_kind is the historical name (the seq scheduler is one consumer) */
