@@ -881,3 +881,6 @@ swreduce_probe: tools/swreduce_probe.c $(COBJ)
 
 chainexp_probe: tools/chainexp_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+chainav_probe: tools/chainav_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
