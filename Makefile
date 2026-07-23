@@ -832,3 +832,6 @@ int8reduce_probe: tools/int8reduce_probe.c $(COBJ)
 
 xmax_probe: tools/xmax_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+reqi8_probe: tools/reqi8_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

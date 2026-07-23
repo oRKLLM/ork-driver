@@ -12975,6 +12975,9 @@ static int seq_disp_rope_neox_f16  (ork_npu *c,const ork_seq_op *o){ return ork_
 static int seq_disp_rmsnorm_f16    (ork_npu *c,const ork_seq_op *o){ return ork_npu_rmsnorm_f16   (c,o->M,o->N,(const f16*)o->A,(const f16*)o->B,(float)o->in_scale,(f16*)o->C); }
 /* A1: fp16 matmul with contiguous fp16 output (packed w) — SW-dispatch (own submit, not the f32-out doorbell). */
 static int seq_disp_f16_mm_f16out  (ork_npu *c,const ork_seq_op *o){ return ork_mm_run_f16_f16out (c,o->w,o->M,(const f16*)o->A,(f16*)o->C); }
+/* A1 int8: matmul with int8 requant output (int8 in, int8 out) — the all-int8 softmax island's int8 x-max
+ * broadcast (max_i8 . -ones -> -max_bc int8) + any int8 matmul->SDP feed. mult/shift via o->mult/o->shift. */
+static int seq_disp_matmul_requant_i8(ork_npu *c,const ork_seq_op *o){ return ork_mm_run_i8_out8(c,o->w,o->M,(const int8_t*)o->A,(int8_t*)o->C,o->mult,o->shift); }
 static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   /* ORK_OP_MM_I8   */ { 1, DT_I8,      XP_MC_MM,      OCK_SW, seq_disp_i8_mm    },
   /* ORK_OP_MM_F16  */ { 1, DT_F16,     XP_STREAM_F16, OCK_HW, seq_disp_f16_mm   },
@@ -13001,6 +13004,7 @@ static const struct ork_seq_class SEQ_CLASS[ORK_OP_NKIND] = {
   [ORK_OP_ROPE_NEOX_F16]      = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rope_neox_f16   },
   [ORK_OP_RMSNORM_F16]        = { 0, SEQ_KEEPDT, XP_SDP, OCK_SW, seq_disp_rmsnorm_f16     },
   [ORK_OP_MM_F16_F16OUT]      = { 0, SEQ_KEEPDT, XP_STREAM_F16, OCK_SW, seq_disp_f16_mm_f16out }, /* matmul w/ fp16 out; hw=0 (own submit, not the f32 doorbell) */
+  [ORK_OP_MATMUL_REQUANT_I8]  = { 0, SEQ_KEEPDT, XP_MC_MM,      OCK_SW, seq_disp_matmul_requant_i8 }, /* int8 matmul -> int8 requant out; hw=0 (own submit) */
 };
 /* HW-doorbell eligibility: the exact acceptance ork_dyn_begin_mc enforces per task. int8/fp16 = single-slice,
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
@@ -13044,6 +13048,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
               case ORK_OP_MM_I8:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_F16: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_MM_F16_F16OUT: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K*2); so[i].cbytes=(uint32_t)((size_t)o->M*w->N*2); break;   /* fp16 output */
+              case ORK_OP_MATMUL_REQUANT_I8: if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K); so[i].cbytes=(uint32_t)((size_t)o->M*w->N); break;   /* int8 in, int8 out */
               case ORK_OP_MM_I4:  if(!w||!w->is_orkd){ok=0;break;} so[i].weight_id=w->orkd_id; so[i].N=w->N; so[i].abytes=(uint32_t)((size_t)o->M*w->K);   so[i].cbytes=(uint32_t)((size_t)o->M*w->N*4); break;
               case ORK_OP_EWMUL_F16: case ORK_OP_ADD_F16: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N*2); so[i].bbytes=(uint32_t)((size_t)o->M*o->N*2); so[i].cbytes=(uint32_t)((size_t)o->M*o->N*2); break;   /* fp16 binary SDP */
               case ORK_OP_SILU_I8: case ORK_OP_GELU_I8: case ORK_OP_EXP_I8: so[i].N=o->N; so[i].abytes=(uint32_t)((size_t)o->M*o->N); so[i].cbytes=(uint32_t)((size_t)o->M*o->N); break;   /* int8 unary SDP */
