@@ -890,3 +890,6 @@ chainqkv_probe: tools/chainqkv_probe.c $(COBJ)
 
 chainbench_probe: tools/chainbench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+scorest_probe: tools/scorest_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
