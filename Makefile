@@ -908,3 +908,6 @@ chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 
 attn_decode_bench_probe: tools/attn_decode_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+kv_append_probe: tools/kv_append_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

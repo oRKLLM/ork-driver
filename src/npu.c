@@ -212,6 +212,8 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; };
+/* Tier 12f resident-KV handle — MUST match the typedef in include/ork_npu.h (npu.c doesn't include that header). */
+typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; } ork_kv_resident;
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
@@ -1785,6 +1787,58 @@ ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: pack resident in the daemon (remember the domain so runs carry it) */
     return pack(c,K,N,B,DT_I8);  }
+
+/* ---- Tier 12f: RESIDENT K/V with per-key APPEND (decode attention) -----------------------------------------
+ * A decode step appends ONE key to the KV cache, then attends over all keys. Repacking K^T/V from scratch each
+ * step is packing-bound (measured ~15x slower than CPU); instead keep the two packed int8 weights RESIDENT and
+ * write only the new key's tile bytes each step (+ a per-tile bsync). ork_mm_pack_i8's tile layout is
+ *   bb[nt*KT*1024 + kt*1024 + nl*32 + kk]   (nt=n/32, kt=k/32, nl=n%32, kk=k%32; KT = this tile's K/32)
+ * K^T weight is [Kp=512, Lmax]: K=Kp fixed so KT=16 and a new key is a new N-COLUMN (n=key) — a clean append
+ * into the single N-tile (Lmax<=nmax). V weight is [Lmax, HD]: the key is the K (contraction) index, so it lands
+ * in K-tile ks_idx=key/KS at local kt=(key%KS)/32 — multi-tile when Lmax>KS. Both weights are alloc'd zeroed for
+ * the full Lmax, so keys beyond the current length contribute 0 (Q·0=0 score, 0 weight) and the caller just runs
+ * the matmuls at K=Lmax / N=Lmax with a host softmax over the first `len` keys. Quant scales are the caller's
+ * (per-key ks for K via host dequant; a single vs for V). Local NPU only. */
+ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax){
+    if(!c || c->daemon || HD%32 || Lmax%32 || Lmax<32 || Lmax>c->soc->nmax) return NULL;  /* v1: K^T single N-tile */
+    int Kp=512;
+    int8_t *zk=calloc((size_t)Kp*Lmax,1), *zv=calloc((size_t)Lmax*HD,1);
+    if(!zk||!zv){ free(zk); free(zv); return NULL; }
+    ork_w *wkt=ork_mm_pack_i8(c,Kp,Lmax,zk), *wv=ork_mm_pack_i8(c,Lmax,HD,zv);
+    free(zk); free(zv);
+    if(!wkt||!wv){ if(wkt)ork_w_free(wkt); if(wv)ork_w_free(wv); return NULL; }
+    ork_kv_resident *kv=calloc(1,sizeof *kv);
+    if(!kv){ ork_w_free(wkt); ork_w_free(wv); return NULL; }
+    kv->wkt=wkt; kv->wv=wv; kv->HD=HD; kv->Lmax=Lmax; kv->Kp=Kp;
+    return kv;
+}
+/* Append key `key` (0..Lmax-1): kcol[HD] = this key's K vector (int8), vrow[HD] = its V vector (int8). Writes the
+ * tile bytes for the new K^T column and V row, then bsyncs the touched tile(s). Returns 0/ok, <0 bad-arg. */
+int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow){
+    if(!c || !kv || key<0 || key>=kv->Lmax || !kcol || !vrow) return -2;
+    int HD=kv->HD, Kp=kv->Kp, Lmax=kv->Lmax, KS=int8_ks(c);
+    /* The M=1 matmul reads the FULL-K blob Bf when present (bdma = Bf?Bf:Bb), so Bf is authoritative; Bb is the
+     * K-sliced fallback. Update BOTH. Bf is a single full-K tile per N-slice (Sn==1 here): KTf=K/32, layout
+     * bb[nt*KTf*1024 + kt*1024 + nl*32 + kk] (nt=n/32,kt=k/32,nl=n%32,kk=k%32). */
+    /* --- K^T [Kp,Lmax]: element [k][n=key], k<HD (k>=HD stays 0). Bf single tile KTf=Kp/32; Bb Sk==1 same. --- */
+    { int KTf=Kp/32, nt=key/32, nl=key%32;
+      if(kv->wkt->Bf){ int8_t *bf=(int8_t*)kv->wkt->Bf[0].cpu;
+        for(int k=0;k<HD;k++) bf[(size_t)nt*KTf*1024 + (size_t)(k/32)*1024 + (size_t)nl*32 + (k%32)] = kcol[k];
+        bsync(c->fd, &kv->wkt->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+      int8_t *bb=(int8_t*)kv->wkt->Bb[0].cpu;
+      for(int k=0;k<HD;k++) bb[(size_t)nt*KTf*1024 + (size_t)(k/32)*1024 + (size_t)nl*32 + (k%32)] = kcol[k];
+      bsync(c->fd, &kv->wkt->Bb[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+    /* --- V [Lmax,HD]: element [k=key][n=e]. Bf single full-K tile (KTf=Lmax/32); Bb K-sliced tile ks_idx=key/KS. --- */
+    { if(kv->wv->Bf){ int KTf=Lmax/32; int8_t *bf=(int8_t*)kv->wv->Bf[0].cpu;
+        for(int e=0;e<HD;e++) bf[(size_t)(e/32)*KTf*1024 + (size_t)(key/32)*1024 + (size_t)(e%32)*32 + (key%32)] = vrow[e];
+        bsync(c->fd, &kv->wv->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+      int ks_idx=key/KS, k0=ks_idx*KS, Kp_t=(Lmax-k0<KS)?(Lmax-k0):KS, KTt=Kp_t/32, lk=key-k0, kt=lk/32, kk=lk%32;
+      int8_t *bb=(int8_t*)kv->wv->Bb[ks_idx].cpu;
+      for(int e=0;e<HD;e++) bb[(size_t)(e/32)*KTt*1024 + (size_t)kt*1024 + (size_t)(e%32)*32 + kk] = vrow[e];
+      bsync(c->fd, &kv->wv->Bb[ks_idx], RKNPU_MEM_SYNC_TO_DEVICE); }
+    return 0;
+}
+void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv){ (void)c; if(!kv)return; if(kv->wkt)ork_w_free(kv->wkt); if(kv->wv)ork_w_free(kv->wv); free(kv); }
 
 /* ---- int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom) ----
  * A gmax-selected "fp16" layer wants UNQUANTIZED activations (fp16 A, no act-quant error) but does NOT

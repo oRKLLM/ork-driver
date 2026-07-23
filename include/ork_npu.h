@@ -203,6 +203,15 @@ ork_w       *ork_mm_pack   (ork_npu *ctx, int K, int N, const ork_f16  *B);
  * @return Resident weight handle for ork_mm_run_i8(), or NULL on bad dims (K%32!=0 or N%32!=0).
  */
 ork_w       *ork_mm_pack_i8(ork_npu *ctx, int K, int N, const int8_t   *B);
+/* Tier 12f — resident K/V with per-key append for decode attention. Alloc two zeroed resident int8 weights:
+ * wkt = K^T[512, Lmax] (Q·K^T), wv = V[Lmax, HD]. ork_kv_append writes ONE key's tile bytes each step (no repack),
+ * so decode attention keeps the KV packed and only the matmuls run per token. Run with M=1, K/N=Lmax (keys beyond
+ * the current length are zero -> contribute nothing); the caller does the [1,len] softmax on the host. HD%32,
+ * Lmax%32, Lmax<=nmax. Local NPU only. See src/npu.c for the tiling + scale contract (per-key ks / single vs). */
+typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; } ork_kv_resident;
+ork_kv_resident *ork_kv_resident_alloc(ork_npu *ctx, int HD, int Lmax);
+int              ork_kv_append(ork_npu *ctx, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow);
+void             ork_kv_resident_free(ork_npu *ctx, ork_kv_resident *kv);
 /* re-tile int8 B into an existing same-shape ork_w (reuses its DMA; no alloc/free) — for pooling
  * reused weights (MoE experts) without churning/fragmenting the NPU IOMMU. 0 ok / -1 / -2 mismatch. */
 int          ork_mm_repack_i8(ork_npu *ctx, ork_w *w, int K, int N, const int8_t *B);
