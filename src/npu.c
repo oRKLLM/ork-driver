@@ -135,10 +135,15 @@ struct ork_dom_scratch {
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
-    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded[ORK_MAXCORE];   /* fused-chain LUT cache: chain_Lrc/Lsc hold the (shared) patched LUT DRAM; chain_lut_devloaded[core] tracks whether THAT core's physically-per-core SDP LUT SRAM still holds the current LUT. Any-core-strategy (single/rr/multi): the scheduler picks the core, we cache per-core. Invalidated for a core on reset; for ALL cores when the LUT identity (chain_lut_p) changes. ORK_CHAIN_LUT_STICKY skips the per-core reload when that core is still resident */
-    int chain_core;     /* fused-chain target core when the caller pins one (rr scheduler sets it per dispatch); <0 or default 0 = core 0. The scheduler owns core selection; the per-core caches above/below make any choice cache-correct */
-    int chain_task_P[ORK_MAXCORE];   /* fused-chain task-config cache, per-core: the P-program task array is stable per chain shape; cache it (keyed on P per core) so a sticky homogeneous loop skips the rebuild+bsync. c->task DRAM is shared, so a hit ALSO requires chain_task_owner==core (no other core's LUT-load/rebuild clobbered it since) */
-    int chain_task_owner;   /* which core's task array currently sits in the shared c->task DRAM (-1 = none/clobbered); guards the shared-buffer task cache under core-alternation */
+    /* fused-chain PER-CORE scratch (increment 2: concurrent round-robin — one independent buffer set per core so
+     * chains dispatched to different cores never share DRAM). chain_rc = P-program regcmd, chain_tk = P-task array,
+     * chain_lrc = LUT-load regcmd (DRAM source), chain_lsc = LUT SDP scratch. Lazily allocated per core on first use. */
+    struct buf chain_rc[ORK_MAXCORE], chain_tk[ORK_MAXCORE], chain_lrc[ORK_MAXCORE], chain_lsc[ORK_MAXCORE];
+    const int16_t *chain_lut_p[ORK_MAXCORE];   /* per-core: which LUT is patched into chain_lrc[core] (rebuild that core's lrc when it changes) */
+    int chain_lut_devloaded[ORK_MAXCORE];      /* per-core: chain_lut_devloaded[core]=1 => that core's physically-per-core SDP LUT SRAM still holds its LUT (invalidated for a core on reset). ORK_CHAIN_LUT_STICKY skips the reload when still resident */
+    int chain_core;     /* per-dispatch target core (rr scheduler sets it); default 0. Public setter clamps to 0 until concurrent dispatch is wired; per-core caches make any core cache-correct */
+    int chain_task_P[ORK_MAXCORE];      /* per-core task-config cache: shape (P) whose task array currently sits in chain_tk[core] */
+    int chain_task_built[ORK_MAXCORE];  /* per-core: 1 => chain_tk[core] holds the current P-program task array (P=chain_task_P[core]); a LUT-load on that core memsets chain_tk[core] and clears this */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
@@ -1356,7 +1361,7 @@ ork_npu *ork_npu_init(void){
     { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
       if(ud && atoi(ud) && !(isd && atoi(isd))){
         orkd_conn *dc=orkd_connect();
-        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->chain_task_owner=-1; g_npu_ctx=c;
+        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
             if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
             if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc)); return c; }
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
@@ -1374,7 +1379,7 @@ ork_npu *ork_npu_init(void){
       if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
           fprintf(stderr,"[ork] NPU SRAM: %u KiB %s\n",(unsigned)(g_sram_total>>10),
                   g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->chain_task_owner=-1; c->last_async_cpu=-1;
+    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
     c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
@@ -1429,7 +1434,8 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);bdestroy(fd,&c->mtk_all);
     bdestroy(fd,&c->ppu_a);bdestroy(fd,&c->ppu_b);bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
-    for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);}
+    for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);
+        bdestroy(fd,&c->chain_rc[i]);bdestroy(fd,&c->chain_tk[i]);bdestroy(fd,&c->chain_lrc[i]);bdestroy(fd,&c->chain_lsc[i]);}   /* multi-core matmul + per-core chain scratch, one pass */
     /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
     if(c->dom_save){ for(int d=0;d<ORK_MAXDOM;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
         struct ork_dom_scratch *s=&c->dom_save[d];
@@ -1523,13 +1529,12 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 /* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
- * round-robin: the scheduler will place independent prefill chains on different cores. The per-core LUT/task
- * caches (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) already key off the chosen core and are
- * core-0-validated. ⚠️ RE-CLAMPED to 0: the chain still uses the SHARED c->regcmd/c->task and never brings up
- * cores 1/2, so a submit there HARD-WEDGES the IOMMU. Cross-core needs the chain routed through per-core
- * buffers (mrc/mtk/maf/mcc) + mc_ensure bring-up + a DEDICATED per-core chain-warm (NOT mwarm[], which the
- * matmul path sets — keying the chain warm off mwarm made the FFN->chain sequence skip its warm and wedge).
- * That is round-robin "increment 1"; this clamp lifts once it lands. */
+ * round-robin: the scheduler places independent prefill chains on different cores, each with its OWN per-core
+ * scratch (chain_rc/tk/lrc/lsc[core]) and per-core caches (chain_lut_devloaded[], chain_task_P[]/
+ * chain_task_built[]). Cross-core is fixed + validated sequentially (chainrr_probe, all cores coherent) via the
+ * subcore_task[] fix + per-core buffers. Kept CLAMPED to 0 for the PUBLIC setter until concurrent dispatch is
+ * wired and because a cold target core still needs a prior matmul bring-up; cross-core callers use the
+ * scheduler path / ork_npu_set_chain_core_unsafe (which the bring-up-aware caller drives). */
 void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
     if(core!=0) fprintf(stderr,"[ork] ork_npu_set_chain_core(%d) IGNORED: cross-core chain needs per-core buffer routing (round-robin increment 1); clamped to 0\n",core);
     c->chain_core=0; }
@@ -4265,7 +4270,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
-    if(rst){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_devloaded[i]=0; c->chain_task_owner=-1; }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
+    if(rst){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
     int wclr=0;
     switch(x->wc){
       case WC_NOTKW:         wclr=!kw; break;
@@ -9218,6 +9223,14 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     int KS_CHAIN = int8_ks(c);   // K-slice size for the FFN chain down projection (default 1024)
 
+    /* increment 2 (concurrent round-robin): this chain runs entirely on core `chain_cc` using its OWN scratch
+     * set (chain_rc/tk/lrc/lsc[chain_cc]), so chains dispatched to different cores never share DRAM. Lazily
+     * allocated per core in the current domain (single-domain assumption, as the prior shared LUT buffers had).
+     * regcmd 1MB (~1160 programs) / task 256KB bound the chain size; P is bounds-checked at the build site. */
+    struct buf *RC=&c->chain_rc[chain_cc], *TK=&c->chain_tk[chain_cc], *LRC=&c->chain_lrc[chain_cc], *LSC=&c->chain_lsc[chain_cc];
+    if(!RC->cpu){ *RC=bcreate(fd,1048576,0x403,c->dom_active); *TK=bcreate(fd,262144,0x40b,c->dom_active);
+        if(!RC->cpu||!TK->cpu){ return -2; } }
+
     // 1. Validate all tasks
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -9381,13 +9394,13 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                          (uint32_t)w->Bb[ks].dma, out_dma[i] + (uint32_t)((size_t)ks * M * N * 4), 1, CBUF, 0);
                 if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
                 if (p < P - 1) {   // chain to the next K-slice (or terminate on the last)
-                    uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                    uint64_t next_dma = RC->dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
                     rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
                     rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
                     rc[218] = 0x0014 | (0x0037u << 16);   // next = matmul K-slice (108 regs)
                     rc[219] = (0x0101 << 16);
                 }
-                memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                memcpy((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
             }
             continue;
         }
@@ -9433,7 +9446,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                 if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
-                uint64_t next_dma = c->regcmd.dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                uint64_t next_dma = RC->dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
                 int nk = CHAIN_KIND(i + 1);
                 int next_is_sdp = (nk == OP_SILU || nk == OP_EWMUL);   // next program's regcfg: SDP=69 -> amt 36; matmul=108 -> amt 55
                 uint32_t namt = next_is_sdp ? (uint32_t)((69 + 3) / 2) : 0x0037;
@@ -9446,44 +9459,42 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                 rc[dw+2] = 0x0014 | (namt << 16);
                 rc[dw+3] = (0x0101 << 16) | (0);
             }
-            memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+            memcpy((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
     }
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
 
     // FUSED-SiLU LUT-load: stream the gate task's silu LUT into SDP SRAM ONCE before the chain (enable 0x18,
     // ping-pong OFF). It persists into the chain submit; the gate task's set_i8_silu output stage reads it.
     if (do_lut) {
-        /* LUT-build-once cache: persist Lrc/Lsc in the ctx and re-patch only when the LUT changes; with
-         * ORK_CHAIN_LUT_STICKY also skip the load submit when the SDP SRAM still holds this LUT (unchanged +
-         * no reset since) — saves the ~148us/call load on tight same-LUT loops (decode / round-robin). The
-         * buffer+patch cache is always safe; the load-skip is opt-in because another LUT-loading op between
-         * calls would clobber the SDP SRAM without our knowledge (the caller guarantees a homogeneous loop). */
+        /* LUT-build-once cache (PER-CORE): chain_lrc/lsc[cc] hold this core's patched LUT DRAM; re-patch only when
+         * the LUT identity changes for this core. With ORK_CHAIN_LUT_STICKY also skip the load submit when core cc's
+         * physically-per-core SDP SRAM still holds this LUT — saves the ~148us/call load on tight same-LUT loops
+         * (decode / round-robin). Per-core buffers make this concurrency-safe: sibling cores never share this DRAM. */
         static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
-        int cc = chain_cc;   /* step-1: chain's target core (hoisted above) */
-        if (!c->chain_Lrc.cpu) {   /* one-time alloc, persists for the ctx lifetime */
-            c->chain_Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
-            c->chain_Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
-            if (!c->chain_Lrc.cpu || !c->chain_Lsc.cpu) { ok = -2; goto cleanup; }
+        int cc = chain_cc;   /* this chain's target core (hoisted above) */
+        if (!LRC->cpu) {   /* one-time per-core alloc */
+            *LRC = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
+            *LSC = bcreate(fd, 4096, 0x403, c->dom_active);
+            if (!LRC->cpu || !LSC->cpu) { ok = -2; goto cleanup; }
         }
-        if (c->chain_lut_p != ss->lut) {   /* (re)build Lrc contents only when the LUT identity changes */
-            memcpy(c->chain_Lrc.cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
-            setr((uint32_t*)c->chain_Lrc.cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)c->chain_Lsc.dma);
-            { uint32_t *lr=(uint32_t*)c->chain_Lrc.cpu; int j=0;
+        if (c->chain_lut_p[cc] != ss->lut) {   /* (re)build THIS core's Lrc only when its LUT identity changes */
+            memcpy(LRC->cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
+            setr((uint32_t*)LRC->cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)LSC->dma);
+            { uint32_t *lr=(uint32_t*)LRC->cpu; int j=0;
               for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
                   int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
                   lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
-            bsync(fd, &c->chain_Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
-            /* LUT identity changed -> every core's resident SDP SRAM copy is now stale */
-            c->chain_lut_p = ss->lut; for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_devloaded[i]=0;
+            bsync(fd, LRC, RKNPU_MEM_SYNC_TO_DEVICE);
+            c->chain_lut_p[cc] = ss->lut; c->chain_lut_devloaded[cc] = 0;   /* new LUT patched -> this core's SRAM copy is stale */
         }
         /* load the LUT into core cc's (physically per-core) SDP SRAM; skip only if sticky AND already resident on cc */
         if (!(sticky && c->chain_lut_devloaded[cc])) {
-            struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
-            lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=c->chain_Lrc.dma;
-            bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-            c->chain_task_owner=-1;   /* the LUT-load just memset the shared c->task DRAM -> no chain array resides there now */
-            struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
+            struct rknpu_task *lt=TK->cpu; memset(lt,0,sizeof *lt);
+            lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=LRC->dma;
+            bsync(fd,TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            c->chain_task_built[cc]=0;   /* the LUT-load just memset this core's task DRAM -> chain array no longer resides there */
+            struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=TK->obj;
             ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms();
             /* ALL THREE subcore_task[] must be populated even for a single core (npu.c:3365): on core_mask=1<<cc
              * the kernel commits subcore_task[cc]; leaving it zero NULL-derefs rknpu_job_subcore_commit and wedges.
@@ -9496,27 +9507,27 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
 
     // One rknpu_task per program (P total, PC-chained), one single-core submit.
     int submit_ok = 0;
-    struct rknpu_task *t = c->task.cpu;
+    struct rknpu_task *t = TK->cpu;
     /* task-config cache (per-core): the P-program array (enable/regcfg/regcmd_addr — all shape-stable, regcmd_addr
-     * fixed to c->regcmd.dma) is identical every call for a fixed chain shape. Skip the rebuild+bsync when sticky +
-     * the LUT is resident on this core AND the shape (chain_task_P[cc]) matches AND the shared c->task DRAM still
-     * holds THIS core's array (chain_task_owner==cc — any other core's LUT-load or rebuild since would have clobbered
-     * it). Reset invalidates via devloaded[] + owner; a foreign core's touch invalidates via owner. */
+     * fixed to chain_rc[cc].dma) is identical every call for a fixed chain shape on this core. Skip the rebuild+bsync
+     * when sticky + the LUT is resident on cc AND the shape (chain_task_P[cc]) matches AND chain_tk[cc] still holds
+     * this core's array (chain_task_built[cc]; a LUT-load on cc memsets chain_tk[cc] and clears it). Per-core buffers
+     * mean NO cross-core clobber — concurrent rr chains each own their chain_tk[core]. */
     { static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
-      int cached = sticky && c->chain_lut_devloaded[chain_cc] && c->chain_task_owner==chain_cc && c->chain_task_P[chain_cc]==P;
+      int cached = sticky && c->chain_lut_devloaded[chain_cc] && c->chain_task_built[chain_cc] && c->chain_task_P[chain_cc]==P;
       if(!cached){
         memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
         for (int p = 0; p < P; p++) {   // default: matmul task
             t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
             t[p].regcfg_amount = 108;
-            t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4;
+            t[p].regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4;
         }
         for (int i = 0; i < S; i++) {   // SDP tasks (silu/ewmul): enable 0x18, regcfg 69 (single program at prog_off[i])
             int k = CHAIN_KIND(i);
             if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
         }
-        bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        c->chain_task_P[chain_cc] = P; c->chain_task_owner = chain_cc;   /* this core's array now owns the shared c->task DRAM */
+        bsync(fd, TK, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        c->chain_task_P[chain_cc] = P; c->chain_task_built[chain_cc] = 1;   /* this core's chain_tk now holds the P-array */
       } }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     // ping-pong OFF (0x1) for any silu chain (SDP/LUT task present) so a bank swap doesn't race the LUT SRAM
@@ -9540,7 +9551,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         fbuf = cbufs[fi] ? cbufs[fi] : &tmp_C[fi];
     }
 
-    sub.flags = ss ? 0x1u : ork_ppflags(); sub.task_number = P; sub.task_obj_addr = c->task.obj;
+    sub.flags = ss ? 0x1u : ork_ppflags(); sub.task_number = P; sub.task_obj_addr = TK->obj;
     sub.core_mask = 1u << chain_cc; sub.fence_fd = -1;   /* step-1: chain runs on its parameterized core */
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
     /* RE PROBE (ORK_STEER_HALT_AT=<p>): does the PC sequencer read each program's chain descriptor from DRAM
@@ -9567,7 +9578,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             for (;;) { int dn = 1; for (size_t e = 0; e < fno; e++) { __asm__ volatile("dc civac,%0"::"r"(&fdb[e]):"memory"); if (fdb[e] == 0x7fffffff) { dn = 0; break; } } if (dn || ork_now_us()-pt > cap) break; }
         }
         if (do_steer) {   /* mid-flight: halt program steer_at by zeroing its next-amount (0x0014) in DRAM */
-            uint32_t *rcp = (uint32_t*)((char*)c->regcmd.cpu + (size_t)steer_at * REGCMD_I8_N * 4);
+            uint32_t *rcp = (uint32_t*)((char*)RC->cpu + (size_t)steer_at * REGCMD_I8_N * 4);
             rcp[218] = 0x0014;   /* 0x0014 | (amount 0) => sequencer stops after this program */
             __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
             usleep((unsigned)(P*60u + 8000u));   /* drain the (halted-or-full) chain before the FROM bsync */
