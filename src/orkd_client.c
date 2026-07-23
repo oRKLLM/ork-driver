@@ -244,6 +244,37 @@ uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B){
     return hh.rc == 0 ? hh.id : 0;
 }
 
+/* Tier 12f resident-KV alloc: daemon allocs K^T[512,Lmax]+V[Lmax,HD]; returns kv handle + the two weight ids. */
+uint64_t orkd_kv_alloc(orkd_conn *c, int HD, int Lmax, uint64_t *wkt_id, uint64_t *wv_id){
+    if (!c || c->fd < 0 || HD <= 0 || Lmax <= 0) return 0;
+    struct orkd_kv_alloc rq; memset(&rq, 0, sizeof rq); rq.HD = (uint32_t)HD; rq.Lmax = (uint32_t)Lmax;
+    struct orkd_hdr h = { ORKD_KV_ALLOC, (uint32_t)sizeof rq, 3 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq)) return 0;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return 0;
+    if (rh.type != ORKD_KV_ALLOC_OK){ if (rh.len) cdrain(c->fd, rh.len); return 0; }
+    struct orkd_kv_alloc_ok ok;
+    if (rn(c->fd, &ok, sizeof ok) <= 0) return 0;
+    if (rh.len > sizeof ok) cdrain(c->fd, rh.len - sizeof ok);
+    if (ok.rc) return 0;
+    if (wkt_id) *wkt_id = ok.wkt_id; if (wv_id) *wv_id = ok.wv_id;
+    return ok.kv_id;
+}
+/* Append key `key`: kcol[HD] (K vector) + vrow[HD] (V vector), int8. 0/ok, <0 err. */
+int orkd_kv_append(orkd_conn *c, uint64_t kv_id, int key, int HD, const int8_t *kcol, const int8_t *vrow){
+    if (!c || c->fd < 0 || HD <= 0 || key < 0 || !kcol || !vrow) return -2;
+    struct orkd_kv_append rq; memset(&rq, 0, sizeof rq); rq.kv_id = kv_id; rq.key = (uint32_t)key; rq.HD = (uint32_t)HD;
+    struct orkd_hdr h = { ORKD_KV_APPEND, (uint32_t)(sizeof rq + 2*(size_t)HD), 3 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &rq, sizeof rq) || wn(c->fd, kcol, (size_t)HD) || wn(c->fd, vrow, (size_t)HD)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_KV_APPEND_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    if (rh.len > sizeof hh) cdrain(c->fd, rh.len - sizeof hh);
+    return hh.rc;
+}
+
 /* Import client-owned, PRE-TILED weight dma-buf(s) into the daemon (ORKD_IMPORT). fds ride SCM_RIGHTS on the
  * header: bb_fd (Bb tiles) always, bf_fd (full-K Bf, its own buffer) when bf_bytes>0. The daemon maps them
  * into this client's pack_domain (Bf into its OWN obj) and returns a weight id. 0 on failure. The caller keeps

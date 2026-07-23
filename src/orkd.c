@@ -82,7 +82,9 @@ static void send_error(int fd, uint64_t tag, uint32_t code, const char *msg){
 #define ORKD_MAX_BYTES (512u << 20)         /* sanity cap on a single weight/A transfer */
 
 struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT_I8 | ORKD_DT_F16 (wire dtype) */
+struct ckv { uint64_t id; ork_kv_resident *kv; };   /* Tier 12f resident-KV handle (its wkt/wv are also registered in wt[]) */
 struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain;
+                struct ckv kvt[ORKD_MAX_WEIGHTS]; int nkv;   /* resident-KV handles for ORKD_KV_APPEND */
                 unsigned owned_dom;   /* bitmask of IOMMU domains this client requested via ORKD_DOM_REQ (bits 1..POOL); released on drop */
                 struct orkd_ring *ring; int ring_fd; uint32_t ring_tail; };  /* A-ring: attached low-latency shm transport */
 
@@ -227,6 +229,40 @@ static int handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
     if (!werr && payload) werr = writen(cl->fd, Cd, dsz);
     free(A); free(Cg); free(Cs); free(Cu); free(Ch); free(Cd);
     return werr ? -1 : 0;
+}
+/* Tier 12f resident-KV: the daemon runs a DIRECT npu ctx (fd valid), so ork_kv_resident_alloc/append take the
+ * LOCAL path here. Register the two resident weights in wt[] (so ORKD_CHAIN can reference them by id) and keep
+ * the kv handle in kvt[] for append. Freed with the rest on client drop. */
+static int handle_kv_alloc(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_kv_alloc rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0) return -1;
+    struct orkd_kv_alloc_ok ok; memset(&ok, 0, sizeof ok); ok.rc = -1;
+    ork_kv_resident *kv = ork_kv_resident_alloc(npu, (int)rq.HD, (int)rq.Lmax);
+    if (kv && cl->nw + 2 <= ORKD_MAX_WEIGHTS && cl->nkv < ORKD_MAX_WEIGHTS){
+        uint64_t wkt_id = ++cl->next_wid, wv_id = ++cl->next_wid, kv_id = ++cl->next_wid;
+        cl->wt[cl->nw++] = (struct cweight){ wkt_id, kv->wkt, kv->Kp, (int)rq.Lmax, (int)ORKD_DT_I8 };
+        cl->wt[cl->nw++] = (struct cweight){ wv_id,  kv->wv,  (int)rq.Lmax, (int)rq.HD, (int)ORKD_DT_I8 };
+        cl->kvt[cl->nkv++] = (struct ckv){ kv_id, kv };
+        ok.rc = 0; ok.kv_id = kv_id; ok.wkt_id = wkt_id; ok.wv_id = wv_id;
+    } else if (kv) ork_kv_resident_free(npu, kv);
+    send_msg(cl->fd, ORKD_KV_ALLOC_OK, tag, &ok, sizeof ok);
+    return 0;
+}
+static int handle_kv_append(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_kv_append rq;
+    if (readn(cl->fd, &rq, sizeof rq) <= 0) return -1;
+    uint32_t HD = rq.HD; size_t nb = 2 * (size_t)HD;
+    if (HD == 0 || HD > 4096){ if (nb) drain(cl->fd, nb); send_error(cl->fd, tag, ORKD_EPROTO, "bad HD"); return 0; }
+    int8_t *buf = malloc(nb);
+    if (!buf){ drain(cl->fd, nb); send_error(cl->fd, tag, ORKD_EOOM, "kv append alloc"); return 0; }
+    if (readn(cl->fd, buf, nb) <= 0){ free(buf); return -1; }
+    ork_kv_resident *kv = NULL;
+    for (int i = 0; i < cl->nkv; i++) if (cl->kvt[i].id == rq.kv_id){ kv = cl->kvt[i].kv; break; }
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh);
+    hh.rc = kv ? ork_kv_append(npu, kv, (int)rq.key, buf, buf + HD) : -2;
+    free(buf);
+    send_msg(cl->fd, ORKD_KV_APPEND_OK, tag, &hh, sizeof hh);
+    return 0;
 }
 /* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
  * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
@@ -585,6 +621,9 @@ static int ring_service(ork_npu *npu, struct client *cl, int nc){
 static void client_reclaim(struct client *cl, ork_npu *npu){
     for (int i = 0; i < cl->nw; i++) ork_mm_free(npu, cl->wt[i].w);
     cl->nw = 0;
+    /* Tier 12f: the kv handles' wkt/wv were registered in wt[] and freed above — free just the kv structs here. */
+    for (int i = 0; i < cl->nkv; i++) free(cl->kvt[i].kv);
+    cl->nkv = 0;
     if (cl->ring){ munmap(cl->ring, ORKD_RING_BYTES); cl->ring = NULL; }
     if (cl->ring_fd > 0){ close(cl->ring_fd); cl->ring_fd = -1; }
 }
@@ -782,6 +821,8 @@ int main(void){
                 case ORKD_PING: send_msg(cl[i].fd, ORKD_PONG, h.tag, NULL, 0); break;
                 case ORKD_BYE:  drop = 1; break;
                 case ORKD_PACK: if (handle_pack(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_KV_ALLOC:  if (handle_kv_alloc (&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_KV_APPEND: g_orkd_submits++; if (handle_kv_append(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_IMPORT: if (handle_import(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_FFN: g_orkd_submits++; if (handle_ffn(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  g_orkd_submits++; if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;

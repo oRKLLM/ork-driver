@@ -213,7 +213,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; };
 /* Tier 12f resident-KV handle — MUST match the typedef in include/ork_npu.h (npu.c doesn't include that header). */
-typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; } ork_kv_resident;
+typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; uint64_t orkd_kv; } ork_kv_resident;
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
@@ -1800,8 +1800,19 @@ ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
  * the matmuls at K=Lmax / N=Lmax with a host softmax over the first `len` keys. Quant scales are the caller's
  * (per-key ks for K via host dequant; a single vs for V). Local NPU only. */
 ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax){
-    if(!c || c->daemon || HD%32 || Lmax%32 || Lmax<32 || Lmax>c->soc->nmax) return NULL;  /* v1: K^T single N-tile */
+    if(!c || HD%32 || Lmax%32 || Lmax<32 || Lmax>c->soc->nmax) return NULL;  /* v1: K^T single N-tile */
     int Kp=512;
+    if(c->daemon){   /* orkd: the daemon allocs the resident K^T/V; we mirror the two resident weight ids (for
+                      * ORKD_CHAIN) + keep the kv id for ork_kv_append. */
+        uint64_t wkt_id=0, wv_id=0, kvid=orkd_kv_alloc(c->daemon, HD, Lmax, &wkt_id, &wv_id);
+        if(!kvid) return NULL;
+        ork_kv_resident *kv=calloc(1,sizeof *kv); ork_w *wkt=calloc(1,sizeof *wkt), *wv=calloc(1,sizeof *wv);
+        if(!kv||!wkt||!wv){ free(kv); free(wkt); free(wv); return NULL; }
+        wkt->is_orkd=1; wkt->orkd_id=wkt_id; wkt->K=Kp;   wkt->N=Lmax; wkt->dtype=DT_I8; wkt->domain=ork_dom(c->pack_domain);
+        wv->is_orkd=1;  wv->orkd_id=wv_id;  wv->K=Lmax; wv->N=HD;   wv->dtype=DT_I8; wv->domain=ork_dom(c->pack_domain);
+        kv->wkt=wkt; kv->wv=wv; kv->HD=HD; kv->Lmax=Lmax; kv->Kp=Kp; kv->orkd_kv=kvid;
+        return kv;
+    }
     int8_t *zk=calloc((size_t)Kp*Lmax,1), *zv=calloc((size_t)Lmax*HD,1);
     if(!zk||!zv){ free(zk); free(zv); return NULL; }
     ork_w *wkt=ork_mm_pack_i8(c,Kp,Lmax,zk), *wv=ork_mm_pack_i8(c,Lmax,HD,zv);
@@ -1816,6 +1827,7 @@ ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax){
  * tile bytes for the new K^T column and V row, then bsyncs the touched tile(s). Returns 0/ok, <0 bad-arg. */
 int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow){
     if(!c || !kv || key<0 || key>=kv->Lmax || !kcol || !vrow) return -2;
+    if(c->daemon) return orkd_kv_append(c->daemon, kv->orkd_kv, key, kv->HD, kcol, vrow);   /* orkd: daemon writes the tile bytes */
     int HD=kv->HD, Kp=kv->Kp, Lmax=kv->Lmax, KS=int8_ks(c);
     /* The M=1 matmul reads the FULL-K blob Bf when present (bdma = Bf?Bf:Bb), so Bf is authoritative; Bb is the
      * K-sliced fallback. Update BOTH. Bf is a single full-K tile per N-slice (Sn==1 here): KTf=K/32, layout
@@ -1838,7 +1850,9 @@ int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, 
       bsync(c->fd, &kv->wv->Bb[ks_idx], RKNPU_MEM_SYNC_TO_DEVICE); }
     return 0;
 }
-void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv){ (void)c; if(!kv)return; if(kv->wkt)ork_w_free(kv->wkt); if(kv->wv)ork_w_free(kv->wv); free(kv); }
+void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv){ if(!kv)return;
+    if(c && c->daemon){ free(kv->wkt); free(kv->wv); free(kv); return; }   /* orkd: mirrors are id-holders; daemon-side reclaimed on disconnect (TODO ORKD_KV_FREE for mid-session release) */
+    if(kv->wkt)ork_w_free(kv->wkt); if(kv->wv)ork_w_free(kv->wv); free(kv); }
 
 /* ---- int8 JIT-inflate to fp16 (emulated W8A16 for IOVA headroom) ----
  * A gmax-selected "fp16" layer wants UNQUANTIZED activations (fp16 A, no act-quant error) but does NOT

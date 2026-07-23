@@ -77,6 +77,11 @@ enum orkd_msg_type {
      * socket round-trip + one submit for the entire FFN inner, intermediates never leave the NPU. */
     ORKD_FFN          = 49, /* client->daemon: {orkd_ffn} + A payload (M*K int8) -> coalesced FFN inner chain    */
     ORKD_FFN_OK       = 50, /* daemon->client: {orkd_handle} + down output payload (M*Kd int32) when rc==0        */
+
+    ORKD_KV_ALLOC     = 51, /* client->daemon: {orkd_kv_alloc} -> daemon allocs resident K^T[512,Lmax]+V[Lmax,HD] (Tier 12f) */
+    ORKD_KV_ALLOC_OK  = 52, /* daemon->client: {orkd_kv_alloc_ok} kv_id + wkt_id + wv_id (+ rc); wkt/wv usable in ORKD_CHAIN */
+    ORKD_KV_APPEND    = 53, /* client->daemon: {orkd_kv_append} + 2*HD int8 (kcol[HD] then vrow[HD]) -> ork_kv_append(key)   */
+    ORKD_KV_APPEND_OK = 54, /* daemon->client: {orkd_handle} rc                                                             */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -161,6 +166,21 @@ struct orkd_ffn {       /* the A payload (M*K int8, ffn-norm output) follows the
     double   in_scale, out_scale;       /* silu LUT scales (real_gate = acc*in_scale; int8 = silu(real)/out_scale) */
     uint32_t abytes;                    /* = M*K (int8 A) */
     uint32_t pad;
+};
+struct orkd_kv_alloc {   /* Tier 12f resident-KV: daemon allocs K^T[512,Lmax] + V[Lmax,HD] int8, zeroed */
+    uint32_t HD, Lmax;
+};
+struct orkd_kv_alloc_ok {
+    uint64_t kv_id;      /* handle for ORKD_KV_APPEND */
+    uint64_t wkt_id;     /* resident weight id for QK^T (usable as a task weight in ORKD_CHAIN) */
+    uint64_t wv_id;      /* resident weight id for e.V */
+    int32_t  rc;         /* 0 ok, <0 error */
+    uint32_t pad;
+};
+struct orkd_kv_append {  /* followed by 2*HD int8: kcol[HD] (the key's K vector) then vrow[HD] (its V vector) */
+    uint64_t kv_id;
+    uint32_t key;        /* 0..Lmax-1 */
+    uint32_t HD;
 };
 struct orkd_run {
     uint64_t weight_id;

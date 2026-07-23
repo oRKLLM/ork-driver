@@ -65,6 +65,11 @@ uint32_t orkd_soc_cores(orkd_conn *c);
 
 /* Pack an int8 weight B[K,N] resident in the daemon. Returns a weight id (>0) or 0 on failure. */
 uint64_t orkd_pack_i8(orkd_conn *c, int K, int N, const int8_t *B);
+/* Tier 12f resident-KV: daemon allocs resident K^T[512,Lmax]+V[Lmax,HD]; returns a kv handle (>0) + the two
+ * resident weight ids (usable as task weights in orkd_run_chain_i8). orkd_kv_append writes one key's tile bytes
+ * daemon-side (no per-step repack). 0/failure for alloc; 0/ok, <0 err for append. */
+uint64_t orkd_kv_alloc (orkd_conn *c, int HD, int Lmax, uint64_t *wkt_id, uint64_t *wv_id);
+int      orkd_kv_append(orkd_conn *c, uint64_t kv_id, int key, int HD, const int8_t *kcol, const int8_t *vrow);
 
 /* Run int8 A[M,K] x weight -> C[M,N] (int32), computed on the daemon's NPU. 0 = ok, <0 = error. */
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C);
