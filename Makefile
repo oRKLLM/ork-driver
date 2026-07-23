@@ -887,3 +887,6 @@ chainav_probe: tools/chainav_probe.c $(COBJ)
 
 chainqkv_probe: tools/chainqkv_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+chainbench_probe: tools/chainbench_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
