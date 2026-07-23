@@ -404,21 +404,31 @@ static int handle_seq(struct client *cl, ork_npu *npu, uint64_t tag){
         seq[i].C = Cs[i]; if (!o->c_keep) ctot += o->cbytes;   /* c_keep => stays resident, not shipped back */
     }
     int rc = ok ? ork_submit_seq(npu, seq, n) : -2;
-    if (getenv("ORKD_SEQ_DEBUG")){   /* dump each op's A-input + C-output stats to orkd.log (root-cause the seq) */
-        fprintf(stderr, "[seqdbg] n=%d ok=%d rc=%d in_total=%u\n", n, ok, rc, sh.in_total);
-        for (int i = 0; ok && i < n; i++){
-            struct orkd_seq_op *o = &ops[i];
-            size_t asz = o->a_src ? (o->a_src>=1 && o->a_src<=i ? ops[o->a_src-1].cbytes : 0) : o->abytes;
-            long a8 = 0; const int8_t *ain = (const int8_t*)seq[i].A;
-            if (ain) for (size_t b = 0; b < asz; b++) a8 += ain[b];
-            long c8 = 0, c32 = 0; const int8_t *c8p = (const int8_t*)Cs[i]; const int32_t *c32p = (const int32_t*)Cs[i];
-            for (size_t b = 0; b < o->cbytes; b++) c8 += c8p[b];
-            for (size_t q = 0; q < o->cbytes/4; q++) c32 += c32p[q];
-            fprintf(stderr, "[seqdbg] op%d kind=%u M=%d N=%d a_src=%d c_keep=%u asz=%zu cb=%u | Asum(i8)=%ld Csum(i8)=%ld Csum(i32)=%ld C[i32:0..3]=%d,%d,%d,%d\n",
-                    i, o->kind, seq[i].M, seq[i].N, o->a_src, o->c_keep, asz, o->cbytes, a8, c8, c32,
-                    c32p[0], o->cbytes>=8?c32p[1]:0, o->cbytes>=12?c32p[2]:0, o->cbytes>=16?c32p[3]:0);
+    { const char *dbg = getenv("ORKD_SEQ_DEBUG");   /* dump each op's A-input + C-output stats to a DETERMINISTIC file
+        * (ORKD_SEQ_DEBUG=path, or =1 -> /tmp/orkd-seqdbg.log). Own fd + fsync per seq so it survives a later NPU wedge
+        * and never depends on stderr/orkd.log's runtime-dir location. This is the reliable observability for the
+        * orkd SW-run() reduce bug (registry: resident int8 softmax seq assembly). */
+      if (dbg){
+        const char *path = (dbg[0] && strcmp(dbg,"1")) ? dbg : "/tmp/orkd-seqdbg.log";
+        int dfd = open(path, O_CREAT|O_WRONLY|O_APPEND, 0644);
+        if (dfd >= 0){ char lb[512]; int ln;
+            ln = snprintf(lb, sizeof lb, "[seqdbg] n=%d ok=%d rc=%d in_total=%u\n", n, ok, rc, sh.in_total); if(ln>0) (void)!write(dfd, lb, (size_t)ln);
+            for (int i = 0; ok && i < n; i++){
+                struct orkd_seq_op *o = &ops[i];
+                size_t asz = o->a_src ? (o->a_src>=1 && o->a_src<=i ? ops[o->a_src-1].cbytes : 0) : o->abytes;
+                long a8 = 0; const int8_t *ain = (const int8_t*)seq[i].A;
+                if (ain) for (size_t b = 0; b < asz; b++) a8 += ain[b];
+                long c8 = 0, c32 = 0; const int8_t *c8p = (const int8_t*)Cs[i]; const int32_t *c32p = (const int32_t*)Cs[i];
+                for (size_t b = 0; b < o->cbytes; b++) c8 += c8p[b];
+                for (size_t q = 0; q < o->cbytes/4; q++) c32 += c32p[q];
+                ln = snprintf(lb, sizeof lb, "[seqdbg] op%d kind=%u M=%d N=%d a_src=%d c_keep=%u asz=%zu cb=%u | Asum(i8)=%ld Csum(i8)=%ld Csum(i32)=%ld C[i32:0..3]=%d,%d,%d,%d\n",
+                        i, o->kind, seq[i].M, seq[i].N, o->a_src, o->c_keep, asz, o->cbytes, a8, c8, c32,
+                        c32p[0], o->cbytes>=8?c32p[1]:0, o->cbytes>=12?c32p[2]:0, o->cbytes>=16?c32p[3]:0);
+                if(ln>0) (void)!write(dfd, lb, (size_t)ln);
+            }
+            fsync(dfd); close(dfd);
         }
-        fflush(stderr);
+      }
     }
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
     int payload = (rc == 0);
