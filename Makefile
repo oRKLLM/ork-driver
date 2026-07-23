@@ -829,3 +829,6 @@ i8out_map_probe: tools/i8out_map_probe.c $(COBJ)
 # orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./int8reduce_probe
 int8reduce_probe: tools/int8reduce_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+xmax_probe: tools/xmax_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
