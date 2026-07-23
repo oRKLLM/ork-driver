@@ -1523,15 +1523,16 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 /* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
- * round-robin: the scheduler pins each dispatched chain to a core and the per-core LUT/task caches
- * (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) keep every core cache-correct wherever it lands.
- * ⚠️ CROSS-CORE IS UNVALIDATED and wedges in the bare direct path: ork_npu_init only brings up core 0, so a
- * chain submit on core 1/2 HARD-WEDGES the IOMMU (verified 2026-07-23, 4 power-cycles; neither a per-core warm
- * nor a preceding run_multicore matmul fixes it — the matmul mode-switch right before a chain also wedges).
- * The per-core CACHING here is correct and core-0-validated; whether cores 1/2 can run the chain at all is an
- * open question that must be answered INSIDE orkd (full daemon init), NOT bare probes. Invalid ids fall to 0. */
+ * round-robin: the scheduler will place independent prefill chains on different cores. The per-core LUT/task
+ * caches (chain_lut_devloaded[], chain_task_P[]/chain_task_owner) already key off the chosen core and are
+ * core-0-validated. ⚠️ RE-CLAMPED to 0: the chain still uses the SHARED c->regcmd/c->task and never brings up
+ * cores 1/2, so a submit there HARD-WEDGES the IOMMU. Cross-core needs the chain routed through per-core
+ * buffers (mrc/mtk/maf/mcc) + mc_ensure bring-up + a DEDICATED per-core chain-warm (NOT mwarm[], which the
+ * matmul path sets — keying the chain warm off mwarm made the FFN->chain sequence skip its warm and wedge).
+ * That is round-robin "increment 1"; this clamp lifts once it lands. */
 void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
-    c->chain_core = (core>=0 && core<c->soc->cores) ? core : 0; }
+    if(core!=0) fprintf(stderr,"[ork] ork_npu_set_chain_core(%d) IGNORED: cross-core chain needs per-core buffer routing (round-robin increment 1); clamped to 0\n",core);
+    c->chain_core=0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
  * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
 void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
@@ -9203,7 +9204,6 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     /* step-1 core-parameterize: the whole chain (LUT-load + program submit) runs on this one core, so
      * round-robin can place independent chains on different cores. Default 0 = core 0 (unchanged). */
     int chain_cc = (c->chain_core>=0 && c->chain_core<c->soc->cores) ? c->chain_core : 0;
-    { const char*e=getenv("ORK_CHAIN_CORE"); if(e){ int v=atoi(e); if(v>=0 && v<c->soc->cores) chain_cc=v; } }   /* step-2 test override (setter stays clamped); per-core warm below primes the target core */
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
      * allocs per-call scratch, so it must only be used to batch S>1 independent matmuls. */
@@ -9479,10 +9479,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             c->chain_task_owner=-1;   /* the LUT-load just memset the shared c->task DRAM -> no chain array resides there now */
             struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
             ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-            /* step-2: the LUT-load is the FIRST submit on core cc; on a cold core it wedges before the main
-             * submit's reps=2 warm can run. Warm it in place (reps=2 discard-first) when this core is cold. */
-            int lreps = c->mwarm[cc] ? 1 : 2;
-            for (int lr=0; lr<lreps; lr++) if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { if(lr==lreps-1){ ok=-1; goto cleanup; } }
+            if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
             c->chain_lut_devloaded[cc] = 1;
         }
     }
@@ -9544,7 +9541,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int steer_at; { const char*e=getenv("ORK_STEER_HALT_AT"); steer_at = e?atoi(e):-1; }   /* per-call: probe warms unset, then sets it */
     int do_steer = (steer_at >= 0 && steer_at < P-1 && !ss);
     if (do_steer || fdb_on) sub.flags |= 0x2u;              /* NONBLOCK: do_steer (RE probe) or the fused-chain doorbell */
-    int reps = do_steer ? 1 : (c->mwarm[chain_cc] ? 1 : 2);   /* step-2: PER-CORE cold-warm (was the single c->warmed -> a cold non-0 core skipped its warm and wedged) */
+    int reps = do_steer ? 1 : (c->warmed ? 1 : 2);
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = mm_timeout_ms();
@@ -9567,7 +9564,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             if (getenv("ORK_VERBOSE")) fprintf(stderr, "[STEER] NONBLOCK submit + halt-inject at prog %d/%d\n", steer_at, P);
         }
     }
-    c->warmed = 1; c->mwarm[chain_cc] = 1;   /* step-2: mark THIS core warm */
+    c->warmed = 1;
 
     // 7. Sync memory back and copy results
     for (int i = 0; i < S; i++) {
