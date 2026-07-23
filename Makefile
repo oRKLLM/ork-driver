@@ -869,3 +869,6 @@ exp_biased_probe: tools/exp_biased_probe.c $(COBJ)
 # softmax_i8_seq_probe — resident int8 softmax island as one seq (K-pad QK^T -> biased exp -> reduce). Board+PPU.
 softmax_i8_seq_probe: tools/softmax_i8_seq_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+softmax_i8_split_probe: tools/softmax_i8_split_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
