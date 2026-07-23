@@ -135,7 +135,8 @@ struct ork_dom_scratch {
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
 struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
-    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded;   /* fused-chain LUT cache: persist the LUT buffers + patched contents across calls; chain_lut_devloaded tracks whether the SDP SRAM still holds it (invalidated on reset) so ORK_CHAIN_LUT_STICKY can skip the per-call reload submit */
+    struct buf chain_Lrc, chain_Lsc; const int16_t *chain_lut_p; int chain_lut_devloaded; int chain_lut_core;   /* fused-chain LUT cache: persist the LUT buffers + patched contents across calls; chain_lut_devloaded tracks whether the SDP SRAM still holds it (invalidated on reset); chain_lut_core = which core's SDP holds it (step-1 core-parameterize: the LUT-load + chain submit run on the same core, so switching cores reloads) — ORK_CHAIN_LUT_STICKY skips the per-call reload only when core+LUT match */
+    int chain_core;     /* fused-chain target core (step-1 core-parameterize): the LUT-load + chain submit both run here; 0 default = core 0 (unchanged), settable via ork_npu_set_chain_core for round-robin (one chain per core) */
     int chain_task_P;   /* fused-chain task-config cache: the P-program task array is stable per chain shape and re-bsync'd every call; cache it (keyed on P) so a sticky homogeneous loop skips the rebuild+bsync (valid only when the LUT-load — which shares c->task — was ALSO skipped, i.e. sticky) */
     /* multi-core (ORK_NPU_MC): per-core regcmd/task/feature/output so cores submit concurrently */
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
@@ -1520,6 +1521,14 @@ int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
 /* policy: cap the cores the auto-tuner may use for a matmul (n<=0 → all soc cores). The library
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
 void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
+/* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
+ * round-robin, but NON-0 CORES ARE NOT YET SAFE: the chain's scratch + warm state (regcmd/task/Af/Cc/cres)
+ * are core-0-oriented, so submitting on core 1/2 against them HARD-WEDGES the NPU (needs a physical power-
+ * cycle — verified 2026-07-23). Core-param is coupled to per-core scratch (round-robin step 2). Until step 2
+ * lands, this CLAMPS to core 0 (non-0 warns, not honored) so it can't wedge. Step 2 removes the clamp. */
+void ork_npu_set_chain_core(ork_npu *c,int core){ if(!c)return;
+    if(core!=0) fprintf(stderr,"[ork] ork_npu_set_chain_core(%d) IGNORED: non-0 cores need per-core scratch (round-robin step 2); clamped to 0\n",core);
+    c->chain_core=0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
  * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
 void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
@@ -9188,6 +9197,9 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
     }
 
+    /* step-1 core-parameterize: the whole chain (LUT-load + program submit) runs on this one core, so
+     * round-robin can place independent chains on different cores. Default 0 = core 0 (unchanged). */
+    int chain_cc = (c->chain_core>=0 && c->chain_core<c->soc->cores) ? c->chain_core : 0;
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
      * allocs per-call scratch, so it must only be used to batch S>1 independent matmuls. */
@@ -9438,6 +9450,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
          * buffer+patch cache is always safe; the load-skip is opt-in because another LUT-loading op between
          * calls would clobber the SDP SRAM without our knowledge (the caller guarantees a homogeneous loop). */
         static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
+        int cc = chain_cc;   /* step-1: chain's target core (hoisted above) */
         if (!c->chain_Lrc.cpu) {   /* one-time alloc, persists for the ctx lifetime */
             c->chain_Lrc = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
             c->chain_Lsc = bcreate(fd, 4096, 0x403, c->dom_active);
@@ -9453,14 +9466,15 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             bsync(fd, &c->chain_Lrc, RKNPU_MEM_SYNC_TO_DEVICE);
             c->chain_lut_p = ss->lut; c->chain_lut_devloaded = 0;
         }
-        if (!(sticky && c->chain_lut_devloaded)) {   /* load the LUT into SDP SRAM (skip only if sticky + still resident) */
+        /* load the LUT into core cc's SDP SRAM; skip only if sticky AND it's already resident on THIS core */
+        if (!(sticky && c->chain_lut_devloaded && c->chain_lut_core==cc)) {
             struct rknpu_task *lt=c->task.cpu; memset(lt,0,sizeof *lt);
             lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=c->chain_Lrc.dma;
             bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=c->task.obj;
-            ls.core_mask=RKNPU_CORE0_MASK; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+            ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms(); ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
             if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
-            c->chain_lut_devloaded = 1;
+            c->chain_lut_devloaded = 1; c->chain_lut_core = cc;
         }
     }
 
@@ -9473,7 +9487,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
      * only under sticky) — so c->task still holds this array. Any reset/foreign submit invalidates via P mismatch
      * or the devloaded flag. */
     { static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
-      int cached = sticky && c->chain_lut_devloaded && c->chain_task_P==P;
+      int cached = sticky && c->chain_lut_devloaded && c->chain_lut_core==chain_cc && c->chain_task_P==P;
       if(!cached){
         memset(t, 0, (size_t)P * sizeof(struct rknpu_task));
         for (int p = 0; p < P; p++) {   // default: matmul task
@@ -9488,8 +9502,6 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         c->chain_task_P = P;
       } }
-    static int tc = -2;
-    if (tc == -2) { const char *e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     // ping-pong OFF (0x1) for any silu chain (SDP/LUT task present) so a bank swap doesn't race the LUT SRAM
     // commit (AGENTS.md); plain matmul chains keep ork_ppflags() (register-config-only, ping-pong safe).
@@ -9513,7 +9525,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     }
 
     sub.flags = ss ? 0x1u : ork_ppflags(); sub.task_number = P; sub.task_obj_addr = c->task.obj;
-    sub.core_mask = 1u << tc; sub.fence_fd = -1;
+    sub.core_mask = 1u << chain_cc; sub.fence_fd = -1;   /* step-1: chain runs on its parameterized core */
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)P};
     /* RE PROBE (ORK_STEER_HALT_AT=<p>): does the PC sequencer read each program's chain descriptor from DRAM
      * at EXECUTION time (steerable mid-flight) or pre-cache the whole chain at submit? Submit NONBLOCK, then
