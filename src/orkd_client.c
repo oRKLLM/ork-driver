@@ -392,6 +392,32 @@ int orkd_attn_rr_i8(orkd_conn *c, int nchains, const uint64_t *wkt_ids, const ui
     return hh.rc;
 }
 
+/* ORKD_LAYER: the daemon runs a whole decode layer on the spine in ONE round-trip. `h` carries the dims/ids/
+ * scales (caller fills wq..wd, D..nkv, pos, attn_scale, rope_base). Payload arrays are fp32; x_out=[D] fp32.
+ * Returns the daemon rc (0 ok). */
+int orkd_layer_i8(orkd_conn *c, struct orkd_layer *h,
+                  const float *attn_norm, const float *q_norm, const float *ffn_norm,
+                  const float *x, const float *Kc, const float *Vc, float *x_out){
+    if (!c || c->fd < 0 || !h || !attn_norm || !q_norm || !ffn_norm || !x || !Kc || !Vc || !x_out) return -1;
+    int D=(int)h->D, dk=(int)h->dk, dv=(int)h->dv, Hkv=(int)h->Hkv, nkv=(int)h->nkv;
+    size_t an=(size_t)D*4, qn=(size_t)dk*4, fn=(size_t)D*4, xb=(size_t)D*4;
+    size_t kc=(size_t)Hkv*nkv*dk*4, vc=(size_t)Hkv*nkv*dv*4;
+    h->domain = c->op_domain; h->pbytes = (uint32_t)(an+qn+fn+xb+kc+vc);
+    struct orkd_hdr hh = { ORKD_LAYER, (uint32_t)(sizeof *h + h->pbytes), 59 };
+    if (wn(c->fd,&hh,sizeof hh) || wn(c->fd,h,sizeof *h) || wn(c->fd,attn_norm,an) || wn(c->fd,q_norm,qn) ||
+        wn(c->fd,ffn_norm,fn) || wn(c->fd,x,xb) || wn(c->fd,Kc,kc) || wn(c->fd,Vc,vc)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd,&rh,sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_LAYER_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle rhh;
+    if (rn(c->fd,&rhh,sizeof rhh) <= 0) return -1;
+    size_t consumed=sizeof rhh, ob=(size_t)D*4;
+    if (rhh.rc == 0){ if (rh.len < consumed+ob){ if(rh.len>consumed) cdrain(c->fd,rh.len-consumed); return -1; }
+        if (rn(c->fd,x_out,ob) <= 0) return -1; consumed+=ob; }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return rhh.rc;
+}
+
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);

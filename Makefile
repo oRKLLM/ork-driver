@@ -607,6 +607,9 @@ orkd_attn_probe: tools/orkd_attn_probe.c src/orkd_client.c src/orkd_client.h src
 orkd_attn_rr_probe: tools/orkd_attn_rr_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
 
+orkd_layer_probe: tools/orkd_layer_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/spine_kernels.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+
 # i16out_fix_probe — DEPRECATED/QUARANTINED (dup of i16out_probe; validates unmerged set_i16_out). Stub unless -DORK_DEPRECATED_PROBES.
 i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

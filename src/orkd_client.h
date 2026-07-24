@@ -92,6 +92,10 @@ int orkd_attn_i8(orkd_conn *c, uint64_t wkt_id, uint64_t wones_id, uint64_t wv_i
 int orkd_attn_rr_i8(orkd_conn *c, int nchains, const uint64_t *wkt_ids, const uint64_t *wones_ids, const uint64_t *wv_ids,
                     int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
                     double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av);
+struct orkd_layer;
+int orkd_layer_i8(orkd_conn *c, struct orkd_layer *h,
+                  const float *attn_norm, const float *q_norm, const float *ffn_norm,
+                  const float *x, const float *Kc, const float *Vc, float *x_out);
 
 /* fp16 counterparts (Path B increment 2): B/A are fp16 (passed as void*), C is fp32. Pack returns id>0 / 0. */
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);

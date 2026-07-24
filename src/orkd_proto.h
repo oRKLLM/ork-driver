@@ -86,6 +86,8 @@ enum orkd_msg_type {
     ORKD_ATTN_OK      = 56, /* daemon->client: {orkd_handle} + Sigma(Nq*32 int32) then av(Nq*dv int32) when rc==0             */
     ORKD_ATTN_RR      = 57, /* client->daemon: {orkd_attn_rr} + nchains weight-id triples + Q -> N fused attn chains fanned RR across cores (ork_mm_run_chains_rr_biased) */
     ORKD_ATTN_RR_OK   = 58, /* daemon->client: {orkd_handle} + per-chain [Sigma(Nq*32) then av(Nq*dv)] int32, nchains of them, when rc==0 */
+    ORKD_LAYER        = 59, /* client->daemon: {orkd_layer} + payload -> the daemon runs a WHOLE decode layer on the spine (CPU glue + doorbell matmuls, resident) in ONE round-trip; reply = x_out[D] */
+    ORKD_LAYER_OK     = 60, /* daemon->client: {orkd_handle} + x_out (D fp32) when rc==0 */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -196,6 +198,18 @@ struct orkd_attn_rr {   /* payload after this struct = nchains*{uint64 wkt_id,wo
     int32_t  r_mult, r_shift;
     double   in_scale, out_scale, max_bias;
     uint32_t abytes;                    /* = nchains*Nq*Kp (int8 Q, chain-major) */
+    uint32_t pad;
+};
+struct orkd_layer {   /* the daemon runs a WHOLE decode layer on the spine in one round-trip. Payload after the
+                       * struct (all fp32): attn_norm[D], q_norm[dk], ffn_norm[D], x[D], Kc[Hkv*nkv*dk],
+                       * Vc[Hkv*nkv*dv]. Weights are already daemon-resident (referenced by id). Reply = x_out[D].
+                       * v1 sends Kc/Vc inline (a probe convenience); real use keeps the KV cache resident. */
+    uint64_t wq,wk,wv,wo,wg,wu,wd;      /* 7 resident weight ids (K^T-not: plain [in,out] int8 packs) */
+    uint32_t D,H,Hkv,dk,dv,Nff,nkv;
+    uint32_t pos;                       /* rope position */
+    uint32_t domain;
+    double   attn_scale, rope_base;
+    uint32_t pbytes;                    /* total payload bytes after this struct */
     uint32_t pad;
 };
 struct orkd_kv_alloc {   /* Tier 12f resident-KV: daemon allocs K^T[512,Lmax] + V[Lmax,HD] int8, zeroed */
