@@ -928,6 +928,9 @@ spine_sched_probe: tools/spine_sched_probe.c $(COBJ)
 spine_kernels_probe: tools/spine_kernels_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -lm
 
+spine_attnblock_probe: tools/spine_attnblock_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
