@@ -931,6 +931,9 @@ spine_kernels_probe: tools/spine_kernels_probe.c
 spine_attnblock_probe: tools/spine_attnblock_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+spine_layer_probe: tools/spine_layer_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
