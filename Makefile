@@ -919,6 +919,9 @@ resident_handoff_probe: tools/resident_handoff_probe.c $(COBJ)
 doorbell_overlap_probe: tools/doorbell_overlap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+spine_worker_probe: tools/spine_worker_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
