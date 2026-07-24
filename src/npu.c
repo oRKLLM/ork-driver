@@ -27,6 +27,7 @@
 #include "rknpu_ioctl.h"
 #include "orkd_client.h"   /* Path B: transparent orkd client routing (gated by ORK_USE_ORKD) */
 #include "orkd_proto.h"    /* ORKD_DT_* wire dtypes for the transparent ring transport */
+#include "spine_kernels.h" /* CPU glue (rmsnorm/rope/attn/silu/quant/civac) for the whole-layer core ork_mm_layer_i8 */
 #include "regcmd_array_4x32x16.h"
 #include "regcmd_i8.h"
 #include "regcmd_i4.h"
@@ -134,7 +135,7 @@ struct ork_dom_scratch {
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     /* fused-chain PER-CORE scratch (increment 2: concurrent round-robin — one independent buffer set per core so
      * chains dispatched to different cores never share DRAM). chain_rc = P-program regcmd, chain_tk = P-task array,
      * chain_lrc = LUT-load regcmd (DRAM source), chain_lsc = LUT SDP scratch. Lazily allocated per core on first use. */
@@ -9259,6 +9260,80 @@ int ork_mm_attn_rr_orkd(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones
     int rc = ok ? orkd_attn_rr_i8(c->daemon, nchains, kt, on, v, Nq, Nk, Kp, dv,
                                   r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av) : -3;
     free(kt); free(on); free(v);
+    return rc;
+}
+
+/* --- ORKD whole-decode-layer core: the SINGLE home for the layer compute (lib<->orkd parity) ----------------
+ * layer_mm: one M=1 matmul against a resident weight — doorbell if K fits its envelope (K%512==0 && K<=4096),
+ * else wide-K run_i8; warm-retry. (Moved here from orkd.c handle_layer so direct and daemon share one impl.) */
+static int layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t *C){
+    /* DEFAULT run_i8: the whole-layer op is a parity/correctness path, not a perf path (decode-on-NPU is a
+     * measured loss), and the M=1 doorbell MISSES at layer dims on RK3588 (a pre-existing doorbell-fragility
+     * issue — see tasks #13/#21 — that returns garbage, rel=1.0). run_i8 is bit-exact + robust here, so it is
+     * the default; ORK_LAYER_DOORBELL=1 opts back into the doorbell for doorbell-miss debugging only. */
+    static int runi8 = -1; if (runi8 < 0) runi8 = getenv("ORK_LAYER_DOORBELL") ? 0 : 1;
+    if (!runi8 && K % 512 == 0 && K <= 4096) {
+        for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
+            if (!h) break; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } }
+    }
+    if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
+    return -1; }
+/* Transport-transparent whole-layer op. c->daemon set => forward as one ORKD_LAYER round-trip; else run locally
+ * (the orkd daemon's handle_layer lands here on its own direct ctx). See the header for the compute contract. */
+int ork_mm_layer_i8(ork_npu *c, const struct ork_layer_dims *d,
+                    ork_w *wq, ork_w *wk, ork_w *wv, ork_w *wo, ork_w *wg, ork_w *wu, ork_w *wd,
+                    const float *attn_norm, const float *q_norm, const float *ffn_norm,
+                    const float *x, const float *Kc, const float *Vc, float *x_out){
+    if (!c || !d || !wq||!wk||!wv||!wo||!wg||!wu||!wd || !attn_norm||!q_norm||!ffn_norm||!x||!Kc||!Vc||!x_out) return -3;
+    if (c->daemon){   /* orkd transport: weights must be daemon-resident; forward the whole layer in one round-trip */
+        if (!wq->is_orkd||!wk->is_orkd||!wv->is_orkd||!wo->is_orkd||!wg->is_orkd||!wu->is_orkd||!wd->is_orkd) return -3;
+        struct orkd_layer h; memset(&h,0,sizeof h);
+        h.wq=wq->orkd_id; h.wk=wk->orkd_id; h.wv=wv->orkd_id; h.wo=wo->orkd_id;
+        h.wg=wg->orkd_id; h.wu=wu->orkd_id; h.wd=wd->orkd_id;
+        h.D=d->D; h.H=d->H; h.Hkv=d->Hkv; h.dk=d->dk; h.dv=d->dv; h.Nff=d->Nff; h.nkv=d->nkv;
+        h.pos=d->pos; h.attn_scale=d->attn_scale; h.rope_base=d->rope_base; h.domain=wq->domain;
+        return orkd_layer_i8(c->daemon, &h, attn_norm, q_norm, ffn_norm, x, Kc, Vc, x_out);
+    }
+    /* direct: run the layer locally on ctx's NPU (spine CPU glue + doorbell matmuls, same-thread coherent) */
+    int D=(int)d->D,H=(int)d->H,Hkv=(int)d->Hkv,dk=(int)d->dk,dv=(int)d->dv,Nff=(int)d->Nff,nkv=(int)d->nkv;
+    int Nq=H*dk,Nkv=Hkv*dk,rk2=(Hkv>0)?H/Hkv:1;
+    int rc=-1;
+    int32_t *Cq=ork_dma_alloc(c,(size_t)Nq*4),*Ck=ork_dma_alloc(c,(size_t)Nkv*4),*Cv=ork_dma_alloc(c,(size_t)Nkv*4),
+            *Co=ork_dma_alloc(c,(size_t)D*4),*Cg=ork_dma_alloc(c,(size_t)Nff*4),*Cu=ork_dma_alloc(c,(size_t)Nff*4),*Cd=ork_dma_alloc(c,(size_t)D*4);
+    int8_t *xn8=malloc(D),*ao8=malloc(Nq),*xf8=malloc(D),*ac8=malloc(Nff);
+    float *xo=malloc((size_t)D*4),*qf=malloc((size_t)Nq*4),*ao=malloc((size_t)Nq*4),*x1=malloc((size_t)D*4),
+          *xf=malloc((size_t)D*4),*gf=malloc((size_t)Nff*4),*uf=malloc((size_t)Nff*4),*act=malloc((size_t)Nff*4);
+    if (Cq&&Ck&&Cv&&Co&&Cg&&Cu&&Cd&&xn8&&ao8&&xf8&&ac8&&xo&&qf&&ao&&x1&&xf&&gf&&uf&&act){
+        uint64_t wset[7]={(uint64_t)(uintptr_t)wq,(uint64_t)(uintptr_t)wk,(uint64_t)(uintptr_t)wv,(uint64_t)(uintptr_t)wo,
+                          (uint64_t)(uintptr_t)wg,(uint64_t)(uintptr_t)wu,(uint64_t)(uintptr_t)wd};
+        int warm_hit = c->layer_warmed && !memcmp(c->layer_warm, wset, sizeof wset);
+        if (!warm_hit){   /* warm the doorbell ONCE per weight-set (a cold doorbell returns garbage); steady-state per-token hits */
+            int8_t *wa=calloc(Nff<D?D:Nff,1); if(wa) memset(wa,1,(size_t)(Nff<D?D:Nff));
+            if (wa){ layer_mm(c,wq,wa,D,Nq,Cq);layer_mm(c,wk,wa,D,Nkv,Ck);layer_mm(c,wv,wa,D,Nkv,Cv);layer_mm(c,wo,wa,Nq,D,Co);
+                     layer_mm(c,wg,wa,D,Nff,Cg);layer_mm(c,wu,wa,D,Nff,Cu);layer_mm(c,wd,wa,Nff,D,Cd); free(wa); }
+            memcpy(c->layer_warm, wset, sizeof wset); c->layer_warmed=1;
+        }
+        float sx=(spine_rmsnorm(x,attn_norm,D,1e-6f,xo), spine_quant(xo,D,xn8));
+        int m = layer_mm(c,wq,xn8,D,Nq,Cq)||layer_mm(c,wk,xn8,D,Nkv,Ck)||layer_mm(c,wv,xn8,D,Nkv,Cv);
+        if (!m){
+            for (int i=0;i<Nq;i++) qf[i]=Cq[i]/sx;
+            for (int h=0;h<H;h++){ float*qh=qf+(size_t)h*dk; spine_rmsnorm(qh,q_norm,dk,1e-6f,qh); spine_rope_neox(qh,dk,(int)d->pos,(float)d->rope_base);
+                spine_attn(qh, Kc+(size_t)(h/rk2)*nkv*dk, Vc+(size_t)(h/rk2)*nkv*dv, nkv,dk,dv,(float)d->attn_scale, ao+(size_t)h*dv); }
+            float sa=spine_quant(ao,Nq,ao8);
+            if (!layer_mm(c,wo,ao8,Nq,D,Co)){
+                for (int i=0;i<D;i++) x1[i]=x[i]+Co[i]/sa;
+                float sf=(spine_rmsnorm(x1,ffn_norm,D,1e-6f,xf), spine_quant(xf,D,xf8));
+                if (!(layer_mm(c,wg,xf8,D,Nff,Cg)||layer_mm(c,wu,xf8,D,Nff,Cu))){
+                    for (int i=0;i<Nff;i++){ gf[i]=Cg[i]/sf; uf[i]=Cu[i]/sf; } spine_silu_glu(gf,uf,Nff,act);
+                    float sac=spine_quant(act,Nff,ac8);
+                    if (!layer_mm(c,wd,ac8,Nff,D,Cd)){ for (int i=0;i<D;i++) x_out[i]=x1[i]+Cd[i]/sac; rc=0; }
+                }
+            }
+        }
+    }
+    if(Cq)ork_dma_free(c,Cq);if(Ck)ork_dma_free(c,Ck);if(Cv)ork_dma_free(c,Cv);if(Co)ork_dma_free(c,Co);
+    if(Cg)ork_dma_free(c,Cg);if(Cu)ork_dma_free(c,Cu);if(Cd)ork_dma_free(c,Cd);
+    free(xn8);free(ao8);free(xf8);free(ac8);free(xo);free(qf);free(ao);free(x1);free(xf);free(gf);free(uf);free(act);
     return rc;
 }
 

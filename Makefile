@@ -29,7 +29,7 @@ COBJ    := $(CORE:.c=.o) src/orkd_client.o   # orkd client shim (Path B: npu.c t
 # only that header, so it must not invalidate the attest).
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity
 TESTS    :=
 
 all: check-registry $(EXAMPLES) $(TESTS)
@@ -384,7 +384,7 @@ MODEL ?= stories15M.bin
 TEST_TIMEOUT ?= 360
 test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe
 	@fail=0; \
-	for t in "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
+	for t in "test_api_parity" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	  echo "== $$t"; timeout $(TEST_TIMEOUT) sudo ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) sudo ./llama2 "$(MODEL)" 6 || fail=1; \
 	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \

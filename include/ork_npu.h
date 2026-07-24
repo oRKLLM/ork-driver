@@ -1224,6 +1224,18 @@ int          ork_mm_attn_rr_orkd(ork_npu *ctx, int nchains, ork_w *const *wkt, o
                               int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
                               double in_scale, double out_scale, double max_bias,
                               const int8_t *Q, int32_t *Sigma, int32_t *av);
+/* ORKD whole-decode-layer core: rmsnorm -> qkv -> q/k-norm+rope -> attn -> o -> +res -> ffn-norm -> gate/up
+ * -> silu-glu -> down -> +res, as ONE op against 7 resident int8 weights (wq/wk/wv/wo, wg/wu=[D,Nff], wd=[Nff,D]).
+ * CPU glue (rmsnorm/rope/attn/silu, all fp32) interleaved with the doorbell matmuls; x/Kc/Vc/x_out are fp32.
+ * Transport-transparent: routes to the daemon (orkd_layer_i8) when ctx is an orkd client, else runs locally on
+ * ctx's NPU — the orkd daemon's handler calls THIS on its own direct ctx, so lib and orkd share one compute core.
+ * NOTE: decode-on-NPU is a MEASURED loss vs CPU (see wiki/OPS_REGISTRY); this exists for lib<->orkd parity and
+ * correctness, not as a perf path. Returns 0/ok, -3 = bad args / weights not resident under orkd. */
+struct ork_layer_dims { uint32_t D, H, Hkv, dk, dv, Nff, nkv, pos; double attn_scale, rope_base; };
+int          ork_mm_layer_i8(ork_npu *ctx, const struct ork_layer_dims *d,
+                             ork_w *wq, ork_w *wk, ork_w *wv, ork_w *wo, ork_w *wg, ork_w *wu, ork_w *wd,
+                             const float *attn_norm, const float *q_norm, const float *ffn_norm,
+                             const float *x, const float *Kc, const float *Vc, float *x_out);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

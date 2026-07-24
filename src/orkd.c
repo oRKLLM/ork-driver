@@ -321,79 +321,36 @@ static int handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
     free(scb); free(eb); free(ss); free(avb); free(tk); free(chains); free(S); free(trip); free(Q);
     return werr ? -1 : 0;
 }
-/* ORKD_LAYER: the daemon runs a WHOLE decode layer on the spine in ONE round-trip. Handlers run single-threaded
- * here, so the layer executes sequentially on this thread (CPU glue kernels interleaved with doorbell matmuls,
- * same-thread => read-after-drain coherent — the spine_layer_probe structure, ported). Weights are resident
- * (by id); Kc/Vc + gains + x come in the payload; reply = x_out[D]. Overlap (CPU worker ∥ doorbell) is a later
- * optimization; v1 collapses the ~56 round-trips/token to 1 while staying bit-exact. */
+/* ORKD_LAYER: the daemon runs a WHOLE decode layer in ONE round-trip. This handler is now a THIN transport
+ * shim: deserialize the request + payload, resolve weight ids -> resident ork_w*, then run the layer via the
+ * shared lib core ork_mm_layer_i8 (npu->daemon is NULL on the daemon's own ctx, so it takes the LOCAL path —
+ * the exact same compute a direct-NPU client runs; that is the lib<->orkd parity guarantee). Reply = x_out[D].
+ * All compute/warm/coherence lives in ork_mm_layer_i8 (src/npu.c). NOTE: decode-on-NPU is a measured perf loss;
+ * this path exists for parity/correctness, not speed. */
 static ork_w *layer_find_w(struct client *cl, uint64_t id){ for (int j=0;j<cl->nw;j++) if (cl->wt[j].id==id) return cl->wt[j].w; return NULL; }
-static int layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t *C){   /* M=1 matmul: doorbell if K fits its envelope (K%512==0 && K<=4096), else wide-K run_i8; warm-retry */
-    /* ORK_LAYER_RUNI8: force ALL matmuls through run_i8 (single I8 mode, warm-once). Mixing the doorbell
-     * (I8_CHAIN) with run_i8 (I8) — as a wide-K down proj forces — thrashes the mode/warm state every layer
-     * (a 2s cold-doorbell re-warm poll each call). All-run_i8 stays one mode, so it is the clean steady-state. */
-    static int runi8 = -1; if (runi8 < 0) runi8 = getenv("ORK_LAYER_RUNI8") ? 1 : 0;
-    if (!runi8 && K % 512 == 0 && K <= 4096) {
-        for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
-            if (!h) break; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } }
-    }
-    if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
-    return -1; }
 static int handle_layer(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_layer a;
     if (readn(cl->fd, &a, sizeof a) <= 0) return -1;
-    int D=(int)a.D,H=(int)a.H,Hkv=(int)a.Hkv,dk=(int)a.dk,dv=(int)a.dv,Nff=(int)a.Nff,nkv=(int)a.nkv;
-    int Nq=H*dk,Nkv=Hkv*dk,rk2=(Hkv>0)?H/Hkv:1;
-    size_t an=(size_t)D*4,qn=(size_t)dk*4,fn=(size_t)D*4,xb=(size_t)D*4,kc=(size_t)Hkv*nkv*dk*4,vc=(size_t)Hkv*nkv*dv*4;
-    if (D<1||H<1||Hkv<1||dk<1||dv<1||Nff<1||nkv<1 || a.pbytes!=(uint32_t)(an+qn+fn+xb+kc+vc) || a.pbytes>ORKD_MAX_BYTES){
+    int D=(int)a.D;
+    size_t an=(size_t)a.D*4,qn=(size_t)a.dk*4,fn=(size_t)a.D*4,xb=(size_t)a.D*4,
+           kc=(size_t)a.Hkv*a.nkv*a.dk*4,vc=(size_t)a.Hkv*a.nkv*a.dv*4;
+    if (a.D<1||a.H<1||a.Hkv<1||a.dk<1||a.dv<1||a.Nff<1||a.nkv<1 || a.pbytes!=(uint32_t)(an+qn+fn+xb+kc+vc) || a.pbytes>ORKD_MAX_BYTES){
         drain(cl->fd, a.pbytes); send_error(cl->fd, tag, ORKD_EPROTO, "layer dims"); return 0; }
     char *pl = malloc(a.pbytes); if (!pl){ drain(cl->fd,a.pbytes); send_error(cl->fd,tag,ORKD_EOOM,"layer pl"); return 0; }
     if (readn(cl->fd, pl, a.pbytes) <= 0){ free(pl); return -1; }
-    float *attn_norm=(float*)pl, *q_norm=(float*)(pl+an), *ffn_norm=(float*)(pl+an+qn),
-          *x=(float*)(pl+an+qn+fn), *Kc=(float*)(pl+an+qn+fn+xb), *Vc=(float*)(pl+an+qn+fn+xb+kc);
+    const float *attn_norm=(const float*)pl, *q_norm=(const float*)(pl+an), *ffn_norm=(const float*)(pl+an+qn),
+          *x=(const float*)(pl+an+qn+fn), *Kc=(const float*)(pl+an+qn+fn+xb), *Vc=(const float*)(pl+an+qn+fn+xb+kc);
     ork_w *pWq=layer_find_w(cl,a.wq),*pWk=layer_find_w(cl,a.wk),*pWv=layer_find_w(cl,a.wv),*pWo=layer_find_w(cl,a.wo),
           *pWg=layer_find_w(cl,a.wg),*pWu=layer_find_w(cl,a.wu),*pWd=layer_find_w(cl,a.wd);
     if (!pWq||!pWk||!pWv||!pWo||!pWg||!pWu||!pWd){ free(pl); send_error(cl->fd,tag,ORKD_EBADH,"layer weight id"); return 0; }
-    /* dma outputs + int8 A scratch */
-    int32_t *Cq=ork_dma_alloc(npu,(size_t)Nq*4),*Ck=ork_dma_alloc(npu,(size_t)Nkv*4),*Cv=ork_dma_alloc(npu,(size_t)Nkv*4),
-            *Co=ork_dma_alloc(npu,(size_t)D*4),*Cg=ork_dma_alloc(npu,(size_t)Nff*4),*Cu=ork_dma_alloc(npu,(size_t)Nff*4),*Cd=ork_dma_alloc(npu,(size_t)D*4);
-    int8_t *xn8=malloc(D),*ao8=malloc(Nq),*xf8=malloc(D),*ac8=malloc(Nff);
-    float *xo=malloc((size_t)D*4),*qf=malloc((size_t)Nq*4),*ao=malloc((size_t)Nq*4),*x1=malloc((size_t)D*4),
-          *xf=malloc((size_t)D*4),*gf=malloc((size_t)Nff*4),*uf=malloc((size_t)Nff*4),*act=malloc((size_t)Nff*4);
-    int rc=-1;
-    if (Cq&&Ck&&Cv&&Co&&Cg&&Cu&&Cd&&xn8&&ao8&&xf8&&ac8&&xo&&qf&&ao&&x1&&xf&&gf&&uf&&act){
-        uint64_t wset[7]={a.wq,a.wk,a.wv,a.wo,a.wg,a.wu,a.wd};
-        int warm_hit = cl->layer_warmed && !memcmp(cl->layer_warm, wset, sizeof wset);
-        if (!warm_hit){   /* warm the doorbell ONCE per weight-shape set (cold doorbell returns garbage); skip if this set is already warm (steady-state per-token: identical weights) */
-            int8_t *wa=calloc(Nff<D?D:Nff,1); if(wa) memset(wa,1,(size_t)(Nff<D?D:Nff));
-            if (wa){ layer_mm(npu,pWq,wa,D,Nq,Cq);layer_mm(npu,pWk,wa,D,Nkv,Ck);layer_mm(npu,pWv,wa,D,Nkv,Cv);layer_mm(npu,pWo,wa,Nq,D,Co);
-                     layer_mm(npu,pWg,wa,D,Nff,Cg);layer_mm(npu,pWu,wa,D,Nff,Cu);layer_mm(npu,pWd,wa,Nff,D,Cd); free(wa); }
-            memcpy(cl->layer_warm, wset, sizeof wset); cl->layer_warmed=1;
-        }
-        float sx=(spine_rmsnorm(x,attn_norm,D,1e-6f,xo), spine_quant(xo,D,xn8));
-        int m = layer_mm(npu,pWq,xn8,D,Nq,Cq)||layer_mm(npu,pWk,xn8,D,Nkv,Ck)||layer_mm(npu,pWv,xn8,D,Nkv,Cv);
-        if (!m){
-            for (int i=0;i<Nq;i++) qf[i]=Cq[i]/sx;
-            for (int h=0;h<H;h++){ float*qh=qf+(size_t)h*dk; spine_rmsnorm(qh,q_norm,dk,1e-6f,qh); spine_rope_neox(qh,dk,(int)a.pos,(float)a.rope_base);
-                spine_attn(qh, Kc+(size_t)(h/rk2)*nkv*dk, Vc+(size_t)(h/rk2)*nkv*dv, nkv,dk,dv,(float)a.attn_scale, ao+(size_t)h*dv); }
-            float sa=spine_quant(ao,Nq,ao8);
-            if (!layer_mm(npu,pWo,ao8,Nq,D,Co)){
-                for (int i=0;i<D;i++) x1[i]=x[i]+Co[i]/sa;
-                float sf=(spine_rmsnorm(x1,ffn_norm,D,1e-6f,xf), spine_quant(xf,D,xf8));
-                if (!(layer_mm(npu,pWg,xf8,D,Nff,Cg)||layer_mm(npu,pWu,xf8,D,Nff,Cu))){
-                    for (int i=0;i<Nff;i++){ gf[i]=Cg[i]/sf; uf[i]=Cu[i]/sf; } spine_silu_glu(gf,uf,Nff,act);
-                    float sac=spine_quant(act,Nff,ac8);
-                    if (!layer_mm(npu,pWd,ac8,Nff,D,Cd)){ for (int i=0;i<D;i++) xo[i]=x1[i]+Cd[i]/sac; rc=0; }
-                }
-            }
-        }
-    }
+    float *xo=malloc((size_t)D*4);
+    struct ork_layer_dims dd={ a.D,a.H,a.Hkv,a.dk,a.dv,a.Nff,a.nkv,a.pos, a.attn_scale,a.rope_base };
+    int rc = xo ? ork_mm_layer_i8(npu,&dd,pWq,pWk,pWv,pWo,pWg,pWu,pWd,attn_norm,q_norm,ffn_norm,x,Kc,Vc,xo) : -1;
     struct orkd_handle hh; memset(&hh,0,sizeof hh); hh.rc=rc;
     struct orkd_hdr rh = { ORKD_LAYER_OK, (uint32_t)(sizeof hh + (rc==0 ? (size_t)D*4 : 0)), tag };
     int werr = writen(cl->fd,&rh,sizeof rh) || writen(cl->fd,&hh,sizeof hh);
     if (!werr && rc==0) werr = writen(cl->fd, xo, (size_t)D*4);
-    if(Cq)ork_dma_free(npu,Cq);if(Ck)ork_dma_free(npu,Ck);if(Cv)ork_dma_free(npu,Cv);if(Co)ork_dma_free(npu,Co);
-    if(Cg)ork_dma_free(npu,Cg);if(Cu)ork_dma_free(npu,Cu);if(Cd)ork_dma_free(npu,Cd);
-    free(xn8);free(ao8);free(xf8);free(ac8);free(xo);free(qf);free(ao);free(x1);free(xf);free(gf);free(uf);free(act);free(pl);
+    free(xo); free(pl);
     return werr ? -1 : 0;
 }
 /* Tier 12f resident-KV: the daemon runs a DIRECT npu ctx (fd valid), so ork_kv_resident_alloc/append take the
