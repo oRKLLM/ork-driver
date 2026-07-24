@@ -913,6 +913,9 @@ chainrr_conc_probe: tools/chainrr_conc_probe.c $(COBJ)
 chainrr_biased_probe: tools/chainrr_biased_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+resident_handoff_probe: tools/resident_handoff_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
