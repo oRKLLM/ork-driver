@@ -110,6 +110,31 @@ just a small pool the caller fills ahead on a background thread. `ork_stream_poo
 > only hides behind the submit at large M (crossover ≈ M 256 on a 2048×2048 layer). The RAM-resident
 > cache wins by keeping that cost off the per-submit hot path.
 
+## Heterogeneous CPU∥NPU dispatcher (`ork_spine`)
+
+`include/ork_spine.h` (header-only, C + C++) drives an **op DAG across execution units** — an NPU unit (the
+doorbell on its own worker thread, so the NPU stays single-stream) plus one or more CPU worker units pinned to
+spare big cores — from a single poll loop. Each op declares its dependencies (a bitmask of earlier ops) and a
+placement (`ORK_PL_NPU` / `ORK_PL_CPU` / `ORK_PL_EITHER`); independent NPU and CPU work runs concurrently and a
+dependent op waits for its producer.
+
+```c
+#include "ork_spine.h"
+ork_spine_unit U[2];
+ork_spine_unit_start(&U[0], ORK_UNIT_NPU, 4);   // one NPU unit (single-stream), big core 4
+ork_spine_unit_start(&U[1], ORK_UNIT_CPU, 6);   // CPU worker, big core 6
+ork_spine_op ops[] = { {0, ORK_PL_NPU, npu_fn, &a0, 0}, {0, ORK_PL_CPU, cpu_fn, &a1, 0}, ... };
+ork_spine_run(U, 2, ops, nops);                 // runs the DAG to completion, overlapped
+ork_spine_unit_stop(&U[0]); ork_spine_unit_stop(&U[1]);
+```
+
+**Coherency (hard rule):** an NPU-produced dma buffer read by a CPU unit on another thread needs a `dc civac`
+on BOTH sides — the NPU op flushes with `ork_spine_civac_range()` after `ork_dyn_end`, and the consumer
+invalidates with `ork_spine_civac_range()` before reading. At most **one** NPU unit (the doorbell can't be driven
+concurrently; `ork_spine_run` rejects more). See `examples/test_spine.c` and `tools/spine_sched_probe.c`. General
+infrastructure (prefill CPU-quant∥NPU-matmul, mixed CPU/NPU op-graphs, bridging IOMMU domain-swap latency) — not
+tied to any one model path.
+
 ## Build & run (on a Rockchip board)
 
 Requires the `rknpu` DRM driver (stock on Rockchip Linux), a C compiler, and access to
