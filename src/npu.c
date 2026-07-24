@@ -9217,6 +9217,31 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     return run_chain_i8_impl(c, S, tasks, NULL, -1); }
 
+/* ORKD coalesced SwiGLU FFN against 3 resident (is_orkd) weights — one ORKD_FFN round-trip, one on-NPU
+ * chain submit (gate->silu->up->glu->down), intermediates never leave the NPU. Thin wrapper over the
+ * orkd_ffn_i8 client; the caller owns the per-stage requant (mult/shift) + silu (in_scale,out_scale). */
+int ork_mm_ffn_orkd(ork_npu *c, ork_w *wg, ork_w *wu, ork_w *wd,
+                    int M, int K, int Nff, int Kd,
+                    int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
+                    double in_scale, double out_scale, const int8_t *A, int32_t *out){
+    if (!c || !c->daemon || !wg || !wu || !wd) return -3;
+    if (!wg->is_orkd || !wu->is_orkd || !wd->is_orkd) return -3;   /* weights must be daemon-resident */
+    return orkd_ffn_i8(c->daemon, wg->orkd_id, wu->orkd_id, wd->orkd_id, M, K, Nff, Kd,
+                       gate_mult, gate_shift, up_mult, up_shift, glu_mult, glu_shift, in_scale, out_scale, A, out);
+}
+
+/* ORKD fused attention core against 3 resident (is_orkd) weights (K^T[Kp,Nk], ones[Nk,32], V[Nk,dv]) — one
+ * ORKD_ATTN round-trip, one on-NPU chain (QK^T->exp->reduce,e.V), e never leaves the NPU. Sigma[Nq*32] +
+ * av[Nq*dv] returned; caller normalizes attn=av/Sigma. Thin wrapper over the orkd_attn_i8 client. */
+int ork_mm_attn_orkd(ork_npu *c, ork_w *wkt, ork_w *wones, ork_w *wv,
+                     int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                     double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || !c->daemon || !wkt || !wones || !wv) return -3;
+    if (!wkt->is_orkd || !wones->is_orkd || !wv->is_orkd) return -3;   /* weights must be daemon-resident */
+    return orkd_attn_i8(c->daemon, wkt->orkd_id, wones->orkd_id, wv->orkd_id, Nq, Nk, Kp, dv,
+                        r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av);
+}
+
 /* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
  * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
  * (build via ork_mm_silu_build_lut). Single M-tile per task for now (M<=chain mcap). 0/ok,-1 wedge,-2 dims. */
@@ -9262,19 +9287,38 @@ int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
 /* Same heterogeneous chain, but the SDP activation task (kind 2) applies EXP instead of SiLU — the HW-chained
  * softmax numerator: [QK^T(1) -> exp(2, in0=0) -> reduce(0, reads exp)] as ONE submit, e kept on-chip. Scores
  * must be <=0 (post-max domain) so exp in (0,1] fits int8. Only differs from _ffn by the curve fn. 0/ok,-1,-2,-3. */
-int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
-                                const ork_chain_op *ops, double in_scale, double out_scale) {
+/* Fused-exp chain, but the exp bakes in a SCALAR max-subtract: e = exp((score-max_bias)*in_scale)/out_scale.
+ * max_bias=0 => plain exp (scores must already be <=0). A max_bias >= every real score keeps all args <=0 so the
+ * int8 exp never saturates, and the constant cancels in the softmax normalize av/Sigma (registry: exp_biased_probe,
+ * scalar global-max-biased exp_i8). This is what makes the fused attention core correct on REAL (positive) QK^T
+ * scores without a live per-query max. See ork_npu_exp_i8_biased / silu_build_curve_biased.
+ * (Defined before the plain wrapper below: the standalone Makefile build does not pull ork_npu.h into this TU.) */
+int ork_mm_run_chain_i8_ffn_exp_biased(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+                                       const ork_chain_op *ops, double in_scale, double out_scale, double max_bias) {
     if (S < 1 || !ops) return -2;
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (silu_calibrate_idx(c)) return -1;
-    /* build-once: the exp curve depends only on (in_scale,out_scale); skip the host rebuild when unchanged so
-     * the static lut CONTENTS are stable across calls (which is what makes run_chain_i8_impl's pointer-keyed
-     * LUT cache correct). */
-    static int16_t lut[1030]; static double c_is=-1, c_os=-1;
-    if (in_scale != c_is || out_scale != c_os) { silu_build_curve(c, exp_f, in_scale, out_scale, lut); c_is=in_scale; c_os=out_scale; }
+    /* build-once: the exp curve depends only on (in_scale,out_scale,max_bias); skip the host rebuild when
+     * unchanged so the static lut CONTENTS are stable across calls (which is what makes run_chain_i8_impl's
+     * pointer-keyed LUT cache correct). Per-layer biases that DIFFER within a process force a rebuild each call
+     * (correct, but defeats the pointer cache for that call) — prefer a single process-wide bias (e.g. the int8
+     * score-ceiling) so this stays a one-time build. */
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1, c_bias=-1e300;
+    if (in_scale != c_is || out_scale != c_os || max_bias != c_bias) {
+        silu_build_curve_biased(c, exp_f, in_scale, out_scale, max_bias, lut); c_is=in_scale; c_os=out_scale; c_bias=max_bias;
+        /* contents of `lut` changed IN PLACE (same address). run_chain_i8_impl keys its device-LUT (re)load on the
+         * ss->lut POINTER (chain_lut_p[cc]), so an in-place rebuild would leave the STALE curve resident on the NPU
+         * SRAM. Invalidate the pointer cache on all cores so the next submit rebuilds the core Lrc + reuploads the
+         * new curve. (Without this, a per-call-varying in_scale/bias serves the FIRST call's LUT — measured: same
+         * in_scale gave 0.098 fresh vs 0.83 as a 2nd call.) */
+        for (int i=0;i<ORK_MAXCORE;i++) c->chain_lut_p[i] = NULL; }
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     return run_chain_i8_impl(c, S, tasks, &ss, -1);
+}
+int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+                                const ork_chain_op *ops, double in_scale, double out_scale) {
+    return ork_mm_run_chain_i8_ffn_exp_biased(c, S, tasks, ops, in_scale, out_scale, 0.0);
 }
 
 static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core) {
@@ -9729,6 +9773,44 @@ int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *c
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
     /* establish SHARED state ONCE single-threaded (workers skip via force_core>=0): domain + int8-chain mode */
+    if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
+        dom_activate(c, chains[0][0].w->domain);
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
+    npu_pool_ensure(c);
+    struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
+    return rc;
+}
+/* BIASED round-robin: same concurrent dispatch as ork_mm_run_chains_rr, but the fused exp bakes in a scalar
+ * max-subtract (e=exp((score-max_bias)*in_scale)/out_scale) so the chains are correct on REAL (positive) scores
+ * without a live per-query max (registry: scalar global-max-biased exp; bias cancels in av/Sigma). This lets N
+ * independent attention cores' [QK^T->exp->reduce,e.V] chains fan across the NPU cores from a single dispatch.
+ * The exp LUT contents change IN PLACE at one static address, so run_chain_i8_impl's POINTER-keyed per-core
+ * device-LUT cache (chain_lut_p[cc]) would go stale. We invalidate all cores ONCE here, single-threaded, BEFORE
+ * the workers start — each worker's run_chain_i8_impl then rebuilds+reuploads THIS core's per-core SDP-SRAM LUT
+ * on its first chain (the "LUT-cache-update op at the front of the chain, injected per core"). Per-core buffers
+ * make that reload concurrency-safe. Returns 0/ok, <0 err. Local NPU only (the daemon calls it on its own ctx). */
+int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                                const ork_chain_op *ops, double in_scale, double out_scale, double max_bias){
+    if(!c || nchains<1 || !chains || !S || !ops) return -2;
+    if(c->daemon) return -3;                     /* local NPU only (the daemon owns its own scheduler) */
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(silu_calibrate_idx(c)) return -1;
+    for(int i=0;i<nchains;i++){ if(S[i]<1 || !chains[i]) return -2; }
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1, c_bias=-1e300;
+    if(in_scale!=c_is || out_scale!=c_os || max_bias!=c_bias){
+        silu_build_curve_biased(c, exp_f, in_scale, out_scale, max_bias, lut); c_is=in_scale; c_os=out_scale; c_bias=max_bias;
+        for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_p[i]=NULL;   /* in-place LUT rebuild -> force each core to reload */
+    }
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
     if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
         dom_activate(c, chains[0][0].w->domain);
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);

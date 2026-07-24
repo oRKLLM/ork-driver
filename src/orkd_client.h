@@ -86,6 +86,12 @@ int orkd_ffn_i8(orkd_conn *c, uint64_t gate_id, uint64_t up_id, uint64_t down_id
                 int M, int K, int Nff, int Kd,
                 int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
                 double in_scale, double out_scale, const int8_t *A, int32_t *out);
+int orkd_attn_i8(orkd_conn *c, uint64_t wkt_id, uint64_t wones_id, uint64_t wv_id,
+                 int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                 double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av);
+int orkd_attn_rr_i8(orkd_conn *c, int nchains, const uint64_t *wkt_ids, const uint64_t *wones_ids, const uint64_t *wv_ids,
+                    int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                    double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av);
 
 /* fp16 counterparts (Path B increment 2): B/A are fp16 (passed as void*), C is fp32. Pack returns id>0 / 0. */
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B);

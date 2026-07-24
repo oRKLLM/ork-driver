@@ -1183,20 +1183,40 @@ int          ork_mm_run_chain_i8_ffn(ork_npu *ctx, int S, const ork_mm_task_i8 *
  * ONE submit, intermediates on-chip. Scores must be <=0 (post-max domain). 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int          ork_mm_run_chain_i8_ffn_exp(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
                                          const ork_chain_op *ops, double in_scale, double out_scale);
+/* Same, but the fused exp bakes in a scalar max-subtract: e = exp((score-max_bias)*in_scale)/out_scale. A
+ * max_bias >= every real score keeps args <=0 (int8 exp never saturates) and cancels in the softmax normalize —
+ * makes the fused core correct on REAL (positive) scores without a live per-query max. 0.0 = plain exp. */
+int          ork_mm_run_chain_i8_ffn_exp_biased(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks,
+                                         const ork_chain_op *ops, double in_scale, double out_scale, double max_bias);
 /* CONCURRENT round-robin: dispatch `nchains` homogeneous fused-exp chains across all NPU cores at once (one per
  * core, atomic work-stealing), each on its own per-core scratch. chains[i]=that chain's S[i]-task array; ops the
  * shared op graph; scales the shared exp requant. Prefill throughput (~3x). Cores must be WARM first. 0/ok,<0 err. */
 int          ork_mm_run_chains_rr(ork_npu *ctx, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
                                   const ork_chain_op *ops, double in_scale, double out_scale);
+/* Same concurrent round-robin, but the fused exp bakes in a scalar max_bias (e=exp((score-max_bias)*in_scale)/
+ * out_scale) so the chains are correct on REAL scores without a live max — fans N attention cores' fused
+ * [QK^T->exp->reduce,e.V] chains across the NPU cores. Reloads the per-core device LUT on rebuild. 0/ok,<0 err. */
+int          ork_mm_run_chains_rr_biased(ork_npu *ctx, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                                  const ork_chain_op *ops, double in_scale, double out_scale, double max_bias);
 /* ORKD coalesced SwiGLU FFN: run the whole [gate->silu->up->glu->down] inner as ONE daemon-side HW-chained
  * submit (ORKD_FFN / orkd_ffn_i8) against the 3 ALREADY-RESIDENT weights (wg/wu/wd must be daemon-imported —
  * is_orkd — e.g. from the orkpack; no re-import). A = int8 activation [M,K]; out = int32 down output [M,Kd].
- * Requant is identity (0x4000/14) + in_scale/out_scale, matching ork_mm_run_chain_i8_ffn. This is the
- * per-tensor int8 coalesced path (fast; one submit instead of per-op). Returns -3 if no daemon or any weight
- * is not resident (caller should fall back to the fd-local ork_mm_run_chain_i8_ffn). */
+ * Per-stage fixed-point requant (gate/up/glu each a mult>>shift on the int32 accumulator -> int8 intermediate)
+ * + the silu (in_scale,out_scale) LUT, exactly as orkd_ffn_i8 / ork_mm_run_chain_i8_ffn expect (see
+ * orkd_ffn_probe for the scale model). Per-tensor int8 coalesced path (fast; one submit instead of per-op).
+ * Returns -3 if no daemon or any weight is not resident (caller should fall back to fd-local run_chain_i8_ffn). */
 int          ork_mm_ffn_orkd(ork_npu *ctx, ork_w *wg, ork_w *wu, ork_w *wd,
-                             int M, int K, int Nff, int Kd, double in_scale, double out_scale,
+                             int M, int K, int Nff, int Kd,
+                             int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
+                             double in_scale, double out_scale,
                              const int8_t *A, int32_t *out);
+/* ORKD fused attention core [QK^T->exp->reduce,e.V] (chainav) as ONE daemon submit against 3 resident weights:
+ * wkt=K^T[Kp,Nk], wones=ones[Nk,32], wv=V[Nk,dv]. Q=[Nq,Kp] int8. Sigma=[Nq,32] + av=[Nq,dv] int32 out (attn =
+ * av/Sigma, caller normalizes). r_mult/r_shift = QK^T score requant; in/out_scale = exp LUT. -3 if not resident. */
+int          ork_mm_attn_orkd(ork_npu *ctx, ork_w *wkt, ork_w *wones, ork_w *wv,
+                              int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                              double in_scale, double out_scale, double max_bias,
+                              const int8_t *Q, int32_t *Sigma, int32_t *av);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

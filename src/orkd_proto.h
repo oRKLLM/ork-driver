@@ -82,6 +82,10 @@ enum orkd_msg_type {
     ORKD_KV_ALLOC_OK  = 52, /* daemon->client: {orkd_kv_alloc_ok} kv_id + wkt_id + wv_id (+ rc); wkt/wv usable in ORKD_CHAIN */
     ORKD_KV_APPEND    = 53, /* client->daemon: {orkd_kv_append} + 2*HD int8 (kcol[HD] then vrow[HD]) -> ork_kv_append(key)   */
     ORKD_KV_APPEND_OK = 54, /* daemon->client: {orkd_handle} rc                                                             */
+    ORKD_ATTN         = 55, /* client->daemon: {orkd_attn} + Q payload (Nq*Kp int8) -> fused attn core [QK^T->exp->reduce,e.V] ONE submit */
+    ORKD_ATTN_OK      = 56, /* daemon->client: {orkd_handle} + Sigma(Nq*32 int32) then av(Nq*dv int32) when rc==0             */
+    ORKD_ATTN_RR      = 57, /* client->daemon: {orkd_attn_rr} + nchains weight-id triples + Q -> N fused attn chains fanned RR across cores (ork_mm_run_chains_rr_biased) */
+    ORKD_ATTN_RR_OK   = 58, /* daemon->client: {orkd_handle} + per-chain [Sigma(Nq*32) then av(Nq*dv)] int32, nchains of them, when rc==0 */
     ORKD_ERROR    = 255, /* daemon->client: {orkd_error} code + message                                        */
 };
 
@@ -165,6 +169,33 @@ struct orkd_ffn {       /* the A payload (M*K int8, ffn-norm output) follows the
     int32_t  glu_mult, glu_shift;       /* glu ewmul requant */
     double   in_scale, out_scale;       /* silu LUT scales (real_gate = acc*in_scale; int8 = silu(real)/out_scale) */
     uint32_t abytes;                    /* = M*K (int8 A) */
+    uint32_t pad;
+};
+struct orkd_attn {      /* A payload = Q (Nq*Kp int8, key-padded query rows) follows. Reply = Sigma(Nq*32 int32) then
+                         * av(Nq*dv int32). Fixed op-list built daemon-side (chainav): QK^T MM8(Q,Wkt)->requant->exp SDP
+                         * ->reduce MM(e,Wones)=Sigma + e.V MM(e,Wv)=av. e stays on-chip; attn = av/Sigma (caller normalizes). */
+    uint64_t wkt_id, wones_id, wv_id;   /* resident: K^T[Kp,Nk], ones[Nk,32], V[Nk,dv] */
+    uint32_t Nq, Nk, Kp, dv;            /* Nq query rows, Nk keys(=Lmax), Kp=512 (padded d), dv head_dim */
+    uint32_t domain;                    /* client-chosen IOMMU domain (0 = weights' pack domain) */
+    int32_t  r_mult, r_shift;           /* QK^T int32->int8 score requant */
+    double   in_scale, out_scale;       /* exp LUT scales (e = exp(score*in_scale)/out_scale) */
+    double   max_bias;                  /* scalar global-max bias baked into exp LUT: e = exp((score-max_bias)*in_scale)/out_scale.
+                                         * Any max_bias >= every real score keeps args <=0 (int8 exp fits); cancels in av/Sigma.
+                                         * 0.0 = plain exp (requires scores already <=0). */
+    uint32_t abytes;                    /* = Nq*Kp (int8 Q) */
+    uint32_t pad;
+};
+#define ORKD_ATTN_RR_MAX 64   /* max fused-attn chains in one RR dispatch (e.g. one per kv-head) */
+struct orkd_attn_rr {   /* payload after this struct = nchains*{uint64 wkt_id,wones_id,wv_id} triples, then Q
+                         * (nchains*Nq*Kp int8, chain-major). Reply (rc==0) = per chain: Sigma(Nq*32 i32) then
+                         * av(Nq*dv i32), nchains of them. Homogeneous: all chains share Nq/Nk/Kp/dv + requant +
+                         * exp LUT (in/out_scale,max_bias). Daemon dispatches via ork_mm_run_chains_rr_biased. */
+    uint32_t nchains;
+    uint32_t Nq, Nk, Kp, dv;
+    uint32_t domain;
+    int32_t  r_mult, r_shift;
+    double   in_scale, out_scale, max_bias;
+    uint32_t abytes;                    /* = nchains*Nq*Kp (int8 Q, chain-major) */
     uint32_t pad;
 };
 struct orkd_kv_alloc {   /* Tier 12f resident-KV: daemon allocs K^T[512,Lmax] + V[Lmax,HD] int8, zeroed */

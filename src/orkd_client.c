@@ -325,6 +325,73 @@ int orkd_ffn_i8(orkd_conn *c, uint64_t gate_id, uint64_t up_id, uint64_t down_id
     return hh.rc;
 }
 
+/* Fused attention core (ORKD_ATTN, chainav): [QK^T->exp->reduce,e.V] in ONE daemon-side submit against 3
+ * resident weights (K^T[Kp,Nk], ones[Nk,32], V[Nk,dv]). Sends Q (Nq*Kp int8); receives Sigma (Nq*32 int32)
+ * then av (Nq*dv int32). Caller normalizes attn = av/Sigma. 0/ok, <0 err. */
+int orkd_attn_i8(orkd_conn *c, uint64_t wkt_id, uint64_t wones_id, uint64_t wv_id,
+                 int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                 double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || c->fd < 0 || Nq <= 0 || Nk <= 0 || Kp <= 0 || dv <= 0 || !Q || !Sigma || !av) return -1;
+    struct orkd_attn a; memset(&a, 0, sizeof a);
+    a.wkt_id = wkt_id; a.wones_id = wones_id; a.wv_id = wv_id;
+    a.Nq = (uint32_t)Nq; a.Nk = (uint32_t)Nk; a.Kp = (uint32_t)Kp; a.dv = (uint32_t)dv; a.domain = c->op_domain;
+    a.r_mult = r_mult; a.r_shift = r_shift; a.in_scale = in_scale; a.out_scale = out_scale; a.max_bias = max_bias;
+    uint32_t abytes = (uint32_t)((size_t)Nq * Kp); a.abytes = abytes;
+    struct orkd_hdr h = { ORKD_ATTN, (uint32_t)(sizeof a + abytes), 55 };
+    if (wn(c->fd, &h, sizeof h) || wn(c->fd, &a, sizeof a) || wn(c->fd, Q, abytes)) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_ATTN_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, sbytes = (size_t)Nq * 32 * 4, avbytes = (size_t)Nq * dv * 4;
+    if (hh.rc == 0){
+        if (rh.len < consumed + sbytes + avbytes){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        if (rn(c->fd, Sigma, sbytes) <= 0) return -1; consumed += sbytes;
+        if (rn(c->fd, av,    avbytes) <= 0) return -1; consumed += avbytes;
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
+/* ORKD_ATTN_RR: N fused attention chains dispatched round-robin across the daemon's NPU cores in ONE round-trip.
+ * wkt_ids/wones_ids/wv_ids = per-chain resident weight ids (length nchains). Q = nchains*Nq*Kp int8 (chain-major).
+ * Sigma = nchains*Nq*32, av = nchains*Nq*dv int32 out (attn_c = av_c/Sigma_c). All chains share the requant + exp
+ * LUT (in/out_scale,max_bias). Returns the dispatch rc (0 ok, <0 err). */
+int orkd_attn_rr_i8(orkd_conn *c, int nchains, const uint64_t *wkt_ids, const uint64_t *wones_ids, const uint64_t *wv_ids,
+                    int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                    double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || c->fd < 0 || nchains < 1 || nchains > ORKD_ATTN_RR_MAX || Nq <= 0 || Nk <= 0 || Kp <= 0 || dv <= 0) return -1;
+    if (!wkt_ids || !wones_ids || !wv_ids || !Q || !Sigma || !av) return -1;
+    struct orkd_attn_rr a; memset(&a, 0, sizeof a);
+    a.nchains = (uint32_t)nchains; a.Nq = (uint32_t)Nq; a.Nk = (uint32_t)Nk; a.Kp = (uint32_t)Kp; a.dv = (uint32_t)dv;
+    a.domain = c->op_domain; a.r_mult = r_mult; a.r_shift = r_shift; a.in_scale = in_scale; a.out_scale = out_scale; a.max_bias = max_bias;
+    uint32_t abytes = (uint32_t)((size_t)nchains * Nq * Kp); a.abytes = abytes;
+    uint64_t *trip = malloc((size_t)nchains * 3 * 8); if (!trip) return -1;
+    for (int n = 0; n < nchains; n++){ trip[n*3]=wkt_ids[n]; trip[n*3+1]=wones_ids[n]; trip[n*3+2]=wv_ids[n]; }
+    uint32_t tbytes = (uint32_t)((size_t)nchains * 3 * 8);
+    struct orkd_hdr h = { ORKD_ATTN_RR, (uint32_t)(sizeof a + tbytes + abytes), 57 };
+    int werr = wn(c->fd, &h, sizeof h) || wn(c->fd, &a, sizeof a) || wn(c->fd, trip, tbytes) || wn(c->fd, Q, abytes);
+    free(trip);
+    if (werr) return -1;
+    struct orkd_hdr rh;
+    if (rn(c->fd, &rh, sizeof rh) <= 0) return -1;
+    if (rh.type != ORKD_ATTN_RR_OK){ if (rh.len) cdrain(c->fd, rh.len); return -1; }
+    struct orkd_handle hh;
+    if (rn(c->fd, &hh, sizeof hh) <= 0) return -1;
+    size_t consumed = sizeof hh, sperc = (size_t)Nq * 32 * 4, avperc = (size_t)Nq * dv * 4;
+    size_t want = (size_t)nchains * (sperc + avperc);
+    if (hh.rc == 0){
+        if (rh.len < consumed + want){ if (rh.len > consumed) cdrain(c->fd, rh.len - consumed); return -1; }
+        for (int n = 0; n < nchains; n++){
+            if (rn(c->fd, Sigma + (size_t)n*Nq*32, sperc) <= 0) return -1; consumed += sperc;
+            if (rn(c->fd, av    + (size_t)n*Nq*dv, avperc) <= 0) return -1; consumed += avperc;
+        }
+    }
+    if (rh.len > consumed) cdrain(c->fd, rh.len - consumed);
+    return hh.rc;
+}
+
 int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int8_t *A, int32_t *C){
     if (!c || c->fd < 0 || M <= 0 || K <= 0 || N <= 0 || !A || !C) return -1;
     uint32_t abytes = (uint32_t)((size_t)M * K);

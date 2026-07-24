@@ -230,6 +230,95 @@ static int handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
     free(A); free(Cg); free(Cs); free(Cu); free(Ch); free(Cd);
     return werr ? -1 : 0;
 }
+/* ORKD_ATTN: the fused attention core [QK^T->exp->reduce,e.V] as ONE coalesced on-NPU chain (chainav pattern,
+ * ork_mm_run_chain_i8_ffn_exp). Fixed op-list built daemon-side against 3 resident weights: K^T[Kp,Nk], ones[Nk,32],
+ * V[Nk,dv]. Q (Nq*Kp int8) follows. Reply = Sigma(Nq*32 int32) then av(Nq*dv int32). e never leaves the NPU. */
+static int handle_attn(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_attn a;
+    if (readn(cl->fd, &a, sizeof a) <= 0) return -1;
+    if (a.abytes > ORKD_MAX_BYTES){ drain(cl->fd, a.abytes); send_error(cl->fd, tag, ORKD_EPROTO, "attn Q too big"); return 0; }
+    int8_t *Q = malloc(a.abytes ? a.abytes : 1);
+    if (!Q){ drain(cl->fd, a.abytes); send_error(cl->fd, tag, ORKD_EOOM, "attn Q"); return 0; }
+    if (a.abytes && readn(cl->fd, Q, a.abytes) <= 0){ free(Q); return -1; }
+    struct cweight *ckt = NULL, *co = NULL, *cv = NULL;
+    for (int j = 0; j < cl->nw; j++){ uint64_t id = cl->wt[j].id;
+        if (id == a.wkt_id) ckt = &cl->wt[j]; if (id == a.wones_id) co = &cl->wt[j]; if (id == a.wv_id) cv = &cl->wt[j]; }
+    int Nq = (int)a.Nq, Nk = (int)a.Nk, Kp = (int)a.Kp, dv = (int)a.dv;
+    if (!ckt || !co || !cv || Nq < 1 || Nk < 1 || Kp < 1 || dv < 1 || a.abytes != (uint32_t)((size_t)Nq * Kp)){
+        free(Q); send_error(cl->fd, tag, (ckt && co && cv) ? ORKD_EPROTO : ORKD_EBADH, "attn weight/dim"); return 0; }
+    /* scb/eb hold int8 (scores, exp) in the low bytes of int32 slots (chainav C usage); ss = reduce Sigma[Nq,32]; av[Nq,dv] */
+    size_t nb = (size_t)Nq * Nk * 4, sb = (size_t)Nq * 32 * 4, ab = (size_t)Nq * dv * 4;
+    int32_t *scb = malloc(nb), *eb = malloc(nb), *ss = malloc(sb), *avb = malloc(ab);
+    if (!scb || !eb || !ss || !avb){ free(Q); free(scb); free(eb); free(ss); free(avb); send_error(cl->fd, tag, ORKD_EOOM, "attn scratch"); return 0; }
+    ork_mm_task_i8 t[4] = {
+        { ckt->w, Nq, Q,            scb },   /* QK^T -> scores (reads Q)     */
+        { ckt->w, Nq, (int8_t*)scb, eb  },   /* exp(t0) -> e (N-sized by wkt) */
+        { co->w,  Nq, (int8_t*)eb,  ss  },   /* reduce e(t1) -> Sigma         */
+        { cv->w,  Nq, (int8_t*)eb,  avb } }; /* e(t1).V -> av                 */
+    ork_chain_op ops[4] = {
+        { 1, -1, 0, a.r_mult, a.r_shift },   /* QK^T MM8, int32->int8 score requant */
+        { 2,  0, 0, 0, 0 },                  /* exp(t0)                             */
+        { 0,  1, 0, 0, 0 },                  /* reduce e(t1) -> Sigma               */
+        { 0,  1, 0, 0, 0 } };                /* e(t1).V -> av                       */
+    int rc = ork_mm_run_chain_i8_ffn_exp_biased(npu, 4, t, ops, a.in_scale, a.out_scale, a.max_bias);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
+    int payload = (rc == 0);
+    struct orkd_hdr rh = { ORKD_ATTN_OK, (uint32_t)(sizeof hh + (payload ? sb + ab : 0)), tag };
+    int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
+    if (!werr && payload) werr = (writen(cl->fd, ss, sb) || writen(cl->fd, avb, ab));
+    free(Q); free(scb); free(eb); free(ss); free(avb);
+    return werr ? -1 : 0;
+}
+/* ORKD_ATTN_RR: N fused attention chains fanned round-robin across the NPU cores in ONE dispatch (the daemon runs
+ * a DIRECT ctx, so ork_mm_run_chains_rr_biased takes the local multi-core path). Payload = nchains {wkt,wones,wv}
+ * id triples then Q (nchains*Nq*Kp int8, chain-major). Reply = per chain Sigma(Nq*32) then av(Nq*dv) int32. All
+ * chains share the requant + scalar-max-biased exp LUT. This is the decode attention path: one round-trip, Hkv
+ * kv-head chains on separate cores concurrently, e never leaves the NPU. */
+static int handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
+    struct orkd_attn_rr a;
+    if (readn(cl->fd, &a, sizeof a) <= 0) return -1;
+    int nch = (int)a.nchains, Nq = (int)a.Nq, Nk = (int)a.Nk, Kp = (int)a.Kp, dv = (int)a.dv;
+    size_t tbytes = (nch>=1 && nch<=ORKD_ATTN_RR_MAX) ? (size_t)nch*3*8 : 0;
+    /* bad nchains: still consume the triples+Q we can compute, then error. abytes was sent by the client. */
+    if (nch < 1 || nch > ORKD_ATTN_RR_MAX || Nq < 1 || Nk < 1 || Kp < 1 || dv < 1 || a.abytes > ORKD_MAX_BYTES
+        || a.abytes != (uint32_t)((size_t)nch * Nq * Kp)){
+        drain(cl->fd, tbytes + a.abytes); send_error(cl->fd, tag, ORKD_EPROTO, "attn_rr dims"); return 0; }
+    uint64_t *trip = malloc(tbytes); int8_t *Q = malloc(a.abytes ? a.abytes : 1);
+    if (!trip || !Q){ free(trip); free(Q); drain(cl->fd, tbytes + a.abytes); send_error(cl->fd, tag, ORKD_EOOM, "attn_rr in"); return 0; }
+    if (readn(cl->fd, trip, tbytes) <= 0 || (a.abytes && readn(cl->fd, Q, a.abytes) <= 0)){ free(trip); free(Q); return -1; }
+    /* per-chain scratch + task lists; ss/avb hold the outputs to reply */
+    size_t sb = (size_t)Nq*32*4, ab = (size_t)Nq*dv*4, nb = (size_t)Nq*Nk*4;
+    int32_t **scb = calloc(nch,sizeof(void*)), **eb = calloc(nch,sizeof(void*)), **ss = calloc(nch,sizeof(void*)), **avb = calloc(nch,sizeof(void*));
+    ork_mm_task_i8 (*tk)[4] = calloc(nch,sizeof(*tk));
+    const ork_mm_task_i8 **chains = calloc(nch,sizeof(void*)); int *S = calloc(nch,sizeof(int));
+    int oom = (!scb||!eb||!ss||!avb||!tk||!chains||!S), bad = 0;
+    for (int n = 0; n < nch && !oom; n++){
+        scb[n]=malloc(nb); eb[n]=malloc(nb); ss[n]=malloc(sb); avb[n]=malloc(ab);
+        if (!scb[n]||!eb[n]||!ss[n]||!avb[n]){ oom=1; break; }
+        uint64_t wkt_id=trip[n*3], wones_id=trip[n*3+1], wv_id=trip[n*3+2];
+        struct cweight *ckt=NULL,*co=NULL,*cv=NULL;
+        for (int j=0;j<cl->nw;j++){ uint64_t id=cl->wt[j].id;
+            if (id==wkt_id) ckt=&cl->wt[j]; if (id==wones_id) co=&cl->wt[j]; if (id==wv_id) cv=&cl->wt[j]; }
+        if (!ckt||!co||!cv){ bad=1; break; }
+        int8_t *Qn = Q + (size_t)n*Nq*Kp;
+        tk[n][0]=(ork_mm_task_i8){ ckt->w, Nq, Qn,             scb[n] };
+        tk[n][1]=(ork_mm_task_i8){ ckt->w, Nq, (int8_t*)scb[n], eb[n] };
+        tk[n][2]=(ork_mm_task_i8){ co->w,  Nq, (int8_t*)eb[n],  ss[n] };
+        tk[n][3]=(ork_mm_task_i8){ cv->w,  Nq, (int8_t*)eb[n],  avb[n] };
+        chains[n]=tk[n]; S[n]=4;
+    }
+    ork_chain_op ops[4] = { {1,-1,0,a.r_mult,a.r_shift}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
+    int rc = (oom||bad) ? -1 : ork_mm_run_chains_rr_biased(npu, nch, chains, S, ops, a.in_scale, a.out_scale, a.max_bias);
+    int payload = (rc == 0);
+    struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
+    struct orkd_hdr rh = { ORKD_ATTN_RR_OK, (uint32_t)(sizeof hh + (payload ? (size_t)nch*(sb+ab) : 0)), tag };
+    if (oom || bad) hh.rc = oom ? ORKD_EOOM : ORKD_EBADH;
+    int werr = writen(cl->fd, &rh, sizeof rh) || writen(cl->fd, &hh, sizeof hh);
+    for (int n = 0; n < nch && !werr && payload; n++) werr = (writen(cl->fd, ss[n], sb) || writen(cl->fd, avb[n], ab));
+    for (int n = 0; n < nch; n++){ if(scb)free(scb[n]); if(eb)free(eb[n]); if(ss)free(ss[n]); if(avb)free(avb[n]); }
+    free(scb); free(eb); free(ss); free(avb); free(tk); free(chains); free(S); free(trip); free(Q);
+    return werr ? -1 : 0;
+}
 /* Tier 12f resident-KV: the daemon runs a DIRECT npu ctx (fd valid), so ork_kv_resident_alloc/append take the
  * LOCAL path here. Register the two resident weights in wt[] (so ORKD_CHAIN can reference them by id) and keep
  * the kv handle in kvt[] for append. Freed with the rest on client drop. */
@@ -699,6 +788,17 @@ static void orkd_warmup(ork_npu *npu){
     int rc = ork_submit_seq(npu, ops, wf ? 2 : 1);
     if (wf) ork_mm_free(npu, wf);
     fprintf(stderr, "[orkd] warmup rc=%d (int16-LUT calibration + fp16 matmul primed)\n", rc);
+    /* Bring up ALL cores (ORKD_ATTN_RR precondition: a cold core's first submit wedges). A single-task int8
+     * matmul with M>1,N=512 dispatches run_multicore across cores 0..nc-1, priming each — the same warm the
+     * direct chainrr probes do before ork_mm_run_chains_rr[_biased]. Without this the first RR dispatch fans a
+     * chain onto a never-online core and wedges. */
+    { int WK=512, WN=512, WM=32;
+      int8_t *wb=malloc((size_t)WK*WN), *wa=malloc((size_t)WM*WK); int32_t *wc=malloc((size_t)WM*WN*4);
+      if (wb && wa && wc){ memset(wb,1,(size_t)WK*WN); memset(wa,1,(size_t)WM*WK);
+          ork_w *wi=ork_mm_pack_i8(npu,WK,WN,wb);
+          if (wi){ ork_mm_task_i8 wt={wi,WM,wa,wc}; int mrc=ork_mm_run_chain_i8(npu,1,&wt); ork_mm_free(npu,wi);
+              fprintf(stderr, "[orkd] warmup multicore-i8 rc=%d (all cores primed for RR)\n", mrc); } }
+      free(wb); free(wa); free(wc); }
 }
 
 int main(void){
@@ -825,6 +925,8 @@ int main(void){
                 case ORKD_KV_APPEND: g_orkd_submits++; if (handle_kv_append(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_IMPORT: if (handle_import(&cl[i], npu, recvd_fds[0], recvd_fds[1], h.tag) < 0) drop = 1; recvd_fds[0] = recvd_fds[1] = -1; break;
                 case ORKD_FFN: g_orkd_submits++; if (handle_ffn(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_ATTN: g_orkd_submits++; if (handle_attn(&cl[i], npu, h.tag) < 0) drop = 1; break;
+                case ORKD_ATTN_RR: g_orkd_submits++; if (handle_attn_rr(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_RUN:  g_orkd_submits++; if (handle_run (&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_FREE: if (handle_free(&cl[i], npu, h.tag) < 0) drop = 1; break;
                 case ORKD_SDP:  g_orkd_submits++; if (handle_sdp (&cl[i], npu, h.tag) < 0) drop = 1; break;

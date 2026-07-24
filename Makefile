@@ -600,6 +600,13 @@ orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_prot
 orkd_ffn_probe: tools/orkd_ffn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
 	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
 
+# orkd_attn_probe — fused attention core [QK^T->exp->reduce,e.V] routed THROUGH orkd (ORKD_ATTN). Pure client. Board tool.
+orkd_attn_probe: tools/orkd_attn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+
+orkd_attn_rr_probe: tools/orkd_attn_rr_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
+	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+
 # i16out_fix_probe — DEPRECATED/QUARANTINED (dup of i16out_probe; validates unmerged set_i16_out). Stub unless -DORK_DEPRECATED_PROBES.
 i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
@@ -901,6 +908,9 @@ chainrr_probe: tools/chainrr_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 chainrr_conc_probe: tools/chainrr_conc_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+chainrr_biased_probe: tools/chainrr_biased_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
