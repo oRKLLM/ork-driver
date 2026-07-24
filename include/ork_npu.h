@@ -1217,6 +1217,13 @@ int          ork_mm_attn_orkd(ork_npu *ctx, ork_w *wkt, ork_w *wones, ork_w *wv,
                               int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
                               double in_scale, double out_scale, double max_bias,
                               const int8_t *Q, int32_t *Sigma, int32_t *av);
+/* RR variant: nchains fused-attn chains (per-chain wkt/wv, shared wones) fanned across cores in ONE round-trip
+ * through orkd. Q = nchains*Nq*Kp int8 (chain-major); Sigma = nchains*Nq*32, av = nchains*Nq*dv int32. All
+ * weights daemon-resident. -3 if not resident / no daemon. */
+int          ork_mm_attn_rr_orkd(ork_npu *ctx, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
+                              int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                              double in_scale, double out_scale, double max_bias,
+                              const int8_t *Q, int32_t *Sigma, int32_t *av);
 int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE

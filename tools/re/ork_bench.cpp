@@ -244,8 +244,10 @@ int main(int argc, char** argv){
     cp.n_batch = P > UB ? P : UB;
     cp.n_ubatch= UB;
     cp.n_threads = 4; cp.n_threads_batch = 4;
-    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;  // ggml-ork is a MUL_MAT accelerator; the fused FA
-                                                          // op isn't on its path (auto-FA -> graph compute -1)
+    // ggml-ork is historically a MUL_MAT accelerator (attention decomposed into mul_mats), so FA is OFF by
+    // default. ORK_BENCH_FA=1 enables FLASH_ATTN_EXT so the NPU decode-attention path (ORK_ATTN_DEC/_KV/_FUSED)
+    // actually sees the op; prefill FA that can't run under orkd falls to the ork CPU-delegate.
+    cp.flash_attn_type = getenv("ORK_BENCH_FA") ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 

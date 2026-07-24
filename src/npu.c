@@ -9241,6 +9241,26 @@ int ork_mm_attn_orkd(ork_npu *c, ork_w *wkt, ork_w *wones, ork_w *wv,
     return orkd_attn_i8(c->daemon, wkt->orkd_id, wones->orkd_id, wv->orkd_id, Nq, Nk, Kp, dv,
                         r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av);
 }
+/* RR variant: nchains fused-attn chains (per-chain wkt/wv, shared wones) fanned across the daemon's cores in ONE
+ * round-trip (ORKD_ATTN_RR / ork_mm_run_chains_rr_biased). Q = nchains*Nq*Kp int8 (chain-major); Sigma =
+ * nchains*Nq*32, av = nchains*Nq*dv int32 (attn_c = av_c/Sigma_c). All weights must be daemon-resident. -3 if not. */
+int ork_mm_attn_rr_orkd(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
+                        int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                        double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || !c->daemon || nchains < 1 || nchains > ORKD_ATTN_RR_MAX || !wkt || !wones || !wv) return -3;
+    if (!wones->is_orkd) return -3;
+    uint64_t *kt = malloc((size_t)nchains*8), *on = malloc((size_t)nchains*8), *v = malloc((size_t)nchains*8);
+    if (!kt || !on || !v){ free(kt); free(on); free(v); return -3; }
+    int ok = 1;
+    for (int n = 0; n < nchains; n++){
+        if (!wkt[n] || !wv[n] || !wkt[n]->is_orkd || !wv[n]->is_orkd){ ok = 0; break; }
+        kt[n] = wkt[n]->orkd_id; on[n] = wones->orkd_id; v[n] = wv[n]->orkd_id;
+    }
+    int rc = ok ? orkd_attn_rr_i8(c->daemon, nchains, kt, on, v, Nq, Nk, Kp, dv,
+                                  r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av) : -3;
+    free(kt); free(on); free(v);
+    return rc;
+}
 
 /* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
  * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
