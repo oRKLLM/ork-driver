@@ -87,7 +87,8 @@ struct ckv { uint64_t id; ork_kv_resident *kv; };   /* Tier 12f resident-KV hand
 struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain;
                 struct ckv kvt[ORKD_MAX_WEIGHTS]; int nkv;   /* resident-KV handles for ORKD_KV_APPEND */
                 unsigned owned_dom;   /* bitmask of IOMMU domains this client requested via ORKD_DOM_REQ (bits 1..POOL); released on drop */
-                struct orkd_ring *ring; int ring_fd; uint32_t ring_tail; };  /* A-ring: attached low-latency shm transport */
+                struct orkd_ring *ring; int ring_fd; uint32_t ring_tail;   /* A-ring: attached low-latency shm transport */
+                uint64_t layer_warm[7]; int layer_warmed; };   /* ORKD_LAYER: cache the last-warmed 7-weight-id set so the doorbell warm (per weight shape) fires ONCE per weight set, not every layer/token (steady-state: same 7 weights each token) */
 
 /* A-sched: PER-CLIENT IOMMU DOMAINS (opt-in, ORKD_PER_CLIENT_DOMAINS=1). Intent: pack each client's resident
  * weights into a distinct iommu domain -> isolation + a full ~4 GiB IOVA window each (rk_iommu v2 cap is
@@ -326,9 +327,17 @@ static int handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
  * (by id); Kc/Vc + gains + x come in the payload; reply = x_out[D]. Overlap (CPU worker ∥ doorbell) is a later
  * optimization; v1 collapses the ~56 round-trips/token to 1 while staying bit-exact. */
 static ork_w *layer_find_w(struct client *cl, uint64_t id){ for (int j=0;j<cl->nw;j++) if (cl->wt[j].id==id) return cl->wt[j].w; return NULL; }
-static int layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int N, int32_t *C){   /* doorbell matmul (M=1), warm-retry */
-    for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
-        if (!h) continue; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } } return -1; }
+static int layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t *C){   /* M=1 matmul: doorbell if K fits its envelope (K%512==0 && K<=4096), else wide-K run_i8; warm-retry */
+    /* ORK_LAYER_RUNI8: force ALL matmuls through run_i8 (single I8 mode, warm-once). Mixing the doorbell
+     * (I8_CHAIN) with run_i8 (I8) — as a wide-K down proj forces — thrashes the mode/warm state every layer
+     * (a 2s cold-doorbell re-warm poll each call). All-run_i8 stays one mode, so it is the clean steady-state. */
+    static int runi8 = -1; if (runi8 < 0) runi8 = getenv("ORK_LAYER_RUNI8") ? 1 : 0;
+    if (!runi8 && K % 512 == 0 && K <= 4096) {
+        for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
+            if (!h) break; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } }
+    }
+    if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
+    return -1; }
 static int handle_layer(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_layer a;
     if (readn(cl->fd, &a, sizeof a) <= 0) return -1;
@@ -352,23 +361,28 @@ static int handle_layer(struct client *cl, ork_npu *npu, uint64_t tag){
           *xf=malloc((size_t)D*4),*gf=malloc((size_t)Nff*4),*uf=malloc((size_t)Nff*4),*act=malloc((size_t)Nff*4);
     int rc=-1;
     if (Cq&&Ck&&Cv&&Co&&Cg&&Cu&&Cd&&xn8&&ao8&&xf8&&ac8&&xo&&qf&&ao&&x1&&xf&&gf&&uf&&act){
-        int8_t *wa=calloc(Nff<D?D:Nff,1); if(wa) memset(wa,1,(size_t)(Nff<D?D:Nff));
-        if (wa){ layer_mm(npu,pWq,wa,Nq,Cq);layer_mm(npu,pWk,wa,Nkv,Ck);layer_mm(npu,pWv,wa,Nkv,Cv);layer_mm(npu,pWo,wa,D,Co);
-                 layer_mm(npu,pWg,wa,Nff,Cg);layer_mm(npu,pWu,wa,Nff,Cu);layer_mm(npu,pWd,wa,D,Cd); free(wa); }  /* warm per shape */
+        uint64_t wset[7]={a.wq,a.wk,a.wv,a.wo,a.wg,a.wu,a.wd};
+        int warm_hit = cl->layer_warmed && !memcmp(cl->layer_warm, wset, sizeof wset);
+        if (!warm_hit){   /* warm the doorbell ONCE per weight-shape set (cold doorbell returns garbage); skip if this set is already warm (steady-state per-token: identical weights) */
+            int8_t *wa=calloc(Nff<D?D:Nff,1); if(wa) memset(wa,1,(size_t)(Nff<D?D:Nff));
+            if (wa){ layer_mm(npu,pWq,wa,D,Nq,Cq);layer_mm(npu,pWk,wa,D,Nkv,Ck);layer_mm(npu,pWv,wa,D,Nkv,Cv);layer_mm(npu,pWo,wa,Nq,D,Co);
+                     layer_mm(npu,pWg,wa,D,Nff,Cg);layer_mm(npu,pWu,wa,D,Nff,Cu);layer_mm(npu,pWd,wa,Nff,D,Cd); free(wa); }
+            memcpy(cl->layer_warm, wset, sizeof wset); cl->layer_warmed=1;
+        }
         float sx=(spine_rmsnorm(x,attn_norm,D,1e-6f,xo), spine_quant(xo,D,xn8));
-        int m = layer_mm(npu,pWq,xn8,Nq,Cq)||layer_mm(npu,pWk,xn8,Nkv,Ck)||layer_mm(npu,pWv,xn8,Nkv,Cv);
+        int m = layer_mm(npu,pWq,xn8,D,Nq,Cq)||layer_mm(npu,pWk,xn8,D,Nkv,Ck)||layer_mm(npu,pWv,xn8,D,Nkv,Cv);
         if (!m){
             for (int i=0;i<Nq;i++) qf[i]=Cq[i]/sx;
             for (int h=0;h<H;h++){ float*qh=qf+(size_t)h*dk; spine_rmsnorm(qh,q_norm,dk,1e-6f,qh); spine_rope_neox(qh,dk,(int)a.pos,(float)a.rope_base);
                 spine_attn(qh, Kc+(size_t)(h/rk2)*nkv*dk, Vc+(size_t)(h/rk2)*nkv*dv, nkv,dk,dv,(float)a.attn_scale, ao+(size_t)h*dv); }
             float sa=spine_quant(ao,Nq,ao8);
-            if (!layer_mm(npu,pWo,ao8,D,Co)){
+            if (!layer_mm(npu,pWo,ao8,Nq,D,Co)){
                 for (int i=0;i<D;i++) x1[i]=x[i]+Co[i]/sa;
                 float sf=(spine_rmsnorm(x1,ffn_norm,D,1e-6f,xf), spine_quant(xf,D,xf8));
-                if (!(layer_mm(npu,pWg,xf8,Nff,Cg)||layer_mm(npu,pWu,xf8,Nff,Cu))){
+                if (!(layer_mm(npu,pWg,xf8,D,Nff,Cg)||layer_mm(npu,pWu,xf8,D,Nff,Cu))){
                     for (int i=0;i<Nff;i++){ gf[i]=Cg[i]/sf; uf[i]=Cu[i]/sf; } spine_silu_glu(gf,uf,Nff,act);
                     float sac=spine_quant(act,Nff,ac8);
-                    if (!layer_mm(npu,pWd,ac8,D,Cd)){ for (int i=0;i<D;i++) xo[i]=x1[i]+Cd[i]/sac; rc=0; }
+                    if (!layer_mm(npu,pWd,ac8,Nff,D,Cd)){ for (int i=0;i<D;i++) xo[i]=x1[i]+Cd[i]/sac; rc=0; }
                 }
             }
         }
