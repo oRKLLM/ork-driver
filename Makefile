@@ -922,6 +922,9 @@ doorbell_overlap_probe: tools/doorbell_overlap_probe.c $(COBJ)
 spine_worker_probe: tools/spine_worker_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+spine_sched_probe: tools/spine_sched_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
