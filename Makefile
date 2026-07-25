@@ -47,6 +47,15 @@ $(EXAMPLES): %: examples/%.c $(COBJ)
 $(TESTS): %: %.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# cpu_gemm_probe — measures a NEON int8 CPU GEMM vs ork_mm_run_i8 (NPU) at prefill dims, to size the
+# ork_spine column-split ceiling. Board tool, not in `make test`.
+cpu_gemm_probe: tools/cpu_gemm_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+dotprod -o $@ $< $(COBJ) -lm
+
+# cpu_op_sweep — per-op NPU-vs-CPU cost sweep (SDP/activation ops) to populate the op-cap table. Board tool.
+cpu_op_sweep: tools/cpu_op_sweep.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE diagnostic (NOT in `make test`): probes whether the captured PPU LUT/PWL regcmd can be
 # driven STANDALONE. NEGATIVE RESULT on RK3588 — the PPU does not activate from an isolated
 # replay (output buffer comes back unwritten). Kept as a runnable ground-truth probe; exits
