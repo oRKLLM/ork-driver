@@ -158,6 +158,9 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
     int dom_active; int dom_seen[ORK_MAXDOM];
+    /* ORK_DOM_PROFILE: dom_activate cost telemetry (the "domain-swap window"). Steady = pure scratch
+     * pointer-swap memcpy; first = one-time per-domain first-touch bcreate(regcmd/task/Af). */
+    uint64_t dom_sw_n, dom_sw_first_n; double dom_sw_us, dom_sw_first_us, dom_sw_max_us;
     int dom_next;   /* direct-mode domain allocator counter (ork_npu_domain_alloc hands out 1,2,3,…); Path B asks the daemon instead */
     /* Per-domain native "anchor": one small NATIVE bcreate per non-0 domain, allocated BEFORE any dma-buf
      * import is mapped into that domain. The kernel rknpu driver sets up a domain's IOVA allocator / page
@@ -602,6 +605,7 @@ static void act(int fd,uint32_t f,uint32_t v){
 static void dom_activate(ork_npu *c,int dom){
     if(dom<0||dom>=ORK_MAXDOM) dom=0;
     if(dom==c->dom_active) return;
+    double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
     if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
@@ -624,11 +628,15 @@ static void dom_activate(ork_npu *c,int dom){
      * raw, and a non-NULL in-domain Af is the safe, complete invariant rather than relying on each caller.
      * Cc and the per-core mc-* scratch are NOT allocated here: their sizes are matmul-dependent, so every
      * run path lazily (re)allocates them in c->dom_active under their own .size/.cpu guards. */
-    if(!neo->used && !c->regcmd.cpu){
+    int _first = (!neo->used && !c->regcmd.cpu);
+    if(_first){
         c->regcmd=bcreate(c->fd,2097152,0x403,dom); c->task=bcreate(c->fd,524288,0x40b,dom); c->Af=bcreate(c->fd,(size_t)4*32768*2,0x403,dom);
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
             memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     }
+    { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
+      c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
+      if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }
 }
 
 static struct ork_npu *g_npu_ctx = NULL;
@@ -1418,6 +1426,13 @@ void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshallin
 static void ork_npu_xprof_dump(void);
 void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
     int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
+    if(getenv("ORK_DOM_PROFILE") && c->dom_sw_n){   /* domain-swap window telemetry */
+        uint64_t steady_n = c->dom_sw_n - c->dom_sw_first_n; double steady_us = c->dom_sw_us - c->dom_sw_first_us;
+        fprintf(stderr, "[ork DOM-SWAP] %llu real switches (%.1f us total, %.2f us max) | first-touch %llu (%.0f us, one-time bcreate) | steady swaps %llu = %.3f us total, %.4f us/swap avg\n",
+            (unsigned long long)c->dom_sw_n, c->dom_sw_us, c->dom_sw_max_us,
+            (unsigned long long)c->dom_sw_first_n, c->dom_sw_first_us,
+            (unsigned long long)steady_n, steady_us, steady_n ? steady_us/(double)steady_n : 0.0);
+    }
     if(c->seq_witness){ ork_mm_free(c, c->seq_witness); c->seq_witness=NULL; }   /* B2 terminal-SDP witness weight */
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
@@ -8063,14 +8078,20 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
                               const int16_t *lut,int nlut,int8_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    /* MULTI-DOMAIN: the FFN chain calls this per-layer fused-SiLU LUT-calibration probe with c->dom_active set
+     * to the layer's (non-0) domain; the probe's buffers + submits must MATCH it, else submitting
+     * iommu_domain_id=0 while c->dom_active!=0 WEDGES (errno 110) — the same hazard already fixed for the i16
+     * SiLU probes (ork_npu_probe_silu_std_i16). dom==0 for every single-domain caller => behavior-preserving.
+     * ORK_SILU_DOM0=1 forces dom0 (A/B / disable the fix). */
+    int dom = getenv("ORK_SILU_DOM0") ? 0 : c->dom_active;
+    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
     bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
-    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
+    struct buf O=bcreate(fd,(size_t)M*N,0x403,dom); if(!O.cpu){bdestroy(fd,&W);return -2;}
+    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
+    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     /* Prime against a fresh-buffer stale-read/wedge — but ONLY when the NPU isn't already int8-warm. The chain
      * builds the fused-SiLU LUT via this probe once per layer during prep; an unconditional ~107ms ACT_RESET
@@ -8090,7 +8111,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(rknpu_submit_ioctl(fd,&sub,dom)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
     }
 
     /* ---- submit 2: matmul compute (enable=0x1d, regcfg=108) reading the resident LUT ---- */
@@ -8107,7 +8128,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       int ok=-1; double t1=0;
       for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms(); double t0=ork_now_us();
-          if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+          if(rknpu_submit_ioctl(fd,&sub,dom)){ ok=-1; break; }
           bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
       if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
       bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
