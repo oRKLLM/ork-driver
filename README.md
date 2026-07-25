@@ -318,7 +318,8 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 |---|---|
 | `ORK_PERSIST=<path>` | load the `.orkpack` if present, else build it on first run and cache |
 | `ORK_ORKPACK_TIERMAP`, `ORK_ORKPACK_I4_FFN`, `ORK_ORKPACK_I4_ABOVE_MB`, `ORK_ORKPACK_TIER_FROM_SRC`, `ORK_ORKPACK_CPU` | per-tensor tier selection when converting an orkpack |
-| `ORK_DOMAINS=<n>`, `ORK_DOMAIN_LAYERS` | IOMMU-domain layout for >4 GiB residency |
+| `ORK_DOMAINS=<n>` | **DEPRECATED + IGNORED** — the domain count is auto-sized from the resident orkpack footprint. An explicit value could under-provision IOVA (last-domain overflow → Bf PRIME-fail → warmup wedge); setting it now logs a warning and is ignored. Use `ORK_DOMAIN_LAYERS` for manual layer→domain control. |
+| `ORK_DOMAIN_LAYERS` | manual layers-per-domain (advanced; the auto-sizer byte-balances by default) |
 | `ORK_WCACHE_BUDGET_MB`, `ORK_STREAM_RAM_BUDGET_MB` | resident-weight / RAM streaming LRU budgets |
 | `ORK_EVICT_SRC`, `ORK_NO_IMPORT`, `ORK_IMPORT_CHUNK_MB`, `ORK_NO_CONSOLIDATE_IMPORT` | zero-copy import controls |
 
