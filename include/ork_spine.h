@@ -61,7 +61,7 @@ typedef struct ork_spine_op {
     int unit, gen; long ret;
 } ork_spine_op;
 
-static void *ork__spine_unit_loop(void *p){ ork_spine_unit *u = p; pthread_mutex_lock(&u->mu);
+static void *ork__spine_unit_loop(void *p){ ork_spine_unit *u = (ork_spine_unit *) p; pthread_mutex_lock(&u->mu);
     for (;;){ while (u->gen == u->done_gen && !u->stop) pthread_cond_wait(&u->go, &u->mu);
         if (u->stop){ pthread_mutex_unlock(&u->mu); return NULL; }
         long (*fn)(void *) = u->fn; void *arg = u->arg; int g = u->gen; pthread_mutex_unlock(&u->mu);

@@ -795,6 +795,10 @@ static_id_probe: tools/static_id_probe.c $(COBJ)
 steer_probe: tools/steer_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# doorbell-vs-async stall isolation: does the doorbell chain starve when the CPU stops polling? Not in all/test.
+doorbell_stall_probe: tools/doorbell_stall_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # dynamic-submit API test: begin/progress/halt/end (NONBLOCK chain, per-op doorbell, mid-flight early-exit). Not in all/test.
 ork_dyn_test: tools/ork_dyn_test.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
