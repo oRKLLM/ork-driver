@@ -37,6 +37,7 @@
 #include "regcmd_softmax_wt.h"    /* RE: its matmul weight blobs (verbatim) */
 #include "regcmd_reshape.h"       /* RE: vendor fp16 contiguous->atom-8 reshape base (task4) — WIP */
 #include "ork_npu.h"
+#include "ork_slice.h"           /* slice-and-dice decomposer (ork_slice_matmul / caps) for the sliced-doorbell primitive */
 #include "soc.h"
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
@@ -5242,6 +5243,63 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         fprintf(stderr,"[RUN#%ld]   -> rc=%d C[int32] min=%ld max=%ld zero=%ld/%zu head=[%d %d %d %d]\n",
             myn,r,cmn,cmx,cz,nc,C[0],C[1],C[2],C[3]); fflush(stderr); }
     return r;
+}
+
+/* ---- SLICE-AND-DICE: a matmul packed as c_base doorbell tiles (K-slice + N-tile, ork_slice.h). Pack once,
+ * run many. Lets a wide-K / wide-N op run ENTIRELY on the doorbell (K-slice int32-accumulate + N-tile scatter),
+ * bit-exact vs ork_mm_run_i8 — the foundation for the doorbell owning every submit (SLICE_AND_DICE_PLAN.md). */
+typedef struct ork_w_sliced { int K, N; ork_slice_caps cap; int nks, nnt; ork_w **sub; } ork_w_sliced;   /* sub[ki*nnt+ni] */
+
+void ork_mm_free_i8_sliced(ork_npu *c, ork_w_sliced *w) {
+    if (!w) return;
+    if (w->sub) { for (int i = 0; i < w->nks * w->nnt; i++) if (w->sub[i]) ork_mm_free(c, w->sub[i]); free(w->sub); }
+    free(w);
+}
+
+ork_w_sliced *ork_mm_pack_i8_sliced(ork_npu *c, int K, int N, const int8_t *B) {
+    if (!c || !B || K <= 0 || N <= 0) return NULL;
+    ork_slice_caps cap = ork_slice_caps_rk3588();
+    if (K % cap.kmul || N % cap.nmul) return NULL;                       /* unaligned: pad not yet supported */
+    int ks = (cap.kmax / cap.kmul) * cap.kmul, ns = (cap.nmax / cap.nmul) * cap.nmul;
+    int nks = (K + ks - 1) / ks, nnt = (N + ns - 1) / ns;
+    struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
+    w->K = K; w->N = N; w->cap = cap; w->nks = nks; w->nnt = nnt;
+    w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
+    int8_t *blk = malloc((size_t) ks * ns);
+    if (!w->sub || !blk) { free(blk); ork_mm_free_i8_sliced(c, w); return NULL; }
+    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
+        for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
+            for (int k = 0; k < Ks; k++) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* gather block */
+            ork_w *sw = ork_mm_pack_i8(c, Ks, Nw, blk);
+            if (!sw) { free(blk); ork_mm_free_i8_sliced(c, w); return NULL; }
+            w->sub[ki*nnt + ni] = sw; } }
+    free(blk); return w;
+}
+
+int ork_mm_run_i8_sliced(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
+    if (!c || !w || !A || !C || M < 1) return -1;
+    int ks = (w->cap.kmax / w->cap.kmul) * w->cap.kmul, ns = (w->cap.nmax / w->cap.nmul) * w->cap.nmul;
+    int8_t  *Aslc = malloc((size_t) M * ks);                            /* gathered A[:, k0:k1] */
+    /* PLAIN (non-DMA) partial: forces the doorbell's scratch copy-back path (direct=0) so the NPU writes its
+     * OWN in-domain per-core scratch and ork_dyn_end memcpy's it back here — bit-exact for any M/nc. An
+     * ork_dma_alloc'd buffer would be zero-copy-eligible (direct mode); allocated AFTER the weight pack (as a
+     * pack-once/run-many primitive must), its zero-copy output IOVA/warm state is stale and the NPU writes
+     * nowhere (reads back 0). The scratch path sidesteps that entirely (ZC-OUT is ~0 gain anyway). */
+    int32_t *part = malloc((size_t) M * ns * sizeof(int32_t));          /* per-(N-tile) partial */
+    if (!Aslc || !part) { free(Aslc); free(part); return -1; }
+    int rc = 0;
+    for (int ni = 0; ni < w->nnt && !rc; ni++) { int n0 = ni*ns, n1 = n0+ns < w->N ? n0+ns : w->N, Nw = n1-n0;
+        for (int m = 0; m < M; m++) memset(C + (size_t) m*w->N + n0, 0, (size_t) Nw * sizeof(int32_t));   /* zero this N-tile */
+        for (int ki = 0; ki < w->nks && !rc; ki++) { int k0 = ki*ks, k1 = k0+ks < w->K ? k0+ks : w->K, Ks = k1-k0;
+            for (int m = 0; m < M; m++) memcpy(Aslc + (size_t) m*Ks, A + (size_t) m*w->K + k0, Ks);       /* gather A cols */
+            ork_mm_task_i8 t = { w->sub[ki*w->nnt + ni], M, Aslc, part };
+            ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);          /* one c_base tile on the doorbell */
+            if (!h) { if (ork_mm_run_i8(c, t.w, M, Aslc, part)) rc = -1; }
+            else if (ork_dyn_end(h) < 0) rc = -1;
+            if (!rc) for (int m = 0; m < M; m++) { int32_t *cr = C + (size_t) m*w->N + n0, *pr = part + (size_t) m*Nw;
+                for (int n = 0; n < Nw; n++) cr[n] += pr[n]; }         /* accumulate the K-slice partial (copy-back already coherent) */
+        } }
+    free(Aslc); free(part); return rc;
 }
 
 /* ---- FUSED FFN: matmul with an on-NPU output-stage activation (SwiGLU fusion) --------------------

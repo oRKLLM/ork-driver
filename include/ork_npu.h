@@ -387,6 +387,14 @@ int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, floa
  * @return 0 on success, negative on error (bad args / submit failure).
  */
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+/* SLICE-AND-DICE (ork_slice.h): pack a matmul as a set of c_base doorbell tiles (K-slice + N-tile) so a
+ * wide-K / wide-N op runs ENTIRELY on the doorbell — K-slice int32-accumulate + N-tile scatter — bit-exact
+ * vs ork_mm_run_i8. Pack once, run many. `nc` = doorbell colsplit cores (0=all; 1 avoids the non-even-N
+ * colsplit issue). The foundation for the doorbell owning every submit (see SLICE_AND_DICE_PLAN.md). */
+typedef struct ork_w_sliced ork_w_sliced;
+ork_w_sliced *ork_mm_pack_i8_sliced(ork_npu *ctx, int K, int N, const int8_t *B);
+int           ork_mm_run_i8_sliced (ork_npu *ctx, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
+void          ork_mm_free_i8_sliced(ork_npu *ctx, ork_w_sliced *w);
 /* FUSED SwiGLU gate matmul: C = silu(requant(A·W)) as int8 [M*N], activation applied IN the matmul's
  * SDP output stage (no extra submit / round-trip). Resident full-K int8 weight (K%512==0, K<=4096).
  * R = r_mult/2^r_shift + out_bias is the SCALAR OUT_CVT (so quantize A PER-TENSOR, not per-row);
