@@ -126,6 +126,14 @@ int main(int argc,char**argv){
     rc |= test_load_import(ctx,2048,512,4);   /* in Bf full-K envelope (K<=4096, K%512) */
     rc |= test_load_import(ctx,4096,1024,2);
 
+    /* #36 REPRO: imported-Bf through the M>1 colsplit at N=3584 (7B shapes), vs CPU. The direct-JIT
+     * (natively-packed Bf) path is already CPU-verified correct for these; this isolates whether the
+     * IMPORTED-Bf layout mis-dispatches the non-even 3-core N=3584 colsplit. */
+    rc |= test_load_import(ctx,3584,3584,228);    /* base q/o_proj: colsplit N=3584 across 3 cores */
+    rc |= test_load_import(ctx,3584,3584,32);     /* same, small M */
+    rc |= test_load_import(ctx,18944,3584,64);    /* ffn_down wide-K, N=3584 */
+    if (getenv("SKIP_STREAM")) { printf("\n%s (load-import only)\n", rc?"FAIL":"ALL OK"); ork_npu_free(ctx); return rc; }
+
     /* fixed-slot streaming: working set bigger than what fits at once would normally fragment.
      * default: many experts cycled. Sizes chosen so the total working set is multi-GB if held, but
      * the pool only holds 1 at a time. */

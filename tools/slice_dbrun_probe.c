@@ -39,9 +39,27 @@ int main(int argc, char **argv) {
 
     long bad = 0, first = -1;
     for (size_t i = 0; i < (size_t) M*N; i++) if (Cslc[i] != Cref[i]) { if (first < 0) first = (long) i; bad++; }
-    printf("mismatches = %ld / %d", bad, M*N);
+    printf("mismatches (sliced vs run_i8) = %ld / %d", bad, M*N);
     if (bad) printf("  first@%ld: sliced %d vs ref %d", first, Cslc[first], Cref[first]);
-    printf(" -> %s\n", bad ? "FAIL" : "BIT-EXACT PASS");
+    printf(" -> %s\n", bad ? "DIFFER" : "identical");
+
+    /* CPU int32 reference (CPUREF=1) — the ONLY trustworthy truth when the driver path itself is suspect
+     * (task #36: N=3584 colsplit can break ork_mm_run_i8, so "sliced vs run_i8" above would be meaningless).
+     * O(M*N*K): use a SMALL M. Reports run_i8 AND sliced EACH vs CPU, so we see which path is correct. */
+    if (getenv("CPUREF")) {
+        int32_t *Ccpu = (int32_t *) malloc((size_t) M*N*4);
+        for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) { int32_t s = 0; const int8_t *ar = A + (size_t) m*K;
+            for (int k = 0; k < K; k++) s += (int32_t) ar[k] * (int32_t) B[(size_t) k*N + n];
+            Ccpu[(size_t) m*N + n] = s; }
+        long br = 0, bs = 0, fr = -1, fs = -1;
+        for (size_t i = 0; i < (size_t) M*N; i++) { if (Cref[i] != Ccpu[i]) { if (fr<0) fr=(long)i; br++; }
+                                                    if (Cslc[i] != Ccpu[i]) { if (fs<0) fs=(long)i; bs++; } }
+        printf("vs CPU: run_i8 mism=%ld/%d%s | sliced mism=%ld/%d%s\n",
+               br, M*N, br?" <-- run_i8 BROKEN for this shape":" OK", bs, M*N, bs?" <-- sliced FAIL":" OK");
+        if (br) printf("   run_i8 first@%ld: %d vs cpu %d\n", fr, Cref[fr], Ccpu[fr]);
+        if (bs) printf("   sliced first@%ld: %d vs cpu %d\n", fs, Cslc[fs], Ccpu[fs]);
+        free(Ccpu);
+    }
 
     /* A/B throughput: blocking mcworker (run_i8) vs sliced doorbell (run_sliced), same shape. REPS env (default 40). */
     int reps = getenv("REPS") ? atoi(getenv("REPS")) : 40; if (reps < 1) reps = 1;
