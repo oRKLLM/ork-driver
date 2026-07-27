@@ -795,6 +795,15 @@ static_id_probe: tools/static_id_probe.c $(COBJ)
 steer_probe: tools/steer_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# slice-and-dice decomposer (ork_slice.h) self-test: c_base tiling + exact coverage. NPU-FREE + fast + self-
+# validating -> safe to run anywhere (no board). Header-only, no $(COBJ).
+slice_test: tools/slice_test.c include/ork_slice.h
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
+# slice-and-dice EXECUTION proof: run wide-K on the doorbell via K-slice c_base tiles, bit-exact vs blocking. Board only.
+slice_dbrun_probe: tools/slice_dbrun_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # doorbell-vs-async stall isolation: does the doorbell chain starve when the CPU stops polling? Not in all/test.
 doorbell_stall_probe: tools/doorbell_stall_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
