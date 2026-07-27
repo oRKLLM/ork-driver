@@ -4417,13 +4417,13 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
-        if(!h) return -1;                              /* outside the verified envelope: reject, never wedge-fallback */
+        if(!h) return ORK_RC_WEDGE_PRONE;              /* outside the verified doorbell envelope: refuse (rescue-eligible), never wedge-fallback */
         return ork_dyn_end(h) < 0 ? -1 : 0;
       }
       if(i8 && M==1){   /* DECODE i8 with no doorbell envelope (rare, e.g. Sn>1 && K>4096): reject (no safe decode fallback) */
-        fprintf(stderr, "[ork] ERROR: int8 decode M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
-                "blocking fallback (would risk an unrecoverable NPU wedge)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
-        return -1;
+        fprintf(stderr, "[ork] int8 decode M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
+                "blocking fallback (would risk an unrecoverable NPU wedge) — rescue-eligible (ORK_RC_WEDGE_PRONE)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
+        return ORK_RC_WEDGE_PRONE;
       }
       /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);

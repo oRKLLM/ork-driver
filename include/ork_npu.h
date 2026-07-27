@@ -387,6 +387,12 @@ int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, floa
  * @return 0 on success, negative on error (bad args / submit failure).
  */
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
+/* WEDGE-PRONE REFUSAL. A run entry returns this DISTINCT code (not the generic -1) when it declines a shape
+ * it has no VERIFIED path for — rather than attempt a blocking submit that could hard-wedge the NPU. It is a
+ * clean, catchable signal: the caller may RESCUE the op by decomposing it onto the doorbell via the sliced
+ * primitive (ork_mm_*_sliced), which only ever emits verified c_base tiles. A shape that runs normally never
+ * returns this, so a rescue keyed on it costs working shapes nothing. Value chosen far from 0/-1/-2/-3. */
+#define ORK_RC_WEDGE_PRONE (-501)
 /* SLICE-AND-DICE (ork_slice.h): pack a matmul as a set of c_base doorbell tiles (K-slice + N-tile) so a
  * wide-K / wide-N op runs ENTIRELY on the doorbell — one chained submit, K-slice int32-accumulate + N-tile
  * scatter — bit-exact vs the reference matmul. Pack once, run many. `nc` = doorbell cores (0=all; 1 avoids
