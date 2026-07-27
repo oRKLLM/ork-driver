@@ -5246,60 +5246,92 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
 }
 
 /* ---- SLICE-AND-DICE: a matmul packed as c_base doorbell tiles (K-slice + N-tile, ork_slice.h). Pack once,
- * run many. Lets a wide-K / wide-N op run ENTIRELY on the doorbell (K-slice int32-accumulate + N-tile scatter),
- * bit-exact vs ork_mm_run_i8 — the foundation for the doorbell owning every submit (SLICE_AND_DICE_PLAN.md). */
-typedef struct ork_w_sliced { int K, N; ork_slice_caps cap; int nks, nnt; ork_w **sub; } ork_w_sliced;   /* sub[ki*nnt+ni] */
+ * run many. Lets a wide-K / wide-N op run ENTIRELY on the doorbell (one chained submit, K-slice int32-accumulate
+ * + N-tile scatter), bit-exact vs the reference matmul — the foundation for the doorbell owning every submit
+ * (SLICE_AND_DICE_PLAN.md). PRECISION-GENERAL: the handle carries its dtype and pack/run dispatch to the
+ * per-precision doorbell envelope; the decomposer (tile geometry) is dtype-agnostic. ONLY DT_I8 is live today
+ * (q8_0 compute path + only precision the multi-core doorbell accepts as tiles); DT_F16/DT_I4 pack returns NULL
+ * until their doorbell tile path is built. sub[ki*nnt+ni] holds one c_base-sized packed weight per tile. */
+typedef struct ork_w_sliced { int K, N, dtype; ork_slice_caps cap; int nks, nnt; ork_w **sub; } ork_w_sliced;
 
-void ork_mm_free_i8_sliced(ork_npu *c, ork_w_sliced *w) {
+void ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w) {                   /* dtype-agnostic: ork_mm_free frees any sub-weight */
     if (!w) return;
     if (w->sub) { for (int i = 0; i < w->nks * w->nnt; i++) if (w->sub[i]) ork_mm_free(c, w->sub[i]); free(w->sub); }
     free(w);
 }
 
-ork_w_sliced *ork_mm_pack_i8_sliced(ork_npu *c, int K, int N, const int8_t *B) {
-    if (!c || !B || K <= 0 || N <= 0) return NULL;
+/* int8 sub-weight packer: decompose K/N and pack each c_base tile from B[K,N]. */
+static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     ork_slice_caps cap = ork_slice_caps_rk3588();
     if (K % cap.kmul || N % cap.nmul) return NULL;                       /* unaligned: pad not yet supported */
     int ks = (cap.kmax / cap.kmul) * cap.kmul, ns = (cap.nmax / cap.nmul) * cap.nmul;
     int nks = (K + ks - 1) / ks, nnt = (N + ns - 1) / ns;
     struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->cap = cap; w->nks = nks; w->nnt = nnt;
+    w->K = K; w->N = N; w->dtype = DT_I8; w->cap = cap; w->nks = nks; w->nnt = nnt;
     w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
     int8_t *blk = malloc((size_t) ks * ns);
-    if (!w->sub || !blk) { free(blk); ork_mm_free_i8_sliced(c, w); return NULL; }
+    if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
     for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
         for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
             for (int k = 0; k < Ks; k++) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* gather block */
             ork_w *sw = ork_mm_pack_i8(c, Ks, Nw, blk);
-            if (!sw) { free(blk); ork_mm_free_i8_sliced(c, w); return NULL; }
+            if (!sw) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
             w->sub[ki*nnt + ni] = sw; } }
     free(blk); return w;
 }
 
-int ork_mm_run_i8_sliced(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
+/* PRECISION DISPATCH. dtype selects the per-precision sub-weight packer + (in run) the doorbell envelope. */
+ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dtype) {
+    if (!c || !B || K <= 0 || N <= 0) return NULL;
+    switch (dtype) {
+        case DT_I8: return slice_pack_i8(c, K, N, (const int8_t *) B);
+        default:    fprintf(stderr, "[ork] slice-and-dice: dtype %d not yet on the doorbell (int8 only); see OPS_REGISTRY\n", dtype);
+                    return NULL;   /* DT_F16 / DT_I4: doorbell tile envelope not built yet */
+    }
+}
+
+static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
     int ks = (w->cap.kmax / w->cap.kmul) * w->cap.kmul, ns = (w->cap.nmax / w->cap.nmul) * w->cap.nmul;
-    int8_t  *Aslc = malloc((size_t) M * ks);                            /* gathered A[:, k0:k1] */
-    /* PLAIN (non-DMA) partial: forces the doorbell's scratch copy-back path (direct=0) so the NPU writes its
-     * OWN in-domain per-core scratch and ork_dyn_end memcpy's it back here — bit-exact for any M/nc. An
-     * ork_dma_alloc'd buffer would be zero-copy-eligible (direct mode); allocated AFTER the weight pack (as a
-     * pack-once/run-many primitive must), its zero-copy output IOVA/warm state is stale and the NPU writes
-     * nowhere (reads back 0). The scratch path sidesteps that entirely (ZC-OUT is ~0 gain anyway). */
-    int32_t *part = malloc((size_t) M * ns * sizeof(int32_t));          /* per-(N-tile) partial */
-    if (!Aslc || !part) { free(Aslc); free(part); return -1; }
+    int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N;
+    /* SINGLE chained doorbell submit over EVERY tile (K-slices x N-tiles) — one begin/end, not nks*nnt
+     * round-trips. ork_dyn_begin_mc distributes the S tasks across the nc cores and chains each core's tasks
+     * into one PC-chain (weight streamed in one pass), the wedge-safe mirror of the mcworker's CHAIN-KSPLIT.
+     * A per K-slice (shared across its N-tiles); each tile's [M,Nw] partial lands in its own plain-malloc slot
+     * (forces direct=0 scratch copy-back — see the note above ork_mm_pack_sliced); the K-slices are then
+     * summed host-side into C (the NPU has no on-device C+= mode). */
+    int8_t  *Aslc = malloc((size_t) M * K);                               /* [nks] gathered A[:, k0:k1] blocks */
+    int32_t *part = malloc((size_t) nks * M * N * sizeof(int32_t));        /* one [M,Nw] slot per tile */
+    ork_mm_task_i8 *tasks = malloc((size_t) S * sizeof *tasks);
+    if (!Aslc || !part || !tasks) { free(Aslc); free(part); free(tasks); return -1; }
+    size_t aoff = 0, poff = 0;
+    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
+        int8_t *aptr = Aslc + aoff;
+        for (int m = 0; m < M; m++) memcpy(aptr + (size_t) m*Ks, A + (size_t) m*K + k0, Ks);   /* gather A cols (once per K-slice) */
+        aoff += (size_t) M * Ks;
+        for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
+            tasks[ki*nnt + ni] = (ork_mm_task_i8){ w->sub[ki*nnt + ni], M, aptr, part + poff };
+            poff += (size_t) M * Nw; } }
     int rc = 0;
-    for (int ni = 0; ni < w->nnt && !rc; ni++) { int n0 = ni*ns, n1 = n0+ns < w->N ? n0+ns : w->N, Nw = n1-n0;
-        for (int m = 0; m < M; m++) memset(C + (size_t) m*w->N + n0, 0, (size_t) Nw * sizeof(int32_t));   /* zero this N-tile */
-        for (int ki = 0; ki < w->nks && !rc; ki++) { int k0 = ki*ks, k1 = k0+ks < w->K ? k0+ks : w->K, Ks = k1-k0;
-            for (int m = 0; m < M; m++) memcpy(Aslc + (size_t) m*Ks, A + (size_t) m*w->K + k0, Ks);       /* gather A cols */
-            ork_mm_task_i8 t = { w->sub[ki*w->nnt + ni], M, Aslc, part };
-            ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);          /* one c_base tile on the doorbell */
-            if (!h) { if (ork_mm_run_i8(c, t.w, M, Aslc, part)) rc = -1; }
-            else if (ork_dyn_end(h) < 0) rc = -1;
-            if (!rc) for (int m = 0; m < M; m++) { int32_t *cr = C + (size_t) m*w->N + n0, *pr = part + (size_t) m*Nw;
-                for (int n = 0; n < Nw; n++) cr[n] += pr[n]; }         /* accumulate the K-slice partial (copy-back already coherent) */
-        } }
-    free(Aslc); free(part); return rc;
+    ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);                  /* ONE doorbell submit for all tiles */
+    if (!h) { for (int s = 0; s < S && !rc; s++)                           /* out of envelope: per-tile blocking fallback */
+                  if (ork_mm_run_i8(c, tasks[s].w, M, (const int8_t*)tasks[s].A, (int32_t*)tasks[s].C)) rc = -1; }
+    else if (ork_dyn_end(h) < 0) rc = -1;
+    if (!rc) for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
+        for (int ki = 0; ki < nks; ki++) { const int32_t *src = (const int32_t*)tasks[ki*nnt + ni].C;
+            for (int m = 0; m < M; m++) { int32_t *cr = C + (size_t) m*N + n0; const int32_t *pr = src + (size_t) m*Nw;
+                if (ki == 0) for (int n = 0; n < Nw; n++) cr[n]  = pr[n];   /* first K-slice seeds, rest accumulate */
+                else         for (int n = 0; n < Nw; n++) cr[n] += pr[n]; } } }
+    free(Aslc); free(part); free(tasks); return rc;
+}
+
+/* PRECISION DISPATCH. A/C point at the dtype's element type (int8/int32 for DT_I8; fp16/fp32 for DT_F16). */
+int ork_mm_run_sliced(ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc) {
+    if (!w) return -1;
+    switch (w->dtype) {
+        case DT_I8: return slice_run_i8(c, w, M, (const int8_t *) A, (int32_t *) C, nc);
+        default:    return -3;   /* DT_F16 / DT_I4: doorbell tile envelope not built yet (pack already rejects) */
+    }
 }
 
 /* ---- FUSED FFN: matmul with an on-NPU output-stage activation (SwiGLU fusion) --------------------

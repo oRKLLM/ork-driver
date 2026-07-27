@@ -31,12 +31,12 @@ int main(int argc, char **argv) {
     if (ork_mm_run_i8(c, wf, M, A, Cref)) { printf("ref run FAIL\n"); return 1; }
     ork_mm_free(c, wf);
 
-    /* slice-and-dice library primitive: pack once (c_base tiles), run on the doorbell */
-    ork_w_sliced *ws = ork_mm_pack_i8_sliced(c, K, N, B);
-    if (!ws) { printf("pack_i8_sliced FAIL (alignment? K%%512=%d N%%16=%d)\n", K%512, N%16); return 1; }
+    /* slice-and-dice library primitive: pack once (c_base tiles), run on the doorbell (general dtype API) */
+    ork_w_sliced *ws = ork_mm_pack_sliced(c, K, N, B, ORK_DT_I8);
+    if (!ws) { printf("pack_sliced FAIL (alignment? K%%512=%d N%%16=%d)\n", K%512, N%16); return 1; }
     int32_t *Cslc = (int32_t *) malloc((size_t) M*N*4);
-    if (ork_mm_run_i8_sliced(c, ws, M, A, Cslc, nc)) { printf("run_i8_sliced FAIL\n"); return 1; }
-    ork_mm_free_i8_sliced(c, ws);
+    if (ork_mm_run_sliced(c, ws, M, A, Cslc, nc)) { printf("run_sliced FAIL\n"); return 1; }
+    ork_mm_free_sliced(c, ws);
 
     long bad = 0, first = -1;
     for (size_t i = 0; i < (size_t) M*N; i++) if (Cslc[i] != Cref[i]) { if (first < 0) first = (long) i; bad++; }

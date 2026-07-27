@@ -388,13 +388,20 @@ int          ork_mm_run   (ork_npu *ctx, ork_w *w, int M, const ork_f16 *A, floa
  */
 int          ork_mm_run_i8(ork_npu *ctx, ork_w *w, int M, const int8_t  *A, int32_t *C);
 /* SLICE-AND-DICE (ork_slice.h): pack a matmul as a set of c_base doorbell tiles (K-slice + N-tile) so a
- * wide-K / wide-N op runs ENTIRELY on the doorbell — K-slice int32-accumulate + N-tile scatter — bit-exact
- * vs ork_mm_run_i8. Pack once, run many. `nc` = doorbell colsplit cores (0=all; 1 avoids the non-even-N
- * colsplit issue). The foundation for the doorbell owning every submit (see SLICE_AND_DICE_PLAN.md). */
+ * wide-K / wide-N op runs ENTIRELY on the doorbell — one chained submit, K-slice int32-accumulate + N-tile
+ * scatter — bit-exact vs the reference matmul. Pack once, run many. `nc` = doorbell cores (0=all; 1 avoids
+ * the non-even-N colsplit issue #36). The foundation for the doorbell owning every submit (SLICE_AND_DICE_PLAN.md).
+ *
+ * PRECISION-GENERAL SURFACE: the decomposer (tile geometry) is dtype-agnostic; the handle carries its dtype
+ * and pack/run dispatch to the per-precision doorbell envelope. `B`/`A` point at the dtype's element type
+ * (int8_t for ORK_DT_I8; ork_f16 for ORK_DT_F16); `C` is int32[M,N] for int8, fp32[M,N] for fp16. ONLY
+ * ORK_DT_I8 is live today (the q8_0 compute path + the only precision the multi-core doorbell accepts as
+ * tiles); ORK_DT_F16 / ORK_DT_I4 pack returns NULL until their doorbell tile path is built (see OPS_REGISTRY). */
+typedef enum { ORK_DT_F16 = 0, ORK_DT_I8 = 1, ORK_DT_I4 = 2 } ork_dtype;   /* matches the internal DT_ values */
 typedef struct ork_w_sliced ork_w_sliced;
-ork_w_sliced *ork_mm_pack_i8_sliced(ork_npu *ctx, int K, int N, const int8_t *B);
-int           ork_mm_run_i8_sliced (ork_npu *ctx, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
-void          ork_mm_free_i8_sliced(ork_npu *ctx, ork_w_sliced *w);
+ork_w_sliced *ork_mm_pack_sliced(ork_npu *ctx, int K, int N, const void *B, int dtype);
+int           ork_mm_run_sliced (ork_npu *ctx, ork_w_sliced *w, int M, const void *A, void *C, int nc);
+void          ork_mm_free_sliced(ork_npu *ctx, ork_w_sliced *w);
 /* FUSED SwiGLU gate matmul: C = silu(requant(A·W)) as int8 [M*N], activation applied IN the matmul's
  * SDP output stage (no extra submit / round-trip). Resident full-K int8 weight (K%512==0, K<=4096).
  * R = r_mult/2^r_shift + out_bias is the SCALAR OUT_CVT (so quantize A PER-TENSOR, not per-row);
