@@ -86,7 +86,7 @@ struct cweight { uint64_t id; ork_w *w; int K, N, dtype; };   /* dtype = ORKD_DT
 struct ckv { uint64_t id; ork_kv_resident *kv; };   /* Tier 12f resident-KV handle (its wkt/wv are also registered in wt[]) */
 struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGHTS]; int nw; uint64_t next_wid; int domain;
                 struct ckv kvt[ORKD_MAX_WEIGHTS]; int nkv;   /* resident-KV handles for ORKD_KV_APPEND */
-                unsigned owned_dom;   /* bitmask of IOMMU domains this client requested via ORKD_DOM_REQ (bits 1..POOL); released on drop */
+                uint64_t owned_dom;   /* bitmask of IOMMU domains this client requested via ORKD_DOM_REQ (bits 1..63); released on drop */
                 struct orkd_ring *ring; int ring_fd; uint32_t ring_tail;   /* A-ring: attached low-latency shm transport */
                 uint64_t layer_warm[7]; int layer_warmed; };   /* ORKD_LAYER: cache the last-warmed 7-weight-id set so the doorbell warm (per weight shape) fires ONCE per weight set, not every layer/token (steady-state: same 7 weights each token) */
 
@@ -104,17 +104,20 @@ struct client { int fd; int hello; uint32_t id; struct cweight wt[ORKD_MAX_WEIGH
  * assigns one per client on accept (dom_alloc); (b) EXPLICIT — the client requests one via ORKD_DOM_REQ
  * (dom_alloc_explicit, works regardless of the env knob) and packs into it (orkd_pack.domain). Both draw from
  * the same g_dom_inuse pool; all a client's domains (auto + requested) are released on drop. */
-#define ORKD_DOMAIN_POOL 8                    /* domains 1..8 handed out; 0 = shared/default */
+/* No fixed domain-pool cap: the daemon hands out as many domains as the client's auto-sizer requests.
+ * The only ceiling is the per-client owned_dom bitmask width (uint64 -> domains 1..63, ~155 GiB of IOVA —
+ * far beyond any RK3588 config), so the auto-sizer's count is never clamped in practice. */
+#define ORKD_NDOM 64                          /* owned_dom bitmask width (domain ids 1..63; 0 = shared/default) */
 static int g_per_client_dom = 0;              /* ORKD_PER_CLIENT_DOMAINS: auto-assign a domain per client on accept */
-static unsigned char g_dom_inuse[ORKD_DOMAIN_POOL + 1];   /* index 1..POOL; 0 unused (always-available shared) */
-static int dom_alloc_explicit(void){          /* grab a free pool domain (for an explicit ORKD_DOM_REQ) -> 1..POOL, or 0 if exhausted */
-    for (int d = 1; d <= ORKD_DOMAIN_POOL; d++) if (!g_dom_inuse[d]){ g_dom_inuse[d] = 1; return d; }
+static unsigned char g_dom_inuse[ORKD_NDOM];  /* index 1..63; 0 unused (always-available shared) */
+static int dom_alloc_explicit(void){          /* grab a free pool domain (for an explicit ORKD_DOM_REQ) -> 1..63, or 0 if exhausted */
+    for (int d = 1; d < ORKD_NDOM; d++) if (!g_dom_inuse[d]){ g_dom_inuse[d] = 1; return d; }
     return 0;
 }
 static int dom_alloc(void){                   /* auto per-client domain on accept (gated by the env knob); 0 = shared */
     return g_per_client_dom ? dom_alloc_explicit() : 0;
 }
-static void dom_release(int d){ if (d >= 1 && d <= ORKD_DOMAIN_POOL) g_dom_inuse[d] = 0; }
+static void dom_release(int d){ if (d >= 1 && d < ORKD_NDOM) g_dom_inuse[d] = 0; }
 static int g_active_dom = 0;                   /* domain of the last-dispatched work (what the NPU is warmed to) */
 
 /* drain n bytes into the void — keeps the stream in sync when a request can't be serviced */
@@ -182,7 +185,7 @@ static int handle_import(struct client *cl, ork_npu *npu, int bb_fd, int bf_fd, 
     if (!im.bb_bytes || im.bb_bytes > ORKD_MAX_BYTES || im.bf_bytes > ORKD_MAX_BYTES){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EPROTO, "import bad size"); return 0; }
     int pdom = (int)im.domain;
     if (pdom > 0){
-        if (pdom > ORKD_DOMAIN_POOL || !(cl->owned_dom & (1u << pdom))){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
+        if (pdom >= ORKD_NDOM || !(cl->owned_dom & (1ull << pdom))){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
     } else pdom = cl->domain;
     ork_npu_set_pack_domain(npu, pdom);
     ork_w *w = ork_mm_adopt_imported_i8(npu, (int)im.K, (int)im.N, bb_fd, bf_fd, (size_t)im.bb_bytes, (size_t)im.bf_bytes);
@@ -403,7 +406,7 @@ static int handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
      * (cl->domain, 0 unless ORKD_PER_CLIENT_DOMAINS). The weight lands here; its RUNs inherit it via w->domain. */
     int pdom = (int)pk.domain;
     if (pdom > 0){
-        if (pdom > ORKD_DOMAIN_POOL || !(cl->owned_dom & (1u << pdom))){ free(wbuf); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
+        if (pdom >= ORKD_NDOM || !(cl->owned_dom & (1ull << pdom))){ free(wbuf); send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
     } else pdom = cl->domain;
     ork_npu_set_pack_domain(npu, pdom);
     ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
@@ -674,7 +677,7 @@ static int handle_dmabuf(struct client *cl, ork_npu *npu, int dfd, uint64_t tag)
 static int handle_dom_req(struct client *cl, uint64_t tag){
     int d = dom_alloc_explicit();
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
-    if (d > 0){ cl->owned_dom |= (1u << d); hh.id = (uint64_t)d; hh.rc = 0; }
+    if (d > 0){ cl->owned_dom |= (1ull << d); hh.id = (uint64_t)d; hh.rc = 0; }
     else hh.rc = -1;                                     /* pool exhausted */
     send_msg(cl->fd, ORKD_DOM_OK, tag, &hh, sizeof hh);
     return 0;
@@ -684,7 +687,7 @@ static int handle_dom_rel(struct client *cl, uint64_t tag){
     if (readn(cl->fd, &rq, sizeof rq) <= 0) return -1;
     int d = (int)rq.id;
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.id = rq.id;
-    if (d >= 1 && d <= ORKD_DOMAIN_POOL && (cl->owned_dom & (1u << d))){ cl->owned_dom &= ~(1u << d); dom_release(d); hh.rc = 0; }
+    if (d >= 1 && d < ORKD_NDOM && (cl->owned_dom & (1ull << d))){ cl->owned_dom &= ~(1ull << d); dom_release(d); hh.rc = 0; }
     else hh.rc = -1;                                     /* not a domain this client owns */
     send_msg(cl->fd, ORKD_DOM_OK, tag, &hh, sizeof hh);
     return 0;
@@ -981,7 +984,7 @@ int main(void){
                 wk_purge_fd(npu, cl[i].fd);    /* drop this client's queued work (prevents fd-reuse aliasing) */
                 client_reclaim(&cl[i], npu);   /* free the client's resident weights (leak-safe on BYE/EOF) */
                 dom_release(cl[i].domain);     /* return the client's auto IOMMU domain to the pool */
-                for (int d = 1; d <= ORKD_DOMAIN_POOL; d++) if (cl[i].owned_dom & (1u << d)) dom_release(d);   /* + any it explicitly requested (leak-safe) */
+                for (int d = 1; d < ORKD_NDOM; d++) if (cl[i].owned_dom & (1ull << d)) dom_release(d);   /* + any it explicitly requested (leak-safe) */
                 close(cl[i].fd);
                 cl[i] = cl[nc-1]; nc--;        /* compact; NO i-- (slot i's pollfd is now stale — service next tick) */
                 if (refs == 0) idle_since = now_ms();

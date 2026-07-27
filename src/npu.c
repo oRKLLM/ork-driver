@@ -126,7 +126,6 @@ static long   g_fd_n = 0;          /* number of SUBMIT ioctls timed */
 
 struct buf { uint32_t handle; uint64_t dma, obj; void *cpu; size_t size; int heap_fd; int domain; };  /* heap_fd: for zero-copy IMPORTED bufs (ork_dma_import / bimport) the dma-buf fd to close on destroy; 0 for ordinary MEM_CREATE-allocated bufs. domain: the iommu domain this buffer's IOVA was reserved in (for the IOVA wedge-guard accounting; set by bcreate/bimport, released by bdestroy). */
 struct ork_pw { struct ork_npu *c; int id; };   /* persistent NPU-pool worker arg */
-#define ORK_MAXDOM 16
 /* Parked per-domain copy of the submit-touched scratch (see ork_npu.dom_save). Mirrors exactly the
  * ork_npu fields that name DMA buffers a submit references + their warm/size bookkeeping. cres is host
  * RAM (domain-agnostic) so it is NOT parked here. */
@@ -158,7 +157,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * the same domain as the weight. The fields above are the ACTIVE working set; dom_active is which
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
-    int dom_active; int dom_seen[ORK_MAXDOM];
+    int dom_active; int dom_cap;   /* dom_cap = allocated length of dom_anchor[] / dom_save[]; grown on demand by dom_reserve, NO fixed cap (domain count = whatever the auto-sizer / ork_npu_domain_alloc drives) */
     /* ORK_DOM_PROFILE: dom_activate cost telemetry (the "domain-swap window"). Steady = pure scratch
      * pointer-swap memcpy; first = one-time per-domain first-touch bcreate(regcmd/task/Af). */
     uint64_t dom_sw_n, dom_sw_first_n; double dom_sw_us, dom_sw_first_us, dom_sw_max_us;
@@ -170,8 +169,8 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * weight tiles (non-deterministic dropped-K corruption, affects single- AND multi-core; NATIVE weights
      * are immune). A native alloc first establishes the domain correctly. Kept alive for the ctx lifetime
      * so the domain stays anchored; freed at teardown. See ork_dom_prime(). */
-    struct buf dom_anchor[ORK_MAXDOM];
-    struct ork_dom_scratch *dom_save;   /* [ORK_MAXDOM]; lazily allocated when multi-domain is first used */
+    struct buf *dom_anchor;             /* [dom_cap]; per-domain native anchor, grown by dom_reserve */
+    struct ork_dom_scratch *dom_save;   /* [dom_cap]; NULL until multi-domain is first used — its NULL-ness is the single-vs-multi-domain signal the run paths key on */
     /* persistent worker pool: spawned once, signalled per matmul (cuts per-matmul create/join) */
     pthread_t pth[ORK_MAXCORE]; struct ork_pw pwa[ORK_MAXCORE]; int pool_n;
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
@@ -565,9 +564,32 @@ static struct buf bimport_fd(int fd,int dbuf,size_t size,int domain){
  * tools/mc_import_probe.c: import-first FAULTS, native-alloc-first is bit-exact; single- AND multi-core).
  * One tiny native anchor per domain, kept resident for the ctx lifetime (freed at teardown). No-op for
  * domain 0 (always established) and when already anchored. Call BEFORE the first bimport into `dom`. */
+/* Grow the per-domain arrays (native anchor + parked scratch) to hold at least `need` domains. No fixed
+ * cap — the domain count is whatever the auto-sizer / ork_npu_domain_alloc drives. dom_save is allocated
+ * here (so it becomes non-NULL exactly when multi-domain is first entered, preserving the single-vs-multi
+ * signal the run paths key on). Called from every multi-domain entry: dom_activate, ork_dom_prime,
+ * ork_npu_domain_alloc, ork_npu_set_ndomains. Returns 0 ok, -1 on OOM (caller degrades gracefully). */
+static int dom_reserve(ork_npu *c, int need){
+    if(need <= c->dom_cap) return 0;
+    int nc = c->dom_cap ? c->dom_cap : 2; while(nc < need) nc *= 2;
+    struct buf *na = realloc(c->dom_anchor, (size_t)nc*sizeof *na);
+    struct ork_dom_scratch *ns = realloc(c->dom_save, (size_t)nc*sizeof *ns);
+    if(na) c->dom_anchor = na;
+    if(ns) c->dom_save = ns;
+    if(!na || !ns) return -1;   /* keep whatever grew; the guarded call sites won't index past dom_cap */
+    memset(c->dom_anchor + c->dom_cap, 0, (size_t)(nc-c->dom_cap)*sizeof *c->dom_anchor);
+    memset(c->dom_save   + c->dom_cap, 0, (size_t)(nc-c->dom_cap)*sizeof *c->dom_save);
+    c->dom_cap = nc;
+    return 0;
+}
+/* Public: pre-size the ctx for `n` IOMMU domains — the backend calls this once with the auto-sizer's
+ * n_domains so no per-weight grow happens mid-load. Only meaningful for n>1 (n<=1 = single-domain, leaves
+ * dom_save NULL). Safe to call repeatedly; only ever grows. */
+void ork_npu_set_ndomains(ork_npu *c, int n){ if(c && n>1) dom_reserve(c, n); }
 static void ork_dom_prime(ork_npu *c, int dom){
     int d = ork_dom(dom);
-    if(d<=0 || d>=ORK_MAXDOM) return;                 /* domain 0 never needs it */
+    if(d<=0) return;                                  /* domain 0 never needs an anchor */
+    if(dom_reserve(c, d+1)) return;                   /* grow arrays to cover domain d (OOM -> skip anchoring) */
     if(c->dom_anchor[d].cpu) return;                  /* already anchored */
     c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
 }
@@ -604,10 +626,10 @@ static void act(int fd,uint32_t f,uint32_t v){
  * use, so the run path's lazy bcreate allocates it in `dom` via c->dom_active). No-op when
  * single-domain (dom==dom_active and only domain 0 ever used). */
 static void dom_activate(ork_npu *c,int dom){
-    if(dom<0||dom>=ORK_MAXDOM) dom=0;
+    if(dom<0) dom=0;
     if(dom==c->dom_active) return;
     double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
-    if(!c->dom_save){ c->dom_save=calloc(ORK_MAXDOM,sizeof *c->dom_save); if(!c->dom_save){ return; } }
+    if(dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
     old->used=1; old->regcmd=c->regcmd; old->task=c->task; old->Af=c->Af; old->Cc=c->Cc; old->ccsz=c->ccsz; old->warmed=c->warmed;
@@ -1461,13 +1483,13 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);
         bdestroy(fd,&c->chain_rc[i]);bdestroy(fd,&c->chain_tk[i]);bdestroy(fd,&c->chain_lrc[i]);bdestroy(fd,&c->chain_lsc[i]);}   /* multi-core matmul + per-core chain scratch, one pass */
     /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
-    if(c->dom_save){ for(int d=0;d<ORK_MAXDOM;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
+    if(c->dom_save){ for(int d=0;d<c->dom_cap;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
         struct ork_dom_scratch *s=&c->dom_save[d];
         bdestroy(fd,&s->regcmd);bdestroy(fd,&s->task);bdestroy(fd,&s->Af);bdestroy(fd,&s->Cc);bdestroy(fd,&s->mtk_all);
         for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&s->mrc[i]);bdestroy(fd,&s->mtk[i]);bdestroy(fd,&s->maf[i]);bdestroy(fd,&s->mcc[i]);} }
         free(c->dom_save); }
     for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
-    for(int d=0;d<ORK_MAXDOM;d++) if(c->dom_anchor[d].cpu) bdestroy(fd,&c->dom_anchor[d]);   /* per-domain native anchors */
+    if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
@@ -1589,7 +1611,7 @@ int ork_npu_domain_alloc(ork_npu *c){
     if(!c) return -1;
     if(c->daemon) return orkd_domain_alloc(c->daemon);
     if(c->dom_next < 1) c->dom_next = 1;
-    if(c->dom_next >= ORK_MAXDOM) return -1;
+    if(dom_reserve(c, c->dom_next+1)) return -1;   /* grow arrays to cover the new domain (no fixed cap); OOM -> fail */
     return c->dom_next++;
 }
 int ork_npu_domain_free(ork_npu *c,int domain){

@@ -134,6 +134,10 @@ int          ork_npu_uses_orkd(const ork_npu *ctx);   /* 1 = context routes thro
  * ork_npu_domain_free when done (also auto-reclaimed when the context/connection is freed). id>0 ok, <0 error. */
 int          ork_npu_domain_alloc(ork_npu *ctx);
 int          ork_npu_domain_free(ork_npu *ctx, int domain);
+/* Pre-size the ctx for `n` IOMMU domains (the per-domain anchor + parked-scratch arrays grow to fit). The
+ * backend calls this once with the auto-sizer's domain count so no per-weight array grow happens mid-load.
+ * There is no fixed domain cap — `n` is whatever the auto-sizer computes. No-op for n<=1 (single-domain). */
+void         ork_npu_set_ndomains(ork_npu *ctx, int n);
 
 /**
  * @brief Allocate an NPU-coherent, CPU-mapped buffer for zero-copy activations/outputs.
