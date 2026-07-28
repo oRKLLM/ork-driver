@@ -152,24 +152,34 @@ int ioctl(int fd, unsigned long request, ...) {
                             if(o==0x1024)K=v&0xffff; else if(o==0x1038)N=v&0xffff; else if(o==0x102c)M=v&0xffff;
                             else if(o==0x1110)wadr=v; else if(o==0x1070)aadr=v; else if(o==0x1030)wbytes=v;
                             else if(o==0x1034)wstride=v; else if(o==0x4020)cadr=v; }
-                        /* weight is STRIDED: 0x1034=row stride (full N), tile is N-wide -> memory SPAN =
-                         * (K-1)*stride + N (int8 bytes), far larger than 0x1030=K*N. Dump the whole span so
-                         * a replay's strided fetch stays in-bounds (this was the errno-110 wedge). */
-                        uint32_t wspan = (wstride>=N && K>0) ? (K-1)*wstride + N : wbytes;
-                        wbytes = wspan;
+                        /* SPANS (fixed 2026-07-28): the old (K-1)*wstride+N heuristic mis-fires on the M-fold
+                         * (0x1034=K is bytes-per-kernel, NOT a row pitch) -> a non-de-tileable over-dump; and A
+                         * was hardcoded to M*K which TRUNCATES a padded fold A. Instead dump each operand from
+                         * its base to the END of its mapped handle (capped), and RECORD offsets + handle sizes +
+                         * the raw weight regs in meta, so an offline replay/reversal gets the COMPLETE memory
+                         * image the regcmd actually read (no layout/pad/stride assumption). Replay patches
+                         * 0x1070/0x1110/0x4020 to the dump base (= aadr/wadr/cadr), so addressing is preserved. */
                         int wantK=getenv("RKDUMP_MM_K")?atoi(getenv("RKDUMP_MM_K")):3584;
                         int wantN=getenv("RKDUMP_MM_N")?atoi(getenv("RKDUMP_MM_N")):1216;
                         if ((int)K==wantK && (int)N==wantN && M>best_M) { best_M=M;
-                            fprintf(stderr,"[RKDUMP_MM] MATCH M=%u K=%u N=%u wadr=0x%x aadr=0x%x cadr=0x%x wbytes=%u\n",M,K,N,wadr,aadr,cadr,wbytes);
+                            uint64_t aoff=0,woff=0,coff=0;
+                            struct ent*ab=by_dma_range(aadr,&aoff), *wb=by_dma_range(wadr,&woff), *cb=by_dma_range(cadr,&coff);
+                            /* Bound each dump to the operand's actual footprint + generous margin (A and W live in
+                             * giant shared handles — 98MB acts / ~4GB weights — so never dump the whole handle):
+                             * A ~ 8*M*K, weight ~ 4*(K*N)=4*0x1030, both clamped to what's left in the handle.
+                             * Env ORK_MM_ACAP / ORK_MM_WCAP override (bytes) for a wider strided-read capture. */
+                            size_t acap=getenv("ORK_MM_ACAP")?(size_t)strtoull(getenv("ORK_MM_ACAP"),0,0):(size_t)M*K*8;
+                            size_t wcap=getenv("ORK_MM_WCAP")?(size_t)strtoull(getenv("ORK_MM_WCAP"),0,0):(size_t)wbytes*4;
+                            size_t asz=(ab&&ab->size>aoff)?(size_t)(ab->size-aoff):0; if(asz>acap)asz=acap;
+                            size_t wsz=(wb&&wb->size>woff)?(size_t)(wb->size-woff):0; if(wsz>wcap)wsz=wcap;
+                            size_t csz=(size_t)M*N*4; if(cb&&(size_t)(cb->size-coff)<csz)csz=(size_t)(cb->size-coff);
+                            fprintf(stderr,"[RKDUMP_MM] MATCH M=%u K=%u N=%u wadr=0x%x aadr=0x%x cadr=0x%x | Aspan=%zu Wspan=%zu (0x1030=%u 0x1034=%u)\n",M,K,N,wadr,aadr,cadr,asz,wsz,wbytes,wstride);
                             FILE*f=fopen("/tmp/mm_regcmd.txt","w"); if(f){ for(int k=0;k<rcwords;k++)fprintf(f,"%08x ",rw[k]); fprintf(f,"\n"); fclose(f);}
-                            { FILE*mf=fopen("/tmp/mm_meta.txt","w"); if(mf){ fprintf(mf,"M %u\nK %u\nN %u\nwbytes %u\n",M,K,N,wbytes); fclose(mf);} }
-                            uint64_t off; struct ent*wb=by_dma_range(wadr,&off);
-                            if(wb&&wb->cpu&&wbytes){ FILE*g=fopen("/tmp/mm_weight.bin","wb"); if(g){fwrite((char*)wb->cpu+off,1,wbytes,g);fclose(g);} fprintf(stderr,"  weight %u B @+0x%llx of handle dma=0x%llx\n",wbytes,(unsigned long long)off,(unsigned long long)wb->dma);}
+                            { FILE*mf=fopen("/tmp/mm_meta.txt","w"); if(mf){ fprintf(mf,"M %u\nK %u\nN %u\nwbytes %u\nwstride %u\nAspan %zu\nWspan %zu\nCspan %zu\naoff %llu\nwoff %llu\ncoff %llu\n",M,K,N,wbytes,wstride,asz,wsz,csz,(unsigned long long)aoff,(unsigned long long)woff,(unsigned long long)coff); fclose(mf);} }
+                            if(ab&&ab->cpu&&asz){ FILE*g=fopen("/tmp/mm_A.bin","wb"); if(g){fwrite((char*)ab->cpu+aoff,1,asz,g);fclose(g);} fprintf(stderr,"  A %zu B @+0x%llx handle size=%llu\n",asz,(unsigned long long)aoff,(unsigned long long)ab->size);}
+                            if(wb&&wb->cpu&&wsz){ FILE*g=fopen("/tmp/mm_weight.bin","wb"); if(g){fwrite((char*)wb->cpu+woff,1,wsz,g);fclose(g);} fprintf(stderr,"  weight %zu B @+0x%llx of handle dma=0x%llx size=%llu\n",wsz,(unsigned long long)woff,(unsigned long long)wb->dma,(unsigned long long)wb->size);}
                             else fprintf(stderr,"  weight buffer 0x%x NOT mapped\n",wadr);
-                            struct ent*ab=by_dma_range(aadr,&off);
-                            if(ab&&ab->cpu){ FILE*g=fopen("/tmp/mm_A.bin","wb"); if(g){fwrite((char*)ab->cpu+off,1,(size_t)M*K,g);fclose(g);} }
-                            struct ent*cb=by_dma_range(cadr,&off);
-                            if(cb&&cb->cpu){ FILE*g=fopen("/tmp/mm_C.bin","wb"); if(g){fwrite((char*)cb->cpu+off,1,(size_t)M*N*4,g);fclose(g);} }
+                            if(cb&&cb->cpu&&csz){ FILE*g=fopen("/tmp/mm_C.bin","wb"); if(g){fwrite((char*)cb->cpu+coff,1,csz,g);fclose(g);} }
                             fprintf(stderr,"  dumped regcmd+weight+A+C to /tmp/mm_*.{txt,bin} (best M=%u)\n",M);
                             /* CHAIN WALK: follow the in-regcmd PC-chain (0x0101:0x0010 next-addr / 0x0014 amount)
                              * to capture EVERY chained task's regcmd + per-task meta — the full M-fold K-slice

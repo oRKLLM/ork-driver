@@ -62,7 +62,7 @@ int main(int argc,char**argv){
     }
 
     int32_t*Cout=calloc((size_t)M*N,4); double us=0;
-    int r=ork_npu_replay_i8(c,rc,rn,M,K,N,Anc,Wok,(int)((size_t)K*N),Cout,2,&us);
+    int r=ork_npu_replay_i8(c,rc,rn,M,K,N,Anc,(int)Aelems,Wok,(int)((size_t)K*N),Cout,2,&us);
     if(r){ printf("submit rc=%d (STALL/err)\n",r); ork_npu_free(c); return 1; }
     /* dump raw NPU output + CPU ref for OFFLINE layout analysis (find the de-tile that matches) */
     { FILE*f=fopen("/tmp/mf_cout.bin","wb"); if(f){fwrite(Cout,4,(size_t)M*N,f);fclose(f);}

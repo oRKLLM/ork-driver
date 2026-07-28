@@ -50,7 +50,7 @@ int main(int argc,char**argv){
         if(p<0||(size_t)p>=WB) continue;
         memset(B,0,WB); B[p]=1;
         memset(C,0,(size_t)M*N*4);
-        double us; int r=ork_npu_replay_i8(c,rc,rn,M,K,N,A,B,(int)WB,C,1,&us);
+        double us; int r=ork_npu_replay_i8(c,rc,rn,M,K,N,A,(int)((size_t)M*K),B,(int)WB,C,1,&us);
         if(r){ printf("  p=%ld replay rc=%d\n",p,r); continue; }
         int ns=-1; for(int n=0;n<N;n++) if(C[0*N+n]!=0){ ns=n; break; }
         if(ns<0){ if(rstart>=0) printf("%ld -1 -1 0\n",p); else printf("  p=%-8ld -> (no output lit; C0 all zero)\n",p); continue; }

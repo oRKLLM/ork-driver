@@ -48,7 +48,7 @@ int main(int argc,char**argv){
     /* (2) replay rkllm's regcmd with its REAL weight + A; verify vs captured C */
     printf("submitting rkllm regcmd...\n");
     int32_t *Cout=calloc((size_t)M*N,4); double us_r=0;
-    int rr=ork_npu_replay_i8(c,rc,rn,M,K,N,A,B,(int)wn,Cout,iters,&us_r);
+    int rr=ork_npu_replay_i8(c,rc,rn,M,K,N,A,(int)an,B,(int)wn,Cout,iters,&us_r);
     if(rr){ printf("REPLAY FAILED rc=%d\n",rr); }
     else {
         int bad=0,first=-1; long maxe=0;

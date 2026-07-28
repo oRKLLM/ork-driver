@@ -690,7 +690,7 @@ int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn
  * Adata/Bdata: captured A / tiled-weight bytes (NULL => garbage, timing only). Cout: computed int32 output
  * (for correctness check vs captured C). Patches A/B/C addrs, single-core, times `iters`. 0/ok. */
 int          ork_npu_replay_i8(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
-                               const signed char *Adata, const signed char *Bdata, int Bbytes, int *Cout, int iters, double *us);
+                               const signed char *Adata, int Abytes, const signed char *Bdata, int Bbytes, int *Cout, int iters, double *us);
 /* #39 PORT (RE): dump ork's synth_i8 regcmd for (mc,K,N) to diff vs rkllm's captured regcmd. Returns word count. */
 int          ork_npu_synth_i8_dump(ork_npu *ctx, int mc, int K, int N, unsigned *out, int outn);
 

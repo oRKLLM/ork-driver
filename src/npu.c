@@ -8181,7 +8181,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
  * descriptor is identical to ork's (enable=0xd,int_mask=0x300,regcfg_amount=108 — verified from capture).
  * SAFETY: mm_timeout_ms() so a bad regcmd self-terminates (soft, reboot-recoverable) rather than hanging. */
 int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
-                      const int8_t *Adata, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us){
+                      const int8_t *Adata, int Abytes, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us){
     int fd=c->fd; if(fd<0) return -3; if(rn<8 || rn>2048 || M<1 || (K%32) || (N%16)) return -2;
     int dom=c->dom_active;
     size_t bsz=(Bbytes>(int)((size_t)K*N))?(size_t)Bbytes:(size_t)K*N;   /* B may be a STRIDED span > K*N (rkllm column-tile) */
@@ -8195,7 +8195,8 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     size_t cszg=(size_t)M*N*4*8+65536;                   /* #39: oversize C 8x as an OOB guard while RE'ing the mfold output stride (a wrong stride writes in-bounds -> diagnosable, not a wedge) */
     struct buf Cc=bcreate(fd,cszg,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom);   if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
-    if(Adata) memcpy(A.cpu,Adata,(size_t)M*K); else memset(A.cpu,1,(size_t)M*K);   /* real captured A, or garbage (timing only) */
+    if(Adata){ size_t acp=(Abytes>0)?(size_t)Abytes:(size_t)M*K; if(acp>aszg)acp=aszg; memcpy(A.cpu,Adata,acp); }   /* real captured A (full span, incl. any fold padding), clamped to the buffer */
+    else memset(A.cpu,1,(size_t)M*K);   /* garbage (timing only) */
     if(Bdata) memcpy(B.cpu,Bdata,(Bbytes>0)?(size_t)Bbytes:(size_t)K*N); else memset(B.cpu,1,bsz);   /* real captured strided weight, or garbage */
     memset(Cc.cpu,0,cszg);
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
