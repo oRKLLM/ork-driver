@@ -860,6 +860,44 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
     setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
+/* #39 PORT (RE): dump ork's synth_i8 regcmd words for (mc,K,N) with sentinel addresses, so a tool can diff
+ * against rkllm's captured regcmd and read off the exact field delta (schedule + feature-layout) the M-fold
+ * variant must apply. Returns word count (REGCMD_I8_N), or <0 on error. */
+/* #39 M-FOLD variant: rkllm's schedule that folds M into the CNA WIDTH dimension (~1.6x/program measured
+ * at M=36 K=3584 N=1216). Feature layout is NC1HWC2 (C2=16): A packed [C1=K/16][H=1][W=M][C2=16], C output
+ * likewise (host packer/de-tiler). The register delta vs synth_i8 was read from the ork-vs-rkllm regcmd diff
+ * at M=2 AND M=24 (rocket_registers.h-named): DATAIN WIDTH=M/HEIGHT=1 (0x1020/0x1084), out cube WIDTH=M-1
+ * HEIGHT=0 (0x4030/0x4034/0x405c/0x3014), FEATURE_GRAINS=2 (0x1010), CONV_CON1 mode cleared (0x100c),
+ * schedule 0x1044=(K/64)*M 0x107c=4M 0x1040=0xb1-0xf*(M/8), surf strides 0x4024=M*64 (int32 out) 0x1080=M*16
+ * (int8 A in), NOTCH 0x4038=0. Built as a DELTA on the synth_i8 baseline so all non-delta regs are inherited
+ * correct. 0x40c0 SURFACE_ADD is address-typed — best-effort here, the one board-sweep target. GATED: only
+ * synthesized on the explicit m-fold path; the default matmul is untouched. */
+static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
+    synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match rkllm */
+    setr(rc,REGCMD_I8_N,0x201,0x1020,((uint32_t)mc<<16)|1);      /* DATAIN WIDTH=M HEIGHT=1 (was 1,M) */
+    setr(rc,REGCMD_I8_N,0x201,0x1084,((uint32_t)mc<<16)|1);
+    setr(rc,REGCMD_I8_N,0x201,0x1028,mc);                        /* DATAIN batch/atomics = M (template default 1) */
+    setr(rc,REGCMD_I8_N,0x201,0x1010,0x20);                      /* FEATURE_GRAINS=2 (const) */
+    setr(rc,REGCMD_I8_N,0x201,0x1044,(uint32_t)(K/64)*mc);       /* K-passes folded over M */
+    { int v=4*mc; if(v>128)v=128; setr(rc,REGCMD_I8_N,0x201,0x107c,v); }
+    { int v=0xb1-0xf*(mc/8); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I8_N,0x201,0x1040,v); }
+    setr(rc,REGCMD_I8_N,0x1001,0x4030,mc-1);                     /* out cube WIDTH=M-1 */
+    setr(rc,REGCMD_I8_N,0x1001,0x4034,0);                        /* out cube HEIGHT=0 */
+    setr(rc,REGCMD_I8_N,0x1001,0x405c,mc-1);                     /* WDMA WIDTH=M-1 (was HEIGHT<<16) */
+    setr(rc,REGCMD_I8_N,0x801,0x3014,mc-1);
+    setr(rc,REGCMD_I8_N,0x1001,0x4038,0);                        /* NOTCH_ADDR=0 (NC1HWC2) */
+    setr(rc,REGCMD_I8_N,0x1001,0x4024,(uint32_t)mc*16*4);        /* DST_SURF_STRIDE int32 out = M*C2*4 */
+    setr(rc,REGCMD_I8_N,0x201,0x1080,(uint32_t)mc*2);            /* CNA input SURF_STRIDE = (W*C2)/8 (8-byte units; verified vs mm_A.bin: 36*16/8=72) */
+    setr(rc,REGCMD_I8_N,0x1001,0x40c0,aC);                       /* DPU_SURFACE_ADD is an ABSOLUTE output IOVA (rocket_registers.h), NOT a size — was mc*64=0x600 -> wild write -> AXI hang (the hard-wedge). Point it at the C base. */
+    for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
+}
+int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
+    if(!c || outn < REGCMD_I8_N) return -2;
+    if(getenv("ORK_MFOLD")){ synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }
+    int sched = (K==1024 || K==512);
+    synth_i8((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, sched, c->soc->cbuf_elems, 0);
+    return REGCMD_I8_N;
+}
 
 /* ── On-NPU (PPU) fused output stage — additive, GATED, CPU/NEON path stays the default ──────────
  *
@@ -8106,6 +8144,54 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
 /* Replay an ASSEMBLED int16 LUT-op (from tools/re/assemble_op.c): stream `lut` via the LUT-loader, then run the
  * given `regcmd` VERBATIM (RKNN's matched index/scale params baked in) — patching only addresses + M/N geometry.
  * Bit-exact to RKNN, no index decode. in/out int16 [M*N], N%8==0. 0/ok,-1 wedged,-2 shape,-3 SoC. */
+/* #38 RE: replay a CAPTURED int8 matmul regcmd (e.g. rkllm's, from tools/re/regcmd_capture) on ork's own
+ * submit path, to TIME the foreign schedule on the same silicon. Data is garbage (memset) — TIMING ONLY,
+ * output not checked. Allocates A[M*K]/B[K*N]/C[M*N*4] in the active domain, patches the A/B/C address regs
+ * (0x1070/0x1110/0x4020 — the only addresses a plain INT8_MM_INT8_TO_INT32 regcmd references) to them,
+ * submits single-core task_number=1 (chain-links ignored at n=1), warms once, times `iters`. rkllm's task
+ * descriptor is identical to ork's (enable=0xd,int_mask=0x300,regcfg_amount=108 — verified from capture).
+ * SAFETY: mm_timeout_ms() so a bad regcmd self-terminates (soft, reboot-recoverable) rather than hanging. */
+int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
+                      const int8_t *Adata, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us){
+    int fd=c->fd; if(fd<0) return -3; if(rn<8 || rn>2048 || M<1 || (K%32) || (N%16)) return -2;
+    int dom=c->dom_active;
+    size_t bsz=(Bbytes>(int)((size_t)K*N))?(size_t)Bbytes:(size_t)K*N;   /* B may be a STRIDED span > K*N (rkllm column-tile) */
+    /* #39 SAFETY RIG: oversize A/B (like C) with a large guard margin so a malformed mfold DMA descriptor that
+     * reads out-of-bounds lands in MAPPED memory (garbage -> diagnosable) instead of hanging the AXI/IOMMU bus
+     * (the hard-wedge failure mode). The extra pages are mapped in the same IOVA domain and never freed early. */
+    size_t aszg=(size_t)M*K*8+(1u<<20), bszg=bsz*8+(1u<<20);
+    struct buf A =bcreate(fd,aszg,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bszg,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    memset(A.cpu,0,aszg); memset(B.cpu,0,bszg);          /* zero the guard region so OOB reads see zeros, not stale */
+    size_t cszg=(size_t)M*N*4*8+65536;                   /* #39: oversize C 8x as an OOB guard while RE'ing the mfold output stride (a wrong stride writes in-bounds -> diagnosable, not a wedge) */
+    struct buf Cc=bcreate(fd,cszg,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom);   if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    if(Adata) memcpy(A.cpu,Adata,(size_t)M*K); else memset(A.cpu,1,(size_t)M*K);   /* real captured A, or garbage (timing only) */
+    if(Bdata) memcpy(B.cpu,Bdata,(Bbytes>0)?(size_t)Bbytes:(size_t)K*N); else memset(B.cpu,1,bsz);   /* real captured strided weight, or garbage */
+    memset(Cc.cpu,0,cszg);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
+    setr(rc,rn,0x201,0x1070,(uint32_t)A.dma);            /* A (activations) */
+    setr(rc,rn,0x201,0x1110,(uint32_t)B.dma);            /* B (weights) */
+    setr(rc,rn,0x1001,0x4020,(uint32_t)Cc.dma);          /* C (int32 output) */
+    setr(rc,rn,0x1001,0x40c0,(uint32_t)Cc.dma);          /* #39: DPU_SURFACE_ADD is ALSO an output IOVA — MUST be patched or the mfold WDMA writes to a wild address and hangs the AXI bus (hard wedge). */
+    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub;
+    #define _RSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+    _RSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto done; }          /* warm */
+    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Cout) memcpy(Cout,Cc.cpu,(size_t)M*N*4);           /* computed output for correctness check vs captured C */
+    { double t0=ork_now_us();
+      for(int i=0;i<iters;i++){ _RSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto done; } }
+      if(us) *us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
+    #undef _RSUB
+done:
+    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+}
 int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
                            const int16_t *in,int M,int N,int16_t *out,double *us){
     int fd=c->fd;

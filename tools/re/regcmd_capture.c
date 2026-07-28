@@ -140,6 +140,40 @@ int ioctl(int fd, unsigned long request, ...) {
                 int rcwords = (int)t[i].regcfg_amount * 2 + 16;
                 if (re && re->cpu) hexwords("regcmd", (uint32_t *)((char*)re->cpu + roff), rcwords);
                 else fprintf(stderr, "  (regcmd buffer for dma=0x%llx not mapped)\n", (unsigned long long)t[i].regcmd_addr);
+                /* RKDUMP_MM: dump the FIRST matmul matching K/N — regcmd + weight(B) + A + real output(C)
+                 * buffer regions (real_ioctl already ran, so C holds the true result) → enables a bit-exact
+                 * + timed replay on ork AND reverse of rkllm's weight TILING (known logical W vs dumped bytes). */
+                if (re && re->cpu && getenv("RKDUMP_MM")) {
+                    static uint32_t best_M = 0;   /* keep the LARGEST-M matching program (overwrite files) */
+                    {
+                        uint32_t *rw = (uint32_t *)((char*)re->cpu + roff);
+                        uint32_t K=0,N=0,M=0,wadr=0,aadr=0,cadr=0,wbytes=0,wstride=0;
+                        for (int k=0;k+1<rcwords;k+=2){ uint32_t o=rw[k]&0xffff, v=(rw[k]>>16)|((rw[k+1]&0xffff)<<16);
+                            if(o==0x1024)K=v&0xffff; else if(o==0x1038)N=v&0xffff; else if(o==0x102c)M=v&0xffff;
+                            else if(o==0x1110)wadr=v; else if(o==0x1070)aadr=v; else if(o==0x1030)wbytes=v;
+                            else if(o==0x1034)wstride=v; else if(o==0x4020)cadr=v; }
+                        /* weight is STRIDED: 0x1034=row stride (full N), tile is N-wide -> memory SPAN =
+                         * (K-1)*stride + N (int8 bytes), far larger than 0x1030=K*N. Dump the whole span so
+                         * a replay's strided fetch stays in-bounds (this was the errno-110 wedge). */
+                        uint32_t wspan = (wstride>=N && K>0) ? (K-1)*wstride + N : wbytes;
+                        wbytes = wspan;
+                        int wantK=getenv("RKDUMP_MM_K")?atoi(getenv("RKDUMP_MM_K")):3584;
+                        int wantN=getenv("RKDUMP_MM_N")?atoi(getenv("RKDUMP_MM_N")):1216;
+                        if ((int)K==wantK && (int)N==wantN && M>best_M) { best_M=M;
+                            fprintf(stderr,"[RKDUMP_MM] MATCH M=%u K=%u N=%u wadr=0x%x aadr=0x%x cadr=0x%x wbytes=%u\n",M,K,N,wadr,aadr,cadr,wbytes);
+                            FILE*f=fopen("/tmp/mm_regcmd.txt","w"); if(f){ for(int k=0;k<rcwords;k++)fprintf(f,"%08x ",rw[k]); fprintf(f,"\n"); fclose(f);}
+                            { FILE*mf=fopen("/tmp/mm_meta.txt","w"); if(mf){ fprintf(mf,"M %u\nK %u\nN %u\nwbytes %u\n",M,K,N,wbytes); fclose(mf);} }
+                            uint64_t off; struct ent*wb=by_dma_range(wadr,&off);
+                            if(wb&&wb->cpu&&wbytes){ FILE*g=fopen("/tmp/mm_weight.bin","wb"); if(g){fwrite((char*)wb->cpu+off,1,wbytes,g);fclose(g);} fprintf(stderr,"  weight %u B @+0x%llx of handle dma=0x%llx\n",wbytes,(unsigned long long)off,(unsigned long long)wb->dma);}
+                            else fprintf(stderr,"  weight buffer 0x%x NOT mapped\n",wadr);
+                            struct ent*ab=by_dma_range(aadr,&off);
+                            if(ab&&ab->cpu){ FILE*g=fopen("/tmp/mm_A.bin","wb"); if(g){fwrite((char*)ab->cpu+off,1,(size_t)M*K,g);fclose(g);} }
+                            struct ent*cb=by_dma_range(cadr,&off);
+                            if(cb&&cb->cpu){ FILE*g=fopen("/tmp/mm_C.bin","wb"); if(g){fwrite((char*)cb->cpu+off,1,(size_t)M*N*4,g);fclose(g);} }
+                            fprintf(stderr,"  dumped regcmd+weight+A+C to /tmp/mm_*.{txt,bin} (best M=%u)\n",M);
+                        }
+                    }
+                }
             }
         } else {
             fprintf(stderr, "  (task descriptor not mapped; dumping all tracked buffers)\n");

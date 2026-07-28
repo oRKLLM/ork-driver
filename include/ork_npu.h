@@ -686,6 +686,13 @@ int          ork_npu_silu_i8(ork_npu *ctx, const signed char *in, int M, int N,
  * index decode. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn, const short *lut, int nlut,
                                     const short *in, int M, int N, short *out, double *us);
+/* #38 RE: replay a captured int8 matmul regcmd (rkllm's, from regcmd_capture) on ork's submit path.
+ * Adata/Bdata: captured A / tiled-weight bytes (NULL => garbage, timing only). Cout: computed int32 output
+ * (for correctness check vs captured C). Patches A/B/C addrs, single-core, times `iters`. 0/ok. */
+int          ork_npu_replay_i8(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
+                               const signed char *Adata, const signed char *Bdata, int Bbytes, int *Cout, int iters, double *us);
+/* #39 PORT (RE): dump ork's synth_i8 regcmd for (mc,K,N) to diff vs rkllm's captured regcmd. Returns word count. */
+int          ork_npu_synth_i8_dump(ork_npu *ctx, int mc, int K, int N, unsigned *out, int outn);
 
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT
