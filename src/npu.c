@@ -789,7 +789,7 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
 static void setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
-#include "rocket_regs.h"
+#include "ork_regs.h"
 /* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
  * offset) from the rocket-cross-referenced table and validates the value fits the register's defined field
  * bits (a value with bits outside them is a bug — flagged, then written so behavior is preserved). This is
@@ -943,12 +943,12 @@ int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int o
  * matmuls are all K>=512, so this is not a practical limit. */
 static void set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4050,0x0124);                             /* int8 output row byte-stride config (const; int32=0x07fc) */
-    setr(rc,REGCMD_I8_N,0x1001,0x40c0,0x0020);                             /* output element size = 1 byte (int32=0x0080) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);                              /* requant multiplier */
-    setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);                             /* requant shift (>>) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x0124);                             /* int8 output row byte-stride config (const; int32=0x07fc) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,0x0020);                             /* output element size = 1 byte (int32=0x0080) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);                              /* requant multiplier */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);                             /* requant shift (>>) */
 }
 /* PHASE 1 (#35 chained FFN): INT16 matmul output stage — requant int32 acc -> int16 (scale mult/2^shift),
  * 2-byte elements. Between int8 (0x40c0=0x20,0x4050=0x0124) and int32 (0x40c0=0x80,0x4050=0x07fc); int16 is
@@ -971,12 +971,12 @@ static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
     unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0000036e;
     unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;
     unsigned r38=getenv("ORK_I16OUT_4038")?strtoul(getenv("ORK_I16OUT_4038"),0,0):(unsigned)((((s/8)-1)<<16)|((N/8)-1));
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,r10);
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,r38);
-    setr(rc,REGCMD_I8_N,0x1001,0x4050,r50);
-    setr(rc,REGCMD_I8_N,0x1001,0x40c0,rc0);
-    setr(rc,REGCMD_I8_N,0x1001,0x4084,mult);
-    setr(rc,REGCMD_I8_N,0x1001,0x4088,shift);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,r38);
+    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);
 }
 
 /* PHASE 1 (#35 chained FFN) — the SHIM the user asked for: instead of the CLOSED int16-matmul-output,
@@ -996,17 +996,17 @@ static void set_f16_out(uint32_t*rc,int N,int stride){
     unsigned rc0=getenv("ORK_F16OUT_40c0")?strtoul(getenv("ORK_F16OUT_40c0"),0,0):0x00000040; /* 2-byte elem */
     unsigned r84=getenv("ORK_F16OUT_4084")?strtoul(getenv("ORK_F16OUT_4084"),0,0):0x00000001; /* gain */
     unsigned r88=getenv("ORK_F16OUT_4088")?strtoul(getenv("ORK_F16OUT_4088"),0,0):0x00000000; /* shift */
-    setr(rc,REGCMD_I8_N,0x1001,0x4004,r04);
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,r10);
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-    setr(rc,REGCMD_I8_N,0x1001,0x403c,((N-1)<<16)|(N-1));
-    setr(rc,REGCMD_I8_N,0x1001,0x4050,r50);
-    setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);
-    setr(rc,REGCMD_I8_N,0x1001,0x4080,0);
-    setr(rc,REGCMD_I8_N,0x1001,0x4084,r84);
-    setr(rc,REGCMD_I8_N,0x1001,0x4088,r88);
-    setr(rc,REGCMD_I8_N,0x1001,0x40c0,rc0);
-    setr(rc,REGCMD_I8_N,0x1001,0x40c4,0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,r04);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
+    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,r84);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,r88);
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R40C4,0);
 }
 
 /* fp16-IN fp16-OUT DPU output stage, reconstructed from the VENDOR conv task[0] (conv_mul.rknn, decoded against
@@ -1023,37 +1023,37 @@ static void set_f16_out_fp16in(uint32_t*rc,int M,int N){
      * set_mul_geom's OUTPUT side (0x4024/0x4030/0x403c/0x4058/0x405c/0x40c0 = M*16 / M-1 / N), overriding synth's
      * contiguous fp32-atom geometry. M param needed for the M*16 surface stride. */
     /* Precision/bypass/CVT regs from the captured vendor fp16->fp16 MATMUL (cap_fp16f16.dec). */
-    setr(rc,REGCMD_N,0x1001,0x4004,0x0000000e);
-    setr(rc,REGCMD_N,0x1001,0x400c,0x000001e4);                       /* FEATURE_MODE OUTPUT_MODE=2 */
-    setr(rc,REGCMD_N,0x1001,0x4010,0x48000002);                       /* DATA_FORMAT fp16/fp16/fp16 */
-    setr(rc,REGCMD_N,0x1001,0x4040,0x00000053);                       /* BS FULLY BYPASSED (matmul, NOT conv's 0x20150) */
-    setr(rc,REGCMD_N,0x1001,0x4050,0x00000126);                       /* BS_OW_CFG */
-    setr(rc,REGCMD_N,0x1001,0x4060,0x00000053);                       /* BN fully bypassed */
-    setr(rc,REGCMD_N,0x1001,0x4070,0x00000383);                       /* EW fully bypassed */
-    setr(rc,REGCMD_N,0x1001,0x4078,0x00000001);
-    setr(rc,REGCMD_N,0x1001,0x4080,0x00000000);
-    setr(rc,REGCMD_N,0x1001,0x4084,0x00010001);                       /* OUT_CVT_SCALE: FP32TOFP16_EN=1 | scale=1  <-- KEY */
-    setr(rc,REGCMD_N,0x1001,0x4088,0x00000000);
-    setr(rc,REGCMD_N,0x1001,0x40c4,0x00000000);
+    setrn(rc,REGCMD_N,RK_DPU_S_POINTER,0x0000000e);
+    setrn(rc,REGCMD_N,RK_DPU_FEATURE_MODE_CFG,0x000001e4);                       /* FEATURE_MODE OUTPUT_MODE=2 */
+    setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,0x48000002);                       /* DATA_FORMAT fp16/fp16/fp16 */
+    setrn(rc,REGCMD_N,RK_DPU_BS_CFG,0x00000053);                       /* BS FULLY BYPASSED (matmul, NOT conv's 0x20150) */
+    setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000126);                       /* BS_OW_CFG */
+    setrn(rc,REGCMD_N,RK_DPU_BN_CFG,0x00000053);                       /* BN fully bypassed */
+    setrn(rc,REGCMD_N,RK_DPU_EW_CFG,0x00000383);                       /* EW fully bypassed */
+    setrn(rc,REGCMD_N,RK_DPU_EW_CVT_SCALE,0x00000001);
+    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);
+    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,0x00010001);                       /* OUT_CVT_SCALE: FP32TOFP16_EN=1 | scale=1  <-- KEY */
+    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,0x00000000);
+    setrn(rc,REGCMD_N,RK_DPU_R40C4,0x00000000);
     if(getenv("ORK_F16_ATOM8")){
         /* ATOM-8 fp16 output — geometry taken EXACTLY from the bit-exact atom-8 SDP (REGCMD_MUL_F16 / set_mul_geom):
          * surface stride M*16, 0x4050 BS_OW_CFG=0x2 (OD_BYPASS, SIZE_E=0 — NOT the contiguous 0x126 or the int16
          * 0x248 that hung), 0x4038=0. This makes the fp16 matmul emit the PC16 atom-8 layout the SDP reads, so
          * ork_npu_mul_perchan_f16 can consume it directly (no reshape, no notch). */
         uint32_t s=(uint32_t)(M*16);
-        setr(rc,REGCMD_N,0x1001,0x4024,s);                            /* DST_SURF_STRIDE = M*16 */
-        setr(rc,REGCMD_N,0x1001,0x4030,(uint32_t)(M-1));
-        setr(rc,REGCMD_N,0x1001,0x4034,0);
-        setr(rc,REGCMD_N,0x1001,0x4038,0);
-        setr(rc,REGCMD_N,0x1001,0x403c,(uint32_t)(((N-1)<<16)|(N-1)));
-        setr(rc,REGCMD_N,0x1001,0x4050,0x00000002);                   /* BS_OW_CFG = 0x2 (atom-8; KEY) */
-        setr(rc,REGCMD_N,0x1001,0x4058,(uint32_t)(N-1));
-        setr(rc,REGCMD_N,0x1001,0x405c,(uint32_t)(M-1));
-        setr(rc,REGCMD_N,0x1001,0x40c0,s);                            /* SURFACE_ADD = M*16 */
+        setrn(rc,REGCMD_N,RK_DPU_DST_SURF_STRIDE,s);                            /* DST_SURF_STRIDE = M*16 */
+        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,0);
+        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,0);
+        setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
+        setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000002);                   /* BS_OW_CFG = 0x2 (atom-8; KEY) */
+        setrn(rc,REGCMD_N,RK_DPU_DST_N2,(uint32_t)(N-1));
+        setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+        setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,s);                            /* SURFACE_ADD = M*16 */
     } else {
         (void)M;                                                      /* CONTIGUOUS [M][N] (cap_fp16f16); PROVEN 512/512 standalone */
-        setr(rc,REGCMD_N,0x1001,0x4038,(((N/8)-1)<<16)|((N/8)-1));
-        setr(rc,REGCMD_N,0x1001,0x40c0,0x00000020);
+        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/8)-1)<<16)|((N/8)-1));
+        setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,0x00000020);
     }
 }
 
@@ -1093,18 +1093,18 @@ int ork_ppu_fuse_enabled(ork_npu *c){
 static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     set_i8_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4060,0x00020040); /* activation mode bit 0x0002 (fixed) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4068,cfg4068);    /* per-scale field, no observed output effect (replay) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4070,0x00000302); /* fixed */
-    setr(rc,REGCMD_I8_N,0x1001,0x4080,out_bias);   /* output bias / asymmetric zero-point (silu(0) -> out_bias) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4108,0x00000068); /* LUT config (fixed) */
-    setr(rc,REGCMD_I8_N,0x1001,0x410c,0x00050500); /* LUT config (fixed) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4110,idx_off);    /* index offset -> C0 (silu-zero index ~512) */
-    setr(rc,REGCMD_I8_N,0x1001,0x411c,0x00004000); /* fixed config (scale-independent) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4128,0x40320000); /* fixed config */
-    setr(rc,REGCMD_I8_N,0x1001,0x412c,0x000001a0); /* fixed config */
+    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040); /* activation mode bit 0x0002 (fixed) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);    /* per-scale field, no observed output effect (replay) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302); /* fixed */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);   /* output bias / asymmetric zero-point (silu(0) -> out_bias) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068); /* LUT config (fixed) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500); /* LUT config (fixed) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);    /* index offset -> C0 (silu-zero index ~512) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000); /* fixed config (scale-independent) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000); /* fixed config */
+    setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0); /* fixed config */
 }
 
 /* ── Fused EW-mul (SwiGLU dual-input) output stage ───────────────────────────────────────────────
@@ -1138,16 +1138,16 @@ static unsigned mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=geten
  * atom (16 for int8, 8 for the 2-byte fp16/int16) sets the cube; both give surf_stride = M*16 bytes. */
 static void set_mul_geom(uint32_t *rc,int n,int M,int N){
     uint32_t sstride=(uint32_t)(M*16);
-    setr(rc,n,0x2001,0x500c,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
-    setr(rc,n,0x2001,0x5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
-    setr(rc,n,0x2001,0x5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
-    setr(rc,n,0x2001,0x5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
-    setr(rc,n,0x1001,0x4024,sstride);                  /* output surface stride */
-    setr(rc,n,0x1001,0x4030,(uint32_t)(M-1));
-    setr(rc,n,0x1001,0x403c,(uint32_t)(((N-1)<<16)|(N-1)));
-    setr(rc,n,0x1001,0x4058,(uint32_t)(N-1));
-    setr(rc,n,0x1001,0x405c,(uint32_t)(M-1));
-    setr(rc,n,0x1001,0x40c0,sstride);                  /* SURFACE_ADD = M*16 */
+    setrn(rc,n,RK_SDP_500C,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+    setrn(rc,n,RK_SDP_5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+    setrn(rc,n,RK_SDP_5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+    setrn(rc,n,RK_SDP_5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
+    setrn(rc,n,RK_DPU_DST_SURF_STRIDE,sstride);                  /* output surface stride */
+    setrn(rc,n,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+    setrn(rc,n,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
+    setrn(rc,n,RK_DPU_DST_N2,(uint32_t)(N-1));
+    setrn(rc,n,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+    setrn(rc,n,RK_DPU_SURFACE_ADD,sstride);                  /* SURFACE_ADD = M*16 */
 }
 
 /* Apply ork's synth_i8 matmul GEOMETRY (same formulas as synth_i8, sched=1) onto an arbitrary regcmd `rc`
@@ -1155,16 +1155,16 @@ static void set_mul_geom(uint32_t *rc,int n,int M,int N){
  * RKNN's register ORDER + EW output-stage/lane (so it executes) while making the conv engine read ork's own
  * [Nt][Kt][32][32] A/B tile layout (so acc is correct). Addresses (0x1070/0x1110/0x4020) patched by caller. */
 static void apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
-    setr(rc,n,0x201,0x1024,((K-1)<<16)|K);setr(rc,n,0x201,0x1030,K*N);setr(rc,n,0x201,0x1034,K);
-    setr(rc,n,0x201,0x1044,(K+63)/64);setr(rc,n,0x201,0x1088,K);setr(rc,n,0x201,0x107c,K/16);
-    setr(rc,n,0x201,0x1020,0x10000|mc);setr(rc,n,0x201,0x1084,0x10000|mc);setr(rc,n,0x201,0x102c,mc);
-    setr(rc,n,0x1001,0x4034,mc-1);setr(rc,n,0x1001,0x405c,(mc-1)<<16);setr(rc,n,0x801,0x3014,(mc-1)<<16);
-    setr(rc,n,0x1001,0x403c,((N-1)<<16)|(N-1));setr(rc,n,0x1001,0x4058,N-1);setr(rc,n,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-    setr(rc,n,0x201,0x1038,0x1010000|N);setr(rc,n,0x801,0x3018,N-1);
+    setrn(rc,n,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,n,RK_CNA_WEIGHT_SIZE0,K*N);setrn(rc,n,RK_CNA_WEIGHT_SIZE1,K);
+    setrn(rc,n,RK_CNA_CBUF_CON1,(K+63)/64);setrn(rc,n,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,n,RK_CNA_DMA_CON1,K/16);
+    setrn(rc,n,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,n,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,n,RK_CNA_DATA_SIZE3,mc);
+    setrn(rc,n,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,n,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,n,RK_PDP_OUT_M,(mc-1)<<16);
+    setrn(rc,n,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));setrn(rc,n,RK_DPU_DST_N2,N-1);setrn(rc,n,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    setrn(rc,n,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,n,RK_PDP_OUT_N,N-1);
     int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-    int rows=(mc+1<R)?(mc+1):R; setr(rc,n,0x201,0x1010,16*rows);
+    int rows=(mc+1<R)?(mc+1):R; setrn(rc,n,RK_CNA_CONV_CON2,16*rows);
     double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
-    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,n,0x201,0x1040,v);
+    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,n,RK_CNA_CBUF_CON0,v);
 }
 
 /* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
@@ -1193,56 +1193,56 @@ static void set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,u
         /* DECISIVE ISOLATION: EW multiply with a REGISTER-constant operand (EW_OP_SRC=0, bit6=0), NO RDMA.
          * out = up_acc * EW_OP_VALUE_0. If this works, the EW stage is fine on ork geometry & the RDMA is the
          * wedge; if it wedges, the EW stage itself is incompatible with ork's dense conv geometry. */
-        setr(rc,REGCMD_I8_N,0x1001,0x4070,0x90400284);          /* EW_CFG mul, OP_SRC=0 (register operand) */
-        setr(rc,REGCMD_I8_N,0x1001,0x4090,(uint32_t)strtoul(getenv("ORK_EW_REGOP"),0,0)); /* EW_OP_VALUE_0 */
-        setr(rc,REGCMD_I8_N,0x1001,0x4050,0x00000125);
-        setr(rc,REGCMD_I8_N,0x1001,0x4010,0x000000e0);
+        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x90400284);          /* EW_CFG mul, OP_SRC=0 (register operand) */
+        setrn(rc,REGCMD_I8_N,RK_DPU_EW_OP_VALUE_0,(uint32_t)strtoul(getenv("ORK_EW_REGOP"),0,0)); /* EW_OP_VALUE_0 */
+        setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);
+        setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);
     } else if(!getenv("ORK_EW_NOMUL")){
         /* EW_CFG: multiply(bit2), operand from RDMA(bit6), operand-CVT active(bit8=0), LUT+ReLU bypass(7,9).
          * ORK_EW_CFG / ORK_EW_ERDMA override EW_CFG / ERDMA_CFG for int8-vs-int16 data-size tuning. */
         uint32_t ewcfg=0x904002c4; { const char*e=getenv("ORK_EW_CFG"); if(e) ewcfg=(uint32_t)strtoul(e,0,0); }
-        setr(rc,REGCMD_I8_N,0x1001,0x4070,ewcfg);
-        setr(rc,REGCMD_I8_N,0x1001,0x4074,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
-        setr(rc,REGCMD_I8_N,0x1001,0x4078,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
+        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,ewcfg);
+        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
+        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
         /* output-stage EW-active bits (required so the DPU expects the element-wise/RDMA stage; mode bits,
          * geometry-independent). ORK_EW_NO50=skip individual ones during bisection. */
-        setr(rc,REGCMD_I8_N,0x1001,0x4050,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
-        setr(rc,REGCMD_I8_N,0x1001,0x4010,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
-        { const char*eo=getenv("ORK_EW_COFF"); if(eo) setr(rc,REGCMD_I8_N,0x1001,0x4074,(uint32_t)strtoul(eo,0,0)); }
-        { const char*es=getenv("ORK_EW_CSCL"); if(es) setr(rc,REGCMD_I8_N,0x1001,0x4078,(uint32_t)strtoul(es,0,0)); }
+        setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
+        setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
+        { const char*eo=getenv("ORK_EW_COFF"); if(eo) setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(eo,0,0)); }
+        { const char*es=getenv("ORK_EW_CSCL"); if(es) setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(es,0,0)); }
         /* DPU_RDMA (0x50xx): fetch silu(gate) as the element-wise operand at EW_BASE (0x5038).
          * ORK_EW_SPTR overrides RDMA_S_POINTER (0x5004): 0xe = PP mode (producer/consumer ping-pong, needs a
          * partner to advance the pointer — deadlocks in a standalone shot); try 0/1 for single-shot no-PP. */
         { uint32_t sp=0x0000000e; const char*e=getenv("ORK_EW_SPTR"); if(e) sp=(uint32_t)strtoul(e,0,0);
-          setr(rc,REGCMD_I8_EW_N,0x2001,0x5004,sp); }
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5008,0x00000001);       /* RDMA_OPERATION_ENABLE (only in EW-memory path) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x500c,M-1);              /* RDMA_DATA_CUBE_WIDTH  = M-1 */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5010,0x00000000);       /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5014,N-1);              /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+          setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,sp); }
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);       /* RDMA_OPERATION_ENABLE (only in EW-memory path) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,M-1);              /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);       /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,N-1);              /* RDMA_DATA_CUBE_CHANNEL= N-1 */
         uint32_t erdma=0x40000004; { const char*e=getenv("ORK_EW_ERDMA"); if(e) erdma=(uint32_t)strtoul(e,0,0); }
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5034,erdma);            /* RDMA_ERDMA_CFG: enable(bit0=0)+data_size/mode */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5038,aG);               /* RDMA_EW_BASE_ADDR = silu(gate) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5018,aG);               /* RDMA_SRC_BASE_ADDR (valid) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);            /* RDMA_ERDMA_CFG: enable(bit0=0)+data_size/mode */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,aG);               /* RDMA_EW_BASE_ADDR = silu(gate) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,aG);               /* RDMA_SRC_BASE_ADDR (valid) */
         /* rocket rkt_regcmd.c element-wise: the operand is read via the BRDMA channel from SRC_BASE (0x5018),
          * with BRDMA_DATA_USE=1 (0x501c bits1-4 => value 0x2). (I earlier wrongly DISABLED BRDMA -> the RDMA
          * never delivered the operand -> DPU hung.) NRDMA off; BS_BASE valid (not the stale RKNN addr). */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x501c,0x00000002);       /* RDMA_BRDMA_CFG: BRDMA_DATA_USE=1 (on) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5028,0x00000000);       /* RDMA_NRDMA_CFG: NRDMA_DATA_USE=0 (off) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5020,aG);               /* RDMA_BS_BASE_ADDR: valid (not stale RKNN) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x5040,s);                /* RDMA_EW_SURF_STRIDE (dense = N) */
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x504c,s);
-        setr(rc,REGCMD_I8_EW_N,0x2001,0x506c,s);
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);       /* RDMA_BRDMA_CFG: BRDMA_DATA_USE=1 (on) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5028,0x00000000);       /* RDMA_NRDMA_CFG: NRDMA_DATA_USE=0 (off) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5020,aG);               /* RDMA_BS_BASE_ADDR: valid (not stale RKNN) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,s);                /* RDMA_EW_SURF_STRIDE (dense = N) */
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,s);
+        setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,s);
         /* 0x5044 (FEATURE_MODE_CFG int8) + 0x5068 (RDMA_WEIGHT=0x01010101) come from REGCMD_EW_LANE as-is. */
         /* ORK_EW_STRIDE overrides EW_SURF_STRIDE (cube atom-16 layout probe: M*16) */
         { const char*e=getenv("ORK_EW_STRIDE"); if(e){ uint32_t v=(uint32_t)strtoul(e,0,0);
-            setr(rc,REGCMD_I8_EW_N,0x2001,0x5040,v); setr(rc,REGCMD_I8_EW_N,0x2001,0x506c,v); setr(rc,REGCMD_I8_EW_N,0x2001,0x504c,v); } }
+            setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,v); setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,v); setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,v); } }
         /* PC_OPERATION_ENABLE (regcmd trailer, reg 0x8 lane 0x81): ork's REGCMD_I8 trailer has 0x0d
          * (CNA|CORE|DPU) — the DPU_RDMA block (bit 0x10) is NOT enabled, so the RDMA never runs and the DPU
          * waits forever. RKNN's EW op has 0x1d here. Enable the RDMA block in the regcmd's own op-enable. */
-        setr(rc,REGCMD_I8_EW_N,0x0081,0x0008,0x0000001d);
+        setrn(rc,REGCMD_I8_EW_N,RK_PC_OPERATION_ENABLE,0x0000001d);
     }
     /* ORK_EW_BIAS overrides 0x4080 (output offset/bias) */
-    { const char*e=getenv("ORK_EW_BIAS"); if(e) setr(rc,REGCMD_I8_N,0x1001,0x4080,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_EW_BIAS"); if(e) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(e,0,0)); }
 }
 
 /* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
@@ -1258,17 +1258,17 @@ void ork_i4_fuzz_clear(void){ g_i4_fovr_n=0; }
 void ork_i4_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i4_fovr_n<16){ g_i4_fovr[g_i4_fovr_n].blk=blk; g_i4_fovr[g_i4_fovr_n].reg=reg; g_i4_fovr[g_i4_fovr_n].val=val; g_i4_fovr_n++; } }
 static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
-    setr(rc,REGCMD_I4_N,0x201,0x1024,((K-1)<<16)|K);       /* K range (element count) */
-    setr(rc,REGCMD_I4_N,0x201,0x1030,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
-    setr(rc,REGCMD_I4_N,0x201,0x1034,K/2);                 /* weight row bytes */
-    setr(rc,REGCMD_I4_N,0x201,0x1044,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
-    setr(rc,REGCMD_I4_N,0x201,0x1088,K);
-    setr(rc,REGCMD_I4_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I4_N,0x801,0x3018,N-1);
+    setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
+    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
+    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE1,K/2);                 /* weight row bytes */
+    setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON1,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
+    setrn(rc,REGCMD_I4_N,RK_CNA_FC_DATA_SIZE1,K);
+    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_I4_N,RK_PDP_OUT_N,N-1);
     /* N-output-stride regs, parameterized for wide-N single-submit (verified vs N=64 & N=128
      * captures: 0x403c=(N-1)dup, 0x4058=N-1, 0x3018=N-1 above). 0x40c0/0x4050 are CONSTANT across N
      * (0x80/0x7fe — left at REGCMD_I4). */
-    setr(rc,REGCMD_I4_N,0x1001,0x403c,((N-1)<<16)|(N-1));
-    setr(rc,REGCMD_I4_N,0x1001,0x4058,N-1);
+    setrn(rc,REGCMD_I4_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
+    setrn(rc,REGCMD_I4_N,RK_DPU_DST_N2,N-1);
     /* Multi-M scheduler (mc>1) — native batch mode (NVDLA D_BATCH_NUMBER analog): one submit computes H
      * rows with the weight streamed ONCE, output at stride-2 (logical row m -> physical row 2m; int16 result
      * in an int32-stepped DMA). Reached only via ORK_I4_MSCHED (gated OFF; production callers pass mc=1 ->
@@ -1292,27 +1292,27 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
          *   0x01 M-count 0x1020/0x1084/0x102c   0x02 0x4034(PPU rows)   0x04 0x3014(DPU)
          *   0x08 0x4038(out width/4)            0x10 0x1010(CNA hint)   0x20 0x1040(K-schedule=POISON) */
         static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x5f;}
-        setr(rc,REGCMD_I4_N,0x1001,0x405c,0);                                   /* the trigger (always) */
+        setrn(rc,REGCMD_I4_N,RK_DPU_WDMA_SIZE_1,0);                                   /* the trigger (always) */
         /* 0x107c = K/16 : the batch activation-cube-size reg (Exp-2026-07-07 fuzz). Captured as 4 (tuned to
          * the M=4/K=64 capture); setting it to K/16 restores the native 4-ROW batch at ANY K — bit-exact at
          * K=512/1024/2048 (0x20/0x40/0x80). This lifts multi-M from 1 row to 4 rows/submit at production K
          * (4x fewer weight streams). Narrow: only K/16 gives 4 (neighbors give 2); 4 is the cap for this reg. */
-        if(mregs&0x40) setr(rc,REGCMD_I4_N,0x201,0x107c,(uint32_t)(K/16));
-        if(mregs&0x01){ setr(rc,REGCMD_I4_N,0x201,0x1020,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x1084,0x10000|mc_phys);setr(rc,REGCMD_I4_N,0x201,0x102c,mc_phys); }
-        if(mregs&0x02) setr(rc,REGCMD_I4_N,0x1001,0x4034,mc_phys-1);
-        if(mregs&0x04) setr(rc,REGCMD_I4_N,0x801,0x3014,(mc_phys-1)<<16);
-        if(mregs&0x08) setr(rc,REGCMD_I4_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-        if(mregs&0x10) setr(rc,REGCMD_I4_N,0x201,0x1010,16*(mc_phys+1));
+        if(mregs&0x40) setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON1,(uint32_t)(K/16));
+        if(mregs&0x01){ setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0,0x10000|mc_phys);setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc_phys);setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE3,mc_phys); }
+        if(mregs&0x02) setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_HEIGHT,mc_phys-1);
+        if(mregs&0x04) setrn(rc,REGCMD_I4_N,RK_PDP_OUT_M,(mc_phys-1)<<16);
+        if(mregs&0x08) setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+        if(mregs&0x10) setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,16*(mc_phys+1));
         if(mregs&0x20){ double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=mc_phys/64; if(mg<1)mg=1;
-            int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I4_N,0x201,0x1040,v); }
+            int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,v); }
         /* ORK_I4_1040: direct override of the K-reduction schedule reg (RE: find the int4 multi-row value —
          * the int8 formula corrupts, omitting it leaves only row0 for K>64). Applied last, wins over mregs&0x20. */
-        { const char*e=getenv("ORK_I4_1040"); if(e) setr(rc,REGCMD_I4_N,0x201,0x1040,(uint32_t)strtoul(e,0,0)); }
+        { const char*e=getenv("ORK_I4_1040"); if(e) setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,(uint32_t)strtoul(e,0,0)); }
         /* ORK_I4_1010: override CNA row/activation-cube reg (RE: multi-M computes rows_computed*K=256 elems —
          * a fixed activation-cube budget; find the reg that enlarges it so K=2048 gets >1 row). */
-        { const char*e=getenv("ORK_I4_1010"); if(e) setr(rc,REGCMD_I4_N,0x201,0x1010,(uint32_t)strtoul(e,0,0)); }
+        { const char*e=getenv("ORK_I4_1010"); if(e) setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,(uint32_t)strtoul(e,0,0)); }
     }
-    setr(rc,REGCMD_I4_N,0x201,0x1070,aA);setr(rc,REGCMD_I4_N,0x201,0x1110,aB);setr(rc,REGCMD_I4_N,0x1001,0x4020,aC);
+    setrn(rc,REGCMD_I4_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_I4_N,RK_DPU_DST_BASE_ADDR,aC);
     for(int i=0;i<g_i4_fovr_n;i++) setr(rc,REGCMD_I4_N,g_i4_fovr[i].blk,g_i4_fovr[i].reg,g_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
@@ -3666,7 +3666,7 @@ static void *mcworker(void *vp){
             if(!active){
                 int Ncore = nt_sz;
                 uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
-                setr(rc,REGCMD_N,0x201,0x1040,0xb1);
+                setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
                 if (validate_regcmd("mcworker_dec_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
                     a->rc = -1; c->mc_error = 1;
                 }
@@ -3687,7 +3687,7 @@ static void *mcworker(void *vp){
                     memcpy(rc, w->pcrc+(size_t)slot*REGCMD_N, sizeof rc);   /* cache hit: reuse precompiled regcmd */
                 } else {
                     synth_i8(rc,1,K,Ncore,aA,aB,aC,1,CBUF,0);
-                    setr(rc,REGCMD_N,0x201,0x1040,0xb1);                       /* M=1 single-tile schedule */
+                    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);                       /* M=1 single-tile schedule */
                     if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) {
                         a->rc = -1; c->mc_error = 1;
                     } else if(mt){ memcpy(w->pcrc+(size_t)slot*REGCMD_N, rc, sizeof rc); mt[1]=K;mt[2]=Ncore;mt[3]=aA;mt[4]=aB;mt[5]=aC; mt[0]=1; }
@@ -5457,7 +5457,7 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -5527,23 +5527,23 @@ static void set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_
         e=getenv("ORK_SILU_38DIV"); div38=e?atoi(e):8;                              /* group stride divisor (int8=16,int32=4,int16=8) */
         const char*g=getenv("ORK_SILU_4084"); if(g){ ovg=1; r84=(uint32_t)strtoul(g,0,0);
             const char*s=getenv("ORK_SILU_4088"); r88=s?(uint32_t)strtoul(s,0,0):0; } }  /* CVT gain override (fp16=0x00010001) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4084,ovg?r84:(uint32_t)r_mult);   /* CVT gain (int R mantissa, or fp16 0x00010001) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4088,ovg?r88:(uint32_t)r_shift);  /* CVT shift */
-    setr(rc,REGCMD_I8_N,0x1001,0x4004,0x0030); setr(rc,REGCMD_I8_N,0x2001,0x5004,0x0030); /* activation mode on */
-    setr(rc,REGCMD_I8_N,0x1001,0x4010,r4010);              /* output precision (PREC field) + LUT/activation enable */
-    setr(rc,REGCMD_I8_N,0x1001,0x40c0,r40c0);              /* output element size */
-    setr(rc,REGCMD_I8_N,0x1001,0x4050,r4050);              /* output row byte-stride config */
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,(((N/div38)-1)<<16)|((N/div38)-1)); /* output group stride */
-    setr(rc,REGCMD_I8_N,0x1001,0x4060,0x00020040);
-    setr(rc,REGCMD_I8_N,0x1001,0x4068,cfg4068);
-    setr(rc,REGCMD_I8_N,0x1001,0x4070,0x00000302);
-    setr(rc,REGCMD_I8_N,0x1001,0x4080,out_bias);
-    setr(rc,REGCMD_I8_N,0x1001,0x4108,0x00000068);
-    setr(rc,REGCMD_I8_N,0x1001,0x410c,0x00050500);
-    setr(rc,REGCMD_I8_N,0x1001,0x4110,idx_off);
-    setr(rc,REGCMD_I8_N,0x1001,0x411c,0x00004000);
-    setr(rc,REGCMD_I8_N,0x1001,0x4128,0x40320000);
-    setr(rc,REGCMD_I8_N,0x1001,0x412c,0x000001a0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,ovg?r84:(uint32_t)r_mult);   /* CVT gain (int R mantissa, or fp16 0x00010001) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,ovg?r88:(uint32_t)r_shift);  /* CVT shift */
+    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r4010);              /* output precision (PREC field) + LUT/activation enable */
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,r40c0);              /* output element size */
+    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r4050);              /* output row byte-stride config */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/div38)-1)<<16)|((N/div38)-1)); /* output group stride */
+    setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040);
+    setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302);
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000);
+    setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0);
 }
 
 /* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
@@ -5565,7 +5565,7 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -5614,31 +5614,31 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
  * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     { const char*e=getenv("ORK_F16_C4004"); uint32_t v=e?(uint32_t)strtoul(e,0,0):0x0030;
-      setr(rc,REGCMD_N,0x1001,0x4004,v); setr(rc,REGCMD_N,0x2001,0x5004,v); } /* activation mode on */
+      setrn(rc,REGCMD_N,RK_DPU_S_POINTER,v); setrn(rc,REGCMD_N,RK_SDP_5004,v); } /* activation mode on */
     /* 0x4010 = fp16 output CVT (post-LUT). Deliberately kept at REGCMD's 0xa8000002 (fp16->fp32); overriding
      * is WEDGE-PRONE (proc-precision mismatch). ORK_F16_C4010 for the upper-bank RE probe only. */
-    { const char*e=getenv("ORK_F16_C4010"); if(e) setr(rc,REGCMD_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_F16_C4010"); if(e) setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); }
     /* index/output gain (0x4084/0x4088): REGCMD's default is ~1 -> gate barely moves the LUT index (curve
      * under-sampled). Env-override to spread gate over the LUT (fp16 analog of the int8 acc->index R). */
-    { const char*g=getenv("ORK_F16_R84"); if(g){ setr(rc,REGCMD_N,0x1001,0x4084,(uint32_t)strtoul(g,0,0));
-        const char*s=getenv("ORK_F16_R88"); setr(rc,REGCMD_N,0x1001,0x4088,s?(uint32_t)strtoul(s,0,0):0); } }
-    { const char*e=getenv("ORK_F16_C4060"); setr(rc,REGCMD_N,0x1001,0x4060,e?(uint32_t)strtoul(e,0,0):0x00020040); }   /* silu LUT-stage config (shared with the int8 fused path) */
+    { const char*g=getenv("ORK_F16_R84"); if(g){ setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(g,0,0));
+        const char*s=getenv("ORK_F16_R88"); setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,s?(uint32_t)strtoul(s,0,0):0); } }
+    { const char*e=getenv("ORK_F16_C4060"); setrn(rc,REGCMD_N,RK_DPU_BN_CFG,e?(uint32_t)strtoul(e,0,0):0x00020040); }   /* silu LUT-stage config (shared with the int8 fused path) */
     /* 0x4064 = fp16 index-scale param. REGCMD's default gives a small gate-dependent spread; 0xffff7dc8
      * (standalone silu) COLLAPSES it. Keep REGCMD's default unless env-overridden (calibration RE). */
-    { const char*e=getenv("ORK_F16_C4064"); if(e) setr(rc,REGCMD_N,0x1001,0x4064,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_F16_C4064"); if(e) setrn(rc,REGCMD_N,RK_DPU_BN_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
     /* 0x4044 = BS_ALU_OPERAND (za), a PRE-LUT bias on the accumulator. The fp16 index only spreads for
      * NEGATIVE acc; setting za shifts the gate negative so positive gates fall into the spreading region
      * (negatives then clamp ~0, ~= silu(neg)). Env-overridable for the calibration crack. */
-    { const char*e=getenv("ORK_F16_ZA"); if(e) setr(rc,REGCMD_N,0x1001,0x4044,(uint32_t)strtoul(e,0,0)); }
-    setr(rc,REGCMD_N,0x1001,0x4068,cfg4068);
-    { const char*e=getenv("ORK_F16_C4070"); setr(rc,REGCMD_N,0x1001,0x4070,e?(uint32_t)strtoul(e,0,0):0x00000302); }
-    setr(rc,REGCMD_N,0x1001,0x4080,out_bias);
-    { const char*e=getenv("ORK_F16_C4108"); setr(rc,REGCMD_N,0x1001,0x4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
-    { const char*e=getenv("ORK_F16_C410C"); setr(rc,REGCMD_N,0x1001,0x410c,e?(uint32_t)strtoul(e,0,0):0x00050500); }
-    setr(rc,REGCMD_N,0x1001,0x4110,idx_off);
-    { const char*e=getenv("ORK_F16_C411C"); setr(rc,REGCMD_N,0x1001,0x411c,e?(uint32_t)strtoul(e,0,0):0x00004000); }
-    { const char*e=getenv("ORK_F16_C4128"); setr(rc,REGCMD_N,0x1001,0x4128,e?(uint32_t)strtoul(e,0,0):0x40320000); }
-    { const char*e=getenv("ORK_F16_C412C"); setr(rc,REGCMD_N,0x1001,0x412c,e?(uint32_t)strtoul(e,0,0):0x000001a0); }
+    { const char*e=getenv("ORK_F16_ZA"); if(e) setrn(rc,REGCMD_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
+    setrn(rc,REGCMD_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    { const char*e=getenv("ORK_F16_C4070"); setrn(rc,REGCMD_N,RK_DPU_EW_CFG,e?(uint32_t)strtoul(e,0,0):0x00000302); }
+    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    { const char*e=getenv("ORK_F16_C4108"); setrn(rc,REGCMD_N,RK_DPU_R4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
+    { const char*e=getenv("ORK_F16_C410C"); setrn(rc,REGCMD_N,RK_DPU_R410C,e?(uint32_t)strtoul(e,0,0):0x00050500); }
+    setrn(rc,REGCMD_N,RK_DPU_R4110,idx_off);
+    { const char*e=getenv("ORK_F16_C411C"); setrn(rc,REGCMD_N,RK_DPU_R411C,e?(uint32_t)strtoul(e,0,0):0x00004000); }
+    { const char*e=getenv("ORK_F16_C4128"); setrn(rc,REGCMD_N,RK_DPU_R4128,e?(uint32_t)strtoul(e,0,0):0x40320000); }
+    { const char*e=getenv("ORK_F16_C412C"); setrn(rc,REGCMD_N,RK_DPU_R412C,e?(uint32_t)strtoul(e,0,0):0x000001a0); }
     /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
 }
 
@@ -5675,7 +5675,7 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
     struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -5983,13 +5983,13 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     uint32_t rc[REGCMD_I8_N];
     synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     if(mode==1){   /* override with the rkllm-captured M-tile program */
-        setr(rc,REGCMD_I8_N,0x201,0x1010,0x20);
-        setr(rc,REGCMD_I8_N,0x201,0x1044,(K/64)*M);
-        setr(rc,REGCMD_I8_N,0x201,0x107c,4*M);
+        setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);
+        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K/64)*M);
+        setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,4*M);
         int mg=(M+7)/8; int v=0xb1-0x0f*(mg-1); if(v<0x1b)v=0x1b;
-        setr(rc,REGCMD_I8_N,0x201,0x1040,v);
-        setr(rc,REGCMD_I8_N,0x201,0x1020,(M<<16)|1);
-        setr(rc,REGCMD_I8_N,0x201,0x1084,(M<<16)|1);
+        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
+        setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,(M<<16)|1);
+        setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,(M<<16)|1);
     }
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_mtile_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
@@ -6018,7 +6018,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
     uint32_t rc[REGCMD_I8_N];
     synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6095,12 +6095,12 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     /* TOGGLE SWEEP: restore individual output-stage regs to their int32 (completing) values to isolate the
      * WDMA terminal-count stall. Each ORK_MM_R<reg>=<hex> overrides one reg AFTER set_i16_out. */
     { const char*e;
-      if((e=getenv("ORK_MM_R4010"))) setr(rc,REGCMD_I8_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4038"))) setr(rc,REGCMD_I8_N,0x1001,0x4038,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4050"))) setr(rc,REGCMD_I8_N,0x1001,0x4050,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4084"))) setr(rc,REGCMD_I8_N,0x1001,0x4084,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4088"))) setr(rc,REGCMD_I8_N,0x1001,0x4088,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R40c0"))) setr(rc,REGCMD_I8_N,0x1001,0x40c0,(uint32_t)strtoul(e,0,0)); }
+      if((e=getenv("ORK_MM_R4010"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4038"))) setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4050"))) setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4084"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4088"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R40c0"))) setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,(uint32_t)strtoul(e,0,0)); }
     if(getenv("ORK_MM_DUMPRC")){ const char*tag=getenv("ORK_MM_I32OUT")?"I32":"I16"; /* dump the assembled 0x40xx output stage for diffing */
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ uint32_t r=rc[k]&0xffff, v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
             if(r>=0x4000 && r<0x4100) fprintf(stderr,"[%s] 0x%04x = 0x%08x\n",tag,r,v); } }
@@ -6319,7 +6319,7 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     uint32_t rc[REGCMD_N];
     int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
     synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
-    if(rowpitch!=K) setr(rc,REGCMD_N,0x201,0x107c,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
+    if(rowpitch!=K) setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
     if(!getenv("ORK_F16_FP32OUT")) set_f16_out_fp16in(rc,M,N);        /* vendor fp16-out stage (atom-8); skip => synth's native fp32-out (compute sanity) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
@@ -6401,7 +6401,7 @@ int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,in
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
     synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
-    setr(rc,REGCMD_N,0x201,0x107c,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
+    setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
     set_f16_out_fp16in(rc,M,N);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
@@ -6446,20 +6446,20 @@ int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,
     uint32_t ewcfg=getenv("ORK_F16EW_CFG")?strtoul(getenv("ORK_F16EW_CFG"),0,0):0x108003c4;   /* vendor fp16 EW mul */
     uint32_t erdma=getenv("ORK_F16EW_ERDMA")?strtoul(getenv("ORK_F16EW_ERDMA"),0,0):0x00000008;/* per-channel + 2-byte */
     uint32_t r4050=getenv("ORK_F16EW_4050")?strtoul(getenv("ORK_F16EW_4050"),0,0):0x00000127; /* out row cfg + EW-enable bit0 */
-    setr(rc,REGCMD_I8_EW_N,0x1001,0x4070,ewcfg);
-    setr(rc,REGCMD_I8_EW_N,0x1001,0x4074,0x00000000);
-    setr(rc,REGCMD_I8_EW_N,0x1001,0x4078,0x00000001);
-    setr(rc,REGCMD_I8_EW_N,0x1001,0x4050,r4050);
-    { const char*e=getenv("ORK_F16EW_4010"); if(e) setr(rc,REGCMD_I8_EW_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); } /* fp16 DATA_FORMAT + EW-enable bits sweep */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5004,0x0000000e);
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5008,0x00000001);               /* RDMA_OPERATION_ENABLE */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x500c,(uint32_t)(M-1));          /* WIDTH=M-1 */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5010,0x00000000);              /* HEIGHT=1 */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5014,(uint32_t)(N-1));          /* CHANNEL=N-1 */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5034,erdma);
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5038,(uint32_t)SB.dma);         /* EW operand = scale[N] */
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x5018,(uint32_t)SB.dma);
-    setr(rc,REGCMD_I8_EW_N,0x2001,0x501c,0x00000002);              /* BRDMA_DATA_USE=1 */
+    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CFG,ewcfg);
+    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_OFFSET,0x00000000);
+    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_SCALE,0x00000001);
+    setrn(rc,REGCMD_I8_EW_N,RK_DPU_BS_OW_CFG,r4050);
+    { const char*e=getenv("ORK_F16EW_4010"); if(e) setrn(rc,REGCMD_I8_EW_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* fp16 DATA_FORMAT + EW-enable bits sweep */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,0x0000000e);
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);               /* RDMA_OPERATION_ENABLE */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,(uint32_t)(M-1));          /* WIDTH=M-1 */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);              /* HEIGHT=1 */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,(uint32_t)(N-1));          /* CHANNEL=N-1 */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,(uint32_t)SB.dma);         /* EW operand = scale[N] */
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,(uint32_t)SB.dma);
+    setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);              /* BRDMA_DATA_USE=1 */
     memcpy(c->regcmd.cpu,rc,REGCMD_I8_EW_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x1d; tk->int_mask=0x300; tk->int_clear=0x1ffff;               /* 0x1d: enable EW/second lane */
@@ -6554,14 +6554,14 @@ int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,i
     /* ORK_EW_MULT/ORK_EW_SHIFT: override the captured requant (0x4084/0x4088, captured >>29 kills small acc)
      * so the output is interpretable when driving the verbatim op with our own uniform data. */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
-      if(em) setr(rc,REGCMD_EWMUL_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
-      if(es) setr(rc,REGCMD_EWMUL_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0)); }
-    setr(rc,REGCMD_EWMUL_N,0x0201,0x1070,(uint32_t)I.dma);          /* input x */
-    setr(rc,REGCMD_EWMUL_N,0x0201,0x1110,(uint32_t)Wt.dma+0x2300);  /* weights */
-    setr(rc,REGCMD_EWMUL_N,0x1001,0x4020,(uint32_t)O.dma);          /* output */
-    setr(rc,REGCMD_EWMUL_N,0x2001,0x5018,(uint32_t)Gl.dma+0x400);   /* 2nd-input silu(gate) */
-    setr(rc,REGCMD_EWMUL_N,0x2001,0x5038,(uint32_t)Gl.dma+0x800);   /* 2nd-input partner */
-    setr(rc,REGCMD_EWMUL_N,0x2001,0x5020,(uint32_t)Wt.dma+0x2480);  /* 2nd-input param (in weight buf) */
+      if(em) setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
+    setrn(rc,REGCMD_EWMUL_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)I.dma);          /* input x */
+    setrn(rc,REGCMD_EWMUL_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma+0x2300);  /* weights */
+    setrn(rc,REGCMD_EWMUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);          /* output */
+    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5018,(uint32_t)Gl.dma+0x400);   /* 2nd-input silu(gate) */
+    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5038,(uint32_t)Gl.dma+0x800);   /* 2nd-input partner */
+    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5020,(uint32_t)Wt.dma+0x2480);  /* 2nd-input param (in weight buf) */
     if(getenv("ORK_EW_DUMP")){ printf("# verbatim EW-mul regcmd, in=0x%x wt=0x%x gl=0x%x out=0x%x\n",
         (uint32_t)I.dma,(uint32_t)Wt.dma,(uint32_t)Gl.dma,(uint32_t)O.dma);
         for(int k=0;k+1<REGCMD_EWMUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
@@ -6613,32 +6613,32 @@ int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const 
         /* Also inject ork's DENSE int8-out output-stage byte config (set_i8_out8) so the output writes dense
          * [M][N] where ork reads it — the template's RKNN output-byte config produced bias-only garbage.
          * Keep the SDP element-wise MULTIPLY enable (0x4070=0x904002c4) + 0x4050 bit0 (2nd-input enable). */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4010,0x00000000);    /* int8-out (clear int32 bit) */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4038,(((N/16)-1)<<16)|((N/16)-1)); /* dense output group stride */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4050,0x00000125);    /* int8 row config + 2nd-input enable (bit0) */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x40c0,0x00000020);    /* output element size = 1 byte (dense) */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4080,0x00000000);    /* zero bias for the probe */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x500c,M-1);           /* 2nd-lane geometry -> ork's (M,N) */
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5010,M-1);
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5014,N-1);
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5040,N);
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x504c,N);
-        setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x506c,N);
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_PRECISION,0x00000000);    /* int8-out (clear int32 bit) */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DATA_CUBE_NOTCH,(((N/16)-1)<<16)|((N/16)-1)); /* dense output group stride */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_BS_OW_CFG,0x00000125);    /* int8 row config + 2nd-input enable (bit0) */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_SURFACE_ADD,0x00000020);    /* output element size = 1 byte (dense) */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);    /* zero bias for the probe */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_500C,M-1);           /* 2nd-lane geometry -> ork's (M,N) */
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5010,M-1);
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5014,N-1);
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5040,N);
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_504C,N);
+        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_506C,N);
     }
     /* ORK_EW_MULT/SHIFT override the captured requant so small test accumulators requant to a readable value. */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
-      if(em) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
-      if(es) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0)); }
+      if(em) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
     uint32_t gstride = getenv("ORK_EW_VERBATIM") ? 0x80 : (uint32_t)N;  /* 2nd-input row stride */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x0201,0x1070,(uint32_t)c->Af.dma);        /* input A */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x0201,0x1110,(uint32_t)Wt.dma);           /* up-weights */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5018,(uint32_t)Gb.dma);           /* silu(gate) 2nd input */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5038,(uint32_t)Gb.dma+gstride);   /* 2nd-input partner = base+stride */
-    setr(rc,REGCMD_EWMUL_LIN_N,0x2001,0x5020,(uint32_t)Wt.dma+0x8080);    /* 2nd-input param (in weight buf) */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)c->Af.dma);        /* input A */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma);           /* up-weights */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5018,(uint32_t)Gb.dma);           /* silu(gate) 2nd input */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5038,(uint32_t)Gb.dma+gstride);   /* 2nd-input partner = base+stride */
+    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5020,(uint32_t)Wt.dma+0x8080);    /* 2nd-input param (in weight buf) */
     /* ORK_EW_NOMUL: turn OFF the EW multiply (0x4070 -> plain 0x0302) to read R=requant(acc) alone —
      * isolates "does the matmul+requant work" from "does the multiply work". */
-    if(getenv("ORK_EW_NOMUL")) setr(rc,REGCMD_EWMUL_LIN_N,0x1001,0x4070,0x00000302);
+    if(getenv("ORK_EW_NOMUL")) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_EW_CFG,0x00000302);
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_EWMUL_LIN_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
         bdestroy(fd,&Wt);bdestroy(fd,&O);bdestroy(fd,&Gb); return 0; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6675,27 +6675,27 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);   /* clear device-side output (op writes only part -> avoid stale) */
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
-    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);        /* output */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT"),*eb=getenv("ORK_EW_BIAS");
       const char*co=getenv("ORK_EW_COFF"),*cs=getenv("ORK_EW_CSCL");
-      if(em) setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)strtoul(em,0,0));
-      if(es) setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)strtoul(es,0,0));
-      if(eb) setr(rc,REGCMD_MUL_N,0x1001,0x4080,(uint32_t)strtoul(eb,0,0));
-      if(co) setr(rc,REGCMD_MUL_N,0x1001,0x4074,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
-      if(cs) setr(rc,REGCMD_MUL_N,0x1001,0x4078,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
+      if(em) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0));
+      if(eb) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(eb,0,0));
+      if(co) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
+      if(cs) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
       const char*ao=getenv("ORK_EW_AOFF");
-      if(ao) setr(rc,REGCMD_MUL_N,0x1001,0x4044,(uint32_t)strtoul(ao,0,0));   /* BS_ALU_OPERAND = za (operand a zero-pt) */
+      if(ao) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(ao,0,0));   /* BS_ALU_OPERAND = za (operand a zero-pt) */
       /* SDP DPU ALU-mode registers (rocket rocket_registers.h: 0x4040=BS_CFG, 0x4048=BS_MUL_CFG,
        * 0x4070=EW_CFG w/ EW_ALU_ALGO bits[19:16]: MAX=0,MIN=1,SUM=2,EQL=3). Override to retarget the
        * ALU function (e.g. ADD-routing + algo=0 => on-NPU max(a,b)). RE hooks for building max-reduce. */
       const char*r40=getenv("ORK_EW_R40"),*r48=getenv("ORK_EW_R48"),*r70=getenv("ORK_EW_R70");
-      if(r40) setr(rc,REGCMD_MUL_N,0x1001,0x4040,(uint32_t)strtoul(r40,0,0));
-      if(r48) setr(rc,REGCMD_MUL_N,0x1001,0x4048,(uint32_t)strtoul(r48,0,0));
-      if(r70) setr(rc,REGCMD_MUL_N,0x1001,0x4070,(uint32_t)strtoul(r70,0,0));
+      if(r40) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_CFG,(uint32_t)strtoul(r40,0,0));
+      if(r48) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_MUL_CFG,(uint32_t)strtoul(r48,0,0));
+      if(r70) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0));
       const char*r34=getenv("ORK_EW_R34");   /* ERDMA_CFG 0x5034: ERDMA_DATA_MODE bits[31:30] — per-channel operand-b broadcast RE */
-      if(r34) setr(rc,REGCMD_MUL_N,0x2001,0x5034,(uint32_t)strtoul(r34,0,0)); }
+      if(r34) setrn(rc,REGCMD_MUL_N,RK_SDP_5034,(uint32_t)strtoul(r34,0,0)); }
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
         bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O); return 0; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6738,14 +6738,14 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
      * (validated bit-exact without it) — the reset only mattered for entering int8-matmul mode. */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);        /* output */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);        /* up  (SRDMA)  */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);        /* silu (ERDMA) */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult);         /* OUT_CVT_SCALE = gain mantissa */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);        /* OUT_CVT_SHIFT */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4080,0);                      /* zo = 0 (OUT_CVT_OFFSET) */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4044,0);                      /* za = 0 (BS_ALU_OPERAND) */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4074,0);                      /* zb = 0 (EW_CVT_OFFSET) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* up  (SRDMA)  */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* silu (ERDMA) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);         /* OUT_CVT_SCALE = gain mantissa */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);        /* OUT_CVT_SHIFT */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0);                      /* zo = 0 (OUT_CVT_OFFSET) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0);                      /* za = 0 (BS_ALU_OPERAND) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);                      /* zb = 0 (EW_CVT_OFFSET) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6781,9 +6781,9 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
-    setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6852,14 +6852,14 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)mult);     /* OUT_CVT_SCALE (gain mantissa) */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)shift);    /* OUT_CVT_SHIFT */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4080,0);                  /* zo=0 */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4044,0);                  /* za=0 */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4074,0);                  /* zb=0 */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);     /* OUT_CVT_SCALE (gain mantissa) */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);    /* OUT_CVT_SHIFT */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0);                  /* zo=0 */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0);                  /* za=0 */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);                  /* zb=0 */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6894,16 +6894,16 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_N,M,N);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_ADD_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_ADD_N,0x2001,0x5038,(uint32_t)B.dma);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4084,(uint32_t)mult);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4088,(uint32_t)shift);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4078,bscale);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4044,(uint32_t)za);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4074,(uint32_t)zb);
-    setr(rc,REGCMD_ADD_N,0x1001,0x4080,(uint32_t)zo);
-    { const char*r70=getenv("ORK_EW_R70"); if(r70) setr(rc,REGCMD_ADD_N,0x1001,0x4070,(uint32_t)strtoul(r70,0,0)); }  /* EW_ALU_ALGO override: SUM(2)->MAX(0)/MIN(1) */
+    setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,bscale);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,(uint32_t)za);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)zb);
+    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)zo);
+    { const char*r70=getenv("ORK_EW_R70"); if(r70) setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0)); }  /* EW_ALU_ALGO override: SUM(2)->MAX(0)/MIN(1) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -6942,13 +6942,13 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
         int h=cur_n/2;
         uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
         set_mul_geom(rc,REGCMD_ADD_N,M,h);
-        setr(rc,REGCMD_ADD_N,0x1001,0x4020,(uint32_t)oth->dma);                                  /* out */
-        setr(rc,REGCMD_ADD_N,0x2001,0x5018,(uint32_t)cur->dma);                                  /* a = ch [0,h) */
-        setr(rc,REGCMD_ADD_N,0x2001,0x5038,(uint32_t)(cur->dma+(uint32_t)((size_t)(h/16)*M*16))); /* b = ch [h,2h) */
-        setr(rc,REGCMD_ADD_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_ADD_N,0x1001,0x4088,28);      /* identity out-cvt */
-        setr(rc,REGCMD_ADD_N,0x1001,0x4078,0x4000);                                              /* identity b-scale */
-        setr(rc,REGCMD_ADD_N,0x1001,0x4044,0); setr(rc,REGCMD_ADD_N,0x1001,0x4074,0); setr(rc,REGCMD_ADD_N,0x1001,0x4080,0);
-        setr(rc,REGCMD_ADD_N,0x1001,0x4070,0x904002c0);                                          /* EW_ALU_ALGO = MAX(0) */
+        setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)oth->dma);                                  /* out */
+        setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)cur->dma);                                  /* a = ch [0,h) */
+        setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)(cur->dma+(uint32_t)((size_t)(h/16)*M*16))); /* b = ch [h,2h) */
+        setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,28);      /* identity out-cvt */
+        setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,0x4000);                                              /* identity b-scale */
+        setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,0);
+        setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,0x904002c0);                                          /* EW_ALU_ALGO = MAX(0) */
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
@@ -7088,10 +7088,10 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
-    setr(rc,REGCMD_MUL_F16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5038,(uint32_t)B.dma);
-    setr(rc,REGCMD_MUL_F16_N,0x2001,0x5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7140,33 +7140,33 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
     int NT=N/8; double t0=ork_now_us(); int ok=0;
     for(int t=0; t<NT && ok==0; t++){
         uint32_t rc[REGCMD_MUL_F16_NOTCH_N]; memcpy(rc,REGCMD_MUL_F16_NOTCH,sizeof rc);
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5018,(uint32_t)(A.dma+(size_t)t*8*2));   /* input cols 8t..8t+7 */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5038,(uint32_t)(B.dma+(size_t)t*M*8*2)); /* per-element operand block for tile t */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4020,(uint32_t)(O.dma+(size_t)t*M*16));  /* tile slot: 8xM atom block */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5018,(uint32_t)(A.dma+(size_t)t*8*2));   /* input cols 8t..8t+7 */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5038,(uint32_t)(B.dma+(size_t)t*M*8*2)); /* per-element operand block for tile t */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(O.dma+(size_t)t*M*16));  /* tile slot: 8xM atom block */
         /* COMPACT atom-8 output for the 8-channel tile (override the vendor's downstream 0x400 stride) so the
          * readback O+t*M*16 + m*16 + j*2 matches (1 surface, M rows). */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4024,(uint32_t)(M*16));                  /* DST_SURF_STRIDE */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4030,(uint32_t)(M-1));
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4034,0);
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x403c,(uint32_t)((7<<16)|7));             /* 8 channels */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4058,7);
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x405c,(uint32_t)(M-1));
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x40c0,(uint32_t)(M*16));
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)(M*16));                  /* DST_SURF_STRIDE */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,0);
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N_DIMS,(uint32_t)((7<<16)|7));             /* 8 channels */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N2,7);
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_SURFACE_ADD,(uint32_t)(M*16));
         if(getenv("ORK_MULC_HROW")){                                                    /* rows as HEIGHT lines (LINE_NOTCH acts between heights) */
-            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,0);                             /* RDMA WIDTH = 1 */
-            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5010,(uint32_t)(M-1));               /* RDMA HEIGHT = M-1 (rows) */
-            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4030,0);                             /* DPU WIDTH = 1 */
-            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4034,(uint32_t)(M-1));               /* DPU HEIGHT = M-1 */
+            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,0);                             /* RDMA WIDTH = 1 */
+            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5010,(uint32_t)(M-1));               /* RDMA HEIGHT = M-1 (rows) */
+            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,0);                             /* DPU WIDTH = 1 */
+            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,(uint32_t)(M-1));               /* DPU HEIGHT = M-1 */
         } else {
-            setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x500c,(uint32_t)(M-1));               /* WIDTH = M-1 */
+            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,(uint32_t)(M-1));               /* WIDTH = M-1 */
         }
         /* vendor task13 is PER-ELEMENT (DATA_MODE=2, compiler broadcast [1,1,N]->[M,N]); switch to PER-CHANNEL
          * (DATA_MODE=0) so an [N] scale operand applies per output channel. */
         uint32_t ewcfg=getenv("ORK_MULC_EW")?strtoul(getenv("ORK_MULC_EW"),0,0):0x20800384; /* vendor: EW mul, DATA_MODE=2 (per-element), fp16 */
         uint32_t erdma=getenv("ORK_MULC_ERDMA")?strtoul(getenv("ORK_MULC_ERDMA"),0,0):0x8000000a; /* vendor: per-element, 2-byte */
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x1001,0x4070,ewcfg);
-        setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5034,erdma);
-        if(N!=64){ setr(rc,REGCMD_MUL_F16_NOTCH_N,0x2001,0x5048,(uint32_t)((N-8)<<19)); } /* SRC_DMA_CFG.LINE_NOTCH_ADDR[31:19]=N-8 (row-stride skip) */
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_EW_CFG,ewcfg);
+        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5034,erdma);
+        if(N!=64){ setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5048,(uint32_t)((N-8)<<19)); } /* SRC_DMA_CFG.LINE_NOTCH_ADDR[31:19]=N-8 (row-stride skip) */
         memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
@@ -7206,12 +7206,12 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)shift);
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7378,12 +7378,12 @@ int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_
     bsync(fd,&In,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
     uint32_t rc[REGCMD_RESHAPE_F16_N]; memcpy(rc,REGCMD_RESHAPE_F16,sizeof rc);
-    setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1070,(uint32_t)In.dma);    /* input base (CNA activation) */
-    setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1110,(uint32_t)W.dma);     /* weight base (permutation) */
-    setr(rc,REGCMD_RESHAPE_F16_N,0x1001,0x4020,(uint32_t)O.dma);    /* output base (DPU) */
+    setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)In.dma);    /* input base (CNA activation) */
+    setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W.dma);     /* weight base (permutation) */
+    setrn(rc,REGCMD_RESHAPE_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);    /* output base (DPU) */
     { const char*e;   /* RE: reconcile the reshape read geometry to OUR contiguous [M][N] input pitch */
-      if((e=getenv("ORK_RSH_107C"))) setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x107c,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_RSH_1080"))) setr(rc,REGCMD_RESHAPE_F16_N,0x201,0x1080,(uint32_t)strtoul(e,0,0)); }
+      if((e=getenv("ORK_RSH_107C"))) setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON1,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_RSH_1080"))) setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON2,(uint32_t)strtoul(e,0,0)); }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
       t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
@@ -7433,21 +7433,21 @@ int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     #define RQENV(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4010,RQENV("ORK_RQ_4010",0x30000001)); /* OUT int16 | IN int32 | PROC int16 */
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5040,RQENV("ORK_RQ_MSTRIDE",(uint32_t)(M*32))); /* main int32 surf stride */
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)A.dma);        /* main input = int32 G */
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)B.dma);        /* per-channel scale vector */
-    setr(rc,REGCMD_MUL_I16_N,0x2001,0x5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
-    { const char*e=getenv("ORK_RQ_5044"); if(e) setr(rc,REGCMD_MUL_I16_N,0x2001,0x5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_PRECISION,RQENV("ORK_RQ_4010",0x30000001)); /* OUT int16 | IN int32 | PROC int16 */
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5040,RQENV("ORK_RQ_MSTRIDE",(uint32_t)(M*32))); /* main int32 surf stride */
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);        /* main input = int32 G */
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);        /* per-channel scale vector */
+    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
+    { const char*e=getenv("ORK_RQ_5044"); if(e) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
     /* OVER-FETCH hack: RDMA input dims (0x500c width / 0x5014 channel) are DECOUPLED from the DPU output dims
      * (0x4058/0x405c). If the RDMA is stuck 2-byte fetching 2E but the DPU consumes 4E (int32) -> 50% starve,
      * INFLATE the RDMA element count so it fetches 4E bytes -> both terminal counts hit together -> clean. */
     { const char*e;
-      if((e=getenv("ORK_RQ_5014"))) setr(rc,REGCMD_MUL_I16_N,0x2001,0x5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
-      if((e=getenv("ORK_RQ_500C"))) setr(rc,REGCMD_MUL_I16_N,0x2001,0x500c,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)shift);
-    setr(rc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
+      if((e=getenv("ORK_RQ_5014"))) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
+      if((e=getenv("ORK_RQ_500C"))) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_500C,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
     #undef RQENV
     if(getenv("ORK_RQ_DUMP")){ for(int k=0;k+1<REGCMD_MUL_I16_N;k+=2){ unsigned rg=rc[k]&0xffff; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
         if(rg==0x4010||rg==0x4020||rg==0x4024||rg==0x40c0||rg==0x5018||rg==0x5034||rg==0x5038||rg==0x5040||rg==0x5044||rg==0x4084||rg==0x4088) fprintf(stderr,"  [rq] reg=%04x val=%08x\n",rg,v);} }
@@ -7488,12 +7488,12 @@ int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int 
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);            /* a (SRDMA, per-element) */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B.dma);            /* b (ERDMA / EW_BASE) */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5034,0x00000004);                /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=1 */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0); setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); /* za/zb/zo = 0 (drop captured zero-points) */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
+    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* a (SRDMA, per-element) */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);            /* b (ERDMA / EW_BASE) */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5034,0x00000004);                /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=1 */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); /* za/zb/zo = 0 (drop captured zero-points) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7532,12 +7532,12 @@ int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,
     /* EW MUL out=a*b, b (ERDMA 0x5038) as a PER-CHANNEL vector via ERDMA_DATA_MODE (0x5034 bits[31:30]). */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O.dma);            /* output */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A.dma);            /* input a (SRDMA, per-element) */
-    setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)S.dma);            /* scale b (ERDMA / EW_BASE) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* input a (SRDMA, per-element) */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)S.dma);            /* scale b (ERDMA / EW_BASE) */
     #define ENV32(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
-    setr(rc,REGCMD_MUL_N,0x2001,0x5034,ENV32("ORK_ERDMA",0x40000000)); /* ERDMA_CFG: ERDMA_DATA_MODE bits[31:30] (sweep per-channel) */
-    setr(rc,REGCMD_MUL_N,0x1001,0x4084,ENV32("ORK_BS_GAIN",0x00004000)); setr(rc,REGCMD_MUL_N,0x1001,0x4088,28); /* out gain */
+    setrn(rc,REGCMD_MUL_N,RK_SDP_5034,ENV32("ORK_ERDMA",0x40000000)); /* ERDMA_CFG: ERDMA_DATA_MODE bits[31:30] (sweep per-channel) */
+    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,ENV32("ORK_BS_GAIN",0x00004000)); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,28); /* out gain */
     #undef ENV32
     if(getenv("ORK_BS_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2){ unsigned rg=rc[k]&0xffff,ln=rc[k+1]>>16; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); if(rg==0x4020||rg==0x4070||rg==0x5018||rg==0x5034||rg==0x5038) printf("  reg=%04x lane=%04x val=%08x\n",rg,ln,v);} }
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7595,9 +7595,9 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_F16_N]; memcpy(rc,REGCMD_ADD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_F16_N,M,N);
-    setr(rc,REGCMD_ADD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_ADD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_ADD_F16_N,0x2001,0x5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_ADD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5038,(uint32_t)B.dma);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7642,9 +7642,9 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_ADD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_ADD_I16_N,0x2001,0x5038,(uint32_t)B.dma);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5038,(uint32_t)B.dma);
     /* EXPERIMENTAL: int16 add is NOT bit-exact over the signed range. Isolated: the ERDMA/X2 operand (0x5038, via
      * 0x4078) is exact for BOTH signs; the SRDMA/X1 operand (0x5018, via 0x4084) is exact for POSITIVE but HALVES
      * NEGATIVES (int8's X1 didn't — a int16-specific X1 sign/shift behavior). 0x4048 and the shift couple into it,
@@ -7655,11 +7655,11 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     if((e=getenv("ORK_ADD16_R84")))r84=(uint32_t)strtoul(e,0,16);
     if((e=getenv("ORK_ADD16_R88")))r88=(uint32_t)strtoul(e,0,16);
     if((e=getenv("ORK_ADD16_R78")))r78=(uint32_t)strtoul(e,0,16);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4048,r48);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4084,r84);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4088,r88);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4078,r78);
-    setr(rc,REGCMD_ADD_I16_N,0x1001,0x4044,0); setr(rc,REGCMD_ADD_I16_N,0x1001,0x4074,0); setr(rc,REGCMD_ADD_I16_N,0x1001,0x4080,0);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_MUL_CFG,r48);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SCALE,r84);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SHIFT,r88);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_SCALE,r78);
+    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -7703,7 +7703,7 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
 
     /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) ---- */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -7719,16 +7719,16 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     /* ---- submit 2: standalone SiLU op (enable=0x18, regcfg=69) reading the resident LUT ---- */
     uint32_t rc[REGCMD_SILU_STD_N]; memcpy(rc,REGCMD_SILU_STD,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
-    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5040,0);                 /* single-input: no ERDMA 2nd operand */
-    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5038,0);                 /* (set_mul_geom is for the 2-input EW-mul) */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4020,(uint32_t)O.dma);   /* output */
-    setr(rc,REGCMD_SILU_STD_N,0x2001,0x5018,(uint32_t)A.dma);   /* input (SRDMA) */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4084,(uint32_t)r_mult);  /* R mantissa */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4088,(uint32_t)r_shift); /* R shift */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4080,out_bias);          /* out_bias */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4110,idx_off);           /* C0 index offset */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4064,cfg4064);           /* index param */
-    setr(rc,REGCMD_SILU_STD_N,0x1001,0x4068,cfg4068);           /* index param */
+    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0);                 /* single-input: no ERDMA 2nd operand */
+    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);                 /* (set_mul_geom is for the 2-input EW-mul) */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);   /* output */
+    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,(uint32_t)A.dma);   /* input (SRDMA) */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);  /* R mantissa */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift); /* R shift */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);          /* out_bias */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,idx_off);           /* C0 index offset */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,cfg4064);           /* index param */
+    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,cfg4068);           /* index param */
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     /* full task setup — submit-1 repointed regcmd_addr at the LUT-load buffer, so re-point it here */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
@@ -7773,7 +7773,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
 
     /* submit 1: LUT-load */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -7792,13 +7792,13 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     /* submit 2: standalone fp16 activation op */
     uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_F16_N,M,N);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5040,0);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5038,0);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4110,idx_off);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4064,cfg4064);
-    setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4068,cfg4068);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5040,0);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5038,0);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_R4110,idx_off);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_ALU_CFG,cfg4064);
+    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_MUL_CFG,cfg4068);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
@@ -7840,7 +7840,7 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
         if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }while(0)
     /* submit 1: fp16 LUT-load (verbatim; patch only the scratch out addr) — uses Lrc not c->regcmd (2210 words) */
     memcpy(Lrc.cpu,loader,(size_t)ln*4);
-    setr((uint32_t*)Lrc.cpu,ln,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,ln,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
@@ -7850,14 +7850,14 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     }
     /* submit 2: stage-1 (REGCMD_SILU_STD_F16, sigmoid via LE-LUT) VERBATIM, x@A -> sigmoid@S */
     { uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
-      setr(rc,REGCMD_SILU_STD_F16_N,0x1001,0x4020,(uint32_t)S.dma);
-      setr(rc,REGCMD_SILU_STD_F16_N,0x2001,0x5018,(uint32_t)A.dma);
+      setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)S.dma);
+      setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
       SUBMIT1(rc,REGCMD_SILU_STD_F16_N,69); }
     /* submit 3: stage-2 (REGCMD_SILU_F16_T2, x*sigmoid) VERBATIM, sigmoid@S (0x5018) * x@A (0x5038) -> O */
     { uint32_t rc[REGCMD_SILU_F16_T2_N]; memcpy(rc,REGCMD_SILU_F16_T2,sizeof rc);
-      setr(rc,REGCMD_SILU_F16_T2_N,0x1001,0x4020,(uint32_t)O.dma);
-      setr(rc,REGCMD_SILU_F16_T2_N,0x2001,0x5018,(uint32_t)S.dma);
-      setr(rc,REGCMD_SILU_F16_T2_N,0x2001,0x5038,(uint32_t)A.dma);
+      setrn(rc,REGCMD_SILU_F16_T2_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+      setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5018,(uint32_t)S.dma);
+      setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5038,(uint32_t)A.dma);
       SUBMIT1(rc,REGCMD_SILU_F16_T2_N,69); }
     bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=0;
@@ -8080,23 +8080,23 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
 
     /* Build the LUT-load regcmd content + the activation regcmd ONCE. */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memcpy(rc,REGCMD_SILU_STD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_I16_N,M,N);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4084,(uint32_t)r_mult);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4088,(uint32_t)r_shift);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4080,out_bias);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4110,idx_off);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4064,cfg4064);
-    setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4068,cfg4068);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,idx_off);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,cfg4064);
+    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,cfg4068);
     memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* #35: the int16 silu is a STANDALONE pure-SDP op (enable_mask 0x18). IN A CHAIN, its submit wedges in
@@ -8182,10 +8182,10 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     memset(Cc.cpu,0,cszg);
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
-    setr(rc,rn,0x201,0x1070,(uint32_t)A.dma);            /* A (activations) */
-    setr(rc,rn,0x201,0x1110,(uint32_t)B.dma);            /* B (weights) */
-    setr(rc,rn,0x1001,0x4020,(uint32_t)Cc.dma);          /* C (int32 output) */
-    setr(rc,rn,0x1001,0x40c0,(uint32_t)Cc.dma);          /* #39: DPU_SURFACE_ADD is ALSO an output IOVA — MUST be patched or the mfold WDMA writes to a wild address and hangs the AXI bus (hard wedge). */
+    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
+    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);            /* B (weights) */
+    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C (int32 output) */
+    setrn(rc,rn,RK_DPU_SURFACE_ADD,(uint32_t)Cc.dma);          /* #39: DPU_SURFACE_ADD is ALSO an output IOVA — MUST be patched or the mfold WDMA writes to a wild address and hangs the AXI bus (hard wedge). */
     bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
@@ -8225,7 +8225,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
       for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
           lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -8242,9 +8242,9 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     }
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
     set_mul_geom(rc,rn,M,N);
-    setr(rc,rn,0x2001,0x5040,0); setr(rc,rn,0x2001,0x5038,0);
-    setr(rc,rn,0x1001,0x4020,(uint32_t)O.dma);
-    setr(rc,rn,0x2001,0x5018,(uint32_t)A.dma);
+    setrn(rc,rn,RK_SDP_5040,0); setrn(rc,rn,RK_SDP_5038,0);
+    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(rc,rn,RK_SDP_5018,(uint32_t)A.dma);
     memcpy(c->regcmd.cpu,rc,(size_t)rn*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(uint32_t)(rn/2-4); tk->regcmd_addr=c->regcmd.dma;
@@ -8311,7 +8311,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
 
     /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) — streams the silu LUT into PPU SRAM ---- */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma); /* patch the one output addr */
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma); /* patch the one output addr */
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;   /* override LUT data: stream lut[] into the 0x4104 writes in order */
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
@@ -8553,7 +8553,7 @@ int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in
 
     /* submit 1: LUT-load (separate; loads the silu LUT into SDP SRAM, ping-pong OFF) */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -8572,16 +8572,16 @@ int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;   /* next register-amount = (silu regcfg+3)/2 */
       memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
       set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0);
-      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
       bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
       struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
       tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
@@ -8637,7 +8637,7 @@ int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
     { uint16_t*wd=Wd.cpu,*ad=Ad.cpu; for(int i=0;i<32*32;i++)wd[i]=0x3c00; for(int i=0;i<32;i++)ad[i]=0x3c00; } /* fp16 1.0 -> C=32 */
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -8654,10 +8654,10 @@ int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;
       memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
       set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-      setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0); setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma); setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)A.dma);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
-      setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064); setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma); setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
       bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
       struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
       tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
@@ -8726,7 +8726,7 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
      * NPU op after act(RESET) (diagnostic: does a preceding SDP LUT-load poison the following int8 matmul?). */
     if(!getenv("ORK_GS_NOLUT")){
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setr((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)Lsc.dma);
+    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
     bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -8742,16 +8742,16 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
     set_i16_out(mm,N,0,mult,shift);
     memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
     set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0);
-    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(si,REGCMD_SILU_STD_I16_N,0x2001,0x5018,(uint32_t)G.dma);            /* silu INPUT = matmul OUTPUT */
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000u);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14u);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0u);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064);
-    setr(si,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)G.dma);            /* silu INPUT = matmul OUTPUT */
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
+    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
 
     double t0=ork_now_us();
     if(getenv("ORK_GS_SEQ")){
@@ -8830,33 +8830,33 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
     synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
     set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
-    { const char*e=getenv("ORK_I16_MM4010"); if(e) setr(mm,REGCMD_I8_N,0x1001,0x4010,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
+    { const char*e=getenv("ORK_I16_MM4010"); if(e) setrn(mm,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
     /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
      * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
      * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
     if(getenv("ORK_I16_MULTMPL")){   /* OLD: standalone-captured REGCMD_MUL_I16 (hangs chained — no chained-ERDMA arming) */
         memcpy(pc,REGCMD_MUL_I16,sizeof pc);
         set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
-        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4020,(uint32_t)O.dma);
-        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5018,(uint32_t)G.dma);
-        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5038,(uint32_t)SB.dma);
-        setr(pc,REGCMD_MUL_I16_N,0x2001,0x5034,r34);
-        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4088,(uint32_t)s2);
-        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4080,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4044,0); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4074,0);
-        setr(pc,REGCMD_MUL_I16_N,0x1001,0x4040,0x00000053); setr(pc,REGCMD_MUL_I16_N,0x1001,0x4060,0x00000053);
+        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)G.dma);
+        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)SB.dma);
+        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5034,r34);
+        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2);
+        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
+        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_CFG,0x00000053); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BN_CFG,0x00000053);
     } else {   /* CHAIN-SAFE int16 SDP = the PROVEN chained fp16 template (REGCMD_MUL_F16_CHAIN, vendor conv->mul
                 * chained-ERDMA arming), patched precision fp16->int16: 0x4010 int16 DATA_FORMAT, int16 requant
                 * (m2/s2), ERDMA per-channel 2-byte. The chain-safe arming (0x5004/0x5008/0x5044/BS-bypass) is
                 * inherited verbatim — that's what REGCMD_MUL_I16 lacked. */
         memcpy(pc,REGCMD_MUL_F16_CHAIN,REGCMD_MUL_F16_CHAIN_N*4);
         set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4020,(uint32_t)O.dma);
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5018,(uint32_t)G.dma);
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5038,(uint32_t)SB.dma);
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
         uint32_t r10=getenv("ORK_I16_R4010")?strtoul(getenv("ORK_I16_R4010"),0,0):0x24000001; /* int16 DATA_FORMAT (was fp16 0x48000002) */
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4010,r10);
-        setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4084,(uint32_t)m2); setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4088,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_PRECISION,r10);
+        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
     }
     double t0=ork_now_us();
     int crc;
@@ -8920,10 +8920,10 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     set_f16_out_fp16in(mm,M,N);                                                   /* fp16-out ATOM-8 stage (matches the SDP's set_mul_geom layout) */
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
     set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x1001,0x4020,(uint32_t)O.dma);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5018,(uint32_t)G.dma);                /* INPUT = matmul OUTPUT (bridge) */
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5038,(uint32_t)SB.dma);
-    setr(pc,REGCMD_MUL_F16_CHAIN_N,0x2001,0x5034,r34);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);                /* INPUT = matmul OUTPUT (bridge) */
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,r34);
     double t0=ork_now_us();
     ork_chain_prog progs[2]={ {mm,REGCMD_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,-1} };
     int crc=ork_npu_chain_progs(c,2,progs,dom);
@@ -9003,7 +9003,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     int8_t*ad=c->Af.cpu; memset(ad,1,K); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    setr(rc,REGCMD_I8_N,0x201,0x1040,0xb1);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
     for (int i = 0; i < ntask; i++) {
@@ -9048,7 +9048,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N];
     synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
-    setr(rc,REGCMD_N,0x201,0x1040,0xb1);
+    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
     for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
     struct buf extra[2] = {W, O};
     if (validate_regcmd("probe_slice_f16", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
@@ -9189,7 +9189,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
         uint32_t act_dma = (uint32_t)(c->Af.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
         synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
+        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         struct buf extra[2] = {W, O};
         if (validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
         
@@ -9277,7 +9277,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
         synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
+        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         
         if (i < S - 1) {
             uint64_t next_dma = regs_chain.dma + (i + 1) * REGCMD_I8_N * 4;
@@ -9296,7 +9296,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
         synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setr(rc, REGCMD_I8_N, 0x201, 0x1040, 0xb1);
+        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;
         memcpy((char*)regs_sep.cpu + i * REGCMD_I8_N * 4, rc, sizeof(rc));
     }
@@ -9867,18 +9867,18 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                 int tn = (kind == OP_SILU) ? REGCMD_SILU_STD_N : REGCMD_MUL_N;
                 memcpy(rc, tmpl, (size_t)tn * 4);
                 set_mul_geom(rc, tn, mc, N);
-                setr(rc, tn, 0x1001, 0x4020, out_dma[i]);              // output
-                setr(rc, tn, 0x2001, 0x5018, out_dma[in0]);            // operand a = prior output, ALIASED
+                setrn(rc, tn,RK_DPU_DST_BASE_ADDR, out_dma[i]);              // output
+                setrn(rc, tn,RK_SDP_5018, out_dma[in0]);            // operand a = prior output, ALIASED
                 if (kind == OP_SILU) {
-                    setr(rc, tn, 0x2001, 0x5040, 0); setr(rc, tn, 0x2001, 0x5038, 0);   // single-input
-                    setr(rc, tn, 0x1001, 0x4084, (uint32_t)ss->r_mult); setr(rc, tn, 0x1001, 0x4088, (uint32_t)ss->r_shift);
-                    setr(rc, tn, 0x1001, 0x4080, ss->out_bias);
-                    setr(rc, tn, 0x1001, 0x4110, ss->idx_off); setr(rc, tn, 0x1001, 0x4064, ss->cfg4064); setr(rc, tn, 0x1001, 0x4068, ss->cfg4068);
+                    setrn(rc, tn,RK_SDP_5040, 0); setrn(rc, tn,RK_SDP_5038, 0);   // single-input
+                    setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->r_mult); setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->r_shift);
+                    setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, ss->out_bias);
+                    setrn(rc, tn,RK_DPU_R4110, ss->idx_off); setrn(rc, tn,RK_DPU_BN_ALU_CFG, ss->cfg4064); setrn(rc, tn,RK_DPU_BN_MUL_CFG, ss->cfg4068);
                 } else {   // OP_EWMUL: out = a (*) b ; b = second prior output (silu*up for glu)
                     int in1 = ss->ops[i].in1;
-                    setr(rc, tn, 0x2001, 0x5038, out_dma[in1]);        // operand b, ALIASED
-                    setr(rc, tn, 0x1001, 0x4084, (uint32_t)ss->ops[i].mult); setr(rc, tn, 0x1001, 0x4088, (uint32_t)ss->ops[i].shift);
-                    setr(rc, tn, 0x1001, 0x4080, 0); setr(rc, tn, 0x1001, 0x4044, 0); setr(rc, tn, 0x1001, 0x4074, 0);
+                    setrn(rc, tn,RK_SDP_5038, out_dma[in1]);        // operand b, ALIASED
+                    setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->ops[i].mult); setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->ops[i].shift);
+                    setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, 0); setrn(rc, tn,RK_DPU_BS_ALU_CFG, 0); setrn(rc, tn,RK_DPU_EW_CVT_OFFSET, 0);
                 }
             } else {
                 // activation source: ops[i].in0 >= 0 -> a PRIOR task's output (aliased, e.g. down reads glu);
@@ -9928,7 +9928,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         }
         if (c->chain_lut_p[cc] != ss->lut) {   /* (re)build THIS core's Lrc only when its LUT identity changes */
             memcpy(LRC->cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
-            setr((uint32_t*)LRC->cpu, REGCMD_SILU_LUT_N, 0x1001, 0x4020, (uint32_t)LSC->dma);
+            setrn((uint32_t*)LRC->cpu, REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR, (uint32_t)LSC->dma);
             { uint32_t *lr=(uint32_t*)LRC->cpu; int j=0;
               for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
                   int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
@@ -11093,10 +11093,10 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) *(int16_t*)(a+EWCUBEH_S(m,nn))=ha[m*N+nn];
         uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N*2;
         memcpy(rc,REGCMD_SILU_STD_I16,REGCMD_SILU_STD_I16_N*4); set_mul_geom(rc,REGCMD_SILU_STD_I16_N,M,N);
-        setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5038,0);
-        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+*coff)); setr(rc,REGCMD_SILU_STD_I16_N,0x2001,0x5018,adma);
-        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4088,14); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4080,0);
-        setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4110,ORK_SILU16_IDXOFF); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4064,ORK_SILU16_C4064); setr(rc,REGCMD_SILU_STD_I16_N,0x1001,0x4068,ORK_SILU16_C4068);
+        setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,adma);
+        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
+        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
         rcw=REGCMD_SILU_STD_I16_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=2; h->ocube[gi]=2;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*2;
@@ -11106,10 +11106,10 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn];
         uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N;
         memcpy(rc,REGCMD_SILU_STD,REGCMD_SILU_STD_N*4); set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
-        setr(rc,REGCMD_SILU_STD_N,0x2001,0x5040,0); setr(rc,REGCMD_SILU_STD_N,0x2001,0x5038,0);
-        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+*coff)); setr(rc,REGCMD_SILU_STD_N,0x2001,0x5018,adma);
-        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4084,0x4000); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4088,14); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4080,0);
-        setr(rc,REGCMD_SILU_STD_N,0x1001,0x4110,ORK_SILU_IDXOFF); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4064,ORK_SILU_C4064); setr(rc,REGCMD_SILU_STD_N,0x1001,0x4068,ORK_SILU_C4068);
+        setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0); setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);
+        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,adma);
+        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,14); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,0);
+        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,ORK_SILU_IDXOFF); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,ORK_SILU_C4064); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,ORK_SILU_C4068);
         rcw=REGCMD_SILU_STD_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=1; h->ocube[gi]=1;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N;
@@ -11118,9 +11118,9 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++){ a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn]; b[ORK_SEQCUBE(m,nn,M)]=hb[m*N+nn]; }
         uint32_t adma=(uint32_t)(AF->dma+*astage), bdma=(uint32_t)(AF->dma+*astage+(size_t)M*N); *astage+=(size_t)2*M*N;
         memcpy(rc,REGCMD_MUL,REGCMD_MUL_N*4); set_mul_geom(rc,REGCMD_MUL_N,M,N);
-        setr(rc,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)(h->seq_out.dma+*coff)); setr(rc,REGCMD_MUL_N,0x2001,0x5018,adma); setr(rc,REGCMD_MUL_N,0x2001,0x5038,bdma);
-        setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)o->mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)o->shift);
-        setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0);
+        setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_MUL_N,RK_SDP_5018,adma); setrn(rc,REGCMD_MUL_N,RK_SDP_5038,bdma);
+        setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)o->mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)o->shift);
+        setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
         rcw=REGCMD_MUL_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=1; h->ocube[gi]=1;
         h->ooff[gi]=*coff; h->dst[gi]=o->C; *coff+=(size_t)M*N;
@@ -11188,7 +11188,7 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
         h->silu_lsc=bcreate(fd,4096,0x403,c->dom_active);
         if(!h->silu_lrc.cpu||!h->silu_lsc.cpu){ if(h->silu_lrc.cpu)bdestroy(fd,&h->silu_lrc); if(h->silu_lsc.cpu)bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; }
         memcpy(h->silu_lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-        setr((uint32_t*)h->silu_lrc.cpu,REGCMD_SILU_LUT_N,0x1001,0x4020,(uint32_t)h->silu_lsc.dma);
+        setrn((uint32_t*)h->silu_lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)h->silu_lsc.dma);
         { uint32_t*lr=(uint32_t*)h->silu_lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
         bsync(fd,&h->silu_lrc,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -11840,9 +11840,9 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
       rc[218]=0x0014|((uint32_t)amt<<16);         rc[219]=(0x0101u<<16);
       memcpy(base+0*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
     { uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc); set_mul_geom(rc,REGCMD_MUL_N,M,N);
-      setr(rc,REGCMD_MUL_N,0x1001,0x4020,oe); setr(rc,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)(AF->dma+offEwA)); setr(rc,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)(AF->dma+offEwB));
-      setr(rc,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
-      setr(rc,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc,REGCMD_MUL_N,0x1001,0x4074,0);
+      setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,oe); setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)(AF->dma+offEwA)); setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)(AF->dma+offEwB));
+      setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+      setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
       uint64_t nx=RC->dma + (size_t)2*REGCMD_I8_N*4; int amt=(108+3)/2;        /* -> prog2 (matmul regcfg 108) */
       rc[138]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[139]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
       rc[140]=0x0014|((uint32_t)amt<<16);         rc[141]=(0x0101u<<16);
@@ -11914,13 +11914,13 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     /* build the two ewmul regcmds exactly like the standalone ork_npu_ewmul_i8 (geom + addrs + scale) */
     uint32_t rc0[REGCMD_MUL_N],rc1[REGCMD_MUL_N];
     memcpy(rc0,REGCMD_MUL,sizeof rc0); set_mul_geom(rc0,REGCMD_MUL_N,M,N);
-    setr(rc0,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O0.dma); setr(rc0,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A0.dma); setr(rc0,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B0.dma);
-    setr(rc0,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc0,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
-    setr(rc0,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc0,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc0,REGCMD_MUL_N,0x1001,0x4074,0);
+    setrn(rc0,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O0.dma); setrn(rc0,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A0.dma); setrn(rc0,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B0.dma);
+    setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc0,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc0,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
     memcpy(rc1,REGCMD_MUL,sizeof rc1); set_mul_geom(rc1,REGCMD_MUL_N,M,N);
-    setr(rc1,REGCMD_MUL_N,0x1001,0x4020,(uint32_t)O1.dma); setr(rc1,REGCMD_MUL_N,0x2001,0x5018,(uint32_t)A1.dma); setr(rc1,REGCMD_MUL_N,0x2001,0x5038,(uint32_t)B1.dma);
-    setr(rc1,REGCMD_MUL_N,0x1001,0x4084,(uint32_t)mult); setr(rc1,REGCMD_MUL_N,0x1001,0x4088,(uint32_t)shift);
-    setr(rc1,REGCMD_MUL_N,0x1001,0x4080,0); setr(rc1,REGCMD_MUL_N,0x1001,0x4044,0); setr(rc1,REGCMD_MUL_N,0x1001,0x4074,0);
+    setrn(rc1,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O1.dma); setrn(rc1,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A1.dma); setrn(rc1,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B1.dma);
+    setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc1,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc1,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
     /* THE PORT: SDP progs through the proven chainer. ewmul0 is a MIDDLE program (desc_slot=138 = the chain-native
      * descriptor slot decoded from SM_TASK0); ewmul1 is the terminal (desc_slot=-1). chain_progs writes ewmul0's
      * forward descriptor at 138, detects enable!=0xd -> ping-pong OFF, and does the reps=2 cold warm-up. */

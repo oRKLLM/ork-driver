@@ -1,4 +1,4 @@
-/* rocket_regs.h — named NPU regcmd registers, cross-referenced to the mainline accel/rocket driver
+/* ork_regs.h — ork's named NPU regcmd register layer, CROSS-REFERENCED to (not copied from) the mainline accel/rocket driver
  * (rocket_registers.h) + RK3588 TRM ch.36 / NVDLA. The regcmd synth code sets registers BY NAME via
  * SETRN(), which validates the value against the register's defined bit-width (a value with bits outside
  * the register's fields is a bug — caught here, not silently truncated on silicon). Raw/unbounded writes
@@ -11,8 +11,8 @@
  * Blocks (regcmd (block,offset) pairs): 0x0201 CNA (conv/matmul input), 0x1001 DPU (output stage),
  * 0x0801 PDP/aux output dims, 0x0101 PC (program-chain). See wiki regcmd-ISA-Reference.
  */
-#ifndef ORK_ROCKET_REGS_H
-#define ORK_ROCKET_REGS_H
+#ifndef ORK_REGS_H
+#define ORK_REGS_H
 #include <stdint.h>
 
 #define OKR_ANY 0xffffffffu
@@ -56,6 +56,34 @@ enum ork_reg_id {
     /* ── PC block 0x0101 (program chaining) ──────────────────────────────────────────── */
     RK_PC_NEXT_ADDR,        /* 0x0010 next regcmd IOVA (0=end) */
     RK_PC_NEXT_AMOUNT,      /* 0x0014 next register-amount */
+    /* ── DPU output-stage (block 0x1001) — bias(BS)/batchnorm(BN)/elementwise(EW)/requant(OUT_CVT) ─── */
+    RK_DPU_S_POINTER,            /* 4004 DPU_S_POINTER */
+    RK_DPU_FEATURE_MODE_CFG,     /* 400c DPU_FEATURE_MODE_CFG */
+    RK_DPU_BS_CFG,               /* 4040 DPU_BS_CFG */
+    RK_DPU_BS_ALU_CFG,           /* 4044 DPU_BS_ALU_CFG */
+    RK_DPU_BS_MUL_CFG,           /* 4048 DPU_BS_MUL_CFG */
+    RK_DPU_BS_OW_CFG,            /* 4050 DPU_BS_OW_CFG */
+    RK_DPU_BN_CFG,               /* 4060 DPU_BN_CFG */
+    RK_DPU_BN_ALU_CFG,           /* 4064 DPU_BN_ALU_CFG */
+    RK_DPU_BN_MUL_CFG,           /* 4068 DPU_BN_MUL_CFG */
+    RK_DPU_EW_CFG,               /* 4070 DPU_EW_CFG */
+    RK_DPU_EW_CVT_OFFSET,        /* 4074 DPU_EW_CVT_OFFSET_VALUE */
+    RK_DPU_EW_CVT_SCALE,         /* 4078 DPU_EW_CVT_SCALE_VALUE */
+    RK_DPU_OUT_CVT_OFFSET,       /* 4080 DPU_OUT_CVT_OFFSET */
+    RK_DPU_OUT_CVT_SCALE,        /* 4084 DPU_OUT_CVT_SCALE */
+    RK_DPU_OUT_CVT_SHIFT,        /* 4088 DPU_OUT_CVT_SHIFT */
+    RK_DPU_EW_OP_VALUE_0,        /* 4090 DPU_EW_OP_VALUE_0 */
+    RK_DPU_R40C4,                /* 40c4 inferred (not in rocket hdr) */
+    RK_DPU_R4108,                /* 4108 inferred */
+    RK_DPU_R410C,                /* 410c inferred */
+    RK_DPU_R4110,                /* 4110 inferred */
+    RK_DPU_R411C,                /* 411c inferred */
+    RK_DPU_R4128,                /* 4128 inferred */
+    RK_DPU_R412C,                /* 412c inferred */
+    RK_PC_OPERATION_ENABLE,      /* 0081:0008 PC_OPERATION_ENABLE */
+    /* ── SDP/activation block 0x2001 (0x50xx) — silu/gelu/ewmul/requant op regs (inferred by offset) ─── */
+    RK_SDP_5004, RK_SDP_5008, RK_SDP_500C, RK_SDP_5010, RK_SDP_5014, RK_SDP_5018, RK_SDP_501C, RK_SDP_5020,
+    RK_SDP_5028, RK_SDP_5034, RK_SDP_5038, RK_SDP_5040, RK_SDP_5044, RK_SDP_5048, RK_SDP_504C, RK_SDP_506C,
     RK_REG__COUNT
 };
 
@@ -93,6 +121,38 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_PDP_OUT_N]            = {0x801, 0x3018, OKR_ANY,     "PDP_OUT_N"},
     [RK_PC_NEXT_ADDR]         = {0x101, 0x0010, OKR_ANY,     "PC_NEXT_ADDR"},
     [RK_PC_NEXT_AMOUNT]       = {0x101, 0x0014, OKR_ANY,     "PC_NEXT_AMOUNT"},
+    [RK_DPU_S_POINTER]        = {0x1001, 0x4004, OKR_ANY,    "DPU_S_POINTER"},
+    [RK_DPU_FEATURE_MODE_CFG] = {0x1001, 0x400c, OKR_ANY,    "DPU_FEATURE_MODE_CFG"},
+    [RK_DPU_BS_CFG]           = {0x1001, 0x4040, OKR_ANY,    "DPU_BS_CFG"},
+    [RK_DPU_BS_ALU_CFG]       = {0x1001, 0x4044, OKR_ANY,    "DPU_BS_ALU_CFG"},
+    [RK_DPU_BS_MUL_CFG]       = {0x1001, 0x4048, OKR_ANY,    "DPU_BS_MUL_CFG"},
+    [RK_DPU_BS_OW_CFG]        = {0x1001, 0x4050, OKR_ANY,    "DPU_BS_OW_CFG"},
+    [RK_DPU_BN_CFG]           = {0x1001, 0x4060, OKR_ANY,    "DPU_BN_CFG"},
+    [RK_DPU_BN_ALU_CFG]       = {0x1001, 0x4064, OKR_ANY,    "DPU_BN_ALU_CFG"},
+    [RK_DPU_BN_MUL_CFG]       = {0x1001, 0x4068, OKR_ANY,    "DPU_BN_MUL_CFG"},
+    [RK_DPU_EW_CFG]           = {0x1001, 0x4070, OKR_ANY,    "DPU_EW_CFG"},
+    [RK_DPU_EW_CVT_OFFSET]    = {0x1001, 0x4074, OKR_ANY,    "DPU_EW_CVT_OFFSET"},
+    [RK_DPU_EW_CVT_SCALE]     = {0x1001, 0x4078, OKR_ANY,    "DPU_EW_CVT_SCALE"},
+    [RK_DPU_OUT_CVT_OFFSET]   = {0x1001, 0x4080, OKR_ANY,    "DPU_OUT_CVT_OFFSET"},
+    [RK_DPU_OUT_CVT_SCALE]    = {0x1001, 0x4084, OKR_ANY,    "DPU_OUT_CVT_SCALE"},
+    [RK_DPU_OUT_CVT_SHIFT]    = {0x1001, 0x4088, OKR_ANY,    "DPU_OUT_CVT_SHIFT"},
+    [RK_DPU_EW_OP_VALUE_0]    = {0x1001, 0x4090, OKR_ANY,    "DPU_EW_OP_VALUE_0"},
+    [RK_DPU_R40C4]            = {0x1001, 0x40c4, OKR_ANY,    "DPU_R40C4"},
+    [RK_DPU_R4108]            = {0x1001, 0x4108, OKR_ANY,    "DPU_R4108"},
+    [RK_DPU_R410C]            = {0x1001, 0x410c, OKR_ANY,    "DPU_R410C"},
+    [RK_DPU_R4110]            = {0x1001, 0x4110, OKR_ANY,    "DPU_R4110"},
+    [RK_DPU_R411C]            = {0x1001, 0x411c, OKR_ANY,    "DPU_R411C"},
+    [RK_DPU_R4128]            = {0x1001, 0x4128, OKR_ANY,    "DPU_R4128"},
+    [RK_DPU_R412C]            = {0x1001, 0x412c, OKR_ANY,    "DPU_R412C"},
+    [RK_PC_OPERATION_ENABLE]  = {0x81,   0x0008, OKR_ANY,    "PC_OPERATION_ENABLE"},
+    [RK_SDP_5004]={0x2001,0x5004,OKR_ANY,"SDP_5004"},[RK_SDP_5008]={0x2001,0x5008,OKR_ANY,"SDP_5008"},
+    [RK_SDP_500C]={0x2001,0x500c,OKR_ANY,"SDP_500C"},[RK_SDP_5010]={0x2001,0x5010,OKR_ANY,"SDP_5010"},
+    [RK_SDP_5014]={0x2001,0x5014,OKR_ANY,"SDP_5014"},[RK_SDP_5018]={0x2001,0x5018,OKR_ANY,"SDP_5018"},
+    [RK_SDP_501C]={0x2001,0x501c,OKR_ANY,"SDP_501C"},[RK_SDP_5020]={0x2001,0x5020,OKR_ANY,"SDP_5020"},
+    [RK_SDP_5028]={0x2001,0x5028,OKR_ANY,"SDP_5028"},[RK_SDP_5034]={0x2001,0x5034,OKR_ANY,"SDP_5034"},
+    [RK_SDP_5038]={0x2001,0x5038,OKR_ANY,"SDP_5038"},[RK_SDP_5040]={0x2001,0x5040,OKR_ANY,"SDP_5040"},
+    [RK_SDP_5044]={0x2001,0x5044,OKR_ANY,"SDP_5044"},[RK_SDP_5048]={0x2001,0x5048,OKR_ANY,"SDP_5048"},
+    [RK_SDP_504C]={0x2001,0x504c,OKR_ANY,"SDP_504C"},[RK_SDP_506C]={0x2001,0x506c,OKR_ANY,"SDP_506C"},
 };
 
-#endif /* ORK_ROCKET_REGS_H */
+#endif /* ORK_REGS_H */
