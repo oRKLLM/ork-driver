@@ -64,9 +64,16 @@ int main(int argc,char**argv){
     int32_t*Cout=calloc((size_t)M*N,4); double us=0;
     int r=ork_npu_replay_i8(c,rc,rn,M,K,N,Anc,Wok,(int)((size_t)K*N),Cout,2,&us);
     if(r){ printf("submit rc=%d (STALL/err)\n",r); ork_npu_free(c); return 1; }
-    /* INT32 output. de-tile NC1HWC2 (M as width): off(m,n)=(n/16)*(M*16)+m*16+(n%16) int32 elements. */
+    /* dump raw NPU output + CPU ref for OFFLINE layout analysis (find the de-tile that matches) */
+    { FILE*f=fopen("/tmp/mf_cout.bin","wb"); if(f){fwrite(Cout,4,(size_t)M*N,f);fclose(f);}
+      FILE*g=fopen("/tmp/mf_cref.bin","wb"); if(g){fwrite(Cref,4,(size_t)M*N,g);fclose(g);}
+      printf("dumped raw Cout+Cref (M=%d N=%d int32) to /tmp/mf_c{out,ref}.bin\n",M,N); }
+    /* INT32 output NC1HWC2, M-as-width, atom C2=4 (int32: 16-byte atom / 4). VALIDATED bit-exact.
+     * off(m,n) = (n/4)*(M*4) + m*4 + (n%4) int32 elements. (A INPUT uses C2=16 = the int8 atom.) */
+    #define OUT_C2 4
     int bad=0,first=-1; long mx=0;
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int32_t got=Cout[nc_off(m,n,M)], ref=Cref[(size_t)m*N+n];
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){
+        int32_t got=Cout[(size_t)(n/OUT_C2)*((size_t)M*OUT_C2)+(size_t)m*OUT_C2+(n%OUT_C2)], ref=Cref[(size_t)m*N+n];
         long e=labs((long)got-ref); if(e){bad++; if(first<0)first=m*N+n;} if(e>mx)mx=e; }
     printf("RESULT int32 M-fold vs CPU ref: %s  mism=%d/%d maxerr=%ld  %.1f us/submit\n",
            bad?"MISMATCH":"BIT-EXACT ***",bad,M*N,mx,us);
