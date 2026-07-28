@@ -878,7 +878,8 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
  * with tools/re/regcmd_decode against ork_regs.h. Folds M into the CNA WIDTH dim; output int32 NC1HWC2.
  * MEASURED 1.66x ork's own kernel (rkllm regcmd 433 vs ork 719 us/matmul). Built as a DELTA on synth_i8.
  * Corrections from the real capture (supersede earlier RE guesses):
- *   - 0x100c = OKV_CONV1_STD (int32-out bit SET). The fold does NOT clear it; the old "clear-or-STALL" belief
+ *   - 0x100c = OKV_CONV1_GROUP_LINE (GROUP_LINE_OFF bit 29 SET — the fold's feature-read mode, NOT an int32-out
+ *     select; precision is CONV_CON1[9:4], int8=0). The fold SETS it; the old "clear-or-STALL" belief
  *     was an artifact of a broken standalone submit.
  *   - 0x1080 = REAL surface stride 2160/M (60@M36, 108@M20), NOT the 0x0fffffe8 sentinel — that value is
  *     rkllm's M=8 chain-TAIL "inherit CBUF layout" marker and HARD-WEDGES a standalone submit (OOB DMA).
@@ -891,7 +892,7 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
 static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
     synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
     /* --- register-level clone of rkllm's captured M=36 mfold (named via ork_regs.h) --- */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_STD);            /* std int32-out datapath (rkllm SETS this for the fold) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_GROUP_LINE);            /* GROUP_LINE_OFF feature-read (rkllm SETS this for the big-M fold tasks) */
     setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,      0x20);                     /* FEATURE_GRAINS=2 */
     setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into CNA WIDTH (W=M,H=1) */
     setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR, OKC_DATA_SIZE0(mc,1));
@@ -905,11 +906,11 @@ static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t a
     setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,0x600);                   /* 0x4024 output surface stride */
     setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,    0x3000);                  /* 0x40c0 surface/elem-size CONFIG */
     /* extra CNA regs rkllm sets (constant across the captured M values) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_R1014, 0x9);
-    setrn(rc,REGCMD_I8_N,RK_CNA_R104C, 0xb);
-    setrn(rc,REGCMD_I8_N,RK_CNA_R1050, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_R1054, 0x10000);
-    setrn(rc,REGCMD_I8_N,RK_CNA_R1058, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_R105C, 0x10000);
-    setrn(rc,REGCMD_I8_N,RK_CNA_R1078, 0xf000f);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON3, 0x9);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON0, 0xb);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON1, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON2, 0x10000);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON3, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON4, 0x10000);
+    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON0, 0xf000f);
     setrn(rc,REGCMD_I8_N,RK_PDP_R3010, 0x1);                               /* 0x0801:0x3010 */
     /* DPU output stage */
     setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,  OKV_OUT_PREC_INT32);      /* 0x4010 int32 accumulate-out */

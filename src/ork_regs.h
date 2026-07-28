@@ -44,7 +44,7 @@ typedef struct { uint16_t blk; uint16_t off; uint32_t mask; const char *name; co
  */
 enum ork_reg_id {
     /* ── CNA block 0x0201 (conv/matmul input) ───────────────────────────────────────── */
-    RK_CNA_CONV_CON1,       /**< 0x100c @brief CNA datapath mode (CONV_MODE/IN_PRECISION/PROC_PRECISION/NONALIGN_DMA); 0x20000000=std int32-out, 0=M-fold tail. */
+    RK_CNA_CONV_CON1,       /**< 0x100c @brief CNA_CONV_CON1: NONALIGN_DMA[30]/GROUP_LINE_OFF[29]/DECONV[16]/PROC_PRECISION[9:7]/IN_PRECISION[6:4]/CONV_MODE[3:0]. 0x20000000=GROUP_LINE_OFF (M-fold read). */
     RK_CNA_CONV_CON2,       /**< 0x1010 @brief FEATURE_GRAINS[13:4]/KERNEL_GROUP[23:16]: atoms fetched per pass (perf hint). */
     RK_CNA_DATA_SIZE0,      /**< 0x1020 @brief Input feature cube DATAIN_WIDTH[26:16]/DATAIN_HEIGHT[10:0]; the M-fold puts M in WIDTH, HEIGHT=1. */
     RK_CNA_DATA_SIZE1,      /**< 0x1024 @brief Reduction channel count DATAIN_CHANNEL[15:0]/CHANNEL_REAL[29:16] (= K). */
@@ -107,10 +107,10 @@ enum ork_reg_id {
     RK_SDP_5004, RK_SDP_5008, RK_SDP_500C, RK_SDP_5010, RK_SDP_5014, RK_SDP_5018, RK_SDP_501C, RK_SDP_5020,
     RK_SDP_5028, RK_SDP_5034, RK_SDP_5038, RK_SDP_5040, RK_SDP_5044, RK_SDP_5048, RK_SDP_504C, RK_SDP_506C,
     /* ── task #40: registers observed in rkllm's mfold capture, inferred (name unconfirmed) ────────── */
-    RK_BLK0_R0000, RK_BLK41_R0000, RK_CNA_R1014, RK_CNA_R104C,
-    RK_CNA_R1050, RK_CNA_R1054, RK_CNA_R1058, RK_CNA_R105C,
-    RK_CNA_R1060, RK_CNA_R1064, RK_CNA_R1068, RK_CNA_R1074,
-    RK_CNA_R1078, RK_CNA_R1100, RK_CNA_R1104, RK_CNA_R1140,
+    RK_BLK0_R0000, RK_BLK41_R0000, RK_CNA_CONV_CON3, RK_CNA_CVT_CON0,
+    RK_CNA_CVT_CON1, RK_CNA_CVT_CON2, RK_CNA_CVT_CON3, RK_CNA_CVT_CON4,
+    RK_CNA_FC_CON0, RK_CNA_FC_CON1, RK_CNA_R1068, RK_CNA_FC_CON2,
+    RK_CNA_DMA_CON0, RK_CNA_R1100, RK_CNA_R1104, RK_CNA_R1140,
     RK_CNA_R1144, RK_CNA_R1148, RK_CNA_R114C, RK_CNA_R1150,
     RK_CNA_R1154, RK_CNA_R1158, RK_CNA_R115C, RK_CNA_R1160,
     RK_CNA_R1164, RK_CNA_R1168, RK_CNA_R116C, RK_CNA_R1170,
@@ -127,7 +127,7 @@ enum ork_reg_id {
 /* Descriptor table. mask = union of the register's documented field bits (the bounded range). Address and
  * fully-packed registers use OKR_ANY (any 32-bit is legal). Keep in enum order. */
 static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
-    [RK_CNA_CONV_CON1]        = {0x201, 0x100c, OKR_ANY,     "CNA_CONV_CON1",        "CNA datapath mode (CONV/precision); 0x20000000=std int32-out, 0=M-fold tail"},
+    [RK_CNA_CONV_CON1]        = {0x201, 0x100c, OKR_ANY,     "CNA_CONV_CON1",        "CNA_CONV_CON1: GROUP_LINE_OFF[29] (fold read) + precision[9:4] (int8=0) + CONV_MODE[3:0]"},
     [RK_CNA_CONV_CON2]        = {0x201, 0x1010, 0x00ff3fff,  "CNA_CONV_CON2",        "FEATURE_GRAINS[13:4]|KERNEL_GROUP[23:16]: atoms per pass (perf hint)"},
     [RK_CNA_DATA_SIZE0]       = {0x201, 0x1020, 0x07ff07ff,  "CNA_DATA_SIZE0",       "input cube WIDTH[26:16]|HEIGHT[10:0]; fold puts M in WIDTH, HEIGHT=1"},
     [RK_CNA_DATA_SIZE1]       = {0x201, 0x1024, 0x3fffffff,  "CNA_DATA_SIZE1",       "reduction CHANNEL[15:0]|CHANNEL_REAL[29:16] (= K)"},
@@ -193,17 +193,17 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     /* task #40: registers observed in rkllm's mfold capture (K=3584 N=1216), inferred — name/mask unconfirmed */
     [RK_BLK0_R0000]={0x0,0x0000,OKR_ANY,"BLK0_R0000","inferred BLK0 reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
     [RK_BLK41_R0000]={0x41,0x0000,OKR_ANY,"BLK41_R0000","inferred BLK41 reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
-    [RK_CNA_R1014]={0x201,0x1014,OKR_ANY,"CNA_R1014","inferred CNA reg (rkllm=0x9); name unconfirmed"},
-    [RK_CNA_R104C]={0x201,0x104c,OKR_ANY,"CNA_R104C","inferred CNA reg (rkllm=0xb); name unconfirmed"},
-    [RK_CNA_R1050]={0x201,0x1050,OKR_ANY,"CNA_R1050","inferred CNA reg (rkllm=0x10000); name unconfirmed"},
-    [RK_CNA_R1054]={0x201,0x1054,OKR_ANY,"CNA_R1054","inferred CNA reg (rkllm=0x10000); name unconfirmed"},
-    [RK_CNA_R1058]={0x201,0x1058,OKR_ANY,"CNA_R1058","inferred CNA reg (rkllm=0x10000); name unconfirmed"},
-    [RK_CNA_R105C]={0x201,0x105c,OKR_ANY,"CNA_R105C","inferred CNA reg (rkllm=0x10000); name unconfirmed"},
-    [RK_CNA_R1060]={0x201,0x1060,OKR_ANY,"CNA_R1060","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
-    [RK_CNA_R1064]={0x201,0x1064,OKR_ANY,"CNA_R1064","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
+    [RK_CNA_CONV_CON3]={0x201,0x1014,OKR_ANY,"CNA_CONV_CON3","conv mode 3: NN_MODE[30:28]/atrous dilation/deconv stride (rkllm=0x9)"},
+    [RK_CNA_CVT_CON0]={0x201,0x104c,OKR_ANY,"CNA_CVT_CON0","input-feature convert CVT_CON0 (requant enable/round mode; rkllm=0xb)"},
+    [RK_CNA_CVT_CON1]={0x201,0x1050,OKR_ANY,"CNA_CVT_CON1","input convert CVT_SCALE0[31:16]/CVT_OFFSET0[15:0] (rkllm=0x10000 => scale=1,off=0 identity)"},
+    [RK_CNA_CVT_CON2]={0x201,0x1054,OKR_ANY,"CNA_CVT_CON2","input convert CVT_SCALE1/CVT_OFFSET1 (rkllm identity)"},
+    [RK_CNA_CVT_CON3]={0x201,0x1058,OKR_ANY,"CNA_CVT_CON3","input convert CVT_SCALE2/CVT_OFFSET2 (rkllm identity)"},
+    [RK_CNA_CVT_CON4]={0x201,0x105c,OKR_ANY,"CNA_CVT_CON4","input convert CVT_SCALE3/CVT_OFFSET3 (rkllm identity)"},
+    [RK_CNA_FC_CON0]={0x201,0x1060,0xffff0001,"CNA_FC_CON0","FC(matmul)-mode: FC_SKIP_DATA[31:16]/FC_SKIP_EN[0]"},
+    [RK_CNA_FC_CON1]={0x201,0x1064,0x0001ffff,"CNA_FC_CON1","FC data offset[16:0]"},
     [RK_CNA_R1068]={0x201,0x1068,OKR_ANY,"CNA_R1068","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
-    [RK_CNA_R1074]={0x201,0x1074,OKR_ANY,"CNA_R1074","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
-    [RK_CNA_R1078]={0x201,0x1078,OKR_ANY,"CNA_R1078","inferred CNA reg (rkllm=0xf000f); name unconfirmed"},
+    [RK_CNA_FC_CON2]={0x201,0x1074,0x0001ffff,"CNA_FC_CON2","FC weight offset[16:0]"},
+    [RK_CNA_DMA_CON0]={0x201,0x1078,0x800f000f,"CNA_DMA_CON0","feature/weight DMA burst: OV4K_BYPASS[31]/WEIGHT_BURST_LEN[19:16]/DATA_BURST_LEN[3:0] (rkllm=0xf000f)"},
     [RK_CNA_R1100]={0x201,0x1100,OKR_ANY,"CNA_R1100","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
     [RK_CNA_R1104]={0x201,0x1104,OKR_ANY,"CNA_R1104","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
     [RK_CNA_R1140]={0x201,0x1140,OKR_ANY,"CNA_R1140","inferred CNA reg; rkllm writes 0 (scratch/clear), name unconfirmed"},
@@ -253,7 +253,7 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
  *        (@c setrn(rc,n,REG,OKV_*)) and compose packed fields with the @c OKC_* macros — so a config is a
  *        named choice, not a magic hex constant. Directly motivated by the M-fold RE, where every stall/wedge
  *        traced to a misread magic value: 0x40c0 as an IOVA (it's an elem-size config), 0x100c's int32-mode
- *        bit (see @ref OKV_CONV1_STD), 0x1080 as a stride (see @ref OKV_DMA2_CONTIGUOUS). C enums can't hold
+ *        bit (see @ref OKV_CONV1_GROUP_LINE), 0x1080 as a stride (see @ref OKV_DMA2_CONTIGUOUS). C enums can't hold
  *        32-bit values like 0x80000000 cleanly, so these are typed uint32_t constants grouped by register.
  * @{
  */
@@ -263,12 +263,13 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
 /** @brief #RK_DPU_OUT_PRECISION (0x4010) = int32 accumulate-out datapath. */
 #define OKV_OUT_PREC_INT32     0x80000000u
 
-/** @brief #RK_CNA_CONV_CON1 (0x100c) = standard int32-output datapath. rkllm's big-M fold tasks (M=36,20) SET
- *  this bit; only the small M=8 chain-tail tasks clear it (contrary to an earlier belief that the fold needs
- *  it cleared — that came from a broken standalone submit). */
-#define OKV_CONV1_STD          0x20000000u
-/** @brief #RK_CNA_CONV_CON1 (0x100c) = M-fold chain-tail datapath (bit cleared; observed only for M=8 tasks). */
-#define OKV_CONV1_MFOLD        0x00000000u
+/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF bit (bit 29, per mainline rocket_registers.h). rkllm's
+ *  big-M fold tasks (M=36,20) SET this; the small M=8 chain-tail tasks clear it. NOTE: this is NOT an
+ *  "int32-output datapath" bit (an earlier mislabel) — precision lives in CONV_CON1[9:4] IN_PRECISION/
+ *  PROC_PRECISION (int8 = 0). This bit selects the group-line-offset feature-read the M-fold uses. */
+#define OKV_CONV1_GROUP_LINE   0x20000000u
+/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF clear — the plain feature-read (M=8 chain-tail tasks). */
+#define OKV_CONV1_PLAIN        0x00000000u
 
 /** @brief #RK_DPU_SURFACE_ADD (0x40c0) = int8 element/surface size (CONFIG, not an IOVA). */
 #define OKV_ELEMSZ_INT8        0x00000020u
