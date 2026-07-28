@@ -171,6 +171,30 @@ int ioctl(int fd, unsigned long request, ...) {
                             struct ent*cb=by_dma_range(cadr,&off);
                             if(cb&&cb->cpu){ FILE*g=fopen("/tmp/mm_C.bin","wb"); if(g){fwrite((char*)cb->cpu+off,1,(size_t)M*N*4,g);fclose(g);} }
                             fprintf(stderr,"  dumped regcmd+weight+A+C to /tmp/mm_*.{txt,bin} (best M=%u)\n",M);
+                            /* CHAIN WALK: follow the in-regcmd PC-chain (0x0101:0x0010 next-addr / 0x0014 amount)
+                             * to capture EVERY chained task's regcmd + per-task meta — the full M-fold K-slice
+                             * accumulate chain, not just task0. Each linked regcmd is another buffer we've mapped. */
+                            { FILE*cm=fopen("/tmp/mm_chain_meta.txt","w");
+                              uint32_t *tw=rw; int twords=rcwords; int ti=0;
+                              while(ti<32){
+                                uint32_t naddr=0,namt=0,tK=0,tM=0,tca=0,taa=0,tde=0,tcb=0,tksl=0;
+                                for(int k=0;k+1<twords;k+=2){ uint32_t o=tw[k]&0xffff, blk=(tw[k+1]>>16)&0xffff, v=(tw[k]>>16)|((tw[k+1]&0xffff)<<16);
+                                    if(blk==0x101&&o==0x0010)naddr=v; else if(blk==0x101&&o==0x0014)namt=v;
+                                    else if(blk==0x201&&o==0x1024){tK=v&0xffff; tksl=v&0xffff;} else if(blk==0x201&&o==0x102c)tM=v;
+                                    else if(blk==0x1001&&o==0x4020)tca=v; else if(blk==0x201&&o==0x1070)taa=v;
+                                    else if(blk==0x201&&o==0x1044)tde=v; else if(blk==0x201&&o==0x1040)tcb=v; }
+                                char fn[64]; snprintf(fn,sizeof fn,"/tmp/mm_chain_%d.txt",ti);
+                                FILE*cf=fopen(fn,"w"); if(cf){ int nw=twords<224?twords:224; for(int k=0;k<nw;k++)fprintf(cf,"%08x ",tw[k]); fclose(cf);}
+                                if(cm)fprintf(cm,"task %d: Kfield=%u M=%u Aadr=0x%x Cadr=0x%x DATA_ENTRIES=%u CBUF_CON0=0x%x next=0x%x namt=%u\n",ti,tK,tM,taa,tca,tde,tcb,naddr,namt);
+                                if(!naddr) break;
+                                uint64_t noff; struct ent*nb=by_dma_range(naddr,&noff);
+                                if(!(nb&&nb->cpu)){ if(cm)fprintf(cm,"  next 0x%x NOT mapped — chain truncated\n",naddr); break; }
+                                size_t avail=(nb->size>noff)?(nb->size-noff)/4:0; twords=avail<512?(int)avail:512;
+                                tw=(uint32_t*)((char*)nb->cpu+noff); ti++;
+                              }
+                              if(cm)fclose(cm);
+                              fprintf(stderr,"  CHAIN: walked %d task(s) -> /tmp/mm_chain_*.txt + mm_chain_meta.txt\n",ti+1);
+                            }
                         }
                     }
                 }
