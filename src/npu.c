@@ -789,6 +789,17 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
 static void setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
+#include "rocket_regs.h"
+/* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
+ * offset) from the rocket-cross-referenced table and validates the value fits the register's defined field
+ * bits (a value with bits outside them is a bug — flagged, then written so behavior is preserved). This is
+ * the normal path. RE / unbounded writes (specify block+offset+value with NO bounds) use setr() directly —
+ * that is the "raw override" the fuzzer hooks (ork_i8_fuzz_add/ork_f16_fuzz_add) already ride. */
+static void setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
+    const ork_reg_desc *d=&ORK_REGS[id];
+    if(v & ~d->mask) fprintf(stderr,"[ork] WARN reg %s (%04x:%04x): value %#x has bits outside field mask %#x\n",d->name,d->blk,d->off,v,d->mask);
+    setr(rc,n,d->blk,d->off,v);
+}
 /* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of synth(). Inert by default. */
 static struct { uint32_t blk, reg, val; } g_f16_fovr[16]; static int g_f16_fovr_n=0;
 void ork_f16_fuzz_clear(void){ g_f16_fovr_n=0; }
@@ -796,19 +807,19 @@ void ork_f16_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_f16_fovr_n<1
 /* sched=1: single-submit internal M-scheduler (clean power-of-2 Kp); sched=0: one M-tile. */
 static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     memcpy(rc,REGCMD,REGCMD_N*4);
-    setr(rc,REGCMD_N,0x201,0x1024,((K-1)<<16)|K);setr(rc,REGCMD_N,0x201,0x1030,K*N*2);setr(rc,REGCMD_N,0x201,0x1034,K*2);
-    setr(rc,REGCMD_N,0x201,0x1044,K/32);setr(rc,REGCMD_N,0x201,0x1088,K);setr(rc,REGCMD_N,0x201,0x107c,K/8);
-    setr(rc,REGCMD_N,0x201,0x1020,0x10000|mc);setr(rc,REGCMD_N,0x201,0x1084,0x10000|mc);setr(rc,REGCMD_N,0x201,0x102c,mc);
-    setr(rc,REGCMD_N,0x1001,0x4034,mc-1);setr(rc,REGCMD_N,0x1001,0x405c,(mc-1)<<16);setr(rc,REGCMD_N,0x801,0x3014,(mc-1)<<16);
-    setr(rc,REGCMD_N,0x1001,0x403c,((N-1)<<16)|(N-1));setr(rc,REGCMD_N,0x1001,0x4058,N-1);setr(rc,REGCMD_N,0x1001,0x4038,(((N/4)-1)<<16)|((N/4)-1));
-    setr(rc,REGCMD_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_N,0x801,0x3018,N-1);
+    setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE0,K*N*2);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE1,K*2);
+    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON1,K/32);setrn(rc,REGCMD_N,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,K/8);
+    setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE3,mc);
+    setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,REGCMD_N,RK_PDP_OUT_M,(mc-1)<<16);
+    setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));setrn(rc,REGCMD_N,RK_DPU_DST_N2,N-1);setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_N,RK_PDP_OUT_N,N-1);
     if(sched){
-        int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_N,0x201,0x1010,16*rows);
+        int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*rows);
         double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see synth_i8 (65..127-row tile needs the next K-schedule) */
-        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setr(rc,REGCMD_N,0x201,0x1040,v);
-    } else { setr(rc,REGCMD_N,0x201,0x1010,16*(mc+1)); }
-    setr(rc,REGCMD_N,0x201,0x1070,aA);setr(rc,REGCMD_N,0x201,0x1110,aB);setr(rc,REGCMD_N,0x1001,0x4020,aC);
-    for(int i=0;i<g_f16_fovr_n;i++) setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides */
+        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,v);
+    } else { setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*(mc+1)); }
+    setrn(rc,REGCMD_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_N,RK_DPU_DST_BASE_ADDR,aC);
+    for(int i=0;i<g_f16_fovr_n;i++) setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides (raw/unbounded) */
 }
 /* synth_i16 — int16 matmul regcmd (emulated W16A16 coherence layer). Same 2-BYTE geometry as the fp16 synth
  * (int16 tiles are byte-identical layout to fp16), but the CNA precision (REG_CNA_CONV_CON1 @ 0x100c) is
@@ -819,7 +830,7 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
 static void synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
     uint32_t con1=0x20000090u; const char*e=getenv("ORK_I16_CON1"); if(e) con1=(uint32_t)strtoul(e,NULL,0);
-    setr(rc,REGCMD_N,0x201,0x100c,con1);                  /* FP16(2)->INT16(1) precision */
+    setrn(rc,REGCMD_N,RK_CNA_CONV_CON1,con1);             /* FP16(2)->INT16(1) precision */
 }
 /* RE fuzzer hook for int8 (tools; batch-mode RE): (block,reg,val) overrides applied at the END of synth_i8.
  * Inert by default (n=0) — production unaffected. Mirrors the int4 g_i4_fovr hooks. */
@@ -831,13 +842,13 @@ void ork_i8_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i8_fovr_n<16)
  * uses effective K = K/2. cbuf is the fp16 budget; int8 rows = 2*cbuf/K. */
 static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
     memcpy(rc,REGCMD_I8,REGCMD_I8_N*4);
-    setr(rc,REGCMD_I8_N,0x201,0x1024,((K-1)<<16)|K);setr(rc,REGCMD_I8_N,0x201,0x1030,K*N);setr(rc,REGCMD_I8_N,0x201,0x1034,K);
-    setr(rc,REGCMD_I8_N,0x201,0x1044,(K+63)/64);setr(rc,REGCMD_I8_N,0x201,0x1088,K);setr(rc,REGCMD_I8_N,0x201,0x107c,K/16);
-    setr(rc,REGCMD_I8_N,0x201,0x1020,0x10000|mc);setr(rc,REGCMD_I8_N,0x201,0x1084,0x10000|mc);setr(rc,REGCMD_I8_N,0x201,0x102c,mc);
-    setr(rc,REGCMD_I8_N,0x1001,0x4034,mc-1);setr(rc,REGCMD_I8_N,0x1001,0x405c,(mc-1)<<16);setr(rc,REGCMD_I8_N,0x801,0x3014,(mc-1)<<16);
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE0,K*N);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE1,K);
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K+63)/64);setrn(rc,REGCMD_I8_N,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,K/16);
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,mc);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,(mc-1)<<16);
     int s=stride>0?stride:N;
-    setr(rc,REGCMD_I8_N,0x1001,0x403c,((s-1)<<16)|(N-1));setr(rc,REGCMD_I8_N,0x1001,0x4058,N-1);setr(rc,REGCMD_I8_N,0x1001,0x4038,(((s/4)-1)<<16)|((N/4)-1));
-    setr(rc,REGCMD_I8_N,0x201,0x1038,0x1010000|N);setr(rc,REGCMD_I8_N,0x801,0x3018,N-1);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((s-1)<<16)|(N-1));setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/4)-1)<<16)|((N/4)-1));
+    setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_I8_N,RK_PDP_OUT_N,N-1);
     if(sched){
         int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         /* DEBUG knob (ORK_RCAP, default off): override the 0x1010 row-count hint. MEASURED NEUTRAL —
@@ -846,7 +857,7 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
          * only for RE/diagnostics. */
         static int rcap=-2; if(rcap==-2){const char*e=getenv("ORK_RCAP"); rcap=e?atoi(e):-1;}
         if(rcap>0) R=rcap;
-        int rows=(mc+1<R)?(mc+1):R; setr(rc,REGCMD_I8_N,0x201,0x1010,16*rows);
+        int rows=(mc+1<R)?(mc+1):R; setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*rows);
         /* 0x1040 = K-reduction schedule, selected per 64-row group. MUST be ceil(mc/64): a tile of
          * 65..127 rows spills past the first 64-row group, so it needs the NEXT schedule (the one a
          * full 128-row tile uses), not the <=64 schedule. floor(mc/64) gave 65..127-row tiles the
@@ -854,10 +865,10 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
         double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b;
         static int r1040=-2; if(r1040==-2){const char*e=getenv("ORK_R1040"); r1040=e?atoi(e):-1;}
-        if(r1040>0) v=r1040;   /* EXPERIMENTAL: override the 0x1040 schedule (rknn's captured 0x75 for the 30-row tile) */
-        setr(rc,REGCMD_I8_N,0x201,0x1040,v);
-    } else { setr(rc,REGCMD_I8_N,0x201,0x1010,16*(mc+1)); }
-    setr(rc,REGCMD_I8_N,0x201,0x1070,aA);setr(rc,REGCMD_I8_N,0x201,0x1110,aB);setr(rc,REGCMD_I8_N,0x1001,0x4020,aC);
+        if(r1040>0) v=r1040;   /* EXPERIMENTAL: override the CBUF_CON0 bank alloc (rknn's captured 0x75 for the 30-row tile) */
+        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
+    } else { setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*(mc+1)); }
+    setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,aC);
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 /* #39 PORT (RE): dump ork's synth_i8 regcmd words for (mc,K,N) with sentinel addresses, so a tool can diff
@@ -874,21 +885,21 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
  * synthesized on the explicit m-fold path; the default matmul is untouched. */
 static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
     synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match rkllm */
-    setr(rc,REGCMD_I8_N,0x201,0x1020,((uint32_t)mc<<16)|1);      /* DATAIN WIDTH=M HEIGHT=1 (was 1,M) */
-    setr(rc,REGCMD_I8_N,0x201,0x1084,((uint32_t)mc<<16)|1);
-    setr(rc,REGCMD_I8_N,0x201,0x1028,mc);                        /* DATAIN batch/atomics = M (template default 1) */
-    setr(rc,REGCMD_I8_N,0x201,0x1010,0x20);                      /* FEATURE_GRAINS=2 (const) */
-    setr(rc,REGCMD_I8_N,0x201,0x1044,(uint32_t)(K/64)*mc);       /* K-passes folded over M */
-    { int v=4*mc; if(v>128)v=128; setr(rc,REGCMD_I8_N,0x201,0x107c,v); }
-    { int v=0xb1-0xf*(mc/8); if(v<0x1b)v=0x1b; setr(rc,REGCMD_I8_N,0x201,0x1040,v); }
-    setr(rc,REGCMD_I8_N,0x1001,0x4030,mc-1);                     /* out cube WIDTH=M-1 */
-    setr(rc,REGCMD_I8_N,0x1001,0x4034,0);                        /* out cube HEIGHT=0 */
-    setr(rc,REGCMD_I8_N,0x1001,0x405c,mc-1);                     /* WDMA WIDTH=M-1 (was HEIGHT<<16) */
-    setr(rc,REGCMD_I8_N,0x801,0x3014,mc-1);
-    setr(rc,REGCMD_I8_N,0x1001,0x4038,0);                        /* NOTCH_ADDR=0 (NC1HWC2) */
-    setr(rc,REGCMD_I8_N,0x1001,0x4024,(uint32_t)mc*16*4);        /* DST_SURF_STRIDE int32 out = M*C2*4 */
-    setr(rc,REGCMD_I8_N,0x201,0x1080,(uint32_t)mc*2);            /* CNA input SURF_STRIDE = (W*C2)/8 (8-byte units; verified vs mm_A.bin: 36*16/8=72) */
-    setr(rc,REGCMD_I8_N,0x1001,0x40c0,aC);                       /* DPU_SURFACE_ADD is an ABSOLUTE output IOVA (rocket_registers.h), NOT a size — was mc*64=0x600 -> wild write -> AXI hang (the hard-wedge). Point it at the C base. */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,((uint32_t)mc<<16)|1);      /* DATAIN WIDTH=M HEIGHT=1 (was 1,M) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,((uint32_t)mc<<16)|1);
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                   /* DATAIN batch/atomics = M (template default 1) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);                       /* FEATURE_GRAINS=2 (const) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);        /* DATA_ENTRIES folded over M */
+    { int v=4*mc; if(v>128)v=128; setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,v); }
+    { int v=0xb1-0xf*(mc/8); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v); }  /* CBUF bank alloc (DATA_BANK steps) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH,mc-1);                 /* out cube WIDTH=M-1 */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);                   /* out cube HEIGHT=0 */
+    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,mc-1);                     /* WDMA WIDTH=M-1 (was HEIGHT<<16) */
+    setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,mc-1);
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,0);                    /* NOTCH_ADDR=0 (NC1HWC2) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)mc*16*4);    /* DST_SURF_STRIDE int32 out = M*C2*4 */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,(uint32_t)mc*2);              /* CNA input SURF_STRIDE = (W*C2)/8 (8-byte units; verified vs mm_A.bin: 36*16/8=72) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,aC);                       /* DPU_SURFACE_ADD is an ABSOLUTE output IOVA (rocket_registers.h), NOT a size — was mc*64 -> wild write -> AXI hang. Point it at the C base. */
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
