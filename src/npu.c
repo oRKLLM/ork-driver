@@ -8238,6 +8238,50 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
 done:
     bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
 }
+/* #39 A-layout solver: submit a FIXED (captured) regcmd for `nvar` A-variants, reusing ONE buffer set so the
+ * IOVA is stable across submits. The fresh-alloc-per-call path (ork_npu_replay_i8 called N times) intermittently
+ * wedges on the fold; buffer reuse is the safe pattern (cf. replay_mm_i8's iters loop, which never wedged).
+ * Avar = nvar A-images, each `astride` bytes; Bdata = shared weight; Couts = nvar contiguous M*N int32 results.
+ * A warm submit (variant 0) precedes the measured loop. Returns 0/ok, -2 bad shape, <0 on submit error. */
+int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
+        const int8_t *Avar, int nvar, int astride, const int8_t *Bdata, int Bbytes, int32_t *Couts){
+    int fd=c->fd; if(fd<0) return -3; if(rn<8||rn>2048||M<1||(K%32)||(N%16)||nvar<1) return -2;
+    int dom=c->dom_active;
+    size_t bsz=(Bbytes>(int)((size_t)K*N))?(size_t)Bbytes:(size_t)K*N;
+    size_t aszg=(size_t)M*K*8+(1u<<20), bszg=bsz*8+(1u<<20), cszg=(size_t)M*N*4*8+65536;
+    struct buf A =bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf Cc=bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    memset(B.cpu,0,bszg); if(Bdata)memcpy(B.cpu,Bdata,(Bbytes>0)?(size_t)Bbytes:(size_t)K*N); else memset(B.cpu,1,bsz);
+    bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
+    for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff,b=(rc[k+1]>>16)&0xffff; if(b==0x101&&(o==0x0010||o==0x0014)){rc[k]&=0xffff;rc[k+1]&=0xffff0000u;} }
+    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
+    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
+    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub;
+    #define _SSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+    size_t acp=(size_t)astride; if(acp>aszg)acp=aszg;
+    memset(A.cpu,0,aszg); memcpy(A.cpu,Avar,acp); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);   /* warm w/ variant 0 */
+    _SSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
+    for(int v=0; v<nvar; v++){
+        memset(A.cpu,0,aszg); memcpy(A.cpu, Avar+(size_t)v*astride, acp); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(Cc.cpu,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+        _SSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
+        bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+        memcpy(Couts+(size_t)v*M*N, Cc.cpu, (size_t)M*N*4);
+    }
+    ret=0;
+    #undef _SSUB
+sdone:
+    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+}
 int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
                            const int16_t *in,int M,int N,int16_t *out,double *us){
     int fd=c->fd;

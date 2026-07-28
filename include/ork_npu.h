@@ -691,6 +691,10 @@ int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn
  * (for correctness check vs captured C). Patches A/B/C addrs, single-core, times `iters`. 0/ok. */
 int          ork_npu_replay_i8(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
                                const signed char *Adata, int Abytes, const signed char *Bdata, int Bbytes, int *Cout, int iters, double *us);
+/* #39 A-layout solver: replay a fixed captured regcmd for nvar A-variants reusing ONE buffer set (stable IOVA,
+ * wedge-safe). Avar = nvar A-images each `astride` bytes; Couts = nvar contiguous M*N int32 results. 0/ok. */
+int          ork_npu_replay_i8_sweep(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
+                               const signed char *Avar, int nvar, int astride, const signed char *Bdata, int Bbytes, int *Couts);
 /* #39 PORT (RE): dump ork's synth_i8 regcmd for (mc,K,N) to diff vs rkllm's captured regcmd. Returns word count. */
 int          ork_npu_synth_i8_dump(ork_npu *ctx, int mc, int K, int N, unsigned *out, int outn);
 
