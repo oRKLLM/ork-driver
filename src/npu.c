@@ -885,21 +885,24 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
  * synthesized on the explicit m-fold path; the default matmul is untouched. */
 static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
     synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match rkllm */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,((uint32_t)mc<<16)|1);      /* DATAIN WIDTH=M HEIGHT=1 (was 1,M) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,((uint32_t)mc<<16)|1);
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                   /* DATAIN batch/atomics = M (template default 1) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);                       /* FEATURE_GRAINS=2 (const) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);        /* DATA_ENTRIES folded over M */
+    /* --- M-fold recipe, expressed as named intents (see ork_regs.h OKV_ and OKC_ layer) --- */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into the CNA WIDTH dim (W=M,H=1) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR, OKC_DATA_SIZE0(mc,1));
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                       /* DATAIN batch/atomics = M */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_MFOLD);          /* M-fold datapath mode (clear std int32-out bit; else STALLS). Output stays int32. */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);                          /* FEATURE_GRAINS=2 (const) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);           /* DATA_ENTRIES = (K/64)*M */
     { int v=4*mc; if(v>128)v=128; setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,v); }
-    { int v=0xb1-0xf*(mc/8); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v); }  /* CBUF bank alloc (DATA_BANK steps) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH,mc-1);                 /* out cube WIDTH=M-1 */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);                   /* out cube HEIGHT=0 */
-    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,mc-1);                     /* WDMA WIDTH=M-1 (was HEIGHT<<16) */
+    { int db=(mc+7)/8; if(db<1)db=1; if(db>11)db=11;                       /* CBUF banks: DATA_BANK=ceil(M/8), rest to weight (12-bank CBUF). floor(M/8) over-allocated -> cap>K stall. */
+      setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, OKC_CBUF_CON0(db, 12-db)); }
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH,mc-1);                     /* out cube WIDTH=M-1, HEIGHT=0 (M in width) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);
+    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,mc-1);
     setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,mc-1);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,0);                    /* NOTCH_ADDR=0 (NC1HWC2) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)mc*16*4);    /* DST_SURF_STRIDE int32 out = M*C2*4 */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,(uint32_t)mc*2);              /* CNA input SURF_STRIDE = (W*C2)/8 (8-byte units; verified vs mm_A.bin: 36*16/8=72) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,aC);                       /* DPU_SURFACE_ADD is an ABSOLUTE output IOVA (rocket_registers.h), NOT a size — was mc*64 -> wild write -> AXI hang. Point it at the C base. */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,0);                        /* NC1HWC2: no notch */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)mc*16);          /* output surface stride = M*C2 */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,  OKV_DMA2_CONTIGUOUS);           /* contiguous input read -> reduce FULL K (a computed stride gave a partial 608 vs 3584) */
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,OKV_SURFADD_MFOLD);            /* elem/surface-size CONFIG (NOT an address) */
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
@@ -8184,8 +8187,7 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
     setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
     setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);            /* B (weights) */
-    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C (int32 output) */
-    setrn(rc,rn,RK_DPU_SURFACE_ADD,(uint32_t)Cc.dma);          /* #39: DPU_SURFACE_ADD is ALSO an output IOVA — MUST be patched or the mfold WDMA writes to a wild address and hangs the AXI bus (hard wedge). */
+    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C output IOVA (the ONLY output address; 0x40c0/SURFACE_ADD is a config value, NOT an address — do not patch it) */
     bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;

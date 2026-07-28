@@ -63,16 +63,15 @@ int main(int argc,char**argv){
 
     int32_t*Cout=calloc((size_t)M*N,4); double us=0;
     int r=ork_npu_replay_i8(c,rc,rn,M,K,N,Anc,Wok,(int)((size_t)K*N),Cout,2,&us);
-    if(r){ printf("submit rc=%d\n",r); return 1; }
+    if(r){ printf("submit rc=%d (STALL/err)\n",r); ork_npu_free(c); return 1; }
+    /* INT32 output. de-tile NC1HWC2 (M as width): off(m,n)=(n/16)*(M*16)+m*16+(n%16) int32 elements. */
     int bad=0,first=-1; long mx=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int32_t got=Cout[nc_off(m,n,M)], ref=Cref[(size_t)m*N+n];
         long e=labs((long)got-ref); if(e){bad++; if(first<0)first=m*N+n;} if(e>mx)mx=e; }
-    printf("RESULT M-fold vs CPU ref: %s  mism=%d/%d maxerr=%ld  %.1f us/submit\n",
+    printf("RESULT int32 M-fold vs CPU ref: %s  mism=%d/%d maxerr=%ld  %.1f us/submit\n",
            bad?"MISMATCH":"BIT-EXACT ***",bad,M*N,mx,us);
-    /* LAYOUT PROBE: where does the expected C[0][0]=Cref[0] actually land in the raw Cout buffer? reveals the offset formula */
-    { int32_t want=Cref[0]; printf("  raw Cout[0..7]=%d %d %d %d %d %d %d %d\n",Cout[0],Cout[1],Cout[2],Cout[3],Cout[4],Cout[5],Cout[6],Cout[7]);
-      printf("  Cref[0]=%d Cref[N]=%d Cref[1]=%d ; nc_off(0,0)=%zu nc_off(1,0)=%zu nc_off(0,1)=%zu nc_off(0,16)=%zu\n",
-             Cref[0],Cref[N],Cref[1],nc_off(0,0,M),nc_off(1,0,M),nc_off(0,1,M),nc_off(0,16,M));
-      int hits=0; for(size_t i=0;i<(size_t)M*N && hits<6;i++) if(Cout[i]==want){ printf("  Cout[%zu]==Cref[0]=%d\n",i,want); hits++; } }
+    if(bad){ printf("  Cref[0..3]=%d %d %d %d  Cout(nc_off 0,0)=%d (1,0)=%d (0,1)=%d\n",
+             Cref[0],Cref[1],Cref[2],Cref[3],Cout[nc_off(0,0,M)],Cout[nc_off(1,0,M)],Cout[nc_off(0,1,M)]);
+      printf("  raw Cout[0..7]=%d %d %d %d %d %d %d %d\n",Cout[0],Cout[1],Cout[2],Cout[3],Cout[4],Cout[5],Cout[6],Cout[7]); }
     ork_npu_free(c); return bad?1:0;
 }

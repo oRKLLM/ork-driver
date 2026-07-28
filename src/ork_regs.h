@@ -155,4 +155,34 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_SDP_504C]={0x2001,0x504c,OKR_ANY,"SDP_504C"},[RK_SDP_506C]={0x2001,0x506c,OKR_ANY,"SDP_506C"},
 };
 
+/* ══ Named register VALUES + field composers (the "recipe" layer) ═══════════════════════════════════
+ * setrn() names the REGISTER; these name the VALUE. Set a mode-like register by named intent
+ * (setrn(rc,n,REG,OKV_*)) and compose packed fields with the OKC_* macros — so a config is a named
+ * choice, not a magic hex constant. Directly motivated by the M-fold RE, where every stall/wedge traced
+ * to a misread magic value: 0x40c0 as an IOVA (it's an elem-size config), 0x100c's int32-mode bit left on
+ * (stalls the fold), 0x1080 as a stride (it's a "contiguous" sentinel). (C enums can't hold 32-bit values
+ * like 0x80000000 cleanly, so these are typed uint32_t constants grouped by the register they belong to.) */
+
+/* RK_DPU_OUT_PRECISION (0x4010) — output/accumulate datapath precision */
+#define OKV_OUT_PREC_INT8      0x00000000u
+#define OKV_OUT_PREC_INT32     0x80000000u
+
+/* RK_CNA_CONV_CON1 (0x100c) — CNA datapath mode. The 0x20000000 bit selects the standard int32-output
+ * datapath; the M-fold schedule REQUIRES it cleared (with it set, the folded op STALLS). */
+#define OKV_CONV1_STD          0x20000000u   /* standard (non-folded) matmul */
+#define OKV_CONV1_MFOLD        0x00000000u   /* M-fold schedule */
+
+/* RK_DPU_SURFACE_ADD (0x40c0) — element/surface-size CONFIG (NOT an address; do not patch as an IOVA). */
+#define OKV_ELEMSZ_INT8        0x00000020u
+#define OKV_ELEMSZ_INT32       0x00000080u
+#define OKV_SURFADD_MFOLD      0x00000400u   /* M-fold NC1HWC2 surface config (from rkllm's task3) */
+
+/* RK_CNA_DMA_CON2 (0x1080) — input surface stride, OR this "read contiguous / no re-stride" sentinel,
+ * which the M-fold needs to reduce FULL K (a computed stride gives a partial reduction). */
+#define OKV_DMA2_CONTIGUOUS    0x0fffffe8u
+
+/* Packed-field composers. */
+#define OKC_CBUF_CON0(data_bank, weight_bank) ((uint32_t)((((weight_bank)&0xf)<<4) | ((data_bank)&0xf)))  /* RK_CNA_CBUF_CON0 0x1040 */
+#define OKC_DATA_SIZE0(width, height)         ((uint32_t)((((width)&0x7ff)<<16) | ((height)&0x7ff)))       /* RK_CNA_DATA_SIZE0 0x1020/0x1084 (DATAIN_WIDTH|HEIGHT) */
+
 #endif /* ORK_REGS_H */
