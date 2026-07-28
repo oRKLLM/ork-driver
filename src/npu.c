@@ -874,35 +874,50 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
 /* #39 PORT (RE): dump ork's synth_i8 regcmd words for (mc,K,N) with sentinel addresses, so a tool can diff
  * against rkllm's captured regcmd and read off the exact field delta (schedule + feature-layout) the M-fold
  * variant must apply. Returns word count (REGCMD_I8_N), or <0 on error. */
-/* #39 M-FOLD variant: rkllm's schedule that folds M into the CNA WIDTH dimension (~1.6x/program measured
- * at M=36 K=3584 N=1216). Feature layout is NC1HWC2 (C2=16): A packed [C1=K/16][H=1][W=M][C2=16], C output
- * likewise (host packer/de-tiler). The register delta vs synth_i8 was read from the ork-vs-rkllm regcmd diff
- * at M=2 AND M=24 (rocket_registers.h-named): DATAIN WIDTH=M/HEIGHT=1 (0x1020/0x1084), out cube WIDTH=M-1
- * HEIGHT=0 (0x4030/0x4034/0x405c/0x3014), FEATURE_GRAINS=2 (0x1010), CONV_CON1 mode cleared (0x100c),
- * schedule 0x1044=(K/64)*M 0x107c=4M 0x1040=0xb1-0xf*(M/8), surf strides 0x4024=M*64 (int32 out) 0x1080=M*16
- * (int8 A in), NOTCH 0x4038=0. Built as a DELTA on the synth_i8 baseline so all non-delta regs are inherited
- * correct. 0x40c0 SURFACE_ADD is address-typed — best-effort here, the one board-sweep target. GATED: only
- * synthesized on the explicit m-fold path; the default matmul is untouched. */
+/* #39 M-FOLD variant — REGISTER-LEVEL CLONE of rkllm's CAPTURED mfold regcmd (M=36 K=3584 N=1216), decoded
+ * with tools/re/regcmd_decode against ork_regs.h. Folds M into the CNA WIDTH dim; output int32 NC1HWC2.
+ * MEASURED 1.66x ork's own kernel (rkllm regcmd 433 vs ork 719 us/matmul). Built as a DELTA on synth_i8.
+ * Corrections from the real capture (supersede earlier RE guesses):
+ *   - 0x100c = OKV_CONV1_STD (int32-out bit SET). The fold does NOT clear it; the old "clear-or-STALL" belief
+ *     was an artifact of a broken standalone submit.
+ *   - 0x1080 = REAL surface stride 2160/M (60@M36, 108@M20), NOT the 0x0fffffe8 sentinel — that value is
+ *     rkllm's M=8 chain-TAIL "inherit CBUF layout" marker and HARD-WEDGES a standalone submit (OOB DMA).
+ *   - 0x4010 = int32 accumulate-out; plus the extra CNA regs rkllm sets (0x1014/104c/1050-5c/1078).
+ * OPEN (validated at M=36 ONLY): the CBUF/DMA schedule regs 0x1040/0x107c/0x4024/0x40c0 are rkllm's M=36
+ * LITERALS; their per-M formula still needs more captures. And BIT-EXACT additionally requires the caller's
+ * A-pack + C de-tile to match rkllm's fold layout (rkllm's stride-60 A is NOT plain contiguous NC1HWC2).
+ * The "2160" is capture-specific (K=3584,N=1216) pending a K/N-general derivation. GATED: only synthesized on
+ * the explicit m-fold path; the default matmul is untouched. */
 static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
-    synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match rkllm */
-    /* --- M-fold recipe, expressed as named intents (see ork_regs.h OKV_ and OKC_ layer) --- */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into the CNA WIDTH dim (W=M,H=1) */
+    synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
+    /* --- register-level clone of rkllm's captured M=36 mfold (named via ork_regs.h) --- */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_STD);            /* std int32-out datapath (rkllm SETS this for the fold) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,      0x20);                     /* FEATURE_GRAINS=2 */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into CNA WIDTH (W=M,H=1) */
     setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR, OKC_DATA_SIZE0(mc,1));
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                       /* DATAIN batch/atomics = M */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_MFOLD);          /* M-fold datapath mode (clear std int32-out bit; else STALLS). Output stays int32. */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);                          /* FEATURE_GRAINS=2 (const) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                       /* 0x1028 = M */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,     mc);                       /* 0x102c = M */
     setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);           /* DATA_ENTRIES = (K/64)*M */
-    { int v=4*mc; if(v>128)v=128; setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,v); }
-    { int db=(mc+7)/8; if(db<1)db=1; if(db>11)db=11;                       /* CBUF banks: DATA_BANK=ceil(M/8), rest to weight (12-bank CBUF). floor(M/8) over-allocated -> cap>K stall. */
-      setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, OKC_CBUF_CON0(db, 12-db)); }
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH,mc-1);                     /* out cube WIDTH=M-1, HEIGHT=0 (M in width) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);
-    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,mc-1);
-    setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,mc-1);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,0);                        /* NC1HWC2: no notch */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)mc*16);          /* output surface stride = M*C2 */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,  OKV_DMA2_CONTIGUOUS);           /* contiguous input read -> reduce FULL K (a computed stride gave a partial 608 vs 3584) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,OKV_SURFADD_MFOLD);            /* elem/surface-size CONFIG (NOT an address) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,  (uint32_t)(2160/mc));           /* REAL surface stride 2160/M (60@36,108@20); NOT the wedge-prone sentinel */
+    /* CBUF/DMA schedule — rkllm M=36 LITERALS (per-M formula still open; validated at M=36 only) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,       0x60);                     /* 0x107c */
+    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,      0x84);                     /* 0x1040 bank split + K-reduction schedule */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,0x600);                   /* 0x4024 output surface stride */
+    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,    0x3000);                  /* 0x40c0 surface/elem-size CONFIG */
+    /* extra CNA regs rkllm sets (constant across the captured M values) */
+    setrn(rc,REGCMD_I8_N,RK_CNA_R1014, 0x9);
+    setrn(rc,REGCMD_I8_N,RK_CNA_R104C, 0xb);
+    setrn(rc,REGCMD_I8_N,RK_CNA_R1050, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_R1054, 0x10000);
+    setrn(rc,REGCMD_I8_N,RK_CNA_R1058, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_R105C, 0x10000);
+    setrn(rc,REGCMD_I8_N,RK_CNA_R1078, 0xf000f);
+    setrn(rc,REGCMD_I8_N,RK_PDP_R3010, 0x1);                               /* 0x0801:0x3010 */
+    /* DPU output stage */
+    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,  OKV_OUT_PREC_INT32);      /* 0x4010 int32 accumulate-out */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH, mc-1);                   /* 0x4030 out WIDTH=M-1 */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);                      /* 0x4034 */
+    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH, 0);                      /* 0x4038 no notch */
+    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,     mc-1);                   /* 0x405c WIDTH_WDMA=M-1 */
+    setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,           mc-1);
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
@@ -8185,9 +8200,18 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     memset(Cc.cpu,0,cszg);
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
+    /* #39 SAFETY: neutralize any PC chain descriptor (0x0101:0x0010 next-regcmd-addr / 0x0014 next-amount)
+     * baked into a CAPTURED regcmd. We submit task_number=1 (single task), so the chain link is meaningless
+     * here — but if left intact it points at the CAPTURING process's next-task IOVA, which is UNMAPPED in
+     * ork's address space; the NPU walks the chain to it and IOMMU HARD-WEDGES the board. Zero the value
+     * halves (keep offset/block) so next-addr=0 (end of chain) and next-amount=0. (validate_mfold's rfile
+     * path already did this; doing it here makes every ork_npu_replay_i8 caller — incl. replay_mm_i8 — safe.) */
+    for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
+        if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
     setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
     setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);            /* B (weights) */
     setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C output IOVA (the ONLY output address; 0x40c0/SURFACE_ADD is a config value, NOT an address — do not patch it) */
+    if(getenv("ORK_REPLAY_IOVA")) fprintf(stderr,"[replay-iova] A=%#x B=%#x C=%#x RC=%#x task=%#x\n",(unsigned)A.dma,(unsigned)B.dma,(unsigned)Cc.dma,(unsigned)RCb.dma,(unsigned)c->task.dma);  /* #39: observe IOVA stability across runs (intermittency diag) */
     bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
@@ -8195,6 +8219,13 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     int ret=-1; struct rknpu_submit sub;
     #define _RSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
         sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+    /* #39 intermittency probe: the raw mfold replay bypasses ork_npu_enter, so it never does the
+     * mode-ENTRY ACT_RESET that the normal path fires when the schedule/precision mode changes. The
+     * mfold is an unusual-mode regcmd entered right after an int8-normal warmup — hypothesis: the
+     * missing entry-reset leaves stale NPU state that intermittently stalls/wedges the fold. Gate a
+     * reset here so we can A/B whether it makes the submit deterministic (one-time ~107ms, before the
+     * timed loop, so it doesn't taint the per-submit timing). */
+    if(getenv("ORK_REPLAY_RESET")){ struct rknpu_action a={.flags=RKNPU_ACT_RESET,.value=0}; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); }
     _RSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto done; }          /* warm */
     bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Cout) memcpy(Cout,Cc.cpu,(size_t)M*N*4);           /* computed output for correctness check vs captured C */

@@ -78,6 +78,12 @@ libork_npu.so: $(COBJ)                   # shared — dynamic link / FFI from Py
 rknpu_bench: tools/rknpu_bench.c
 	$(CC) $(CFLAGS) -o $@ $< -ldl
 
+# RE tool: decode a captured/synth regcmd word-dump into NAMED registers + NAMED values (ork_regs.h-driven,
+# flags unknown registers/values). Pure host, no NPU, no COBJ — only the ork_regs.h header.
+# Use:  ./regcmd_decode /tmp/mm_regcmd.txt   (or)   cat dump | ./regcmd_decode
+regcmd_decode: tools/re/regcmd_decode.c src/ork_regs.h
+	$(CC) $(CFLAGS) -o $@ $<
+
 # Phase-1 validation of ork_submit_seq: mixed int8(HW-doorbell)+fp16(SW-chain) sequence, bit-exact across
 # many runs + HW<->SW transitions. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./test_submit_seq
 test_submit_seq: tools/test_submit_seq.c $(COBJ)
