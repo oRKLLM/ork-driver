@@ -230,6 +230,24 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
 - To close: exact Rockchip weight-packing spec (vendor/Mesa rocket source) OR full byte-level injection map on a
   STABLE board (this unit is now too degraded — wedges/miscomputes on high-offset probes after ~13 cycles).
 
+## (A) WEIGHT LAYOUT SOLVED (2026-07-29) — RKNN vendor matmul-native format
+- Found via RKNN toolkit source (airockchip/rknn-toolkit2 rknpu2/.../rknn_matmul_api.h): RK3588 int8 matmul B
+  (weight) NATIVE layout = (N/32, K/32, 32, 32) [no,ko,ni,ki], K innermost. Byte offset:
+      woff(k,n) = ((n/32)*(K/32) + (k/32))*1024 + (n%32)*32 + (k%32)
+  (subN=subK=32; total K*N bytes, no pad when K,N%32==0). Per-chip: RK356x int8 (N/16,K/32,16,32); RK3588 int4
+  (N/64,K/32,64,32).
+- CONFIRMED against ALL injection points (once a ramp-aliasing DECODE BUG is fixed): byte0->(k0,n0),
+  byte1->(k1,n0), byte16->(k16,n0), byte64->(k0,n2), byte1024->(k=32,n0). [The earlier "byte1024->k5" was my
+  decode error: ramp A[i]=(i%251)-125 aliases val -120 to i in {5,256,...}; nc16(0,32)=256 => k=32, matching woff.]
+- FULL FOLD LAYOUT (all three now known): A input = nc16 (C2-16, M in width) = (k/16)*(M*16)+m*16+(k%16);
+  W weight = woff (above); C output = c4 (C2-4) = (n/4)*(M*4)+m*4+(n%4).
+- WHY OFFLINE C=A*W FAILED (0/8) despite correct layouts: mm_C.bin is STALE. The C scratch buffer (0xb17a000)
+  is one of only 5 REUSED output buffers; RKDUMP dumps C AFTER the whole rk_bench run, so it holds a LATER
+  submit's output, not the captured tile's. The captured (A,W,C) is NOT a consistent triple => offline can't
+  validate. This is a capture artifact, NOT a layout error.
+- CONFIRMATION PENDING: validate_layout.c (ork's OWN random A/W packed nc16/woff, replay rkllm regcmd, de-tile
+  c4, compare CPU ref A*W) — self-consistent, no captured operands. Wedges intermittently; needs one clean run.
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
