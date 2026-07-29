@@ -182,6 +182,21 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
   the logical weight from the GGUF to constrain the offline solve (N=1216 is likely an internal N-tile, so the
   match is nontrivial).
 
+## (A) (b) NVDLA WEIGHT FORMAT — identified but does NOT fit offline (2026-07-29)
+- NVDLA int8 direct-conv weight (nvdla.org/hw/format.html): kernel-groups of 32; each kernel split into
+  1x1x64 channel cubes; scan C'->K->W->H->C (C'=64 ch fastest, K'=32 kernels, channel-groups slowest).
+  Derived offset(k,n)=(n/32)*(C1*32*64)+(k/64)*(32*64)+(n%32)*64+(k%64), C1=K/64. Totals K*N (=wbytes), and
+  matches the injection low-order (byte0/1 -> k=0/1, n=0). BUT offline (A=nc16,C=c4): 0/15. Family sweep
+  cube{16,32,64} x kgroup{16,32}: 0. So stock NVDLA weight format does NOT reproduce rkllm's C.
+- REALIZATION: injection only confirmed the m-STRIDES (A m*16, C m*4) at ONE (k=0,n=0) point — the k-group
+  stride of A (nc16) and n-group stride of C (c4) are ASSUMED, not confirmed. So there are effectively THREE
+  partially-unknown layouts (A k-structure, C n-structure, weight), and the offline solve is under-constrained
+  unless A/C are exactly standard NC1HWC2 (they may not be, or RK3588 deviates from NVDLA weight format).
+- (a) fallback (injection-map all three) is BLOCKED: the WPOS>=32 probes wedge THIS board (intermittency).
+- CONCLUSION: exact fold layout resolution needs EITHER a stable board for a full injection sweep (map A's
+  k-strides, C's n-strides, and the weight, ~10-20 clean probes) OR a deeper offline joint-solve of all three
+  permutations from the real A/W/C (algorithmic, not a formula guess). Offline formula-guessing is exhausted.
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
