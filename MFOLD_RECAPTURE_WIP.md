@@ -197,6 +197,23 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
   k-strides, C's n-strides, and the weight, ~10-20 clean probes) OR a deeper offline joint-solve of all three
   permutations from the real A/W/C (algorithmic, not a formula guess). Offline formula-guessing is exhausted.
 
+## (A) INJECTION SWEEP (2026-07-29, one-probe-per-boot + sudo reboot): A CONFIRMED, weight structure mapped
+- Cadence that WORKS: ONE inject_map probe per boot, then `sudo reboot` (graceful, resets NPU state, no SPI
+  risk). Persist regcmd at ~/mm_regcmd_m8.txt (cp to /tmp each boot; no rkllm capture -> pure ork). >30s ssh
+  unresponsive = hard wedge -> HA power-cycle. LOW-offset probes (0,1,16,64) run clean; HIGH offsets
+  (1024, 38912) errno-110 or hard-wedge.
+- CONFIRMED points: byte0->(k0,n0); byte1->(k1,n0); byte16->(k=16,n0) [A-offset 128 => A=nc16 k-group stride
+  (k/16)*(M*16) CONFIRMED]; byte64-> output-index 2 (=n2 via c4) => weight n-stride = 32 bytes.
+- WEIGHT structure (low-order, confirmed): 32-channel inner block (k%32), n interleaved at stride 32,
+  channel-block (k/32) outermost. i.e. offset(k,n)=(k/32)*S + n*32 + (k%32). n-stride=32 CONFIRMED (byte64=n2).
+  Also: byte64=n2 (not n1) RULES OUT stock NVDLA cube-64/kernel-group-32 (would give n1).
+- THE LAST UNKNOWN: the channel-block stride S (where k=32 lives). Offline sweep of S over ALL multiples of 32
+  (32..39264) with A=nc16 + confirmed C[m][0] => NO S fits column 0. So S is not a single stride (multi-level/
+  permuted interleave) OR A=nc16 deviates for k>=32 (only confirmed to k=16). Resolving needs probing k>=32
+  weight bytes (offset >= ~1024) which errno-110/wedge; offline is under-determined for it.
+- NET this round: went from 3 fully-unknown layouts to A CONFIRMED, C m-stride CONFIRMED, weight low-order
+  mapped (32-ch block, n*32, k%32); sole remaining unknown = channel-block stride, walled by high-offset wedges.
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
