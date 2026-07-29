@@ -145,6 +145,114 @@ static void report_fold_scaffold(void) {
  *   single-submit partial reduce: M=16,K=3584,DATA_BANK=3 -> 2400 channels
  * On-board sweep (tools/re/fold_alayout.c) ALREADY tested & REJECTED (100% mismatch) these within-tile
  * orderings: rowmajor[M][K], NC1HWC2 C2 in {16,32,64}, colmajor[K][M], nc16 M-innermost. */
+/* CANDIDATE: NC1HWC2 C2=32 with the CAPTURED (padded) surf_stride = (2160/M)*32 bytes — i.e. the surface
+ * stride is the captured 0x1080 value, NOT the contiguous M*32 that fold_alayout.c already tested+rejected.
+ * This is the concrete GROUP_LINE_OFF reading: a padded per-channel-atom surface. */
+static long fold_surf_bytes(int M) { return (2160L / M) * 32; }        /* = 1920 @M36, 3456 @M20 (captured) */
+static long feat_off_fold_padded(int m, int k, int M) {
+    return (long)(k/32) * fold_surf_bytes(M) + (long)m*32 + (k%32);
+}
+/* validate the candidate is self-consistent OFFLINE before any board submit:
+ *  (a) its surf_stride reproduces the captured 0x1080 (60@M36, 108@M20),
+ *  (b) it is a collision-free bijection over one submit's [M x Kslice],
+ *  (c) it reduces to a correct partial matmul. */
+static int verify_padded_candidate(void) {
+    printf("    -- candidate: padded-NC32 (surf_stride = captured 0x1080, not contiguous M*32) --\n");
+    int bad_stride = 0;
+    struct { int M, reg; } pts[] = { {36,60}, {20,108} };
+    for (unsigned i=0;i<sizeof pts/sizeof*pts;i++){ long got = fold_surf_bytes(pts[i].M) >> 5;
+        printf("       surf_stride reg @M=%d: candidate=%ld captured=%d %s\n",
+               pts[i].M, got, pts[i].reg, got==pts[i].reg?"OK":"MISMATCH");
+        if (got != pts[i].reg) bad_stride = 1; }
+    /* bijection + partial matmul over one submit: M=36, Kslice=512 */
+    int M=36, Ks=512, N=32;
+    long span = (long)((Ks+31)/32)*fold_surf_bytes(M) + (long)M*32;   /* padded buffer size */
+    int8_t *buf = calloc(span,1); int *seen = calloc(span, sizeof(int));
+    int coll=0; for(int m=0;m<M;m++) for(int k=0;k<Ks;k++){ long o=feat_off_fold_padded(m,k,M);
+        if(o<0||o>=span){coll++;continue;} if(seen[o]++)coll++; }
+    printf("       bijection over [M=%d x Kslice=%d] in %ld B: %s (%d collisions)\n",
+           M, Ks, span, coll?"FAIL":"OK", coll);
+    /* partial matmul: pack A padded, reduce vs ref */
+    int8_t *A=malloc((size_t)M*Ks),*W=malloc((size_t)Ks*N);
+    for(long i=0;i<(long)M*Ks;i++)A[i]=(int8_t)r7(); for(long i=0;i<(long)Ks*N;i++)W[i]=(int8_t)r7();
+    for(int m=0;m<M;m++)for(int k=0;k<Ks;k++){long o=feat_off_fold_padded(m,k,M); if(o>=0&&o<span)buf[o]=A[(size_t)m*Ks+k];}
+    long mmbad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long acc=0,ref=0;
+        for(int k=0;k<Ks;k++){ acc += (long)buf[feat_off_fold_padded(m,k,M)] * W[(size_t)k*N+n];
+                               ref += (long)A[(size_t)m*Ks+k]           * W[(size_t)k*N+n]; }
+        if(acc!=ref)mmbad++; }   /* asserts A's (m,k) is recoverable through the padded feature map */
+    printf("       partial matmul (feature map recoverable): %ld/%d %s\n", mmbad, M*N, mmbad?"FAIL":"OK");
+    free(buf);free(seen);free(A);free(W);
+    return bad_stride || coll || mmbad;
+}
+/* EXHAUSTIVE constrained enumerator over the CDMA strided-addressing space.
+ * offset(m,k) = ksurf*(k/atom) + line*(m/g) + (m%g)*atom + (k%atom)   [additive; order-independent]
+ * Free params: atom in {16,32,64}, line-group g, and which captured stride {1920,3072} is ksurf vs line.
+ * Filters (all offline): (F1) both register strides reproduce the captured {60,96}; (F2) bijection over
+ * [M x Kslice] with no collisions (Kslice = the largest that packs collision-free); (F3) correct matmul;
+ * (F4) in-bounds max-offset < a fixed buffer (WEDGE-SAFE proof). Prints the survivor SHORTLIST + max-offset. */
+static uint32_t lcg2 = 0xabcdef1u;
+static int r7b(void){ lcg2 = lcg2*1664525u + 1013904223u; return (int)((lcg2>>25)%7) - 3; }
+static long off_gen(int m, int k, int atom, long ksurf, long line, int g) {
+    return ksurf*(long)(k/atom) + line*(long)(m/g) + (long)(m%g)*atom + (k%atom);
+}
+static void enumerate_layouts(void) {
+    printf("== EXHAUSTIVE ENUMERATOR (how many layouts survive the NPU constraints?) ==\n");
+    const int atoms[] = {16,32,64};
+    const long caps[] = {1920,3072};          /* the two captured loop strides (bytes) */
+    const int gs[] = {1,2,3,4,6,9,12,18,36};   /* line-group over M=36 */
+    const long WEDGE_BUF = 1<<20;              /* 1 MiB in-bounds envelope (proof of no-OOB) */
+    int M=36, N=16;
+    int tried=0, biject=0, survive=0, fullk_survive=0;
+    printf("   grid: atom{16,32,64} x g{1,2,3,4,6,9,12,18,36} x stride-assign{2} = 54 raw combos\n");
+    for (unsigned ai=0; ai<3; ai++) for (unsigned gi=0; gi<9; gi++) for (int sw=0; sw<2; sw++) {
+        int atom = atoms[ai], g = gs[gi];
+        long ksurf = caps[sw], line = caps[!sw];
+        tried++;
+        /* largest Kslice (multiple of atom) that packs collision-free in WEDGE_BUF */
+        int Kslice = 0; long maxoff = 0;
+        static char seen[1<<20];
+        for (int Kt = atom; Kt <= 3584; Kt += atom) {
+            memset(seen, 0, WEDGE_BUF);
+            int ok = 1; long mo = 0;
+            for (int m=0; m<M && ok; m++) for (int k=0; k<Kt; k++) {
+                long o = off_gen(m,k,atom,ksurf,line,g);
+                if (o < 0 || o >= WEDGE_BUF) { ok = 0; break; }      /* F4: OOB -> not wedge-safe, reject */
+                if (seen[o]) { ok = 0; break; }                       /* F2: collision -> not bijective */
+                seen[o] = 1; if (o > mo) mo = o;
+            }
+            if (!ok) break;
+            Kslice = Kt; maxoff = mo;
+        }
+        if (Kslice < atom) continue;   /* couldn't even fit one atom-group collision-free */
+        biject++;
+        /* F3: correct matmul over [M x Kslice] through this feature map */
+        int8_t *A=malloc((size_t)M*Kslice),*W=malloc((size_t)Kslice*N);
+        for(long i=0;i<(long)M*Kslice;i++)A[i]=(int8_t)r7b();
+        for(long i=0;i<(long)Kslice*N;i++)W[i]=(int8_t)r7b();
+        int8_t *buf=calloc(maxoff+1,1);
+        for(int m=0;m<M;m++)for(int k=0;k<Kslice;k++)buf[off_gen(m,k,atom,ksurf,line,g)]=A[(size_t)m*Kslice+k];
+        long mmbad=0;
+        for(int m=0;m<M&&!mmbad;m++)for(int n=0;n<N;n++){ long acc=0,ref=0;
+            for(int k=0;k<Kslice;k++){acc+=(long)buf[off_gen(m,k,atom,ksurf,line,g)]*W[(size_t)k*N+n];
+                                      ref+=(long)A[(size_t)m*Kslice+k]*W[(size_t)k*N+n];}
+            if(acc!=ref)mmbad++; }
+        free(A);free(W);free(buf);
+        if (mmbad) continue;
+        survive++;
+        int fullk = (Kslice >= 3584);           /* real A holds full K => the physically-sensible ones */
+        if (fullk) fullk_survive++;
+        printf("   SURVIVOR #%d: atom=%d g=%-2d surf_reg=%ld line_reg=%ld | Kslice=%d ch%s | max_off=%ld B (<1MiB: WEDGE-SAFE)\n",
+               survive, atom, g, ksurf>>5, line>>5, Kslice, fullk?" [full-K]":"", maxoff);
+    }
+    printf("   => tried %d, bijective+matmul-correct %d, ALL-in-bounds %d; of those, full-K-packing = %d\n",
+           tried, biject, survive, fullk_survive);
+    printf("   VERDICT: the sim CANNOT discriminate — EVERY bijection is a correct matmul (weak filter), and\n"
+           "   all %d are proven wedge-safe (in-bounds). So the offline confirm set is ~%d (full-K), NOT 1-4.\n"
+           "   The silicon is the ONLY oracle for which fetch it uses. GOOD NEWS: the whole set is OOB-safe, so\n"
+           "   a replay_i8_sweep confirm campaign (many variants / buffer-set) is hard-wedge-free by construction.\n",
+           survive, fullk_survive);
+}
+
 typedef struct { int M, reg; } surfpt;
 static int fold_search(void) {
     printf("== FOLD SEARCH phase 1 (constrain the layout family — offline) ==\n");
@@ -168,6 +276,10 @@ static int fold_search(void) {
     /* (2) RULE OUT the standard NC1HWC2: its surf_stride = M*atom GROWS with M (captured SHRINKS). */
     printf("    standard NC1HWC2 surf_stride = M*atom (GROWS with M) -> RULED OUT vs captured (shrinks). "
            "The fold A-layout is NOT a scaled standard layout.\n");
+
+    /* (2b) the concrete candidate to confirm on-board */
+    int cand_fail = verify_padded_candidate();
+    printf("    candidate self-consistent OFFLINE: %s\n", cand_fail ? "NO (do not submit)" : "YES (ready for 1 confirm)");
 
     /* (3) within-tile ordering: enumerate, mark matmul-validity + which the board sweep already rejected. */
     const char *ord[] = {"rowmajor[M][Ksl]","colmajor[Ksl][M]","nc16","nc32","nc64","line-grouped(GROUP_LINE_OFF?)"};
@@ -197,6 +309,7 @@ int main(void) {
     printf("== FOLD scaffold (hypothesis surface for the next phase) ==\n");
     report_fold_scaffold();
     fold_search();
+    enumerate_layouts();
     printf("%s\n", fail ? "CALIB FAIL" : "CALIB PASS (standard model reproduces ork's known-good layouts)");
     return fail ? 1 : 0;
 }
