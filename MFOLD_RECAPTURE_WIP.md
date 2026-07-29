@@ -214,6 +214,22 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
 - NET this round: went from 3 fully-unknown layouts to A CONFIRMED, C m-stride CONFIRMED, weight low-order
   mapped (32-ch block, n*32, k%32); sole remaining unknown = channel-block stride, walled by high-offset wedges.
 
+## (A) SECOND TILE (M=1) captured 2026-07-29 — weight interleave still unresolved
+- Captured a clean M=1 tile (RKDUMP_MM_M=1): A=contiguous (nc16(0,k,1)=k), C=contiguous (c4(0,n,1)=n) — ZERO
+  layout assumptions. mm1_{A,weight,C}.bin in scratch. Weight bytes BYTE-IDENTICAL to M=8 capture (confirms the
+  layout is fixed across captures; same model weight).
+- Also confirmed NO zero-point/scale: WPOS=0 injection gave C[m][0]=A[nc16(m,0)]*1 EXACTLY -> int32 out = raw
+  signed A*W (no requant/bias). So the compute model (sum signed a*w) is correct.
+- Tested ALL families on clean M=1 (A both contiguous and width-8): nk[n][k], kn[k][n], NVDLA(cube64,kg32),
+  blk32(n-stride32), cube32(kg32) -> ALL 0/4. Single-stride channel-block sweep (all mult of 32) -> none.
+- Injection pins: byte0/1/16 -> (k=0,1,16, n=0) => column 0 STARTS CONTIGUOUS (k=0..16 at bytes 0..16) then
+  breaks at a block boundary that fits NO single stride => genuine 2+-level interleave.
+- CONCLUSION: the weight is a multi-level NVDLA-derived interleave whose FORM isn't any tried family; it can't be
+  recovered from captured triples (offline, even with 2 tiles) and the byte-level injection to map it needs k>=32
+  offsets that wedge/miscompute on this (degraded) board. Sole remaining unknown; genuinely walled.
+- To close: exact Rockchip weight-packing spec (vendor/Mesa rocket source) OR full byte-level injection map on a
+  STABLE board (this unit is now too degraded — wedges/miscomputes on high-offset probes after ~13 cycles).
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
