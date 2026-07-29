@@ -74,6 +74,36 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
       capture at M=36 once grouped correctly (THEORY CHECK: NEITHER). This is why on-board M-sweeps were
       intractable and the scratch formula was flaky.
 
+## (A) CHAIN STRUCTURE — captured + characterized 2026-07-29 (rk_bench_short + RKDUMP_MM, tools/re/submit_extract.py)
+- rkllm's librkllmrt runs fine via the native C++ benches in ~/rkbench/ (rk_bench_short <model> <maxctx>
+  <maxnew> <ncore>). The node harness (rkllm_bench.js -> orkllm_napi.node) CRASHES (std::out_of_range,
+  0 submits) — do NOT use it; use ~/rkbench/rk_bench_short.
+- Capture cmd (WORKS, low-risk): cd ~/rkbench && sudo env LD_PRELOAD=/tmp/rknpu_dump.so LD_LIBRARY_PATH=.
+  ORK_SUBMIT_ONLY=1 RKDUMP_MM=1 RKDUMP_MM_K=3584 RKDUMP_MM_N=1216 timeout 120 ./rk_bench_short
+  ~/Qwen2.5-7B...w8a8.rkllm 512 4 3   -> /tmp/mm_{regcmd,meta,chain_meta}.txt + mm_{A,weight,C}.bin.
+  NOTE: ORK_SUBMIT_ONLY suppresses per-task regcmd hexdumps (keep OFF if you want all 21 task regcmds in the
+  log). The 0x0010 chain-walk only follows ~4 tasks; the real chain is the task_number=21 DESCRIPTOR ARRAY.
+- ONE MATMUL = a task_number=21 chain, per core (core=0x1/0x2/0x4 round-robin), domain=1, flags=0x5.
+- EVERY TASK IS FULL-K: Ks=64*DATA_ENTRIES/M = 3584 = K for all. NO K-slicing. Each task is a complete
+  A[M,3584]*W[3584,1216] matmul for an M-row tile. DATA_ENTRIES(0x1044)=56*M exactly (56=K/64).
+- rkllm tiles the prefill's TOTAL M into VARIABLE row-tiles: widths seen = 1,2,4,6,8,10,12,14,20,24,36
+  (NOT uniform, NOT width-8). Weight loaded once, tiles chained (weight-resident).
+- SHAPE-CLEAN regs (safe to synth from M): 0x100c=0 (=OKV_CONV1_PLAIN=OKV_CONV1_MFOLD), 0x104c=0xb,
+  0x1044=56*M, output cube WIDTH(0x4030)=M-1, N(0x1038)=1216, K(0x1024)=3584.
+- PLANNER-STATE regs (NOT f(M,N) — vary even at fixed (M,N), e.g. M=6 -> CBUF 0xa2/0xb1/0xa2): 0x1040 CBUF
+  bank split, 0x107c DMA_CON1, 0x1080 DMA_CON2, 0x4024 DST_SURF_STRIDE, 0x40c0 SURFACE_ADD (0x4024/0x40c0
+  are also output address/stride ork computes itself).
+
+## (A) NEXT: single-tile bit-exact REPLAY MVP
+- Each tile is a COMPLETE full-K/full-N matmul -> independently CPU-comparable. MVP: replay rkllm's EXACT
+  captured regcmd for ONE tile (start M=36, its operands are dumped) via ork_npu_replay_i8 (rebase the 3
+  addrs FEATURE/WEIGHT/DST to ork buffers), feed ork-packed A/W in the confirmed layout (C2-16 in / C2-4
+  out / ork_woff weight), compare to CPU ref. This is validate_mfold but with rkllm's regcmd, not ork synth.
+  If bit-exact + no wedge -> capture-replay is viable; scale to a per-M tile-program library + a row-tile
+  chain executor (weight-resident, 3-core RR). If it wedges -> even rkllm's exact regcmd won't run rebased.
+- To get a CLEAN per-tile regcmd: extract from the verbose original dump (submit_extract.py) OR re-capture
+  WITHOUT ORK_SUBMIT_ONLY so every task's regcmd is logged, then pick a full-N (N=0x4c0) tile of the wanted M.
+
 ## Strategic reframe for #39 (DECISION NEEDED)
 "Encode rkllm's fast fold schedule as a formula of shape" is ILL-POSED — there is no such formula; the
 regs are rkllm's tiling-planner output. Remaining real paths, both different from the whole arc so far:

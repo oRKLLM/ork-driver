@@ -54,6 +54,13 @@ As more NPUs are added to the platform, everything needed to onboard one lives h
 - `regcmd_capture.c` — LD_PRELOAD interposer; dumps regcmd + buffers on SUBMIT (`RKDUMP_WORDS`, `ORK_SUBMIT_ONLY`).
 - `run_rknn.c` — minimal RKNN-API runner; loads a `.rknn`, fills inputs deterministically, runs once.
 - `decode_reg.c` — decode a regcmd dump into (domain, addr, value); diff two dumps to isolate op-specific regs.
+- `parse_mfold.py` — tabulate the M-fold matmul's schedule registers per M from a verbose rkllm dump.
+- `analyze_schedule.py` — the richer successor to `parse_mfold.py`: parses a verbose dump, tabulates the
+  schedule regs per group with a CONSTANT-vs-VARIES marker, fits each reg as `a·M+b`, factors by `(rows,
+  K-slice)`, and reads `0x100c`. Its header records the DEFINITIVE regcmd word encoding (value = `w0>>16`;
+  NOT the 32-bit form, which corrupts 16-bit regs). Use it to answer "is reg X a function of shape?".
+- `submit_extract.py` — group a verbose dump's `--- regcmd` blocks under their `=== SUBMIT` header and print
+  one complete multi-task submit (per-task M / DATA_ENTRIES / K-slice / CBUF / N), to spec a chain replay.
 - `silu_std_probe.c` — RE/calibration harness for the standalone SiLU activation op (ramp-measure idx, build curve).
 - `models/build_act.py` — build a single-op activation `.rknn` (silu/sigmoid/gelu/relu/tanh; i8/fp16/i16).
 - `ork_bench.cpp` — open-stack perf harness. Drives the llama.cpp C API directly (the `ggml-ork` backend
@@ -104,6 +111,31 @@ modes and the CBUF banking (2026-07; findings on the wiki `regcmd-ISA-Reference`
   Established: RK3588 matmul is symmetric-only (fp16/int8/int4; all mixed types reject at create);
   `0x4010`=precision/mode; int8/fp16 batch in-task (=our M-scheduler), int4 batches multi-task
   (`task_number`=rows) — which refuted the old `batch_probe` "kernel rejects task_number>1".
+
+## M-fold matmul schedule RE (the rkllm "fold", task #39)
+
+RE-ing rkllm's fast int8 prefill matmul (the "M-fold": tokens folded into the CNA WIDTH). Full record on the
+wiki + `MFOLD_RECAPTURE_WIP.md`; the decisive result: **the fold schedule is NOT a function of the matmul
+shape** — the registers `0x1040/0x107c/0x1080/0x4024/0x40c0` are outputs of rkllm's internal per-sub-block
+tiling planner and vary even at fixed `(M,N)`. So it cannot be *synthesized* from shape; only *captured*.
+
+Workflow (all offline once a dump exists — no wedge risk; rkllm is the reference, not ork's synth):
+```sh
+# 1. capture rkllm's real programs (native C++ bench; the node harness crashes — do NOT use it):
+gcc -shared -fPIC -O2 -Itools/re -Isrc -o /tmp/rknpu_dump.so tools/re/regcmd_capture.c -ldl
+cd ~/rkbench && sudo env LD_PRELOAD=/tmp/rknpu_dump.so LD_LIBRARY_PATH=. RKDUMP_MM=1 \
+    RKDUMP_MM_K=3584 RKDUMP_MM_N=1216 ./rk_bench_short model.rkllm 512 4 3 2>cap.log
+#   -> /tmp/mm_{regcmd,meta,chain_meta}.txt + mm_{A,weight,C}.bin (exact operands for a bit-exact replay).
+#   (omit ORK_SUBMIT_ONLY to get EVERY task's regcmd in cap.log; keep it to only get the RKDUMP_MM files.)
+# 2. characterize offline:
+python3 tools/re/analyze_schedule.py cap.log 3584 1216     # is each reg f(shape)? -> answers: NO for the DMA regs
+python3 tools/re/submit_extract.py   cap.log 21            # one full task_number=21 submit's per-task tiling
+```
+Findings so far: one matmul = a `task_number=21` chain per core (3-core round-robin); every task is FULL-K
+(`DATA_ENTRIES=56·M`), a complete `A[M,3584]·W[3584,1216]`; rkllm tiles the prefill M into VARIABLE row-tiles
+(widths 1,2,4,6,8,10,12,14,20,24,36); shape-clean regs are `0x100c=0` (`=CONV1_PLAIN`), `0x104c=0xb`,
+`0x1044=56·M`, WIDTH=`M-1`. Next: bit-exact single-tile REPLAY of rkllm's captured regcmd via
+`ork_npu_replay_i8` (validate_mfold structure, rkllm's regcmd instead of ork synth).
 
 - **`models/build_conv.py` — single-Conv `.rknn`** (build in the rknn-toolkit2 container, capture on
   the board with `run_rknn`). Conv emits the domain-2001 (`0x50xx`) CDMA block the matmul path lacks.
