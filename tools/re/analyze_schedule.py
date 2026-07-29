@@ -46,6 +46,19 @@ while i < len(lines):
     i+=1
 print(f"parsed {len(blocks)} regcmd blocks from {path}")
 
+# shape inventory: which (K,N) matmuls does the model actually run, and how many tasks each?
+def rv0(regs,reg):
+    for (b,r),(v,v32) in regs.items():
+        if r==reg: return v
+    return None
+shape_hist=defaultdict(int)
+for regs in blocks:
+    K = rv0(regs,0x1024) or rv0(regs,0x1088); N=rv0(regs,0x1038)
+    if K and N: shape_hist[(K,N)]+=1
+print("\n== matmul shape inventory (K,N) -> task count (top 20) ==")
+for (K,N),c in sorted(shape_hist.items(), key=lambda x:-x[1])[:20]:
+    print(f"  K={K:>6} N={N:>6}  x{c}")
+
 def rv(regs, reg, wide=False):
     for (b,r),(v,v32) in regs.items():
         if r==reg: return v32 if wide else v
