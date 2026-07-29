@@ -134,8 +134,37 @@ python3 tools/re/submit_extract.py   cap.log 21            # one full task_numbe
 Findings so far: one matmul = a `task_number=21` chain per core (3-core round-robin); every task is FULL-K
 (`DATA_ENTRIES=56·M`), a complete `A[M,3584]·W[3584,1216]`; rkllm tiles the prefill M into VARIABLE row-tiles
 (widths 1,2,4,6,8,10,12,14,20,24,36); shape-clean regs are `0x100c=0` (`=CONV1_PLAIN`), `0x104c=0xb`,
-`0x1044=56·M`, WIDTH=`M-1`. Next: bit-exact single-tile REPLAY of rkllm's captured regcmd via
-`ork_npu_replay_i8` (validate_mfold structure, rkllm's regcmd instead of ork synth).
+`0x1044=56·M`, WIDTH=`M-1`.
+
+### ★ FOLD LAYOUT SOLVED + BIT-EXACT (2026-07-29) — and the weight layout is a DOCUMENTED vendor format
+
+The full fold data layout is confirmed on silicon (`tools/re/validate_layout.c`: ork packs its OWN A/W, replays
+rkllm's captured regcmd, de-tiles output, compares CPU ref → **0/9728 bit-exact @ 609 µs, M=8**):
+- **A (input)**  = `nc16` : `(k/16)*(M*16) + m*16 + (k%16)`  — NC1HWC2 **C2=16**, M folded into width.
+- **W (weight)** = `woff` : `((n/32)*(K/32) + (k/32))*1024 + (n%32)*32 + (k%32)` — the RK3588 int8 matmul-native
+  weight format (32×32 tiles, K innermost).
+- **C (output)** = `c4`   : `(n/4)*(M*4) + m*4 + (n%4)`  — NC1HWC2 **C2=4** int32.
+
+**The weight layout did NOT need board RE — it is published in the RKNN toolkit header** and this is the
+reusable asset for porting to other Rockchip NPUs: read the per-chip native (subN,subK) directly, no probing.
+Source: `airockchip/rknn-toolkit2 → rknpu2/runtime/Linux/librknn_api/include/rknn_matmul_api.h`
+(function `rknn_B_normal_layout_to_native_layout`). Native B layout `(N/subN, K/subK, subN, subK)`:
+
+| chip | dtype | native (N/subN, K/subK, subN, subK) | subN | subK | align |
+|---|---|---|---|---|---|
+| RK3566/3568/3562 | int8 | (N/16, K/32, 16, 32) | 16 | 32 | 32B |
+| **RK3588 / RK3576** | **int8** | **(N/32, K/32, 32, 32)** | **32** | **32** | **32B** |
+| RK3588 / RK3576 | int4 | (N/64, K/32, 64, 32) | 64 | 32 | 64B |
+| (all) | fp16 | — | — | — | 16B |
+
+General weight offset: `woff(k,n) = ((n/subN)*(K/subK) + (k/subK))*(subN*subK) + (n%subN)*subK + (k%subK)`.
+When adding a new Rockchip SoC, grab its (subN,subK) from that header and this formula gives the weight pack —
+the activation stays NC1HWC2 (C2 = 16 int8 / 8 fp16) and output C2 = 4 (int32). GOTCHA when RE-decoding an
+injection ramp: `A[i]=(i%251)-125` aliases (val -120 → i∈{5,256,…}); pick the i that is a valid `nc16` index.
+
+Capture-replay is thus implementable: pack A=`nc16`/W=`woff`, replay rkllm's per-M captured regcmd
+(`ork_npu_replay_i8`; do NOT set `ORK_REPLAY_RESET` — its `ACT_RESET` pre-submit is a wedge trigger), read
+C=`c4`. Remaining is the weight-resident `task_number=N` HW-chain + benchmark vs ork's normal path.
 
 - **`models/build_conv.py` — single-Conv `.rknn`** (build in the rknn-toolkit2 container, capture on
   the board with `run_rknn`). Conv emits the domain-2001 (`0x50xx`) CDMA block the matmul path lacks.
