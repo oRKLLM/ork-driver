@@ -137,6 +137,51 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
   accumulates / is post-scaled (w8a8 per-channel)?  (b) exact A C2 layout + width padding; (c) exact weight
   tiling; (d) exact C2-4 output mapping. NEXT: systematic offline layout solve from the captured triple.
 
+## (A) TILE SEMANTICS DISAMBIGUATED (2026-07-29): fold is a K-SLICE ACCUMULATING chain, NOT independent tiles
+- Layout-invariant variance test on rkllm's exact M=8 A/W/C: actual std(C)=4345 vs predicted 1815 for a single
+  full-K A*W of this tile's bytes -> ratio 2.39 std ≈ sqrt(6) var -> C = sum of ~6 contributions.
+- Corroborated by SHARED C ADDRESSES: chain meta shows multiple tasks write the SAME Cadr=0xb17a000 (task2,
+  task3, and the M=8 tile) -> they ACCUMULATE into one region.
+- => rkllm's fold is a K-slice ACCUMULATE chain (several tasks sum into one C), NOT independent full-K row-tiles.
+  The "every task full-K (DATA_ENTRIES=56*M)" reading was WRONG. This is WHY the single-tile offline layout
+  solve failed (0/14): compared ONE tile's A*W to an ~6-tile-accumulated C.
+- IMPLICATION: to validate a layout offline, capture a FIRST-WRITER task (fresh C region, no prior accumulation)
+  and compare just that; or model the full accumulation. A working replay needs the whole accumulating chain.
+
+## (A) LAYOUT via CONTROLLED INJECTION (2026-07-29) — A and C layouts CONFIRMED; weight is the sole unknown
+- Method (tools/re/inject_map.c): run rkllm's captured regcmd via ork_npu_replay_i8 with OUR bytes — weight
+  all-zero except ONE byte=1 at WPOS, A = recoverable ramp A[i]=(i%251)-125. Deterministic, no guessing.
+- Also disproved accumulation: grouping the whole verbose dump by C_ADDR shows only 5 distinct C addrs (2948
+  writers to one) = a small REUSED scratch-buffer pool across thousands of matmuls, NOT accumulation. So the
+  tile IS a standalone matmul; layout was the only issue (the variance anomaly was layout-confounded A sampling).
+- WPOS=0 result (weight byte 0 = 1): exactly 8 nonzero outputs at C indices 0,4,8,12,16,20,24,28 (stride 4)
+  and values -125,-109,...,-13 (step 16):
+  * output index = m*4  => OUTPUT layout is c4(m,n,M)=(n/4)*(M*4)+m*4+(n%4)  ✅ CONFIRMED (my c4 was right)
+  * paired A byte offsets = m*16  => INPUT layout is nc16(m,k,M)=(k/16)*(M*16)+m*16+(k%16) ✅ CONFIRMED
+  * weight byte 0 -> (k=0, n=0)
+- So A=nc16 and C=c4 are CORRECT; the earlier 0/14 offline failure was purely the WEIGHT layout (woff wrong).
+- inject_map decodes each WPOS to (n from idx0, k from val0). Sweep WPOS to map the weight layout. GOTCHA:
+  looping many replays in ONE process (fresh buffer alloc each) WEDGES (driver's documented fresh-alloc wedge)
+  — run ONE WPOS per process (a shell loop of separate inject_map invocations; each is fast, no model load).
+- NEXT: sweep WPOS (0,1,2,32,33,1024,...) one-process-each -> derive the weight index->(k,n) formula, plug into
+  replay_tile's CPU ref -> bit-exact. Then ork packs weight in that layout + replays captured per-M regcmds.
+
+## (A) WEIGHT LAYOUT — the last unknown; injection points wedge, offline families don't fit (2026-07-29)
+- Injection points obtained (single fresh submits, decoded): WPOS=0 -> (k=0,n=0); WPOS=1 -> (k=1,n=0). So the
+  weight is k-fastest at the innermost level, byte0=(0,0), byte1=(1,0). Rules out [k][n]; consistent with a
+  k-contiguous inner block. NEED byte 32/1024/N/K to fix the block/column structure.
+- BLOCKED: injection probes for WPOS>=32 WEDGE the board (single-submit AND multi; the NMAP multi-offset probe
+  also wedged). Same mfold run-to-run intermittency, now on the replay path. ~7 cold-cycles spent.
+- OFFLINE brute-force of the weight layout (with A=nc16, C=c4 now CONFIRMED) does NOT fit simple families:
+  tested [n][k]=n*K+k, [k][n]=k*N+n, block (k//B)*S+(k%B) for B{16,32,64} x S{16..4096,K,N,...} -> 0 match on
+  column 0 (target C[m][0]=[767,-900,1657,1888,4896,2336,3119,3185]). The weight is a non-obvious NVDLA kernel
+  format (consult rocket_registers.h / NVDLA weight-tiling docs, per AGENTS.md).
+- So the SOLE remaining unknown for capture-replay is the weight byte layout. A/C layouts CONFIRMED, execution
+  works, per-tile schedule replayable. To finish: either (a) map the weight via injection on a MORE STABLE board
+  (the probes wedge this unit), or (b) derive the weight kernel format from NVDLA/rocket docs, or (c) extract
+  the logical weight from the GGUF to constrain the offline solve (N=1216 is likely an internal N-tile, so the
+  match is nontrivial).
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.

@@ -161,7 +161,13 @@ int ioctl(int fd, unsigned long request, ...) {
                          * 0x1070/0x1110/0x4020 to the dump base (= aadr/wadr/cadr), so addressing is preserved. */
                         int wantK=getenv("RKDUMP_MM_K")?atoi(getenv("RKDUMP_MM_K")):3584;
                         int wantN=getenv("RKDUMP_MM_N")?atoi(getenv("RKDUMP_MM_N")):1216;
-                        if ((int)K==wantK && (int)N==wantN && M>best_M) { best_M=M;
+                        int wantM=getenv("RKDUMP_MM_M")?atoi(getenv("RKDUMP_MM_M")):0;
+                        /* RKDUMP_MM_M pins ONE exact M: dump the FIRST matching tile ONLY (then lock best_M so no
+                         * later match partial-overwrites) — guarantees regcmd+A+W+C+meta are all the SAME tile.
+                         * (The old M>best_M "keep largest" raced: a later larger-M match that failed to remap A
+                         * left A+meta from an earlier M while regcmd+C came from the larger M — inconsistent.) */
+                        int match = wantM ? ((int)M==wantM && best_M!=0x7fffffff) : (M>best_M);
+                        if ((int)K==wantK && (int)N==wantN && match) { best_M = wantM ? 0x7fffffff : M;
                             uint64_t aoff=0,woff=0,coff=0;
                             struct ent*ab=by_dma_range(aadr,&aoff), *wb=by_dma_range(wadr,&woff), *cb=by_dma_range(cadr,&coff);
                             /* Bound each dump to the operand's actual footprint + generous margin (A and W live in
