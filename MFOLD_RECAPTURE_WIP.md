@@ -245,8 +245,10 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
   is one of only 5 REUSED output buffers; RKDUMP dumps C AFTER the whole rk_bench run, so it holds a LATER
   submit's output, not the captured tile's. The captured (A,W,C) is NOT a consistent triple => offline can't
   validate. This is a capture artifact, NOT a layout error.
-- CONFIRMATION PENDING: validate_layout.c (ork's OWN random A/W packed nc16/woff, replay rkllm regcmd, de-tile
-  c4, compare CPU ref A*W) — self-consistent, no captured operands. Wedges intermittently; needs one clean run.
+- ★ CONFIRMED BIT-EXACT (validate_layout.c): ork's OWN random A(nc16)/W(woff) -> replay rkllm regcmd -> de-tile
+  c4 -> CPU ref A*W = **0/9728 mismatch, maxerr=0, 609us**. Layout SOLVED + validated. Capture-replay works.
+- ★ WEDGE ROOT-CAUSE: ORK_REPLAY_RESET (ACT_RESET pre-submit) was the trigger; without it mfold replay runs
+  clean (validated twice). Not board degradation. Do NOT set ORK_REPLAY_RESET for the mfold replay path.
 
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
