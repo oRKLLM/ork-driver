@@ -104,6 +104,45 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
 - To get a CLEAN per-tile regcmd: extract from the verbose original dump (submit_extract.py) OR re-capture
   WITHOUT ORK_SUBMIT_ONLY so every task's regcmd is logged, then pick a full-N (N=0x4c0) tile of the wanted M.
 
+## (A) REPLAY MVP progress (tools/re/replay_tile.c)
+- replay_tile feeds rkllm's captured regcmd (/tmp/mm_regcmd.txt, 232 words, the M=36 full-K/full-N tile) +
+  rkllm's operand bytes through ork_npu_replay_i8 (patches FEATURE/WEIGHT/DST addrs, task_number=1), then
+  compares ork's raw output buffer to rkllm's dumped output (/tmp/mm_C.bin) — zero layout assumptions.
+- **KEY POSITIVE: rkllm's exact regcmd EXECUTES ON ork with NO WEDGE** (repeatable, ~640 us/submit). This
+  de-risks the whole capture-replay idea: what wedged all along was ork's WRONG SYNTH, not the fold path.
+- OUTPUT not yet bit-exact: raw compare 28692/29184 mismatch, ork=37 vs rkllm=8941 at idx0. ork's value is
+  far too small for a full K=3584 dot-product -> ork isn't reading the weights/A rkllm's program expects.
+  Layout is irrelevant to the raw compare (same regcmd + same bytes must match), so it's an INPUT-COVERAGE
+  or CHAIN-CONTEXT issue. Hypotheses being tested:
+  (i) weight span: fed only first K*N; rkllm dumped Wspan=4*K*N -> the fold may read STRIDED across the full
+      span. [testing: feed full mm_weight.bin]
+  (ii) chain context: this M=36 tile is 1 of a task_number=21 chain; if weights are CBUF-resident from a
+      prior task (loaded once), a standalone single-task replay has no resident weights -> near-zero output.
+      If (i) doesn't fix it, the tile is NOT standalone and (A) needs a FULL-CHAIN replay (all 21 tasks in
+      one submit), not single-task. That's the chain-replay executor (extend ork_npu_replay_i8 to the
+      task_number=21 descriptor array with per-task regcmd + rebased addrs).
+
+## (A) LAYOUT is ALSO unconfirmed vs rkllm (offline check, 2026-07-29)
+- Pulled rkllm's EXACT operands for one tile locally (scp /tmp/mm_{A,weight,C}.bin, mm_regcmd.txt) and ran the
+  DECISIVE offline check (scratch offline_layout_check.py / layout_solve.py): does rkllm's OWN A*W (de-tiled
+  via our "confirmed" fold layouts) == rkllm's OWN captured C?  ANSWER: NO. 0/14 sampled outputs match.
+- The A*W magnitudes are the RIGHT SCALE (hundreds..thousands, like rkllm's C) -> K is fully summed with real
+  data, but the INDEX MAPPING is wrong. Swept width-pad {16,24,32,48} x A{C2-16,rowmaj,transposed} x
+  W{ork_woff,[k][n],[n][k]} x C{C2-4,rowmaj} -> NOTHING matches (best 0/4).
+- CONCLUSION: the "confirmed unique" fold layout (C2-16 in / ork_woff / C2-4 out) was only ever validated
+  against ORK'S OWN single-tile synth (validate_mfold M=8), NEVER against rkllm's real data. Both the schedule
+  AND the layout need solving from captured data. (The one bit-exact M=8 was ork-self-consistent, not rkllm.)
+- This is now a BOUNDED OFFLINE puzzle (no board/wedge risk): I have rkllm's exact A, W, C, regcmd locally.
+  Open sub-questions for the solve: (a) is this M=24 tile a STANDALONE full matmul or a chain sub-block whose C
+  accumulates / is post-scaled (w8a8 per-channel)?  (b) exact A C2 layout + width padding; (c) exact weight
+  tiling; (d) exact C2-4 output mapping. NEXT: systematic offline layout solve from the captured triple.
+
+## (A) NET STATE
+- WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
+  viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
+- OPEN: exact fold LAYOUT (refuted vs rkllm data) and exact per-tile SCHEDULE (planner output) both still need
+  offline solving from captured data before a bit-exact replay is possible.
+
 ## Strategic reframe for #39 (DECISION NEEDED)
 "Encode rkllm's fast fold schedule as a formula of shape" is ILL-POSED — there is no such formula; the
 regs are rkllm's tiling-planner output. Remaining real paths, both different from the whole arc so far:
