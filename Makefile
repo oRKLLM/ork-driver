@@ -84,6 +84,12 @@ rknpu_bench: tools/rknpu_bench.c
 regcmd_decode: tools/re/regcmd_decode.c src/ork_regs.h
 	$(CC) $(CFLAGS) -o $@ $<
 
+# RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
+# Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
+# Use:  make cdma_calib && ./cdma_calib   (exit 0 iff the standard model reproduces ork's layouts bit-exact)
+cdma_calib: tools/re/cdma_calib.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 # Phase-1 validation of ork_submit_seq: mixed int8(HW-doorbell)+fp16(SW-chain) sequence, bit-exact across
 # many runs + HW<->SW transitions. Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 300 ./test_submit_seq
 test_submit_seq: tools/test_submit_seq.c $(COBJ)
