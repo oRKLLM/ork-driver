@@ -138,6 +138,55 @@ static void report_fold_scaffold(void) {
            "          from the seed; each survivor confirmed by ONE ork_npu_replay_i8_sweep submit (wedge-safe).\n");
 }
 
+/* ======================= FOLD SEARCH (phase 1: constrain the layout family, offline) ==================== */
+/* Captured invariants (from the mfold RE / regcmd captures):
+ *   surf-stride reg 0x1080 * M ~= 2160  [reg=60@M36, reg=108@M20]  -> surf_stride shrinks as M grows
+ *   line-stride reg @M36 = 96 (3072 B)
+ *   single-submit partial reduce: M=16,K=3584,DATA_BANK=3 -> 2400 channels
+ * On-board sweep (tools/re/fold_alayout.c) ALREADY tested & REJECTED (100% mismatch) these within-tile
+ * orderings: rowmajor[M][K], NC1HWC2 C2 in {16,32,64}, colmajor[K][M], nc16 M-innermost. */
+typedef struct { int M, reg; } surfpt;
+static int fold_search(void) {
+    printf("== FOLD SEARCH phase 1 (constrain the layout family — offline) ==\n");
+    /* (1) verify the surf_stride*M invariant and derive the fixed region */
+    surfpt pts[] = { {36,60}, {20,108} };
+    long konst = -1; int inv_ok = 1;
+    for (unsigned i=0;i<sizeof pts/sizeof*pts;i++){ long p=(long)pts[i].M*pts[i].reg;
+        printf("    surf: M=%d reg=%d -> M*reg=%ld\n", pts[i].M, pts[i].reg, p);
+        if (konst<0) konst=p; else if (p!=konst) inv_ok=0; }
+    printf("    => surf_stride reg = %ld / M  (invariant %s): surf_stride shrinks with M\n",
+           konst, inv_ok ? "HOLDS" : "BROKEN");
+    long region_atoms = konst;                 /* 2160 atom-32 units */
+    long region_bytes = region_atoms * 32;     /* = per-submit A/CBUF data region */
+    printf("    => FIXED per-submit region = %ld atom-32 = %ld B; K-slice channels/token = (2160/M)*32\n",
+           region_atoms, region_bytes);
+    printf("       M=36 -> %ld ch/token/submit (partial of K=3584);  M=20 -> %ld ch/token (~full K)\n",
+           (2160/36)*32L, (2160/20)*32L);
+    printf("    UNIFIES with CBUF finding: K-per-slice is proportional to 1/M because M*K_slice = fixed CBUF\n"
+           "    data region -> big M forces more K-slices -> the chain-required behavior. (new synthesis)\n");
+
+    /* (2) RULE OUT the standard NC1HWC2: its surf_stride = M*atom GROWS with M (captured SHRINKS). */
+    printf("    standard NC1HWC2 surf_stride = M*atom (GROWS with M) -> RULED OUT vs captured (shrinks). "
+           "The fold A-layout is NOT a scaled standard layout.\n");
+
+    /* (3) within-tile ordering: enumerate, mark matmul-validity + which the board sweep already rejected. */
+    const char *ord[] = {"rowmajor[M][Ksl]","colmajor[Ksl][M]","nc16","nc32","nc64","line-grouped(GROUP_LINE_OFF?)"};
+    const int   board_rejected[] = {1,1,1,1,1,0};   /* fold_alayout.c results; line-grouped = UNTESTED */
+    printf("    within-tile (m,k)->offset candidates:\n");
+    for (unsigned i=0;i<sizeof ord/sizeof*ord;i++)
+        printf("      %-30s matmul-valid=yes(weak filter)  board=%s\n", ord[i],
+               board_rejected[i] ? "REJECTED (100%% mismatch)" : "UNTESTED <- the residual");
+
+    /* (4) verdict + the precise next input */
+    printf("    NARROWED: fixed-region/M surf model derived+unified; every SIMPLE within-tile ordering is\n"
+           "    board-rejected -> the residual is the GROUP_LINE_OFF line-grouping (the one unpublished bit).\n");
+    printf("    OFFLINE is now underdetermined by the reg dump alone (stride fixes the FRAME, not the\n"
+           "    intra-surface permutation). NEXT INPUT to finish: the actual A bytes rkllm staged for a\n"
+           "    known input -> read the permutation directly from ~/rkllm_ffn_capture_2026-07-27.dump\n"
+           "    (board), OR a single one-hot ork_npu_replay_i8_sweep confirm of the line-grouped candidate.\n");
+    return 0;   /* research readout, not a pass/fail gate */
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
     printf("cdma_calib — offline CDMA address model (no NPU)\n");
@@ -147,6 +196,7 @@ int main(void) {
     fail |= check_matmul_standard();
     printf("== FOLD scaffold (hypothesis surface for the next phase) ==\n");
     report_fold_scaffold();
+    fold_search();
     printf("%s\n", fail ? "CALIB FAIL" : "CALIB PASS (standard model reproduces ork's known-good layouts)");
     return fail ? 1 : 0;
 }
