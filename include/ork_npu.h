@@ -695,8 +695,22 @@ int          ork_npu_replay_i8(ork_npu *ctx, const unsigned *regcmd, int rn, int
  * wedge-safe). Avar = nvar A-images each `astride` bytes; Couts = nvar contiguous M*N int32 results. 0/ok. */
 int          ork_npu_replay_i8_sweep(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
                                const signed char *Avar, int nvar, int astride, const signed char *Bdata, int Bbytes, int *Couts);
+/* #39 A-layout mapper: for nk0 weight one-hot positions Bpos (ork_woff byte for (n0,k0)), recover per output
+ * slot the A byte offset the fold read. Fills rpos[nk0*M] (raw C int32 index), aoff[nk0*M] (A byte offset),
+ * cnt[nk0] (slots found). One buffer set, wedge-safe. 0/ok. */
+int          ork_npu_replay_i8_amap(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
+                               const unsigned *Bpos, int nk0, int n0, int *rpos, int *aoff, int *cnt);
 /* #39 PORT (RE): dump ork's synth_i8 regcmd for (mc,K,N) to diff vs rkllm's captured regcmd. Returns word count. */
 int          ork_npu_synth_i8_dump(ork_npu *ctx, int mc, int K, int N, unsigned *out, int outn);
+/* #39 weight-resident M-fold chain: P width-w mfold tiles, shared K*N weight, one task_number=P submit. */
+int          ork_npu_mfold_chain(ork_npu *ctx, int P, int w, int K, int N,
+                                 const signed char *Apacked, const signed char *Bpacked,
+                                 int *Craw, int iters, double *us);
+/* #39 same, but each task is a CAPTURED bit-exact tile regcmd (tile_rc/trn) with only addresses re-based. */
+int          ork_npu_mfold_chain_cap(ork_npu *ctx, int P, int w, int K, int N,
+                                     const unsigned *tile_rc, int trn,
+                                     const signed char *Apacked, const signed char *Bpacked,
+                                     int *Craw, int iters, double *us);
 
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT

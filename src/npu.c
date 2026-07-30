@@ -921,6 +921,123 @@ static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t a
     setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,           mc-1);
     for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
+static unsigned mm_timeout_ms(void);   /* fwd (defined below) */
+static uint32_t ork_ppflags(void);     /* fwd (defined below) */
+/* #39 WEIGHT-RESIDENT M-FOLD CHAIN (task_number=P). Each of P tasks is a width-`w` mfold tile built by the
+ * validated synth_i8_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all
+ * P tasks (HW PC-chain), amortizing the weight-DMA over M=P*w rows. Chain descriptor written at words 216-219
+ * EXACTLY like the PROVEN run_chain_i8/mcworker_pref_chain; terminal task clears them. subcore_task[0..2] all
+ * populated (single-core), matching run_chain_i8. Apacked = P tiles of w-row C2-16 A (w*K bytes each); Bpacked =
+ * shared ork_woff weight; Craw = P tiles of raw C2-4 int32 (w*N int32 each). Board only; returns 0/ok, us=avg. */
+int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
+                        const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us){
+    int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||w<1||w>64||(K%32)||(N%16)) return -2;
+    int dom=c->dom_active;
+    size_t tileA=(size_t)w*K, tileC=(size_t)w*N;                 /* per-tile A bytes (C2-16), C int32 elems (C2-4) */
+    /* 8x guard rig (like the replay path): a malformed mfold DMA that over-reads/writes lands in MAPPED memory
+     * (diagnosable) instead of hanging the AXI/IOMMU bus (errno-110). */
+    size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
+    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
+    memcpy(A.cpu,Apacked,(size_t)P*tileA); memcpy(B.cpu,Bpacked,(size_t)K*N);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t *rcbuf=(uint32_t*)RC.cpu;
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;   /* P-task array (c->task is 512KB / flag 0x40b) */
+    for(int t=0;t<P;t++){
+        uint32_t rc[REGCMD_I8_N];
+        synth_i8_mfold(rc, w, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems);
+        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A */
+        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared weight */
+        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
+        /* chain-link at fixed words 216-219, PROVEN run_chain_i8/mcworker_pref_chain encoding. Terminal clears. */
+        if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
+            rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
+            rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
+        } else { rc[216]=rc[217]=rc[218]=rc[219]=0; }
+        memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
+        memset(&tk[t],0,sizeof tk[t]);
+        tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+        tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
+    }
+    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub;
+    #define _CSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
+    _CSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; }        /* warm */
+    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Craw) memcpy(Craw,Cc.cpu,(size_t)P*tileC*4);
+    { double t0=ork_now_us();
+      for(int i=0;i<iters;i++){ _CSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; } }
+      if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
+    #undef _CSUB
+cdone:
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+}
+/* #39 WEIGHT-RESIDENT M-FOLD CHAIN using a CAPTURED bit-exact tile regcmd (task #39: "chain the captured m8
+ * tile"). Identical machinery to ork_npu_mfold_chain, but each of P tasks is a memcpy of `tile_rc` (rkllm's
+ * captured width-`w` mfold regcmd, e.g. mm_regcmd_m8.txt at w=8 — validated 0/9728 bit-exact by validate_layout)
+ * with only the 3 address regs re-based per tile. This sidesteps synth_i8_mfold's schedule (which reproduces
+ * rkllm only via the per-M recipe); the captured tile carries the real planner schedule verbatim. Words 0..215
+ * are the tile (108 regs); trn may be >216 (the capture's next-task bleed) — only the tile words are copied, and
+ * the chain descriptor is written fresh at 216-219. 0x40c0 (=0x400 config, NOT an IOVA) is preserved untouched. */
+int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32_t *tile_rc, int trn,
+                            const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us){
+    int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||w<1||w>64||(K%32)||(N%16)||!tile_rc||trn<108) return -2;
+    int dom=c->dom_active;
+    size_t tileA=(size_t)w*K, tileC=(size_t)w*N;
+    size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
+    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
+    memcpy(A.cpu,Apacked,(size_t)P*tileA); memcpy(B.cpu,Bpacked,(size_t)K*N);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t *rcbuf=(uint32_t*)RC.cpu;
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
+    int ncopy = trn<REGCMD_I8_N ? trn : REGCMD_I8_N;   /* copy the FULL tile incl. its descriptor region, like ork_npu_replay_i8 */
+    for(int t=0;t<P;t++){
+        uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
+        memcpy(rc, tile_rc, (size_t)ncopy*4);                                                  /* captured tile verbatim */
+        /* neutralize the captured PC-chain descriptor IN PLACE — zero only the VALUE halves of the
+         * 0x0010(next-addr)/0x0014(next-amount) block-0x101 entries, KEEPING the reg-ids. This is EXACTLY
+         * what ork_npu_replay_i8 does (validate_layout proved that single-task path 0/9728 bit-exact);
+         * zeroing the whole words destroys the 0x0014 terminator and the lone task hangs. */
+        for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
+            if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
+        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A rows */
+        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared resident weight */
+        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
+        if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;                        /* link to next task */
+            rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
+            rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
+        } /* terminal task: leave the neutralized descriptor (reg-ids kept, values 0) as replay_i8 does */
+        memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
+        memset(&tk[t],0,sizeof tk[t]);
+        tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+        tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
+    }
+    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub;
+    #define _CAPSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
+    _CAPSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; }        /* warm */
+    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Craw) memcpy(Craw,Cc.cpu,(size_t)P*tileC*4);
+    { double t0=ork_now_us();
+      for(int i=0;i<iters;i++){ _CAPSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; } }
+      if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
+    #undef _CAPSUB
+capdone:
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+}
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
     if(!c || outn < REGCMD_I8_N) return -2;
     if(getenv("ORK_MFOLD")){ synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }
@@ -8280,6 +8397,58 @@ int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, i
     ret=0;
     #undef _SSUB
 sdone:
+    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+}
+/* #39 A-layout MAPPER (Route A): recover the fold's A-read map — for each weight one-hot position Bpos[i]
+ * (= ork_woff byte for logical (n0, k0_i)), which A-buffer BYTE OFFSET does the fold pull for each output
+ * position? With a one-hot weight at (k0,n0), C[*][n0] = A_read(*,k0). We run 4 submits/k0 on ONE buffer set
+ * (stable IOVA, wedge-safe): (P) presence A=1 -> the raw-C entries that are 1 mark this k0's M output slots;
+ * (0,1,2) A[j]=(j>>7p)&0x7f base-128 digits -> offset = d0 | d1<<7 | d2<<14 at each slot. Fills, per k0 i:
+ * rpos[i*M+t] = raw int32 index of the t-th output slot, aoff[i*M+t] = the A byte offset it read (t<cnt[i]).
+ * Returns 0/ok. Offsets up to 2MB (fits the oversized A buffer). */
+int ork_npu_replay_i8_amap(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
+        const uint32_t *Bpos, int nk0, int n0, int32_t *rpos, int32_t *aoff, int32_t *cnt){
+    int fd=c->fd; if(fd<0)return -3; if(rn<8||rn>2048||M<1||(K%32)||(N%16)||nk0<1)return -2;
+    int dom=c->dom_active;
+    size_t aszg=(size_t)M*K*8+(1u<<20), bszg=(size_t)K*N*8+(1u<<20), cszg=(size_t)M*N*4*8+65536;
+    struct buf A =bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf Cc=bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
+    for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff,b=(rc[k+1]>>16)&0xffff; if(b==0x101&&(o==0x0010||o==0x0014)){rc[k]&=0xffff;rc[k+1]&=0xffff0000u;} }
+    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
+    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
+    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
+    tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub; int8_t *ab=(int8_t*)A.cpu; int32_t *cb=(int32_t*)Cc.cpu;
+    #define _ASUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+    #define _FILLA(pl) do{ for(size_t j=0;j<aszg;j++) ab[j]=(int8_t)((pl<0)?1:((j>>(7*(pl)))&0x7f)); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
+    /* warm */
+    memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[0]]=1; bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    _FILLA(-1); _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone;
+    for(int i=0;i<nk0;i++){
+        memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[i]]=1; bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+        /* presence: A=1 -> C==1 at this k0's output slots */
+        _FILLA(-1); memset(cb,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+        _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone; bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+        int t=0; for(int idx=0; idx<M*N && t<M; idx++) if(cb[idx]!=0){ rpos[(size_t)i*M+t]=idx; t++; }
+        cnt[i]=t;
+        for(int p=0;p<3;p++){
+            _FILLA(p); memset(cb,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+            _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone; bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+            for(int tt=0;tt<t;tt++){ int32_t d=cb[rpos[(size_t)i*M+tt]]&0x7f;
+                if(p==0) aoff[(size_t)i*M+tt]=d; else aoff[(size_t)i*M+tt]|=(int32_t)d<<(7*p); }
+        }
+    }
+    ret=0;
+    #undef _ASUB
+    #undef _FILLA
+adone:
     bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
 }
 int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
