@@ -307,3 +307,30 @@ Banked regardless: analyze_schedule.py (RE tool), OKV_CONV1_MFOLD=0, the word-en
 - rkllm capture is LOW risk; the wedge risk is ONLY ork's mfold synth (avoid until schedule is derived).
 - Hard wedge recovery: HA "Rock 5B Plug" off (~20s drain) / on; POST via ~/ork-driver/ork_dyn_spin_diag.
 - Bash classifier was intermittently unavailable this session; reads/writes to local files unaffected.
+
+## 2026-07-30 — M>8 chain is BIT-EXACT; "reuse config" decoded (regcmd_decode-verified): there is none
+- **The M>8 chain works.** `ork_npu_mfold_chain_cap` (src/npu.c) chains P copies of the captured bit-exact
+  width-8 tile (`mm_regcmd_m8.txt`) in one `task_number=P` submit, shared resident weight, PC-chained at 216-219.
+  Verified on RK3588: **0-mismatch/maxerr=0 at M=8/16/32/64, no wedge.** Two regcmd-prep requirements (the real
+  cause of every prior "chain wedges/errno-110"): (1) PRESERVE `0x40c0` — it is an elem-size CONFIG (`0x400`
+  M-fold), NOT an output IOVA (patching → unmapped low IOVA → hard wedge; ork_regs.h corrects the old "IOVA"
+  misread); (2) neutralize the captured PC-chain descriptor KEEPING the reg-ids (zero only the value halves of the
+  `0x0010`/`0x0014` block-`0x101` entries, exactly like `ork_npu_replay_i8`) — zeroing whole words 216-219 drops
+  the `0x0014` terminator and even one task hangs.
+- **The "reuse config" does not exist — VERIFIED with `tools/re/regcmd_decode`** (names every reg via ork_regs.h,
+  flags unknowns; NOT a hand-filtered read). Across rkllm's `task_number=21` chain (`extract_tile.py` +
+  per-task regmap diff + full decode): the M=8 tile decodes to **0 UNKNOWN registers**; `0x1040`'s "reuse" bits are
+  **0** in every tile (value = just the 8-bit DATA/WEIGHT bank split); and the FC-mode skip register
+  **`CNA_FC_CON0` `0x1060`** (`FC_SKIP_EN[0]`/`FC_SKIP_DATA[31:16]`) reads **`0x0` across ALL 1208 tasks of ALL
+  21-chains** — the skip/reuse path is NEVER enabled. So rkllm re-streams the weight every task; there is no
+  load-once/reuse flag.
+- **Where the 1.6× actually lives:** bigger-M tiles (up to M=36) amortize one weight stream over more rows. But
+  the captured M=36 tile is a 364-word K-SLICE-ACCUMULATE regcmd (`0x1040=0x84` → DATA_BANK=4/WEIGHT_BANK=8,
+  `0x1080=+2160/M`) that **errno-110s standalone** — at M>8 the 12-bank CBUF can't hold full-K weight + M-rows
+  data, so a big-M task only computes inside the chain's accumulate context (the wiki Exp-2026-07-28 12-bank
+  trade-off). **M=8 (DATA_BANK=1/WEIGHT_BANK=11) is the largest STANDALONE full-K tile.** The M=8 chain is
+  bit-exact but re-streams weight per tile → ~7× slower than ork-normal (which already amortizes via its
+  `mg_max*64` big-M-tile). The 1.6× therefore requires implementing the K-slice-accumulate big-M chain (partial-K
+  weight slices + C-accumulate mode + per-slice bank split) — a substantial planner RE, not a config tweak.
+- New in this pass: `src/npu.c` `ork_npu_mfold_chain_cap`/`ork_npu_mfold_chain`, `tools/re/fold_chain_cap.c`,
+  `tools/re/extract_tile.py`. Wiki updated (NPU-Quirks + Exp-2026-07-28: `0x40c0` correction + bit-exact chain).
