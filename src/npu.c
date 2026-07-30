@@ -1377,8 +1377,8 @@ opdone:
  * row-major. 0/ok, -1 unsupported (shape/M outside envelope), -2 alloc, -3 bad ctx/weight. */
 int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cout, int iters, double*us){
     int fd=c->fd; if(fd<0||!w||!w->Bfold) return -3;
-    int K=w->K, N=w->N; const int NS=FOLD_REF_N; int nslice=w->fold_ns;
-    if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>3) return -1;
+    int K=w->K, N=w->N; const int NS=FOLD_REF_N, NC=3; int nslice=w->fold_ns;   /* NC cores; N>3648 => multiple rounds */
+    if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>64) return -1;
     int dom=w->domain;                                        /* A/C/RC/TK share Bfold's IOVA domain */
     static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
     int mt[64],roff[64],P=0,rem=M,off=0;
@@ -1390,8 +1390,10 @@ int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cou
     memset(A.cpu,0,asz);
     { int8_t*Ap=(int8_t*)A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf Cc[3]={{0}},RC[3]={{0}},TK[3]={{0}}; int rc_ret=-1;
-    size_t csz=(size_t)M*NS*4*8+65536;
+    /* per-slice resident C/RC/TK (built once, like a real run's resident setup); submitted in rounds of <=NC */
+    struct buf *Cc=calloc(nslice,sizeof(struct buf)),*RC=calloc(nslice,sizeof(struct buf)),*TK=calloc(nslice,sizeof(struct buf));
+    int rc_ret=-1; size_t csz=(size_t)M*NS*4*8+65536;
+    if(!Cc||!RC||!TK) goto rwdone;
     for(int s=0;s<nslice;s++){
         Cc[s]=bcreate(fd,csz,0x403,dom);
         RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
@@ -1414,16 +1416,19 @@ int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cou
         }
         bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     }
-    { int gszP[3]={P,P,P};
-      if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto rwdone;
-      for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
-      if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
-          for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
-      if(iters>0){ double t0=ork_now_us(); for(int it=0;it<iters;it++){ if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto rwdone; }
-        if(us)*us=(ork_now_us()-t0)/iters; } rc_ret=0; }
+    #define _FOLD_ROUNDS() do{ int gsz[3]={P,P,P}; for(int r=0;r*NC<nslice;r++){ int rn=nslice-r*NC; if(rn>NC)rn=NC; \
+        if(ork_fold_submit_all(fd,dom,&TK[r*NC],gsz,rn)) goto rwdone; } }while(0)
+    _FOLD_ROUNDS();                                                          /* warm + correctness */
+    for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
+        for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
+    if(iters>0){ double t0=ork_now_us(); for(int it=0;it<iters;it++){ _FOLD_ROUNDS(); } if(us)*us=(ork_now_us()-t0)/iters; }
+    rc_ret=0;
 rwdone:
-    for(int s=0;s<3;s++){ if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
-    bdestroy(fd,&A); free(tmpl); return rc_ret;
+    if(Cc) for(int s=0;s<nslice;s++) if(Cc[s].cpu)bdestroy(fd,&Cc[s]);
+    if(RC) for(int s=0;s<nslice;s++) if(RC[s].cpu)bdestroy(fd,&RC[s]);
+    if(TK) for(int s=0;s<nslice;s++) if(TK[s].cpu)bdestroy(fd,&TK[s]);
+    free(Cc);free(RC);free(TK); bdestroy(fd,&A); free(tmpl); return rc_ret;
 }
 /* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
  * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
@@ -2619,7 +2624,7 @@ size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
 size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     (void)c;
     if(!B || K!=FOLD_REF_K || N<1 || (N%32)) return 0;
-    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>3) return 0;
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return 0;   /* N up to 64*1216 (covers gate/up N=18944) */
     size_t off=0;
     for(int s=0;s<nslice;s++){ int n0=s*NS, sw=(N-n0<NS)?(N-n0):NS; size_t tsz=pgup((size_t)K*sw);
         if(out){ if(off+tsz>cap) return 0;
@@ -2699,7 +2704,7 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
  * ork_w carrying only w->Bfold (nslice bufs). Run via ork_npu_fold_run_w. Shape/size-checked; NULL on mismatch. */
 ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K!=FOLD_REF_K || N<1 || (N%32)) return NULL;
-    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>3) return NULL;
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return NULL;
     size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=pgup((size_t)K*sw);}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;

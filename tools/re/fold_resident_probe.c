@@ -22,7 +22,7 @@ int main(int argc,char**argv){
     int iters=argc>1?atoi(argv[1]):100;
     setvbuf(stdout,0,_IONBF,0);
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
-    int K=3584; int Ns[]={512,3584}; int Ms[]={8,16,32,64,128};
+    int K=3584; int Ns[]={512,3584,18944}; int Ms[]={8,16,32,64,128};   /* k/v, q/o, gate/up */
     printf("fold_resident_probe: K=%d iters=%d  (resident mfold vs normal ork_mm_run_i8, q/k/v/o shapes)\n",K,iters);
     for(size_t ni=0; ni<sizeof Ns/sizeof*Ns; ni++){
         int N=Ns[ni];
