@@ -711,6 +711,10 @@ int          ork_npu_mfold_chain_cap(ork_npu *ctx, int P, int w, int K, int N,
                                      const unsigned *tile_rc, int trn,
                                      const signed char *Apacked, const signed char *Bpacked,
                                      int *Craw, int iters, double *us);
+/* #39 TIMING probe: replay P DIFFERENT captured tiles (tiles=P*rn words) in one chain, shared weight, zeroed
+ * operands. The timing slope vs P reveals weight re-DMA (linear) vs resident reuse (sublinear). */
+int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
+                                       const unsigned *tiles, int rn, int iters, double *us);
 
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT
