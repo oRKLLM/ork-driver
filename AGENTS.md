@@ -153,6 +153,7 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   examples/tests link — an `npu.c` edit rebuilds it once, not ~30×. `CC` uses **ccache** when present
   (`NO_CCACHE=1` to disable). Full build ~20 s, incremental npu.c-edit rebuild ~9 s. `make -j` parallelizes.
 - **No macOS Binary Transfers:** Never push or copy local macOS binaries (from arm64/x86_64 Mac workstation builds) to the target SBC. Only source files should be synchronized (e.g., via git or targeted rsync) and then built natively on the board.
+- **Continuous sync daemon (recommended for long board sessions):** `tools/sync_daemon.sh` runs a 2 s-cadence bidirectional polling `rsync` over a persistent SSH master — pushing Mac source-of-truth (`src/ include/ tools/ examples/ docs/ Makefile`, no `--delete`) to `board:ork-driver/` and pulling `board:~/ork-outbox/` → a local outbox. Launch it once in the background so per-edit hand-syncing (and its cwd/path pitfalls) stops; then just build/run on the board. Put board-side artifacts you want back (dumps, logs, captured regcmds) in `~/ork-outbox/`. Source-of-truth stays the Mac; the board is build+run only (consistent with "no binary transfers").
 
 ---
 
