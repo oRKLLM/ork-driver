@@ -720,6 +720,14 @@ int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
 int          ork_npu_mfold_chain_v(ork_npu *ctx, int P, const int *ws, int K, int N,
                                     const unsigned *tiles, int rn, const signed char *Apacked,
                                     const signed char *Bpacked, int *Craw, int wreuse, int iters, double *us);
+/* #39 Path-1 TOKEN-TILER executor: run P fold sub-tiles of one M_total-token batch as ONE multi-task submit over a
+ * SHARED batch cube (M_total x K nc16 in, M_total x N c4 out, shared woff weight). Tile t handles rows
+ * [row_off[t], row_off[t]+m) at byte offset row_off[t]*16. Caller prepares each tile's regcmd (per-size skeleton +
+ * the 4 M_total regs patched: 0x4024=16*M_total, 0x107c=M_total, 0x1080=M_total-m, 0x40c0=128*M_total). This is
+ * rkllm's real fold — a batch amortized over few big-M tiles. Returns 0/ok, us=avg submit. */
+int          ork_npu_fold_batch(ork_npu *ctx, int Mtot, int K, int N, int P, const int *row_off,
+                                const unsigned *tiles, int rn, const signed char *Apacked,
+                                const signed char *Bpacked, int *Craw, int iters, double *us);
 /* #39 Path-1 CANONICAL output-stage state-setter: rewrite EVERY output-stage register in a REGCMD_I8_N regcmd to
  * its first-principles value (from the full-prefill invariant scan) — across BOTH output blocks 0x1001 (DPU/SDP)
  * and 0x801 (PDP/aux output-dims mirror) — leaving DST_BASE_ADDR (the only output-stage IOVA) for the caller.

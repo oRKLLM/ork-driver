@@ -574,6 +574,10 @@ bigm_selfcontain: tools/re/bigm_selfcontain.c $(COBJ)
 bigm_run: tools/re/bigm_run.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# #39 Path-1 TOKEN-TILER: process an M_total-token batch as one multi-task fold submit (per-size refs + M_total patch).
+fold_tiler: tools/re/fold_tiler.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

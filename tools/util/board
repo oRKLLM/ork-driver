@@ -1,0 +1,17 @@
+#!/bin/zsh
+# board — run commands on the RK3588 board over SSH without nested-quote hell.
+#
+# The board is reached via the SSH host alias `board` (set BOARD_HOST to override). Every mode cd's into
+# ~/ork-driver first (the board's build dir), so paths are relative to the repo. Authoring board-side scripts
+# as local files and piping them (mode 2/3 below) avoids the escaping pitfalls of `ssh board '...'`.
+#
+#   board -c 'cmd'      run a single command:   board -c 'make test'
+#   board file.sh       run a local script file on the board:   board tools/util/foo.sh
+#   board               read a script from stdin:   board <<'EOF' ... EOF   (or  board < script.sh)
+#
+# Put board-side artifacts you want back (dumps, logs, captured regcmds) in ~/ork-outbox/ and let
+# tools/util/sync_daemon.sh pull them to the Mac. Source-of-truth stays the Mac (build+run on the board).
+BOARD_HOST="${BOARD_HOST:-board}"
+if [ "$1" = "-c" ]; then shift; exec ssh "$BOARD_HOST" "cd ~/ork-driver && $*"; fi
+if [ -n "$1" ] && [ -f "$1" ]; then exec ssh "$BOARD_HOST" 'cd ~/ork-driver && bash -s' < "$1"; fi
+exec ssh "$BOARD_HOST" 'cd ~/ork-driver && bash -s'
