@@ -1013,6 +1013,13 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
         setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A rows */
         setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared resident weight */
         setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
+        /* #39 NOVEL: set CNA_CBUF_CON0 WEIGHT_REUSE (0x1040 bit13, per rocket_registers.h) on non-loader tiles so
+         * the HW reuses the weight tile 0 left resident in CBUF and SKIPS the re-DMA — a HW feature rkllm never
+         * uses (bit13=0 in all captured tiles). ORK_MFOLD_WREUSE=1 to try; tile 0 loads normally. */
+        if(t>0 && getenv("ORK_MFOLD_WREUSE")){
+            uint32_t cur=0; for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && ((rc[k+1]>>16)&0xffff)==0x201){ cur=rc[k]>>16; break; }
+            setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u);
+        }
         /* #39 EXPERIMENT: append "inherited" reg-writes a mid-chain big-M tile OMITS (it relies on earlier tasks
          * having set them). ORK_MFOLD_INJECT="blk:reg:val,..." appends them after the 108-reg tile, bumping
          * regcfg_amount, to test whether a big-M tile can be made SELF-CONTAINED (run standalone). */

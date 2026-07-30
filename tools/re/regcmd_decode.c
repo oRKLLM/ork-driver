@@ -125,9 +125,13 @@ static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
             fprintf(out,")"); unk_val++;
         } else if(!has_okv){
             if(is_composer(id)){
-                if(id==RK_CNA_CBUF_CON0) fprintf(out,"-> {data_bank=%u weight_bank=%u}", val&0xf, (val>>4)&0xf);
+                if(id==RK_CNA_CBUF_CON0)  /* rocket_registers.h: DATA_BANK[3:0] WEIGHT_BANK[7:4] FC_DATA_BANK[10:8] DATA_REUSE[12] WEIGHT_REUSE[13] */
+                    fprintf(out,"-> {data_bank=%u weight_bank=%u fc_data_bank=%u DATA_REUSE=%u WEIGHT_REUSE=%u}",
+                            val&0xf, (val>>4)&0xf, (val>>8)&0x7, (val>>12)&1, (val>>13)&1);
                 else                     fprintf(out,"-> {width=%u height=%u}", (val>>16)&0x7ff, val&0x7ff);
             } else if(is_addr(id)) fprintf(out,"[IOVA]");
+            else if(id==RK_CNA_FC_CON0)  /* rocket_registers.h: FC_SKIP_EN[0] FC_SKIP_DATA[31:16] (FC/matmul-mode data-skip) */
+                fprintf(out,"-> {FC_SKIP_EN=%u FC_SKIP_DATA=%u}", val&1, (val>>16)&0xffff);
             else if(id==RK_CNA_DMA_CON1){          /* 0x107c feature-DMA burst: rule = min(4*M,128) for matched tiles */
                 if(Mtile>0){ int exp=4*Mtile>128?128:4*Mtile;
                     if((int)val==exp) fprintf(out,"(feature DMA burst = 4*M = %d, MATCHED)", exp);

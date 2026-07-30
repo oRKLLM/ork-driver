@@ -136,7 +136,7 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_CNA_WEIGHT_SIZE0]     = {0x201, 0x1030, OKR_ANY,     "CNA_WEIGHT_SIZE0",     "total weight byte count (K*N int8)"},
     [RK_CNA_WEIGHT_SIZE1]     = {0x201, 0x1034, OKR_ANY,     "CNA_WEIGHT_SIZE1",     "weight bytes per kernel / K stride (= K int8)"},
     [RK_CNA_WEIGHT_SIZE2]     = {0x201, 0x1038, OKR_ANY,     "CNA_WEIGHT_SIZE2",     "weight cube dims (kernel count N + flags, 0x1010000|N)"},
-    [RK_CNA_CBUF_CON0]        = {0x201, 0x1040, 0x00003fff,  "CNA_CBUF_CON0",        "CBUF bank split DATA/WEIGHT/FC_DATA + reuse; carries the K-reduction schedule"},
+    [RK_CNA_CBUF_CON0]        = {0x201, 0x1040, 0x00003fff,  "CNA_CBUF_CON0",        "DATA_BANK[3:0] WEIGHT_BANK[7:4] FC_DATA_BANK[10:8] DATA_REUSE[12] WEIGHT_REUSE[13] (rocket_registers.h). rkllm leaves REUSE=0 (never uses HW weight-reuse); setting WEIGHT_REUSE[13] on non-loader tiles DOES skip the weight re-DMA (3.4x, #39) but reuse-tile output is wrong until the data-refetch side is handled"},
     [RK_CNA_CBUF_CON1]        = {0x201, 0x1044, 0x00003fff,  "CNA_CBUF_CON1",        "CBUF DATA_ENTRIES[13:0] = (K/64)*M resident feature rows"},
     [RK_CNA_FEATURE_DATA_ADDR]= {0x201, 0x1070, OKR_ANY,     "CNA_FEATURE_DATA_ADDR","input feature (A / activations) IOVA"},
     [RK_CNA_DMA_CON1]         = {0x201, 0x107c, OKR_ANY,     "CNA_DMA_CON1",         "feature DMA burst length / line stride"},
