@@ -85,18 +85,27 @@ int main(int argc,char**argv){
         size_t fb=ork_w_dump_fold_i8_cpu(c,K3,QN[j],Wq[j],NULL,0); void*bl=malloc(fb); ork_w_dump_fold_i8_cpu(c,K3,QN[j],Wq[j],bl,fb);
         wfd[j]=ork_mm_load_fold_i8(c,K3,QN[j],bl,fb); free(bl);
         if(!wn[j]||!wfd[j]) ok=0; }
-      printf("\n== SHARED-INPUT BATCH (QKV: q=3584,k=512,v=512) ==\n");
+      /* FUSED baseline = the SHIPPING ggml-ork group fusion: concat q|k|v along N (=4608), quantize A once,
+       * ONE normal matmul. This is what the fold-batch must actually beat (not 3x separate). */
+      int Ncat=QN[0]+QN[1]+QN[2]; int8_t*Wcat=malloc((size_t)K3*Ncat); ork_w*wcat=NULL;
+      if(ok){ for(int k=0;k<K3;k++){ int o2=0; for(int j=0;j<3;j++){ for(int n=0;n<QN[j];n++) Wcat[(size_t)k*Ncat+o2+n]=Wq[j][(size_t)k*QN[j]+n]; o2+=QN[j]; } }
+        wcat=ork_mm_pack_i8(c,K3,Ncat,Wcat); if(!wcat) ok=0; }
+      printf("\n== SHARED-INPUT BATCH (QKV) vs 3x-separate AND vs FUSED-wide(N=%d, shipping) ==\n", Ncat);
       int BM[]={8,16,32,64};
       for(size_t mi=0; ok && mi<sizeof BM/sizeof*BM; mi++){ int M=BM[mi];
         int32_t *Cf[3],*Cn[3]; for(int j=0;j<3;j++){ Cf[j]=calloc((size_t)M*QN[j],4); Cn[j]=calloc((size_t)M*QN[j],4); }
+        int32_t *Ccat=calloc((size_t)M*Ncat,4);
         double us_b=0; ork_w*ws[3]={wfd[0],wfd[1],wfd[2]}; int32_t*Co[3]={Cf[0],Cf[1],Cf[2]};
         int rc=ork_npu_fold_batch_w(c,3,ws,M,A,Co,60,&us_b);
         for(int j=0;j<3;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]);
         long mism=0; for(int j=0;j<3;j++) for(size_t e=0;e<(size_t)M*QN[j];e++) if(Cf[j][e]!=Cn[j][e]){ mism++; break; }
-        double t0=now_us(); for(int i=0;i<60;i++) for(int j=0;j<3;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]); double us_n=(now_us()-t0)/60;
-        printf("  M=%-3d  batch-fold %8.1f us | 3x normal %8.1f us | %.2fx  rc=%d mism=%ld\n", M, us_b, us_n, us_n/us_b, rc, mism);
-        for(int j=0;j<3;j++){ free(Cf[j]); free(Cn[j]); }
+        double t0=now_us(); for(int i=0;i<60;i++) for(int j=0;j<3;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]); double us_3=(now_us()-t0)/60;
+        double t1=now_us(); for(int i=0;i<60;i++) ork_mm_run_i8(c,wcat,M,A,Ccat); double us_c=(now_us()-t1)/60;
+        printf("  M=%-3d  batch-fold %7.1f | 3x-sep %7.1f (%.2fx) | fused-wide %7.1f (%.2fx)  mism=%ld rc=%d\n",
+               M, us_b, us_3, us_3/us_b, us_c, us_c/us_b, mism, rc);
+        for(int j=0;j<3;j++){ free(Cf[j]); free(Cn[j]); } free(Ccat);
       }
+      if(wcat) ork_mm_free(c,wcat); free(Wcat);
       for(int j=0;j<3;j++){ if(wn[j])ork_mm_free(c,wn[j]); if(wfd[j])ork_mm_free(c,wfd[j]); free(Wq[j]); } free(A);
     }
     /* ---- gate+up batch (FFN, both N=18944, share input) — the FLOP bulk. Expected ~wash (DRAM-BW-bound). ---- */
