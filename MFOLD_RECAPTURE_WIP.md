@@ -250,6 +250,23 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
 - ★ WEDGE ROOT-CAUSE: ORK_REPLAY_RESET (ACT_RESET pre-submit) was the trigger; without it mfold replay runs
   clean (validated twice). Not board degradation. Do NOT set ORK_REPLAY_RESET for the mfold replay path.
 
+## (A) WEIGHT-RESIDENT CHAIN built (2026-07-29) — but task_number>1 fold chain WEDGES on replay
+- BENCHMARK BASELINE: ork NORMAL int8 matmul (mc_prof) K=3584 N=1216 M=228 = 5146us(1-core)/4607us(3-core).
+  A naive per-tile fold replay (29 separate width-8 tiles) ≈ 29*609 ≈ 17.7ms => ~4x SLOWER than ork-normal.
+  ork_npu_replay_i8_sweep does N SEPARATE submits (weight NOT CBUF-resident) so it can't show amortization.
+- Built `ork_npu_replay_i8_chain` (appended to board src/npu.c; source tools/re/fold_chain_fn.c): P width-w fold
+  tiles in ONE task_number=P submit sharing ONE woff weight buffer, chained via words 216-219 (0x0010 next-addr
+  /0x0014=0x37) exactly like run_chain_i8; per-tile A/C. Harness tools/re/fold_chain_bench.c.
+- FIXED the captured regcmd's next-task BLEED: words 216.. are the RKDUMP +16 margin = the next task's regcmd
+  (0x1040/0x100c...). regcfg_amount=108 => only words 0-215 are the tile; zero 216.. then write only our descriptor.
+- STILL WEDGES: even P=4 (one task_number=4 submit) hard-wedges the board (both before and after the bleed fix;
+  single-tile task_number=1 replay is bit-exact + clean). This is the recurring MULTI-TASK FOLD STALL — ork
+  replaying a chain of IDENTICAL width-8 tiles single-core wedges, while rkllm's task_number=21 chain (3-core
+  round-robin, planner-VARIED per-task regcmds) runs fine. So the fold's amortization advantage is UNPROVEN.
+- LIKELY fix (future): replay rkllm's ACTUAL captured 21-task chain (its exact per-task regcmds + 3-core RR),
+  not P copies of one tile; OR a non-degraded board to isolate the single-core-identical-tile-chain wedge.
+  Needs the full verbose per-task chain capture (mm_chain_*.txt), not just one tile.
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
