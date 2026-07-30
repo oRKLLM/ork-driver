@@ -578,6 +578,10 @@ bigm_run: tools/re/bigm_run.c $(COBJ)
 fold_tiler: tools/re/fold_tiler.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# #39 A/B: token-fold (ork_npu_fold_run_i8) vs ork-normal (ork_mm_run_i8), same shape.
+ab_fold: tools/re/ab_fold.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

@@ -1217,6 +1217,54 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
 fbdone:
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
 }
+#include "regcmd_fold_refs.h"
+/* #39 fold run-path helpers: build a size-m sub-tile from the baked template, patch its 4 M_total regs. */
+static const uint32_t* fold_ref_for(int m){ for(int i=0;i<FOLD_REFS_N;i++) if(FOLD_REFS[i].m==m) return FOLD_REFS[i].rc; return 0; }
+static int fold_pidx(const uint32_t*pr,int np,unsigned blk,unsigned reg){ for(int j=0;j<np;j++) if((pr[2*j+1]>>16)==blk&&(pr[2*j]&0xffff)==reg) return j; return -1; }
+static void fold_setv(uint32_t*pr,int*np,unsigned blk,unsigned reg,uint32_t v){ int j=fold_pidx(pr,*np,blk,reg); if(j<0){j=*np;(*np)++;} pr[2*j]=(reg&0xffff)|((v&0xffff)<<16); pr[2*j+1]=(blk<<16)|((v>>16)&0xffff); }
+static int fold_build_tile(int m,int Mtot,uint32_t*out232){
+    const uint32_t*cap=fold_ref_for(m); if(!cap) return -1;
+    static const unsigned OUT1001[20]={0x4098,0x409c,0x40a0,0x40a4,0x40a8,0x40ac,0x40c0,0x40c4,0x4100,0x4104,0x4108,0x410c,0x4110,0x4114,0x4118,0x411c,0x4120,0x4124,0x4128,0x412c};
+    uint32_t pr[2*130]; int np=0;
+    for(int k=0;k+1<216;k+=2){ uint32_t w0=cap[k],w1=cap[k+1]; unsigned reg=w0&0xffff,blk=w1>>16;
+        if(w0==0&&w1==0) continue; if(blk==0x101&&(reg==0x0010||reg==0x0014)) continue;
+        int j=fold_pidx(pr,np,blk,reg); if(j<0){pr[2*np]=w0;pr[2*np+1]=w1;np++;}else{pr[2*j]=w0;pr[2*j+1]=w1;} }
+    for(int i=0;i<20;i++) if(fold_pidx(pr,np,0x1001,OUT1001[i])<0) fold_setv(pr,&np,0x1001,OUT1001[i],0);
+    fold_setv(pr,&np,0x81,0x0008,0x000d);            /* doorbell */
+    fold_setv(pr,&np,0x41,0x0000,0);
+    fold_setv(pr,&np,0x201,0x100c,0x20000000);        /* GROUP_LINE (batch sub-tile) */
+    fold_setv(pr,&np,0x1001,0x4024,(uint32_t)(16*Mtot));            /* 4 M_total regs */
+    fold_setv(pr,&np,0x201,0x107c,(uint32_t)(Mtot<128?Mtot:128));
+    fold_setv(pr,&np,0x201,0x1080,(uint32_t)(Mtot-m));
+    fold_setv(pr,&np,0x1001,0x40c0,(uint32_t)(128*Mtot));
+    if(np>108) return -2;
+    memset(out232,0,232*4); for(int j=0;j<2*np;j++) out232[j]=pr[j];
+    return 0;
+}
+static size_t fold_nc16(int m,int cc,int w){ return (size_t)(cc/16)*((size_t)w*16)+(size_t)m*16+(cc%16); }
+static size_t fold_woff(int n,int k,int K){ int KT=(K+31)/32; return ((size_t)(n/32)*KT+(k/32))*1024+(size_t)(n%32)*32+(k%32); }
+static size_t fold_c4(int m,int n,int w){ return (size_t)(n/4)*((size_t)w*4)+(size_t)m*4+(n%4); }
+/* #39 FOLD MATMUL RUN-PATH: C[M,N] int32 = A[M,K] int8 x W[K,N] int8 via rkllm's token-fold — M(<=128) tiled into
+ * <=36-row sub-tiles, ALL run in ONE shared-cube multi-task submit (amortizes ioctl over the whole batch). Uses the
+ * baked per-size templates (regcmd_fold_refs.h), so only K=FOLD_REF_K,N=FOLD_REF_N,M<=128 is supported — returns
+ * -1 otherwise so the caller keeps the standard synth_i8 path. A row-major [M,K], W row-major [K,N], Cout row-major
+ * [M,N]. Single core (core_mask CORE0). Returns 0/ok, us=avg submit; -1 unsupported shape, -2 alloc/build, -3 no fd. */
+int ork_npu_fold_run_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int iters,double*us){
+    if(!c||c->fd<0) return -3;
+    if(K!=FOLD_REF_K||N!=FOLD_REF_N||M<1||M>128) return -1;
+    static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
+    int mm[64],roff[64],P=0,rem=M,off=0;
+    while(rem>0){ for(unsigned s=0;s<sizeof SZ/sizeof*SZ;s++) if(SZ[s]<=rem){mm[P]=SZ[s];roff[P]=off;off+=SZ[s];rem-=SZ[s];P++;break;} if(P>=64) break; }
+    uint32_t *tiles=malloc((size_t)P*232*4); if(!tiles) return -2;
+    for(int t=0;t<P;t++) if(fold_build_tile(mm[t],M,tiles+(size_t)t*232)){ free(tiles); return -2; }
+    int8_t*Ap=calloc((size_t)M*K,1),*Wp=calloc((size_t)K*N,1); int32_t*Craw=calloc((size_t)M*N,4);
+    if(!Ap||!Wp||!Craw){ free(tiles);free(Ap);free(Wp);free(Craw); return -2; }
+    for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k];
+    for(int k=0;k<K;k++)for(int n=0;n<N;n++) Wp[fold_woff(n,k,K)]=Wraw[(size_t)k*N+n];
+    int r=ork_npu_fold_batch(c,M,K,N,P,roff,tiles,232,Ap,Wp,Craw,iters,us);
+    if(!r&&Cout) for(int i=0;i<M;i++)for(int n=0;n<N;n++) Cout[(size_t)i*N+n]=Craw[fold_c4(i,n,M)];
+    free(tiles);free(Ap);free(Wp);free(Craw); return r?-2:0;
+}
 /* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
  * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
  * spread across TWO blocks: the DPU/SDP block 0x1001 AND the PDP/aux output-dims mirror block 0x801. In both,
