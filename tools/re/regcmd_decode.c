@@ -52,6 +52,18 @@ enum { OKV_N = (int)(sizeof OKV_TBL / sizeof OKV_TBL[0]) };
 static int is_composer(enum ork_reg_id id){ return id==RK_CNA_CBUF_CON0||id==RK_CNA_DATA_SIZE0||id==RK_CNA_DATA_SIZE0_MIR; }
 /** @brief True if @p id holds an IOVA (annotated `[IOVA]`, never flagged as an unknown value). */
 static int is_addr(enum ork_reg_id id){ return id==RK_CNA_FEATURE_DATA_ADDR||id==RK_CNA_WEIGHT_DATA_ADDR||id==RK_DPU_DST_BASE_ADDR||id==RK_PC_NEXT_ADDR; }
+/** @brief True if @p id's VALUE is a genuine 32-bit quantity (value = (w0>>16) | ((w1&0xffff)<<16)).
+ *  EVERY OTHER register is 16-bit: value = w0>>16, and w1&0xffff is a SEPARATE mode/secondary field — folding it
+ *  into the value is the misread that made 0x1080 look like the 0x0fffffe8 wedge sentinel. So default is 16-bit;
+ *  only addresses + the provably-packed regs are wide. (Migrating this to a per-row flag in ork_regs.h is #40.) */
+static int is_wide(enum ork_reg_id id){
+    return is_addr(id)
+        || id==RK_CNA_DATA_SIZE0 || id==RK_CNA_DATA_SIZE0_MIR   /* (width<<16)|height */
+        || id==RK_CNA_DATA_SIZE1                                /* ((K-1)<<16)|K */
+        || id==RK_CNA_WEIGHT_SIZE0                              /* K*N bytes (exceeds 16 bits) */
+        || id==RK_CNA_WEIGHT_SIZE2                              /* 0x1010000|N (bit 24 set) */
+        || id==RK_CNA_CVT_CON1 || id==RK_CNA_CVT_CON2 || id==RK_CNA_CVT_CON3 || id==RK_CNA_CVT_CON4; /* scale<<16|offset */
+}
 
 /**
  * @brief Find the #ork_reg_id for a (block,offset) pair.
@@ -74,12 +86,18 @@ static int reg_id(uint32_t blk, uint32_t off){
 static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
     int unk_reg=0, unk_val=0, oob_mask=0;
     for(int k=0;k+1<n;k+=2){
-        uint32_t off=w[k]&0xffffu, blk=w[k+1]>>16, val=(w[k]>>16)|((w[k+1]&0xffffu)<<16);
+        uint32_t off=w[k]&0xffffu, blk=w[k+1]>>16;
+        uint32_t val16=w[k]>>16, extra=w[k+1]&0xffffu;   /* w0 high = 16-bit value; w1 low = a SEPARATE mode/high field */
         int id=reg_id(blk,off);
         fprintf(out,"[%3d] blk=0x%04x off=0x%04x ", k/2, blk, off);
-        if(id<0){ fprintf(out,"%-24s = 0x%08x  ?? UNKNOWN REGISTER (not in ork_regs.h)\n","(unnamed)",val); unk_reg++; continue; }
+        if(id<0){ /* width unknown -> show BOTH interpretations rather than guess (16-bit val+extra, and the 32-bit combine) */
+            fprintf(out,"%-24s val16=0x%04x extra=0x%04x (32b=0x%08x)  ?? UNKNOWN REGISTER (not in ork_regs.h)\n",
+                    "(unnamed)", val16, extra, val16|(extra<<16)); unk_reg++; continue; }
         const ork_reg_desc *d=&ORK_REGS[id];
-        fprintf(out,"%-24s = 0x%08x  ", d->name, val);
+        int wide=is_wide(id);
+        uint32_t val = wide ? (val16|(extra<<16)) : val16;   /* 16-bit regs: value=w0>>16; extra shown separately, NOT folded in */
+        if(wide) fprintf(out,"%-24s = 0x%08x  ", d->name, val);
+        else     fprintf(out,"%-24s = 0x%04x (extra=0x%04x)  ", d->name, val, extra);
         /* enum-like? (has OKV_ entries) */
         int has_okv=0, matched=0;
         for(int i=0;i<OKV_N;i++) if(OKV_TBL[i].id==id){ has_okv=1; if(OKV_TBL[i].val==val){ fprintf(out,"-> %s", OKV_TBL[i].name); matched=1; break; } }
