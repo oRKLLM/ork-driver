@@ -84,6 +84,12 @@ rknpu_bench: tools/rknpu_bench.c
 regcmd_decode: tools/re/regcmd_decode.c src/ork_regs.h
 	$(CC) $(CFLAGS) -o $@ $<
 
+# RE probe (NOT in `make test`): measures per-task HW-chain TRANSITION cost vs per-individual-submit cost
+# for uniform int8 matmul tiles — the decisive input to tools/re/ws_model.c (can weight-stationary escape
+# the submit-bound wall via HW chaining?). Board NPU op — sudo env ORK_MM_TIMEOUT=3000 timeout 180 ./ws_xition_probe [iters]
+ws_xition_probe: tools/re/ws_xition_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use:  make cdma_calib && ./cdma_calib   (exit 0 iff the standard model reproduces ork's layouts bit-exact)
