@@ -740,6 +740,9 @@ int          ork_npu_fold_op_i8(ork_npu *ctx, int K, int N, const signed char *W
 /* #39 mfold RESIDENT-weight variant: fold matmul from a PRE-PACKED w->Bfold (ork_mm_load_fold_i8 / orkpack v5),
  * no per-call fold_woff repack. K=FOLD_REF_K, N<=3*1216, M<=128. A/Cout row-major. 0/ok, -1/-2/-3 as fold_op. */
 int          ork_npu_fold_run_w(ork_npu *ctx, ork_w *w, int M, const signed char *Araw, int *Cout, int iters, double *us);
+/* #39 SHARED-INPUT fold batch: nw weights (K=FOLD_REF_K, resident Bfold, same domain) sharing input A[M,K] — QKV
+ * or gate+up. The nc16 input marshal is done ONCE and reused across all nw folds. Couts[i] row-major. 0/-1/-2/-3. */
+int          ork_npu_fold_batch_w(ork_npu *ctx, int nw, ork_w **ws, int M, const signed char *Araw, int **Couts, int iters, double *us);
 /* #39 mfold orkpack companions: dump the fold_woff-layout weight blob PURE-CPU (out=NULL to size), and load it
  * back into a resident ork_w carrying only w->Bfold. K=FOLD_REF_K(3584), N<=3*FOLD_REF_N(1216), N%32. */
 size_t       ork_w_dump_fold_i8_cpu(ork_npu *ctx, int K, int N, const signed char *B, void *out, size_t cap);

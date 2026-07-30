@@ -74,6 +74,31 @@ int main(int argc,char**argv){
       }
       ork_mm_free(c,wref); ork_mm_free(c,wrt); free(W); free(A); free(blob);
     }
+    /* ---- SHARED-INPUT BATCH: QKV (q N=3584, k/v N=512) share input A. Batch fold (one A-marshal) vs 3 separate
+     * normal ork_mm_run_i8. bit-exact + timing. This is where amortizing the nc16 marshal should pay off. ---- */
+    { int K3=3584; int QN[3]={3584,512,512}; const char*nm[3]={"q","k","v"};
+      int8_t *Wq[3], *A=malloc((size_t)128*K3);
+      ork_w *wn[3], *wfd[3]; int ok=1;
+      for(size_t i=0;i<(size_t)128*K3;i++) A[i]=r8();
+      for(int j=0;j<3;j++){ Wq[j]=malloc((size_t)K3*QN[j]); for(size_t i=0;i<(size_t)K3*QN[j];i++) Wq[j][i]=r8();
+        wn[j]=ork_mm_pack_i8(c,K3,QN[j],Wq[j]);
+        size_t fb=ork_w_dump_fold_i8_cpu(c,K3,QN[j],Wq[j],NULL,0); void*bl=malloc(fb); ork_w_dump_fold_i8_cpu(c,K3,QN[j],Wq[j],bl,fb);
+        wfd[j]=ork_mm_load_fold_i8(c,K3,QN[j],bl,fb); free(bl);
+        if(!wn[j]||!wfd[j]) ok=0; }
+      printf("\n== SHARED-INPUT BATCH (QKV: q=3584,k=512,v=512) ==\n");
+      int BM[]={8,16,32,64};
+      for(size_t mi=0; ok && mi<sizeof BM/sizeof*BM; mi++){ int M=BM[mi];
+        int32_t *Cf[3],*Cn[3]; for(int j=0;j<3;j++){ Cf[j]=calloc((size_t)M*QN[j],4); Cn[j]=calloc((size_t)M*QN[j],4); }
+        double us_b=0; ork_w*ws[3]={wfd[0],wfd[1],wfd[2]}; int32_t*Co[3]={Cf[0],Cf[1],Cf[2]};
+        int rc=ork_npu_fold_batch_w(c,3,ws,M,A,Co,60,&us_b);
+        for(int j=0;j<3;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]);
+        long mism=0; for(int j=0;j<3;j++) for(size_t e=0;e<(size_t)M*QN[j];e++) if(Cf[j][e]!=Cn[j][e]){ mism++; break; }
+        double t0=now_us(); for(int i=0;i<60;i++) for(int j=0;j<3;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]); double us_n=(now_us()-t0)/60;
+        printf("  M=%-3d  batch-fold %8.1f us | 3x normal %8.1f us | %.2fx  rc=%d mism=%ld\n", M, us_b, us_n, us_n/us_b, rc, mism);
+        for(int j=0;j<3;j++){ free(Cf[j]); free(Cn[j]); }
+      }
+      for(int j=0;j<3;j++){ if(wn[j])ork_mm_free(c,wn[j]); if(wfd[j])ork_mm_free(c,wfd[j]); free(Wq[j]); } free(A);
+    }
     printf("\nDONE\n");
     return 0;
 }
