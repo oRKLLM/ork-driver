@@ -57,7 +57,7 @@ enum ork_reg_id {
     RK_CNA_CBUF_CON1,       /**< 0x1044 @brief CBUF DATA_ENTRIES[13:0] = (K/64)*M feature rows held resident. */
     RK_CNA_FEATURE_DATA_ADDR,/**< 0x1070 @brief Input feature (A / activations) IOVA. */
     RK_CNA_DMA_CON1,        /**< 0x107c @brief Feature DMA burst length / line stride. */
-    RK_CNA_DMA_CON2,        /**< 0x1080 @brief Feature DMA SURF_STRIDE[27:0] (8-byte units); 0x0fffffe8 is the chain-tail "inherit CBUF layout" sentinel, NOT a standalone stride. */
+    RK_CNA_DMA_CON2,        /**< 0x1080 @brief Feature surface stride, 16-bit computed value (signed -3*M small-M / 2160/M large-M) + a separate w1-low mode field (0x0fff on the -3*M variant). The old "0x0fffffe8 sentinel" was a 32-bit misread of value 0xffe8 + mode 0x0fff. */
     RK_CNA_DATA_SIZE0_MIR,  /**< 0x1084 @brief Mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020. */
     RK_CNA_FC_DATA_SIZE1,   /**< 0x1088 @brief FC/matmul DMA_CHANNEL[15:0] (= K). */
     RK_CNA_WEIGHT_DATA_ADDR,/**< 0x1110 @brief Weight (B) IOVA. */
@@ -140,7 +140,7 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_CNA_CBUF_CON1]        = {0x201, 0x1044, 0x00003fff,  "CNA_CBUF_CON1",        "CBUF DATA_ENTRIES[13:0] = (K/64)*M resident feature rows"},
     [RK_CNA_FEATURE_DATA_ADDR]= {0x201, 0x1070, OKR_ANY,     "CNA_FEATURE_DATA_ADDR","input feature (A / activations) IOVA"},
     [RK_CNA_DMA_CON1]         = {0x201, 0x107c, OKR_ANY,     "CNA_DMA_CON1",         "feature DMA burst length / line stride"},
-    [RK_CNA_DMA_CON2]         = {0x201, 0x1080, 0x0fffffff,  "CNA_DMA_CON2",         "feature DMA SURF_STRIDE[27:0] (8B units); 0x0fffffe8 = chain-tail inherit-CBUF sentinel, NOT a standalone stride"},
+    [RK_CNA_DMA_CON2]         = {0x201, 0x1080, 0xffff,      "CNA_DMA_CON2",         "feature surface stride, 16-bit computed value (signed -3*M small-M / 2160/M large-M); w1-low is a SEPARATE mode field (0x0fff on the -3*M variant). The '0x0fffffe8 sentinel' was a 32-bit misread of value 0xffe8 + mode 0x0fff"},
     [RK_CNA_DATA_SIZE0_MIR]   = {0x201, 0x1084, 0x07ff07ff,  "CNA_DATA_SIZE0_MIR",   "mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020"},
     [RK_CNA_FC_DATA_SIZE1]    = {0x201, 0x1088, 0x0000ffff,  "CNA_FC_DATA_SIZE1",    "FC/matmul DMA_CHANNEL[15:0] (= K)"},
     [RK_CNA_WEIGHT_DATA_ADDR] = {0x201, 0x1110, OKR_ANY,     "CNA_WEIGHT_DATA_ADDR", "weight (B) IOVA"},
@@ -278,9 +278,11 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
 /** @brief #RK_DPU_SURFACE_ADD (0x40c0) = M-fold NC1HWC2 surface config (rkllm's M=8 task3; big-M tasks use 0x3000). */
 #define OKV_SURFADD_MFOLD      0x00000400u
 
-/** @brief #RK_CNA_DMA_CON2 (0x1080) = "inherit CBUF layout / no re-stride" chain-tail sentinel. rkllm uses it
- *  ONLY for small M=8 chain-tail tasks; the leading tasks use a real stride (0x1080*M ≈ const). NOT valid as
- *  a standalone submit — a standalone M=8 with this value wedges (no prior task established the CBUF layout). */
+/** @brief DEPRECATED / DO NOT USE as a value. `0x0fffffe8` was a 32-bit MISREAD of #RK_CNA_DMA_CON2 (0x1080):
+ *  the register is 16-bit — its real value is the surface stride (e.g. `0xffe8` = signed -3*M at M=8, `0x3c` =
+ *  2160/M at M=36) and `w1&0xffff` is a SEPARATE mode field (`0x0fff` on the -3*M variant). Folding the two into
+ *  one 28-bit number produced the phantom `0x0fffffe8` "sentinel" that misled the mfold RE for weeks. 0x1080 is a
+ *  computed stride, not an enum — kept only so old @refs resolve. See regcmd_decode is_wide()/the 16-bit split. */
 #define OKV_DMA2_CONTIGUOUS    0x0fffffe8u
 
 /** @brief Compose #RK_CNA_CBUF_CON0 (0x1040): DATA_BANK[3:0] | WEIGHT_BANK[7:4]. */

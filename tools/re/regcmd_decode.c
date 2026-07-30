@@ -41,7 +41,8 @@ static const struct { enum ork_reg_id id; uint32_t val; const char *name; } OKV_
     {RK_DPU_OUT_PRECISION, OKV_OUT_PREC_INT32,  "OKV_OUT_PREC_INT32"},
     {RK_CNA_CONV_CON1,     OKV_CONV1_GROUP_LINE,       "OKV_CONV1_GROUP_LINE"},
     {RK_CNA_CONV_CON1,     OKV_CONV1_PLAIN,     "OKV_CONV1_PLAIN"},
-    {RK_CNA_DMA_CON2,      OKV_DMA2_CONTIGUOUS, "OKV_DMA2_CONTIGUOUS"},
+    /* 0x1080 CNA_DMA_CON2 is a COMPUTED 16-bit stride (not an enum) — the old OKV_DMA2_CONTIGUOUS=0x0fffffe8
+     * was a 32-bit-misread phantom, so it is intentionally NOT listed here (decodes as computed/raw). */
     {RK_DPU_SURFACE_ADD,   OKV_ELEMSZ_INT8,     "OKV_ELEMSZ_INT8"},
     {RK_DPU_SURFACE_ADD,   OKV_ELEMSZ_INT32,    "OKV_ELEMSZ_INT32"},
     {RK_DPU_SURFACE_ADD,   OKV_SURFADD_MFOLD,   "OKV_SURFADD_MFOLD"},
