@@ -1299,6 +1299,64 @@ int ork_npu_fold_run_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8
     if(!r&&Cout) for(int i=0;i<M;i++)for(int n=0;n<N;n++) Cout[(size_t)i*N+n]=Craw[fold_c4(i,n,M)];
     free(tiles);free(Ap);free(Wp);free(Craw); return r?-2:0;
 }
+/* #39 FULL-OP fold: C[M,N] int32 = A[M,K] x W[K,N] int8 via N-SPLIT ACROSS CORES — each core single-core-folds its
+ * own <=1216-wide N-slice (own weight columns + output columns, shared A input) CONCURRENTLY. This is rkllm's real
+ * wide-projection scheme, and the honest end-to-end test: does the fold's compute-hiding beat its extra weight
+ * re-streams (36-row tiles) under 3-core DRAM-bandwidth contention (3 cores streaming 3 different slice weights)?
+ * K=FOLD_REF_K, N<=3*1216 (<=3 slices, one core each), M<=128. A/Cout row-major. 0/ok, -1 unsupported, -2 alloc. */
+int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int iters,double*us){
+    int fd=c->fd; if(fd<0) return -3;
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS;
+    if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>3) return -1;
+    int dom=c->dom_active;
+    static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
+    int mt[64],roff[64],P=0,rem=M,off=0;
+    while(rem>0){ for(unsigned s=0;s<sizeof SZ/sizeof*SZ;s++) if(SZ[s]<=rem){mt[P]=SZ[s];roff[P]=off;off+=SZ[s];rem-=SZ[s];P++;break;} if(P>=64) break; }
+    uint32_t *tmpl=malloc((size_t)P*232*4); if(!tmpl) return -2;
+    for(int t=0;t<P;t++) if(fold_build_tile(mt[t],M,tmpl+(size_t)t*232)){ free(tmpl); return -2; }
+    size_t asz=(size_t)M*K*8+(1u<<20);
+    struct buf A=bcreate(fd,asz,0x403,dom); if(!A.cpu){free(tmpl);return -2;}
+    memset(A.cpu,0,asz);
+    { int8_t*Ap=(int8_t*)A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf W[3]={{0}},Cc[3]={{0}},RC[3]={{0}},TK[3]={{0}}; int rc_ret=-1;
+    size_t wsz=(size_t)K*NS*8+(1u<<20), csz=(size_t)M*NS*4*8+65536;
+    for(int s=0;s<nslice;s++){
+        W[s]=bcreate(fd,wsz,0x403,dom); Cc[s]=bcreate(fd,csz,0x403,dom);
+        RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
+        if(!W[s].cpu||!Cc[s].cpu||!RC[s].cpu||!TK[s].cpu) goto opdone;
+        memset(W[s].cpu,0,wsz); memset(Cc[s].cpu,0,csz);
+        int n0=s*NS, ns=(N-n0<NS)?(N-n0):NS; int8_t*Ws=(int8_t*)W[s].cpu;
+        for(int k=0;k<K;k++)for(int n=0;n<ns;n++) Ws[fold_woff(n,k,K)]=Wraw[(size_t)k*N+(n0+n)];
+        bsync(fd,&W[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);
+        uint32_t*rcbuf=(uint32_t*)RC[s].cpu; struct rknpu_task*tk=(struct rknpu_task*)TK[s].cpu;
+        for(int t=0;t<P;t++){
+            uint32_t rc[REGCMD_I8_N]; memcpy(rc, tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
+            uint64_t rf=(uint64_t)roff[t]*16;
+            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+rf));
+            setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W[s].dma);
+            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc[s].dma+rf));
+            if(t<P-1){ uint64_t nxt=RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
+                rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
+                rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101u<<16)|0;
+            } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
+            memcpy(rcbuf+(size_t)t*REGCMD_I8_N, rc, sizeof rc);
+            memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+            tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC[s].dma+(uint64_t)t*REGCMD_I8_N*4;
+        }
+        bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    { int gszP[3]={P,P,P};
+      if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto opdone;                 /* warm (concurrent, core s = slice s) */
+      for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+      if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
+          for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
+      double t0=ork_now_us(); for(int it=0;it<iters;it++){ if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto opdone; }
+      if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); rc_ret=0; }
+opdone:
+    for(int s=0;s<3;s++){ if(W[s].cpu)bdestroy(fd,&W[s]); if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
+    bdestroy(fd,&A); free(tmpl); return rc_ret;
+}
 /* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
  * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
  * spread across TWO blocks: the DPU/SDP block 0x1001 AND the PDP/aux output-dims mirror block 0x801. In both,

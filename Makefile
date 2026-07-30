@@ -566,10 +566,6 @@ test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(COBJ)
 sdp_setter: tools/re/sdp_setter.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
-# #39 Path-1: run a big-M fold tile STANDALONE by making it fully self-contained (append omitted regs + doorbell).
-bigm_selfcontain: tools/re/bigm_selfcontain.c $(COBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
-
 # #39 Path-1 CORRECTED: replay a real M=36 sub-tile faithfully (keep captured surfstr; size output for M_total).
 bigm_run: tools/re/bigm_run.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
@@ -580,6 +576,10 @@ fold_tiler: tools/re/fold_tiler.c $(COBJ)
 
 # #39 A/B: token-fold (ork_npu_fold_run_i8) vs ork-normal (ork_mm_run_i8), same shape.
 ab_fold: tools/re/ab_fold.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# #39 FULL-OP A/B: N-split fold (ork_npu_fold_op_i8) vs ork-normal, K=3584 N=3584 3-core.
+ab_fold_op: tools/re/ab_fold_op.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.

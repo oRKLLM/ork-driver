@@ -733,6 +733,10 @@ int          ork_npu_fold_batch(ork_npu *ctx, int Mtot, int K, int N, int P, con
  * N=FOLD_REF_N(1216), M<=128; returns -1 otherwise (caller keeps the standard path). A/W/Cout row-major. */
 int          ork_npu_fold_run_i8(ork_npu *ctx, int K, int N, const signed char *Wraw, int M,
                                  const signed char *Araw, int *Cout, int ncore, int iters, double *us);
+/* #39 FULL-OP fold: C[M,N]=A[M,K]xW[K,N] int8 via N-split across cores (each core single-core-folds a <=1216-wide
+ * slice concurrently) — rkllm's wide-projection scheme. K=FOLD_REF_K, N<=3*1216, M<=128. A/Cout row-major. */
+int          ork_npu_fold_op_i8(ork_npu *ctx, int K, int N, const signed char *Wraw, int M,
+                                const signed char *Araw, int *Cout, int iters, double *us);
 /* #39 Path-1 CANONICAL output-stage state-setter: rewrite EVERY output-stage register in a REGCMD_I8_N regcmd to
  * its first-principles value (from the full-prefill invariant scan) — across BOTH output blocks 0x1001 (DPU/SDP)
  * and 0x801 (PDP/aux output-dims mirror) — leaving DST_BASE_ADDR (the only output-stage IOVA) for the caller.
