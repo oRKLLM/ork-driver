@@ -1239,12 +1239,15 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
          * (shared B). If ANY mode is BOTH bit-exact AND faster than mode 0, cross-tile reuse IS achievable (fold
          * could stream weight once/slice). 1=WEIGHT_REUSE; 2=+DATA_REUSE(bit12); 3=+FC_SKIP_EN(0x1060) on reuse
          * tiles; 4=+FC_SKIP_EN on the loader too. */
-        { static int wrm=-2; if(wrm==-2){ const char*e=getenv("ORK_WR_MODE"); wrm=e?atoi(e):0; }
-          if(wrm>0){
-            if(j>0){ for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){
-                         uint32_t v=(rc[k]>>16)|0x2000u; if(wrm>=2) v|=0x1000u; rc[k]=(v<<16)|0x1040; break; }
-                     if(wrm>=3) setr(rc,REGCMD_I8_N,0x201,0x1060,0x1); }
-            if(wrm==4 && j==0) setr(rc,REGCMD_I8_N,0x201,0x1060,0x1); } }
+        { static int wrm=-2; static uint32_t fcs=0; static int fcsset=-1;
+          if(wrm==-2){ const char*e=getenv("ORK_WR_MODE"); wrm=e?atoi(e):0; }
+          if(fcsset==-1){ const char*e=getenv("ORK_WR_FCSKIP"); fcsset=e?1:0; fcs=e?(uint32_t)strtoul(e,0,0):0; }
+          if(wrm>0 && j>0){                                   /* reuse tile: skip the weight re-DMA */
+            for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){
+                uint32_t v=(rc[k]>>16)|0x2000u; if(wrm>=2) v|=0x1000u; rc[k]=(v<<16)|0x1040; break; }
+            /* FC_SKIP (0x1060): FC_SKIP_EN[0] | FC_SKIP_DATA[31:16] — sweep the companion count via ORK_WR_FCSKIP
+             * (raw 0x1060 value; e.g. 0x0e000001 = FC_SKIP_DATA=K, EN=1). EN alone errored the submit. */
+            if(fcsset) setr(rc,REGCMD_I8_N,0x201,0x1060,fcs); } }
         memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
         struct rknpu_task *tkg=(struct rknpu_task*)TK[g].cpu; memset(&tkg[j],0,sizeof tkg[j]);
         tkg[j].enable_mask=0xd; tkg[j].int_mask=0x300; tkg[j].int_clear=0x1ffff;
