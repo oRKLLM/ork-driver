@@ -28,20 +28,30 @@ static long ceildiv(long a, long b){ return (a + b - 1) / b; }
 
 typedef struct { double us, mb; long sub; int Kt, Nt, Mt; } res;
 
+/* wall-clock combiner. overlap=0: serial (submit cost ADDS on top of DMA).
+ * overlap=1: non-blocking/doorbell — submit issue HIDES under DMA, so the bottleneck is
+ * whichever is larger, the DRAM stream or the host's submit-issue rate. */
+static double wall(double bytes, long sub, double ov_us, int overlap){
+    double dma = bytes/BW*1e6;
+    double iss = (double)sub*ov_us;
+    if(!overlap) { return dma + iss; }
+    return dma > iss ? dma : iss;
+}
+
 /* output-stationary fold: full-K reduction in HW, weight re-streamed once per M-tile. */
-static res fold_model(long M, long K, long N, double ov_us){
+static res fold_model(long M, long K, long N, double ov_us, int overlap){
     long nsub = ceildiv(M, FOLD_MT);
     double w = (double)nsub * K * N;      /* weight re-streamed per M-tile   */
     double a = (double)M * K;             /* A streamed once total           */
     double o = (double)M * N * 4;         /* single full-K int32 writeout    */
     double bytes = w + a + o;
-    res r = { bytes/BW*1e6 + nsub*ov_us, bytes/1e6, nsub, (int)K, (int)N, (int)FOLD_MT };
+    res r = { wall(bytes, nsub, ov_us, overlap), bytes/1e6, nsub, (int)K, (int)N, (int)FOLD_MT };
     return r;
 }
 
 /* weight-stationary: sweep the (Kt x Nt) resident weight tile, pick min time.
  * chip_accum=0 -> DRAM K-accumulate (safe);  chip_accum=1 -> on-chip (optimistic). */
-static res ws_best(long M, long K, long N, double ov_us, int chip_accum){
+static res ws_best(long M, long K, long N, double ov_us, int chip_accum, int overlap){
     long Wcap = 10 * CBUF / 12;   /* weight-heavy bank split: 10 of 12 banks resident weight */
     long Dcap =  2 * CBUF / 12;   /* 2 banks hold the Mt x Kt activation strip               */
     res best;
@@ -63,7 +73,7 @@ static res ws_best(long M, long K, long N, double ov_us, int chip_accum){
                               : (double)(2*nK) * M*N*4;  /* DRAM accumulate: write+reread per K-tile */
         double bytes = w + a + o;
         long sub = nK * nN * nM;
-        double t = bytes/BW*1e6 + sub*ov_us;
+        double t = wall(bytes, sub, ov_us, overlap);
         if(t < best.us){
             best.us=t; best.mb=bytes/1e6; best.sub=sub;
             best.Kt=(int)Kt; best.Nt=(int)Nt; best.Mt=(int)Mt;
@@ -72,12 +82,12 @@ static res ws_best(long M, long K, long N, double ov_us, int chip_accum){
     return best;
 }
 
-static void row(long M, long K, long N, double ov){
-    res f  = fold_model(M, K, N, ov);
-    res wd = ws_best(M, K, N, ov, 0);   /* DRAM accumulate (safe)      */
-    res wc = ws_best(M, K, N, ov, 1);   /* on-chip accumulate (optim.) */
-    printf("  M=%-5ld ov=%3.0fus | fold %7.0fus (%5.1fMB %ld sub) | "
-           "WS-dram %7.0fus (%5.1fMB %ld sub) x%.2f | WS-chip %7.0fus (%5.1fMB %ld sub) x%.2f  [best Kt=%d Nt=%d Mt=%d]\n",
+static void row(long M, long K, long N, double ov, int overlap){
+    res f  = fold_model(M, K, N, ov, overlap);
+    res wd = ws_best(M, K, N, ov, 0, overlap);   /* DRAM accumulate (safe)      */
+    res wc = ws_best(M, K, N, ov, 1, overlap);   /* on-chip accumulate (optim.) */
+    printf("  M=%-5ld ov=%2.0fus | fold %7.0fus (%5.1fMB %ld sub) | "
+           "WS-dram %8.0fus (%5.1fMB %ld sub) x%.2f | WS-chip %8.0fus (%5.1fMB %ld sub) x%.2f  [chip Kt=%d Nt=%d Mt=%d]\n",
            M, ov, f.us, f.mb, f.sub,
            wd.us, wd.mb, wd.sub, f.us/wd.us,
            wc.us, wc.mb, wc.sub, f.us/wc.us, wc.Kt, wc.Nt, wc.Mt);
@@ -85,18 +95,22 @@ static void row(long M, long K, long N, double ov){
 
 int main(int argc, char**argv){
     long Ms[] = {128, 228, 512, 1024, 2048};
-    double ovs[] = {0, 10, 30, 60};   /* per-submit fixed overhead (us) — the decisive unknown */
+    double ovs[] = {0, 5, 10, 30, 60};   /* per-submit cost (us) — the decisive unknown */
     struct { long K, N; const char*name; } ops[] = {
         {3584, 1216, "fold-ref  (K=3584 N=1216, one N-slice)"},
         {3584, 3584, "ffn-down  (K=3584 N=3584, full op)"},
         {3584, 9472, "ffn-gate  (K=3584 N=9472)"},
     };
-    printf("weight-stationary vs fold  |  ratio >1 = WS wins  |  BW=%.0fGB/s CBUF=%ld fold_Mt=%ld\n", BW/1e9, CBUF, FOLD_MT);
-    for(size_t o=0;o<sizeof ops/sizeof*ops;o++){
-        printf("\n== %s ==\n", ops[o].name);
-        for(size_t j=0;j<sizeof ovs/sizeof*ovs;j++){
-            for(size_t i=0;i<sizeof Ms/sizeof*Ms;i++){ row(Ms[i], ops[o].K, ops[o].N, ovs[j]); }
-            printf("\n");
+    for(int overlap=0; overlap<=1; overlap++){
+        printf("\n########## %s submit model  |  ratio >1 = WS wins  |  BW=%.0fGB/s CBUF=%ld fold_Mt=%ld ##########\n",
+               overlap ? "NON-BLOCKING/overlapped: wall=max(DMA, submits*cost)" : "SERIAL: wall=DMA + submits*cost",
+               BW/1e9, CBUF, FOLD_MT);
+        for(size_t o=0;o<sizeof ops/sizeof*ops;o++){
+            printf("\n== %s ==\n", ops[o].name);
+            for(size_t j=0;j<sizeof ovs/sizeof*ovs;j++){
+                for(size_t i=0;i<sizeof Ms/sizeof*Ms;i++){ row(Ms[i], ops[o].K, ops[o].N, ovs[j], overlap); }
+                printf("\n");
+            }
         }
     }
     (void)argc;(void)argv;
