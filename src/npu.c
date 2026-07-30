@@ -214,7 +214,8 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     /* persistent little-core (A55) marshalling helper (ORK_SSM_PIPELINE): spawned once, condvar-signalled
      * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
-    pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
+    pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob;
+    struct fold_scratch *fold_sc;   /* #39 resident mfold scratch (A/C/RC/TK + tiles), keyed on (M,N,domain); reused across calls */ };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */ };
 /* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
  * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
@@ -1371,64 +1372,93 @@ opdone:
     for(int s=0;s<3;s++){ if(W[s].cpu)bdestroy(fd,&W[s]); if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
     bdestroy(fd,&A); free(tmpl); return rc_ret;
 }
-/* #39 mfold RUN-PATH (RESIDENT weight): same N-split-across-cores fold as ork_npu_fold_op_i8, but the weight is
- * the PRE-PACKED resident w->Bfold (from the orkpack, no per-call fold_woff repack + no W bcreate) — this is what
- * makes mfold viable in the run path. Only the per-call A (nc16) + C (c4) transient bufs are allocated. A/Cout
- * row-major. 0/ok, -1 unsupported (shape/M outside envelope), -2 alloc, -3 bad ctx/weight. */
+/* #39 RESIDENT mfold SCRATCH — the A(nc16)/C(c4)/RC(regcmd)/TK(task) buffers + baked M-fold tile templates, keyed
+ * on (M,N,domain) and REUSED across ork_npu_fold_run_w calls. The per-call bcreate of these (~8ms, ~10 MB-bufs)
+ * was what made the naive run-path fold 8x SLOWER than normal; here it's paid ONCE per shape. All q/o weights in a
+ * batch share (M,N,domain), so one entry serves them all; only the weight/A/C addrs in RC are patched per call. */
+struct fold_scratch { int M, N, nslice, P, domain; int roff[64]; uint32_t *tmpl; struct buf A; struct buf *Cc, *RC, *TK; };
+static void fold_scratch_free(ork_npu *c){
+    struct fold_scratch *fs=c->fold_sc; if(!fs) return;
+    if(fs->Cc) for(int s=0;s<fs->nslice;s++) if(fs->Cc[s].cpu) bdestroy(c->fd,&fs->Cc[s]);
+    if(fs->RC) for(int s=0;s<fs->nslice;s++) if(fs->RC[s].cpu) bdestroy(c->fd,&fs->RC[s]);
+    if(fs->TK) for(int s=0;s<fs->nslice;s++) if(fs->TK[s].cpu) bdestroy(c->fd,&fs->TK[s]);
+    if(fs->A.cpu) bdestroy(c->fd,&fs->A);
+    free(fs->Cc); free(fs->RC); free(fs->TK); free(fs->tmpl); free(fs); c->fold_sc=NULL;
+}
+/* Get (or lazily build) the scratch for this (M,N,domain). Rebuilds on key change. TK is built once here (it
+ * only references RC offsets, not weight/A/C addrs); RC is patched per call in ork_npu_fold_run_w. NULL on alloc. */
+static struct fold_scratch *fold_scratch_get(ork_npu *c, int M, int N, int dom){
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; int fd=c->fd;
+    struct fold_scratch *fs=c->fold_sc;
+    if(fs && fs->M==M && fs->N==N && fs->domain==dom) return fs;
+    if(fs) fold_scratch_free(c);
+    fs=calloc(1,sizeof *fs); if(!fs) return NULL;
+    c->fold_sc=fs;                                                 /* assign early: all error paths reclaim via fold_scratch_free */
+    fs->M=M; fs->N=N; fs->nslice=nslice; fs->domain=dom;
+    fs->tmpl=malloc((size_t)64*232*4); if(!fs->tmpl){ fold_scratch_free(c); return NULL; }
+    static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
+    int P=0,rem=M,off=0;
+    while(rem>0){ int pick=-1; for(unsigned s=0;s<sizeof SZ/sizeof*SZ;s++) if(SZ[s]<=rem){ pick=SZ[s]; break; }
+        if(pick<0) break;
+        fs->roff[P]=off; off+=pick; rem-=pick;
+        if(fold_build_tile(pick,M,fs->tmpl+(size_t)P*232)){ fold_scratch_free(c); return NULL; }
+        if(++P>=64) break; }
+    fs->P=P;
+    size_t asz=(size_t)M*FOLD_REF_K*8+(1u<<20), csz=(size_t)M*NS*4*8+65536;
+    fs->A=bcreate(fd,asz,0x403,dom);
+    fs->Cc=calloc(nslice,sizeof(struct buf)); fs->RC=calloc(nslice,sizeof(struct buf)); fs->TK=calloc(nslice,sizeof(struct buf));
+    if(!fs->A.cpu||!fs->Cc||!fs->RC||!fs->TK){ fold_scratch_free(c); return NULL; }
+    memset(fs->A.cpu,0,asz);                                       /* zero the nc16 pad once; refills overwrite the valid region */
+    for(int s=0;s<nslice;s++){
+        fs->Cc[s]=bcreate(fd,csz,0x403,dom);
+        fs->RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom);
+        fs->TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
+        if(!fs->Cc[s].cpu||!fs->RC[s].cpu||!fs->TK[s].cpu){ fold_scratch_free(c); return NULL; }
+        struct rknpu_task*tk=(struct rknpu_task*)fs->TK[s].cpu;    /* TK is addr-independent -> build once */
+        for(int t=0;t<P;t++){ memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+            tk[t].regcfg_amount=108; tk[t].regcmd_addr=fs->RC[s].dma+(uint64_t)t*REGCMD_I8_N*4; }
+        bsync(fd,&fs->TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    return fs;
+}
+/* #39 mfold RUN-PATH (RESIDENT weight + RESIDENT scratch): the token-fold from the pre-packed resident w->Bfold,
+ * with A/C/RC/TK reused across calls (fold_scratch, keyed on M/N/domain). Per call only: refill A (nc16), patch RC
+ * with this weight's Bfold/A/C addrs, submit rounds of <=3 cores, detile C. A/Cout row-major. 0 ok, -1/-2/-3. */
 int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cout, int iters, double*us){
     int fd=c->fd; if(fd<0||!w||!w->Bfold) return -3;
-    int K=w->K, N=w->N; const int NS=FOLD_REF_N, NC=3; int nslice=w->fold_ns;   /* NC cores; N>3648 => multiple rounds */
+    int K=w->K, N=w->N; const int NS=FOLD_REF_N, NC=3; int nslice=w->fold_ns;
     if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>64) return -1;
-    int dom=w->domain;                                        /* A/C/RC/TK share Bfold's IOVA domain */
-    static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
-    int mt[64],roff[64],P=0,rem=M,off=0;
-    while(rem>0){ for(unsigned s=0;s<sizeof SZ/sizeof*SZ;s++) if(SZ[s]<=rem){mt[P]=SZ[s];roff[P]=off;off+=SZ[s];rem-=SZ[s];P++;break;} if(P>=64) break; }
-    uint32_t *tmpl=malloc((size_t)P*232*4); if(!tmpl) return -2;
-    for(int t=0;t<P;t++) if(fold_build_tile(mt[t],M,tmpl+(size_t)t*232)){ free(tmpl); return -2; }
-    size_t asz=(size_t)M*K*8+(1u<<20);
-    struct buf A=bcreate(fd,asz,0x403,dom); if(!A.cpu){free(tmpl);return -2;}
-    memset(A.cpu,0,asz);
-    { int8_t*Ap=(int8_t*)A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* per-slice resident C/RC/TK (built once, like a real run's resident setup); submitted in rounds of <=NC */
-    struct buf *Cc=calloc(nslice,sizeof(struct buf)),*RC=calloc(nslice,sizeof(struct buf)),*TK=calloc(nslice,sizeof(struct buf));
-    int rc_ret=-1; size_t csz=(size_t)M*NS*4*8+65536;
-    if(!Cc||!RC||!TK) goto rwdone;
+    int dom=w->domain;
+    struct fold_scratch *fs=fold_scratch_get(c,M,N,dom); if(!fs) return -2;
+    int P=fs->P;
+    { int8_t*Ap=(int8_t*)fs->A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
+    bsync(fd,&fs->A,RKNPU_MEM_SYNC_TO_DEVICE);
     for(int s=0;s<nslice;s++){
-        Cc[s]=bcreate(fd,csz,0x403,dom);
-        RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
-        if(!Cc[s].cpu||!RC[s].cpu||!TK[s].cpu) goto rwdone;
-        memset(Cc[s].cpu,0,csz); bsync(fd,&Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);
-        uint32_t*rcbuf=(uint32_t*)RC[s].cpu; struct rknpu_task*tk=(struct rknpu_task*)TK[s].cpu;
+        uint32_t*rcbuf=(uint32_t*)fs->RC[s].cpu;
         for(int t=0;t<P;t++){
-            uint32_t rc[REGCMD_I8_N]; memcpy(rc, tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
-            uint64_t rf=(uint64_t)roff[t]*16;
-            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+rf));
+            uint32_t rc[REGCMD_I8_N]; memcpy(rc, fs->tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
+            uint64_t rf=(uint64_t)fs->roff[t]*16;
+            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(fs->A.dma+rf));
             setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)w->Bfold[s].dma);
-            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc[s].dma+rf));
-            if(t<P-1){ uint64_t nxt=RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
+            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(fs->Cc[s].dma+rf));
+            if(t<P-1){ uint64_t nxt=fs->RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
                 rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
                 rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101u<<16)|0;
             } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
             memcpy(rcbuf+(size_t)t*REGCMD_I8_N, rc, sizeof rc);
-            memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
-            tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC[s].dma+(uint64_t)t*REGCMD_I8_N*4;
         }
-        bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        bsync(fd,&fs->RC[s],RKNPU_MEM_SYNC_TO_DEVICE);
+        bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean CPU C lines before the DPU writes (DMA coherency; the prior detile READ left clean-but-present lines) */
     }
     #define _FOLD_ROUNDS() do{ int gsz[3]={P,P,P}; for(int r=0;r*NC<nslice;r++){ int rn=nslice-r*NC; if(rn>NC)rn=NC; \
-        if(ork_fold_submit_all(fd,dom,&TK[r*NC],gsz,rn)) goto rwdone; } }while(0)
-    _FOLD_ROUNDS();                                                          /* warm + correctness */
-    for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
-    if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
+        if(ork_fold_submit_all(fd,dom,&fs->TK[r*NC],gsz,rn)) return -2; } }while(0)
+    _FOLD_ROUNDS();
+    for(int s=0;s<nslice;s++) bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)fs->Cc[s].cpu;
         for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
     if(iters>0){ double t0=ork_now_us(); for(int it=0;it<iters;it++){ _FOLD_ROUNDS(); } if(us)*us=(ork_now_us()-t0)/iters; }
-    rc_ret=0;
-rwdone:
-    if(Cc) for(int s=0;s<nslice;s++) if(Cc[s].cpu)bdestroy(fd,&Cc[s]);
-    if(RC) for(int s=0;s<nslice;s++) if(RC[s].cpu)bdestroy(fd,&RC[s]);
-    if(TK) for(int s=0;s<nslice;s++) if(TK[s].cpu)bdestroy(fd,&TK[s]);
-    free(Cc);free(RC);free(TK); bdestroy(fd,&A); free(tmpl); return rc_ret;
+    #undef _FOLD_ROUNDS
+    return 0;
 }
 /* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
  * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
@@ -2103,6 +2133,7 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
+    fold_scratch_free(c);   /* #39 resident mfold scratch */
     bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);bdestroy(fd,&c->mtk_all);
     bdestroy(fd,&c->ppu_a);bdestroy(fd,&c->ppu_b);bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
     for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);
