@@ -737,6 +737,13 @@ int          ork_npu_fold_run_i8(ork_npu *ctx, int K, int N, const signed char *
  * slice concurrently) — rkllm's wide-projection scheme. K=FOLD_REF_K, N<=3*1216, M<=128. A/Cout row-major. */
 int          ork_npu_fold_op_i8(ork_npu *ctx, int K, int N, const signed char *Wraw, int M,
                                 const signed char *Araw, int *Cout, int iters, double *us);
+/* #39 mfold RESIDENT-weight variant: fold matmul from a PRE-PACKED w->Bfold (ork_mm_load_fold_i8 / orkpack v5),
+ * no per-call fold_woff repack. K=FOLD_REF_K, N<=3*1216, M<=128. A/Cout row-major. 0/ok, -1/-2/-3 as fold_op. */
+int          ork_npu_fold_run_w(ork_npu *ctx, ork_w *w, int M, const signed char *Araw, int *Cout, int iters, double *us);
+/* #39 mfold orkpack companions: dump the fold_woff-layout weight blob PURE-CPU (out=NULL to size), and load it
+ * back into a resident ork_w carrying only w->Bfold. K=FOLD_REF_K(3584), N<=3*FOLD_REF_N(1216), N%32. */
+size_t       ork_w_dump_fold_i8_cpu(ork_npu *ctx, int K, int N, const signed char *B, void *out, size_t cap);
+ork_w       *ork_mm_load_fold_i8(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* #39 Path-1 CANONICAL output-stage state-setter: rewrite EVERY output-stage register in a REGCMD_I8_N regcmd to
  * its first-principles value (from the full-prefill invariant scan) — across BOTH output blocks 0x1001 (DPU/SDP)
  * and 0x801 (PDP/aux output-dims mirror) — leaving DST_BASE_ADDR (the only output-stage IOVA) for the caller.

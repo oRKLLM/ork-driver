@@ -215,7 +215,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * per chunk to build the G-independent operands on the idle little cluster while the pS matmul runs on
      * the big cores. Kills the per-chunk pthread-spawn cost of the naive version. */
     pthread_t ssm_hth; pthread_mutex_t ssm_hmu; pthread_cond_t ssm_hgo, ssm_hdn; int ssm_hspawn, ssm_hgen, ssm_hdone, ssm_hstop; void *ssm_hjob; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */ };
 /* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
  * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
  * so the guard makes this local copy defer to it (identical shape either way — no conflicting-types). */
@@ -1369,6 +1369,60 @@ int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); rc_ret=0; }
 opdone:
     for(int s=0;s<3;s++){ if(W[s].cpu)bdestroy(fd,&W[s]); if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
+    bdestroy(fd,&A); free(tmpl); return rc_ret;
+}
+/* #39 mfold RUN-PATH (RESIDENT weight): same N-split-across-cores fold as ork_npu_fold_op_i8, but the weight is
+ * the PRE-PACKED resident w->Bfold (from the orkpack, no per-call fold_woff repack + no W bcreate) — this is what
+ * makes mfold viable in the run path. Only the per-call A (nc16) + C (c4) transient bufs are allocated. A/Cout
+ * row-major. 0/ok, -1 unsupported (shape/M outside envelope), -2 alloc, -3 bad ctx/weight. */
+int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cout, int iters, double*us){
+    int fd=c->fd; if(fd<0||!w||!w->Bfold) return -3;
+    int K=w->K, N=w->N; const int NS=FOLD_REF_N; int nslice=w->fold_ns;
+    if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>3) return -1;
+    int dom=w->domain;                                        /* A/C/RC/TK share Bfold's IOVA domain */
+    static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
+    int mt[64],roff[64],P=0,rem=M,off=0;
+    while(rem>0){ for(unsigned s=0;s<sizeof SZ/sizeof*SZ;s++) if(SZ[s]<=rem){mt[P]=SZ[s];roff[P]=off;off+=SZ[s];rem-=SZ[s];P++;break;} if(P>=64) break; }
+    uint32_t *tmpl=malloc((size_t)P*232*4); if(!tmpl) return -2;
+    for(int t=0;t<P;t++) if(fold_build_tile(mt[t],M,tmpl+(size_t)t*232)){ free(tmpl); return -2; }
+    size_t asz=(size_t)M*K*8+(1u<<20);
+    struct buf A=bcreate(fd,asz,0x403,dom); if(!A.cpu){free(tmpl);return -2;}
+    memset(A.cpu,0,asz);
+    { int8_t*Ap=(int8_t*)A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf Cc[3]={{0}},RC[3]={{0}},TK[3]={{0}}; int rc_ret=-1;
+    size_t csz=(size_t)M*NS*4*8+65536;
+    for(int s=0;s<nslice;s++){
+        Cc[s]=bcreate(fd,csz,0x403,dom);
+        RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
+        if(!Cc[s].cpu||!RC[s].cpu||!TK[s].cpu) goto rwdone;
+        memset(Cc[s].cpu,0,csz); bsync(fd,&Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);
+        uint32_t*rcbuf=(uint32_t*)RC[s].cpu; struct rknpu_task*tk=(struct rknpu_task*)TK[s].cpu;
+        for(int t=0;t<P;t++){
+            uint32_t rc[REGCMD_I8_N]; memcpy(rc, tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
+            uint64_t rf=(uint64_t)roff[t]*16;
+            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+rf));
+            setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)w->Bfold[s].dma);
+            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc[s].dma+rf));
+            if(t<P-1){ uint64_t nxt=RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
+                rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
+                rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101u<<16)|0;
+            } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
+            memcpy(rcbuf+(size_t)t*REGCMD_I8_N, rc, sizeof rc);
+            memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+            tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC[s].dma+(uint64_t)t*REGCMD_I8_N*4;
+        }
+        bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    { int gszP[3]={P,P,P};
+      if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto rwdone;
+      for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+      if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
+          for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
+      if(iters>0){ double t0=ork_now_us(); for(int it=0;it<iters;it++){ if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto rwdone; }
+        if(us)*us=(ork_now_us()-t0)/iters; } rc_ret=0; }
+rwdone:
+    for(int s=0;s<3;s++){ if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
     bdestroy(fd,&A); free(tmpl); return rc_ret;
 }
 /* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
@@ -2557,6 +2611,23 @@ size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
         off+=tsz; }
     return off;
 }
+/* #39 mfold: fold-layout (rkllm M-fold, fold_woff) weight blob for B[K,N] straight from raw row-major int8,
+ * PURE-CPU — the on-disk companion (orkpack v5 "Bfold") so the run path skips the per-call fold_woff repack
+ * that otherwise kills mfold. Layout: nslice tiles (NS=FOLD_REF_N wide); tile s = pgup(K*sliceW) holding
+ * fold_woff(n,k,K) for that slice's columns. Only K==FOLD_REF_K && N<=3*FOLD_REF_N (the baked-ref fold
+ * envelope); returns 0 otherwise. Byte-identical to ork_npu_fold_op_i8's per-slice W pack. out=NULL to size. */
+size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    (void)c;
+    if(!B || K!=FOLD_REF_K || N<1 || (N%32)) return 0;
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>3) return 0;
+    size_t off=0;
+    for(int s=0;s<nslice;s++){ int n0=s*NS, sw=(N-n0<NS)?(N-n0):NS; size_t tsz=pgup((size_t)K*sw);
+        if(out){ if(off+tsz>cap) return 0;
+            int8_t *ws=(int8_t*)out+off; memset(ws,0,tsz);
+            for(int k=0;k<K;k++)for(int n=0;n<sw;n++) ws[fold_woff(n,k,K)]=B[(size_t)k*N+(n0+n)]; }
+        off+=tsz; }
+    return off;
+}
 /* NPU-availability gate for the hybrid pack scheduler: return 1 if the NPU appears IN USE (any core
  * loaded above a small threshold), 0 if idle. Reads the kernel's rolling per-core load counter. A
  * hybrid conversion routes a weight to the NPU tile/pack path ONLY when this is 0, so a background
@@ -2624,6 +2695,24 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     return w;
 }
 
+/* #39 mfold: load the fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") into a resident
+ * ork_w carrying only w->Bfold (nslice bufs). Run via ork_npu_fold_run_w. Shape/size-checked; NULL on mismatch. */
+ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K!=FOLD_REF_K || N<1 || (N%32)) return NULL;
+    const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>3) return NULL;
+    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=pgup((size_t)K*sw);}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->K=K;w->N=N;w->dtype=DT_I8;w->owns=1;w->domain=ork_dom(c->pack_domain);
+    w->Bfold=calloc(nslice,sizeof(struct buf)); w->fold_ns=nslice;
+    size_t off=0;
+    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; size_t tsz=pgup((size_t)K*sw);
+        struct buf*b=&w->Bfold[s]; *b=bcreate(c->fd,tsz,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<s;i++) bdestroy(c->fd,&w->Bfold[i]); free(w->Bfold); free(w); return NULL; }
+        memcpy(b->cpu,(const char*)blob+off,tsz); off+=tsz;
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); }
+    return w;
+}
 /* Zero-copy IMPORT variant of ork_mm_load_i8: each resident tile is a dma-buf the NPU reads in place
  * (PRIME import) instead of a MEM_CREATE-alloc'd buffer the blob is memcpy'd into. The bytes still get
  * written once (into the imported mmap) + synced once; the saving is the kernel page allocation, not
@@ -3817,6 +3906,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
      * individually destroyed (the backing import is reclaimed once via own_bufs below). Native Bf has heap_fd>=0. */
     if(c && w->Bf) for(int i=0;i<w->Sn;i++)
         if(w->Bf[i].cpu && w->Bf[i].heap_fd>=0) bdestroy(c->fd,&w->Bf[i]);
+    if(c && w->Bfold) for(int i=0;i<w->fold_ns;i++) if(w->Bfold[i].cpu) bdestroy(c->fd,&w->Bfold[i]);   /* #39 mfold resident weight */
     /* dedicated single-buffer weights (grouped-i4, or consolidated int8): Bb[] entries are VIEWS (share
      * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
      * of a sub-pointer). Reclaims IOVA. */
@@ -3824,7 +3914,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     /* size-bounded consolidated import: Bb[] entries are views into own_bufs[] chunks — destroy each chunk. */
     if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) bdestroy(c->fd,&w->own_bufs[i]);
     free(w->own_bufs);
-    free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w->fa_lut); free(w);
+    free(w->Bb); free(w->Bf); free(w->Bfold); free(w->Bi4); free(w->bscale); free(w->fa_lut); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
