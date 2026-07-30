@@ -1010,13 +1010,14 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
          * zeroing the whole words destroys the 0x0014 terminator and the lone task hangs. */
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
             if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
+        int wreuse = (t>0) && getenv("ORK_MFOLD_WREUSE");
         setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A rows */
-        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared resident weight */
+        if(!wreuse) setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);               /* shared weight; on a REUSE tile leave it (fetch is skipped; re-writing may trigger release) */
         setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
         /* #39 NOVEL: set CNA_CBUF_CON0 WEIGHT_REUSE (0x1040 bit13, per rocket_registers.h) on non-loader tiles so
          * the HW reuses the weight tile 0 left resident in CBUF and SKIPS the re-DMA — a HW feature rkllm never
          * uses (bit13=0 in all captured tiles). ORK_MFOLD_WREUSE=1 to try; tile 0 loads normally. */
-        if(t>0 && getenv("ORK_MFOLD_WREUSE")){
+        if(wreuse){
             uint32_t cur=0; for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && ((rc[k+1]>>16)&0xffff)==0x201){ cur=rc[k]>>16; break; }
             setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u);
         }
@@ -1103,6 +1104,61 @@ int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _MSUB
 mdone:
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+}
+/* #39 UNIFIED per-tile fold chain with REAL operands + Craw return — the tool for Path-1 (state-setter + big-M)
+ * and Path-2 (weight-reuse). P tiles, per-tile width ws[t], per-tile captured regcmd tiles[t*rn..]. A packed as
+ * concatenated per-tile nc16 (tile t = ws[t] rows, offset = sum of prior ws*K bytes); shared woff weight Bpacked;
+ * Craw = concatenated per-tile c4 (ws[t]*N int32 each). wreuse: OR WEIGHT_REUSE(0x1040 bit13) into tiles t>0.
+ * Rebases A/W/C per tile onto shared guard buffers preserving the concat layout. Returns 0/ok, us=avg submit. */
+int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const uint32_t *tiles, int rn,
+                          const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int wreuse, int iters, double *us){
+    int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||(K%32)||(N%16)||!tiles||rn<108||rn>512) return -2;
+    int dom=c->dom_active;
+    size_t Aoff[65], Coff[65], atot=0, ctot=0;   /* per-tile byte/elem offsets in the concat packing */
+    for(int t=0;t<P;t++){ Aoff[t]=atot; Coff[t]=ctot; atot+=(size_t)ws[t]*K; ctot+=(size_t)ws[t]*N; }
+    size_t asz=atot*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=ctot*4*8+65536;
+    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
+    memcpy(A.cpu,Apacked,atot); memcpy(B.cpu,Bpacked,(size_t)K*N);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t *rcbuf=(uint32_t*)RC.cpu; struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
+    int ncopy = rn<REGCMD_I8_N ? rn : REGCMD_I8_N;
+    for(int t=0;t<P;t++){
+        uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
+        memcpy(rc, tiles+(size_t)t*rn, (size_t)ncopy*4);
+        for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
+            if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
+        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + Aoff[t]));
+        if(!(wreuse&&t>0)) setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + Coff[t]*4));
+        if(wreuse&&t>0){ uint32_t cur=0; for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && ((rc[k+1]>>16)&0xffff)==0x201){ cur=rc[k]>>16; break; }
+            setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u); }
+        if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
+            rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
+            rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
+        } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
+        memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
+        memset(&tk[t],0,sizeof tk[t]);
+        tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
+        tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
+    }
+    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1; struct rknpu_submit sub;
+    #define _VSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
+    _VSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; }
+    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(Craw) memcpy(Craw,Cc.cpu,ctot*4);
+    { double t0=ork_now_us(); for(int i=0;i<iters;i++){ _VSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; } }
+      if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
+    #undef _VSUB
+vdone:
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
 }
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){

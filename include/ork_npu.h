@@ -715,6 +715,11 @@ int          ork_npu_mfold_chain_cap(ork_npu *ctx, int P, int w, int K, int N,
  * operands. The timing slope vs P reveals weight re-DMA (linear) vs resident reuse (sublinear). */
 int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
                                        const unsigned *tiles, int rn, int iters, double *us);
+/* #39 UNIFIED per-tile fold chain: P tiles of per-tile width ws[t], real operands (concat nc16 A / woff B),
+ * Craw out (concat c4), optional WEIGHT_REUSE on tiles t>0. For [state-setter+big-M] and weight-reuse chains. */
+int          ork_npu_mfold_chain_v(ork_npu *ctx, int P, const int *ws, int K, int N,
+                                    const unsigned *tiles, int rn, const signed char *Apacked,
+                                    const signed char *Bpacked, int *Craw, int wreuse, int iters, double *us);
 
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT

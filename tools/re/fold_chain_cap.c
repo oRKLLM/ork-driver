@@ -35,8 +35,10 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++) W[i]=(int8_t)r7();
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long s=0; for(int k=0;k<K;k++) s+=(long)A[(size_t)m*K+k]*W[(size_t)k*N+n]; Cref[(size_t)m*N+n]=(int32_t)s; }
     /* pack A: P tiles, tile t = rows [t*8, t*8+8) as width-8 C2-16 */
+    int same_a = getenv("ORK_SAME_A")!=NULL;   /* diag: all tiles use tile-0 rows -> isolates weight-reuse from data-refetch */
+    if(same_a) for(int t=1;t<P;t++)for(int m=0;m<w;m++)for(int n=0;n<N;n++) Cref[(size_t)(t*w+m)*N+n]=Cref[(size_t)m*N+n];
     int8_t *Ap=calloc((size_t)P*w*K,1);
-    for(int t=0;t<P;t++)for(int m=0;m<w;m++)for(int k=0;k<K;k++) Ap[(size_t)t*w*K + nc16(m,k,w)] = A[(size_t)(t*w+m)*K+k];
+    for(int t=0;t<P;t++)for(int m=0;m<w;m++)for(int k=0;k<K;k++) Ap[(size_t)t*w*K + nc16(m,k,w)] = A[(size_t)((same_a?0:t)*w+m)*K+k];
     int8_t *Wp=calloc((size_t)K*N,1); for(int k=0;k<K;k++)for(int n=0;n<N;n++) Wp[woff(n,k,K)]=W[(size_t)k*N+n];
     int32_t *Craw=calloc((size_t)P*w*N,4);
 
@@ -47,9 +49,11 @@ int main(int argc,char**argv){
     double us=0; int r=ork_npu_mfold_chain_cap(c,P,w,K,N,rc,rn,Ap,Wp,Craw,5,&us);
     if(r){ printf("chain_cap rc=%d (STALL/err)\n",r); ork_npu_free(c); return 1; }
     long mm=0,mx=0; int first=-1;
-    for(int t=0;t<P;t++)for(int m=0;m<w;m++)for(int n=0;n<N;n++){
+    for(int t=0;t<P;t++){ long tmm=0;
+      for(int m=0;m<w;m++)for(int n=0;n<N;n++){
         int32_t got=Craw[(size_t)t*w*N + c4(m,n,w)], ref=Cref[(size_t)(t*w+m)*N+n];
-        long e=labs((long)got-ref); if(e){mm++; if(first<0)first=(t*w+m)*N+n;} if(e>mx)mx=e; }
+        long e=labs((long)got-ref); if(e){mm++;tmm++; if(first<0)first=(t*w+m)*N+n;} if(e>mx)mx=e; }
+      printf("  tile %d: %ld/%d wrong\n", t, tmm, w*N); }
     printf("RESULT cap-chain: %ld/%d mismatch  maxerr=%ld  %.1f us/submit (%d tasks, M=%d)  %s\n",
            mm,M*N,mx,us,P,M, mm?"MISMATCH":"*** BIT-EXACT — captured tile chains, weight-resident at M>8! ***");
     ork_npu_free(c); return mm?1:0;
