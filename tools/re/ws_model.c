@@ -95,7 +95,9 @@ static void row(long M, long K, long N, double ov, int overlap){
 
 int main(int argc, char**argv){
     long Ms[] = {128, 228, 512, 1024, 2048};
-    double ovs[] = {0, 5, 10, 30, 60};   /* per-submit cost (us) — the decisive unknown */
+    /* per-tile cost (us): 1-2 ~ HW-chain task-transition (one submit, HW walks the chain);
+     * 5-60 ~ individual ioctl/doorbell submits. The decisive unknown. */
+    double ovs[] = {0, 1, 2, 5, 10, 30, 60};
     struct { long K, N; const char*name; } ops[] = {
         {3584, 1216, "fold-ref  (K=3584 N=1216, one N-slice)"},
         {3584, 3584, "ffn-down  (K=3584 N=3584, full op)"},
