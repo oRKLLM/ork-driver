@@ -29,6 +29,10 @@ int main(int argc,char**argv){
     ork_npu_set_core_budget(c,1);
     { int8_t*wd=calloc((size_t)K*N,1);int32_t*td=calloc((size_t)8*N,4);int8_t*ad=calloc((size_t)8*K,1);  /* warm the int8 mode */
       ork_w*ww=ork_mm_pack_i8(c,K,N,wd); if(ww){ork_mm_run_i8(c,ww,8,ad,td);ork_mm_free(c,ww);} free(wd);free(td);free(ad); }
+    if(argc>5){ int fp=atoi(argv[5]); if(fp>P)fp=P;   /* explicit single-P run (ordered inheritance chain: P=1 would wedge on missing inherited regs) */
+        double us=0; int r=ork_npu_mfold_chain_multi(c,fp,wmax,K,N,rc,232,3,&us);
+        printf("single P=%d: %s  %.1f us/submit  (%.1f us/task)\n", fp, r?"STALL/err":"RAN", us, us/fp);
+        ork_npu_free(c); return r?1:0; }
     printf(" Pn |  us/submit | us/task | note\n");
     int steps[]={1,2,4,8,12,16,20,21}; double prev=0;
     for(int si=0; si<(int)(sizeof steps/sizeof steps[0]); si++){
