@@ -99,6 +99,27 @@ int main(int argc,char**argv){
       }
       for(int j=0;j<3;j++){ if(wn[j])ork_mm_free(c,wn[j]); if(wfd[j])ork_mm_free(c,wfd[j]); free(Wq[j]); } free(A);
     }
+    /* ---- gate+up batch (FFN, both N=18944, share input) — the FLOP bulk. Expected ~wash (DRAM-BW-bound). ---- */
+    { int K3=3584, GN=18944; int8_t *Wg[2], *A=malloc((size_t)128*K3); ork_w *wn[2],*wfd[2]; int ok=1;
+      for(size_t i=0;i<(size_t)128*K3;i++) A[i]=r8();
+      for(int j=0;j<2;j++){ Wg[j]=malloc((size_t)K3*GN); for(size_t i=0;i<(size_t)K3*GN;i++) Wg[j][i]=r8();
+        wn[j]=ork_mm_pack_i8(c,K3,GN,Wg[j]);
+        size_t fb=ork_w_dump_fold_i8_cpu(c,K3,GN,Wg[j],NULL,0); void*bl=malloc(fb); ork_w_dump_fold_i8_cpu(c,K3,GN,Wg[j],bl,fb);
+        wfd[j]=ork_mm_load_fold_i8(c,K3,GN,bl,fb); free(bl); if(!wn[j]||!wfd[j]) ok=0; }
+      printf("\n== SHARED-INPUT BATCH (gate+up: 2x N=18944) ==\n");
+      int BM[]={8,32};
+      for(size_t mi=0; ok && mi<sizeof BM/sizeof*BM; mi++){ int M=BM[mi];
+        int32_t *Cf[2],*Cn[2]; for(int j=0;j<2;j++){ Cf[j]=calloc((size_t)M*GN,4); Cn[j]=calloc((size_t)M*GN,4); }
+        double us_b=0; ork_w*ws[2]={wfd[0],wfd[1]}; int32_t*Co[2]={Cf[0],Cf[1]};
+        int rc=ork_npu_fold_batch_w(c,2,ws,M,A,Co,20,&us_b);
+        for(int j=0;j<2;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]);
+        long mism=0; for(int j=0;j<2;j++) for(size_t e=0;e<(size_t)M*GN;e++) if(Cf[j][e]!=Cn[j][e]){ mism++; break; }
+        double t0=now_us(); for(int i=0;i<20;i++) for(int j=0;j<2;j++) ork_mm_run_i8(c,wn[j],M,A,Cn[j]); double us_n=(now_us()-t0)/20;
+        printf("  M=%-3d  batch-fold %8.1f us | 2x normal %8.1f us | %.2fx  rc=%d mism=%ld\n", M, us_b, us_n, us_n/us_b, rc, mism);
+        for(int j=0;j<2;j++){ free(Cf[j]); free(Cn[j]); }
+      }
+      for(int j=0;j<2;j++){ if(wn[j])ork_mm_free(c,wn[j]); if(wfd[j])ork_mm_free(c,wfd[j]); free(Wg[j]); } free(A);
+    }
     printf("\nDONE\n");
     return 0;
 }
