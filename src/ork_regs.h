@@ -57,7 +57,7 @@ enum ork_reg_id {
     RK_CNA_CBUF_CON1,       /**< 0x1044 @brief CBUF DATA_ENTRIES[13:0] = (K/64)*M feature rows held resident. */
     RK_CNA_FEATURE_DATA_ADDR,/**< 0x1070 @brief Input feature (A / activations) IOVA. */
     RK_CNA_DMA_CON1,        /**< 0x107c @brief Feature DMA burst length / line stride. */
-    RK_CNA_DMA_CON2,        /**< 0x1080 @brief Feature surface stride, 16-bit computed value (signed -3*M small-M / 2160/M large-M) + a separate w1-low mode field (0x0fff on the -3*M variant). The old "0x0fffffe8 sentinel" was a 32-bit misread of value 0xffe8 + mode 0x0fff. */
+    RK_CNA_DMA_CON2,        /**< 0x1080 @brief Feature surface stride, SIGNED 28-bit two's complement. w1-low is the sign extension (0xfff for negatives, 0x000 for positives — verified 0/4114 violations, NOT a mode field). Planner-chosen per tile (-3*M common at small M). The old "0x0fffffe8 sentinel" was just -24 read as unsigned. */
     RK_CNA_DATA_SIZE0_MIR,  /**< 0x1084 @brief Mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020. */
     RK_CNA_FC_DATA_SIZE1,   /**< 0x1088 @brief FC/matmul DMA_CHANNEL[15:0] (= K). */
     RK_CNA_WEIGHT_DATA_ADDR,/**< 0x1110 @brief Weight (B) IOVA. */
@@ -140,7 +140,7 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_CNA_CBUF_CON1]        = {0x201, 0x1044, 0x00003fff,  "CNA_CBUF_CON1",        "CBUF DATA_ENTRIES[13:0] = (K/64)*M resident feature rows"},
     [RK_CNA_FEATURE_DATA_ADDR]= {0x201, 0x1070, OKR_ANY,     "CNA_FEATURE_DATA_ADDR","input feature (A / activations) IOVA"},
     [RK_CNA_DMA_CON1]         = {0x201, 0x107c, OKR_ANY,     "CNA_DMA_CON1",         "feature DMA burst length / line stride"},
-    [RK_CNA_DMA_CON2]         = {0x201, 0x1080, 0xffff,      "CNA_DMA_CON2",         "feature surface stride, 16-bit computed value (signed -3*M small-M / 2160/M large-M); w1-low is a SEPARATE mode field (0x0fff on the -3*M variant). The '0x0fffffe8 sentinel' was a 32-bit misread of value 0xffe8 + mode 0x0fff"},
+    [RK_CNA_DMA_CON2]         = {0x201, 0x1080, 0x0fffffff,  "CNA_DMA_CON2",         "feature surface stride, SIGNED 28-bit two's complement (w1-low = sign extension: 0xfff for negatives, NOT a mode field — 0/4114 violations in capture); planner-chosen per tile (-3*M common at small M). The '0x0fffffe8 sentinel' was just -24 (=-3*8) read as unsigned"},
     [RK_CNA_DATA_SIZE0_MIR]   = {0x201, 0x1084, 0x07ff07ff,  "CNA_DATA_SIZE0_MIR",   "mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020"},
     [RK_CNA_FC_DATA_SIZE1]    = {0x201, 0x1088, 0x0000ffff,  "CNA_FC_DATA_SIZE1",    "FC/matmul DMA_CHANNEL[15:0] (= K)"},
     [RK_CNA_WEIGHT_DATA_ADDR] = {0x201, 0x1110, OKR_ANY,     "CNA_WEIGHT_DATA_ADDR", "weight (B) IOVA"},
@@ -278,11 +278,11 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
 /** @brief #RK_DPU_SURFACE_ADD (0x40c0) = M-fold NC1HWC2 surface config (rkllm's M=8 task3; big-M tasks use 0x3000). */
 #define OKV_SURFADD_MFOLD      0x00000400u
 
-/** @brief DEPRECATED / DO NOT USE as a value. `0x0fffffe8` was a 32-bit MISREAD of #RK_CNA_DMA_CON2 (0x1080):
- *  the register is 16-bit — its real value is the surface stride (e.g. `0xffe8` = signed -3*M at M=8, `0x3c` =
- *  2160/M at M=36) and `w1&0xffff` is a SEPARATE mode field (`0x0fff` on the -3*M variant). Folding the two into
- *  one 28-bit number produced the phantom `0x0fffffe8` "sentinel" that misled the mfold RE for weeks. 0x1080 is a
- *  computed stride, not an enum — kept only so old @refs resolve. See regcmd_decode is_wide()/the 16-bit split. */
+/** @brief DEPRECATED / DO NOT USE as a value. #RK_CNA_DMA_CON2 (0x1080) is a SIGNED 28-bit surface stride;
+ *  `0x0fffffe8` is simply `-24` (= -3*M at M=8) in two's complement, read as UNSIGNED. `w1&0xfff` is the sign
+ *  extension of a negative stride (0/4114 violations in the capture), NOT a mode/sentinel. This misread — a
+ *  small negative stride mistaken for a ~268 MB stride — misled the mfold RE for weeks. Kept only so old @refs
+ *  resolve; the decoder treats 0x1080 as signed (see regcmd_decode is_signed()). */
 #define OKV_DMA2_CONTIGUOUS    0x0fffffe8u
 
 /** @brief Compose #RK_CNA_CBUF_CON0 (0x1040): DATA_BANK[3:0] | WEIGHT_BANK[7:4]. */

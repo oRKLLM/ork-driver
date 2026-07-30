@@ -63,8 +63,13 @@ static int is_wide(enum ork_reg_id id){
         || id==RK_CNA_DATA_SIZE1                                /* ((K-1)<<16)|K */
         || id==RK_CNA_WEIGHT_SIZE0                              /* K*N bytes (exceeds 16 bits) */
         || id==RK_CNA_WEIGHT_SIZE2                              /* 0x1010000|N (bit 24 set) */
+        || id==RK_CNA_DMA_CON2                                  /* signed 28-bit surface stride (w1-low = sign ext) */
         || id==RK_CNA_CVT_CON1 || id==RK_CNA_CVT_CON2 || id==RK_CNA_CVT_CON3 || id==RK_CNA_CVT_CON4; /* scale<<16|offset */
 }
+/** @brief True if @p id's (wide) value is TWO'S-COMPLEMENT signed over its mask width. 0x1080 CNA_DMA_CON2 is a
+ *  signed surface stride: negatives (e.g. -3*M) sign-extend into w1-low as 0xfff — verified 0/4114 violations in
+ *  the rkllm capture. The old "0x0fffffe8 sentinel" was just -24 (= -3*8) read as unsigned. NOT a mode field. */
+static int is_signed(enum ork_reg_id id){ return id==RK_CNA_DMA_CON2; }
 
 /**
  * @brief Find the #ork_reg_id for a (block,offset) pair.
@@ -97,8 +102,12 @@ static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
         const ork_reg_desc *d=&ORK_REGS[id];
         int wide=is_wide(id);
         uint32_t val = wide ? (val16|(extra<<16)) : val16;   /* 16-bit regs: value=w0>>16; extra shown separately, NOT folded in */
-        if(wide) fprintf(out,"%-24s = 0x%08x  ", d->name, val);
-        else     fprintf(out,"%-24s = 0x%04x (extra=0x%04x)  ", d->name, val, extra);
+        if(wide && is_signed(id)){
+            uint32_t m=(d->mask==OKR_ANY)?0xffffffffu:d->mask, sb=(m>>1)+1;   /* sign bit = top set bit of the mask */
+            long sv=(long)(val&m); if((val&m)&sb) sv-=(long)(sb<<1);
+            fprintf(out,"%-24s = 0x%08x (signed %ld)  ", d->name, val, sv);
+        } else if(wide) fprintf(out,"%-24s = 0x%08x  ", d->name, val);
+        else            fprintf(out,"%-24s = 0x%04x (extra=0x%04x)  ", d->name, val, extra);
         /* enum-like? (has OKV_ entries) */
         int has_okv=0, matched=0;
         for(int i=0;i<OKV_N;i++) if(OKV_TBL[i].id==id){ has_okv=1; if(OKV_TBL[i].val==val){ fprintf(out,"-> %s", OKV_TBL[i].name); matched=1; break; } }
