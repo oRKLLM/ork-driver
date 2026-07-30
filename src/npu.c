@@ -1169,20 +1169,37 @@ vdone:
  * 0x40c0=128*M_total — plus the output-stage regs + doorbell). Shared weight (0x1110). This is rkllm's real fold:
  * a batch amortized over few big-M tiles, one weight stream per tile. Apacked = M_total x K nc16 (width M_total);
  * Bpacked = K x N woff; Craw = M_total x N c4 (width M_total). Returns 0/ok, us=avg submit. */
+/* #39 per-core fold submit: one core's task-group, core_mask=1u<<core, own task buffer (tasks from index 0),
+ * subcore_task[*]={0,P} — EXACTLY the proven mcworker per-core pattern. Run one per thread => concurrent 3-core. */
+struct ork_fbc_arg { int fd, dom, core, P, rc; struct buf *tk; };
+static void *ork_fbc_thread(void *vp){
+    struct ork_fbc_arg *a=vp; struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=ork_ppflags(); sub.task_number=(uint32_t)a->P; sub.task_obj_addr=a->tk->obj; sub.fence_fd=-1;
+    sub.core_mask=1u<<a->core;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)a->P};
+    sub.timeout=mm_timeout_ms();
+    a->rc = rknpu_submit_ioctl(a->fd,&sub,a->dom);
+    return NULL;
+}
+/* fire the nc per-core submits CONCURRENTLY (one thread each) and wait; 0 ok, -1 if any core errored */
+static int ork_fold_submit_all(int fd,int dom,struct buf *TK,const int *gsz,int nc){
+    if(nc<=1){ struct ork_fbc_arg a={fd,dom,0,gsz[0],0,&TK[0]}; ork_fbc_thread(&a); return a.rc?-1:0; }
+    pthread_t th[3]; struct ork_fbc_arg ar[3]; int made=0,e=0;
+    for(int cc=0;cc<nc;cc++){ ar[cc]=(struct ork_fbc_arg){fd,dom,cc,gsz[cc],0,&TK[cc]};
+        if(pthread_create(&th[cc],NULL,ork_fbc_thread,&ar[cc])!=0){ e=1; break; } made++; }
+    for(int cc=0;cc<made;cc++){ pthread_join(th[cc],NULL); if(ar[cc].rc) e=1; }
+    return e?-1:0;
+}
 int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row_off,
                        const uint32_t *tiles, int rn, const int8_t *Apacked, const int8_t *Bpacked,
                        int32_t *Craw, int ncore, int iters, double *us){
     int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||Mtot<1||Mtot>256||(K%32)||(N%16)||!tiles||rn<108||rn>512) return -2;
     int dom=c->dom_active;
-    /* ncore accepted but CLAMPED TO 1: a single-submit multi-core fold (core_mask=0x7 + subcore-split, rkllm's
-     * task_number=36=12/core mechanism) HARD-WEDGES the RK3588 NPU in ork's setup — confirmed twice (P=3 one
-     * tile/core AND a full sweep both froze the board, single-core never did). ork's kernel/DRM path expects
-     * PER-CORE submits (core_mask=1u<<i), not one 0x7 ioctl; real 3-core needs concurrent per-core submits
-     * (mcworker-style) over the shared cube — a separate build. The group/subcore code below is kept (it drives
-     * correctly at nc=1 and is the skeleton for that future path). */
-    int nc = 1; (void)ncore; if(nc>P) nc=P;
-    /* per-core contiguous task groups: core g runs slots [gstart[g], gstart[g]+gsz[g]) as its own chain.
-     * Inactive cores (g>=nc) stay {0,0} and are excluded from core_mask (an empty subcore group wedges). */
+    /* nc CONCURRENT per-core submits (core_mask=1u<<c each, own task buffer) — the proven ork multi-core path.
+     * (The single-ioctl core_mask=0x7 + subcore-split, rkllm's mechanism, HARD-WEDGES ork's setup — see the
+     * 2026-07-30 Experiment Log; ork's kernel path wants per-core submits.) Never more cores than tiles. */
+    int nc = ncore>=3 ? 3 : (ncore==2 ? 2 : 1); if(nc>P) nc=P; if(nc>c->soc->cores) nc=c->soc->cores;
+    /* per-core contiguous task groups: core g runs tiles [gstart[g], gstart[g]+gsz[g]) as its own PC-chain */
     int gstart[3]={0,0,0}, gsz[3]={0,0,0};
     { int base=P/nc, rem=P%nc, s=0; for(int g=0;g<nc;g++){ gsz[g]=base+(g<rem?1:0); gstart[g]=s; s+=gsz[g]; } }
     size_t asz=(size_t)Mtot*K*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)Mtot*N*4*8+65536;
@@ -1190,14 +1207,15 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
     struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
     struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
     struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
-    /* OWN task buffer in `dom` (NOT c->task — that lives in the default domain; a submit with iommu_domain_id=dom
-     * referencing a default-domain task obj EINVALs when dom!=default, which is why fold_batch used to fail after
-     * the standard run path activated a domain). Matches how the multicore run path uses c->mtk[i] in dom_active. */
-    struct buf TK=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom); if(!TK.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC);return -2;}
+    /* one OWN task buffer PER CORE in `dom` (like the multicore run path's c->mtk[i]) — each holds its core's
+     * tasks from index 0, so each per-core submit uses subcore_task={0,gsz}. (Using c->task, which lives in the
+     * default domain, EINVALs when dom!=default.) */
+    struct buf TK[3]={{0}}; for(int g=0;g<nc;g++){ TK[g]=bcreate(fd,(size_t)(gsz[g]+2)*sizeof(struct rknpu_task),0x40b,dom);
+        if(!TK[g].cpu){ for(int q=0;q<g;q++) bdestroy(fd,&TK[q]); bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return -2; } }
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
     memcpy(A.cpu,Apacked,(size_t)Mtot*K); memcpy(B.cpu,Bpacked,(size_t)K*N);
     bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
-    uint32_t *rcbuf=(uint32_t*)RC.cpu; struct rknpu_task *tk=(struct rknpu_task*)TK.cpu;
+    uint32_t *rcbuf=(uint32_t*)RC.cpu;
     int ncopy = rn<REGCMD_I8_N ? rn : REGCMD_I8_N;
     for(int t=0;t<P;t++){
         uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
@@ -1208,34 +1226,30 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
         setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+roff));
         setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                           /* shared weight */
         setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma+roff));
-        /* chain WITHIN this tile's core-group; the last tile of each group is terminal */
-        int glast=0; for(int g=0;g<nc;g++) if(gsz[g] && t==gstart[g]+gsz[g]-1) glast=1;
+        /* which core-group owns this tile, and its local index */
+        int g=0; while(g<nc-1 && t>=gstart[g+1]) g++;
+        int j=t-gstart[g], glast=(t==gstart[g]+gsz[g]-1);
+        /* chain WITHIN the group; the last tile of each group is terminal */
         if(!glast){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
             rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
             rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
         } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
         memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
-        memset(&tk[t],0,sizeof tk[t]);
-        tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
-        tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
+        struct rknpu_task *tkg=(struct rknpu_task*)TK[g].cpu; memset(&tkg[j],0,sizeof tkg[j]);
+        tkg[j].enable_mask=0xd; tkg[j].int_mask=0x300; tkg[j].int_clear=0x1ffff;
+        tkg[j].regcfg_amount=108; tkg[j].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
     bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    uint32_t cmask=0; for(int g=0;g<nc;g++) cmask|=(1u<<g);        /* only cores that actually have a task group */
-    int ret=-1; struct rknpu_submit sub;
-    #define _FBSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=TK.obj; sub.core_mask=cmask; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
-        sub.subcore_task[0]=(struct rknpu_subcore_task){(uint32_t)gstart[0],(uint32_t)gsz[0]}; \
-        sub.subcore_task[1]=(struct rknpu_subcore_task){(uint32_t)gstart[1],(uint32_t)gsz[1]}; \
-        sub.subcore_task[2]=(struct rknpu_subcore_task){(uint32_t)gstart[2],(uint32_t)gsz[2]}; }while(0)
-    _FBSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto fbdone; }
+    for(int g=0;g<nc;g++) bsync(fd,&TK[g],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int ret=-1;
+    if(ork_fold_submit_all(fd,dom,TK,gsz,nc)) goto fbdone;                                       /* warm */
     bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Craw) memcpy(Craw,Cc.cpu,(size_t)Mtot*N*4);
-    { double t0=ork_now_us(); for(int i=0;i<iters;i++){ _FBSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto fbdone; } }
+    { double t0=ork_now_us(); for(int i=0;i<iters;i++){ if(ork_fold_submit_all(fd,dom,TK,gsz,nc)) goto fbdone; }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
-    #undef _FBSUB
 fbdone:
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC);bdestroy(fd,&TK); return ret;
+    for(int g=0;g<nc;g++) bdestroy(fd,&TK[g]);
+    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
 }
 #include "regcmd_fold_refs.h"
 /* #39 fold run-path helpers: build a size-m sub-tile from the baked template, patch its 4 M_total regs. */
