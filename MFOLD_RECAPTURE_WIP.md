@@ -267,6 +267,25 @@ tasks at K=3584 N=1216, 13 distinct output widths) with tools/re/analyze_schedul
   not P copies of one tile; OR a non-degraded board to isolate the single-core-identical-tile-chain wedge.
   Needs the full verbose per-task chain capture (mm_chain_*.txt), not just one tile.
 
+## (A) ACTUAL 21-task chain structure (2026-07-29) + why faithful replay is hard
+- rkllm's fold submit: task_number=21, flags=0x5, and subcore_task[0..2] each = {task_start, task_number=7}
+  -> 21 = 3 SUBCORES x 7 tasks. Three submits (core=0x4/0x1/0x2) share ONE task buffer (0xffff...095b4000).
+  So 21 is a TILE COUNT (3-way subcore split, 7 tiles/subcore), NOT a divisor of K*N or a fixed M-tile.
+- Per-task widths (0x102c) are HETEROGENEOUS, greedy largest-first + remainder tail:
+  36,36,36,24,20,20,16,16,14,10,10,8,8,6,6,4,4,4,1,1,1 (all full-K, DATA_ENTRIES=56*M). Widths drawn from a
+  HW-preferred set {1,4,6,8,10,14,16,20,24,36}. They tile the prefill's M_total rows.
+- BUT per-task A(0x1070)/C(0x4020) offsets are MOSTLY +0 with a few +576/+1152/+1728 — NOT a clean consecutive
+  row-partition. Many tasks read the SAME A base. So the exact per-task (rows,cols) tiling is NOT yet decoded;
+  faithful replay needs that mapping (it's not "tile t = rows [sum widths..])").
+- CHAIN WEDGE persists: my identical-M=8 chain (ork_npu_replay_i8_chain) hard-wedges at P=4 even after the
+  next-task-bleed fix AND matching run_chain_i8's subcore_task[0..2]={0,P}. ork's NORMAL multi-task chain works
+  on the same fresh boot, so it's the FOLD regcmd in a chain, not general degradation. Likely the identical-tile
+  chain violates the planner's cross-task CBUF/schedule coordination that rkllm's VARIED chain relies on.
+- FAITHFUL (b) = replay rkllm's ACTUAL 21 VARIED regcmds with the correct per-task A/C tiling + 3-subcore(7 each)
+  structure. Blocked by: (1) the per-task tiling is not decoded (murky A/C offsets); (2) this board wedges on
+  every fold chain (~23 cold-cycles in) so it can't be iterated/validated. Needs the exact tiling RE + a
+  non-degraded board. Recommend fresh HW; the single-tile capture-replay (609us, bit-exact) is the banked win.
+
 ## (A) NET STATE
 - WORKS: capture pipeline; rkllm's regcmd EXECUTES on ork with NO WEDGE (~640us) -> capture-replay mechanically
   viable; the historic wedges were ork's WRONG SYNTH, not the fold path.
