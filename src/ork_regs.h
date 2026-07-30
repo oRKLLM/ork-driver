@@ -154,7 +154,7 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_DPU_DST_N2]           = {0x1001, 0x4058, OKR_ANY,    "DPU_DST_N2",           "output N-1 (secondary)"},
     [RK_DPU_WDMA_SIZE_1]      = {0x1001, 0x405c, 0x1fff1fff, "DPU_WDMA_SIZE_1",      "write-DMA WIDTH_WDMA[12:0]/HEIGHT_WDMA[28:16] (-1 each)"},
     [RK_DPU_SURFACE_ADD]      = {0x1001, 0x40c0, OKR_ANY,    "DPU_SURFACE_ADD",      "output surface/element-size CONFIG (NOT an IOVA): 0x20 int8, 0x80 int32, 0x400 M-fold"},
-    [RK_PDP_OUT_M]            = {0x801, 0x3014, OKR_ANY,     "PDP_OUT_M",            "PDP/aux output M dim ((M-1)<<16)"},
+    [RK_PDP_OUT_M]            = {0x801, 0x3014, OKR_ANY,     "PDP_OUT_M",            "PDP/aux output M dim = M-1 (16-bit; verified M-1 not (M-1)<<16 from the M=8 capture)"},
     [RK_PDP_OUT_N]            = {0x801, 0x3018, OKR_ANY,     "PDP_OUT_N",            "PDP/aux output N dim (N-1)"},
     [RK_PC_NEXT_ADDR]         = {0x101, 0x0010, OKR_ANY,     "PC_NEXT_ADDR",         "PC next-regcmd IOVA for HW task chaining (0 = end of chain)"},
     [RK_PC_NEXT_AMOUNT]       = {0x101, 0x0014, OKR_ANY,     "PC_NEXT_AMOUNT",       "PC next-task register-write count = (n+3)/2"},

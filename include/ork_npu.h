@@ -720,9 +720,10 @@ int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
 int          ork_npu_mfold_chain_v(ork_npu *ctx, int P, const int *ws, int K, int N,
                                     const unsigned *tiles, int rn, const signed char *Apacked,
                                     const signed char *Bpacked, int *Craw, int wreuse, int iters, double *us);
-/* #39 Path-1 CANONICAL SDP/PPU state-setter: rewrite EVERY block-0x1001 (DPU/SDP output-stage) register in a
- * REGCMD_I8_N regcmd to its first-principles value (from the full-prefill invariant scan), leaving DST_BASE_ADDR
- * for the caller. Zero a proven fold tile's 0x1001 block, stamp, and the output stage is rebuilt from understood
+/* #39 Path-1 CANONICAL output-stage state-setter: rewrite EVERY output-stage register in a REGCMD_I8_N regcmd to
+ * its first-principles value (from the full-prefill invariant scan) — across BOTH output blocks 0x1001 (DPU/SDP)
+ * and 0x801 (PDP/aux output-dims mirror) — leaving DST_BASE_ADDR (the only output-stage IOVA) for the caller.
+ * Zero a proven fold tile's 0x1001+0x801 blocks, stamp, and the whole output stage is rebuilt from understood
  * values — the loader a delta-encoded big-M tile inherits. surfadd = 0x40c0 SURFACE_ADD (128*M matched small-M).
  * Returns the number of registers stamped, or <0 on bad args. */
 int          ork_npu_sdp_stamp(unsigned *rc, int rn, int M, int N, unsigned surfadd);

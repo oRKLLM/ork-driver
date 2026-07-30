@@ -1161,18 +1161,20 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
 vdone:
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
 }
-/* #39 Path-1 CANONICAL SDP/PPU STATE-SETTER. The full-prefill scan (tools/re full_sdp.py over pf.dump, 134,267
- * tiles) proved the DPU/SDP output stage (regcmd block 0x1001) is ONE invariant config for every int8 fold
- * matmul: every functional register holds a single value across ALL tiles, and only the geometry registers
- * (DST addr/stride, cube width, N-dims, SURFACE_ADD) vary with (M,N). sdp_canon() returns that first-principles
- * value for any 0x1001 register — no captured blob. ork_npu_sdp_stamp() rewrites the value of EVERY 0x1001
- * register present in a REGCMD_I8_N regcmd to its canonical value (leaving DST_BASE_ADDR 0x4020 for the caller's
- * C IOVA), so a proven-runnable fold skeleton whose 0x1001 block has been zeroed gets its ENTIRE output stage
- * rebuilt from understood values. This is the "state-setter" a delta-encoded, register-inheriting big-M tile
- * depends on (NVDLA register-file persistence). surfadd = 0x40c0 SURFACE_ADD (128*M for matched small-M tiles;
- * the burst-regime value for big-M, e.g. 0x3000 at M=36 — see full_sdp.py's 0x40c0-by-M histogram). */
+/* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
+ * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
+ * spread across TWO blocks: the DPU/SDP block 0x1001 AND the PDP/aux output-dims mirror block 0x801. In both,
+ * every functional register holds a single value across ALL tiles; only the geometry registers vary with (M,N).
+ * sdp_canon() returns that first-principles value for any 0x1001/0x801 register — no captured blob.
+ * ork_npu_sdp_stamp() rewrites the value of EVERY 0x1001/0x801 register present in a REGCMD_I8_N regcmd to its
+ * canonical value (leaving DST_BASE_ADDR 0x4020 for the caller's C IOVA — the only output-stage address), so a
+ * proven-runnable fold skeleton whose 0x1001+0x801 blocks are zeroed gets its ENTIRE output stage rebuilt from
+ * understood values. This is the "state-setter" a delta-encoded, register-inheriting big-M tile depends on (NVDLA
+ * register-file persistence). surfadd = 0x40c0 SURFACE_ADD (128*M for matched small-M tiles; the burst-regime
+ * value for big-M, e.g. 0x3000 at M=36 — see full_sdp.py's 0x40c0-by-M histogram). */
 static uint32_t sdp_canon(unsigned reg,int M,int N,uint32_t surfadd){
     switch(reg){
+        /* ── DPU/SDP output stage (block 0x1001) ── */
         case 0x4004: return 0xe;                                   /* DPU_S_POINTER */
         case 0x400c: return 0x1e4;                                 /* FEATURE_MODE_CFG */
         case 0x4010: return 0x80000000u;                           /* OUT_PRECISION: int32 accumulate-out (bit-31) */
@@ -1188,18 +1190,22 @@ static uint32_t sdp_canon(unsigned reg,int M,int N,uint32_t surfadd){
         case 0x4078: return 1;                                     /* EW_CVT_SCALE = 1 */
         case 0x4084: return 1;                                     /* OUT_CVT_SCALE = 1 (identity requant) */
         case 0x40c0: return surfadd;                               /* SURFACE_ADD (M-fold config) */
-        default:     return 0;   /* every other 0x1001 reg is invariant-0 across the whole prefill:
-                                  * 0x4014/4034/4038/4044/4048/404c/4054/4064/4068/406c/4074/407c/4080/4088/
-                                  * 4090/4094/4098-40ac/40c4/4100-412c */
+        /* ── PDP/aux output-dims mirror (block 0x801): const + (M,N) geometry, no IOVA ── */
+        case 0x3010: return 1;                                     /* PDP_R3010 (const 1) */
+        case 0x3014: return (uint32_t)(M-1);                       /* PDP_OUT_M = M-1 */
+        case 0x3018: return (uint32_t)(N-1);                       /* PDP_OUT_N = N-1 */
+        default:     return 0;   /* every other 0x1001/0x801 reg is invariant-0 across the whole prefill:
+                                  * 0x1001: 4014/4034/4038/4044/4048/404c/4054/4064/4068/406c/4074/407c/4080/4088/
+                                  *         4090/4094/4098-40ac/40c4/4100-412c ; 0x801: 301c/3030 */
     }
 }
 int ork_npu_sdp_stamp(uint32_t *rc,int rn,int M,int N,uint32_t surfadd){
     if(!rc||rn<108||M<1||M>4096||(N%16)) return -2;
     int nset=0;
     for(int k=0;k+1<rn;k+=2){ unsigned reg=rc[k]&0xffff, blk=(rc[k+1]>>16)&0xffff;
-        if(blk!=0x1001 || reg==0x4020) continue;                  /* skip DST_BASE_ADDR — caller writes the C IOVA */
+        if((blk!=0x1001 && blk!=0x801) || reg==0x4020) continue;  /* both output-stage blocks; skip C-IOVA DST_BASE_ADDR */
         uint32_t v=sdp_canon(reg,M,N,surfadd);
-        rc[k]=(reg)|((v&0xffff)<<16); rc[k+1]=(0x1001u<<16)|((v>>16)&0xffff);  /* unified 16-bit/wide encode (as setr) */
+        rc[k]=(reg)|((v&0xffff)<<16); rc[k+1]=(blk<<16)|((v>>16)&0xffff);  /* unified 16-bit/wide encode (as setr) */
         nset++; }
     return nset;
 }

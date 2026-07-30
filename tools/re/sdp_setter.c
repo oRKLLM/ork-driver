@@ -64,9 +64,9 @@ int main(int argc,char**argv){
     memcpy(syn,cap,sizeof cap);
     int zeroed=0;
     for(int k=0;k+1<232;k+=2){ unsigned blk=(syn[k+1]>>16)&0xffff;
-        if(blk==0x1001){ syn[k]&=0xffff; syn[k+1]&=0xffff0000u; zeroed++; } }   /* keep reg-id+blk, wipe value */
+        if(blk==0x1001||blk==0x801){ syn[k]&=0xffff; syn[k+1]&=0xffff0000u; zeroed++; } }  /* both output blocks; keep reg-id+blk, wipe value */
     int nset=ork_npu_sdp_stamp(syn,232,wl,N,0x400);                              /* 0x400 = 128*8 (matched M=8) */
-    printf("stamp: zeroed %d block-0x1001 pairs, sdp_stamp rewrote %d regs\n", zeroed, nset);
+    printf("stamp: zeroed %d output-stage pairs (0x1001 DPU/SDP + 0x801 PDP/aux), sdp_stamp rewrote %d regs\n", zeroed, nset);
     double us1=0; long mx1=0; long mm1=run1(c,syn,wl,K,N,A,W,&us1,&mx1);
     if(mm1<0){ printf("PROOF chain_v STALL/err (rc)\n"); ork_npu_free(c); return 1; }
     printf("SYNTH SDP (canonical):   %ld/%d mismatch maxerr=%ld  %.1f us  %s\n",
