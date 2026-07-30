@@ -727,12 +727,12 @@ int          ork_npu_mfold_chain_v(ork_npu *ctx, int P, const int *ws, int K, in
  * rkllm's real fold — a batch amortized over few big-M tiles. Returns 0/ok, us=avg submit. */
 int          ork_npu_fold_batch(ork_npu *ctx, int Mtot, int K, int N, int P, const int *row_off,
                                 const unsigned *tiles, int rn, const signed char *Apacked,
-                                const signed char *Bpacked, int *Craw, int iters, double *us);
+                                const signed char *Bpacked, int *Craw, int ncore, int iters, double *us);
 /* #39 FOLD MATMUL run-path: C[M,N] int32 = A[M,K] int8 x W[K,N] int8 via the token-fold (M<=128 tiled into
  * <=36-row sub-tiles, one shared-cube multi-task submit). Baked per-size templates => only K=FOLD_REF_K(3584),
  * N=FOLD_REF_N(1216), M<=128; returns -1 otherwise (caller keeps the standard path). A/W/Cout row-major. */
 int          ork_npu_fold_run_i8(ork_npu *ctx, int K, int N, const signed char *Wraw, int M,
-                                 const signed char *Araw, int *Cout, int iters, double *us);
+                                 const signed char *Araw, int *Cout, int ncore, int iters, double *us);
 /* #39 Path-1 CANONICAL output-stage state-setter: rewrite EVERY output-stage register in a REGCMD_I8_N regcmd to
  * its first-principles value (from the full-prefill invariant scan) — across BOTH output blocks 0x1001 (DPU/SDP)
  * and 0x801 (PDP/aux output-dims mirror) — leaving DST_BASE_ADDR (the only output-stage IOVA) for the caller.

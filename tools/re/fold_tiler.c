@@ -12,7 +12,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ork_npu.h"
-extern int ork_npu_fold_batch(ork_npu*,int,int,int,int,const int*,const unsigned*,int,const int8_t*,const int8_t*,int32_t*,int,double*);
+extern int ork_npu_fold_batch(ork_npu*,int,int,int,int,const int*,const unsigned*,int,const int8_t*,const int8_t*,int32_t*,int,int,double*);
 static uint32_t rng=0x9e37u; static int r7(void){ rng=rng*1664525u+1013904223u; return (int)((rng>>25)%7)-3; }
 static size_t nc16(int m,int c,int w){ return (size_t)(c/16)*((size_t)w*16)+(size_t)m*16+(c%16); }
 static size_t woff(int n,int k,int K){ int KT=(K+31)/32; return ((size_t)(n/32)*KT+(k/32))*1024+(size_t)(n%32)*32+(k%32); }
@@ -79,7 +79,8 @@ int main(int argc,char**argv){
     ork_npu_set_core_budget(c,1);
     { ork_w*ww=ork_mm_pack_i8(c,K,N,W); if(ww){int32_t*t=calloc((size_t)8*N,4);int8_t*a8=calloc((size_t)8*K,1);ork_mm_run_i8(c,ww,8,a8,t);free(t);free(a8);ork_mm_free(c,ww);} }
     double us=0;
-    int r=ork_npu_fold_batch(c,Mtot,K,N,P,roff,tiles,232,Ap,Wp,Craw,3,&us);
+    int ncore=getenv("ORK_FOLD_NCORE")?atoi(getenv("ORK_FOLD_NCORE")):1;
+    int r=ork_npu_fold_batch(c,Mtot,K,N,P,roff,tiles,232,Ap,Wp,Craw,ncore,3,&us);
     if(r){ printf("RESULT: fold_batch rc=%d (STALL/err)\n",r); ork_npu_free(c); return 1; }
     long mm=0,mx=0; for(int i=0;i<Mtot;i++)for(int n=0;n<N;n++){ int32_t got=Craw[c4(i,n,Mtot)],rf=ref[(size_t)i*N+n]; long e=labs((long)got-rf); if(e)mm++; if(e>mx)mx=e; }
     printf("RESULT M_total=%d: %ld/%d mismatch maxerr=%ld  %.1f us/submit (%d tiles, %.1f us/tile)  %s\n",
