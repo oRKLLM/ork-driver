@@ -562,6 +562,10 @@ test_fused_activation: tests/test_fused_activation.c $(COBJ)
 test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# #39 Path-1: canonical SDP/PPU state-setter proof (reconstruct block 0x1001 from first principles).
+sdp_setter: tools/re/sdp_setter.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

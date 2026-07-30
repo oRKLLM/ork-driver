@@ -1161,6 +1161,48 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
 vdone:
     bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
 }
+/* #39 Path-1 CANONICAL SDP/PPU STATE-SETTER. The full-prefill scan (tools/re full_sdp.py over pf.dump, 134,267
+ * tiles) proved the DPU/SDP output stage (regcmd block 0x1001) is ONE invariant config for every int8 fold
+ * matmul: every functional register holds a single value across ALL tiles, and only the geometry registers
+ * (DST addr/stride, cube width, N-dims, SURFACE_ADD) vary with (M,N). sdp_canon() returns that first-principles
+ * value for any 0x1001 register — no captured blob. ork_npu_sdp_stamp() rewrites the value of EVERY 0x1001
+ * register present in a REGCMD_I8_N regcmd to its canonical value (leaving DST_BASE_ADDR 0x4020 for the caller's
+ * C IOVA), so a proven-runnable fold skeleton whose 0x1001 block has been zeroed gets its ENTIRE output stage
+ * rebuilt from understood values. This is the "state-setter" a delta-encoded, register-inheriting big-M tile
+ * depends on (NVDLA register-file persistence). surfadd = 0x40c0 SURFACE_ADD (128*M for matched small-M tiles;
+ * the burst-regime value for big-M, e.g. 0x3000 at M=36 — see full_sdp.py's 0x40c0-by-M histogram). */
+static uint32_t sdp_canon(unsigned reg,int M,int N,uint32_t surfadd){
+    switch(reg){
+        case 0x4004: return 0xe;                                   /* DPU_S_POINTER */
+        case 0x400c: return 0x1e4;                                 /* FEATURE_MODE_CFG */
+        case 0x4010: return 0x80000000u;                           /* OUT_PRECISION: int32 accumulate-out (bit-31) */
+        case 0x4024: return (uint32_t)(16*M);                      /* DST_SURF_STRIDE = 16*M */
+        case 0x4030: return (uint32_t)(M-1);                       /* DATA_CUBE_WIDTH = M-1 */
+        case 0x403c: return ((uint32_t)(N-1)<<16)|(uint32_t)(N-1); /* DST_N_DIMS = ((s-1)<<16)|(N-1), s=N */
+        case 0x4040: return 0x53;                                  /* BS_CFG */
+        case 0x4050: return 0x7fc;                                 /* BS_OW_CFG (int32 output row byte-stride) */
+        case 0x4058: return (uint32_t)(N-1);                       /* DST_N2 = N-1 */
+        case 0x405c: return (uint32_t)(M-1);                       /* WDMA_SIZE_1 width = M-1 */
+        case 0x4060: return 0x53;                                  /* BN_CFG */
+        case 0x4070: return 0x383;                                 /* EW_CFG */
+        case 0x4078: return 1;                                     /* EW_CVT_SCALE = 1 */
+        case 0x4084: return 1;                                     /* OUT_CVT_SCALE = 1 (identity requant) */
+        case 0x40c0: return surfadd;                               /* SURFACE_ADD (M-fold config) */
+        default:     return 0;   /* every other 0x1001 reg is invariant-0 across the whole prefill:
+                                  * 0x4014/4034/4038/4044/4048/404c/4054/4064/4068/406c/4074/407c/4080/4088/
+                                  * 4090/4094/4098-40ac/40c4/4100-412c */
+    }
+}
+int ork_npu_sdp_stamp(uint32_t *rc,int rn,int M,int N,uint32_t surfadd){
+    if(!rc||rn<108||M<1||M>4096||(N%16)) return -2;
+    int nset=0;
+    for(int k=0;k+1<rn;k+=2){ unsigned reg=rc[k]&0xffff, blk=(rc[k+1]>>16)&0xffff;
+        if(blk!=0x1001 || reg==0x4020) continue;                  /* skip DST_BASE_ADDR — caller writes the C IOVA */
+        uint32_t v=sdp_canon(reg,M,N,surfadd);
+        rc[k]=(reg)|((v&0xffff)<<16); rc[k+1]=(0x1001u<<16)|((v>>16)&0xffff);  /* unified 16-bit/wide encode (as setr) */
+        nset++; }
+    return nset;
+}
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
     if(!c || outn < REGCMD_I8_N) return -2;
     if(getenv("ORK_MFOLD")){ synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }

@@ -720,6 +720,12 @@ int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
 int          ork_npu_mfold_chain_v(ork_npu *ctx, int P, const int *ws, int K, int N,
                                     const unsigned *tiles, int rn, const signed char *Apacked,
                                     const signed char *Bpacked, int *Craw, int wreuse, int iters, double *us);
+/* #39 Path-1 CANONICAL SDP/PPU state-setter: rewrite EVERY block-0x1001 (DPU/SDP output-stage) register in a
+ * REGCMD_I8_N regcmd to its first-principles value (from the full-prefill invariant scan), leaving DST_BASE_ADDR
+ * for the caller. Zero a proven fold tile's 0x1001 block, stamp, and the output stage is rebuilt from understood
+ * values — the loader a delta-encoded big-M tile inherits. surfadd = 0x40c0 SURFACE_ADD (128*M matched small-M).
+ * Returns the number of registers stamped, or <0 on bad args. */
+int          ork_npu_sdp_stamp(unsigned *rc, int rn, int M, int N, unsigned surfadd);
 
 /* On-NPU SiLU (int16 / w16a16i) — EXPERIMENTAL, not yet bit-exact. Runs the standalone int16 activation-LUT op,
  * but the int16 op's index-gain response to 0x4068 differs from the int8 op's (which is decoded), so the LUT
