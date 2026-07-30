@@ -91,6 +91,12 @@ static int reg_id(uint32_t blk, uint32_t off){
  */
 static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
     int unk_reg=0, unk_val=0, oob_mask=0;
+    /* Pre-scan the fold tile's M (0x102c) and primary feature-DMA burst (0x107c) so the CDMA schedule regs can be
+     * checked against the derived rules: burst 0x107c = min(4*M,128) for matched single-pass tiles (else it is a
+     * per-output-position prefetch on the large accumulate tiles), and stride 0x1080 = +/-(0x107c - M). */
+    int Mtile=0, curburst=0;   /* curburst tracks the MOST-RECENT 0x107c so 0x1080 pairs with ITS burst, not the first */
+    for(int k=0;k+1<n && k<216;k+=2){ uint32_t b=w[k+1]>>16, o=w[k]&0xffffu, v=w[k]>>16;
+        if(b==0x201 && o==0x102c && !Mtile) Mtile=(int)v; }
     for(int k=0;k+1<n;k+=2){
         uint32_t off=w[k]&0xffffu, blk=w[k+1]>>16;
         uint32_t val16=w[k]>>16, extra=w[k+1]&0xffffu;   /* w0 high = 16-bit value; w1 low = a SEPARATE mode/high field */
@@ -102,6 +108,7 @@ static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
         const ork_reg_desc *d=&ORK_REGS[id];
         int wide=is_wide(id);
         uint32_t val = wide ? (val16|(extra<<16)) : val16;   /* 16-bit regs: value=w0>>16; extra shown separately, NOT folded in */
+        if(id==RK_CNA_DMA_CON1) curburst=(int)val;           /* running burst: 0x1080 below pairs with the nearest preceding 0x107c */
         if(wide && is_signed(id)){
             uint32_t m=(d->mask==OKR_ANY)?0xffffffffu:d->mask, sb=(m>>1)+1;   /* sign bit = top set bit of the mask */
             long sv=(long)(val&m); if((val&m)&sb) sv-=(long)(sb<<1);
@@ -120,6 +127,17 @@ static int ork_regcmd_decode(const uint32_t *w, int n, FILE *out){
                 if(id==RK_CNA_CBUF_CON0) fprintf(out,"-> {data_bank=%u weight_bank=%u}", val&0xf, (val>>4)&0xf);
                 else                     fprintf(out,"-> {width=%u height=%u}", (val>>16)&0x7ff, val&0x7ff);
             } else if(is_addr(id)) fprintf(out,"[IOVA]");
+            else if(id==RK_CNA_DMA_CON1){          /* 0x107c feature-DMA burst: rule = min(4*M,128) for matched tiles */
+                if(Mtile>0){ int exp=4*Mtile>128?128:4*Mtile;
+                    if((int)val==exp) fprintf(out,"(feature DMA burst = 4*M = %d, MATCHED)", exp);
+                    else fprintf(out,"(feature DMA burst = %u; ANOMALY != 4*M(%d): large-tile per-output-position prefetch, cap 128)", val, exp); }
+                else fprintf(out,"(feature DMA burst)"); }
+            else if(id==RK_CNA_DMA_CON2){          /* 0x1080 signed surface stride: rule = +/-(0x107c - M) */
+                uint32_t m=(d->mask==OKR_ANY)?0xffffffffu:d->mask, sb=(m>>1)+1; long sv=(long)(val&m); if((val&m)&sb) sv-=(long)(sb<<1);
+                if(Mtile>0 && curburst>0 && (sv==(long)curburst-Mtile || sv==(long)Mtile-curburst)){
+                    if(sv==-3L*Mtile) fprintf(out,"(surface stride %ld = -3*M = -(0x107c-M) [burst=4*M])", sv);
+                    else              fprintf(out,"(surface stride %ld = %c(0x107c - M))", sv, sv>=0?'+':'-'); }
+                else fprintf(out,"(surface stride %ld; NOTE: != +/-(0x107c=%d - M=%d))", sv, curburst, Mtile); }
             else fprintf(out,"(computed/raw)");
         }
         if(d->mask!=OKR_ANY && (val & ~d->mask)){ fprintf(out,"  !! bits 0x%x outside field mask 0x%x", val & ~d->mask, d->mask); oob_mask++; }
