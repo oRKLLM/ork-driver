@@ -1003,3 +1003,7 @@ attn_decode_bench_probe: tools/attn_decode_bench_probe.c $(COBJ)
 
 kv_append_probe: tools/kv_append_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# capture librknnrt matmul regcmds (B resident, run xN) to prove whether the vendor reuses weight. RKNN_DIR + shim.
+rknn_reuse_cap: tools/re/rknn_reuse_cap.c
+	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< -L$(RKNN_DIR) -lrknnrt -lm
