@@ -86,7 +86,7 @@ static void row(long M, long K, long N, double ov, int overlap){
     res f  = fold_model(M, K, N, ov, overlap);
     res wd = ws_best(M, K, N, ov, 0, overlap);   /* DRAM accumulate (safe)      */
     res wc = ws_best(M, K, N, ov, 1, overlap);   /* on-chip accumulate (optim.) */
-    printf("  M=%-5ld ov=%2.0fus | fold %7.0fus (%5.1fMB %ld sub) | "
+    printf("  M=%-5ld ov=%4.1fus | fold %7.0fus (%5.1fMB %ld sub) | "
            "WS-dram %8.0fus (%5.1fMB %ld sub) x%.2f | WS-chip %8.0fus (%5.1fMB %ld sub) x%.2f  [chip Kt=%d Nt=%d Mt=%d]\n",
            M, ov, f.us, f.mb, f.sub,
            wd.us, wd.mb, wd.sub, f.us/wd.us,
@@ -97,7 +97,7 @@ int main(int argc, char**argv){
     long Ms[] = {128, 228, 512, 1024, 2048};
     /* per-tile cost (us): 1-2 ~ HW-chain task-transition (one submit, HW walks the chain);
      * 5-60 ~ individual ioctl/doorbell submits. The decisive unknown. */
-    double ovs[] = {0, 1, 2, 5, 7, 10, 30, 60};  /* 7 = MEASURED HW-chain transition (ws_xition_probe) */
+    double ovs[] = {0, 2, 4, 4.4, 7};  /* 4.4 = MEASURED HW-chain per-tile FLOOR (reuse, weight-DMA removed) */
     struct { long K, N; const char*name; } ops[] = {
         {3584, 1216, "fold-ref  (K=3584 N=1216, one N-slice)"},
         {3584, 3584, "ffn-down  (K=3584 N=3584, full op)"},

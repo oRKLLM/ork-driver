@@ -93,6 +93,9 @@ ws_xition_probe: tools/re/ws_xition_probe.c $(COBJ)
 chain_shape_probe: tools/re/chain_shape_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+chain_marginal_probe: tools/re/chain_marginal_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use:  make cdma_calib && ./cdma_calib   (exit 0 iff the standard model reproduces ork's layouts bit-exact)
