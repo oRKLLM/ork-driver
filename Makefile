@@ -570,6 +570,10 @@ sdp_setter: tools/re/sdp_setter.c $(COBJ)
 bigm_selfcontain: tools/re/bigm_selfcontain.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# #39 Path-1 CORRECTED: replay a real M=36 sub-tile faithfully (keep captured surfstr; size output for M_total).
+bigm_run: tools/re/bigm_run.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
