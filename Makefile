@@ -566,6 +566,10 @@ test_rsqrt_lut: tools/re/test_rsqrt_lut.c $(COBJ)
 sdp_setter: tools/re/sdp_setter.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# #39 Path-1: run a big-M fold tile STANDALONE by making it fully self-contained (append omitted regs + doorbell).
+bigm_selfcontain: tools/re/bigm_selfcontain.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # tools/re toolkit: IOMMU domain-switch probe + int4 CPU-reference check.
 dom_switch_probe: tools/re/dom_switch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
