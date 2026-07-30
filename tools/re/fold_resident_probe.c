@@ -53,6 +53,27 @@ int main(int argc,char**argv){
         }
         ork_mm_free(c,wn); ork_mm_free(c,wf); free(W); free(A); free(blob);
     }
+    /* ---- AUTO-ROUTE: a normally-packed q/o weight with a fold blob attached; ork_mm_run_i8 must self-select
+     * the fold at M<=64 and the normal path at M>64, both bit-exact vs a pure-normal reference weight. ---- */
+    { int N=3584; int8_t *W=malloc((size_t)K*N), *A=malloc((size_t)128*K);
+      for(size_t i=0;i<(size_t)K*N;i++) W[i]=r8(); for(size_t i=0;i<(size_t)128*K;i++) A[i]=r8();
+      ork_w *wref=ork_mm_pack_i8(c,K,N,W), *wrt=ork_mm_pack_i8(c,K,N,W);
+      size_t fb=ork_w_dump_fold_i8_cpu(c,K,N,W,NULL,0); void *blob=malloc(fb); ork_w_dump_fold_i8_cpu(c,K,N,W,blob,fb);
+      int at=ork_w_attach_fold_i8(c,wrt,blob,fb);
+      printf("\n== AUTO-ROUTE (N=3584): ork_mm_run_i8 self-select (attach rc=%d) ==\n", at);
+      int RM[]={32,128};
+      for(size_t j=0;j<sizeof RM/sizeof*RM;j++){ int M=RM[j];
+        int32_t *Cr=calloc((size_t)M*N,4), *Ce=calloc((size_t)M*N,4);
+        ork_mm_run_i8(c,wref,M,A,Ce); ork_mm_run_i8(c,wrt,M,A,Cr);
+        long mism=0; for(size_t e=0;e<(size_t)M*N;e++) if(Cr[e]!=Ce[e]){ mism++; }
+        double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,wrt,M,A,Cr);  double us=(now_us()-t0)/iters;
+        double t1=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,wref,M,A,Ce); double un=(now_us()-t1)/iters;
+        printf("  M=%-3d routed %8.1f us | normal %8.1f us | %.2fx  mism=%ld  (%s)\n",
+               M, us, un, un/us, mism, M<=64?"fold expected":"normal expected");
+        free(Cr); free(Ce);
+      }
+      ork_mm_free(c,wref); ork_mm_free(c,wrt); free(W); free(A); free(blob);
+    }
     printf("\nDONE\n");
     return 0;
 }

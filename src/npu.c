@@ -2718,6 +2718,24 @@ ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); }
     return w;
 }
+/* #39 attach a fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") to an EXISTING loaded/packed
+ * ork_w so ork_mm_run_i8 auto-routes small-M through the fold. Bfold bufs land in w->domain. 0 ok, <0 error.
+ * No-op (0) if already attached. Caller stores the fold blob only for the winning shapes (K=3584, wide q/o N). */
+int ork_w_attach_fold_i8(ork_npu *c, ork_w *w, const void *blob, size_t n){
+    if(!c||!w||w->K!=FOLD_REF_K||w->N<1||(w->N%32)) return -1;
+    if(w->Bfold) return 0;
+    const int NS=FOLD_REF_N; int nslice=(w->N+NS-1)/NS; if(nslice<1||nslice>64) return -1;
+    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; need+=pgup((size_t)w->K*sw);}
+    if(n!=need) return -1;
+    struct buf *bf=calloc(nslice,sizeof(struct buf)); if(!bf) return -2;
+    size_t off=0;
+    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; size_t tsz=pgup((size_t)w->K*sw);
+        bf[s]=bcreate(c->fd,tsz,0x403,w->domain);
+        if(!bf[s].cpu){ for(int i=0;i<s;i++)bdestroy(c->fd,&bf[i]); free(bf); return -2; }
+        memcpy(bf[s].cpu,(const char*)blob+off,tsz); off+=tsz;
+        bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE); }
+    w->Bfold=bf; w->fold_ns=nslice; return 0;
+}
 /* Zero-copy IMPORT variant of ork_mm_load_i8: each resident tile is a dma-buf the NPU reads in place
  * (PRIME import) instead of a MEM_CREATE-alloc'd buffer the blob is memcpy'd into. The bytes still get
  * written once (into the imported mmap) + synced once; the saving is the kernel page allocation, not
@@ -5918,6 +5936,17 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         for(size_t i=0;i<na;i++){ int8_t v=A[i]; if(v<amn)amn=v; if(v>amx)amx=v; if(v)anz++; }
         fprintf(stderr,"[RUN#%ld] i8 M=%d K=%d N=%d Sk=%d Sn=%d bf=%d | A[int8] min=%ld max=%ld nz=%ld/%zu head=[%d %d %d %d]\n",
             myn,M,w->K,w->N,w->Sk,w->Sn,w->Bf?1:0,amn,amx,anz,na,A[0],A[1],A[2],A[3]); fflush(stderr); }
+    /* #39 SELECTIVE mfold: a q/o-class weight (K=3584, wide N in <=3 slices) carrying a resident fold weight
+     * (orkpack Bfold) at SMALL M<=64 wins ~1.1-1.44x via the token-fold's compute-under-DMA overlap. Larger M
+     * and the FFN (gate/up N=18944) are DRAM-BW-bound (no win), and k/v (1 slice) has no N-parallelism — so
+     * auto-engage ONLY when Bfold is present (eligible shape), fold_ns is the 2-3 slice winning band, and M is
+     * in-envelope. This makes it ubatch-selective for free: small batches fold, large batches take normal. */
+    if(w->Bfold && w->fold_ns>=2 && w->fold_ns<=3 && M>=1 && M<=64 && !getenv("ORK_NOFOLD")){
+        double tf = g_ork_prof ? ork_now_us() : 0;
+        int rf = ork_npu_fold_run_w(c,w,M,(const int8_t*)A,C,0,NULL);
+        if(rf==0){ if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-tf; g_prof_i8_calls++; } return 0; }
+        /* fold declined (alloc/shape) — fall through to the normal path, no behavior change */
+    }
     double t0 = g_ork_prof ? ork_now_us() : 0;
     int r = run(c,w,M,A,C);
     if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; }
