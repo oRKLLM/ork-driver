@@ -59,6 +59,7 @@ static int is_addr(enum ork_reg_id id){ return id==RK_CNA_FEATURE_DATA_ADDR||id=
  *  only addresses + the provably-packed regs are wide. (Migrating this to a per-row flag in ork_regs.h is #40.) */
 static int is_wide(enum ork_reg_id id){
     return is_addr(id)
+        || id==RK_CNA_CONV_CON1                                 /* 0x100c: GROUP_LINE_OFF is bit 29 -> lives in the w1/extra half */
         || id==RK_CNA_DATA_SIZE0 || id==RK_CNA_DATA_SIZE0_MIR   /* (width<<16)|height */
         || id==RK_CNA_DATA_SIZE1                                /* ((K-1)<<16)|K */
         || id==RK_CNA_WEIGHT_SIZE0                              /* K*N bytes (exceeds 16 bits) */

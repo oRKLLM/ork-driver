@@ -263,12 +263,17 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
 /** @brief #RK_DPU_OUT_PRECISION (0x4010) = int32 accumulate-out datapath. */
 #define OKV_OUT_PREC_INT32     0x80000000u
 
-/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF bit (bit 29, per mainline rocket_registers.h). rkllm's
- *  big-M fold tasks (M=36,20) SET this; the small M=8 chain-tail tasks clear it. NOTE: this is NOT an
- *  "int32-output datapath" bit (an earlier mislabel) — precision lives in CONV_CON1[9:4] IN_PRECISION/
- *  PROC_PRECISION (int8 = 0). This bit selects the group-line-offset feature-read the M-fold uses. */
+/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF bit (bit 29, per mainline rocket_registers.h). It lives in
+ *  the w1/extra half of the reg-write, so 0x100c must be decoded WIDE. NOTE: not an "int32-output datapath" bit
+ *  (an earlier mislabel) — precision is CONV_CON1[9:4] (int8 = 0). RE finding (2026-07-30, full-register diff of
+ *  in-chain tiles): GROUP_LINE_OFF is the ONLY functional mode bit that differs between the big-M fold tiles that
+ *  DEPEND on resident weight (M=24/36, WEIGHT_BANK=8, cannot run standalone) and the small-M tiles that self-load
+ *  the full weight (WEIGHT_BANK=11) — the weight-DMA config regs (0x1110/0x1030/0x1034/0x1038/0x1088/0x1024) are
+ *  IDENTICAL in both. So GROUP_LINE_OFF is the prime suspect for the "reuse resident weight" (fold) mode; whether
+ *  it alone suppresses the weight re-DMA is UNPROVEN (needs a full-chain replay + timing to confirm). */
 #define OKV_CONV1_GROUP_LINE   0x20000000u
-/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF clear — the plain feature-read (M=8 chain-tail tasks). */
+/** @brief #RK_CNA_CONV_CON1 (0x100c) GROUP_LINE_OFF clear — the PLAIN feature-read: self-loads the full weight,
+ *  standalone-capable (all bit-exact standalone tiles, incl. the M=8 chain, use this — and re-DMA the weight). */
 #define OKV_CONV1_PLAIN        0x00000000u
 
 /** @brief #RK_DPU_SURFACE_ADD (0x40c0) = int8 element/surface size (CONFIG, not an IOVA). */
