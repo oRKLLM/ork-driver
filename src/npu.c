@@ -11456,6 +11456,22 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                 double el = ork_now_us() - pt; if (el > 3e6) break;
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
         bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        /* WIDE-K PARALLEL ACCUMULATE: sum this core's Sk [M,Ncore] partials into its C columns HERE, in this
+         * pool thread — matching mcworker's chain-ksplit (each core accumulates its own partials in parallel)
+         * instead of the SERIAL sum in ork_dyn_end (measured ~31ms serial vs ~13ms NPU submit on ffn_down =
+         * the whole doorbell-vs-mcworker wide-K gap). The blocking submit guarantees every partial has landed;
+         * the 3 cores write DISJOINT C column ranges (dst=C+c0), so no cross-core race. NEON int32 (bit-exact:
+         * integer add is associative). dst[i]=NULL => ork_dyn_end's copy-back skips this core. */
+        if (a->h->oSk[i] > 1 && a->h->dst[i]) {
+            int Me = a->h->oM[i] ? a->h->oM[i] : 1, Sk = a->h->oSk[i], no = a->h->nout[i], Nn = no/(Sk*Me);
+            size_t ds = a->h->ostride[i] > 0 ? (size_t)a->h->ostride[i] : (size_t)Nn, kstride = (size_t)Me*Nn;
+            const int32_t *src = (const int32_t*)a->h->outptr[i]; int32_t *d = a->h->dst[i];
+            for (int m = 0; m < Me; m++) { const int32_t *bs = src + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds; int n = 0;
+                for (; n+4 <= Nn; n += 4) { int32x4_t acc = vld1q_s32(bs+n);
+                    for (int ks = 1; ks < Sk; ks++) acc = vaddq_s32(acc, vld1q_s32(bs+(size_t)ks*kstride+n)); vst1q_s32(dr+n, acc); }
+                for (; n < Nn; n++) { int32_t acc = bs[n]; for (int ks = 1; ks < Sk; ks++) acc += bs[(size_t)ks*kstride+n]; dr[n] = acc; } }
+            a->h->dst[i] = NULL;   /* accumulated per-core; ork_dyn_end copy-back skips this i */
+        }
     }
     return NULL;
 }
