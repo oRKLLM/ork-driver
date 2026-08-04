@@ -10994,6 +10994,11 @@ struct ork_dyn_chain {
                                  * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
     int        ostride[1024];   /* per-op copy-back dst row stride (elements): >0 => end() writes [M, nout/M] scratch
                                  * to dst at this row stride (a column-slice of a wider C, colsplit M>1). 0 = contiguous. */
+    int        ocol0[1024];     /* colsplit balanced wide-N: this core's first C column (c0). With oscat, end()
+                                 * recomputes the within-slice segment widths from (ocol0, nout/oM, N, nmax). */
+    int8_t     oscat[1024];     /* 1 => balanced wide-N BOUNDARY-SCATTER copy-back: scratch is segment-major
+                                 * [M,segw] blocks (each program contiguous, no notch); end() scatters each segment
+                                 * to C[c0+coff .. ) at row-stride N, segment widths cut at nmax slice boundaries. */
     int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
     struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
     int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
@@ -11073,7 +11078,7 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
         __asm__ volatile("dc civac,%0"::"r"(&base[no-1]):"memory"); if (base[no-1]==ORK_DYN_SENT) return 0;   /* fast gate */
         for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
         return 1; }
-    if (M > 1 && Nx > NMAXd) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
+    if ((M > 1 && Nx > NMAXd) || h->oscat[i]) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
         * output's write-order over N is NOT reliably last-col-last (like the int4 int16 output above), so a
         * per-row-last-col poll fires before the whole block drains -> partial scatter -> non-deterministic
         * zeros. Poll the FULL surface: done only when EVERY scratch word is non-sentinel. */
@@ -11467,6 +11472,13 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < nc; i++) {
         int t0 = (int)((long)i * NN / nc), t1 = (int)((long)(i+1) * NN / nc), Ncore = (t1 - t0) * nt_sz, c0 = t0 * nt_sz;
+        /* BALANCED wide-N (Sn>1): each core owns the even ~N/nc contiguous column range [c0,c1) (t0=i*NN/nc,
+         * bit-exact to mcworker) — this keeps the per-core weight-DMA volume balanced (the wall-clock lever;
+         * a whole-slice-per-core split imbalanced it 8192/8192/2560 and cost 1.3x). The range can CROSS an
+         * nmax slice boundary; the base emission below cuts it into within-slice segments, each written to a
+         * SEGMENT-MAJOR contiguous scratch block (synth stride=0 => no notch), and end() BOUNDARY-SCATTERS the
+         * blocks to C[c0..c1) at row-stride N (h->oscat). Balanced AND notch-free — the two levers the
+         * descriptor-array dump pinned as the mcworker-vs-doorbell gap (2026-08-03). */
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         if ((size_t)M * K > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
@@ -11474,7 +11486,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         size_t osz = (size_t)M * Ncore * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
-        struct buf *CC = &c->mcc[i]; int c1 = t1 * nt_sz;
+        struct buf *CC = &c->mcc[i];
         if (K > 4096) {   /* WIDE-K colsplit (ffn_down; Sn==1, ANY M): per-core K-split — Sk*(M-tile) partial
             * [mc,Ncore] programs over this core's column range; end() SUMS the Sk [M,Ncore] partials into
             * C[c0:c1) at row-stride N (ork_dyn_end oSk accumulate, [ks][m][n] layout). M>1: A's K-slice rows are
@@ -11521,26 +11533,27 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np2};
             continue;
         }
-        int np = 0;   /* programs for this core: (M-tile x overlapping N-slice) */
-        /* This core owns the CONTIGUOUS column range [c0,c1) of C. Wide-N (Sn>1): that range can span several
-         * N-slices, so emit one program per overlapping slice (its column sub-range), writing into the core's
-         * [M,Ncore] scratch at the right column offset (row-stride Ncore via synth stride). Because the range
-         * is contiguous in C, end() copies the whole [M,Ncore] to C[c0:c1) as one strided block. */
-        for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
-            for (int ns = 0; ns < w->Sn; ns++) {
-                int sl0 = ns * NMAX_C, slNc = (N - sl0 < NMAX_C) ? (N - sl0) : NMAX_C, sl1 = sl0 + slNc;
-                int ov0 = c0 > sl0 ? c0 : sl0, ov1 = c1 < sl1 ? c1 : sl1;   /* overlap of [c0,c1) with slice ns */
-                if (ov1 <= ov0) continue;
-                int Ncol = ov1 - ov0, inslice = ov0 - sl0, scol = ov0 - c0;   /* cols from this slice; offset in slice; offset in scratch */
-                if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
-                uint32_t wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(inslice / nt_sz) * K * nt_sz);   /* column-tile offset within slice ns */
-                memset(rc, 0, sizeof rc);
-                synth_i8(rc, mc, K, Ncol, adma + (uint32_t)((size_t)m0 * K), wbase,
-                         (uint32_t)(CC->dma + ((size_t)m0 * Ncore + scol) * 4), 1, CBUF, Ncore);   /* rows [m0,m0+mc) x cols [scol,scol+Ncol) of [M,Ncore] */
-                if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
-                memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
-                np++;
-            }
+        int np = 0, nseg = 0;   /* programs for this core: (within-slice SEGMENT x M-tile), segment-major scratch */
+        /* This core owns the CONTIGUOUS column range [c0,c1) of C, which may CROSS nmax slice boundaries. Cut it
+         * into within-slice segments; lay the scratch SEGMENT-MAJOR ([M,segw] blocks back-to-back) and write each
+         * program contiguously (synth stride=0 => Ncol==row-stride, NO notch). Balanced (even [c0,c1)) + notch-free.
+         * end() boundary-scatters each block to its C column sub-range at row-stride N (h->oscat, using h->ocol0). */
+        { int c1e = c0 + Ncore; size_t segbase = 0; int cur = c0;
+          while (cur < c1e) {
+              int ns = cur / NMAX_C, sl1 = (ns + 1) * NMAX_C; if (sl1 > N) sl1 = N;
+              int segend = (c1e < sl1) ? c1e : sl1, segw = segend - cur, is0 = cur - ns * NMAX_C;
+              uint32_t wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(is0 / nt_sz) * K * nt_sz);   /* slice ns, in-slice col offset */
+              for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+                  if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+                  memset(rc, 0, sizeof rc);
+                  synth_i8(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
+                           (uint32_t)(CC->dma + (segbase + (size_t)m0 * segw) * 4), 1, CBUF, 0);   /* [mc,segw] contiguous block */
+                  if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                  memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+                  np++;
+              }
+              segbase += (size_t)M * segw; cur = segend; nseg++;
+          }
         }
         for (int p = 0; p < np; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
             if (p < np - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
@@ -11549,7 +11562,11 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
             tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
         h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = M * Ncore; h->oM[i] = M; h->oSk[i] = 0;
-        h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = (M > 1) ? N : 0;   /* strided col copy-back for M>1 */
+        h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N; h->ocol0[i] = c0;
+        h->oscat[i] = (nseg > 1);   /* boundary-scatter ONLY when the balanced range crosses a slice boundary (>=2 segments);
+            * a single-segment core (all base Sn==1, incl. attention) is a plain contiguous [M,Ncore] block -> keep the
+            * cheap per-row-last-col done + ostride copy-back (oscat=0). Setting oscat unconditionally forced the
+            * pathological full-surface poll on the base path and tanked native attention 73->13. */
         Pc[i] = np;
         memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np; subs[i].task_obj_addr = c->mtk[i].obj;
@@ -11570,6 +11587,14 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
      * 3s cap -> recover-resubmit stall (measured ~10 t/s on ffn_down). The per-op full flush is small vs the
      * wide K-split/scatter compute. Plain base (Sn==1,K<=4096,M>64) keeps the cheap last-col seed. */
     int hardened = (M <= 64) || (w->K > 4096) || (w->Sn > 1);
+    /* STAGE 2: the PARALLEL path submits BLOCKING (ork_csub_worker clears the nonblock bit) + sets prepolled, so
+     * completion = the blocking ioctl return + bsync FROM_DEVICE — the full-surface SENT seed is NEVER polled
+     * there (pure waste: O(M*Ncore) CPU writes/core, the doorbell-specific wide-N host tax native doesn't pay).
+     * Skip it and use cold-only clean-before (hardened_w=0). The NONBLOCK path (no PARALLEL, or COLSPLIT_NB)
+     * still seeds + polls sentinels, so it keeps the full-surface seed + hardened clean-before. */
+    int parallel_blocking = (nc > 1 && getenv("ORK_COLSPLIT_PARALLEL") && !getenv("ORK_COLSPLIT_NB"));
+    int hardened_w = parallel_blocking ? 0 : hardened;
+    if (!parallel_blocking)
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
@@ -11577,7 +11602,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     __asm__ volatile("dsb ish":::"memory");
     if (nc > 1 && getenv("ORK_COLSPLIT_PARALLEL")) {   /* per-core submit + O(1) poll on own pool thread (ork_csub_worker) */
         struct ork_csub cs[ORK_MAXCORE];
-        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened, Pc[i] != 0 };
+        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0 };
         npu_pool_ensure(c);
         pthread_mutex_lock(&c->pmu); c->pjob = cs; c->pjob_nc = nc; c->pjob_fn = ork_csub_worker;
         c->pjob_stride = sizeof(struct ork_csub); c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
@@ -12382,10 +12407,30 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
                 for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
                     int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
                     d[(size_t)m * ds + n] = (int32_t)acc; } }
-            else { const int32_t *src = (const int32_t*)h->outptr[i];
-                for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
-                    int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
-                    d[(size_t)m * ds + n] = (int32_t)acc; } }
+            else { const int32_t *src = (const int32_t*)h->outptr[i];   /* colsplit wide-K int8: sum Sk int32 partials.
+                * NEON over n (4-wide): integer add is associative + wraps mod 2^32 identically to the scalar
+                * (int32_t)int64_acc, so BIT-EXACT. Row m of partial ks lives at src[ks*Me*Nn + m*Nn]. */
+                const size_t kstride = (size_t)Me * Nn;
+                for (int m = 0; m < Me; m++) {
+                    const int32_t *base = src + (size_t)m * Nn; int32_t *dr = d + (size_t)m * ds; int n = 0;
+                    for (; n + 4 <= Nn; n += 4) {
+                        int32x4_t acc = vld1q_s32(base + n);
+                        for (int ks = 1; ks < Sk; ks++) acc = vaddq_s32(acc, vld1q_s32(base + (size_t)ks * kstride + n));
+                        vst1q_s32(dr + n, acc); }
+                    for (; n < Nn; n++) { int32_t acc = base[n]; for (int ks = 1; ks < Sk; ks++) acc += base[(size_t)ks * kstride + n]; dr[n] = acc; } }
+            }
+        }
+        else if (h->oscat[i]) {   /* BOUNDARY-SCATTER (balanced wide-N): scratch is segment-major [M,segw] blocks
+            * (each program wrote contiguously => no notch). Place each block into C at its column sub-range,
+            * cutting [c0,c0+Ne) at nmax slice boundaries — the exact inverse of begin_colsplit's emission. */
+            const int32_t *src = (const int32_t*)h->outptr[i]; int32_t *d = h->dst[i];   /* d = C + c0 */
+            int c0 = h->ocol0[i]; size_t blk = 0; int cur = c0, coff = 0;
+            while (coff < Ne) {
+                int ns = cur / NMAXe, sl1 = (ns + 1) * NMAXe; if (sl1 > h->N) sl1 = h->N;
+                int segend = (c0 + Ne < sl1) ? (c0 + Ne) : sl1, segw = segend - cur;
+                for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * h->ostride[i] + coff], &src[blk + (size_t)m * segw], (size_t)segw * 4);
+                blk += (size_t)Me * segw; coff += segw; cur = segend;
+            }
         }
         else
         /* SCATTER (M>1 wide-N): the scratch holds Sn contiguous [M,Nc] slice blocks; place each block into
