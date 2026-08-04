@@ -5154,6 +5154,11 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     if(x->setdt) c->last_dt=to;
     return 1;
 }
+/* fp16 multicore matmul (Sn==1) rides the doorbell colsplit (bit-exact vs single-core/mcworker; beats mcworker
+ * 1.08-1.4x on all shapes — validated test_f16colsplit). DEFAULT ON; ORK_F16_COLSPLIT=0 reverts to blocking mcworker. */
+static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):1;} return v; }
+static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
+static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     const double ts=ork_now_us();
@@ -5197,6 +5202,16 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         return ORK_RC_WEDGE_PRONE;
       }
       /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2) {
+        /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
+         * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
+         * touch). h==NULL (ineligible / buffers too small) FALLS BACK to the mcworker path below. */
+        ork_install_term();
+        ork_mm_task_i8 tf = { .w = w, .M = M, .A = (const int8_t*)A, .C = (int32_t*)C };
+        int ncf = nc; if (ncf > c->soc->cores) ncf = c->soc->cores;
+        ork_dyn_chain *h = ork_dyn_begin_colsplit(c, &tf, ncf);
+        if (h) return ork_dyn_end(h) < 0 ? -1 : 0;
+    }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
 
@@ -11455,6 +11470,14 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                 }
                 double el = ork_now_us() - pt; if (el > 3e6) break;
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
+        else if (a->h->mc_dt == DT_F16 && a->h->oSk[i] > 1) {   /* fp16 K-split: the BLOCKING submit's completion can
+            * precede the f32 writeback DRAIN (~4% intermittent stale partial -> the host accumulate misses one slice
+            * -> maxerr ~= a slice's magnitude). Full-surface civac VERIFY the seeded-SENT surface before accumulating,
+            * same guard int8 uses for its interleaved-decode surface. Needs the SENT seed + clean-before (fp16_hard). */
+            volatile int32_t *o = (volatile int32_t*)a->h->outptr[i]; int no = a->h->nout[i]; double pt = ork_now_us();
+            for (;;) { int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
+                if (all) break; double el = ork_now_us() - pt; if (el > 3e6) break; if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        }
         bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         /* WIDE-K PARALLEL ACCUMULATE: sum this core's Sk [M,Ncore] partials into its C columns HERE, in this
          * pool thread — matching mcworker's chain-ksplit (each core accumulates its own partials in parallel)
@@ -11465,17 +11488,28 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
         if (a->h->oSk[i] > 1 && a->h->dst[i]) {
             int Me = a->h->oM[i] ? a->h->oM[i] : 1, Sk = a->h->oSk[i], no = a->h->nout[i], Nn = no/(Sk*Me);
             size_t ds = a->h->ostride[i] > 0 ? (size_t)a->h->ostride[i] : (size_t)Nn, kstride = (size_t)Me*Nn;
-            const int32_t *src = (const int32_t*)a->h->outptr[i]; int32_t *d = a->h->dst[i];
             /* ks-OUTER (cache-friendly, like mcworker's chain-ksplit accumulate): read each K-slice partial
              * CONTIGUOUSLY and accumulate into the small C column block (stays hot in cache across the Sk
              * passes). The prior (m,n)-outer/ks-inner order scattered every element's reads across Sk
-             * partials 1.2MB apart -> cache/TLB thrash (measured ~8-10ms vs ~2ms). Bit-exact (int add assoc). */
-            for (int m = 0; m < Me; m++) { const int32_t *bs = src + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds;
-                for (int n = 0; n < Nn; n++) dr[n] = bs[n]; }   /* ks=0 init */
-            for (int ks = 1; ks < Sk; ks++) { const int32_t *sk = src + (size_t)ks*kstride;
-                for (int m = 0; m < Me; m++) { const int32_t *bs = sk + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds; int n = 0;
-                    for (; n+4 <= Nn; n += 4) vst1q_s32(dr+n, vaddq_s32(vld1q_s32(dr+n), vld1q_s32(bs+n)));
-                    for (; n < Nn; n++) dr[n] += bs[n]; } }
+             * partials 1.2MB apart -> cache/TLB thrash (measured ~8-10ms vs ~2ms). Bit-exact (int add assoc;
+             * fp16 f32-add order matches mcworker's ks-ascending sum lane-for-lane). */
+            if (a->h->mc_dt == DT_F16) {   /* fp16: f32 partials + f32 accumulate (Stage 1) */
+                const float *src = (const float*)a->h->outptr[i]; float *d = (float*)a->h->dst[i];
+                for (int m = 0; m < Me; m++) { const float *bs = src + (size_t)m*Nn; float *dr = d + (size_t)m*ds;
+                    for (int n = 0; n < Nn; n++) dr[n] = bs[n]; }   /* ks=0 init */
+                for (int ks = 1; ks < Sk; ks++) { const float *sk = src + (size_t)ks*kstride;
+                    for (int m = 0; m < Me; m++) { const float *bs = sk + (size_t)m*Nn; float *dr = d + (size_t)m*ds; int n = 0;
+                        for (; n+4 <= Nn; n += 4) vst1q_f32(dr+n, vaddq_f32(vld1q_f32(dr+n), vld1q_f32(bs+n)));
+                        for (; n < Nn; n++) dr[n] += bs[n]; } }
+            } else {
+                const int32_t *src = (const int32_t*)a->h->outptr[i]; int32_t *d = a->h->dst[i];
+                for (int m = 0; m < Me; m++) { const int32_t *bs = src + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds;
+                    for (int n = 0; n < Nn; n++) dr[n] = bs[n]; }   /* ks=0 init */
+                for (int ks = 1; ks < Sk; ks++) { const int32_t *sk = src + (size_t)ks*kstride;
+                    for (int m = 0; m < Me; m++) { const int32_t *bs = sk + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds; int n = 0;
+                        for (; n+4 <= Nn; n += 4) vst1q_s32(dr+n, vaddq_s32(vld1q_s32(dr+n), vld1q_s32(bs+n)));
+                        for (; n < Nn; n++) dr[n] += bs[n]; } }
+            }
             a->h->dst[i] = NULL;   /* accumulated per-core; ork_dyn_end copy-back skips this i */
         }
     }
@@ -11483,13 +11517,15 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
 }
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
-    int nt_sz = 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col tiles 32 wide; mcap rows/program; NMAX_C = N-slice width */
+    int dt = w->dtype;   /* DT_I8 today; fp16/int4 branches keyed on this (Stage 0: dt==DT_I8 == byte-identical) */
+    int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     if (mc_ensure(c, nc)) return NULL;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
+    h->mc_dt = dt;   /* set EARLY: ork_csub_worker (runs before the tail below) reads it for the accumulate dtype */
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < nc; i++) {
@@ -11503,7 +11539,66 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
          * descriptor-array dump pinned as the mcworker-vs-doorbell gap (2026-08-03). */
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
-        if ((size_t)M * K > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
+        size_t aesz = (dt == DT_F16) ? 2 : 1;   /* A element bytes: fp16 2, int8 1 */
+        if ((size_t)M * K * aesz > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
+        if (dt == DT_F16) {   /* fp16 colsplit (Stage 1): K-sliced Bb + host f32 accumulate; Sn==1 (gated). Mirrors the
+            * int8 WIDE-K branch with synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
+            * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only synth()+Bb+dtype differ). */
+            int CBUFf = (CBUF > 32768) ? 32768 : CBUF;   /* fp16 M-scheduler is validated only to the 32768-tile; a larger cbuf miscomputes mc>~cap (mcworker applies the same cap) */
+            int KS = c->soc->ks, RBf = CBUFf;   /* fp16: RB = cbuf (int8 doubles it) */
+            struct rknpu_task *tkf = (struct rknpu_task*)c->mtk[i].cpu;
+            size_t ksz = (size_t)w->Sk * M * Ncore * 4;   /* Sk f32 partials [ks][M][Ncore] */
+            if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
+                if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; }
+            struct buf *CC = &c->mcc[i];
+            /* pre-grow mrc/mtk for this core: fp16 chunks are small (<=8 @ K>=2048) => Sk*ceil(M/chunk) programs.
+             * bound generously (512); tkf re-fetched after any grow. */
+            size_t needrc = (size_t)512 * REGCMD_N * 4, needtk = (size_t)512 * sizeof(struct rknpu_task);
+            if (RC->size < needrc) { bdestroy(fd, &c->mrc[i]); c->mrc[i] = bcreate(fd, needrc, 0x403, c->dom_active);
+                if (!c->mrc[i].cpu) { free(h); return NULL; } RC = &c->mrc[i]; c->mwarm[i] = 0; }
+            if (c->mtk[i].size < needtk) { bdestroy(fd, &c->mtk[i]); c->mtk[i] = bcreate(fd, needtk, 0x40b, c->dom_active);
+                if (!c->mtk[i].cpu) { free(h); return NULL; } tkf = (struct rknpu_task*)c->mtk[i].cpu; }
+            struct buf *AFS = &c->maf[0];   /* gather A ONCE (shared, read-only across cores): fp16 [Sk][M][Kp] */
+            if (i == 0) { f16 *afg = (f16*)AFS->cpu; const f16 *Af = (const f16*)t->A; size_t goff = 0;
+              for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+                  for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, Af + (size_t)m*K + k0, (size_t)Kp*2);   /* per-row memcpy (== int8 wide-K gather); Sk==1 => contiguous. Scalar j-loop was a big fixed cost on low-M shapes. */
+                  goff += (size_t)M*Kp; }
+              bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+            uint32_t a_base = (uint32_t)AFS->dma;
+            int np2 = 0; size_t goff = 0;
+            for (int ks = 0; ks < w->Sk; ks++) {
+                int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+                int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);   /* fp16 sched window (NO HISCHED here) */
+                int R = RBf/Kp; if (R<1) R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+                double scale=(double)Kp/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
+                int kcap = mg_max*64; if(!sched) kcap=(RBf/2)/Kp; if(kcap<4*R) kcap=sched?4*R:((RBf/2)/Kp); if(kcap<1) kcap=1;   /* fp16 M-tile cap — NEVER raise: >cap miscomputes (npu.c ~4770) */
+                uint32_t wbase = (uint32_t)(w->Bb[ks].dma + (uint64_t)t0 * Kp * 32);   /* Sn==1: Bb[ks], N-tile stride Kp*32 (== mcworker) */
+                for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
+                    if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }
+                    memset(rc, 0, REGCMD_N * 4);
+                    synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + (goff + (size_t)m0*Kp)*2), wbase,
+                          (uint32_t)(CC->dma + ((size_t)ks*M + m0)*Ncore*4), sched, CBUFf);
+                    if (validate_regcmd("ork_dyn_colsplit_f16", c, rc, REGCMD_N, w, NULL, 0)) { free(h); return NULL; }
+                    memcpy((char*)RC->cpu + (size_t)np2*REGCMD_N*4, rc, REGCMD_N*4);
+                    np2++;
+                }
+                goff += (size_t)M*Kp;
+            }
+            for (int p = 0; p < np2; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p*REGCMD_N*4);
+                if (p < np2-1) { uint64_t nx = RC->dma + (size_t)(p+1)*REGCMD_N*4;
+                    pr[216] = 0x0010 | ((nx & 0xffff) << 16); pr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    pr[218] = 0x0014 | (0x0037u << 16);       pr[219] = (0x0101 << 16); }
+                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p*REGCMD_N*4; tkf[p] = tt; }
+            h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
+            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* f32 accumulate/copy-back -> C columns at row-stride N */
+            Pc[i] = np2;
+            memset(&subs[i], 0, sizeof subs[i]);
+            subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;
+            subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+            subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np2};
+            continue;
+        }
         uint32_t adma = (uint32_t)AF->dma;
         if (K <= 4096) memcpy(AF->cpu, t->A, (size_t)M * K);   /* full A[M,K] for base/wide-N. WIDE-K (K>4096) re-gathers A into AF as [Sk][M][Kp] below, so this full copy would be pure waste there — skip it. */
         size_t osz = (size_t)M * Ncore * 4;
@@ -11615,15 +11710,19 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
      * last-col-last. Without this the M>64 last-col seed mismatches the full-surface poll -> completion misses ->
      * 3s cap -> recover-resubmit stall (measured ~10 t/s on ffn_down). The per-op full flush is small vs the
      * wide K-split/scatter compute. Plain base (Sn==1,K<=4096,M>64) keeps the cheap last-col seed. */
-    int hardened = (M <= 64) || (w->K > 4096) || (w->Sn > 1);
+    int hardened = (M <= 64) || (w->K > 4096) || (w->Sn > 1) || (dt == DT_F16 && w->Sk > 1);   /* fp16 K-split partials: write-order not last-col-last => full-surface seed (NONBLOCK path only) */
     /* STAGE 2: the PARALLEL path submits BLOCKING (ork_csub_worker clears the nonblock bit) + sets prepolled, so
      * completion = the blocking ioctl return + bsync FROM_DEVICE — the full-surface SENT seed is NEVER polled
      * there (pure waste: O(M*Ncore) CPU writes/core, the doorbell-specific wide-N host tax native doesn't pay).
      * Skip it and use cold-only clean-before (hardened_w=0). The NONBLOCK path (no PARALLEL, or COLSPLIT_NB)
      * still seeds + polls sentinels, so it keeps the full-surface seed + hardened clean-before. */
     int parallel_blocking = (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL") && !getenv("ORK_COLSPLIT_NB"));
-    int hardened_w = parallel_blocking ? 0 : hardened;
-    if (!parallel_blocking)
+    /* fp16 K-split: the blocking submit's completion can precede the f32 writeback drain, so ork_csub_worker
+     * runs a full-surface civac VERIFY even on the parallel-blocking path. That verify needs the SENT seed
+     * flushed to DRAM first -> seed the surface AND force the clean-before (hardened_w=1) for fp16 here. */
+    int fp16_hard = (dt == DT_F16 && w->Sk > 1);
+    int hardened_w = parallel_blocking ? (fp16_hard ? 1 : 0) : hardened;
+    if (!parallel_blocking || fp16_hard)
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
@@ -11652,7 +11751,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     /* Stash the round context so ork_dyn_end recovers a dropped colsplit round (the M=1 int8 decode path also
      * hits the ~1/2000 doorbell-drop: one core's N-column slice never lands, leaving its re-seeded sentinel
      * column = SENT). colsplit is int8-only; hardened (M<=64) = full-surface seed, matching mc_recover_resubmit. */
-    h->mc_nc = nc; h->mc_dt = DT_I8; h->mc_dom = w->domain; h->mc_seed_all = hardened;
+    h->mc_nc = nc; h->mc_dt = dt; h->mc_dom = w->domain; h->mc_seed_all = hardened;   /* mc_dt: I8 recover; fp16 (Stage 1) => recov_max 0 (drains in-submit) */
     for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
     return h;
 }
@@ -11670,6 +11769,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
       int c_wideK = ci8 && cw->Sn == 1 && cw->K > 4096;             /* any M: colsplit wide-K M-tiles the K-slice programs */
       (void)cM;
       if (S == 1 && nc > 1 && (c_base || c_wideN || c_wideK)) return ork_dyn_begin_colsplit(c, &tasks[0], nc); }
+      /* fp16 colsplit is routed ONLY from run_multicore (which falls back to mcworker on NULL) — NOT here, so
+       * direct ork_dyn_begin_mc callers (e.g. the SSM stream/pool fp16 path) keep their pre-Stage-1 behavior. */
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
     if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
@@ -12432,7 +12533,14 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         if (h->oSk[i] > 1) {
             int Sk = h->oSk[i], Nn = no / (Sk * Me); int32_t *d = h->dst[i];
             size_t ds = h->ostride[i] > 0 ? (size_t)h->ostride[i] : (size_t)Nn;   /* colsplit wide-K: land the summed [M,Ncore] in C's columns at row-stride N */
-            if (h->esz == 2) { const int16_t *src = (const int16_t*)h->outptr[i];
+            if (h->mc_dt == DT_F16) { const float *src = (const float*)h->outptr[i]; float *df = (float*)d;   /* colsplit wide-K fp16: sum Sk f32 partials (serial path; the parallel path sums in ork_csub_worker). ks-ascending == mcworker, bit-exact. */
+                const size_t kstride = (size_t)Me * Nn;
+                for (int m = 0; m < Me; m++) { const float *base = src + (size_t)m * Nn; float *dr = df + (size_t)m * ds; int n = 0;
+                    for (; n + 4 <= Nn; n += 4) { float32x4_t acc = vld1q_f32(base + n);
+                        for (int ks = 1; ks < Sk; ks++) acc = vaddq_f32(acc, vld1q_f32(base + (size_t)ks * kstride + n));
+                        vst1q_f32(dr + n, acc); }
+                    for (; n < Nn; n++) { float acc = base[n]; for (int ks = 1; ks < Sk; ks++) acc += base[(size_t)ks * kstride + n]; dr[n] = acc; } } }
+            else if (h->esz == 2) { const int16_t *src = (const int16_t*)h->outptr[i];
                 for (int m = 0; m < Me; m++) for (int n = 0; n < Nn; n++) {
                     int64_t acc = 0; for (int ks = 0; ks < Sk; ks++) acc += src[(size_t)ks * Me * Nn + (size_t)m * Nn + n];
                     d[(size_t)m * ds + n] = (int32_t)acc; } }
