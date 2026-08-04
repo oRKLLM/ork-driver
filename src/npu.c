@@ -11432,7 +11432,8 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
 struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; };
 static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
     if (a->active) {
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        if (a->h->oSk[i] <= 1) bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf bsync (unused for i>0, double for i=0) */
+        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         if (a->hardened || !c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         c->mwarm[i] = 1;
@@ -11504,7 +11505,8 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         if ((size_t)M * K > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
-        memcpy(AF->cpu, t->A, (size_t)M * K); uint32_t adma = (uint32_t)AF->dma;   /* full A[M,K], host memory (all cores read all A) */
+        uint32_t adma = (uint32_t)AF->dma;
+        if (K <= 4096) memcpy(AF->cpu, t->A, (size_t)M * K);   /* full A[M,K] for base/wide-N. WIDE-K (K>4096) re-gathers A into AF as [Sk][M][Kp] below, so this full copy would be pure waste there — skip it. */
         size_t osz = (size_t)M * Ncore * 4;
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
@@ -11519,11 +11521,17 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             size_t ksz = (size_t)w->Sk * M * Ncore * 4;
             if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
                 if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; CC = &c->mcc[i]; }
-            { int8_t *afg = (int8_t*)AF->cpu; size_t goff = 0;   /* gather A[M,K] -> [Sk][M][Kp] (per-slice contiguous per row) */
+            /* A[M,K]->[Sk][M][Kp] is IDENTICAL for every core (A is not core-dependent — only the weight column
+             * range differs per core). Gather it ONCE into maf[0] (shared, read-only) and point every core's
+             * regcmd at it, instead of the redundant per-core gather that dominated the serial build (~1.4ms x
+             * nc). maf[0] is sized M*K by the i==0 realloc above; the 3 cores only READ it (no write race). */
+            struct buf *AFS = &c->maf[0];
+            if (i == 0) { int8_t *afg = (int8_t*)AFS->cpu; size_t goff = 0;
               for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                   for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, (const int8_t*)t->A + (size_t)m*K + k0, (size_t)Kp);
                   goff += (size_t)M*Kp; }
-              bsync(fd, AF, RKNPU_MEM_SYNC_TO_DEVICE); }
+              bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+            uint32_t a_base = (uint32_t)AFS->dma;   /* shared gathered A for all cores */
             int np2 = 0; size_t goff = 0;
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
@@ -11532,7 +11540,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M - m0 < kcap) ? (M - m0) : kcap;
                     if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, sizeof rc);
-                    synth_i8(rc, mc, Kp, Ncore, (uint32_t)(AF->dma + goff + (size_t)m0*Kp), wbase,
+                    synth_i8(rc, mc, Kp, Ncore, (uint32_t)(a_base + goff + (size_t)m0*Kp), wbase,
                              (uint32_t)(CC->dma + ((size_t)ks * M + m0) * Ncore * 4), sched, CBUF, 0);   /* [mc,Ncore] rows [m0,+mc) of partial ks */
                     if (validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
