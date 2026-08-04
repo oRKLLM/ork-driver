@@ -5154,9 +5154,12 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     if(x->setdt) c->last_dt=to;
     return 1;
 }
-/* fp16 multicore matmul (Sn==1) rides the doorbell colsplit (bit-exact vs single-core/mcworker; beats mcworker
- * 1.08-1.4x on all shapes — validated test_f16colsplit). DEFAULT ON; ORK_F16_COLSPLIT=0 reverts to blocking mcworker. */
-static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):1;} return v; }
+/* fp16 multicore matmul (Sn==1) doorbell colsplit. Bit-exact and 1.08-1.4x faster than mcworker WHEN it lands,
+ * BUT the K-split (Sk>1) parallel path has a rare (~1/40) completion race that escalates to an NPU WEDGE under
+ * sustained load (a blocking submit never returns; SIGTERM can't recover it -> reboot). The SENT-seed + civac
+ * verify reduced but did NOT eliminate it. So DEFAULT OFF until root-caused; ORK_F16_COLSPLIT=1 opts in (dev only).
+ * mcworker stays the reliable fp16 default. See COLSPLIT_MULTIPREC_WIP.md. */
+static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):0;} return v; }
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
