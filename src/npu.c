@@ -11466,10 +11466,16 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             int Me = a->h->oM[i] ? a->h->oM[i] : 1, Sk = a->h->oSk[i], no = a->h->nout[i], Nn = no/(Sk*Me);
             size_t ds = a->h->ostride[i] > 0 ? (size_t)a->h->ostride[i] : (size_t)Nn, kstride = (size_t)Me*Nn;
             const int32_t *src = (const int32_t*)a->h->outptr[i]; int32_t *d = a->h->dst[i];
-            for (int m = 0; m < Me; m++) { const int32_t *bs = src + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds; int n = 0;
-                for (; n+4 <= Nn; n += 4) { int32x4_t acc = vld1q_s32(bs+n);
-                    for (int ks = 1; ks < Sk; ks++) acc = vaddq_s32(acc, vld1q_s32(bs+(size_t)ks*kstride+n)); vst1q_s32(dr+n, acc); }
-                for (; n < Nn; n++) { int32_t acc = bs[n]; for (int ks = 1; ks < Sk; ks++) acc += bs[(size_t)ks*kstride+n]; dr[n] = acc; } }
+            /* ks-OUTER (cache-friendly, like mcworker's chain-ksplit accumulate): read each K-slice partial
+             * CONTIGUOUSLY and accumulate into the small C column block (stays hot in cache across the Sk
+             * passes). The prior (m,n)-outer/ks-inner order scattered every element's reads across Sk
+             * partials 1.2MB apart -> cache/TLB thrash (measured ~8-10ms vs ~2ms). Bit-exact (int add assoc). */
+            for (int m = 0; m < Me; m++) { const int32_t *bs = src + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds;
+                for (int n = 0; n < Nn; n++) dr[n] = bs[n]; }   /* ks=0 init */
+            for (int ks = 1; ks < Sk; ks++) { const int32_t *sk = src + (size_t)ks*kstride;
+                for (int m = 0; m < Me; m++) { const int32_t *bs = sk + (size_t)m*Nn; int32_t *dr = d + (size_t)m*ds; int n = 0;
+                    for (; n+4 <= Nn; n += 4) vst1q_s32(dr+n, vaddq_s32(vld1q_s32(dr+n), vld1q_s32(bs+n)));
+                    for (; n < Nn; n++) dr[n] += bs[n]; } }
             a->h->dst[i] = NULL;   /* accumulated per-core; ork_dyn_end copy-back skips this i */
         }
     }
