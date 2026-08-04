@@ -5174,17 +5174,15 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * so we ADAPT prefill by M-tiling into <=64-row doorbell submits (rows are independent -> bit-exact). A shape
      * outside the envelope returns an ERROR — we never silently fall to the blocking path. */
     { int i8 = (dt==DT_I8 && (w->N/32)>=2 && nc>1);
-      /* PREFILL REGRESSION FIX: 23af039 extended the doorbell colsplit to M>1 wide-N/wide-K, which regressed
-       * prefill ~15x (155->10 t/s) — the wide-K ffn_down colsplit does per-K-slice partial submits + HOST
-       * gather/accumulate, vs the mcworker's CHAIN-PREFILL/CHAIN-KSPLIT (all K-slices in ONE PC-chain per core,
-       * HW-accumulate, weight streamed once). Restore the M==1 (decode-only) gate on wide-N/wide-K so M>1
-       * PREFILL falls through to the mcworker path below (the bdc6f7a 155 t/s path, still intact). r_base
-       * (Sn==1,K<=4096) stays any-M — it was any-M and fast at 155 t/s. ORK_COLSPLIT_MGT1=1 opts M>1 back
-       * onto the doorbell colsplit (the 23af039 behavior) for comparison. */
-      int mgt1 = getenv("ORK_COLSPLIT_MGT1") != NULL;
-      int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;               /* any M (internal mg_max*64 M-tiling) */
-      int r_wideN = i8 && (M==1||mgt1) && w->Sn>1 && w->K<=4096 && w->Bf; /* wide-N (ffn gate/up): doorbell for DECODE; M>1 -> mcworker */
-      int r_wideK = i8 && (M==1||mgt1) && w->Sn==1 && w->K>4096;          /* wide-K (ffn down): doorbell for DECODE; M>1 -> mcworker */
+      /* COLSPLIT IS THE DEFAULT (any M) for base, wide-N and wide-K. The old M==1 gate on wide-N/wide-K (behind
+       * ORK_COLSPLIT_MGT1) existed because 23af039's first M>1 colsplit regressed prefill ~15x (per-K-slice
+       * partials + a SERIAL host accumulate). That is FIXED: balanced boundary-split (no notch, no load-
+       * imbalance) + PER-CORE PARALLEL ks-outer accumulate + gather-A-once now make colsplit BEAT the mcworker
+       * chain on the 7B (75 vs 73 t/s, bit-exact) AND it is self-healing (a blocking mcworker miss hard-wedges
+       * the NPU). The MGT1 gate is removed; mcworker is legacy fall-through only (TODO: remove — see task list). */
+      int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;   /* any M (internal mg_max*64 M-tiling) */
+      int r_wideN = i8 && w->Sn>1 && w->K<=4096 && w->Bf;    /* wide-N ffn gate/up: colsplit, any M */
+      int r_wideK = i8 && w->Sn==1 && w->K>4096;             /* wide-K ffn down: colsplit, any M */
       if(r_base || r_wideN || r_wideK){
         /* ONE doorbell submit: ork_dyn_begin_mc -> ork_dyn_begin_colsplit auto-decomposes base (M-tiled),
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
@@ -11424,7 +11422,8 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
  * op-partition would otherwise pin a single op to one core). Scratch+copy-back (not direct output): multi-core
  * direct output to a shared resident C is the unsafe ZC-OUT-multicore case; the copy-back after poll is
  * single-threaded => coherent. */
-/* DOORBELL wide-K fix (ORK_COLSPLIT_PARALLEL): each core submits AND polls its OWN core on its own pool thread
+/* DOORBELL per-core parallel dispatch (DEFAULT; ORK_COLSPLIT_SERIAL forces the legacy inline path): each core
+ * submits AND polls/accumulates its OWN core on its own pool thread
  * (barrier-synced fire), mirroring the mcworker/stream_worker. CRITICAL: the per-core poll is O(1) — just the
  * last output word — NOT ork_dyn_done_i's O(no) full-surface civac scan; 3 threads full-scanning ~190K words
  * each thrash the memory bus against the NPU writeback and serialize it (that was the earlier failure). The
@@ -11622,7 +11621,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
      * there (pure waste: O(M*Ncore) CPU writes/core, the doorbell-specific wide-N host tax native doesn't pay).
      * Skip it and use cold-only clean-before (hardened_w=0). The NONBLOCK path (no PARALLEL, or COLSPLIT_NB)
      * still seeds + polls sentinels, so it keeps the full-surface seed + hardened clean-before. */
-    int parallel_blocking = (nc > 1 && getenv("ORK_COLSPLIT_PARALLEL") && !getenv("ORK_COLSPLIT_NB"));
+    int parallel_blocking = (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL") && !getenv("ORK_COLSPLIT_NB"));
     int hardened_w = parallel_blocking ? 0 : hardened;
     if (!parallel_blocking)
     for (int i = 0; i < nc; i++) if (Pc[i]) {
@@ -11630,7 +11629,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
             volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } }
     __asm__ volatile("dsb ish":::"memory");
-    if (nc > 1 && getenv("ORK_COLSPLIT_PARALLEL")) {   /* per-core submit + O(1) poll on own pool thread (ork_csub_worker) */
+    if (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* DEFAULT: per-core submit+accumulate on pool threads (ork_csub_worker); ORK_COLSPLIT_SERIAL forces the legacy inline path below */
         struct ork_csub cs[ORK_MAXCORE];
         for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0 };
         npu_pool_ensure(c);
