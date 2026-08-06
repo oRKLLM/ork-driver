@@ -5323,6 +5323,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
  * escape hatch). See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
 static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):(getenv("ORK_F16_NO_COLSPLIT")?0:1); } return v; }
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
+#define ORK_RC_F16_SC (-502)   /* internal run_multicore->run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
@@ -5538,6 +5539,11 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         }
         /* fp16_ineligible: fall through to the mcworker path at the original nc. */
     }
+    /* fp16 NEVER falls to the blocking mcworker: every fp16 fallback (colsplit ineligible, wedge de-escalation,
+     * Sn>1 slice-fail) routes to run()'s SINGLE-CORE fp16 reference (bit-exact, no concurrent fetch -> no drop)
+     * via ORK_RC_F16_SC. Removes the last fp16 mcworker dependency (#45). int8 is already fully covered/refused
+     * above, so with this the blocking mcworker path below is dead for both dtypes. */
+    if(dt==DT_F16) return ORK_RC_F16_SC;
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
 
@@ -6159,9 +6165,9 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
      * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
      * measuring chained-ork-1core vs rknn-1core apples-to-apples (rknn chains its M-tiles in 1 submit). */
-    if(nc>1) return run_multicore(c,w,M,A,C,nc);
+    if(nc>1){ int rmc=run_multicore(c,w,M,A,C,nc); if(rmc!=ORK_RC_F16_SC) return rmc; }   /* ORK_RC_F16_SC: fp16 fallback -> fall through to the single-core fp16 reference below (no mcworker) */
     { static int mc1=-1; if(mc1<0){const char*e=getenv("ORK_MC1"); mc1=e?atoi(e):0;}
-      if(mc1 && M>1 && c->soc->cores>=1) return run_multicore(c,w,M,A,C,1); }
+      if(mc1 && M>1 && w->dtype==DT_I8 && c->soc->cores>=1) return run_multicore(c,w,M,A,C,1); }   /* mc1 int8-only: fp16 must not re-enter run_multicore (would re-signal ORK_RC_F16_SC) */
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see mcworker) */
