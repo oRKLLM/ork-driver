@@ -85,7 +85,7 @@ static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
  * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the
  * weight every row (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default ON (bit-exact
- * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + i4_mcworker
+ * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + run_i4_mc_db (per-row doorbell)
  * + stream_worker_i4; NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy.
  *   PRESERVED as a distinct, named strategy — the multi-task-submit batch (many 1-row tasks per submit, the
  *   vendor's int4 approach; task_number=rows) is a SEPARATE path and must NOT overwrite/conflate with this.
@@ -4322,7 +4322,6 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
      * while the caller (e.g. ggml-ork) maintains the 50% footprint reduction on disk. */
     return ork_mm_pack_i8(c, K, N, B);
 }
-static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* defined below */
 static int run_i4_incr_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* STRATEGY C multi-core, defined below */
 static int run_i4_bchain(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: chain H-row batches, one weight load */
 static int run_i4_cbatch(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C);  /* EXP: compact-task batch (CBATCH) */
@@ -4333,14 +4332,14 @@ int ork_dyn_end(ork_dyn_chain *h);
 /* TASK #4: multi-M int4 onto the NONBLOCK doorbell spine. Decompose the M rows of one int4 weight into a chain
  * of M=1 int4 programs distributed across cores via ork_dyn_begin_mc_i4 (the validated M=1 int4 doorbell: full-
  * surface int16 seed+poll, int16->int32 widen, and — task #4 — the same drop-recover as int8). Bit-identical to
- * per-row. Single-slice only (the doorbell's envelope); returns -4 (caller falls back to blocking run_i4_mc) for
+ * per-row. Single-slice only (the doorbell's envelope); returns -4 (caller refuses — ORK_RC_WEDGE_PRONE) for
  * wide-N/K or when the M-program chain doesn't fit the per-core regcmd/task buffers. */
 static int run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     ork_mm_task_i8 *tk = malloc((size_t)M * sizeof *tk); if(!tk) return -4;
     for(int m=0;m<M;m++) tk[m]=(ork_mm_task_i8){ w, 1, A + (size_t)m*w->K, C + (size_t)m*w->N };
     ork_dyn_chain *h = ork_dyn_begin_mc_i4(c, M, tk, nc);
     free(tk);
-    if(!h) return -4;   /* shape/buffer limit -> caller uses blocking run_i4_mc */
+    if(!h) return -4;   /* shape/buffer limit -> caller refuses (ORK_RC_WEDGE_PRONE) */
     int d = ork_dyn_end(h);
     return (d == M-1) ? 0 : -1;
 }
@@ -4377,15 +4376,12 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(bchain && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_bchain(c,w,M,A,C); if(r!=-4) return r; }
     static int cbatch=-1; if(cbatch<0){const char*e=getenv("ORK_I4_CBATCH"); cbatch=(e&&atoi(e))?1:0;}
     if(cbatch && M>=2 && w->Sk==1 && w->Sn==1){ int r=run_i4_cbatch(c,w,M,A,C); if(r!=-4) return r; }
-    /* TASK #4 DEFAULT: multi-M int4 rides the doorbell spine (per-row chain via ork_dyn_begin_mc_i4). ORK_I4_NODB=1
-     * reverts to the blocking run_i4_mc. Sk==1 (single K-group); A1 added Sn>1 (each row's N-slices = chained
-     * column-slice programs). -4 => fall back (K-split/grouped, or chain too big for the per-core buffers). */
-    static int i4db=-1; if(i4db<0){const char*e=getenv("ORK_I4_NODB"); i4db=(e&&atoi(e))?0:1;}
-    if(i4db && M>=1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;   /* per-row doorbell chain (M=1 decode = 1-row chain) — covers decode + Sk>1 + Sn>1, validated maxerr=0 */
-        return ORK_RC_WEDGE_PRONE; }   /* doorbell -4 (over-large chain / unsupported int4 shape): refuse (rescue-eligible), NEVER the blocking i4_mcworker — int4 is off mcworker on the default path (#45) */
-    /* ORK_I4_NODB opt-in ONLY (default is the doorbell above): the legacy blocking int4 path (i4_mcworker), kept for A/B until the Stage-4 mcworker deletion. */
-    if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
-    double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
+    /* multi-M int4 rides the doorbell spine (per-row chain via ork_dyn_begin_mc_i4): M=1 decode = a 1-row
+     * chain; covers Sk>1 and Sn>1 (each row's N-slices = chained column-slice programs). -4 (over-large chain
+     * / unsupported int4 shape) => refuse (rescue-eligible). The blocking i4_mcworker path is removed (#45). */
+    if(!g_ork_prof){ int r=run_i4_mc_db(c,w,M,A,C,nc); return r!=-4 ? r : ORK_RC_WEDGE_PRONE; }
+    double t0=ork_now_us(); int r=run_i4_mc_db(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++;
+    return r!=-4 ? r : ORK_RC_WEDGE_PRONE;
 }
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
@@ -4477,9 +4473,9 @@ static int mc_ensure(ork_npu *c,int nc){
     return 0;
 }
 static double ork_now_us(void);   /* fwd (defined below) */
-/* ORK_MCPROF diagnostic: per-core phase timing inside mcworker's prefill (M>1) path —
- * copy (activation tile host-copy + bsync), submit (regcmd + ioctl + result bsync), acc
- * (host accumulate). Pins why large-M multi-core barely scales. Read via ork_npu_mc_timing. */
+/* ORK_MCPROF diagnostic: per-core phase timing (copy / submit / acc). Populated by the single-core
+ * run() path (the multi-core matmul now runs on the doorbell colsplit, which reports via its own
+ * poll/backoff timers, not g_mc_*). Read via ork_npu_mc_timing. */
 #define MCPROF_MAX 8
 static double g_mc_copy[MCPROF_MAX], g_mc_sub[MCPROF_MAX], g_mc_acc[MCPROF_MAX]; static long g_mc_n[MCPROF_MAX];
 static double g_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of g_mc_sub (the OVERLAPPABLE part; ioctl/NPU = sub-synth) */
@@ -4488,621 +4484,6 @@ void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?g_mc_synth[core]:0; }
 
-struct mcw { ork_npu *c; int core, nc, dt, M; const void *A; ork_w *w; void *cres; int rc; int reps; size_t maxout; int chain_pref; int chain_ksplit; };
-
-static void unified_ioctl(struct mcw *a, int i, int nc) {
-    ork_npu *c = a->c; int fd = c->fd; int reps = a->reps; struct buf *CC = &c->mcc[i];
-    if (c->mc_error) {
-        a->rc = -1;
-        return;
-    }
-    for(int rep=0;rep<reps;rep++){
-        int last=(rep==reps-1);
-        struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;
-        sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
-        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        sub.timeout=mm_timeout_ms();
-        if(i==0) trace_submit(&sub);   /* ORK_TRACE: dump the mcworker fp16 regcmd sequence (core 0) for the doorbell-vs-mcworker diff */
-        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){ a->rc=-1; return; } }
-        bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
-    }
-    c->mwarm[i]=1;
-}
-
-static void *mcworker(void *vp){
-    struct mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, dt=a->dt, M=a->M, fd=c->fd;
-    int K=a->w->K, N=a->w->N, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* cbuf raise (57344, int8 R=32 @K3584) is INT8-ONLY: the fp16 M-scheduler is validated only to the 32768-tile and miscomputes larger fp16 M-tiles (latent bug) */
-    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
-    ork_w *w=a->w; const void *A=a->A; struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*CC=&c->mcc[i];
-    size_t maxout = a->maxout;
-    if(c->mccsz[i]<maxout){
-        fprintf(stderr, "[ork] ERROR: mccsz[%d]=%zu < maxout=%zu, buffer not pre-allocated!\n", i, c->mccsz[i], maxout);
-        a->rc=-1;
-        c->mc_error = 1;
-    }
-    if(M==1 && w->Bf){   /* int8 DECODE fast path: ONE full-K submit per N-slice (no K-split) */
-        if (!c->mc_error) {
-            int8_t*ad=AF->cpu; const int8_t*Ai=A; for(int j=0;j<K;j++)ad[j]=Ai[j]; bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-        }
-        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
-            int active = (t1 > t0);
-            if(!active){
-                int Ncore = nt_sz;
-                uint32_t rc[REGCMD_N]; synth_i8(rc,1,K,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
-                setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
-                if (validate_regcmd("mcworker_dec_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
-                    a->rc = -1; c->mc_error = 1;
-                }
-                if (!c->mc_error) {
-                    memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                }
-                unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-            } else {
-                int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
-                double _tp0=ork_now_us();   /* Tier 2a teardown: copy=regcmd-prep, submit=ioctl+result-sync, acc=writeout */
-                uint32_t rc[REGCMD_N];
-                /* PRECOMPILED REGCMD (ORK_PRECOMP_RC): the M=1 decode regcmd is fixed across tokens; synth once
-                 * per (core,ns), reuse the bytes (skip ~20 setr scans + validate). Address-validated => safe. */
-                uint32_t aA=(uint32_t)AF->dma, aB=(uint32_t)wbase, aC=(uint32_t)CC->dma;
-                int slot = i*w->Sn + ns;   /* pcrc allocated single-threaded in run_multicore; each core owns disjoint slots */
-                uint32_t *mt = (w->pcrc && slot<w->pcrc_slots) ? w->pcrc_meta+(size_t)slot*6 : NULL;
-                if(mt && mt[0]==1 && mt[1]==(uint32_t)K && mt[2]==(uint32_t)Ncore && mt[3]==aA && mt[4]==aB && mt[5]==aC){
-                    memcpy(rc, w->pcrc+(size_t)slot*REGCMD_N, sizeof rc);   /* cache hit: reuse precompiled regcmd */
-                } else {
-                    synth_i8(rc,1,K,Ncore,aA,aB,aC,1,CBUF,0);
-                    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);                       /* M=1 single-tile schedule */
-                    if (validate_regcmd("mcworker_dec_active", c, rc, REGCMD_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    } else if(mt){ memcpy(w->pcrc+(size_t)slot*REGCMD_N, rc, sizeof rc); mt[1]=K;mt[2]=Ncore;mt[3]=aA;mt[4]=aB;mt[5]=aC; mt[0]=1; }
-                }
-                if (!c->mc_error) {
-                    memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                    double _ti0=ork_now_us(); g_mc_copy[i]+=_ti0-_tp0;
-                    unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                    double _tw0=ork_now_us(); g_mc_sub[i]+=_tw0-_ti0;
-                    int32_t*cc=CC->cpu,*cr=a->cres; for(int col=0;col<Ncore;col++)cr[n0+coff+col]=cc[col];
-                    g_mc_acc[i]+=ork_now_us()-_tw0; g_mc_n[i]++;
-                } else {
-                    unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                }
-            }
-        }
-        return NULL;
-    }
-    if(a->chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
-        /* CHAIN-PREFILL: PC-chain this core's M-tiles into chained submits (instead of one ioctl per
-         * M-tile). M-tiles have disjoint output rows -> no data dependency. AF holds all M rows (staged
-         * once); each chained program writes its own disjoint rows of CC; readback CC once per submit.
-         * SAME weight => SAME domain & core. Only the ACTIVE N-range is chained; an inactive core (no
-         * N-tiles — rare, auto-tuner avoids it) falls through to the per-tile path below.
-         * PER-N-SLICE (LEVER #1): we emit ONE submit per N-slice so each submit's chained programs all
-         * reference the SINGLE weight buffer Bf[ns] (the cross-N-slice chain referencing multiple
-         * distinct Bf[ns] buffers in one submit is what wedged the kernel CDMA walker — errno 110 /
-         * "cdma address wild"). Wide-N (Sn>1) now chains within each slice instead of falling through
-         * to per-tile; Sn==1 is unchanged (one slice == one submit, as before). */
-        int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
-        /* SMALL-TILE PACKING (ORK_SMALLTILE, default OFF): mirror rkllm — pack many SMALL CBUF-resident
-         * tiles back-to-back in the one chained submit instead of a few LARGE per-core tiles. With it set:
-         * M-tile = ORK_SMALLTILE_M (default 32) and each core's Ncore columns are sub-tiled into
-         * ORK_SMALLTILE_N-wide column blocks (default 1216, snapped to a multiple of nt_sz). Goal: each
-         * task's working set stays in CBUF/SRAM so the MAC stays fed across tasks. Same validated regcmd
-         * /K-handling (no 0x107c/0x1044 K-grouping). validate_regcmd + fall back to the per-tile path.
-         *
-         * M-TILE CEILING (corrected 2026-06-30): the real upper bound is the 0x1040 K-reduction
-         * schedule, == mg_max*64 (mc+1 miscomputes; bit-exact-validated at every K: 704@K512, 320@K1024,
-         * 128@K2048, 64@K3584/4096). The old "R-1 / CBUF-resident rows" RE finding was WRONG — it claimed
-         * R=pow2_floor(2*CBUF/K) (~31) was a hard cap, but activations STREAM (they need not be CBUF-
-         * resident) and reg 0x1010 is only a perf hint (correctness is identical regardless). That false
-         * cap throttled the M-tile ~2-4x below mg_max*64 and made the kernel re-stream the K*N weight from
-         * DRAM far too often (single-core is weight-DMA-bound) — see AGENTS.md "weight-DMA amortization".
-         * SMALLTILE deliberately wants SMALL tiles, so it still clamps to R-1 below as its own ceiling
-         * (not a correctness limit). The N axis is the free packing lever (sub-tile Ncore). */
-        static int st_on=-1, st_m=0, st_n=0;
-        if(st_on<0){ const char*e=getenv("ORK_SMALLTILE"); st_on=e?atoi(e):0;
-            const char*em=getenv("ORK_SMALLTILE_M"); st_m=em?atoi(em):32;
-            const char*en=getenv("ORK_SMALLTILE_N"); st_n=en?atoi(en):1216;
-            if(st_m<1)st_m=32; if(st_n<nt_sz)st_n=nt_sz; }
-        if(st_on){ int cap=R-1; if(cap<1)cap=1; chunk=st_m; if(chunk>cap)chunk=cap; if(chunk>M)chunk=M; if(chunk<1)chunk=1; }
-        int nsub_w = st_on ? ((st_n+nt_sz-1)/nt_sz)*nt_sz : 0;   /* N-subtile width (mult of nt_sz); 0=whole Ncore */
-        /* require the active N-range across ALL N-slices; verify all are active (Sn is 1 for the
-         * 7B prefill matmuls — nmax=8192 >= N). If any N-slice is inactive for this core, fall back. */
-        int all_active=1;
-        for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
-        if(all_active){
-            /* PER-N-SLICE CHAINING (LEVER #1): emit ONE submit per N-slice — chain only that slice's
-             * M-tiles x N-subtiles. Every chained program in a submit references the SINGLE weight
-             * buffer Bf[ns] (column subtiles are byte offsets WITHIN Bf[ns], not separate allocations),
-             * so this never reintroduces the cross-N-slice / cross-buffer chain that wedges the kernel
-             * CDMA walker (errno 110). For Sn==1 this is identical to the old single-chain behaviour
-             * (one slice -> one submit); for Sn>1 it replaces (Sn x nmt) per-tile ioctls with (Sn)
-             * chained submits. RC/tk/CC are reused from offset 0 for each slice (sequential submits on
-             * this core's NPU core), so they only need to hold ONE slice's worth of programs. */
-            int nmt=(M+chunk-1)/chunk;
-            /* worst-case programs in a SINGLE N-slice (bounds pd[] / RC / tk usage) */
-            int Pmax=0;
-            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz;
-                int nsw = nsub_w ? nsub_w : Ncore; int nnsub=(Ncore+nsw-1)/nsw;
-                int Pns=nnsub*nmt; if(Pns>Pmax)Pmax=Pns; }
-            size_t needrc=(size_t)Pmax*REGCMD_I8_N*4, needtk=(size_t)Pmax*sizeof(struct rknpu_task);
-            /* per-program output descriptor (column-subtiled): each program writes a contiguous
-             * [mco, Nsub] int32 block; scatter accounts for its (m0, n0+coff+nc0) offset. */
-            int maxpd = Pmax; if(maxpd<1)maxpd=1;
-            struct { size_t cc_off; int m0,mco,nc0,Nsub,n0,coff; } *pd = malloc((size_t)maxpd*sizeof *pd);
-            if(needrc<=RC->size && needtk<=c->mtk[i].size && pd && !c->mc_error){
-                /* stage all M rows of A into AF (contiguous [M,K]) once; reused by every N-slice */
-                double _tc0=ork_now_us();
-                memcpy(AF->cpu, A, (size_t)M*K); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                uint32_t rc[REGCMD_I8_N];
-                struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
-                int bad=0;
-                for(int ns=0;ns<w->Sn && !bad;ns++){ double _tsy0=ork_now_us(); int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                    int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
-                    int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
-                    int n0=ns*NMAX;
-                    int nsw = nsub_w ? nsub_w : Ncore;
-                    /* build THIS N-slice's chain into RC/tk/CC from offset 0; every program references
-                     * Bf[ns] + a column byte-offset within it (single-buffer => no errno-110 hazard). */
-                    int p=0; size_t cc_off=0;
-                    for(int nc0=0;nc0<Ncore && !bad;nc0+=nsw){int Nsub=(Ncore-nc0<nsw)?(Ncore-nc0):nsw;
-                        /* weight for this column subtile: Bf tile layout is [Ntile][Ktile][32][32];
-                         * advancing by one nt_sz-column tile = K*32 bytes. */
-                        uint64_t wsub=wbase+(uint64_t)nc0*K;
-                        for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                            memset(rc,0,sizeof rc);
-                            synth_i8(rc,mco,Kp,Nsub,
-                                     (uint32_t)(AF->dma+(uint64_t)m0*K), (uint32_t)wsub,
-                                     (uint32_t)(CC->dma+cc_off), 1, CBUF, 0);
-                            if(validate_regcmd("mcworker_pref_chain", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
-                            /* PC-chain to next program (same words as run_chain_i8). The final program
-                             * of the slice gets its chain words cleared below so the chain terminates
-                             * WITHIN this single-buffer slice (no cross-slice link). */
-                            uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
-                            rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
-                            rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
-                            memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
-                            struct rknpu_task t; memset(&t,0,sizeof t);
-                            t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
-                            t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
-                            tk[p]=t;
-                            pd[p].cc_off=cc_off; pd[p].m0=m0; pd[p].mco=mco; pd[p].nc0=nc0;
-                            pd[p].Nsub=Nsub; pd[p].n0=n0; pd[p].coff=coff;
-                            p++;
-                            cc_off += (size_t)mco*Nsub*4;
-                            if(cc_off>CC->size){ bad=1; break; }
-                            /* p is bounded by this slice's tile count <= Pmax (= maxpd, the malloc'd
-                             * pd[] / sized RC/tk). The loop math can't exceed it; no guard needed. */
-                        }
-                    }
-                    if(bad||p<1) break;
-                    int P=p;   /* programs in THIS N-slice's chain */
-                    /* terminate the chain: the last program must not link past itself */
-                    { uint32_t *l=(uint32_t*)((char*)RC->cpu+(size_t)(P-1)*REGCMD_I8_N*4);
-                      l[216]=l[217]=l[218]=l[219]=0; }
-                    bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-                    g_mc_synth[i]+=ork_now_us()-_tsy0;   /* host synth+bsync (overlappable); ioctl/NPU = g_mc_sub - this */
-                    int reps=c->mwarm[i]?1:2;
-                    for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
-                        struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-                        sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
-                        sub.core_mask=1u<<i;
-                        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
-                        sub.timeout=mm_timeout_ms();
-                        if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
-                        bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
-                    }
-                    c->mwarm[i]=1;
-                    double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0; _ts0=_ta0;
-                    if(bad||a->rc==-1) break;
-                    /* scatter THIS slice's [mco,Nsub] blocks -> cres (disjoint output cols/rows) */
-                    int32_t*cr=a->cres;
-                    for(int q=0;q<P;q++){
-                        int32_t*cc=(int32_t*)((char*)CC->cpu+pd[q].cc_off);
-                        int mco=pd[q].mco,Nsub=pd[q].Nsub,m0=pd[q].m0;
-                        int col0=pd[q].n0+pd[q].coff+pd[q].nc0;
-                        for(int r=0;r<mco;r++)for(int n=0;n<Nsub;n++)
-                            cr[(size_t)(m0+r)*N+(col0+n)]=cc[(size_t)r*Nsub+n];
-                    }
-                    g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
-                }
-                if(!bad && a->rc!=-1){ free(pd); return NULL; }
-                /* on bad/validate/submit failure, fall through to the per-tile path. It rewrites ALL
-                 * of this core's output columns (= over the same disjoint rows/cols this core owns),
-                 * so an aborted partial-slice scatter above is harmless. */
-            }
-            free(pd);
-        }
-        /* fall through to original per-tile prefill below */
-    }
-    if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){   /* Tier 1c-ii: full-K PREFILL — one submit/M-tile over full K, no K-split accumulate */
-        int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-        double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
-        for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
-            int active = (t1 > t0);
-            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                if(!active){
-                    int Ncore = nt_sz;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)w->Bf[ns].dma,(uint32_t)CC->dma,1,CBUF,0);
-                    if (validate_regcmd("mcworker_pref_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    }
-                    if (!c->mc_error) {
-                        memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                    }
-                    unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                } else {
-                    int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz; uint64_t wbase=w->Bf[ns].dma+(uint64_t)t0*K*32;
-                    double _tc0=ork_now_us();
-                    if (!c->mc_error) {
-                        int8_t*ad=AF->cpu; const int8_t*Ai=A; for(int r=0;r<mco;r++)for(int j=0;j<K;j++)ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
-                        bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                    }
-                    double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                    uint32_t rc[REGCMD_N]; synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,1,CBUF,0);
-                    if (validate_regcmd("mcworker_pref_active", c, rc, REGCMD_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    }
-                    if (!c->mc_error) {
-                        memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                        unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                        double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
-                        int32_t*cc=CC->cpu,*cr=a->cres; for(int r=0;r<mco;r++)for(int n=0;n<Ncore;n++)cr[(size_t)(m0+r)*N+(n0+coff+n)]=cc[(size_t)r*Ncore+n];
-                        g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
-                    } else {
-                        unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                    }
-                }
-            }
-        }
-        return NULL;
-    }
-    if(a->chain_ksplit && dt==DT_I8 && M>1 && (K%512)==0 && K>4096 && w->Sn==1){
-        /* CHAIN-KSPLIT: wide-K (K>4096, Bf=NULL → no full-K weight) normally K-splits into
-         * ceil(K/KS) separate ioctls/call (run_i8's dominant prefill submit cost). Instead PC-chain
-         * the K-slice (and M-tile) programs into ONE submit per core, then host-accumulate the
-         * K-slice partials. The NPU has no on-device C+= mode in our regcmd, so each K-slice must
-         * write its own partial slot; we cap the simultaneous partials per submit to a CC byte
-         * budget and accumulate between batches (still far fewer ioctls than per-slice). Only the
-         * ACTIVE N-range is chained; a core with any inactive N-slice falls through. Gated
-         * ORK_CHAIN_KSPLIT (default on); the address math is per-slice exact.
-         * Sn==1 ONLY: like chain-prefill, a chained submit spanning >1 N-slice references multiple
-         * distinct Bb[ns*Sk+ks] weight buffers, the cross-buffer reference the kernel CDMA walker
-         * rejects (errno 110 / "cdma address wild"). ffn_down (the only wide-K matmul, K=18944 N=3584)
-         * is Sn=1 so this is a no-op there; a hypothetical wide-K+wide-N weight (N>nmax) falls through
-         * to the proven per-slice K-split accumulate below. */
-        int all_active=1;
-        for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)all_active=0;}
-        if(all_active && !c->mc_error){
-            /* per-core CC partial budget (bytes). ffn_down (K=18944→19 slices, Ncore~1.2k, M=256)
-             * needs ~24 MB; default 64 MB covers it in one batch. ORK_CHAIN_KSPLIT_MB overrides. */
-            static long ccbudget=-1; if(ccbudget<0){const char*e=getenv("ORK_CHAIN_KSPLIT_MB"); ccbudget=(long)(e?atoi(e):64)*1024*1024;}
-            int bad=0;
-            /* Walk K-slices, batching into PC-chains that fit the CC budget. Each program in a batch
-             * writes a disjoint CC region (its own K-slice partial for its N-slice/M-tile). After a
-             * batch submit, accumulate every partial into cres, then reuse CC for the next batch. */
-            int ks=0;
-            while(ks<w->Sk && !bad && !c->mc_error){
-                /* plan this batch: greedily add K-slices while CC partials fit the budget */
-                int ks_end=ks; size_t cc_total=0; int P=0;
-                /* record per (program) descriptor for accumulate; bounded by REGCMD/task buffer caps */
-                struct { int ns,ks,m0,mco,Ncore,coff,n0; size_t cc_off, af_off; } pd[256];
-                size_t cc_off=0, af_off=0;
-                for(int kk=ks; kk<w->Sk; kk++){
-                    int k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
-                    int sched=(Kp==1024||Kp==512),R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-                    double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-                    int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
-                    /* tentative bytes for this K-slice (all N-slices, all M-tiles) */
-                    size_t kk_bytes=0; int kk_progs=0;
-                    for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz;
-                        for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                            kk_bytes += (size_t)mco*Ncore*4; kk_progs++; }
-                    }
-                    /* always take at least one K-slice even if it alone exceeds budget. A K-slice must
-                     * be placed WHOLE (all its N/M programs) or not at all — partial placement drops
-                     * part of the K-reduction → wrong result. If even the first slice can't fit pd[],
-                     * bail to the per-tile fall-through (bad). */
-                    if(kk>ks && (cc_total+kk_bytes>(size_t)ccbudget || P+kk_progs>(int)(sizeof(pd)/sizeof(pd[0])))) break;
-                    if(P+kk_progs>(int)(sizeof(pd)/sizeof(pd[0]))){ bad=1; break; }   /* first slice too big for pd[] */
-                    /* lay out program descriptors for this K-slice */
-                    int placed=0;
-                    for(int ns=0;ns<w->Sn && placed<kk_progs;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); int Ncore=(t1-t0)*nt_sz, coff=t0*nt_sz;
-                        for(int m0=0;m0<M && placed<kk_progs;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                            pd[P].ns=ns; pd[P].ks=kk; pd[P].m0=m0; pd[P].mco=mco; pd[P].Ncore=Ncore; pd[P].coff=coff; pd[P].n0=ns*NMAX;
-                            pd[P].cc_off=cc_off; cc_off+=(size_t)mco*Ncore*4;
-                            pd[P].af_off=af_off; af_off+=(size_t)mco*Kp;   /* gathered A tile [mco][Kp] */
-                            P++; placed++;
-                        }
-                    }
-                    cc_total=cc_off; ks_end=kk+1;
-                    if(P>=(int)(sizeof(pd)/sizeof(pd[0]))) break;
-                }
-                if(bad) break;   /* planning could not represent a K-slice → per-tile fall-through */
-                size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
-                if(needrc>RC->size || needtk>c->mtk[i].size || cc_total>CC->size || af_off>AF->size){ bad=1; break; }
-                /* gather each program's A tile [mco][Kp] into AF (regcmd reads A with row-stride Kp,
-                 * so the full-K-strided host A must be re-tiled per K-slice). */
-                double _tc0=ork_now_us();
-                for(int p=0;p<P;p++){
-                    int kk=pd[p].ks, k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
-                    int8_t*ad=(int8_t*)AF->cpu+pd[p].af_off; const int8_t*Ai=A;
-                    for(int r=0;r<pd[p].mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Ai[(size_t)(pd[p].m0+r)*K+k0+j];
-                }
-                bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                /* synth + PC-chain every program in this batch */
-                uint32_t rc[REGCMD_I8_N];
-                struct rknpu_task *tk=(struct rknpu_task*)c->mtk[i].cpu;
-                for(int p=0;p<P && !bad;p++){
-                    int kk=pd[p].ks, k0=kk*KS, Kp=(K-k0<KS)?(K-k0):KS;
-                    int sched=(Kp==1024||Kp==512);
-                    struct buf*Bb=&w->Bb[(size_t)pd[p].ns*w->Sk+kk];
-                    uint64_t wbase=Bb->dma+(uint64_t)(pd[p].coff/nt_sz)*Kp*32;   /* coff/nt_sz = t0 tile index */
-                    memset(rc,0,sizeof rc);
-                    synth_i8(rc, pd[p].mco, Kp, pd[p].Ncore,
-                             (uint32_t)(AF->dma+pd[p].af_off),   /* this program's gathered [mco][Kp] tile */
-                             (uint32_t)wbase,
-                             (uint32_t)(CC->dma+pd[p].cc_off), sched, CBUF, 0);
-                    if(validate_regcmd("mcworker_pref_ksplit", c, rc, REGCMD_I8_N, w, NULL, 0)){ bad=1; break; }
-                    if(p<P-1){   /* PC-chain to next program */
-                        uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_I8_N*4;
-                        rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
-                        rc[218]=0x0014|(0x0037<<16);      rc[219]=(0x0101<<16)|0;
-                    }
-                    memcpy((char*)RC->cpu+(size_t)p*REGCMD_I8_N*4, rc, REGCMD_I8_N*4);
-                    struct rknpu_task t; memset(&t,0,sizeof t);
-                    t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108;
-                    t.regcmd_addr=RC->dma+(size_t)p*REGCMD_I8_N*4;
-                    tk[p]=t;
-                }
-                if(bad) break;
-                bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-                int reps=c->mwarm[i]?1:2;
-                double _tsub0=ork_now_us();
-                for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
-                    struct rknpu_submit sub; memset(&sub,0,sizeof sub);
-                    sub.flags=ork_ppflags(); sub.task_number=P; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1;
-                    sub.core_mask=1u<<i;
-                    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
-                    sub.timeout=mm_timeout_ms();
-                    if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
-                    bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
-                }
-                c->mwarm[i]=1;
-                g_mc_sub[i]+=ork_now_us()-_tsub0; g_mc_n[i]++;
-                if(bad||a->rc==-1) break;
-                /* accumulate this batch's K-slice partials into cres (cres pre-zeroed by run_multicore) */
-                double _ta0=ork_now_us();
-                int32_t*cr=a->cres;
-                for(int p=0;p<P;p++){
-                    int32_t*cc=(int32_t*)((char*)CC->cpu+pd[p].cc_off);
-                    int Ncore=pd[p].Ncore, base_n=pd[p].n0+pd[p].coff;
-                    for(int r=0;r<pd[p].mco;r++){
-                        size_t cr_off=(size_t)(pd[p].m0+r)*N+base_n;
-                        size_t cc_row=(size_t)r*Ncore; int col=0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                        for(;col<=Ncore-16;col+=16){
-                            int32x4_t a0=vld1q_s32(&cc[cc_row+col]),    a1=vld1q_s32(&cc[cc_row+col+4]);
-                            int32x4_t a2=vld1q_s32(&cc[cc_row+col+8]),  a3=vld1q_s32(&cc[cc_row+col+12]);
-                            int32x4_t b0=vld1q_s32(&cr[cr_off+col]),    b1=vld1q_s32(&cr[cr_off+col+4]);
-                            int32x4_t b2=vld1q_s32(&cr[cr_off+col+8]),  b3=vld1q_s32(&cr[cr_off+col+12]);
-                            vst1q_s32(&cr[cr_off+col],   vaddq_s32(b0,a0)); vst1q_s32(&cr[cr_off+col+4], vaddq_s32(b1,a1));
-                            vst1q_s32(&cr[cr_off+col+8], vaddq_s32(b2,a2)); vst1q_s32(&cr[cr_off+col+12],vaddq_s32(b3,a3));
-                        }
-#endif
-                        for(;col<Ncore;col++) cr[cr_off+col]+=cc[cc_row+col];
-                    }
-                }
-                g_mc_acc[i]+=ork_now_us()-_ta0;
-                ks=ks_end;
-            }
-            if(!bad && a->rc!=-1) return NULL;
-            /* on any failure fall through to the robust per-tile K-split path below. Zero THIS core's
-             * output columns first (we may have partially accumulated) so the per-tile path's +=
-             * starts clean; other cores own disjoint columns and are untouched. */
-            c->mc_error=0; a->rc=0;
-            int32_t*cr=a->cres;
-            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc); if(t1<=t0)continue;
-                int Ncore=(t1-t0)*nt_sz, base_n=ns*NMAX+t0*nt_sz;
-                for(int r=0;r<M;r++) memset(&cr[(size_t)r*N+base_n],0,(size_t)Ncore*4);
-            }
-        }
-    }
-    for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-        int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc);
-        int active = (t1 > t0);
-        int Ncore = active ? (t1-t0)*nt_sz : nt_sz;
-        int coff = active ? t0*nt_sz : 0;
-        for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)),R=RB/Kp;if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }   /* ORK_F16_HISCHED: extend the fp16 sched window to include Kp=2048 -> chunk=mg_max*64=64 (not 8), streaming the weight ONCE per 64 rows instead of 8x. The silu path already runs sched=1 at Kp=2048 bit-exact (validated). Validate the PLAIN matmul via test_matmul before default-on. */
-            double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-            int chunk = mg_max * 64; if(!sched) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
-            struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks]; uint64_t wbase=Bb->dma+(uint64_t)(active?t0:0)*Kp*32;  /* Kp*32 B/N-tile (both dtypes) */
-            /* ORK_F16_CHAIN (default OFF): PC-chain THIS (N-slice,K-slice)'s fp16 M-tiles into ONE
-             * task_number>1 submit instead of one ioctl per M-tile. fp16 K>=2048 takes sched=0 -> chunk=8
-             * (an 8-row correctness limit, NOT enlargeable), so at prefill M there are M/8 M-tiles each a
-             * separate ioctl (the 34-ioctls/matmul explosion vs int8's chained 3.6). Chaining keeps each
-             * task <=8 rows (bit-exact) but collapses the ioctls ~M/8x. Mirrors the int8 chain-prefill
-             * (~2760): fp16 matmul uses the SAME 108-reg format (regcfg_amount=108, enable 0xd, chain slot
-             * word 216, next-amount 0x37), so only synth()+Bb differ. Chain stays WITHIN Bb (one buffer =
-             * no cross-buffer CDMA-walker wedge, errno110). M-tiles have disjoint output rows -> no dep.
-             * Guarded: falls back to the per-tile loop if buffers are too small. */
-            static int f16ch=-1; if(f16ch<0){const char*e=getenv("ORK_F16_CHAIN"); f16ch=e?atoi(e):0;}
-            if(dt==DT_F16 && f16ch && active && !c->mc_error){
-                int nmt=(M+chunk-1)/chunk;
-                size_t needaf=(size_t)M*Kp*2, needrc=(size_t)nmt*REGCMD_N*4, needcc=(size_t)M*Ncore*4;
-                if(nmt>1 && needaf<=AF->size && needrc<=RC->size && needcc<=CC->size){
-                    /* stage ALL M rows of this K-slice into AF once */
-                    { f16*ad=AF->cpu; const f16*Af=A; for(int r=0;r<M;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)r*K+k0+j]; }
-                    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                    struct rknpu_task*tk=(struct rknpu_task*)c->mtk[i].cpu;
-                    int p=0; size_t cc_off=0; int bad=0;
-                    for(int m0=0;m0<M && !bad;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                        uint32_t rc[REGCMD_N];
-                        synth(rc,mco,Kp,Ncore,(uint32_t)(AF->dma+(uint64_t)m0*Kp*2),(uint32_t)wbase,(uint32_t)(CC->dma+cc_off),sched,CBUF);
-                        if(validate_regcmd("mcworker_f16_chain",c,rc,REGCMD_N,w,NULL,0)){bad=1;break;}
-                        uint64_t nx=RC->dma+(size_t)(p+1)*REGCMD_N*4;   /* PC-chain to next program (slot word 216, amt 0x37 — same as int8) */
-                        rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101u<<16)|((nx>>16)&0xffff);
-                        rc[218]=0x0014|(0x0037u<<16);      rc[219]=(0x0101u<<16)|0;
-                        memcpy((char*)RC->cpu+(size_t)p*REGCMD_N*4,rc,REGCMD_N*4);
-                        struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=108; t.regcmd_addr=RC->dma+(size_t)p*REGCMD_N*4;
-                        tk[p]=t;
-                        cc_off+=(size_t)mco*Ncore*4; p++;
-                    }
-                    if(!bad && p>=1){
-                        { uint32_t*l=(uint32_t*)((char*)RC->cpu+(size_t)(p-1)*REGCMD_N*4); l[216]=l[217]=l[218]=l[219]=0; }  /* terminate chain */
-                        bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-                        int reps=c->mwarm[i]?1:2;
-                        for(int rep=0;rep<reps && !c->mc_error;rep++){ int last=(rep==reps-1);
-                            struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)p; sub.task_obj_addr=c->mtk[i].obj; sub.fence_fd=-1; sub.core_mask=1u<<i;
-                            sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)p};
-                            sub.timeout=mm_timeout_ms();
-                            if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){a->rc=-1;c->mc_error=1;bad=1;break;} continue; }
-                            bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
-                        }
-                        c->mwarm[i]=1;
-                        if(!bad && a->rc!=-1){ float*cr=a->cres; size_t off=0;   /* scatter+accumulate the p disjoint-row blocks */
-                            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                                float*cc=(float*)((char*)CC->cpu+off);
-                                for(int r=0;r<mco;r++)for(int n=0;n<Ncore;n++) cr[(size_t)(m0+r)*N+(n0+coff+n)]+=cc[(size_t)r*Ncore+n];
-                                off+=(size_t)mco*Ncore*4; }
-                            continue;   /* this K-slice fully handled by the chained submit */
-                        }
-                    }
-                    /* bad/failure -> fall through to the per-tile loop (rewrites the same rows/cols) */
-                }
-            }
-            for(int m0=0;m0<M;m0+=chunk){int mco=(M-m0<chunk)?(M-m0):chunk; if(mco<=0)continue;
-                if(!active){
-                    uint32_t rc[REGCMD_N];
-                    if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
-                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF,0);
-                    if (validate_regcmd("mcworker_loop_inactive", c, rc, REGCMD_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    }
-                    if (!c->mc_error) {
-                        memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                    }
-                    unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                } else {
-                    double _tc0=ork_now_us();
-                    if (!c->mc_error) {
-                        if(dt==DT_F16){f16*ad=AF->cpu;const f16*Af=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j];}
-                        else{int8_t*ad=AF->cpu;const int8_t*Ai=A;for(int r=0;r<mco;r++)for(int j=0;j<Kp;j++)ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j];}
-                        bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                    }
-                    double _ts0=ork_now_us(); g_mc_copy[i]+=_ts0-_tc0;
-                    uint32_t rc[REGCMD_N];
-                    if(dt==DT_F16)synth   (rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF);
-                    else          synth_i8(rc,mco,Kp,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)CC->dma,sched,CBUF,0);
-                    if (validate_regcmd("mcworker_loop_active", c, rc, REGCMD_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    }
-                    if (!c->mc_error) {
-                        memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                        unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                        double _ta0=ork_now_us(); g_mc_sub[i]+=_ta0-_ts0;
-                        if(dt==DT_F16){
-                            float  *cc=CC->cpu,*cr=a->cres;
-                            for(int r=0;r<mco;r++) {
-                                size_t cr_row_offset = (size_t)(m0+r)*N + (n0+coff);
-                                size_t cc_row_offset = (size_t)r*Ncore;
-                                int col = 0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                                for (; col <= Ncore - 16; col += 16) {
-                                    float32x4_t vcc0 = vld1q_f32(&cc[cc_row_offset + col]);
-                                    float32x4_t vcc1 = vld1q_f32(&cc[cc_row_offset + col + 4]);
-                                    float32x4_t vcc2 = vld1q_f32(&cc[cc_row_offset + col + 8]);
-                                    float32x4_t vcc3 = vld1q_f32(&cc[cc_row_offset + col + 12]);
-
-                                    float32x4_t vcr0 = vld1q_f32(&cr[cr_row_offset + col]);
-                                    float32x4_t vcr1 = vld1q_f32(&cr[cr_row_offset + col + 4]);
-                                    float32x4_t vcr2 = vld1q_f32(&cr[cr_row_offset + col + 8]);
-                                    float32x4_t vcr3 = vld1q_f32(&cr[cr_row_offset + col + 12]);
-
-                                    vcr0 = vaddq_f32(vcr0, vcc0);
-                                    vcr1 = vaddq_f32(vcr1, vcc1);
-                                    vcr2 = vaddq_f32(vcr2, vcc2);
-                                    vcr3 = vaddq_f32(vcr3, vcc3);
-
-                                    vst1q_f32(&cr[cr_row_offset + col], vcr0);
-                                    vst1q_f32(&cr[cr_row_offset + col + 4], vcr1);
-                                    vst1q_f32(&cr[cr_row_offset + col + 8], vcr2);
-                                    vst1q_f32(&cr[cr_row_offset + col + 12], vcr3);
-                                }
-#endif
-                                for (; col < Ncore; col++) {
-                                    cr[cr_row_offset + col] += cc[cc_row_offset + col];
-                                }
-                            }
-                        }
-                        else{
-                            int32_t*cc=CC->cpu,*cr=a->cres;
-                            for(int r=0;r<mco;r++) {
-                                size_t cr_row_offset = (size_t)(m0+r)*N + (n0+coff);
-                                size_t cc_row_offset = (size_t)r*Ncore;
-                                int col = 0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                                for (; col <= Ncore - 16; col += 16) {
-                                    int32x4_t vcc0 = vld1q_s32(&cc[cc_row_offset + col]);
-                                    int32x4_t vcc1 = vld1q_s32(&cc[cc_row_offset + col + 4]);
-                                    int32x4_t vcc2 = vld1q_s32(&cc[cc_row_offset + col + 8]);
-                                    int32x4_t vcc3 = vld1q_s32(&cc[cc_row_offset + col + 12]);
-
-                                    int32x4_t vcr0 = vld1q_s32(&cr[cr_row_offset + col]);
-                                    int32x4_t vcr1 = vld1q_s32(&cr[cr_row_offset + col + 4]);
-                                    int32x4_t vcr2 = vld1q_s32(&cr[cr_row_offset + col + 8]);
-                                    int32x4_t vcr3 = vld1q_s32(&cr[cr_row_offset + col + 12]);
-
-                                    vcr0 = vaddq_s32(vcr0, vcc0);
-                                    vcr1 = vaddq_s32(vcr1, vcc1);
-                                    vcr2 = vaddq_s32(vcr2, vcc2);
-                                    vcr3 = vaddq_s32(vcr3, vcc3);
-
-                                    vst1q_s32(&cr[cr_row_offset + col], vcr0);
-                                    vst1q_s32(&cr[cr_row_offset + col + 4], vcr1);
-                                    vst1q_s32(&cr[cr_row_offset + col + 8], vcr2);
-                                    vst1q_s32(&cr[cr_row_offset + col + 12], vcr3);
-                                }
-#endif
-                                for (; col < Ncore; col++) {
-                                    cr[cr_row_offset + col] += cc[cc_row_offset + col];
-                                }
-                            }
-                        }
-                        g_mc_acc[i]+=ork_now_us()-_ta0; g_mc_n[i]++;
-                    } else {
-                        unified_ioctl(a, i, nc); if(a->rc == -1) return NULL;
-                    }
-                }
-            }
-        }
-    }
-    return NULL;
-}
-/* persistent worker pool: spawned once, each pinned to driving NPU core `id`. Signalled per matmul
- * (gen bump) — workers with id<nc run mcworker for that job, the rest sleep. Replaces per-matmul
- * pthread_create/join (the spawn cost matters at ~200 matmuls/decode-token). */
-/* Pin the calling thread to a big CPU core. On RK3576 (4×A72+4×A53) and RK3588 (4×A76+4×A55)
- * the big cluster is the HIGH-numbered CPUs, so map NPU-driver thread `id` -> CPU (ncpu-1-id):
- * distinct big cores, no contention. Without this the scheduler parks the pool workers on the
- * little cores, making them ~2x slower than the (lucky big-core) calling thread and collapsing
- * multi-core prefill scaling to ~1.1x. ORK_NO_AFFINITY=1 disables (e.g. odd topologies). */
 static void pin_big_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
     if(off) return;
@@ -5140,7 +4521,7 @@ static void *npu_pool_worker(void *vp){
         while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
         if(c->pstop){ pthread_mutex_unlock(&c->pmu); return NULL; }
         mygen=c->pgen; int nc=c->pjob_nc; void *args=c->pjob; void *(*fn)(void*)=c->pjob_fn; size_t st=c->pjob_stride; pthread_mutex_unlock(&c->pmu);
-        if(id<nc){ fn((char*)args + (size_t)id*st);   /* mcworker (run_multicore) or chain_core_worker */
+        if(id<nc){ fn((char*)args + (size_t)id*st);   /* chain_core_worker / colsplit per-core worker */
             pthread_mutex_lock(&c->pmu); if(++c->pdone==nc-1) pthread_cond_signal(&c->pdn); pthread_mutex_unlock(&c->pmu); }
     }
 }
@@ -5321,15 +4702,14 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
  * mcworker (A/B, governors-verified). The K-split (Sk>1) drop that used to WEDGE was root-caused as a concurrent
  * CROSS-BUFFER weight-fetch wild (HW prefetches Bb[ks+1] while Bb[ks] drains) and is now PREVENTED by CONTIG (one
  * contiguous weight buffer -> no dma-buf boundary -> no wild -> no drop; validated 1000-iter 0-drop + make test).
- * CONTIG is default-on for Sn==1 inside ork_dyn_begin_colsplit. ORK_F16_NO_COLSPLIT opts back to mcworker (A/B /
- * escape hatch). See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
-static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):(getenv("ORK_F16_NO_COLSPLIT")?0:1); } return v; }
+ * CONTIG is default-on for Sn==1 inside ork_dyn_begin_colsplit; it is the ONLY fp16 multicore path (#45) — the
+ * legacy mcworker fallback has been removed. See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
+static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):1; } return v; }   /* colsplit is the ONLY fp16 multicore path (#45); ORK_F16_COLSPLIT=0 -> single-core fp16 reference (never mcworker) */
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
 #define ORK_RC_F16_SC (-502)   /* internal run_multicore->run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
-    const double ts=ork_now_us();
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
@@ -5352,7 +4732,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
        * partials + a SERIAL host accumulate). That is FIXED: balanced boundary-split (no notch, no load-
        * imbalance) + PER-CORE PARALLEL ks-outer accumulate + gather-A-once now make colsplit BEAT the mcworker
        * chain on the 7B (75 vs 73 t/s, bit-exact) AND it is self-healing (a blocking mcworker miss hard-wedges
-       * the NPU). The MGT1 gate is removed; mcworker is legacy fall-through only (TODO: remove — see task list). */
+       * the NPU). The MGT1 gate is removed; the legacy blocking mcworker fall-through has been removed (#45). */
       int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;   /* any M (internal mg_max*64 M-tiling) */
       int r_wideN = i8 && w->Sn>1 && w->K<=4096 && w->Bf;    /* wide-N ffn gate/up: colsplit, any M */
       int r_wideK = i8 && w->Sn==1 && (w->K>4096 || !w->Bf);  /* wide-K ffn down (K>4096) OR no-Bf K<=4096 (ORK_NO_BF FFN-chain): both ride the Bf-FREE Bb K-split colsplit, any M — removes the int8 no-Bf Sn==1 mcworker fall-through (#48) */
@@ -5364,7 +4744,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if(!h) return ORK_RC_WEDGE_PRONE;              /* outside the verified doorbell envelope: refuse (rescue-eligible), never wedge-fallback */
         return ork_dyn_end(h) < 0 ? -1 : 0;
       }
-      if(i8 && w->Sn>1 && (w->K>4096 || !w->Bf) && !getenv("ORK_NO_I8_WIDEN_SLICE")){
+      if(i8 && w->Sn>1 && (w->K>4096 || !w->Bf)){
         /* int8 WIDE-N with no single-submit base (no Bf, or K>4096): serve each N-slice as a standalone Sn==1
          * K-split colsplit (Bf-free — the validated wide-K path, per slice). cstride=N writes each slice's sub-N
          * result into the wider C at the full row stride. With r_base/r_wideN/r_wideK covering everything else,
@@ -5388,7 +4768,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 "blocking fallback (would risk an unrecoverable NPU wedge) — rescue-eligible (ORK_RC_WEDGE_PRONE)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
         return ORK_RC_WEDGE_PRONE;
       }
-      /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
+      /* i8 M>1 wide-N/wide-K are fully covered by r_wideN/r_wideK/slice above; nothing falls through (the mcworker CHAIN path is removed #45). */ }
     if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn > 1 && (w->N/16) >= 2 && w->Sk <= 64
         && !getenv("ORK_COLSPLIT_SERIAL") && !getenv("ORK_F16_NO_WIDEN")) {
         /* fp16 WIDE-N (Sn>1): per-N-slice CONTIG colsplit. Each N-slice is served as a standalone Sn==1 CONTIG
@@ -5396,7 +4776,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * per-core K-chain never crosses a dma-buf boundary (the cross-buffer prefetch WILD that CONTIG prevents).
          * Cores split THAT slice's columns; end() writes the sub-N result into the wider C at the full row-stride N
          * via task.cstride. Sn sequential begin/end. Any ineligible/wedged slice abandons colsplit for this matmul
-         * and falls through to the mcworker backstop (correctness). This removes fp16 wide-N's mcworker dependency
+         * and falls through to run()'s single-core fp16 reference via ORK_RC_F16_SC (correctness). This removes fp16 wide-N's mcworker dependency
          * (task #45) using the validated Sn==1 no-drop path per slice. */
         int NMAXn = c->soc->nmax, KSn = c->soc->ks;
         if (!w->Bbc_ns_valid) {   /* build the per-N-slice CONTIG weights ONCE (resident; reclaimed at teardown like Bbc) */
@@ -5413,7 +4793,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                     memcpy((char*)w->Bbc_ns[ns].cpu + off, w->Bb[(size_t)ns*w->Sk + ks].cpu, sz); off += sz; }
                 bsync(fd, &w->Bbc_ns[ns], RKNPU_MEM_SYNC_TO_DEVICE);
             }
-            if (build_ok) w->Bbc_ns_valid = 1;   /* partial/failed build -> stays invalid; the slice loop bails to mcworker */
+            if (build_ok) w->Bbc_ns_valid = 1;   /* partial/failed build -> stays invalid; the slice loop bails to the single-core fp16 reference */
         }
         if (w->Bbc_ns_valid) {
             ork_install_term();
@@ -5433,14 +4813,14 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 else if (ork_dyn_end(hs) < 0 || c->mc_error) wideN_ok = 0;
             }
             if (wideN_ok) return 0;
-            fprintf(stderr, "[ork] fp16 wide-N colsplit ineligible/wedge (K=%d N=%d Sn=%d) — mcworker backstop\n", w->K, w->N, w->Sn);
-            c->mc_error = 0;   /* fall through to the mcworker path for the whole matmul */
+            fprintf(stderr, "[ork] fp16 wide-N colsplit ineligible/wedge (K=%d N=%d Sn=%d) — single-core fp16 reference backstop\n", w->K, w->N, w->Sn);
+            c->mc_error = 0;   /* fall through to run()'s single-core fp16 reference (ORK_RC_F16_SC) for the whole matmul */
         }
     }
-    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> mcworker */
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> single-core fp16 reference */
         /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
          * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
-         * touch). h==NULL (ineligible / buffers too small) FALLS BACK to the mcworker path below. */
+         * touch). h==NULL (ineligible / buffers too small) FALLS BACK to run()'s single-core fp16 reference (ORK_RC_F16_SC). */
         ork_install_term();
         ork_mm_task_i8 tf = { .w = w, .M = M, .A = (const int8_t*)A, .C = (int32_t*)C };
         int ncf = nc; if (ncf > c->soc->cores) ncf = c->soc->cores;
@@ -5466,7 +4846,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             c->mc_error = 0;   /* clear BEFORE begin (the parallel workers run inside begin + set it on a wedged submit) */
             c->f16_force_blocking = (fp16_block_heal && attempt > 0) ? 1 : 0;   /* nonblock-detect + blocking-heal */
             ork_dyn_chain *h = ork_dyn_begin_colsplit(c, &tf, ncf);
-            if (!h) { fp16_ineligible = 1; break; }   /* ineligible / buffers too small -> mcworker at original nc */
+            if (!h) { fp16_ineligible = 1; break; }   /* ineligible / buffers too small -> single-core fp16 reference */
             int rc = ork_dyn_end(h);
             if (rc >= 0 && !c->mc_error) { fp16_healed = 1; break; }   /* landed clean (kernel-transparent resets included) */
             /* WEDGE POST-MORTEM: capture the HW fault signature (int_status/hw_elapse/iommu/freeSRAM) at the moment of
@@ -5497,7 +4877,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 * nc=1 guarantees the retry lands first try (the bit-exact reference). Reap-mechanism proven by REAP_TEST. */
                 ork_kmsg("F16-WEDGE attempt %d/%d -> FD-REAP + de-escalate to nc=1", attempt+1, fp16_recov_max);
                 if (ork_ctx_fd_reap(c) < 0) fprintf(stderr, "[ork] fp16 FD-REAP failed (context unusable)\n");
-                break;   /* fall through to the nc=1 de-escalation below (single-core mcworker on the reaped+re-imported ctx) */
+                break;   /* fall through to the nc=1 de-escalation below (single-core fp16 reference on the reaped+re-imported ctx) */
             }
             if (attempt < fp16_recov_max && getenv("ORK_F16_TCLEAN")) {   /* TIMEOUT-CLEAN recovery (task #47, the driver's
                 * intended path): NO reset, NO fd-close. Just retry the colsplit — its nonblock submits call
@@ -5526,7 +4906,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if (fp16_healed) return 0;
         if (!fp16_ineligible) {   /* recovery exhausted (repeated wilds survive resets = a genuinely stuck NPU): FINAL
             * BACKSTOP = de-escalate to single-core (nc=1: no concurrent fetch -> the bit-exact reference, never wedges).
-            * Slow but correct + safe. Falls through to the mcworker path with nc forced to 1 + a cold re-warm. */
+            * Slow but correct + safe. Falls through to run()'s single-core fp16 reference (ORK_RC_F16_SC) with a cold re-warm. */
             fprintf(stderr, "[ork] fp16 colsplit wedge (K=%d N=%d M=%d) — de-escalating to single-core\n", w->K, w->N, M);
             if (getenv("ORK_F16_TCLEAN")) {   /* TCLEAN: the last colsplit attempt left dropped/stuck jobs on ALL cores; nc=1
                 * below only submits to core 0, so cores 1..n would keep a stuck job that UAFs at process teardown (close(fd)
@@ -5539,611 +4919,28 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             c->mc_error = 0; nc = 1;
             c->warmed = 0; for (int z = 0; z < ORK_MAXCORE; z++) c->mwarm[z] = 0;
         }
-        /* fp16_ineligible: fall through to the mcworker path at the original nc. */
+        /* fp16_ineligible: fall through to run()'s single-core fp16 reference (ORK_RC_F16_SC) at the original nc. */
     }
     /* fp16 NEVER falls to the blocking mcworker: every fp16 fallback (colsplit ineligible, wedge de-escalation,
      * Sn>1 slice-fail) routes to run()'s SINGLE-CORE fp16 reference (bit-exact, no concurrent fetch -> no drop)
      * via ORK_RC_F16_SC. Removes the last fp16 mcworker dependency (#45). int8 is already fully covered/refused
-     * above, so with this the blocking mcworker path below is dead for both dtypes. */
+     * above — the blocking mcworker path that used to sit below has been removed (#45). */
     if(dt==DT_F16) return ORK_RC_F16_SC;
-    ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
-    if(mc_ensure(c,nc)) return -1;
-
-    /* PRECOMPILED REGCMD cache: allocate SINGLE-THREADED here (mcworker runs on nc threads concurrently, so a
-     * lazy alloc inside it races and use-after-frees). One slot per (core,ns); mcworker only READS/patches its
-     * own disjoint slots. */
-    if(ork_precomp() && w->Bf && !w->pcrc){ w->pcrc_slots=ORK_MAXCORE*w->Sn;
-        w->pcrc=calloc((size_t)w->pcrc_slots*REGCMD_N,4); w->pcrc_meta=calloc((size_t)w->pcrc_slots*6,4);
-        if(!w->pcrc||!w->pcrc_meta){ free(w->pcrc); free(w->pcrc_meta); w->pcrc=NULL; w->pcrc_meta=NULL; w->pcrc_slots=0; } }
-
-    /* Pre-allocate multi-core buffers on the single calling thread to eliminate concurrent allocations / race conditions */
-    int N=w->N, K=w->K, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see mcworker) */
-    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF, nt_sz=dt?32:16;
-    /* CHAIN-PREFILL (ORK_CHAIN_PREFILL, default ON): in the int8 M>1 full-K prefill path each core
-     * normally issues one ioctl per M-tile (serial ~134us floor each — the dominant prefill submit
-     * source, ~18/matmul/core). When set, the core instead PC-chains ALL its M-tiles into ONE submit
-     * (task_number=P). Independent disjoint-row outputs -> no data dep, same weight/domain/core. This
-     * needs the core's AF to hold ALL M rows (M*K) and CC the full M*Ncore output (each tile writes
-     * disjoint rows) rather than one-tile scratch. Set ORK_CHAIN_PREFILL=0 to revert per-tile submits.
-     * PER-N-SLICE (LEVER #1): the chain is emitted ONE submit per N-slice, so every chained submit
-     * references a SINGLE weight buffer Bf[ns]. A chain spanning >1 N-slice would reference several
-     * distinct Bf[ns] buffers and the kernel's regcmd CDMA walker rejects that (RKNPU_SUBMIT errno
-     * 110 / "cdma address wild" → 60s job timeout → NPU soft-reset) — exactly what the old Sn==1 gate
-     * avoided. Now wide-N (e.g. ffn_gate/up N=18944 → Sn=3 when nmax<N) still chains, just per slice:
-     * (Sn) chained submits instead of (Sn × M-tiles) per-tile ioctls. */
-    static int chain_pref=-1; if(chain_pref<0){const char*e=getenv("ORK_CHAIN_PREFILL"); chain_pref=e?atoi(e):1;}
-    int use_chain_pref = chain_pref && dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096;
-    /* CHAIN-KSPLIT (ORK_CHAIN_KSPLIT, default ON): wide-K int8 prefill (K>4096, no Bf) PC-chains its
-     * K-slice submits into one ioctl/core (see mcworker). Needs maf to hold all M*K of A and mcc to
-     * hold a budget's worth of K-slice partials + mrc/mtk to hold the chained programs. */
-    static int chain_ks=-1; if(chain_ks<0){const char*e=getenv("ORK_CHAIN_KSPLIT"); chain_ks=e?atoi(e):1;}
-    static long ks_ccbudget=-1; if(ks_ccbudget<0){const char*e=getenv("ORK_CHAIN_KSPLIT_MB"); ks_ccbudget=(long)(e?atoi(e):64)*1024*1024;}
-    int use_chain_ksplit = chain_ks && dt==DT_I8 && M>1 && (K%512)==0 && K>4096 && w->Sn==1;   /* Sn>1 (wide-K+wide-N): per-slice fall-through (cross-Bb-buffer chain wedges; see mcworker) */
-    size_t core_maxout[ORK_MAXCORE] = {0};
-    for(int i=0;i<nc;i++){
-        size_t maxout=0, maxaf=0;
-        for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-            int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz;
-            int active = (cols > 0);
-            int eff_cols = active ? cols : nt_sz;
-            for(int k0=0;k0<K;k0+=KS){
-                int Kp=(K-k0<KS)?(K-k0):KS;
-                int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048));   /* match the ORK_F16_HISCHED chunk window so maxout sizing tracks the larger fp16 M-tile */
-                int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-                double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-                int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
-                int rows=chunk<M?chunk:M;
-                /* ORK_F16_CHAIN sizes CC/AF for the WHOLE (N-slice,K-slice) M-tile chain (all M rows staged
-                 * + all tiles' disjoint output blocks held at once), not one tile — mirrors int8's chain-prefill
-                 * sizing below. Harmless (scratch) for non-chained fp16. */
-                int crows = (dt==DT_F16 && getenv("ORK_F16_CHAIN")) ? M : rows;
-                size_t o=(size_t)crows*eff_cols*4; if(o>maxout)maxout=o;
-                size_t sz=(size_t)crows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
-            }
-        }
-        if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
-            int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-            double scale=(double)Kp/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-            int chunk = mg_max * 64; if(chunk < 1) chunk = 1; if(chunk > M) chunk = M;   /* M-tile = the 0x1040 schedule's validated max rows (mg_max*64). NOT R-1: R=pow2_floor(2*cbuf/K) was a FALSE "CBUF-resident rows" cap (~31) that re-streamed the K*N weight from DRAM ~2-4x too often (single-core is weight-DMA-bound). mg_max*64 is the exact bit-exact ceiling (mc+1 miscomputes). See AGENTS.md "weight-DMA amortization". */
-            int rows=chunk<M?chunk:M;
-            size_t sz=(size_t)rows*Kp*1;
-            if(sz>maxaf)maxaf=sz;
-            /* CHAIN-PREFILL: AF holds ALL M rows (staged once), CC holds full M*eff_cols output
-             * (each chained tile writes its own disjoint block; readback once after the submit).
-             * The chained programs are laid out CONTIGUOUSLY in CC (running offset across N-slices
-             * and, under ORK_SMALLTILE, column subtiles), so CC must hold the SUM over N-slices
-             * of M*Ncore*4 — not the max. (Sn==1 for the 7B prefill matmuls, so this == the old
-             * max there.) Also grow mrc/mtk to hold the (possibly large) chained program count. */
-            if(use_chain_pref){
-                size_t afull=(size_t)M*Kp*1; if(afull>maxaf)maxaf=afull;
-                static int st_on2=-1,st_m2=0,st_n2=0;
-                if(st_on2<0){const char*e=getenv("ORK_SMALLTILE");st_on2=e?atoi(e):0;
-                    const char*em=getenv("ORK_SMALLTILE_M");st_m2=em?atoi(em):32;
-                    const char*en=getenv("ORK_SMALLTILE_N");st_n2=en?atoi(en):1216;
-                    if(st_m2<1)st_m2=32; if(st_n2<nt_sz)st_n2=nt_sz;}
-                int cap2=R-1; if(cap2<1)cap2=1; int ch=st_on2?(st_m2>cap2?cap2:st_m2):chunk; if(ch>M)ch=M; if(ch<1)ch=1;
-                int nsw=st_on2?((st_n2+nt_sz-1)/nt_sz)*nt_sz:0;
-                int nmt=(M+ch-1)/ch; int P=0; size_t ccsum=0;
-                for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                    int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz;
-                    int eff_cols = (cols>0)?cols:nt_sz;
-                    int nsw2=nsw?nsw:eff_cols; int nnsub=(eff_cols+nsw2-1)/nsw2;
-                    P += nnsub*nmt;
-                    ccsum += (size_t)M*eff_cols*4;
-                }
-                if(ccsum>maxout)maxout=ccsum;
-                size_t needrc=(size_t)P*REGCMD_I8_N*4, needtk=(size_t)P*sizeof(struct rknpu_task);
-                if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active);
-                    if(!c->mrc[i].cpu){ fprintf(stderr,"[ork] ERROR: pref mrc[%d] alloc failed (%zu)\n",i,needrc); return -1; } c->mwarm[i]=0; }
-                if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active);
-                    if(!c->mtk[i].cpu){ fprintf(stderr,"[ork] ERROR: pref mtk[%d] alloc failed (%zu)\n",i,needtk); return -1; } }
-            }
-        }
-        if(use_chain_ksplit){
-            /* AF holds all M*K of A. CC holds a batch of K-slice partials: cap to the SMALLER of the
-             * budget and the total partials this core would produce (so small matmuls don't over-alloc).
-             * Programs/batch bounded by pd[] (256) and the mrc/mtk capacity (grown below). */
-            /* AF holds per-program gathered A tiles [mco][Kp]; a full batch can re-gather A per
-             * N-slice, so the worst case is Sn*M*K (sum of Kp over a batch == K when whole-K). */
-            size_t afull=(size_t)w->Sn*M*K; if(afull>maxaf)maxaf=afull;
-            size_t total_part=0;
-            for(int ns=0;ns<w->Sn;ns++){int Nc=(N-ns*NMAX<NMAX)?(N-ns*NMAX):NMAX,NN=Nc/nt_sz;
-                int t0=(int)((long)i*NN/nc),t1=(int)((long)(i+1)*NN/nc),cols=(t1-t0)*nt_sz; if(cols<=0)continue;
-                total_part+=(size_t)w->Sk*M*cols*4;   /* Sk slices x M rows x this core's cols */
-            }
-            size_t want=(size_t)ks_ccbudget; if(total_part<want)want=total_part;
-            if(want>maxout)maxout=want;
-            /* grow regcmd/task buffers to hold up to 256 chained programs */
-            size_t needrc=(size_t)256*REGCMD_I8_N*4, needtk=(size_t)256*sizeof(struct rknpu_task);
-            if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active);
-                if(!c->mrc[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mrc[%d] alloc failed (%zu)\n",i,needrc); return -1; } c->mwarm[i]=0; }
-            if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active);
-                if(!c->mtk[i].cpu){ fprintf(stderr,"[ork] ERROR: ksplit mtk[%d] alloc failed (%zu)\n",i,needtk); return -1; } }
-        }
-        core_maxout[i] = maxout;
-        if(c->mccsz[i]<maxout){
-            bdestroy(fd,&c->mcc[i]);
-            c->mcc[i]=bcreate(fd,maxout,0x403,c->dom_active);
-            c->mccsz[i]=maxout;
-            c->mwarm[i]=0;
-            c->mwarm[0]=0;
-            if(!c->mcc[i].cpu){
-                fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output buffer (size=%zu) for core %d\n", maxout, i);
-                return -1;
-            }
-        }
-        if(c->maf[i].size<maxaf){
-            bdestroy(fd,&c->maf[i]);
-            c->maf[i]=bcreate(fd,maxaf,0x403,c->dom_active);
-            if(!c->maf[i].cpu){
-                fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation buffer maf[%d] (size=%zu, IOMMU full?)\n", i, maxaf);
-                return -1;
-            }
-        }
-    }
-
-    int reps = c->mwarm[0] ? 1 : 2;
-
-    size_t need=(size_t)M*w->N*4;
-    if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;} memset(c->cres,0,need);
-    struct mcw args[ORK_MAXCORE]; int rc=0;
-    for(int i=0;i<nc;i++) args[i]=(struct mcw){c,i,nc,dt,M,A,w,c->cres,0,reps,core_maxout[i],use_chain_pref,use_chain_ksplit};
-    npu_pool_ensure(c);
-    c->mc_error = 0;
-    if(nc>1) pthread_barrier_init(&c->b_ioctl, NULL, nc);
-    const double t1=ork_now_us();
-    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=mcworker; c->pjob_stride=sizeof(struct mcw); c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
-    mcworker(&args[0]);                                   /* core 0 on the calling thread */
-    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
-    if(nc>1) pthread_barrier_destroy(&c->b_ioctl);
-    for(int i=0;i<nc;i++){ if(args[i].rc) rc=-1; }
-    if(rc) return -1;
-    const double t2=ork_now_us();
-    memcpy(C,c->cres,need);
-    const double t3=ork_now_us();
-    g_rt_setup+=t1-ts; g_rt_submit+=t2-t1; g_rt_copy+=t3-t2; g_rt_n++;
-    return 0;
+    /* mcworker path deleted (#45). Nothing reaches here: fp16 returned ORK_RC_F16_SC above;
+     * every int8 M>1 (nc>1, N>=64) returned in the i8 colsplit/refuse block; int8 N<64 never
+     * reaches run_multicore (run() shrinks nc->1). Refuse defensively, never a blocking fallback. */
+    return ORK_RC_WEDGE_PRONE;
 }
 
-/* ---- int4 (W4A4) multi-core: WIDE submits with COLUMN-split. Each core owns a contiguous range
- * of 64-wide N-blocks within each N-slice and computes them in ONE wide submit per K-slice (not one
- * per 64-tile) — so a decode matmul is ~nc·Sk·Sn submits, not Sn·64-tiles. Per-core buffers,
- * core_mask=1<<i, all subcore_task[] populated, NO per-submit RESET (the dtype-switch RESET is done
- * once in run_i4_mc; concurrent RESET / a submit-storm is the documented board-hang). nc==1 = serial
- * (one core, whole width). Writes disjoint columns of C, no lock. ---- */
-struct i4mcw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; int32_t *C; int rc; };
-static void *i4_mcworker(void *vp){
-    struct i4mcw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
-    pin_big_core(i);                           /* core 0 = calling thread, 1.. = spawned workers */
-    ork_w *w=a->w; int K=w->K, N=w->N, KS=ORK_I4_KS, NMAX=c->soc->nmax;
-    struct buf *RC=&c->mrc[i], *AF=&c->maf[i], *O=&c->mcc[i]; a->rc=0;
-    int32_t *acc=malloc((size_t)M*NMAX*4);
-    if(!acc){
-        a->rc=-1; c->mc_error=1;
-    }
-    for(int ns=0;ns<w->Sn;ns++){
-        int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NB=Nc/64;
-        int b0=(int)((long)i*NB/nc), b1=(int)((long)(i+1)*NB/nc);
-        int active = (b1 > b0);
-        int ci0 = active ? b0*64 : 0, Ncore = active ? (b1-b0)*64 : 64;
-        if(acc) memset(acc, 0, (size_t)M*Ncore*4);
-        for(int ks=0;ks<w->Sk;ks++){
-            int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            /* Native multi-M batch (ORK_I4_MSCHED): H = min(16384/Kp, HCAP) rows/submit — the int4 CBUF
-             * activation-cube budget (Exp-2026-07-07, 0x107c=K/16 sets it). HW reads A at stride-2 (real row
-             * j -> A-slot 2j, so mc=2H) and writes output row j of 64-block b at physrow (4j + 4H*b). Engaged
-             * only when H>=2 (else the per-row PC-chain, since a 1-row batch = per-row). HCAP bounds buffers. */
-            int Hcap = 16384 / Kp; if (Hcap > 16) Hcap = 16; if (Hcap < 1) Hcap = 1;
-            /* Batch mode also needs this core's N-slice WEIGHT resident: Ncore*Kp int4 must fit the weight
-             * CBUF budget (~131072 int4, Exp-2026-07-07: K=2048 1 block ok / 2 blocks drops blk1). Beyond
-             * that the far N-blocks silently don't compute, so fall back to the per-row path (still correct).
-             * A future N-subslice loop would keep batch mode for wide N at large K (roadmap). */
-            int Hcap_ok = Hcap >= 2;
-            int wfit = ((size_t)Ncore * Kp) <= 131072;          /* whole N-slice weight fits in one submit */
-            /* N-subslice only pays off when each submit covers >=2 blocks (Nsub_max>=128, i.e. Kp<=1024):
-             * at Kp=2048 only 1 block fits per submit, so wide-N becomes submit-bound and LOSES to per-row
-             * (bench 2026-07-08: K512 1.10x, K1024 1.19x, K2048 0.66x). So sub-slice only where it wins;
-             * elsewhere (wide-N large-K) fall through to per-row, which is optimal there. */
-            int nsub_max = (131072 / Kp) & ~63;                 /* max 64-block-aligned cols per weight-budget submit */
-            int nsub_ok = ork_i4_nsub() && nsub_max >= 128;     /* >=2 blocks/submit => net win */
-            int msched_k = ork_i4_batch() && Hcap_ok && M >= 2 && (wfit || nsub_ok);
-            int chunk_M = msched_k ? Hcap : 16;
-            for (int m0 = 0; m0 < M; m0 += chunk_M) {
-                int cur_chunk = (M - m0 < chunk_M) ? (M - m0) : chunk_M;
-                if (!c->mc_error) {
-                    if (msched_k) {
-                        for (int j = 0; j < cur_chunk; j++)   /* real row j at A-slot 2j (stride-2 input) */
-                            tile_i4_Aslice((uint8_t*)AF->cpu + (size_t)(2 * j) * (Kp / 2), a->A + (size_t)(m0 + j) * K, k0, Kp);
-                    } else if (cur_chunk > 1) {
-                        for (int m = 0; m < cur_chunk; m++) {
-                            tile_i4_Aslice((uint8_t*)AF->cpu + (size_t)m * (Kp / 2), a->A + (size_t)(m0 + m) * K, k0, Kp);
-                        }
-                    } else {
-                        tile_i4_Aslice(AF->cpu, a->A + (size_t)m0 * K, k0, Kp);
-                    }
-                    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                }
-                uint64_t wbase=w->Bb[(size_t)ns*w->Sk+ks].dma + (uint64_t)(active?b0:0)*Kp*32;  /* Kp*32 B per N-block */
-                struct rknpu_task *tk_arr = c->mtk[i].cpu;
-                /* Native multi-M (Exp-2026-06-19, NVDLA batch mode): ONE submit computes cur_chunk rows
-                 * with the weight streamed ONCE (resident), vs the per-row PC-chain below that re-fetches
-                 * the weight every row. mc=cur_chunk -> synth_i4 sets mc_phys=2*cur_chunk + 0x405c=0, and
-                 * the output DMA writes logical row m to PHYSICAL row 2m (int16 result in an int32-stepped
-                 * buffer). A is cur_chunk consecutive single-row tiles (already laid out above). */
-                if (msched_k) {
-                    /* Self-contained native BATCH path, N-subsliced. Compute cur_chunk (H) rows with the weight
-                     * streamed once per N-sub-slice. mc=2H (HW reads A at stride-2, row j -> A-slot 2j); output
-                     * row j of 64-block b at physrow (4j + 4H*b). Nsub_max caps each submit's weight to the
-                     * 131072-int4 budget; = whole Ncore when it already fits (single iteration = pre-nsub path). */
-                    int H = cur_chunk, Nsub_max = Ncore;
-                    if (nsub_ok) { Nsub_max = nsub_max; if (Nsub_max > Ncore) Nsub_max = Ncore; }  /* sub-slice to the weight budget */
-                    for (int nc0 = 0; nc0 < Ncore && !c->mc_error; nc0 += Nsub_max) {
-                        int Nsub = (Ncore - nc0 < Nsub_max) ? (Ncore - nc0) : Nsub_max;
-                        uint64_t wbase_sub = wbase + (uint64_t)(nc0 / 64) * Kp * 32;   /* Kp*32 B per 64-block */
-                        uint32_t rc[REGCMD_I4_N];
-                        synth_i4(rc, 2 * H, Kp, Nsub, (uint32_t)AF->dma, (uint32_t)wbase_sub, (uint32_t)O->dma);
-                        if (validate_regcmd("i4_mcworker_msched", c, rc, REGCMD_I4_N, w, NULL, 0)) { a->rc = -1; c->mc_error = 1; break; }
-                        rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;  /* single task, no chain */
-                        memcpy(RC->cpu, rc, sizeof(rc));
-                        struct rknpu_task *tk = c->mtk[i].cpu;
-                        memset(tk, 0, sizeof(struct rknpu_task));
-                        tk[0].enable_mask = 0xd; tk[0].int_mask = 0x300; tk[0].int_clear = 0x1ffff;
-                        tk[0].regcfg_amount = 116; tk[0].regcmd_addr = c->mrc[i].dma;
-                        bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
-                        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-                        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-                        sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.fence_fd = -1;
-                        sub.core_mask = 1u << i;
-                        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
-                        int reps = c->mwarm[i] ? 1 : 2;
-                        for (int rep = 0; rep < reps; rep++) {
-                            int last = (rep == reps - 1); sub.timeout = mm_timeout_ms();
-                            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) { a->rc = -1; c->mc_error = 1; break; } continue; }
-                            bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
-                        }
-                        c->mwarm[i] = 1;
-                        if (active && acc) {   /* de-tile: o[(4j+4H*b)*64 + c] -> C[row m0+j][nc0 + b*64 + c] */
-                            int16_t *o = O->cpu; int NBc = Nsub / 64;
-                            for (int j = 0; j < H; j++)
-                                for (int b = 0; b < NBc; b++) {
-                                    size_t base = (size_t)(4 * j + 4 * H * b) * 64;
-                                    int32_t *ap = &acc[(size_t)(m0 + j) * Ncore + nc0 + b * 64];
-                                    const int16_t *op = &o[base];
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                                    for (int cc = 0; cc < 64; cc += 16) {   /* widen-add 64 int16 -> int32 (4x int16x8) */
-                                        int32x4_t a0=vld1q_s32(&ap[cc]),    a1=vld1q_s32(&ap[cc+4]);
-                                        int32x4_t a2=vld1q_s32(&ap[cc+8]),  a3=vld1q_s32(&ap[cc+12]);
-                                        int16x8_t o0=vld1q_s16(&op[cc]),    o1=vld1q_s16(&op[cc+8]);
-                                        a0=vaddw_s16(a0,vget_low_s16(o0));  a1=vaddw_high_s16(a1,o0);
-                                        a2=vaddw_s16(a2,vget_low_s16(o1));  a3=vaddw_high_s16(a3,o1);
-                                        vst1q_s32(&ap[cc],a0);   vst1q_s32(&ap[cc+4],a1);
-                                        vst1q_s32(&ap[cc+8],a2); vst1q_s32(&ap[cc+12],a3);
-                                    }
-#else
-                                    for (int cc = 0; cc < 64; cc++) ap[cc] += op[cc];
-#endif
-                                }
-                        }
-                    }
-                    if (c->mc_error) { a->rc = -1; free(acc); return NULL; }
-                    continue;   /* skip the per-row submit/accumulate below */
-                }
-                int ntask = cur_chunk;
-                {
-                memset(tk_arr, 0, cur_chunk * sizeof(struct rknpu_task));
-                for(int m=0; m<cur_chunk; m++) {
-                    uint32_t rc[REGCMD_I4_N];
-                    uint32_t aA = (uint32_t)AF->dma + m * (Kp / 2);
-                    uint32_t aC = (uint32_t)O->dma + m * (Ncore * 2);
-                    synth_i4(rc, 1, Kp, Ncore, aA, (uint32_t)wbase, aC);
-                    if (validate_regcmd("i4_mcworker", c, rc, REGCMD_I4_N, w, NULL, 0)) {
-                        a->rc = -1; c->mc_error = 1;
-                    }
-                    if (m < cur_chunk - 1) {
-                        uint64_t next_dma = c->mrc[i].dma + (m + 1) * REGCMD_I4_N * 4;
-                        rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
-                        rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-                        rc[218] = 0x0014 | (0x0037 << 16);
-                        rc[219] = (0x0101 << 16) | (0);
-                    } else {
-                        rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;
-                    }
-                    memcpy((char*)RC->cpu + m * REGCMD_I4_N * 4, rc, sizeof(rc));
-                    tk_arr[m].enable_mask = 0xd;
-                    tk_arr[m].int_mask = 0x300;
-                    tk_arr[m].int_clear = 0x1ffff;
-                    tk_arr[m].regcfg_amount = 116;
-                    tk_arr[m].regcmd_addr = c->mrc[i].dma + m * REGCMD_I4_N * 4;
-                }
-                }
-                if (!c->mc_error) {
-                    bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
-                    bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-                }
-                int reps=c->mwarm[i]?1:2;
-                if (c->mc_error) {
-                    a->rc = -1;
-                    free(acc);
-                    return NULL;
-                }
-                struct rknpu_submit sub;
-                memset(&sub, 0, sizeof sub);
-                sub.flags = ork_ppflags();
-                sub.task_number = ntask;
-                sub.task_obj_addr = c->mtk[i].obj;
-                sub.fence_fd = -1;
-                sub.core_mask = 1u << i;
-                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, ntask};
-                for (int rep = 0; rep < reps; rep++) {
-                    int last = (rep == reps - 1);
-                    sub.timeout = mm_timeout_ms();
-                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
-                        if (last) {
-                            a->rc = -1;
-                            free(acc);
-                            return NULL;
-                        }
-                        continue;
-                    }
-                    bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
-                }
-                c->mwarm[i]=1;
-                if (active && acc) {
-                    int16_t*o=O->cpu;
-                    if(cur_chunk>1) {
-                        /* per-row PC-chain: rows written contiguously */
-                        for(int m=0;m<cur_chunk;m++){
-                            for(int col=0;col<Ncore;col++){
-                                acc[(m0 + m)*Ncore + col] += o[(size_t)m * Ncore + col];
-                            }
-                        }
-                    } else {
-                        int32_t*acc_ptr = &acc[m0 * Ncore];
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                        int col = 0;
-                        for (; col <= Ncore - 16; col += 16) {
-                            int32x4_t vacc0 = vld1q_s32(&acc_ptr[col]);
-                            int32x4_t vacc1 = vld1q_s32(&acc_ptr[col + 4]);
-                            int32x4_t vacc2 = vld1q_s32(&acc_ptr[col + 8]);
-                            int32x4_t vacc3 = vld1q_s32(&acc_ptr[col + 12]);
-
-                            int16x8_t vo16_0 = vld1q_s16(&o[col]);
-                            int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
-
-                            vacc0 = vaddw_s16(vacc0, vget_low_s16(vo16_0));
-                            vacc1 = vaddw_high_s16(vacc1, vo16_0);
-                            vacc2 = vaddw_s16(vacc2, vget_low_s16(vo16_1));
-                            vacc3 = vaddw_high_s16(vacc3, vo16_1);
-
-                            vst1q_s32(&acc_ptr[col], vacc0);
-                            vst1q_s32(&acc_ptr[col + 4], vacc1);
-                            vst1q_s32(&acc_ptr[col + 8], vacc2);
-                            vst1q_s32(&acc_ptr[col + 12], vacc3);
-                        }
-                        for (; col < Ncore; col++) {
-                            acc_ptr[col] += o[col];
-                        }
-#else
-                        for(int nt=0;nt<Ncore/8;nt++){
-                            for(int nl=0;nl<8;nl++){
-                                acc_ptr[nt*8+nl] += o[nt*8+nl];
-                            }
-                        }
-#endif
-                    }
-                }
-            }
-        }
-        if (active && acc) {
-            for(int m=0;m<M;m++){
-                for(int z=0;z<Ncore;z++){
-                    a->C[(size_t)m*N + n0+ci0+z] = acc[m*Ncore + z];
-                }
-            }
-        }
-    }
-    free(acc); return NULL;
-}
-static int run_i4_mc(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc){
-    int fd=c->fd;
-    if(nc>c->soc->cores)nc=c->soc->cores;
-    if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    if(nc<1)nc=1;
-    ork_npu_enter(c,DT_I4,XP_I4_MC,OCK_NONE);
-    if(mc_ensure(c,nc)) return -1;
-    size_t osz=(size_t)c->soc->nmax*(M > 1 ? 2 * M : 1)*2;        /* per-core output: up to a full N-slice of int16 */
-    if(ork_i4_batch()){ size_t mo=(size_t)c->soc->nmax*64*2; if(osz<mo)osz=mo; }  /* batch de-tile: physrow up to 4*HCAP(=16)*NB = 64*Ncore int16 */
-    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
-    size_t asz=(size_t)M*ORK_I4_KS/2;
-    if(asz < (size_t)4*32768*2) asz=(size_t)4*32768*2;
-    for(int i=0;i<nc;i++){ if(c->maf[i].size<asz){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,asz,0x403,c->dom_active); if(!c->maf[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate multi-core activation maf[%d] (size=%zu)\n", i, asz);return -2;} } }
-    /* Zero-copy chaining (the portable half of the int8 zero-copy design — perf-neutral, correctness
-     * for DMA pipelines). int4 can't read/write the caller's A/C *directly* (A needs the nibble re-tile,
-     * the int16 hardware output needs widening to the int32 C), so the internal AF/O scratch is
-     * mandatory. But when A/C are ork_dma_alloc buffers, int4 must still observe coherency so it
-     * composes with up/downstream NPU ops: invalidate a DMA-resident A once before the CPU re-tiles it
-     * (see NPU-produced input), and flush a DMA-resident C once after the CPU writes it (downstream NPU
-     * sees the output). dirty-line eviction otherwise corrupts a chained op — the same hazard the int8
-     * output zero-copy fix addressed. */
-    struct buf *abuf=dma_find(c,A), *cbuf=dma_find(c,C);
-    if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_FROM_DEVICE);   /* CPU re-tile must see an NPU-produced A */
-    struct i4mcw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
-    for(int i=0;i<nc;i++) args[i]=(struct i4mcw){c,i,nc,M,w,A,C,0};
-    c->mc_error = 0;
-    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker,&args[i]);
-    i4_mcworker(&args[0]);                                /* core 0 on the calling thread */
-    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
-    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
-    if(cbuf) bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);     /* flush host-written C for a downstream NPU op */
-    return 0;
-}
-
-struct i4gw { ork_npu *c; int core, nc, M; ork_w *w; const int8_t *A; const float *aS,*bS; float *Cf; int rc; };
-static void *i4_mcworker_g(void *vp){
-    struct i4gw *a=vp; ork_npu *c=a->c; int i=a->core, nc=a->nc, M=a->M, fd=c->fd;
-    pin_big_core(i);                           /* core 0 = calling thread, 1.. = spawned workers */
-    ork_w *w=a->w; int K=w->K,N=w->N,G=w->gsize,NMAX=c->soc->nmax,Sk=w->Sk;
-    struct buf *RC=&c->mrc[i],*AF=&c->maf[i],*O=&c->mcc[i]; a->rc=0;
-    float *acc=malloc((size_t)NMAX*4);
-    if(!acc){
-        a->rc=-1; c->mc_error=1;
-    }
-    for(int ns=0;ns<w->Sn;ns++){
-        int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NB=Nc/64;
-        int b0=(int)((long)i*NB/nc),b1=(int)((long)(i+1)*NB/nc);
-        int active=(b1>b0);
-        int ci0=active?b0*64:0,Ncore=active?(b1-b0)*64:64;
-        for(int m=0;m<M;m++){ const int8_t*Arow=a->A+(size_t)m*K;
-            if (active && acc) {
-                for(int z=0;z<Ncore;z++)acc[z]=0;
-            }
-            for(int g=0;g<Sk;g++){
-                if (!c->mc_error) {
-                    tile_i4_Aslice(AF->cpu,Arow,g*G,G); bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
-                }
-                uint64_t wbase=w->Bb[(size_t)ns*Sk+g].dma+(uint64_t)(active?b0:0)*G*32;
-                uint32_t rc[REGCMD_I4_N]; synth_i4(rc,1,G,Ncore,(uint32_t)AF->dma,(uint32_t)wbase,(uint32_t)O->dma);
-                if (validate_regcmd("i4_mcworker_g", c, rc, REGCMD_I4_N, w, NULL, 0)) {
-                    a->rc = -1; c->mc_error = 1;
-                }
-                if (!c->mc_error) {
-                    memcpy(RC->cpu,rc,sizeof rc); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-                }
-                int reps=c->mwarm[i]?1:2;
-                if (c->mc_error) {
-                    a->rc = -1;
-                    free(acc);
-                    return NULL;
-                }
-                struct rknpu_submit sub;
-                memset(&sub, 0, sizeof sub);
-                sub.flags = ork_ppflags();
-                sub.task_number = 1;
-                sub.task_obj_addr = c->mtk[i].obj;
-                sub.fence_fd = -1;
-                sub.core_mask = 1u << i;
-                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
-                /* ORK_I4G_DOORBELL: dispatch each per-group submit NONBLOCK + spin-poll a DRAM doorbell (the last
-                 * output int16, seeded to an unproducible sentinel) instead of the blocking wait — cuts the
-                 * per-submit scheduler-wake off the K/G-submit grouped-int4 cost. SAFE at M=1 (nc=1, one submit
-                 * stream); NOT for large-M grouped (nc>1 concurrent streams -> wedge risk). */
-                static int i4g_db=-1; if(i4g_db<0){const char*e=getenv("ORK_I4G_DOORBELL"); i4g_db=(e&&atoi(e))?1:0;}
-                for (int rep = 0; rep < reps; rep++) {
-                    int last = (rep == reps - 1);
-                    sub.timeout = mm_timeout_ms();
-                    if (i4g_db) {
-                        volatile int16_t *db=(volatile int16_t*)O->cpu + (Ncore-1);   /* last output elem = doorbell */
-                        const int16_t SENT=0x7fff;                                    /* int4·int4·G max ~8192 < 32767 */
-                        *db=SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
-                        struct rknpu_submit s2=sub; s2.flags |= 0x2;                  /* NONBLOCK */
-                        if (rknpu_submit_ioctl(fd, &s2, w->domain)) { if(last){a->rc=-1;free(acc);return NULL;} continue; }
-                        long sp=0; for(;sp<20000000L && *db==SENT;sp++){ __asm__ volatile("dc civac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory"); }
-                        if (sp>=20000000L){ if(last){a->rc=-1;free(acc);return NULL;} continue; }
-                        bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);                      /* coherent full-tile read for the accumulate */
-                    } else {
-                        if (rknpu_submit_ioctl(fd, &sub, w->domain)) {
-                            if (last) {
-                                a->rc = -1;
-                                free(acc);
-                                return NULL;
-                            }
-                            continue;
-                        }
-                        bsync(fd, O, RKNPU_MEM_SYNC_FROM_DEVICE);
-                    }
-                }
-                c->mwarm[i]=1;
-                if (active && acc) {
-                    int16_t*o=O->cpu; float as=a->aS[(size_t)m*Sk+g];
-                    const float *bS_ptr = a->bS + (size_t)g*N + n0+ci0;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-                    float32x4_t vas = vdupq_n_f32(as);
-                    int col = 0;
-                    for (; col <= Ncore - 16; col += 16) {
-                        int16x8_t vo16_0 = vld1q_s16(&o[col]);
-                        int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
-
-                        int32x4_t vo32_0_low  = vmovl_s16(vget_low_s16(vo16_0));
-                        int32x4_t vo32_0_high = vmovl_s16(vget_high_s16(vo16_0));
-                        float32x4_t vo_f_0_low  = vcvtq_f32_s32(vo32_0_low);
-                        float32x4_t vo_f_0_high = vcvtq_f32_s32(vo32_0_high);
-
-                        int32x4_t vo32_1_low  = vmovl_s16(vget_low_s16(vo16_1));
-                        int32x4_t vo32_1_high = vmovl_s16(vget_high_s16(vo16_1));
-                        float32x4_t vo_f_1_low  = vcvtq_f32_s32(vo32_1_low);
-                        float32x4_t vo_f_1_high = vcvtq_f32_s32(vo32_1_high);
-
-                        float32x4_t vbS_0_low  = vld1q_f32(&bS_ptr[col]);
-                        float32x4_t vbS_0_high = vld1q_f32(&bS_ptr[col + 4]);
-                        float32x4_t vbS_1_low  = vld1q_f32(&bS_ptr[col + 8]);
-                        float32x4_t vbS_1_high = vld1q_f32(&bS_ptr[col + 12]);
-
-                        float32x4_t vacc_0_low  = vld1q_f32(&acc[col]);
-                        float32x4_t vacc_0_high = vld1q_f32(&acc[col + 4]);
-                        float32x4_t vacc_1_low  = vld1q_f32(&acc[col + 8]);
-                        float32x4_t vacc_1_high = vld1q_f32(&acc[col + 12]);
-
-                        float32x4_t vprod_0_low  = vmulq_f32(vbS_0_low,  vo_f_0_low);
-                        float32x4_t vprod_0_high = vmulq_f32(vbS_0_high, vo_f_0_high);
-                        float32x4_t vprod_1_low  = vmulq_f32(vbS_1_low,  vo_f_1_low);
-                        float32x4_t vprod_1_high = vmulq_f32(vbS_1_high, vo_f_1_high);
-
-                        vacc_0_low  = vmlaq_f32(vacc_0_low,  vprod_0_low,  vas);
-                        vacc_0_high = vmlaq_f32(vacc_0_high, vprod_0_high, vas);
-                        vacc_1_low  = vmlaq_f32(vacc_1_low,  vprod_1_low,  vas);
-                        vacc_1_high = vmlaq_f32(vacc_1_high, vprod_1_high, vas);
-
-                        vst1q_f32(&acc[col],      vacc_0_low);
-                        vst1q_f32(&acc[col + 4],  vacc_0_high);
-                        vst1q_f32(&acc[col + 8],  vacc_1_low);
-                        vst1q_f32(&acc[col + 12], vacc_1_high);
-                    }
-                    for (; col < Ncore; col++) {
-                        acc[col] += as * bS_ptr[col] * (float)o[col];
-                    }
-#else
-                    for(int col=0;col<Ncore;col++) acc[col]+= as * bS_ptr[col] * (float)o[col];
-#endif
-                }
-            }
-            if (active && acc) {
-                for(int z=0;z<Ncore;z++) a->Cf[(size_t)m*N + n0+ci0+z]=acc[z];
-            }
-        }
-    }
-    free(acc); return NULL;
-}
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    /* B: DEFAULT route grouped int4 through the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float
-     * scale-accumulate drain). ORK_I4G_NODB=1 reverts to the blocking i4_mcworker_g; NULL (chain/scratch too
-     * big) also falls through. */
-    { static int i4gdb=-1; if(i4gdb<0){const char*e=getenv("ORK_I4G_NODB"); i4gdb=(e&&atoi(e))?0:1;}
-      if(i4gdb){ ork_dyn_chain *hg=ork_dyn_begin_mc_i4_grouped(c,M,w,A,aScale,bScale,C,0); if(hg) return ork_dyn_grouped_end(hg)?-1:0; } }
-    int fd=c->fd, NB=w->N/64, nc=budget(c, M);
-    if(nc>NB)nc=NB;
-    if(nc>c->soc->cores)nc=c->soc->cores;
-    if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    if(nc<1)nc=1;
-    static int logged = 0;
-    if (!logged) {
-        fprintf(stderr, "[ork] ork_mm_run_i4_grouped: M=%d, N=%d, K=%d, nc=%d, NB=%d\n", M, w->N, w->K, nc, NB);
-        logged = 1;
-    }
-    ork_npu_enter(c,DT_I4,XP_I4_MC,OCK_NONE);
-    if(mc_ensure(c,nc)) return -1;
-    size_t osz=(size_t)c->soc->nmax*2;
-    for(int i=0;i<nc;i++){ if(c->mccsz[i]<osz){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,osz,0x403,c->dom_active); c->mccsz[i]=osz; c->mwarm[i]=0; if(!c->mcc[i].cpu){fprintf(stderr, "[ork] ERROR: failed to allocate grouped multi-core output mcc[%d] (size=%zu)\n", i, osz);return -2;} } }
-    struct i4gw args[ORK_MAXCORE]; pthread_t th[ORK_MAXCORE];
-    for(int i=0;i<nc;i++) args[i]=(struct i4gw){c,i,nc,M,w,A,aScale,bScale,C,0};
-    c->mc_error = 0;
-    for(int i=1;i<nc;i++) pthread_create(&th[i],NULL,i4_mcworker_g,&args[i]);
-    i4_mcworker_g(&args[0]);
-    for(int i=1;i<nc;i++) pthread_join(th[i],NULL);
-    for(int i=0;i<nc;i++) if(args[i].rc) return -1;
-    return 0;
+    /* Grouped int4 runs on the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float scale-accumulate
+     * drain). NULL (chain/scratch too big / ineligible) => refuse (rescue-eligible); the blocking
+     * i4_mcworker_g path is removed (#45). */
+    ork_dyn_chain *hg=ork_dyn_begin_mc_i4_grouped(c,M,w,A,aScale,bScale,C,0);
+    if(hg) return ork_dyn_grouped_end(hg)?-1:0;
+    return ORK_RC_WEDGE_PRONE;
 }
 
 static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
@@ -6164,15 +4961,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * Before the anchor, multi-core imports non-deterministically corrupted output (C[last] wrong, dropped
      * K-slices) — that was a fresh-domain establishment race, NOT a core issue (single-core corrupted too).
      * No single-core gate is needed; see the >4GiB-import notes (wiki Tier 10 / NPU-Quirks). */
-    /* ORK_MC1=1: route single-core (nc==1) through run_multicore so it uses the CHAINED prefill path
-     * (M-tiles PC-chained into ~1 submit) instead of the per-tile single-core path (~19 submits). For
-     * measuring chained-ork-1core vs rknn-1core apples-to-apples (rknn chains its M-tiles in 1 submit). */
     if(nc>1){ int rmc=run_multicore(c,w,M,A,C,nc); if(rmc!=ORK_RC_F16_SC) return rmc; }   /* ORK_RC_F16_SC: fp16 fallback -> fall through to the single-core fp16 reference below (no mcworker) */
-    { static int mc1=-1; if(mc1<0){const char*e=getenv("ORK_MC1"); mc1=e?atoi(e):0;}
-      if(mc1 && M>1 && w->dtype==DT_I8 && c->soc->cores>=1) return run_multicore(c,w,M,A,C,1); }   /* mc1 int8-only: fp16 must not re-enter run_multicore (would re-signal ORK_RC_F16_SC) */
     pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
-    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see mcworker) */
+    if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see the fp16 colsplit path) */
     int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
@@ -11822,7 +10614,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
  * ork_mm_run_i4_grouped's doorbell path. Row-decomposed (M=1 tasks across cores); each row emits Sn*Sk programs
  * (K-slice = gsize G, Sk = K/G groups). Output = Sk int16 partial blocks of [N] per row. Unlike A2's int-sum,
  * the drain (ork_dyn_grouped_end) FLOAT scale-accumulates: C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]
- * (matches i4_mcworker_g). NULL if ineligible (chain/scratch too big) -> caller uses the blocking i4_mcworker_g. */
+ * (matches the grouped drain). NULL if ineligible (chain/scratch too big) -> caller refuses (ORK_RC_WEDGE_PRONE; the blocking i4_mcworker_g path is removed #45). */
 static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A,
                                                   const float *aScale, const float *bScale, float *Cf, int nc) {
     if (!w || w->dtype != DT_I4 || !w->gsize || M < 1 || M > 1024) return NULL;
@@ -12066,7 +10858,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
          * the 3 cores write DISJOINT C column ranges (dst=C+c0), so no cross-core race. NEON int32 (bit-exact:
          * integer add is associative). dst[i]=NULL => ork_dyn_end's copy-back skips this core. */
         if (a->h->oSk[i] > 1 && a->h->dst[i]) {   /* PER-CORE PARALLEL accumulate (int8 AND fp16) — each core sums its
-            * own Sk [M,Ncore] partials in this pool thread, EXACTLY like mcworker (4817-4821). The blocking per-slice
+            * own Sk [M,Ncore] partials in this pool thread (per-core parallel accumulate). The blocking per-slice
             * submits + the FROM_DEVICE bsync above guarantee this core's partials have landed in DRAM; the lockstep
             * barrier (csub_barrier) guarantees no core crossed into a later Bb[ks] while another was still fetching
             * this one (the concurrent-cross-buffer CDMA wild that produced the wrong-answers). So fp16 no longer needs
@@ -12436,15 +11228,15 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
     /* P3 sub-nmax column-tiling: a single int8 matmul multi-cored by N-column split across cores. base:
      * Sn==1 & K<=4096 & Bf (any M). M=1 also does wide-N (Sn>1, K<=4096, Bf; core's range spans slices) and
-     * wide-K (Sn==1, K>4096; per-core K-split accumulate over Bb K-slices — no Bf). M>1 wide-N/wide-K stay on
-     * mcworker (their multi-slice/K-split done + strided writes are unverified at M>1). */
+     * wide-K (Sn==1, K>4096; per-core K-split accumulate over Bb K-slices — no Bf). M>1 wide-N/wide-K are dispatched by run_multicore's
+     * colsplit (this direct ork_dyn_begin_mc entry serves the M=1 / SSM-stream callers). */
     { const ork_w *cw = tasks[0].w; int cM = tasks[0].M, ci8 = (cw->dtype == DT_I8 && (cw->N / 32) >= 2);
       int c_base = ci8 && cw->Sn == 1 && cw->K <= 4096 && cw->Bf;
       int c_wideN = ci8 && cw->Sn > 1 && cw->K <= 4096 && cw->Bf;   /* any M: colsplit base path M-tiles + N-slices */
       int c_wideK = ci8 && cw->Sn == 1 && (cw->K > 4096 || !cw->Bf);  /* any M: colsplit wide-K M-tiles the K-slice programs. K<=4096 no-Bf (ORK_NO_BF) also rides the Bf-free K-split here (matches run_multicore r_wideK) — else it falls through to the M>64 !Bf NULL refuse (was mis-read as #36 N=3584; really this gate gap) */
       (void)cM;
       if (S == 1 && nc > 1 && (c_base || c_wideN || c_wideK)) return ork_dyn_begin_colsplit(c, &tasks[0], nc); }
-      /* fp16 colsplit is routed ONLY from run_multicore (which falls back to mcworker on NULL) — NOT here, so
+      /* fp16 colsplit is routed ONLY from run_multicore (which falls back to the single-core fp16 reference on NULL) — NOT here, so
        * direct ork_dyn_begin_mc callers (e.g. the SSM stream/pool fp16 path) keep their pre-Stage-1 behavior. */
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
@@ -14723,7 +13515,7 @@ int ork_mm_run_i4_incr(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C)
     int fd=c->fd, K=w->K, N=w->N, NBLK=N/64;
     const int NBW=64;                                 /* per-N-block matmul width (the vendor-validated case) */
     static struct buf sA={0}, sC={0}, sRC={0}, sTK={0}; static int cap_M=0,cap_K=0, warm=0;
-    /* int4 regcmd mode is stateful: reset when entering int4 from another dtype (mirrors run_i4_mc) */
+    /* int4 regcmd mode is stateful: reset when entering int4 from another dtype (mirrors the int4 run path) */
     if(ork_npu_enter(c,DT_I4,XP_I4_INCR,OCK_NONE)) warm=0;
     if(M>cap_M||K>cap_K){
         warm=0;   /* fresh output buffer -> first submit reads stale; needs a warmup rep (AGENTS cold-start) */

@@ -360,8 +360,8 @@ Families: `ORK_SILU_40xx` / `ORK_SILU_OBYTES` / `ORK_SILU_38DIV` (fused-SiLU out
 `ORK_I16OUT_*` / `ORK_F16OUT_*` (int16/fp16 matmul output-stage encoding), `ORK_F16_C*` / `ORK_F16_R*` /
 `ORK_F16_ZA` / `ORK_F16_MTILE` / `ORK_F16_GCAP` (fp16 fused-SiLU calibration), `ORK_ADD16_R*` (int16 add),
 `ORK_EW_*` (element-wise-mul RE), `ORK_SM_*` (softmax-replay layout), `ORK_I4_1010`/`_1040`/`_CB_*`/`_ALAY`/
-`_NSUB`/`_MREGS` (int4 scheduler/bank RE), `ORK_R1040`, `ORK_MC1`, `ORK_SMALLTILE*`, `ORK_*_PROBE_*`,
-`ORK_CHAIN_KSPLIT*`, `ORK_CONSOLIDATE_I8`, `ORK_DIRECT_I4`, `ORK_I16_DOM0`/`_RESET`/`_CON1`/`_DUMP`,
+`_NSUB`/`_MREGS` (int4 scheduler/bank RE), `ORK_R1040`, `ORK_SMALLTILE*`, `ORK_*_PROBE_*`,
+`ORK_CONSOLIDATE_I8`, `ORK_DIRECT_I4`, `ORK_I16_DOM0`/`_RESET`/`_CON1`/`_DUMP`,
 `ORK_PROBE_RESET`, `ORK_NPU_TESTCORE`, `ORK_FUSED_DUMP`/`_MTILE`, `ORK_GATE_ABLATE`, `ORK_IMATRIX`.
 Grep `ORK_` in `src/` and the ggml-ork backend for the exhaustive list.
 
