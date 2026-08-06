@@ -4381,7 +4381,9 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * reverts to the blocking run_i4_mc. Sk==1 (single K-group); A1 added Sn>1 (each row's N-slices = chained
      * column-slice programs). -4 => fall back (K-split/grouped, or chain too big for the per-core buffers). */
     static int i4db=-1; if(i4db<0){const char*e=getenv("ORK_I4_NODB"); i4db=(e&&atoi(e))?0:1;}
-    if(i4db && M>=2){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r; }   /* A1 Sn>1 + A2 Sk>1 supported; begin_mc_i4 -4s an over-large chain -> blocking run_i4_mc */
+    if(i4db && M>=1){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;   /* per-row doorbell chain (M=1 decode = 1-row chain) — covers decode + Sk>1 + Sn>1, validated maxerr=0 */
+        return ORK_RC_WEDGE_PRONE; }   /* doorbell -4 (over-large chain / unsupported int4 shape): refuse (rescue-eligible), NEVER the blocking i4_mcworker — int4 is off mcworker on the default path (#45) */
+    /* ORK_I4_NODB opt-in ONLY (default is the doorbell above): the legacy blocking int4 path (i4_mcworker), kept for A/B until the Stage-4 mcworker deletion. */
     if(!g_ork_prof) return run_i4_mc(c,w,M,A,C,nc);
     double t0=ork_now_us(); int r=run_i4_mc(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++; return r;
 }
