@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <stdarg.h>
 #include <unistd.h>
 #include <sys/mman.h>
 #include <pthread.h>
@@ -176,6 +177,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     pthread_mutex_t pmu; pthread_cond_t pgo, pdn; void *pjob; int pjob_nc, pgen, pdone, pstop;
     void *(*pjob_fn)(void *); size_t pjob_stride;   /* generalized pool dispatch: per-core worker + arg stride */
     pthread_barrier_t b_ioctl; int mc_submit_rc; int mc_error;
+    int f16_force_blocking;   /* colsplit worker: force BLOCKING submit even under ORK_F16_SENTINEL (nonblock-detect + blocking-heal hybrid: attempt 0 nonblock/fast-detect, retries blocking so the kernel watchdog REAPS+clears the sticky slice-1 drop) */
     int last_async_cpu;   /* sched_getcpu() of the most recent async worker at entry (diagnostic/test: -1 = none) */
     /* zero-copy registry: caller-allocated NPU-coherent DMA buffers (ork_dma_alloc). When a matmul's
      * A/C live in one of these, the regcmd points at them directly — no host gather/writeout memcpy. */
@@ -220,7 +222,9 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * cache of per-(M,N,domain) C/RC/TK+tiles (q's N=3584 and k/v's N=512 coexist without thrash). */
     struct buf fold_A; int fold_A_M, fold_A_dom;
     struct fold_scratch *fold_scr[8]; int fold_scr_n; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */ };
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
+    struct buf Bbc; int Bbc_valid; /* (A) fp16 CONTIGUOUS weight: all Sk K-slice Bb[ks] concatenated into ONE buffer (built lazily on first ORK_F16_CONTIG colsplit) so the HW chain can walk slice->slice WITHOUT crossing a dma-buf boundary (the cross-buffer CDMA-wild) — enables one chained submit/core like int8. Sn==1 only. */
+    struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */ };
 /* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
  * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
  * so the guard makes this local copy defer to it (identical shape either way — no conflicting-types). */
@@ -270,6 +274,11 @@ static int is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const st
                 if (w->Bf[i].cpu && addr >= w->Bf[i].dma && addr < w->Bf[i].dma + w->Bf[i].size) return 1;
             }
         }
+        /* fp16 CONTIG (Task #50): the contiguous concatenated weight (all K-slices in ONE buffer). Without this
+         * clause a valid Bbc.dma+offset weight base was FALSE-flagged "wild/unallocated" -> validate_regcmd failed
+         * -> CONTIG refused -> fell back to the concurrent per-slice path that wedges. Bbc.cpu==0 when unused. */
+        if (w->Bbc.cpu && addr >= w->Bbc.dma && addr < w->Bbc.dma + w->Bbc.size) return 1;
+        for (int i = 0; i < 3; i++) if (w->Bgap[i].cpu && addr >= w->Bgap[i].dma && addr < w->Bgap[i].dma + w->Bgap[i].size) return 1;   /* CONTIG GAP-stagger filler buffers */
     }
     if (extra && extra_n > 0) {
         for (int i = 0; i < extra_n; i++) {
@@ -436,6 +445,21 @@ static void live_add(int fd, uint32_t h, uint64_t o){ pthread_mutex_lock(&g_live
 static void live_del(uint32_t h){ pthread_mutex_lock(&g_live_mu);
     for(int i=0;i<g_live_n;i++) if(g_live[i].handle==h){ g_live[i]=g_live[--g_live_n]; break; }
     pthread_mutex_unlock(&g_live_mu); }
+/* IMPORT REGISTRY (fd-reap recovery, task #47). A parallel registry holding POINTERS to every dma-buf-IMPORTED
+ * buf (bimport / bimport_fd) — the ones whose backing pages PERSIST across a DRM-fd close (the client/heap holds
+ * the dma-buf fd). ork_ctx_fd_reap() walks this to RE-IMPORT each buffer into the reopened fd and rewrite its
+ * handle/IOVA/obj/cpu IN PLACE, so resident weights survive a close+reopen with NO re-pack (only bcreate'd buffers
+ * — scratch — are lost, and those lazily re-create). Pointers are stable (Bb[]/own_bufs[] are calloc'd arrays);
+ * bdestroy unregisters. Values-registry g_live is for SIGTERM MEM_DESTROY; this one is for reap re-import. */
+static struct buf **g_imp=NULL; static int g_imp_n=0, g_imp_cap=0;
+static void imp_reg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
+    for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ pthread_mutex_unlock(&g_live_mu); return; }   /* dedupe */
+    if(g_imp_n==g_imp_cap){ int nc=g_imp_cap?g_imp_cap*2:128; void*p=realloc(g_imp,(size_t)nc*sizeof*g_imp); if(p){g_imp=p;g_imp_cap=nc;} }
+    if(g_imp_n<g_imp_cap) g_imp[g_imp_n++]=b;
+    pthread_mutex_unlock(&g_live_mu); }
+static void imp_unreg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
+    for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ g_imp[i]=g_imp[--g_imp_n]; break; }
+    pthread_mutex_unlock(&g_live_mu); }
 static volatile sig_atomic_t g_sig_busy=0;
 static void ork_sig_teardown(int sig){
     if(!g_sig_busy){ g_sig_busy=1; int fd=g_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
@@ -469,7 +493,7 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
 }
 static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
-    live_del(b->handle);
+    live_del(b->handle); imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
     g_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
@@ -1993,6 +2017,20 @@ uint64_t ork_npu_dma_rw(ork_npu *c){ if(!c) return 0; struct rknpu_action a; mem
  * to capture state before a wedge/reboot destroys it. task_counter is a submit-time out field (0 for NONBLOCK)
  * so it is not queryable post-hoc; the DMA-amount deltas + the per-op output doorbells (ork_dyn_progress) are
  * the post-mortem signals. */
+/* Emit a diagnostic line to /dev/kmsg so it rides netconsole OFF-BOX and survives a hard wedge that stdout/files can't
+ * (a fatal wedge loses anything still on the board; kmsg->netconsole->Mac is already gone by then). Rare wedge-path only.
+ * <4>=KERN_WARNING passes the default console loglevel. Best-effort: needs root (the tests run as root); silent if not. */
+static void ork_kmsg(const char *fmt, ...){
+    char msg[504]; va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
+    int kfd = open("/dev/kmsg", O_WRONLY|O_CLOEXEC);
+    if(kfd >= 0){ char buf[512]; int n = snprintf(buf, sizeof buf, "<4>ork: %s", msg);
+        if(n>0){ ssize_t w=write(kfd, buf, (size_t)n<sizeof buf?(size_t)n:sizeof buf-1); (void)w; } close(kfd); }
+    /* ORK_F16_TRACE=<path>: ALSO mirror every step to a local, line-flushed file so a `tail -f` shows live progress
+     * even when netconsole is lossy or the run never emits campaign output (e.g. a wedge-spin before the loop). */
+    const char *tp = getenv("ORK_F16_TRACE");
+    if(tp){ static FILE *tf; static int opened; if(!opened){ opened=1; tf=fopen(tp,"a"); }
+        if(tf){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); fprintf(tf, "[%ld.%03ld] %s\n", (long)ts.tv_sec, ts.tv_nsec/1000000L, msg); fflush(tf); } }
+}
 void ork_npu_dump_state(ork_npu *c, const char *label){
     if(!c) return; int fd=c->fd; struct rknpu_action a;
     unsigned long long freq=0,volt=0,iommu=0,sram=0,hwv=0;
@@ -2004,10 +2042,11 @@ void ork_npu_dump_state(ork_npu *c, const char *label){
      * which read 0 on this kernel): (1) g_fd_hw_raw_last = the kernel's per-submit NPU-busy time (hw_elapse),
      * captured after EVERY submit; 0 => the last job did NO work (faulted/never ran). (2) per-task int_status
      * from the shared task buffer (read after a FROM_DEVICE sync). */
-    struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
-    fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=0x%x 0x%x 0x%x 0x%x\n",
-            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)g_fd_hw_raw_last, t[0].int_status,t[1].int_status,t[2].int_status,t[3].int_status);
+    struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;   /* NULL after an fd-reap (task buffer died with the fd, re-created lazily on the next run) — guard the deref */
+    if(t) bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
+    fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=%s0x%x 0x%x 0x%x 0x%x\n",
+            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)g_fd_hw_raw_last, t?"":"(no task buf) ",
+            t?t[0].int_status:0u, t?t[1].int_status:0u, t?t[2].int_status:0u, t?t[3].int_status:0u);
 }
 /* Soft-reset the NPU (RKNPU_ACT_RESET) and force a re-warm (clear c->warmed). Intended as the recovery step
  * AFTER ork_npu_dump_state when a round goes awry: it clears a stuck/faulted job so the bad state does not
@@ -2015,6 +2054,67 @@ void ork_npu_dump_state(ork_npu *c, const char *label){
 int ork_npu_soft_reset(ork_npu *c){ if(!c) return -1; struct rknpu_action a; memset(&a,0,sizeof a);
     a.flags=RKNPU_ACT_RESET; int r=ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a); c->warmed=0;
     for(int i=0;i<c->soc->cores;i++) c->mwarm[i]=0; return r; }
+/* FD-REAP recovery (task #47): the ONLY nonblock-compatible CLEAN reap of a poisoned drop. close(fd) => drm_release
+ * cancels ALL stuck jobs + tears down the whole IOMMU domain (device-global; the driver has no userspace job-abort,
+ * and RKNPU_ACT_RESET does NOT release a dropped nonblock job's dangling mapping). We then reopen + re-init the
+ * device and RE-IMPORT every registered dma-buf weight IN PLACE: its pages persist (client/heap holds the dma-buf fd)
+ * and its CPU mmap is of the dma-buf fd (NOT the drm fd) so it SURVIVES the close — only the IOMMU mapping (drm-fd
+ * MEM_CREATE) died, so re-import is just PRIME_FD_TO_HANDLE+MEM_CREATE (new IOVA/handle), no re-pack, no data copy.
+ * bcreate'd scratch (regcmd/task/per-core mcc/maf/mrc/mtk/...) is LOST but lazily re-created (we zero it + its size
+ * caches so the next mc_ensure/alloc rebuilds it on the fresh fd; warmed=0 forces the fp16 2-pass re-warm). Returns
+ * 0 ok, <0 on reopen/re-import failure (context is then unusable). Caller must have quiesced all submits first. */
+static int reimport_inplace(int fd, struct buf *b){   /* re-map a persisted dma-buf into the reopened fd; keep b->cpu/size/heap_fd */
+    if(b->heap_fd<=0 || !b->cpu) return -1;
+    if(!ork_iova_reserve(b->domain, b->size)) return -1;
+    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=b->heap_fd; ph.flags=0;
+    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ ork_iova_release(b->domain,b->size); return -1; }
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=b->domain;
+    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ ork_iova_release(b->domain,b->size); return -1; }
+    ork_kmsg("  reimport heap_fd=%d oldh=%u -> primeh=%u memh=%u dma=0x%llx obj=0x%llx", b->heap_fd, b->handle, ph.handle, mc.handle, (unsigned long long)mc.dma_addr, (unsigned long long)mc.obj_addr);
+    b->handle=mc.handle; b->dma=mc.dma_addr; b->obj=mc.obj_addr;   /* new IOVA/handle; cpu/size/heap_fd/domain unchanged */
+    live_add(fd,b->handle,b->obj); return 0;
+}
+static int g_reap_n=0;
+int ork_ctx_fd_reap(ork_npu *c){
+    if(!c || c->fd<0) return -1;
+    const char *card=getenv("ORK_NPU_CARD"); if(!card)card=c->soc->card;
+    ork_kmsg("FD-REAP #%d: close(fd=%d) g_imp=%d g_live=%d — drm_release device teardown", ++g_reap_n, c->fd, g_imp_n, g_live_n);
+    /* ABORT any stuck/dropped in-flight job in-kernel BEFORE close. A REAL drop leaves an accepted-but-stuck job still
+     * referencing a GEM object; drm_release then DOUBLE-PUTS that object (job-cleanup put + handle-release put) ->
+     * refcount underflow/use-after-free -> slab corruption (vendor rknpu bug). RKNPU_ACT_RESET removes the job from the
+     * scheduler first, so the subsequent close/drm_release puts each handle exactly once. (Proven necessary only for
+     * REAL drops: 10 FORCE_WEDGE reaps of a CLEAN fd never underflowed; the underflow needs a stuck job at close.) */
+    { struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&ra);
+      struct timespec qs={0,2000000}; nanosleep(&qs,NULL); }   /* 2ms: let the reset settle + the aborted job drain before close */
+    close(c->fd);
+    int nf=open(card,O_RDWR); if(nf<0){ perror("FD-REAP reopen"); c->fd=-1; return -1; }
+    prctl(PR_SET_TIMERSLACK,(unsigned long)1000,0UL,0UL,0UL);
+    act(nf,RKNPU_POWER_ON,0); act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    c->fd=nf;
+    /* all prior IOMMU mappings + live handles are gone with the old fd */
+    pthread_mutex_lock(&g_live_mu); g_live_n=0; g_live_fd=nf; pthread_mutex_unlock(&g_live_mu);
+    for(int d=0; d<ORK_IOVA_NDOM; d++) g_iova_bytes[d]=0;
+    /* re-import every registered dma-buf weight IN PLACE (pages + cpu mmap persisted across the close) */
+    int reimp=0, fail=0; pthread_mutex_lock(&g_live_mu); int nimp=g_imp_n;
+    struct buf **imps=malloc((size_t)(nimp>0?nimp:1)*sizeof*imps); for(int i=0;i<nimp;i++) imps[i]=g_imp[i];
+    pthread_mutex_unlock(&g_live_mu);
+    for(int i=0;i<nimp;i++){ if(reimport_inplace(nf,imps[i])==0) reimp++; else fail++; }
+    free(imps);
+    ork_kmsg("FD-REAP: reopened fd=%d, re-imported %d dma-buf weights (%d failed)", nf, reimp, fail);
+    /* INVALIDATE bcreate'd scratch (lost with the fd) so it lazily re-creates on the fresh fd */
+    #define ZB(b) memset(&(b),0,sizeof(b))
+    ZB(c->regcmd); ZB(c->task); ZB(c->Af); ZB(c->Cc); ZB(c->mtk_all);
+    ZB(c->ppu_a); ZB(c->ppu_b); ZB(c->ppu_o);
+    for(int i=0;i<ORK_MAXCORE;i++){ ZB(c->mrc[i]); ZB(c->mtk[i]); ZB(c->maf[i]); ZB(c->mcc[i]);
+        ZB(c->chain_rc[i]); ZB(c->chain_tk[i]); ZB(c->chain_lrc[i]); ZB(c->chain_lsc[i]);
+        c->mccsz[i]=0; c->mwarm[i]=0; }
+    #undef ZB
+    c->ccsz=0; c->warmed=0; c->mc_alloc=0; c->last_dt=-1; c->last_chain=0;
+    if(c->dom_save){ free(c->dom_save); c->dom_save=NULL; }   /* parked per-domain scratch died with the fd */
+    if(c->dom_anchor){ free(c->dom_anchor); c->dom_anchor=NULL; }
+    c->dom_cap=0; c->dom_active=0;
+    return fail ? -1 : 0;
+}
 /* Recovery probe (the "dummy op") — NONBLOCK + HOST-BOUNDED, so it can NEVER hang on an already-wedged NPU.
  * A blocking submit on a wedged job enters the kernel's `continue wait` and re-waits PAST its own timeout in an
  * uninterruptible D-state (observed 61s->122s, unkillable) — so the recovery probe MUST NOT block. This issues
@@ -2047,6 +2147,37 @@ static int ork_dummy_probe(ork_npu *c){
             if(ork_now_us()-t0>300000.0) break;   /* 300ms host cap => doorbell never landed => still wedged */ } }
     bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc);
     return ok;
+}
+/* REAP stuck async jobs the CLEAN way (task #47 Bug#2): the vendor driver reaps a stuck/timed-out async job via
+ * rknpu_job_timeout_clean, which runs at the TOP of EVERY nonblock submit — if that core's job is past its timeout it
+ * soft-resets + schedule_work(cleanup_work) => a CLEAN rknpu_gem_object_put of the job's task_obj. (Contrast close(fd),
+ * which frees the task buffer UNDER the still-referencing stuck job => the deferred cleanup_work then double-puts a
+ * freed obj => refcount-underflow UAF — the fd-reap wedge.) So: one tiny FP16 nonblock op per core (core_mask=1<<i)
+ * triggers timeout_clean for that core, reaping the fp16 colsplit's dropped slice job. FP16 (matches the warm mode) so
+ * the dummy itself LANDS (doesn't become a new stuck job); its output is irrelevant — timeout_clean fires before it
+ * runs. The dropped job is already past its ~recov_tmo timeout by detect time (800ms poll > 500ms), so it IS reaped. */
+static void ork_npu_reap_stuck(ork_npu *c, int nc){
+    int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems;  unsigned dom=c->dom_active;
+    if(nc<1) nc=1; if(nc>c->soc->cores) nc=c->soc->cores;
+    struct buf A=bcreate(fd,(size_t)K*2,0x403,dom), B=bcreate(fd,(size_t)K*N*2,0x403,dom), Cc=bcreate(fd,(size_t)N*2,0x403,dom);
+    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(B.cpu)bdestroy(fd,&B); if(Cc.cpu)bdestroy(fd,&Cc); return; }
+    memset(A.cpu,0,(size_t)K*2); memset(B.cpu,0,(size_t)K*N*2);
+    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t rc[REGCMD_N]; int sched=((K&(K-1))==0 && K>=128 && K<2048);
+    synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); set_f16_out_fp16in(rc,1,N);
+    memcpy(c->regcmd.cpu,rc,(size_t)REGCMD_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
+    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    for(int i=0;i<nc;i++){
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=1u<<i; s.fence_fd=-1; s.timeout=300;
+        s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        rknpu_submit_ioctl(fd,&s,dom);   /* triggers rknpu_job_timeout_clean(core i) -> clean reap of a timed-out stuck job */
+        ork_kmsg("reap-stuck: fp16 nonblock dummy core=%d (trigger timeout_clean)", i);
+        struct timespec ds={0,3000000}; nanosleep(&ds,NULL);   /* let this core's dummy land + the scheduled cleanup_work run */
+    }
+    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc);
 }
 /* Self-healing recovery: detect -> DUMP everything -> soft RESET -> DUMMY-op probe. Returns 1 if the dummy op
  * PASSES (NPU recovered — caller keeps going), 0 if it FAILS (NPU still broken — caller should throw a fault
@@ -2495,19 +2626,27 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
         /* ORK_WEIGHT_SRAM: request on-chip SRAM for the int8 weight tile (bcreate fails a too-big tile / no-SRAM
          * board over to DRAM). For the CPU/NPU decode PARTITION experiment: NPU reads SRAM ‖ CPU reads DRAM. */
         const uint32_t wflags = getenv("ORK_WEIGHT_SRAM") ? (0x403u|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*esz,wflags,w->domain);
+        /* ORK_F16_IMPORT_W (task #47 fd-reap): back the fp16 weight with a dma-heap IMPORT (bimport) instead of a
+         * plain bcreate, so its pages survive a DRM-fd close+reopen (ork_ctx_fd_reap re-imports it) — the recovery
+         * needs resident weights to persist across the reap. Registered in the import registry for in-place remap. */
+        int f16imp = (dt==DT_F16) && getenv("ORK_F16_IMPORT_W");
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+        *b = f16imp ? bimport(c->fd,(size_t)Kp*Nc*esz,w->domain) : bcreate(c->fd,(size_t)Kp*Nc*esz,wflags,w->domain);
         if(!b->cpu){
-            fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack (size=%zu)\n",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
+            fprintf(stderr,"[ork] ERROR: %s failed to allocate weight buffer Bb[%zu] in pack (size=%zu)\n",f16imp?"bimport":"bcreate",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
             for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
             free(w->Bb); free(w); return NULL;
         }
+        if(f16imp) dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);   /* imports: bracket the CPU fill (rknpu MEM_SYNC doesn't cover foreign imports) */
         if(dt==DT_F16){ f16*bb=b->cpu; const f16*Bf=B;
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
                 bb[nt*KT*16*32+kt*16*32+nl*32+kk]=Bf[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
         } else { int8_t*bb=b->cpu; const int8_t*Bi=B;
             struct tile_i8_arg ta={bb,Bi,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core tiling
         }
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        if(f16imp) dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
+        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+        if(f16imp) imp_reg(b);}}   /* register for fd-reap in-place re-import */
     /* AUTO full-K decode layout (int8, K<=10752): lets the multi-core decode do
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
@@ -4340,6 +4479,7 @@ static void unified_ioctl(struct mcw *a, int i, int nc) {
         sub.task_obj_addr=c->mtk[i].obj;sub.fence_fd=-1;sub.core_mask=1u<<i;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=mm_timeout_ms();
+        if(i==0) trace_submit(&sub);   /* ORK_TRACE: dump the mcworker fp16 regcmd sequence (core 0) for the doorbell-vs-mcworker diff */
         if(rknpu_submit_ioctl(fd,&sub,a->w->domain)){ if(last){ a->rc=-1; return; } }
         bsync(fd,CC,RKNPU_MEM_SYNC_FROM_DEVICE);
     }
@@ -5154,12 +5294,13 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     if(x->setdt) c->last_dt=to;
     return 1;
 }
-/* fp16 multicore matmul (Sn==1) doorbell colsplit. Bit-exact and 1.08-1.4x faster than mcworker WHEN it lands,
- * BUT the K-split (Sk>1) parallel path has a rare (~1/40) completion race that escalates to an NPU WEDGE under
- * sustained load (a blocking submit never returns; SIGTERM can't recover it -> reboot). The SENT-seed + civac
- * verify reduced but did NOT eliminate it. So DEFAULT OFF until root-caused; ORK_F16_COLSPLIT=1 opts in (dev only).
- * mcworker stays the reliable fp16 default. See COLSPLIT_MULTIPREC_WIP.md. */
-static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):0;} return v; }
+/* fp16 multicore matmul (Sn==1) doorbell colsplit — DEFAULT ON (2026-08-05). Bit-exact and 1.04-1.23x faster than
+ * mcworker (A/B, governors-verified). The K-split (Sk>1) drop that used to WEDGE was root-caused as a concurrent
+ * CROSS-BUFFER weight-fetch wild (HW prefetches Bb[ks+1] while Bb[ks] drains) and is now PREVENTED by CONTIG (one
+ * contiguous weight buffer -> no dma-buf boundary -> no wild -> no drop; validated 1000-iter 0-drop + make test).
+ * CONTIG is default-on for Sn==1 inside ork_dyn_begin_colsplit. ORK_F16_NO_COLSPLIT opts back to mcworker (A/B /
+ * escape hatch). See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
+static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):(getenv("ORK_F16_NO_COLSPLIT")?0:1); } return v; }
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
@@ -5205,15 +5346,109 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         return ORK_RC_WEDGE_PRONE;
       }
       /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
-    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2) {
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> mcworker */
         /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
          * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
          * touch). h==NULL (ineligible / buffers too small) FALLS BACK to the mcworker path below. */
         ork_install_term();
         ork_mm_task_i8 tf = { .w = w, .M = M, .A = (const int8_t*)A, .C = (int32_t*)C };
         int ncf = nc; if (ncf > c->soc->cores) ncf = c->soc->cores;
-        ork_dyn_chain *h = ork_dyn_begin_colsplit(c, &tf, ncf);
-        if (h) return ork_dyn_end(h) < 0 ? -1 : 0;
+        /* fp16 STALL DETECT + RECOVER (copies int8's mc_recover_resubmit skeleton — RKNPU_ACT_RESET -> 1ms quiesce
+         * -> resubmit — as a SINGLE-THREADED run-level coordinator, resubmitting the whole colsplit. int8 replays one
+         * stashed submit/core; fp16 can't (its per-slice submits have no single stashed submit + a nonblock re-plumb
+         * would force the 5-9x-slower serial ork_dyn_end accumulate), so the resubmit unit is the whole colsplit —
+         * same detect->reset->quiesce->resubmit-same pattern, fast per-core accumulate preserved. The wild is
+         * intermittent (~1/10-25) like int8's dispatch drop, so a clean-reset resubmit lands with high probability.
+         * Single-threaded (NOT 3 concurrent per-core retries — that hammered a mid-reset NPU into a HARD wedge). */
+        /* DEFAULT 0 = on wedge go STRAIGHT to nc=1 (no resubmit-same): nc=1 is the bit-exact reference so it GUARANTEES
+         * correct output (fixes the ~1.7% wrong-answers the resubmit-same path accepted), and it never hammers a
+         * mid-reset NPU (the resubmit-same x6 was the HARD-wedge risk). ORK_F16_RESUB=<n> re-enables n resubmit-same
+         * attempts for A/B. Blocking stays (nonblock re-wedges fp16). */
+        int fp16_sentinel_r = getenv("ORK_F16_SENTINEL") != NULL;   /* nonblock sentinel path (fast detect) */
+        /* Task #50: ork_dyn_begin_colsplit now heals a dropped fp16 K-slice IN PLACE (reset+reseed+re-launch the workers
+         * over the same buffers, up to ORK_F16_RESUB tries) — the int8 mc_recover_resubmit model. So the run-level loop
+         * must NOT also rebuild-via-begin (the Bug#2 poison path): recov_max=0 => one begin (which heals internally), then
+         * residual mc_error -> nc=1 bit-exact backstop. ORK_F16_REBUILD re-enables the old rebuild-retry for A/B only. */
+        int fp16_recov_max = getenv("ORK_F16_REBUILD") ? (getenv("ORK_F16_RESUB") ? atoi(getenv("ORK_F16_RESUB")) : 6) : 0, fp16_healed = 0, fp16_ineligible = 0;
+        int fp16_block_heal = getenv("ORK_F16_BLOCK_HEAL") != NULL;   /* HYBRID: attempt 0 nonblock (fast detect), retries BLOCKING so the kernel watchdog REAPS the sticky slice-1 drop (userspace ACT_RESET can't) */
+        for (int attempt = 0; attempt <= fp16_recov_max; attempt++) {
+            c->mc_error = 0;   /* clear BEFORE begin (the parallel workers run inside begin + set it on a wedged submit) */
+            c->f16_force_blocking = (fp16_block_heal && attempt > 0) ? 1 : 0;   /* nonblock-detect + blocking-heal */
+            ork_dyn_chain *h = ork_dyn_begin_colsplit(c, &tf, ncf);
+            if (!h) { fp16_ineligible = 1; break; }   /* ineligible / buffers too small -> mcworker at original nc */
+            int rc = ork_dyn_end(h);
+            if (rc >= 0 && !c->mc_error) { fp16_healed = 1; break; }   /* landed clean (kernel-transparent resets included) */
+            /* WEDGE POST-MORTEM: capture the HW fault signature (int_status/hw_elapse/iommu/freeSRAM) at the moment of
+             * detection, BEFORE any reset/resubmit destroys it (per ork_npu_dump_state's "fire before a wedge loses it"
+             * contract). fflush so it streams out even if the box hard-hangs next. */
+            fprintf(stderr, "[F16-WEDGE run-level] attempt %d/%d rc=%d mc_error=%d — pre-recovery HW state:\n", attempt, fp16_recov_max, rc, c->mc_error);
+            ork_kmsg("F16-WEDGE attempt %d/%d rc=%d mc_error=%d (K=%d N=%d M=%d)", attempt, fp16_recov_max, rc, c->mc_error, w->K, w->N, M);
+            ork_npu_dump_state(c, "fp16-wedge PRE-recovery"); fflush(stderr);
+            if (getenv("ORK_F16_FDCLOSE")) {   /* PROBE (ORK_F16_FDCLOSE): does closing the DRM fd REAP the poisoned mapping
+                * CLEANLY (drm_release cancels the stuck job + tears down its IOMMU maps), unlike our bsync (which NULL-derefs
+                * in rknpu_gem_sync_ioctl)? Isolate: close -> reopen -> _exit(0) so the answer isn't masked by stale-buffer
+                * teardown. netconsole shows whether a gem_sync/still-mapped fires between 'begin' and 'reopened'. */
+                int oldfd = c->fd;
+                ork_kmsg("FDCLOSE-REAP begin: close(fd=%d) to force drm_release job-cancel + IOMMU unmap", oldfd);
+                close(oldfd);
+                ork_kmsg("FDCLOSE-REAP: close() returned WITHOUT synchronous crash — reopening %s", c->soc->card);
+                int nf = open(c->soc->card, O_RDWR);
+                if (nf >= 0) { act(nf, RKNPU_POWER_ON, 0); }
+                ork_kmsg("FDCLOSE-REAP: reopened fd=%d (errno=%d) — close+reopen SURVIVED; _exit(0) (skip stale teardown)", nf, nf<0?errno:0);
+                fflush(NULL);
+                _exit(0);
+            }
+            if (attempt < fp16_recov_max && getenv("ORK_F16_FDREAP")) {   /* FD-REAP recovery (task #47): the CLEAN nonblock-safe
+                * reap. close(fd)+reopen tears down the poisoned mapping via drm_release (RKNPU_ACT_RESET can't); the dma-buf
+                * weights (ORK_F16_IMPORT_W) survive + are re-imported in place, scratch lazily rebuilds. Then DE-ESCALATE
+                * this one op to nc=1 (single-core, no concurrent fetch) — do NOT retry the concurrent colsplit, which can
+                * RE-DROP -> another reap -> rapid close/reopen CHURN that faults the kernel IOMMU. Reap cleans the poison;
+                * nc=1 guarantees the retry lands first try (the bit-exact reference). Reap-mechanism proven by REAP_TEST. */
+                ork_kmsg("F16-WEDGE attempt %d/%d -> FD-REAP + de-escalate to nc=1", attempt+1, fp16_recov_max);
+                if (ork_ctx_fd_reap(c) < 0) fprintf(stderr, "[ork] fp16 FD-REAP failed (context unusable)\n");
+                break;   /* fall through to the nc=1 de-escalation below (single-core mcworker on the reaped+re-imported ctx) */
+            }
+            if (attempt < fp16_recov_max && getenv("ORK_F16_TCLEAN")) {   /* TIMEOUT-CLEAN recovery (task #47, the driver's
+                * intended path): NO reset, NO fd-close. Just retry the colsplit — its nonblock submits call
+                * rknpu_job_timeout_clean at the top, which CLEANLY reaps THIS attempt's dropped (now timed-out) slice job
+                * (soft-reset + schedule cleanup_work -> proper task_obj put) before dispatching. Buffers stay alive so the
+                * deferred cleanup never UAFs (that was the fd-close bug). Mirrors int8 mc_recover_resubmit. */
+                ork_kmsg("F16-WEDGE attempt %d/%d -> TCLEAN retry (resubmit triggers timeout_clean reap)", attempt+1, fp16_recov_max);
+                continue;
+            }
+            if (attempt < fp16_recov_max) {   /* wedge (a core's submit dropped): N resets (drain between) + resubmit-same.
+                * The fp16 slice-1 doorbell drop is STICKY across a SINGLE RKNPU_ACT_RESET (proven: 6/6 resubmits re-drop);
+                * ORK_F16_RESET_N>1 tests whether reset->drain->reset clears the persistent CDMA/IOMMU state a single reset
+                * leaves mid-abort. Each reset is followed by ORK_F16_COOLDOWN_MS drain. */
+                const char *rne = getenv("ORK_F16_RESET_N"); int reset_n = rne ? atoi(rne) : 1; if (reset_n < 0) reset_n = 0;   /* 0 = NO reset (test whether a blocking-heal resubmit reaps on its own); 2 = reset->drain->reset */
+                const char *cde = getenv("ORK_F16_COOLDOWN_MS"); long cd_ms = cde ? atol(cde) : 50;
+                fprintf(stderr, "[ork] fp16 colsplit wedge (K=%d N=%d M=%d) attempt %d/%d — %d× RKNPU_ACT_RESET (%ldms drain each) + resubmit\n", w->K, w->N, M, attempt+1, fp16_recov_max, reset_n, cd_ms);
+                for (int rr = 0; rr < reset_n; rr++) {
+                    struct rknpu_action ra; memset(&ra, 0, sizeof ra); ra.flags = RKNPU_ACT_RESET; ioctl(c->fd, DRM_IOCTL_RKNPU_ACTION, &ra);
+                    ork_kmsg("attempt %d reset %d/%d + %ldms drain", attempt+1, rr+1, reset_n, cd_ms);
+                    struct timespec qs = {(time_t)(cd_ms/1000), (long)(cd_ms%1000)*1000000L}; nanosleep(&qs, NULL);
+                }
+                c->warmed = 0; for (int z = 0; z < ORK_MAXCORE; z++) c->mwarm[z] = 0;   /* reset cleared the NPU's warm/regcmd state -> force cold re-warm */
+            }
+        }
+        c->f16_force_blocking = 0;   /* clear the hybrid override so it never leaks into a later matmul */
+        if (fp16_healed) return 0;
+        if (!fp16_ineligible) {   /* recovery exhausted (repeated wilds survive resets = a genuinely stuck NPU): FINAL
+            * BACKSTOP = de-escalate to single-core (nc=1: no concurrent fetch -> the bit-exact reference, never wedges).
+            * Slow but correct + safe. Falls through to the mcworker path with nc forced to 1 + a cold re-warm. */
+            fprintf(stderr, "[ork] fp16 colsplit wedge (K=%d N=%d M=%d) — de-escalating to single-core\n", w->K, w->N, M);
+            if (getenv("ORK_F16_TCLEAN")) {   /* TCLEAN: the last colsplit attempt left dropped/stuck jobs on ALL cores; nc=1
+                * below only submits to core 0, so cores 1..n would keep a stuck job that UAFs at process teardown (close(fd)
+                * frees the buffer under it). Reap ALL cores' stuck jobs the CLEAN way (per-core nonblock dummy -> timeout_clean)
+                * so nothing lingers. This is what makes the nonblock recovery teardown-safe WITHOUT fd-close. */
+                ork_npu_reap_stuck(c, ncf);
+            } else if (fp16_sentinel_r) {   /* legacy sentinel path: single reset (does NOT cleanly reap — see Bug#2) */
+                struct rknpu_action ra; memset(&ra, 0, sizeof ra); ra.flags = RKNPU_ACT_RESET; ioctl(c->fd, DRM_IOCTL_RKNPU_ACTION, &ra);
+                struct timespec qs = {0, 1000000}; nanosleep(&qs, NULL); }
+            c->mc_error = 0; nc = 1;
+            c->warmed = 0; for (int z = 0; z < ORK_MAXCORE; z++) c->mwarm[z] = 0;
+        }
+        /* fp16_ineligible: fall through to the mcworker path at the original nc. */
     }
     ork_npu_enter(c,dt,XP_MC_MM,OCK_NONE);
     if(mc_ensure(c,nc)) return -1;
@@ -9775,6 +10010,153 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     return crc;
 }
 
+/* (B') fp16 cross-slice DRAIN-GAP probe. Chains TWO wide fp16 matmuls with DISTINCT weight buffers (W0,W1) —
+ * reproducing the cross-buffer base-latch condition — into ONE PC-chain submit, optionally with an identity
+ * mul_perchan_f16 GAP between them (REGCMD_MUL_F16_CHAIN, enable 0x18, 69 regs, middle desc_slot=138 per the
+ * regcfg*2 convention). The gap is a pure time-filler on a DUMMY fp16 scratch (identity scale) — its only job is
+ * to idle the weight-CDMA so W0's fetch drains before W1's base latches. Both matmuls use the fp16-out stage
+ * (set_f16_out_fp16in — the config with the PROVEN mm->perchan HW edge). Returns the submit rc (nonzero=wedge);
+ * *nz0/*nz1 = count of nonzero output words per matmul (coarse "did it compute" sanity). rk3588-gated. */
+int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *nz0, long *nz1, double *us) {
+    int fd = c->fd, CBUF = c->soc->cbuf_elems, dom = c->dom_active;
+    if (!ork_ppu_fuse_enabled(c)) return -3;
+    if (Kp % 32 || N % 32 || N > c->soc->nmax || M < 1 || M > 64 || (N & 7)) return -2;
+    ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);
+    size_t gsz = (size_t)M * N * 2; if (gsz < 4096) gsz = 4096;
+    struct buf W0 = bcreate(fd,(size_t)Kp*N*2,0x403,dom), W1 = bcreate(fd,(size_t)Kp*N*2,0x403,dom);
+    struct buf G0 = bcreate(fd,gsz,0x403,dom), G1 = bcreate(fd,gsz,0x403,dom);
+    struct buf GI = bcreate(fd,gsz,0x403,dom), GO = bcreate(fd,gsz,0x403,dom), SB = bcreate(fd,4096,0x403,dom);
+    if (!W0.cpu||!W1.cpu||!G0.cpu||!G1.cpu||!GI.cpu||!GO.cpu||!SB.cpu) {
+        bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&G0);bdestroy(fd,&G1);bdestroy(fd,&GI);bdestroy(fd,&GO);bdestroy(fd,&SB); return -1; }
+    { int NN=N/16, KT=Kp/32; uint16_t *b0=W0.cpu, *b1=W1.cpu;   /* fp16 weight tile [N/16][Kp/32][16][32]; W0 all 1.0, W1 all 1.0 shifted (distinct) */
+      for (int nt=0;nt<NN;nt++) for (int kt=0;kt<KT;kt++) for (int nl=0;nl<16;nl++) for (int kk=0;kk<32;kk++) {
+          size_t o=(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk; b0[o]=0x3c00; b1[o]=0x3c00; } }   /* 0x3c00 = fp16 1.0 */
+    { uint16_t *ad=c->Af.cpu; for (int j=0;j<M*Kp;j++) ad[j]=0x3c00; }   /* A = 1.0 */
+    memset(G0.cpu,0,gsz); memset(G1.cpu,0,gsz); memset(GI.cpu,0,gsz); memset(GO.cpu,0,gsz); memset(SB.cpu,0,4096);
+    { uint16_t *sb=SB.cpu; for (int n=0;n<N;n++) sb[n]=0x3c00; }   /* identity per-channel scale (fp16 1.0) */
+    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&G0,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&G1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&GI,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&GO,RKNPU_MEM_SYNC_TO_DEVICE);
+    bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    static uint32_t mm0[REGCMD_N], mm1[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
+    int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
+    synth(mm0,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)G0.dma,sched,CBUF); set_f16_out_fp16in(mm0,M,N);
+    synth(mm1,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G1.dma,sched,CBUF); set_f16_out_fp16in(mm1,M,N);
+    memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc); set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)GO.dma);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)GI.dma);   /* gap INPUT = dummy scratch (NOT the matmul output) */
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);
+    double t0 = ork_now_us(); int crc;
+    if (use_gap) { ork_chain_prog p[3] = { {mm0,REGCMD_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,138}, {mm1,REGCMD_N,0xd,108,-1} };
+        crc = ork_npu_chain_progs(c,3,p,dom); }
+    else { ork_chain_prog p[2] = { {mm0,REGCMD_N,0xd,108,216}, {mm1,REGCMD_N,0xd,108,-1} };
+        crc = ork_npu_chain_progs(c,2,p,dom); }
+    if (us) *us = ork_now_us()-t0;
+    long z0=0, z1=0;
+    if (!crc) { bsync(fd,&G0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&G1,RKNPU_MEM_SYNC_FROM_DEVICE);
+        uint16_t *g0=G0.cpu, *g1=G1.cpu; for (int e=0;e<M*N;e++){ if(g0[e])z0++; if(g1[e])z1++; } }
+    if (nz0) *nz0=z0; if (nz1) *nz1=z1;
+    bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&G0);bdestroy(fd,&G1);bdestroy(fd,&GI);bdestroy(fd,&GO);bdestroy(fd,&SB);
+    return crc;
+}
+
+/* PER-CORE-FD concurrency probe. Runs a 3-core fp16 N-column-split matmul where EACH core submits on its OWN
+ * fresh DRM fd (a separate open of the card), not the shared c->fd — to test whether per-core-fd isolation
+ * changes the concurrent-fetch "wedge". Core i owns columns [n0,n0+Ncol), n0=i*Ncol, Ncol=N/cores; it computes
+ * ALL M rows of its column slice as an independent fp16 matmul (fp16-out, converted to fp32 into Cout).
+ *   mode 0: each core gets its OWN weight copy (bcreate on its own fd), tiled from B's column slice.
+ *   mode 1: ONE shared dma-heap weight (full K*N, tiled once) imported into every core's fd (bimport +
+ *           bimport_fd); each core points its weight addr at the byte offset of its column-tile block.
+ * Constraint set (kept simple): Sk=1 (single K, no host accumulate), Sn=1 (N<=nmax), M<=64, K%32==0, N%16==0,
+ * and N%(cores*16)==0 so each core's Ncol is a multiple of 16 (a clean col-tile boundary). *us = wall time
+ * around the concurrent submit region. Returns 0 on a completed run — INCLUDING a wedge, in which case Cout
+ * shows the dropped/garbage columns (that IS the signal); <0 only on genuine setup failure (-2 bad shape,
+ * -1 open/alloc). See tools/percore_fd_probe.c. */
+struct ork_pcfd_arg { int fd, core; struct buf *tk; int rc; };
+static void *ork_pcfd_thread(void *vp){
+    struct ork_pcfd_arg *a=vp; struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=a->tk->obj; sub.fence_fd=-1;   /* BLOCKING per-core submit */
+    sub.core_mask=1u<<a->core;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+    sub.timeout=mm_timeout_ms();
+    ork_kmsg("PCFD core=%d submit START fd=%d task_obj=0x%llx", a->core, a->fd, (unsigned long long)a->tk->obj);
+    a->rc = rknpu_submit_ioctl(a->fd,&sub,0);   /* buffers all live in domain 0 */
+    ork_kmsg("PCFD core=%d submit DONE rc=%d", a->core, a->rc);
+    return NULL;
+}
+int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const ork_f16*B,float*Cout,double*us,int mode){
+    if(!c) return -3;
+    int CBUF=c->soc->cbuf_elems;
+    int cores=c->soc->cores; if(cores>ORK_MAXCORE) cores=ORK_MAXCORE; if(cores<1) cores=1;
+    if(M<1||M>64||K%32||N%16||N>c->soc->nmax) return -2;
+    if(N%(cores*16)) return -2;
+    int Ncol=N/cores;
+    const char*card=getenv("ORK_NPU_CARD"); if(!card)card=c->soc->card;
+    int sched=((K&(K-1))==0 && K>=128 && K<2048);
+    int cfd[ORK_MAXCORE]; for(int i=0;i<ORK_MAXCORE;i++) cfd[i]=-1;
+    struct buf wbuf[ORK_MAXCORE]={{0}}, wimp[ORK_MAXCORE]={{0}}, abuf[ORK_MAXCORE]={{0}},
+               cob[ORK_MAXCORE]={{0}}, rcb[ORK_MAXCORE]={{0}}, tkb[ORK_MAXCORE]={{0}};
+    int shared_dbuf=-1, ret=-1;
+    for(int i=0;i<cores;i++){ cfd[i]=open(card,O_RDWR); if(cfd[i]<0) goto done; act(cfd[i],RKNPU_POWER_ON,0); }
+    if(mode==1){   /* ONE shared full-N weight imported into every fd; tile the FULL B once via the primary map */
+        size_t wsz=(size_t)K*N*2;
+        wimp[0]=bimport(cfd[0],wsz,0); if(!wimp[0].cpu) goto done; shared_dbuf=wimp[0].heap_fd;
+        for(int i=1;i<cores;i++){ wimp[i]=bimport_fd(cfd[i],shared_dbuf,wsz,0); if(!wimp[i].cpu) goto done; wimp[i].heap_fd=0; }
+        int NNf=N/16, KT=K/32; ork_f16*bb=wimp[0].cpu;                          /* full tile [N/16][K/32][16][32] */
+        for(int nt=0;nt<NNf;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+            bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
+        for(int i=0;i<cores;i++) bsync(cfd[i],&wimp[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean each fd's mapping of the import */
+    }
+    for(int i=0;i<cores;i++){
+        int n0=i*Ncol; uint32_t aB;
+        if(mode==1){ aB=(uint32_t)(wimp[i].dma + (size_t)n0*K*2); }   /* col-tile slice: n0%16==0 => byte off = n0*K*2 (n0/16 whole tiles, each K/32*16*32*2 = K*32*2 B) */
+        else {
+            wbuf[i]=bcreate(cfd[i],(size_t)K*Ncol*2,0x403,0); if(!wbuf[i].cpu) goto done;
+            int NN=Ncol/16, KT=K/32; ork_f16*bb=wbuf[i].cpu;                   /* per-core tile [Ncol/16][K/32][16][32] of B's cols [n0,n0+Ncol) */
+            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
+                bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(n0+nt*16+nl)];
+            bsync(cfd[i],&wbuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+            aB=(uint32_t)wbuf[i].dma;
+        }
+        abuf[i]=bcreate(cfd[i],(size_t)M*K*2,0x403,0); if(!abuf[i].cpu) goto done;   /* full [M][K] activation (every core needs all of A) */
+        { ork_f16*ad=abuf[i].cpu; for(int j=0;j<M*K;j++) ad[j]=A[j]; }
+        bsync(cfd[i],&abuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        size_t csz=(size_t)M*Ncol*4; if(csz<4096) csz=4096;              /* fp16-out uses M*Ncol*2; over-alloc to 4B/elem, harmless */
+        cob[i]=bcreate(cfd[i],csz,0x403,0); if(!cob[i].cpu) goto done;
+        memset(cob[i].cpu,0,csz); bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* seed */
+        rcb[i]=bcreate(cfd[i],(size_t)REGCMD_N*4,0x403,0); if(!rcb[i].cpu) goto done;
+        tkb[i]=bcreate(cfd[i],4096,0x40b,0); if(!tkb[i].cpu) goto done;
+        uint32_t rc[REGCMD_N];
+        synth(rc,M,K,Ncol,(uint32_t)abuf[i].dma,aB,(uint32_t)cob[i].dma,sched,CBUF);
+        set_f16_out_fp16in(rc,M,Ncol);                                   /* fp16-out, contiguous [M][Ncol] (no ORK_F16_ATOM8) */
+        memcpy(rcb[i].cpu,rc,(size_t)REGCMD_N*4);
+        bsync(cfd[i],&rcb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task*t=(struct rknpu_task*)tkb[i].cpu; memset(t,0,sizeof *t);
+        t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=rcb[i].dma;
+        bsync(cfd[i],&tkb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    }
+    { double t0=ork_now_us();                                            /* concurrent per-core-fd submit: one blocking thread/core */
+      pthread_t th[ORK_MAXCORE]; struct ork_pcfd_arg ar[ORK_MAXCORE]; int made=0;
+      for(int i=0;i<cores;i++){ ar[i]=(struct ork_pcfd_arg){cfd[i],i,&tkb[i],0};
+          if(pthread_create(&th[i],NULL,ork_pcfd_thread,&ar[i])!=0) break; made++; }
+      for(int i=0;i<made;i++) pthread_join(th[i],NULL);
+      if(us) *us=ork_now_us()-t0; }
+    for(int i=0;i<cores;i++){ int n0=i*Ncol;                             /* read fp16-out back, de-column into Cout[M,N] fp32 */
+        bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+        const ork_f16*cf=(const ork_f16*)cob[i].cpu;
+        for(int m=0;m<M;m++) for(int n=0;n<Ncol;n++) Cout[(size_t)m*N+n0+n]=(float)cf[(size_t)m*Ncol+n];
+    }
+    ret=0;
+done:
+    for(int i=0;i<cores;i++){
+        if(cfd[i]<0) continue;
+        bdestroy(cfd[i],&tkb[i]); bdestroy(cfd[i],&rcb[i]); bdestroy(cfd[i],&cob[i]); bdestroy(cfd[i],&abuf[i]);
+        if(mode==1) bdestroy(cfd[i],&wimp[i]); else bdestroy(cfd[i],&wbuf[i]);   /* wimp[0] closes the shared dbuf once (heap_fd zeroed on i>0) */
+        close(cfd[i]);
+    }
+    return ret;
+}
+
 /* Public on-NPU SiLU (int16 / w16a16i): out = clamp_i16(round( silu(in*in_scale)/out_scale )) via the standalone
  * int16 activation-LUT op, using RKNN's captured index params (full-range coverage). Builds the LUT the way RKNN
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
@@ -11029,6 +11411,8 @@ struct ork_dyn_chain {
     struct rknpu_submit mc_subs[ORK_MAXCORE];
     int        mc_Pc[ORK_MAXCORE];
     unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
+                             * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
     int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
                              * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
     /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
@@ -11446,8 +11830,10 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
  * last output word — NOT ork_dyn_done_i's O(no) full-surface civac scan; 3 threads full-scanning ~190K words
  * each thrash the memory bus against the NPU writeback and serialize it (that was the earlier failure). The
  * one-time full-surface VERIFY still happens in ork_dyn_end after all cores land (recovery lives there too). */
-struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; };
+static double g_f16_slice_us;   /* running max of a SUCCESSFULLY-landed fp16 K-slice completion (us). Drives the AUTO sentinel detect timeout = 1.5x this (adaptive per shape, vs a flat 800ms). Benign cross-core race — a heuristic, not correctness. */
+struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
 static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
+    int cold = !c->mwarm[i];   /* capture BEFORE the bsync section sets mwarm=1 — fp16 uses it for the cold-buffer warmup */
     if (a->active) {
         if (a->h->oSk[i] <= 1) bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf bsync (unused for i>0, double for i=0) */
         bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -11458,9 +11844,111 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
     /* NO barrier + BLOCKING submit — EXACTLY the mcworker: 3 pool threads, each does a blocking submit on its
      * core and the kernel-waits (no userspace poll). ORK_COLSPLIT_NB flips to nonblock+poll for comparison. */
     if (a->active) {
+      if (a->h->mc_dt == DT_F16 && a->h->oSk[i] > 1 && !a->h->f16_contig) {   /* CONTIG builds ONE chained submit -> take the single-submit else-path (like int8), NOT the per-slice SW-chain */
+        /* AUTO SW-CHAIN: fp16 K-split cannot HW-chain across distinct Bb[ks] weight buffers (the next task's base
+         * latches while the prior 2x-long fp16 weight-DMA is still draining -> cross-boundary prefetch -> cdma-wild
+         * -> NPU soft-reset/wedge). So submit each K-slice's [kstart,np_ks) range SEPARATELY and BLOCKING — the
+         * blocking return fully drains that slice's weight-DMA before the next slice's base is programmed (the
+         * inter-op barrier the HW chain lacks). Ping-pong stays ON within each slice's same-buffer M-tile chain
+         * (safe). The build terminated the regcmd chain at each slice boundary (kb[]); the oSk f32 accumulate below
+         * then sums the Sk partials. Tiling recomputed identically to the build (deterministic). */
+        ork_w *w = a->w; int M = a->h->oM[i], Sk = a->h->oSk[i], K = w->K;
+        int KS = c->soc->ks, CBUFf = (c->soc->cbuf_elems > 32768) ? 32768 : c->soc->cbuf_elems, RBf = CBUFf, kstart = 0;
+        const char *sge = getenv("ORK_F16_STAGGER"); int stag_us = sge ? atoi(sge) : 0;   /* variant A: per-core-index fetch stagger (µs) */
+        /* fp16 SELF-HEAL — OPT-IN (ORK_F16_RECOV), default OFF. NAIVE retry-same-slice is HARMFUL and DISPROVEN:
+         * resubmitting the identical 3-core concurrent fp16 slice re-triggers the SAME concurrent-fetch CDMA wild,
+         * and hammering submits at a mid-soft-reset NPU ESCALATES a recoverable soft-reset into a HARD WEDGE
+         * (board 10.3.0.236 hard-wedged 2026-08-04; power-cycle recovery, SPI survived). The correct self-heal must
+         * de-escalate on fault (serial/single-core recompute — no concurrent wild — after the reset settles), NOT
+         * resubmit the same concurrent slice. Kept gated for that future design; DO NOT default-on the naive retry. */
+        int f16_recov = getenv("ORK_F16_RECOV") != NULL;
+        const char *dte = getenv("ORK_F16_DETECT_MS"); int detect_ms = dte ? atoi(dte) : 500;   /* GROUNDED fast detect: a legit fp16 slice is ms-scale (~15ms max), so the blocking miss-timeout is the ANALOG of int8's ~300ms sentinel miss — tighten from the arbitrary 8s to ~500ms (30x the max legit slice, 16x faster detect). */
+        /* REAP PRECONDITION (Task #50): the nonblock submit timeout MUST be < the poll-detect window, else a dropped
+         * (benign-miss) job is NOT yet past its timeout when we go to reap it — rknpu_job_timeout_clean only reaps a
+         * job whose age >= its timeout — so it lingers as subcore_data->job and the nc=1 backstop queues behind it
+         * 60-180s -> rknpu_job_abort. Detect is ~1.5x the measured slice (g_f16_slice_us); set the submit timeout to
+         * ~1x the slice (still >> a legit slice, which lands via IRQ before any timeout_clean regardless). Bootstrap
+         * 60ms (< the 800ms bootstrap detect) until the first slice sets the baseline; never exceed detect_ms. */
+        int recov_tmo = g_f16_slice_us > 0 ? (int)(g_f16_slice_us/1000) + 2 : 60;
+        if (recov_tmo > detect_ms) recov_tmo = detect_ms; if (recov_tmo < 3) recov_tmo = 3;
+        int f16_sentinel = (getenv("ORK_F16_SENTINEL") != NULL) && !c->f16_force_blocking;   /* force_blocking overrides -> blocking (heal). SENTINEL RECOVERY: submit NONBLOCK + CPU poll-drain each slice
+            * (last-word gate + full-slice civac verify), tight timeout. Fast wedge-detect (~poll timeout, not the 8s blocking
+            * timeout) AND the CPU never blocks in-kernel (no D-state hard-wedge); on a stuck sentinel -> mc_error -> run-level
+            * recovery. Keeps the barrier's per-slice drain semantics (poll drains before advancing). int8-decode-path style. */
+        const char *spte = getenv("ORK_F16_SENTINEL_TMO_US"); double f16_poll_ovr = spte ? atof(spte) : 0.0;   /* explicit detect-timeout override (us); 0 => AUTO = 1.5x the measured slice-completion time (g_f16_slice_us) */
+        for (int ks = 0; ks < Sk; ks++) {
+            int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
+            int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048), R = RBf/Kp; if (R<1) R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+            double scale=(double)Kp/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg=base>=0x1b?(base-0x1b)/slope+1:0;
+            int kcap=mg*64; if(!sched)kcap=(RBf/2)/Kp; if(kcap<4*R)kcap=sched?4*R:((RBf/2)/Kp); if(kcap<1)kcap=1;
+            int np_ks = (M + kcap - 1) / kcap;
+            struct rknpu_submit s; memset(&s, 0, sizeof s);
+            s.flags = ork_ppflags() | (f16_sentinel ? 0x2u : 0u);   /* SENTINEL: NONBLOCK (0x2) — CPU polls, never blocks in-kernel. Else BLOCKING (ping-pong safe within one buffer). */
+            s.timeout = recov_tmo;
+            s.task_start = (uint32_t)kstart; s.task_number = (uint32_t)np_ks;
+            s.task_obj_addr = c->mtk[i].obj; s.core_mask = 1u << i; s.fence_fd = -1;
+            s.subcore_task[0] = s.subcore_task[1] = s.subcore_task[2] = (struct rknpu_subcore_task){(uint32_t)kstart, (uint32_t)np_ks};
+            if (i == 0) trace_submit(&s);   /* ORK_TRACE: dump the doorbell fp16 per-slice regcmd sequence (core 0) */
+            if (stag_us && i > 0) { struct timespec ts = {0, (long)i * stag_us * 1000}; nanosleep(&ts, NULL); }   /* variant A: offset core i so the 3 cores don't hit the CDMA with fp16 weight fetches at the same instant */
+            int src = rknpu_submit_ioctl(fd, &s, w->domain);
+            if (f16_sentinel) {   /* SENTINEL RECOVERY: NONBLOCK submit returned immediately — now CPU poll-DRAIN this slice's
+                * partial (last-word gate, then full-slice civac verify), with a TIGHT timeout. Fast wedge-detect + CPU never
+                * stuck in-kernel. The full surface was SENT-seeded (hardened_w=1 for fp16). Timeout/reject -> mc_error -> run-level recovery. */
+                if (src) { c->mc_error = 1;
+                    fprintf(stderr, "[F16-WEDGE-DETECT] core=%d Kslice=%d submit_rc=%d (REJECTED at submit) mtk.int_status=0x%x\n",
+                            i, ks, src, ((struct rknpu_task*)c->mtk[i].cpu)[0].int_status); fflush(stderr);
+                    ork_kmsg("WEDGE-DETECT core=%d Kslice=%d submit_rc=%d (REJECTED)", i, ks, src); }
+                else { volatile int32_t *o = (volatile int32_t*)a->h->outptr[i];
+                    int Sk_ = a->h->oSk[i] ? a->h->oSk[i] : 1, per = a->h->nout[i] / Sk_;   /* M*Ncore words per K-slice partial */
+                    /* AUTO detect timeout = 150% of the measured slice-completion time (g_f16_slice_us, updated on every
+                     * successful land) — adaptive per shape instead of a flat 800ms: once the warm/first slice sets the
+                     * baseline (~ms), detect drops to ~20ms, cutting the detect-to-reset VULNERABILITY WINDOW ~40x (the
+                     * period the wedged NPU sits un-halted, able to keep wild-writing). 20ms floor so a tiny first
+                     * measurement + jitter never false-positive; 800ms bootstrap until the first success; env overrides. */
+                    double f16_poll_tmo = f16_poll_ovr > 0 ? f16_poll_ovr : (g_f16_slice_us > 0 ? 1.5 * g_f16_slice_us : 800000.0);
+                    if (f16_poll_ovr <= 0 && f16_poll_tmo < 20000.0) f16_poll_tmo = 20000.0;
+                    size_t last = (size_t)ks * per + per - 1; double pt = ork_now_us(); int wedged = 0;
+                    for (;;) { __asm__ volatile("dc civac,%0"::"r"(&o[last]):"memory");   /* O(1) LAST-WORD gate: cheap wedge-detect (a full-slice scan per poll iter was ~7x slower). Coherency for the accumulate is the FROM_DEVICE bsync below; a real wedge faults early so the last word stays SENT. */
+                        if (o[last] != ORK_DYN_SENT) { double el = ork_now_us() - pt; if (el > g_f16_slice_us) g_f16_slice_us = el; break; }   /* landed: update the slice-time baseline that drives the 1.5x auto timeout */
+                        double el = ork_now_us() - pt; if (el > f16_poll_tmo) { wedged = 1; break; }
+                        if (el > 500.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+                    if (wedged) { c->mc_error = 1;   /* IMMEDIATE located dump — earliest possible, before the barrier/join, so it
+                        * streams out BEFORE any hard-hang loses it. Names the faulting (core, K-slice) + poll elapsed + the
+                        * last-word value that stayed SENT (the doorbell that never landed). */
+                        __asm__ volatile("dc civac,%0"::"r"(&o[last]):"memory");
+                        fprintf(stderr, "[F16-WEDGE-DETECT] core=%d Kslice=%d POLL-MISS after %.0fus (tmo=%.0f) last-word[%zu]=0x%08x (SENT=stuck) mtk.int_status=0x%x\n",
+                                i, ks, ork_now_us()-pt, f16_poll_tmo, last, (unsigned)o[last], ((struct rknpu_task*)c->mtk[i].cpu)[0].int_status); fflush(stderr);
+                        ork_kmsg("WEDGE-DETECT core=%d Kslice=%d POLL-MISS %.0fus last=0x%08x", i, ks, ork_now_us()-pt, (unsigned)o[last]); } }
+            } else {   /* BLOCKING (default): the kernel drains this slice; ORK_F16_RECOV (opt-in, DISPROVEN) resubmits on fault */
+                for (int rt = 0; f16_recov && src && rt < 4; rt++) {
+                    struct timespec rs = {0, 3000000 + (long)i * 2000000}; nanosleep(&rs, NULL);
+                    src = rknpu_submit_ioctl(fd, &s, w->domain);
+                }
+                if (src) c->mc_error = 1;
+            }
+            kstart += np_ks;
+            /* LOCKSTEP: wait for every core to finish this K-slice before any core programs the next slice's
+             * base — keeps all cores fetching the SAME Bb[ks] concurrently (never two distinct fp16 weight
+             * buffers on the CDMA at once = the concurrent-cross-buffer wild). The blocking submit above has
+             * already drained this core's slice, so the barrier only gates the CPU-side loop advance. */
+            if (a->ksbar) pthread_barrier_wait(&c->b_ioctl);
+        }
+        if (i == 0) { const char *fwe = getenv("ORK_F16_FORCE_WEDGE");   /* TEST-ONLY fault injection (no real NPU fault; submits
+            * above all succeeded): mark a simulated wedge for the FIRST N colsplit attempts (countdown), then succeed. N small
+            * (e.g. 2) exercises the reset+resubmit HEAL path (must heal by attempt N+1, bit-exact); N huge (e.g. 99) exhausts
+            * recovery and exercises the nc=1 de-escalation BACKSTOP. Post-barrier, core 0 only. */
+            if (fwe) { static int fw_remain = -1; if (fw_remain < 0) fw_remain = atoi(fwe); if (fw_remain > 0) { c->mc_error = 1; fw_remain--; } } }
+      } else {
         int nb = getenv("ORK_COLSPLIT_NB") != NULL;
         if (!nb) a->subs[i].flags &= ~0x2u;   /* blocking (default here) */
-        a->subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
+        a->subs[i].timeout = (a->h->mc_dt == DT_F16 && mm_timeout_ms() > 8000) ? 8000 : mm_timeout_ms();   /* fp16 (incl. CONTIG): cap wedge-detect at 8s so a CDMA-wild fault falls to the run-level reset+resubmit fast, not a 60s stall */
+        int _csrc = rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
+        if (_csrc && a->h->mc_dt == DT_F16) c->mc_error = 1;   /* CONTIG fp16 wedge: signal the run-level recovery (reset + resubmit / nc=1 backstop) */
+        if (i == 0 && a->h->f16_contig) { const char *fwe = getenv("ORK_F16_FORCE_WEDGE");   /* TEST-ONLY fault injection for the
+            * CONTIG in-place heal loop (no real NPU fault; the submit above succeeded): flag a simulated drop for the first N
+            * begin passes (countdown), then succeed. N small (e.g. 2) must heal by pass N+1 bit-exact; N huge exhausts the heal
+            * and exercises the nc=1 backstop. Core 0 only, after this pass's submit. */
+            if (fwe) { static int fw_remain = -1; if (fw_remain < 0) fw_remain = atoi(fwe); if (fw_remain > 0) { c->mc_error = 1; fw_remain--; } } }
         if (nb) { volatile int32_t *o = (volatile int32_t*)a->h->outptr[i]; int no = a->h->nout[i];
             double pt = ork_now_us();
             for (;;) { __asm__ volatile("dc civac,%0"::"r"(&o[no-1]):"memory");
@@ -11473,14 +11961,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                 }
                 double el = ork_now_us() - pt; if (el > 3e6) break;
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
-        else if (a->h->mc_dt == DT_F16 && a->h->oSk[i] > 1) {   /* fp16 K-split: the BLOCKING submit's completion can
-            * precede the f32 writeback DRAIN (~4% intermittent stale partial -> the host accumulate misses one slice
-            * -> maxerr ~= a slice's magnitude). Full-surface civac VERIFY the seeded-SENT surface before accumulating,
-            * same guard int8 uses for its interleaved-decode surface. Needs the SENT seed + clean-before (fp16_hard). */
-            volatile int32_t *o = (volatile int32_t*)a->h->outptr[i]; int no = a->h->nout[i]; double pt = ork_now_us();
-            for (;;) { int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
-                if (all) break; double el = ork_now_us() - pt; if (el > 3e6) break; if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
-        }
+      }
         bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         /* WIDE-K PARALLEL ACCUMULATE: sum this core's Sk [M,Ncore] partials into its C columns HERE, in this
          * pool thread — matching mcworker's chain-ksplit (each core accumulates its own partials in parallel)
@@ -11488,7 +11969,13 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
          * the whole doorbell-vs-mcworker wide-K gap). The blocking submit guarantees every partial has landed;
          * the 3 cores write DISJOINT C column ranges (dst=C+c0), so no cross-core race. NEON int32 (bit-exact:
          * integer add is associative). dst[i]=NULL => ork_dyn_end's copy-back skips this core. */
-        if (a->h->oSk[i] > 1 && a->h->dst[i]) {
+        if (a->h->oSk[i] > 1 && a->h->dst[i]) {   /* PER-CORE PARALLEL accumulate (int8 AND fp16) — each core sums its
+            * own Sk [M,Ncore] partials in this pool thread, EXACTLY like mcworker (4817-4821). The blocking per-slice
+            * submits + the FROM_DEVICE bsync above guarantee this core's partials have landed in DRAM; the lockstep
+            * barrier (csub_barrier) guarantees no core crossed into a later Bb[ks] while another was still fetching
+            * this one (the concurrent-cross-buffer CDMA wild that produced the wrong-answers). So fp16 no longer needs
+            * the single-threaded full-surface verify+accumulate in ork_dyn_end (5-9x slower — it serialized all cores'
+            * partials through one thread); that path stays as a dormant fallback (unreached: this sets dst[i]=NULL). */
             int Me = a->h->oM[i] ? a->h->oM[i] : 1, Sk = a->h->oSk[i], no = a->h->nout[i], Nn = no/(Sk*Me);
             size_t ds = a->h->ostride[i] > 0 ? (size_t)a->h->ostride[i] : (size_t)Nn, kstride = (size_t)Me*Nn;
             /* ks-OUTER (cache-friendly, like mcworker's chain-ksplit accumulate): read each K-slice partial
@@ -11523,8 +12010,14 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     int dt = w->dtype;   /* DT_I8 today; fp16/int4 branches keyed on this (Stage 0: dt==DT_I8 == byte-identical) */
     int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
+    if (dt == DT_F16 && w->Sk > 1 && nc > 2 && getenv("ORK_F16_2CORE")) nc = 2;   /* variant B: fewer concurrent fp16 fetchers (reliability/speed trade) */
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
-    ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
+    /* Enter the correct PRECISION mode. fp16 must enter the fp16 mode EXACTLY as mcworker does
+     * (DT_F16, XP_MC_MM) — entering the int8-chain mode (DT_I8_CHAIN) for fp16 leaves the stateful
+     * regcmd datapath mismatched, which intermittently DMA-wilds / soft-resets the NPU on the fp16
+     * submits. int8 keeps the HW-chain mode. This is the doorbell-vs-mcworker difference. */
+    if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_MC_MM, OCK_NONE);
+    else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     if (mc_ensure(c, nc)) return NULL;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
@@ -11568,14 +12061,46 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                   goff += (size_t)M*Kp; }
               bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
             uint32_t a_base = (uint32_t)AFS->dma;
-            int np2 = 0; size_t goff = 0;
+            int contig = (w->Sn == 1) && !getenv("ORK_F16_NO_CONTIG");   /* (A) DEFAULT-ON for Sn==1: ONE chained submit/core over a CONTIGUOUS weight (Bbc) — no cross-buffer boundary => no HW cross-boundary prefetch => no CDMA wild => no drop (validated 500-iter 0-drop + shape-suite bit-exact, 2.6x). Sn>1 (multi-N-slice) keeps the per-slice path + the recovery net. ORK_F16_NO_CONTIG opts out for A/B. */
+            if (contig && i == 0 && !w->Bbc_valid) {   /* build the contiguous weight ONCE (single-threaded build): concat all Sk K-slice tiles into one buffer */
+                size_t tot = 0; for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS; tot += (size_t)Kp*N*2; }
+                w->Bbc = bcreate(fd, tot, 0x403, w->domain);
+                if (w->Bbc.cpu) { size_t off = 0;
+                    for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS; size_t sz = (size_t)Kp*N*2;
+                        memcpy((char*)w->Bbc.cpu + off, w->Bb[ks].cpu, sz); off += sz; }
+                    bsync(fd, &w->Bbc, RKNPU_MEM_SYNC_TO_DEVICE); w->Bbc_valid = 1; }
+            }
+            if (contig && !w->Bbc_valid) contig = 0;   /* alloc failed -> fall back to the per-slice SW-chain */
+            h->f16_contig = contig;
+            int gapbase = (contig && getenv("ORK_F16_GAP")) ? atoi(getenv("ORK_F16_GAP")) : 0;   /* (B'') per-core DIFFERENTIAL spin-stagger base: core i gets gapbase*(nc-1-i) identity-perchan filler tasks BETWEEN slices, so core (nc-1) launches ks+1 first and core 0 last — OFFSETS the 3 cores' fp16 fetches in time to de-conflict the concurrent-fetch wild (not a synchronized drain — a staggered restart) */
+            int gap = gapbase > 0;
+            const int GAPM = 8, GAPN = 64;   /* tiny perchan geometry — pure time-filler; GAPM<=64 (perchan cap), GAPN%32==0 */
+            uint32_t gap_pc[REGCMD_MUL_F16_CHAIN_N];
+            if (gap) {
+                if (i == 0 && !w->Bgap_valid) {   /* build the dummy gap buffers ONCE (shared, single-threaded here) */
+                    w->Bgap[0]=bcreate(fd,4096,0x403,w->domain); w->Bgap[1]=bcreate(fd,4096,0x403,w->domain); w->Bgap[2]=bcreate(fd,4096,0x403,w->domain);
+                    if (w->Bgap[0].cpu && w->Bgap[1].cpu && w->Bgap[2].cpu) {
+                        memset(w->Bgap[0].cpu,0,4096); memset(w->Bgap[1].cpu,0,4096);
+                        { uint16_t *sb=(uint16_t*)w->Bgap[2].cpu; for (int e=0;e<GAPN;e++) sb[e]=0x3c00; }   /* identity per-channel scale (fp16 1.0) */
+                        bsync(fd,&w->Bgap[0],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&w->Bgap[1],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&w->Bgap[2],RKNPU_MEM_SYNC_TO_DEVICE);
+                        w->Bgap_valid = 1;
+                    }
+                }
+                if (!w->Bgap_valid) gap = 0;
+                else { memcpy(gap_pc, REGCMD_MUL_F16_CHAIN, sizeof gap_pc); set_mul_geom(gap_pc, REGCMD_MUL_F16_CHAIN_N, GAPM, GAPN);
+                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_DPU_DST_BASE_ADDR, (uint32_t)w->Bgap[1].dma);
+                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5018, (uint32_t)w->Bgap[0].dma);
+                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5038, (uint32_t)w->Bgap[2].dma);
+                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5034, 0x00000008); }
+            }
+            int np2 = 0; size_t goff = 0, sloff = 0; char kb[512] = {0}; unsigned char pcp[600] = {0};   /* pcp[p]=1 => program p is a perchan drain-gap (not a matmul) */
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                 int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);   /* fp16 sched window (NO HISCHED here) */
                 int R = RBf/Kp; if (R<1) R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
                 double scale=(double)Kp/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
                 int kcap = mg_max*64; if(!sched) kcap=(RBf/2)/Kp; if(kcap<4*R) kcap=sched?4*R:((RBf/2)/Kp); if(kcap<1) kcap=1;   /* fp16 M-tile cap — NEVER raise: >cap miscomputes (npu.c ~4770) */
-                uint32_t wbase = (uint32_t)(w->Bb[ks].dma + (uint64_t)t0 * Kp * 32);   /* Sn==1: Bb[ks], N-tile stride Kp*32 (== mcworker) */
+                uint32_t wbase = (uint32_t)((contig ? (w->Bbc.dma + sloff) : w->Bb[ks].dma) + (uint64_t)t0 * Kp * 32);   /* CONTIG: slice base = Bbc + cumulative slice offset (one buffer); else per-slice Bb[ks]. N-tile stride Kp*32 (== mcworker) */
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
                     if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, REGCMD_N * 4);
@@ -11585,19 +12110,31 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                     memcpy((char*)RC->cpu + (size_t)np2*REGCMD_N*4, rc, REGCMD_N*4);
                     np2++;
                 }
-                goff += (size_t)M*Kp;
+                if (!contig && np2 > 0 && np2 <= 512) kb[np2-1] = 1;   /* end of this K-slice's sub-chain (per-slice submit); CONTIG leaves it linked */
+                if (gap && ks < w->Sk-1) {   /* (B'') DIFFERENTIAL spin-stagger: core i gets gapbase*(nc-1-i) filler perchans between slices (padded into REGCMD_N slots; HW reads each one's 69 regs) — offsets this core's ks+1 launch vs the others */
+                    int gapK = gapbase * (nc - 1 - i);
+                    for (int g = 0; g < gapK && np2 < 500; g++) {
+                        if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) break;
+                        memcpy((char*)RC->cpu + (size_t)np2*REGCMD_N*4, gap_pc, REGCMD_MUL_F16_CHAIN_N*4);
+                        pcp[np2] = 1; np2++;
+                    }
+                }
+                goff += (size_t)M*Kp; sloff += (size_t)Kp*N*2;
             }
             for (int p = 0; p < np2; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p*REGCMD_N*4);
-                if (p < np2-1) { uint64_t nx = RC->dma + (size_t)(p+1)*REGCMD_N*4;
-                    pr[216] = 0x0010 | ((nx & 0xffff) << 16); pr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
-                    pr[218] = 0x0014 | (0x0037u << 16);       pr[219] = (0x0101 << 16); }
-                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-                tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p*REGCMD_N*4; tkf[p] = tt; }
+                if (p < np2-1 && (contig || !kb[p])) { uint64_t nx = RC->dma + (size_t)(p+1)*REGCMD_N*4;   /* CONTIG: link ALL (one chain across slices + gaps); SW-chain: link only WITHIN a K-slice */
+                    int slot = pcp[p] ? 138 : 216;                    /* perchan links at its 138 slot (regcfg*2), matmul at 216 */
+                    int nreg = pcp[p+1] ? ((69+3)/2) : ((108+3)/2);   /* next-amount = the NEXT program's register count */
+                    pr[slot]   = 0x0010 | ((nx & 0xffff) << 16); pr[slot+1] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                    pr[slot+2] = 0x0014 | ((uint32_t)nreg << 16); pr[slot+3] = (0x0101 << 16); }
+                struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.int_mask = 0x300; tt.int_clear = 0x1ffff;
+                tt.enable_mask = pcp[p] ? 0x18 : 0xd; tt.regcfg_amount = pcp[p] ? 69 : 108;   /* perchan: enable 0x18, 69 regs; matmul: 0xd, 108 */
+                tt.regcmd_addr = RC->dma + (size_t)p*REGCMD_N*4; tkf[p] = tt; }
             h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
             h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* f32 accumulate/copy-back -> C columns at row-stride N */
             Pc[i] = np2;
             memset(&subs[i], 0, sizeof subs[i]);
-            subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;
+            subs[i].flags = (gap ? 0x1u : ork_ppflags()) | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;   /* gap chain carries an SDP (perchan) task -> ping-pong OFF (0x1); worker clears 0x2 -> blocking */
             subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
             subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)np2};
             continue;
@@ -11725,6 +12262,27 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
      * flushed to DRAM first -> seed the surface AND force the clean-before (hardened_w=1) for fp16 here. */
     int fp16_hard = (dt == DT_F16 && w->Sk > 1);
     int hardened_w = parallel_blocking ? (fp16_hard ? 1 : 0) : hardened;
+    /* fp16 K-split lockstep barrier: the residual wedge (during-submit "cdma address wild" + occasional
+     * plausible-wrong partial) is a CONCURRENT CROSS-BUFFER FETCH — cores loop their Sk slices independently,
+     * so core A can be fetching Bb[ks+1] while core B is still on Bb[ks] = two distinct fp16 weight buffers on
+     * the CDMA at once (fp16's 2-byte weights double the fetch bytes; int8 tolerates it, fp16 wilds). A
+     * per-slice pthread barrier marches all cores in lockstep: every core finishes slice ks before ANY starts
+     * ks+1, so at any instant all cores fetch the SAME Bb[ks] (same-buffer concurrency is benign). Pure CPU
+     * sync, no NPU risk. Requires every dispatched core active (else the barrier count nc deadlocks) — for the
+     * fp16 colsplit nc<=NN so all cores get columns, but guard anyway and fall back to independent loops. */
+    int csub_barrier = 0;
+    if (fp16_hard && nc > 1 && parallel_blocking && !getenv("ORK_F16_NOBAR")) { csub_barrier = 1; for (int i = 0; i < nc; i++) if (!Pc[i]) csub_barrier = 0; }
+    /* fp16 DROP RECOVERY (Task #50). campaign4 (clean board, sentinel, live-traced) PROVED int8's in-place resubmit
+     * model does NOT transfer to fp16: the concurrent-fetch drop is STICKY — reset+resubmit of the identical 3-core
+     * fp16 slice re-drops EVERY attempt (observed Kslice=1, cores alternating, tries 1/2/3 all POLL-MISS), and by the
+     * 3rd reset a re-launched worker HUNG in an uninterruptible D-state (the kernel `continue wait`, see ork_dummy_probe's
+     * header), forcing a power-cycle. So we do NOT resubmit the fp16 slice. On a worker-detected drop: (1) CLEAN-REAP the
+     * stuck slice job via ork_npu_reap_stuck (per-core nonblock dummy -> rknpu_job_timeout_clean; avoids the D-state +
+     * the close(fd) refcount-UAF), then (2) HEALTH-GATE with ork_dummy_probe — a tiny INT8 nonblock host-bounded op on
+     * the same fd (can NEVER hang: int8's drop is a transient dispatch race, not fp16's sticky wild). c->mc_error stays
+     * set so the run-level de-escalates to the nc=1 bit-exact backstop (single-core fp16 = no concurrent fetch = no drop).
+     * Fast + SAFE: bounded nonblock recovery + a guaranteed-correct single-core recompute, never the resubmit thrash. */
+    if (csub_barrier) pthread_barrier_init(&c->b_ioctl, NULL, nc);
     if (!parallel_blocking || fp16_hard)
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
@@ -11733,13 +12291,14 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     __asm__ volatile("dsb ish":::"memory");
     if (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* DEFAULT: per-core submit+accumulate on pool threads (ork_csub_worker); ORK_COLSPLIT_SERIAL forces the legacy inline path below */
         struct ork_csub cs[ORK_MAXCORE];
-        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0 };
+        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0, csub_barrier };
         npu_pool_ensure(c);
         pthread_mutex_lock(&c->pmu); c->pjob = cs; c->pjob_nc = nc; c->pjob_fn = ork_csub_worker;
         c->pjob_stride = sizeof(struct ork_csub); c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
         pthread_mutex_unlock(&c->pmu);
         ork_csub_worker(&cs[0]);   /* core 0 on this thread; cores 1..nc-1 on pool threads */
         pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
+        if (csub_barrier) pthread_barrier_destroy(&c->b_ioctl);
         h->prepolled = 1;   /* workers already submitted + drained every core; ork_dyn_end skips its poll */
     } else
     for (int i = 0; i < nc; i++) if (Pc[i]) {
@@ -11750,6 +12309,23 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             * resurrect a mid-row SENT); cold-only for prefill (M>64, not interleaved — avoids the per-op full flush). */
         c->mwarm[i] = 1;
         subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], w->domain);
+    }
+    if (fp16_hard && c->mc_error) {   /* dropped fp16 K-slice — DON'T resubmit (sticky re-drop + D-state hang, campaign4).
+        * Clean-reap the stuck job + int8 health-gate, then leave mc_error set for the run-level nc=1 bit-exact backstop. */
+        /* RESET-FIRST (campaign5 kernel-source root-cause): the vendor rknpu_job_abort() path (hit whenever a submit
+         * errors/times out) does rknpu_iommu_domain_put() -> msleep(100) -> rknpu_soft_reset() — a 100ms window with the
+         * IOMMU torn down but the NPU CDMA NOT yet halted, so a wild in-flight fp16 fetch escapes into kernel RAM ->
+         * slab corruption -> panic (netconsole: Oops in an unrelated proc's kmem_cache_alloc). rknpu_job_timeout_clean()
+         * is safe ONLY because it soft-resets BEFORE teardown. So HALT the DMA ourselves FIRST — RKNPU_ACT_RESET
+         * (-> rknpu_soft_reset) as the very first recovery action + a settle — so that if any later recovery submit
+         * errors into abort, its domain_put window has NO live DMA to escape. Closes the kernel-ordering hole. */
+        { struct rknpu_action ra; memset(&ra, 0, sizeof ra); ra.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &ra);
+          struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL); }   /* 5ms settle: let the CDMA fully quiesce before any further submit */
+        ork_kmsg("F16 drop (K=%d N=%d M=%d) -> RESET-FIRST (halt DMA) + reap_stuck + int8 dummy health-gate + de-escalate to nc=1 (NO fp16 resubmit)", w->K, w->N, M);
+        ork_npu_reap_stuck(c, nc);
+        int ok = ork_dummy_probe(c);
+        ork_kmsg("F16 drop recovery: int8 dummy-probe %s (mc_error stays set -> nc=1 recompute)", ok ? "PASS (NPU dispatching)" : "FAIL (still wedged)");
+        for (int z = 0; z < ORK_MAXCORE; z++) c->mwarm[z] = 0;   /* reap/probe reset+reused the scratch -> force a cold re-warm on the nc=1 backstop */
     }
     /* Stash the round context so ork_dyn_end recovers a dropped colsplit round (the M=1 int8 decode path also
      * hits the ~1/2000 doorbell-drop: one core's N-column slice never lands, leaving its re-seeded sentinel
@@ -12536,7 +13112,16 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         if (h->oSk[i] > 1) {
             int Sk = h->oSk[i], Nn = no / (Sk * Me); int32_t *d = h->dst[i];
             size_t ds = h->ostride[i] > 0 ? (size_t)h->ostride[i] : (size_t)Nn;   /* colsplit wide-K: land the summed [M,Ncore] in C's columns at row-stride N */
-            if (h->mc_dt == DT_F16) { const float *src = (const float*)h->outptr[i]; float *df = (float*)d;   /* colsplit wide-K fp16: sum Sk f32 partials (serial path; the parallel path sums in ork_csub_worker). ks-ascending == mcworker, bit-exact. */
+            if (h->mc_dt == DT_F16) {
+                /* SINGLE full-surface civac VERIFY (this thread only, after every core's per-slice BLOCKING submits
+                 * returned): the fp16 f16->f32 DPU writeback can lag the blocking-submit completion, so confirm every
+                 * partial word has DRAINED (!= the SENT seed) before summing — else the accumulate reads a mid-drain
+                 * partial (the ~1/40 wedge/wrong-answer). This is the documented completion protocol: ONE full-surface
+                 * verify here, NOT a per-core 3-thread civac-scan (which thrashes the NPU writeback). fp16 K-split only. */
+                { volatile int32_t *o = (volatile int32_t*)h->outptr[i]; double pt = ork_now_us();
+                  for (;;) { int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
+                      if (all) break; double el = ork_now_us() - pt; if (el > 3e6) break; if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
+                const float *src = (const float*)h->outptr[i]; float *df = (float*)d;   /* colsplit wide-K fp16: sum Sk f32 partials, ks-ascending == mcworker, bit-exact. */
                 const size_t kstride = (size_t)Me * Nn;
                 for (int m = 0; m < Me; m++) { const float *base = src + (size_t)m * Nn; float *dr = df + (size_t)m * ds; int n = 0;
                     for (; n + 4 <= Nn; n += 4) { float32x4_t acc = vld1q_f32(base + n);

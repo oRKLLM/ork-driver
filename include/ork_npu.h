@@ -803,6 +803,14 @@ int          ork_npu_chain_mm_perchan_i16(ork_npu *ctx, int M, int K, int N, con
                                           const short *scale, int m1, int s1, int m2, int s2, short *out, double *us);
 int          ork_npu_chain_mm_perchan_f16(ork_npu *ctx, int M, int K, int N, const unsigned short *A, const unsigned short *B,
                                           const unsigned short *scale, unsigned short *out, double *us);
+int          ork_npu_f16_gap_probe(ork_npu *ctx, int M, int Kp, int N, int use_gap, long *nz0, long *nz1, double *us); /* (B') cross-slice drain-gap probe */
+/* RE/calibration only: per-core-fd concurrency probe. 3-core fp16 N-column-split matmul where EACH core submits
+ * on its OWN fresh DRM fd (not the shared ctx fd), to test whether per-core-fd isolation changes the concurrent-
+ * fetch wedge. mode 0 = each core gets its own weight copy; mode 1 = one shared dma-heap weight imported into
+ * every core's fd. A[M,K],B[K,N] fp16 row-major; Cout[M,N] fp32 (fp16-out converted). K%32,N%16,N<=nmax,M<=64,
+ * N%(cores*16)==0. *us = concurrent submit wall time. Returns 0 on a completed run (incl. a wedge — Cout shows
+ * it), -2 bad shape, -1 open/alloc. See tools/percore_fd_probe.c. */
+int          ork_npu_f16_percore_probe(ork_npu *ctx, int M, int K, int N, const ork_f16 *A, const ork_f16 *B, float *Cout, double *us, int mode);
 int          ork_npu_add_i8(ork_npu *ctx, const signed char *a, const signed char *b, int M, int N,
                             double a_scale, double b_scale, double out_scale, signed char *out, double *us);
 
@@ -953,6 +961,7 @@ size_t        ork_npu_sram_free (ork_npu *ctx);   /* free NPU SRAM bytes now (co
 uint64_t      ork_npu_dma_rw    (ork_npu *ctx);   /* cumulative NPU DMA rw bytes; delta across a submit = HW did work (0 => never dispatched) */
 void          ork_npu_dump_state(ork_npu *ctx, const char *label);   /* snapshot NPU state (freq/volt/DMA counters) to stderr on anomaly, before a wedge destroys it */
 int           ork_npu_soft_reset(ork_npu *ctx);   /* RKNPU_ACT_RESET + force re-warm; recovery step after a dump so a stuck job doesn't accumulate into a hard wedge */
+int           ork_ctx_fd_reap(ork_npu *ctx);   /* task #47: close+reopen the DRM fd (drm_release reaps ALL stuck jobs+IOMMU cleanly — the only nonblock-safe reap) then re-import dma-buf weights in place + reset scratch; caller must quiesce submits first. 0 ok, <0 fail */
 int           ork_npu_recover   (ork_npu *ctx, const char *label);   /* self-heal: dump + soft-reset + dummy-op probe; 1 = recovered (continue), 0 = still broken (throw fault) */
 int           ork_npu_force_fault(ork_npu *ctx);   /* DIAGNOSTIC: deliberately force a reliable NPU fault (bogus weight addr -> DMA fault); 0 = faulted as intended */
 ork_dyn_chain *ork_dyn_begin(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);   /* NONBLOCK-submit (single-core chain); NULL on bad args */

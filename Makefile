@@ -800,6 +800,12 @@ mm_perchan_f16_probe: tools/mm_perchan_f16_probe.c $(COBJ)
 mm_perchan_f16_diag_probe: tools/mm_perchan_f16_diag_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+f16_gap_probe: tools/f16_gap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+percore_fd_probe: tools/percore_fd_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 stridedA_bmm_probe: tools/stridedA_bmm_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
