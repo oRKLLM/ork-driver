@@ -74,6 +74,13 @@ int main(void){
     fail|=test(c,16,512,64);      /* multi-M batch, single 64-wide N-block (the proven sweet spot) */
     fail|=test(c,16,2048,64);     /* multi-M batch at production K */
     fail|=test(c,16,2048,256);    /* multi-M batch, wide N (multi-block tile budget) */
+    /* #52: BCHAIN batch-chain on the NONBLOCK doorbell (run_i4_bchain_db) — the DEFAULT int4 M>1 prefill path.
+     * Large-M (M=256) guards the shape the per-row doorbell REFUSES; the N=512 case exercises the bank-width
+     * (Wb=131072/K) N-tiling + de-tile across >1 chunk. Bit-exact vs the CPU int4 reference (K/N kept small so
+     * the O(M*N*K) CPU ref stays cheap). */
+    fail|=test(c,128,512,256);    /* batch doorbell: large-M prefill (single bank chunk) */
+    fail|=test(c,256,512,256);    /* batch doorbell: M=256 — the per-row doorbell refuses this; BCHAIN serves it */
+    fail|=test(c,128,512,512);    /* batch doorbell: multi bank-chunk N-tiling (Wb=256, NC=2) */
     /* SINGLE-CORE int4 (budget=1): W4A4 is physically single-row (mc=1, captured regcmd) + PC-chained
      * for M>1 — no sched=1 M-scheduler/mg_max*64 tile (so the fp16/int8 large-tile bugs don't apply),
      * but this guards the 1-core M>1 chain path that the multi-core cases above don't exercise. */

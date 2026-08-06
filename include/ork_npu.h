@@ -1358,7 +1358,6 @@ int          ork_mm_run_chain_i4(ork_npu *ctx, int S, const ork_mm_task_i4 *task
 /* EXPERIMENTAL: int4 incremental-task batch (vendor task_number=N pattern) — one resident int4 weight,
  * M rows, task[0]=full + task[1..]=12-config incremental (advance only A/C; weight loaded once), ONE
  * submit. Not Hcap-capped (unlike ork_i4_batch stride-2). int8 A, int32 C, N<=64 (single N-block). */
-int          ork_mm_run_i4_incr(ork_npu *ctx, ork_w *w, int M, const int8_t *A, int32_t *C);
 /* Async round-robin stream: S independent int8 matmuls dispatched dynamically across NPU cores (pull
  * model, no barrier). For batches of independent matmuls (e.g. EAGLE-3 verification). 0/ok, -1/-2 err. */
 int          ork_mm_run_stream_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
