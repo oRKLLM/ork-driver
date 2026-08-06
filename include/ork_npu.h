@@ -948,6 +948,8 @@ typedef struct {
     int M;
     const int8_t *A;
     int32_t *C;
+    int cstride;   /* optional output row-stride (elements) override for C; 0 = use w->N. Lets a colsplit write
+                    * a sub-N-width result into a WIDER C at the full row stride (fp16 wide-N per-N-slice path). */
 } ork_mm_task_i8;
 
 typedef struct {

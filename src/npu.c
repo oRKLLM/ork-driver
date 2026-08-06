@@ -224,6 +224,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     struct fold_scratch *fold_scr[8]; int fold_scr_n; };
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
     struct buf Bbc; int Bbc_valid; /* (A) fp16 CONTIGUOUS weight: all Sk K-slice Bb[ks] concatenated into ONE buffer (built lazily on first ORK_F16_CONTIG colsplit) so the HW chain can walk slice->slice WITHOUT crossing a dma-buf boundary (the cross-buffer CDMA-wild) — enables one chained submit/core like int8. Sn==1 only. */
+    struct buf *Bbc_ns; int Bbc_ns_valid; /* (A-wideN) fp16 Sn>1 PER-N-SLICE CONTIGUOUS weights: Sn buffers, Bbc_ns[ns] = that slice's Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated. Each slice is served as a standalone Sn==1 CONTIG colsplit (no cross-buffer wild); built once, resident (reclaimed at ctx teardown like Bbc). */
     struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */ };
 /* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
  * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
@@ -4142,7 +4143,7 @@ int ork_mm_repack_i8_dequant(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row
     if (w->K != K || w->N != N) return -2;
     return tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out);
 }
-void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w->pcrc); free(w->pcrc_meta); free(w); }   /* device buffers freed at ctx teardown */
+void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4); free(w->bscale); free(w->pcrc); free(w->pcrc_meta); free(w->Bbc_ns); free(w); }   /* device buffers freed at ctx teardown */
 /* Free a packed weight AND reclaim its NPU DMA/IOVA. Required for layer-streaming: evicted weights must
  * return their IOVA to the 4 GiB window (rk_iommu is 32-bit — see the wiki / npu-iova cap). Only weights
  * that OWN their buffers (per-tile bcreate: pack / pack_i4 / pack_i8) are reclaimed; weights whose tiles
@@ -5366,6 +5367,54 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         return ORK_RC_WEDGE_PRONE;
       }
       /* i8 M>1 wide-N/wide-K PREFILL: fall through to the mcworker CHAIN-PREFILL/CHAIN-KSPLIT path below. */ }
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn > 1 && (w->N/16) >= 2 && w->Sk <= 64
+        && !getenv("ORK_COLSPLIT_SERIAL") && !getenv("ORK_F16_NO_WIDEN")) {
+        /* fp16 WIDE-N (Sn>1): per-N-slice CONTIG colsplit. Each N-slice is served as a standalone Sn==1 CONTIG
+         * problem — its Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated into ONE resident buffer (Bbc_ns[ns]) so the
+         * per-core K-chain never crosses a dma-buf boundary (the cross-buffer prefetch WILD that CONTIG prevents).
+         * Cores split THAT slice's columns; end() writes the sub-N result into the wider C at the full row-stride N
+         * via task.cstride. Sn sequential begin/end. Any ineligible/wedged slice abandons colsplit for this matmul
+         * and falls through to the mcworker backstop (correctness). This removes fp16 wide-N's mcworker dependency
+         * (task #45) using the validated Sn==1 no-drop path per slice. */
+        int NMAXn = c->soc->nmax, KSn = c->soc->ks;
+        if (!w->Bbc_ns_valid) {   /* build the per-N-slice CONTIG weights ONCE (resident; reclaimed at teardown like Bbc) */
+            w->Bbc_ns = calloc((size_t)w->Sn, sizeof(struct buf));
+            int build_ok = (w->Bbc_ns != NULL);
+            for (int ns = 0; ns < w->Sn && build_ok; ns++) {
+                int c0 = ns*NMAXn, sw = (w->N - c0 < NMAXn) ? (w->N - c0) : NMAXn;
+                size_t tot = 0;
+                for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSn, Kp = (w->K-k0<KSn)?(w->K-k0):KSn; tot += (size_t)Kp*sw*2; }
+                w->Bbc_ns[ns] = bcreate(fd, tot, 0x403, w->domain);
+                if (!w->Bbc_ns[ns].cpu) { build_ok = 0; break; }
+                size_t off = 0;
+                for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSn, Kp = (w->K-k0<KSn)?(w->K-k0):KSn; size_t sz = (size_t)Kp*sw*2;
+                    memcpy((char*)w->Bbc_ns[ns].cpu + off, w->Bb[(size_t)ns*w->Sk + ks].cpu, sz); off += sz; }
+                bsync(fd, &w->Bbc_ns[ns], RKNPU_MEM_SYNC_TO_DEVICE);
+            }
+            if (build_ok) w->Bbc_ns_valid = 1;   /* partial/failed build -> stays invalid; the slice loop bails to mcworker */
+        }
+        if (w->Bbc_ns_valid) {
+            ork_install_term();
+            int wideN_ok = 1;
+            for (int ns = 0; ns < w->Sn && wideN_ok; ns++) {
+                int c0 = ns*NMAXn, sw = (w->N - c0 < NMAXn) ? (w->N - c0) : NMAXn;
+                struct buf vbb[64];   /* slice-view K-slice tiles (w->Sk <= 64 gated above) */
+                for (int ks = 0; ks < w->Sk; ks++) vbb[ks] = w->Bb[(size_t)ns*w->Sk + ks];
+                ork_w wv = *w; wv.N = sw; wv.Sn = 1; wv.Bb = vbb;
+                wv.Bbc = w->Bbc_ns[ns]; wv.Bbc_valid = 1;   /* use the cached per-slice CONTIG (colsplit skips its own Sn==1 build) */
+                wv.Bgap_valid = 0; memset(wv.Bgap, 0, sizeof wv.Bgap);
+                ork_mm_task_i8 tf = { .w = &wv, .M = M, .A = (const int8_t*)A,
+                                      .C = (int32_t*)((char*)C + (size_t)c0*4), .cstride = w->N };
+                c->mc_error = 0;
+                ork_dyn_chain *hs = ork_dyn_begin_colsplit(c, &tf, nc);
+                if (!hs) wideN_ok = 0;
+                else if (ork_dyn_end(hs) < 0 || c->mc_error) wideN_ok = 0;
+            }
+            if (wideN_ok) return 0;
+            fprintf(stderr, "[ork] fp16 wide-N colsplit ineligible/wedge (K=%d N=%d Sn=%d) — mcworker backstop\n", w->K, w->N, w->Sn);
+            c->mc_error = 0;   /* fall through to the mcworker path for the whole matmul */
+        }
+    }
     if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> mcworker */
         /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
          * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
@@ -12151,7 +12200,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                 tt.enable_mask = pcp[p] ? 0x18 : 0xd; tt.regcfg_amount = pcp[p] ? 69 : 108;   /* perchan: enable 0x18, 69 regs; matmul: 0xd, 108 */
                 tt.regcmd_addr = RC->dma + (size_t)p*REGCMD_N*4; tkf[p] = tt; }
             h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
-            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* f32 accumulate/copy-back -> C columns at row-stride N */
+            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = t->cstride ? t->cstride : N;   /* f32 accumulate/copy-back -> C columns at row-stride N (cstride override: fp16 wide-N per-slice writes a sub-N result into the wider C at full stride) */
             Pc[i] = np2;
             memset(&subs[i], 0, sizeof subs[i]);
             subs[i].flags = (gap ? 0x1u : ork_ppflags()) | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;   /* gap chain carries an SDP (perchan) task -> ping-pong OFF (0x1); worker clears 0x2 -> blocking */

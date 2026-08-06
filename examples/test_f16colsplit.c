@@ -52,7 +52,8 @@ int main(int argc,char**argv){
     }
     setenv("ORK_F16_COLSPLIT","1",1);   /* SELF-VALIDATING TEST: force colsplit, assert bit-exact vs nc=1 */
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed (NPU?)\n");return 1;}
-    int shapes[][3]={{8,2048,256},{128,1024,256},{256,2048,256},{256,4096,512},{256,3584,512},{256,3584,3584}};
+    int shapes[][3]={{8,2048,256},{128,1024,256},{256,2048,256},{256,4096,512},{256,3584,512},{256,3584,3584},
+        {128,2048,16384},{128,3584,18944}};   /* last two: WIDE-N fp16 (N>nmax=8192 => Sn=2, Sn=3) — exercise the per-N-slice CONTIG colsplit (task #45 fp16 wide-N); bit-exact vs nc=1 (mcworker) reference */
     int ns=(int)(sizeof(shapes)/sizeof(shapes[0])), fail=0;
     printf("== test_f16colsplit: fp16 nc=3 doorbell colsplit == nc=1 (bit-exact) ==\n");
     for(int i=0;i<ns;i++){ int M=shapes[i][0],K=shapes[i][1],N=shapes[i][2]; double us,me; int nb=one(c,M,K,N,8,&us,&me);
