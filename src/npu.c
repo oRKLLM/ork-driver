@@ -13513,6 +13513,59 @@ static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M
             tk++; } }
     return 1;
 }
+static int g_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
+struct bchdbw { ork_npu *c; int core, c0, c1, NT, K, N, NG, M, H, Wb, Wmax; ork_w *w; const int8_t *A; int32_t *C; unsigned dom; struct rknpu_submit sub; int rc; };
+/* One NPU core's share of the BCHAIN batch-chain: build its (N-chunk x M-group) programs into its pre-allocated
+ * per-core buffers, seed, NONBLOCK submit, poll ITS core (last-program civac gate -> bsync -> full verify), then
+ * de-tile ITS core. Runs on the npu_pool (parallel build+de-tile across cores; de-tile overlaps the sibling
+ * cores' still-running compute). NO reset here — a global RKNPU_ACT_RESET would corrupt live sibling cores; a
+ * completion miss returns rc=-2 and the caller recovers serially after join. rc: 0 ok / -1 build-err / -2 miss. */
+static void *bch_db_worker(void *vp){
+    struct bchdbw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, NT=a->NT;
+    int K=a->K,N=a->N,NG=a->NG,M=a->M,H=a->H,Wb=a->Wb,Wmax=a->Wmax; unsigned dom=a->dom;
+    a->rc=0; if(NT<1) return NULL;
+    pin_big_core(i);
+    uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
+    for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
+        for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
+    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    int tk=0;
+    for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
+        uint32_t wdma=(uint32_t)(a->w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
+        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
+            uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
+            uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
+            memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+            if(g_i4_validate && validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
+            if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
+                rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
+                rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
+            else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
+            memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
+    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
+    for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
+        t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
+    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    memset(&a->sub,0,sizeof a->sub);
+    a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
+    a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
+    a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
+    bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* seed SENT16 */
+    __asm__ volatile("dsb ish":::"memory");
+    a->sub.timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* nonblock */
+    double t0=ork_now_us();
+    for(;;){
+        if(bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,1,NT-1)){                   /* last-program civac gate */
+            bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+            if(bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,3,-1)){                 /* full verify */
+                bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,a->C,2,-1); a->rc=0; return NULL; } }   /* de-tile NOW (overlaps siblings) */
+        if(g_ork_term){ a->rc=0; return NULL; }
+        double el=ork_now_us()-t0;
+        if(el>300000.0){ a->rc=-2; return NULL; }                                        /* dropped round -> caller recovers serially */
+        if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }              /* HEAVY-JOB BACKOFF */
+    }
+}
 static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
     int fd=c->fd, K=w->K, N=w->N;
@@ -13524,10 +13577,13 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
     if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) dom_activate(c,w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
     if(mc_ensure(c,nc)) return -1;
-    int c0[ORK_MAXCORE], c1[ORK_MAXCORE], NTc[ORK_MAXCORE]; struct rknpu_submit subs[ORK_MAXCORE];
+    if(g_i4_validate<0) g_i4_validate=getenv("ORK_I4_VALIDATE")?1:0;   /* init once on the calling thread (before dispatch) */
+    /* pre-size every core's buffers SINGLE-THREADED (no concurrent bcreate in the workers) */
+    struct bchdbw args[ORK_MAXCORE];
     for(int i=0;i<nc;i++){
-        c0[i]=(int)((long)i*NC/nc); c1[i]=(int)((long)(i+1)*NC/nc);
-        int myNC=c1[i]-c0[i], NT=myNC*NG; NTc[i]=NT; if(NT<1){ NTc[i]=0; continue; }
+        int lc0=(int)((long)i*NC/nc), lc1=(int)((long)(i+1)*NC/nc), NT=(lc1-lc0)*NG;
+        args[i]=(struct bchdbw){c,i,lc0,lc1,NT,K,N,NG,M,H,Wb,Wmax,w,A,C,dom,{0},0};
+        if(NT<1) continue;
         size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
         size_t need_o=(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
         if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
@@ -13535,68 +13591,32 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
         if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,need_tk,0x40b,c->dom_active); }
         if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
         if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
-        uint8_t *abase=c->maf[i].cpu; memset(abase,0,need_af);   /* A packed once per M-group (stride-2), reused across this core's N-chunks */
-        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-            for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), A+(size_t)(g*H+j)*K, 0, K); }
-        bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
-        int tk=0;
-        for(int nc2=c0[i];nc2<c1[i];nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
-            uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
-            for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
-                uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
-                uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-                memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
-                if(validate_regcmd("run_i4_bchain_db", c, rc, REGCMD_I4_N, w, NULL, 0)) return -1;
-                int NT=NTc[i];
-                if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
-                    rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
-                    rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
-                else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
-                memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-        bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-        struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
-        for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
-            t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-        memset(&subs[i],0,sizeof subs[i]);
-        subs[i].flags=ork_ppflags()|0x2u;   /* NONBLOCK doorbell: host polls (self-healing), never a blocking-submit wedge */
-        subs[i].task_number=(uint32_t)NT; subs[i].task_obj_addr=c->mtk[i].obj;
-        subs[i].core_mask=1u<<i; subs[i].fence_fd=-1;
-        subs[i].subcore_task[0]=subs[i].subcore_task[1]=subs[i].subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
     }
-    for(int i=0;i<nc;i++) if(NTc[i]){ bch_db_cells(c,i,c0[i],c1[i],Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); }   /* seed SENT16 + flush to DRAM (bulk bsync, not per-cell cvac) */
-    __asm__ volatile("dsb ish":::"memory");
-    for(int i=0;i<nc;i++) if(NTc[i]){ subs[i].timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&subs[i],dom); }   /* nonblock */
-    for(int i=0;i<nc;i++) c->mwarm[i]=1;
-    g_in_doorbell=1;
-    int done_all=0, recov_max=6;
-    for(int recov=0; recov<=recov_max && !done_all; recov++){
-        if(recov){ /* self-heal a dropped round: RESET + re-seed written cells + resubmit (mc_recover_resubmit model) */
-            struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&ra);
-            struct timespec qs={0,1000000}; nanosleep(&qs,NULL);
-            for(int i=0;i<nc;i++) if(NTc[i]){ bch_db_cells(c,i,c0[i],c1[i],Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); }
-            __asm__ volatile("dsb ish":::"memory");
-            for(int i=0;i<nc;i++) if(NTc[i]){ bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-                bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); subs[i].timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&subs[i],dom); }
-        }
-        /* completion: FAST GATE on each core's last program (chain runs in order -> its last program lands last),
-         * then FULL-verify all written cells once (residual per-cell lag). HEAVY-JOB BACKOFF after a tight window
-         * so the civac poll stops contending with the ms-long NPU batch writeback (the M>1 prefill spin regression). */
-        double t0=ork_now_us(), miss_to=(recov<recov_max)?300000.0:3e6; int gate_ok=0;
-        for(;;){
-            if(!gate_ok){ gate_ok=1; for(int i=0;i<nc;i++) if(NTc[i] && !bch_db_cells(c,i,c0[i],c1[i],Wb,N,NG,M,H,Wmax,NULL,1,NTc[i]-1)){ gate_ok=0; break; } }   /* civac gate: last program only (cheap) */
-            if(gate_ok){ for(int i=0;i<nc;i++) if(NTc[i]) bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);   /* gate passed -> one bulk invalidate, then plain full-verify */
-                int full=1; for(int i=0;i<nc;i++) if(NTc[i] && !bch_db_cells(c,i,c0[i],c1[i],Wb,N,NG,M,H,Wmax,NULL,3,-1)){ full=0; break; } if(full){ done_all=1; break; } }
-            if(g_ork_term){ done_all=1; break; }   /* graceful SIGTERM: stop, de-tile what landed */
-            double el=ork_now_us()-t0; if(el>miss_to) break;
-            if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }   /* HEAVY-JOB BACKOFF */
-        }
-    }
+    c->mc_error=0; g_in_doorbell=1;
+    /* PARALLEL: each pool worker builds+seeds+nonblock-submits+polls+de-tiles its own core */
+    npu_pool_ensure(c);
+    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=bch_db_worker; c->pjob_stride=sizeof(struct bchdbw);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
+    bch_db_worker(&args[0]);                                                              /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     g_in_doorbell=0;
-    if(!done_all){ c->mc_error=1; return -1; }
-    for(int i=0;i<nc;i++) if(NTc[i]) bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
-    for(int i=0;i<nc;i++) if(NTc[i]) bch_db_cells(c,i,c0[i],c1[i],Wb,N,NG,M,H,Wmax,C,2,-1);   /* de-tile int16 -> int32 C */
-    return 0;
+    /* collect; serialized recovery for any dropped core (global RESET is safe now — all workers joined) */
+    int missed=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) missed=1; }
+    for(int recov=0; missed && recov<6; recov++){
+        struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&ra);
+        struct timespec qs={0,1000000}; nanosleep(&qs,NULL);
+        for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue; int NT=args[i].NT;
+            bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+            bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+            bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); __asm__ volatile("dsb ish":::"memory");
+            args[i].sub.timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&args[i].sub,dom);
+            double t0=ork_now_us();
+            for(;;){ if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,1,NT-1)){ bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+                       if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,3,-1)){ bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,C,2,-1); args[i].rc=0; break; } }
+                     double el=ork_now_us()-t0; if(el>3e6) break; if(el>1000.0){struct timespec ts={0,50000};nanosleep(&ts,NULL);} } }
+        missed=0; for(int i=0;i<nc;i++) if(args[i].rc==-2) missed=1;
+    }
+    return missed ? -1 : 0;
 }
 struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
 static void *stream_worker_i4(void *vp) {
