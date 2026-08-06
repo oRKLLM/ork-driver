@@ -5352,7 +5352,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
        * the NPU). The MGT1 gate is removed; mcworker is legacy fall-through only (TODO: remove — see task list). */
       int r_base  = i8 && w->Sn==1 && w->K<=4096 && w->Bf;   /* any M (internal mg_max*64 M-tiling) */
       int r_wideN = i8 && w->Sn>1 && w->K<=4096 && w->Bf;    /* wide-N ffn gate/up: colsplit, any M */
-      int r_wideK = i8 && w->Sn==1 && w->K>4096;             /* wide-K ffn down: colsplit, any M */
+      int r_wideK = i8 && w->Sn==1 && (w->K>4096 || !w->Bf);  /* wide-K ffn down (K>4096) OR no-Bf K<=4096 (ORK_NO_BF FFN-chain): both ride the Bf-FREE Bb K-split colsplit, any M — removes the int8 no-Bf Sn==1 mcworker fall-through (#48) */
       if(r_base || r_wideN || r_wideK){
         /* ONE doorbell submit: ork_dyn_begin_mc -> ork_dyn_begin_colsplit auto-decomposes base (M-tiled),
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
@@ -12214,7 +12214,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
         struct buf *CC = &c->mcc[i];
-        if (K > 4096) {   /* WIDE-K colsplit (ffn_down; Sn==1, ANY M): per-core K-split — Sk*(M-tile) partial
+        if (K > 4096 || !w->Bf) {   /* WIDE-K (K>4096) or NO-Bf (K<=4096, ORK_NO_BF) colsplit (Sn==1, ANY M): the Bf-FREE per-core K-split — Sk*(M-tile) partial
             * [mc,Ncore] programs over this core's column range; end() SUMS the Sk [M,Ncore] partials into
             * C[c0:c1) at row-stride N (ork_dyn_end oSk accumulate, [ks][m][n] layout). M>1: A's K-slice rows are
             * strided by the FULL K, but synth reads A contiguous [mc,Kp], so gather A[M,K] -> AF as a per-slice-
