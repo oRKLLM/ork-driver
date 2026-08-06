@@ -2218,18 +2218,38 @@ int ork_npu_force_fault(ork_npu *c){
     return landed;
 }
 
+/* orkd CLIENT context — the EXPLICIT orkd entry point. Connect (auto-spawn) the orkd daemon and route
+ * ork_mm_* through it: the daemon owns the single-stream NPU and serializes every submit, the safe way to
+ * share it across concurrent processes. NO local NPU open (the daemon owns it); the ops check c->daemon.
+ * Returns NULL if the daemon can't be reached (NO silent fallback to direct — the caller decides). The daemon
+ * process itself must not call this (it sets ORKD_IS_DAEMON). Callers pick transport by CHOOSING the entry
+ * point: ork_npu_init() = direct (default), ork_npu_init_orkd() = orkd client. */
+ork_npu *ork_npu_init_orkd(void){
+    const struct ork_soc *soc=ork_soc_detect();
+    if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
+    { const char *isd=getenv("ORKD_IS_DAEMON");
+      if(isd && atoi(isd)){ fprintf(stderr,"[ork] ERROR: ork_npu_init_orkd() called inside the daemon — use ork_npu_init() (direct)\n"); return NULL; } }
+    orkd_conn *dc=orkd_connect();
+    if(!dc){ fprintf(stderr,"[ork] ERROR: ork_npu_init_orkd() — orkd_connect failed (daemon not reachable/spawnable)\n"); return NULL; }
+    ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
+    if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
+    if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc));
+    return c;
+}
+
+/* DIRECT (in-process) NPU context — the DEFAULT entry point: opens the DRM card and owns the single-stream
+ * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
+ * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
+ * select the transport by calling the desired entry point rather than relying on the env. */
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
-    /* Path B: transparent orkd client. ORK_USE_ORKD set (and not the daemon itself, which sets ORKD_IS_DAEMON)
-     * -> connect/auto-spawn orkd and route ork_mm_* through it; NO local NPU open (the daemon owns it). The ops
-     * check c->daemon. Falls back to the direct NPU if the connect fails. */
+    /* Legacy env override: ORK_USE_ORKD set (and not the daemon itself, which sets ORKD_IS_DAEMON) routes
+     * through orkd. Delegates to the explicit entry point; on connect failure, falls back to the direct NPU. */
     { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
       if(ud && atoi(ud) && !(isd && atoi(isd))){
-        orkd_conn *dc=orkd_connect();
-        if(dc){ ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
-            if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
-            if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc)); return c; }
+        ork_npu *c=ork_npu_init_orkd();
+        if(c) return c;
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     warn_if_governor_parked();

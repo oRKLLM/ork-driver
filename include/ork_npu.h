@@ -76,12 +76,23 @@ void         ork_unpin_current_thread(void);
 int          ork_npu_busy(ork_npu *ctx);
 
 /**
- * @brief Open the NPU, detect the SoC from the device tree, and power it on.
+ * @brief Open the NPU DIRECTLY (in-process), detect the SoC from the device tree, and power it on. This is
+ *        the DEFAULT transport: the process owns the single-stream NPU (do not run concurrent direct-NPU
+ *        processes — they wedge the IOMMU). For back-compat, the legacy ORK_USE_ORKD=1 env redirects this to
+ *        the orkd client; new callers should instead choose the transport by calling the desired entry point.
  * @return Device context (one per process), or NULL on failure — no NPU present, or no permission to
  *         open /dev/dri/cardN (the process needs access to the DRM render node).
  */
 ork_npu     *ork_npu_init(void);
-/** @brief Power off the NPU and free a context obtained from ork_npu_init(). */
+/**
+ * @brief Open an orkd CLIENT context: connect (auto-spawn) the orkd daemon and route every ork_mm_* through
+ *        it. The daemon owns the single-stream NPU and serializes all submits — the safe way to share it
+ *        across concurrent processes. This is the counterpart entry point to ork_npu_init(): callers select
+ *        the transport by CHOOSING the function (env is no longer required).
+ * @return orkd-client context, or NULL if the daemon can't be reached/spawned (NO silent fallback to direct).
+ */
+ork_npu     *ork_npu_init_orkd(void);
+/** @brief Power off the NPU and free a context obtained from ork_npu_init() / ork_npu_init_orkd(). */
 void         ork_npu_free(ork_npu *ctx);
 
 /**

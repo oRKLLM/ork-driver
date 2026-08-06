@@ -23,11 +23,18 @@ open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a rea
 ```c
 #include "ork_npu.h"
 
-ork_npu *ctx = ork_npu_init();              // detects the SoC, opens the NPU
+ork_npu *ctx = ork_npu_init();              // detects the SoC, opens the NPU DIRECTLY (in-process, default)
 ork_w   *w   = ork_mm_pack(ctx, K, N, B);   // pack B[K,N] fp16 once, resident on the NPU
 ork_mm_run(ctx, w, M, A, C);                // C[M,N] fp32 = A[M,K] fp16 x B[K,N]  (many times)
 ork_npu_free(ctx);
 ```
+
+Two transports, selected by **which init you call** (same API afterward):
+`ork_npu_init()` opens the NPU **directly** in-process (the default — one process owns the single-stream
+NPU); `ork_npu_init_orkd()` instead routes every op through the **orkd** daemon, which owns the NPU and
+serializes submits so multiple processes can share it without wedging the IOMMU. `ork_npu_uses_orkd(ctx)`
+reports which is in effect. For back-compat `ork_npu_init()` still honors the legacy `ORK_USE_ORKD=1` env
+(delegating to the orkd path), but new callers should pick the entry point explicitly.
 
 - **`C[M,N]` (fp32) = `A[M,K]` (fp16) × `B[K,N]` (fp16)**, arbitrary `M`/`K`/`N`
   (`K%32==0`, `N%16==0`). K-split + N-tiling + M-tiling are handled internally.
