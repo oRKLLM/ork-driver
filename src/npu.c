@@ -5361,7 +5361,26 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if(!h) return ORK_RC_WEDGE_PRONE;              /* outside the verified doorbell envelope: refuse (rescue-eligible), never wedge-fallback */
         return ork_dyn_end(h) < 0 ? -1 : 0;
       }
-      if(i8 && M==1){   /* DECODE i8 with no doorbell envelope (rare, e.g. Sn>1 && K>4096): reject (no safe decode fallback) */
+      if(i8 && w->Sn>1 && (w->K>4096 || !w->Bf) && !getenv("ORK_NO_I8_WIDEN_SLICE")){
+        /* int8 WIDE-N with no single-submit base (no Bf, or K>4096): serve each N-slice as a standalone Sn==1
+         * K-split colsplit (Bf-free — the validated wide-K path, per slice). cstride=N writes each slice's sub-N
+         * result into the wider C at the full row stride. With r_base/r_wideN/r_wideK covering everything else,
+         * this closes the LAST int8 M>1 gap (no-Bf Sn>1 and Sn>1&K>4096) — int8 no longer falls to mcworker (#48). */
+        if(w->Sk>128) return ORK_RC_WEDGE_PRONE;                        /* slice-view array bound (unrealistic K) — refuse, never wedge-fallback */
+        int NMAXn=c->soc->nmax, ok=1;
+        for(int ns=0; ns<w->Sn && ok; ns++){
+            int c0=ns*NMAXn, sw=(w->N-c0<NMAXn)?(w->N-c0):NMAXn;
+            struct buf vbb[128];
+            for(int ks=0; ks<w->Sk; ks++) vbb[ks]=w->Bb[(size_t)ns*w->Sk+ks];   /* this slice's Sk K-slice tiles */
+            ork_w wv=*w; wv.N=sw; wv.Sn=1; wv.Bb=vbb; wv.Bf=NULL;               /* Sn==1 no-Bf view -> forces the Bf-free K-split */
+            ork_mm_task_i8 tf={ .w=&wv, .M=M, .A=(const int8_t*)A, .C=(int32_t*)((char*)C+(size_t)c0*4), .cstride=w->N };
+            ork_dyn_chain *hs=ork_dyn_begin_mc(c,1,&tf,nc);
+            if(!hs || ork_dyn_end(hs)<0) ok=0;
+        }
+        if(ok) return 0;
+        return ORK_RC_WEDGE_PRONE;   /* a slice ineligible/failed -> refuse (rescue-eligible), never wedge-fallback */
+      }
+      if(i8 && M==1){   /* DECODE i8 with no doorbell envelope: reject (no safe decode fallback). With the wide-N slice path above + r_*, this is now a backstop (unreachable for standard shapes). */
         fprintf(stderr, "[ork] int8 decode M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
                 "blocking fallback (would risk an unrecoverable NPU wedge) — rescue-eligible (ORK_RC_WEDGE_PRONE)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
         return ORK_RC_WEDGE_PRONE;
@@ -12258,7 +12277,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                 struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
                 tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
             h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
-            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N;   /* accumulate -> C columns at row-stride N */
+            h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = t->cstride ? t->cstride : N;   /* accumulate -> C columns at row-stride N (cstride override: int8 no-Bf/wide-K wide-N per-N-slice writes a sub-N result into the wider C at full stride) */
             Pc[i] = np2;
             memset(&subs[i], 0, sizeof subs[i]);
             subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;
@@ -12414,7 +12433,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     { const ork_w *cw = tasks[0].w; int cM = tasks[0].M, ci8 = (cw->dtype == DT_I8 && (cw->N / 32) >= 2);
       int c_base = ci8 && cw->Sn == 1 && cw->K <= 4096 && cw->Bf;
       int c_wideN = ci8 && cw->Sn > 1 && cw->K <= 4096 && cw->Bf;   /* any M: colsplit base path M-tiles + N-slices */
-      int c_wideK = ci8 && cw->Sn == 1 && cw->K > 4096;             /* any M: colsplit wide-K M-tiles the K-slice programs */
+      int c_wideK = ci8 && cw->Sn == 1 && (cw->K > 4096 || !cw->Bf);  /* any M: colsplit wide-K M-tiles the K-slice programs. K<=4096 no-Bf (ORK_NO_BF) also rides the Bf-free K-split here (matches run_multicore r_wideK) — else it falls through to the M>64 !Bf NULL refuse (was mis-read as #36 N=3584; really this gate gap) */
       (void)cM;
       if (S == 1 && nc > 1 && (c_base || c_wideN || c_wideK)) return ork_dyn_begin_colsplit(c, &tasks[0], nc); }
       /* fp16 colsplit is routed ONLY from run_multicore (which falls back to mcworker on NULL) — NOT here, so

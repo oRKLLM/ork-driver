@@ -75,15 +75,18 @@ static int check_chain_prefill(ork_npu*ctx){
     /* {256,18944,3584} is the wide-K ffn_down shape that exercises CHAIN-KSPLIT (K>4096, K-split
      * passes PC-chained into one submit/core then host-accumulated). MUST match the CPU ref both
      * with ORK_CHAIN_KSPLIT=1 (chained) and =0 (per-tile K-split). */
-    int shapes[][3] = { {256,18944,3584}, {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048} };
+    int shapes[][3] = { {256,18944,3584}, {256,3584,3584}, {256,2048,2048}, {128,512,1536}, {200,1024,2048},
+        {128,2048,16384}, {96,3584,18944} };   /* last two: WIDE-N int8 (N>nmax=8192 => Sn=2, Sn=3) — exercise r_wideN (default, Bf) AND the per-N-slice K-split (ORK_NO_BF, no Bf); ref-checked vs CPU (#48) */
     int ns = (int)(sizeof(shapes)/sizeof(shapes[0]));
     /* Static golden output checksums (fnv64 of the int32 C) for the fixed-seed inputs above. Regenerate
      * with `ORK_REGEN=1 sudo ./test_matmul` and paste the printed values. A 0 entry auto-triggers regen. */
-    static const uint64_t GOLD[] = {  /* regenerated 2026-07-14 (RK3588); ref-verified bad=0 */
+    static const uint64_t GOLD[] = {  /* regenerated 2026-07-14 (RK3588); ref-verified bad=0. Last two (2026-08-06): WIDE-N int8 (Sn=2,Sn=3), default Bf path (r_wideN), ref-verified bad=0. */
         0xb4d325e573e7037cULL, 0x6084624fae4ea1cdULL, 0x1fc8a45628241e4bULL, 0xa752ea8100ba7d54ULL, 0x21dc86bea3c1015fULL,
+        0x5b98ab74d6e8947aULL, 0x3fcd5ced1fed0f53ULL,
     };
-    int fail=0;
+    int fail=0; unsigned sd_save=sd;
     for(int s=0;s<ns;s++){
+        if(s==5) sd_save=sd;   /* capture the shared fixed-seed PRNG position just before the appended WIDE-N shapes (idx 5,6) — restored after the loop so DOWNSTREAM golden'd tests (check_i8, ...) see the same rnd() inputs they were baked with */
         int M=shapes[s][0],K=shapes[s][1],N=shapes[s][2];
         printf("ChainPrefill: M=%d K=%d N=%d\n",M,K,N); fflush(stdout);
         int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
@@ -107,6 +110,7 @@ static int check_chain_prefill(ork_npu*ctx){
         }
         ork_w_free(w);free(A);free(B);free(C);
     }
+    if(ns>5) sd=sd_save;   /* the WIDE-N shapes consumed rnd(); undo that so later tests' fixed-seed inputs (and their static goldens) are unaffected by adding these shapes */
     return fail;
 }
 static int check_chain_i8(ork_npu*ctx) {
