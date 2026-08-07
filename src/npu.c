@@ -13832,31 +13832,37 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
     bch_db_worker(&args[0]);                                                              /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     g_in_doorbell=0;
+    /* Build the doorbell chain descriptor from the per-core BCHAIN state so recovery + dump ride the SHARED
+     * machinery (mc_recover_resubmit / ork_dyn_dump), same as int8 ork_dyn_end — Stage 2. BCHAIN's output is
+     * ORK_DYN_SENT16-sentinel'd (bch_db_cells seeds/polls it), so mc_recover_resubmit's esz==2 re-seed is exactly
+     * right; the int4 regcmd (synth_i4) + the bch_db_cells int16->int32 de-tile are UNCHANGED (still done below). */
+    ork_dyn_chain hd; memset(&hd,0,sizeof hd);
+    hd.c=c; hd.S=nc; hd.P=nc; hd.N=N; hd.mc=1; hd.esz=2; hd.dom=dom; hd.mc_nc=nc; hd.mc_dt=DT_I4; hd.mc_dom=dom;
+    for(int i=0;i<nc && i<ORK_MAXCORE;i++){ hd.outbuf[i]=&c->mcc[i]; hd.outptr[i]=(int32_t*)c->mcc[i].cpu;
+        hd.nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); hd.oM[i]=1; hd.mc_subs[i]=args[i].sub; }
     /* collect; serialized recovery for any dropped core (global RESET is safe now — all workers joined) */
     int missed=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) missed=1; }
+    /* TEST HOOK (ORK_BCH_INJECT_MISS=<core>): force one LANDED core to look dropped so the recovery path is
+     * exercised on demand (make test can't reliably trigger a real doorbell miss). The core actually landed, so
+     * recovery must reset+resubmit+re-detile it and STILL produce the correct output — a byte-exact recovery test. */
+    const char*mi=getenv("ORK_BCH_INJECT_MISS");
+    if(mi){ int ic=atoi(mi);
+        if(ic>=0 && ic<nc && args[ic].rc==0){ args[ic].rc=-2; missed=1;
+            if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[BCH-INJECT] forcing core %d dropped -> exercise shared recover\n",ic); } }
     for(int recov=0; missed && recov<6; recov++){
-        struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&ra);
-        struct timespec qs={0,1000000}; nanosleep(&qs,NULL);
+        /* recover ONLY the still-missed cores (mc_recover_resubmit resubmits every mc_Pc[i]!=0 core; gating to the
+         * missed set avoids an in-flight resubmit of a landed core racing the next op). Re-seeding a landed core's
+         * output is harmless — its C was already de-tiled and is never re-read. */
+        for(int i=0;i<nc;i++) hd.mc_Pc[i] = (args[i].rc==-2) ? args[i].NT : 0;
+        mc_recover_resubmit(&hd);   /* SHARED: RESET + re-seed SENT16 + re-bsync(maf/mrc/mtk) + resubmit the missed cores */
         for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue; int NT=args[i].NT;
-            bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-            bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-            bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); __asm__ volatile("dsb ish":::"memory");
-            args[i].sub.timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&args[i].sub,dom);
             double t0=ork_now_us();
             for(;;){ if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,1,NT-1)){ bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
                        if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,3,-1)){ bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,C,2,-1); args[i].rc=0; break; } }
                      double el=ork_now_us()-t0; if(el>3e6) break; if(el>1000.0){struct timespec ts={0,50000};nanosleep(&ts,NULL);} } }
         missed=0; for(int i=0;i<nc;i++) if(args[i].rc==-2) missed=1;
     }
-    if(missed){   /* Stage 1: recover exhausted -> auto-dump on the SHARED doorbell facility (ork_dyn_dump), like
-                   * ork_dyn_end@12209. BCHAIN's output IS SENT16-sentinel'd (bch_db_cells), so the per-core landed/
-                   * stuck map + ork_npu_dump_state are meaningful. Diagnostic only; no change to regcmd/de-tile/recover. */
-        ork_dyn_chain hd; memset(&hd,0,sizeof hd);
-        hd.c=c; hd.S=nc; hd.P=nc; hd.N=N; hd.mc=1; hd.esz=2; hd.dom=dom;
-        for(int i=0;i<nc && i<ORK_MAXCORE;i++){ hd.outbuf[i]=&c->mcc[i]; hd.outptr[i]=(int32_t*)c->mcc[i].cpu;
-            hd.nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); hd.oM[i]=1; }
-        ork_dyn_dump(&hd,"run_i4_bchain_db incomplete (recover exhausted)");
-    }
+    if(missed) ork_dyn_dump(&hd,"run_i4_bchain_db incomplete (recover exhausted)");   /* Stage 1: shared doorbell auto-dump */
     return missed ? -1 : 0;
 }
 struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
