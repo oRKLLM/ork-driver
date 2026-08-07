@@ -5208,7 +5208,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * per-precision doorbell envelope; the decomposer (tile geometry) is dtype-agnostic. ONLY DT_I8 is live today
  * (q8_0 compute path + only precision the multi-core doorbell accepts as tiles); DT_F16/DT_I4 pack returns NULL
  * until their doorbell tile path is built. sub[ki*nnt+ni] holds one c_base-sized packed weight per tile. */
-typedef struct ork_w_sliced { int K, N, dtype; ork_slice_caps cap; int nks, nnt; ork_w **sub; } ork_w_sliced;
+typedef struct ork_w_sliced { int K, N, dtype; ork_slice_caps cap; int nks, nnt, ks, ns; ork_w **sub; } ork_w_sliced;
 
 void ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w) {                   /* dtype-agnostic: ork_mm_free frees any sub-weight */
     if (!w) return;
@@ -5220,10 +5220,19 @@ void ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w) {                   /* dtyp
 static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     ork_slice_caps cap = ork_slice_caps_rk3588();
     if (K % cap.kmul || N % cap.nmul) return NULL;                       /* unaligned: pad not yet supported */
-    int ks = (cap.kmax / cap.kmul) * cap.kmul, ns = (cap.nmax / cap.nmul) * cap.nmul;
-    int nks = (K + ks - 1) / ks, nnt = (N + ns - 1) / ns;
+    int ks = (cap.kmax / cap.kmul) * cap.kmul, cap_ns = (cap.nmax / cap.nmul) * cap.nmul;
+    int nks = (K + ks - 1) / ks;
+    /* BALANCED N-TILING (#33 stage 3 — native colsplit's balanced boundary-split): split N into EQUAL-width
+     * tiles (nmul-aligned, <= nmax) using at least `cores` of them, so the doorbell submit hands each core an
+     * even column load. The old nmax+remainder tiling put e.g. 8192+512 on 2 cores (3rd idle) = a 2.3x loss;
+     * equal tiles >= cores mirror ork_dyn_begin_colsplit's t0=i*N/nc balance. */
+    int nnt = (N + cap_ns - 1) / cap_ns; if (nnt < c->soc->cores) nnt = c->soc->cores;
+    int nalign = 32;                                                     /* int8 pack() needs each tile width %32==0 (fp16 %16); N%32==0 holds for any packed int8 weight, so all tiles stay valid */
+    int ns = ((N + nnt - 1) / nnt + nalign - 1) / nalign * nalign;       /* equal width, 32-aligned */
+    if (ns > cap_ns) ns = cap_ns; if (ns < nalign) ns = nalign;
+    nnt = (N + ns - 1) / ns;                                             /* actual tiles after alignment */
     struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->dtype = DT_I8; w->cap = cap; w->nks = nks; w->nnt = nnt;
+    w->K = K; w->N = N; w->dtype = DT_I8; w->cap = cap; w->nks = nks; w->nnt = nnt; w->ks = ks; w->ns = ns;
     w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
     int8_t *blk = malloc((size_t) ks * ns);
     if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
@@ -5248,9 +5257,29 @@ ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dt
     }
 }
 
+/* #33 STAGE 3: per-core PARALLEL ks-outer NEON accumulate for the sliced doorbell run — the proven
+ * colsplit pattern (ork_csub_worker's WIDE-K PARALLEL ACCUMULATE). Each pool core owns a balanced,
+ * DISJOINT output-column range [c0,c1); for every N-tile overlapping it, it sums that tile's nks K-slice
+ * partials into C (ks-outer, so the C column block stays hot across the K-slice passes; NEON int32 add is
+ * associative -> bit-exact). Global-column split parallelizes BOTH wide-N (tiles fan across cores) and
+ * wide-K (a single tile's columns split across cores). Replaces the single-threaded ni/ki/m/n sum that
+ * measured 1.15-2.31x slower than native (worst for wide-N). */
+struct slc_acc { const ork_mm_task_i8 *tasks; int32_t *C; int nks, nnt, ns, N, M, c0, c1; };
+static void *slice_acc_worker(void *p){
+    struct slc_acc *a = p; int nnt=a->nnt, nks=a->nks, ns=a->ns, N=a->N, M=a->M, c0=a->c0, c1=a->c1;
+    for(int ni=0; ni<nnt; ni++){ int n0=ni*ns, Nw=(N-n0<ns)?(N-n0):ns;
+        int lo=(n0>c0)?n0:c0, hi=((n0+Nw)<c1)?(n0+Nw):c1; if(lo>=hi) continue;   /* this tile's overlap with the core's columns */
+        int woff=lo-n0, wlen=hi-lo;
+        for(int ki=0; ki<nks; ki++){ const int32_t *src=(const int32_t*)a->tasks[(size_t)ki*nnt+ni].C;
+            for(int m=0; m<M; m++){ int32_t *cr=a->C+(size_t)m*N+lo; const int32_t *pr=src+(size_t)m*Nw+woff; int n=0;
+                if(ki==0){ for(; n<wlen; n++) cr[n]=pr[n]; }                       /* first K-slice seeds */
+                else { for(; n+4<=wlen; n+=4) vst1q_s32(cr+n, vaddq_s32(vld1q_s32(cr+n), vld1q_s32(pr+n)));
+                       for(; n<wlen; n++) cr[n]+=pr[n]; } } } }                    /* rest accumulate (NEON) */
+    return NULL;
+}
 static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
-    int ks = (w->cap.kmax / w->cap.kmul) * w->cap.kmul, ns = (w->cap.nmax / w->cap.nmul) * w->cap.nmul;
+    int ks = w->ks, ns = w->ns;   /* balanced tile step baked at pack (equal-width N-tiles >= cores) */
     int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N;
     /* SINGLE chained doorbell submit over EVERY tile (K-slices x N-tiles) — one begin/end, not nks*nnt
      * round-trips. ork_dyn_begin_mc distributes the S tasks across the nc cores and chains each core's tasks
@@ -5274,11 +5303,22 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
     ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);                  /* ONE doorbell submit for all tiles */
     if (!h) rc = -1;                                                       /* a c_base tile outside the doorbell envelope -> fail; the caller refuses (ORK_RC_WEDGE_PRONE). NEVER a blocking fall-back (#45) */
     else if (ork_dyn_end(h) < 0) rc = -1;
-    if (!rc) for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
-        for (int ki = 0; ki < nks; ki++) { const int32_t *src = (const int32_t*)tasks[ki*nnt + ni].C;
-            for (int m = 0; m < M; m++) { int32_t *cr = C + (size_t) m*N + n0; const int32_t *pr = src + (size_t) m*Nw;
-                if (ki == 0) for (int n = 0; n < Nw; n++) cr[n]  = pr[n];   /* first K-slice seeds, rest accumulate */
-                else         for (int n = 0; n < Nw; n++) cr[n] += pr[n]; } } }
+    if (!rc) {   /* PER-CORE PARALLEL ks-outer NEON accumulate (Stage 3) — balanced disjoint C-column ranges */
+        int anc = nc>0 ? nc : c->soc->cores; if(anc>ORK_MAXCORE) anc=ORK_MAXCORE; if(anc<1) anc=1;
+        struct slc_acc acc[ORK_MAXCORE];
+        for(int i=0;i<anc;i++){ int cc0=(int)((long)i*N/anc), cc1=(int)((long)(i+1)*N/anc);
+            acc[i]=(struct slc_acc){ tasks, C, nks, nnt, ns, N, M, cc0, cc1 }; }
+        if(anc==1){ slice_acc_worker(&acc[0]); }
+        else {
+            npu_pool_ensure(c);
+            pthread_mutex_lock(&c->pmu);
+            c->pjob=acc; c->pjob_nc=anc; c->pjob_fn=slice_acc_worker; c->pjob_stride=sizeof(struct slc_acc);
+            c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+            pthread_mutex_unlock(&c->pmu);
+            slice_acc_worker(&acc[0]);   /* core 0 runs on the calling thread */
+            pthread_mutex_lock(&c->pmu); while(c->pdone < anc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+        }
+    }
     free(Aslc); free(part); free(tasks); return rc;
 }
 
