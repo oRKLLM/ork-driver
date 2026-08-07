@@ -19,6 +19,7 @@
 
 static uint32_t g = 2463534242u;
 static int8_t r8(void){ g ^= g<<13; g ^= g>>17; g ^= g<<5; return (int8_t)(((int)(g & 0x3f)) - 31); }
+static int8_t r4(void){ g ^= g<<13; g ^= g>>17; g ^= g<<5; return (int8_t)(((int)(g & 0xf)) - 8); }   /* int4 [-8,7] in an int8 container */
 
 static void cpuref(const int8_t *A, const int8_t *B, int M, int K, int N, int32_t *C){
     for(int m=0;m<M;m++) for(int n=0;n<N;n++){ int32_t s=0; const int8_t *ar=A+(size_t)m*K;
@@ -89,6 +90,56 @@ static int one_pad(ork_npu *c, int K, int N, int M, int slice_all, const char *t
     return fail;
 }
 
+/* int4 (W4A4) rescue: decompose a refused int4 shape into BCHAIN-legal sub-tiles. int4 matmul is exact
+ * integer arithmetic (values [-8,7], int32 accumulate) so it's bit-exact vs a CPU int32 reference (the
+ * QUANTIZATION is what's incoherent, not the matmul). A *naturally*-refusing shape needs large M (→ huge CPU
+ * ref), so we FORCE the rescue on cheap shapes that still exercise the natural gate (Sn>1 and K>8192 both
+ * build w->sliced) — plus a forced-small base. Validates slice_pack_i4 + slice_run_i4 (BCHAIN per tile) +
+ * int32 K-accumulate + N-scatter. */
+static int one_i4(ork_npu *c, int K, int N, int M, int slice_all, const char *tag){
+    printf("  [%-10s] K=%d N=%d M=%d int4 (Sn=%d K>8192=%d)\n", tag, K, N, M, (N+8191)/8192, K>8192);
+    int8_t *A=malloc((size_t)M*K), *B=malloc((size_t)K*N);
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4();
+    for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
+    int32_t *Ccpu=malloc((size_t)M*N*4), *Cres=malloc((size_t)M*N*4);
+    cpuref(A,B,M,K,N,Ccpu);
+    if(slice_all) setenv("ORK_SLICE_ALL","1",1); else unsetenv("ORK_SLICE_ALL");
+    ork_w *w=ork_mm_pack_i4(c,K,N,B); unsetenv("ORK_SLICE_ALL");
+    if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(Ccpu);free(Cres); return 1; }
+    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rr=ork_mm_run_i4(c,w,M,A,Cres); unsetenv("ORK_FORCE_SLICE_RESCUE");
+    ork_mm_free(c,w);
+    int fail=0; long f;
+    if(rr==ORK_RC_WEDGE_PRONE){ printf("    rescue REFUSED (-501): int4 tiles not built -> gate/plumbing FAIL\n"); fail=1; }
+    else if(rr){ printf("    int4 rescue rc=%d FAIL\n", rr); fail=1; }
+    else { long b=diff(Cres,Ccpu,(size_t)M*N,&f); if(b){ printf("    int4 rescue vs CPU-int32: %ld mism (first@%ld %d/%d) FAIL\n",b,f,Cres[f],Ccpu[f]); fail=1; } }
+    if(!fail) printf("    OK (int4 rescue == CPU-int32, bit-exact)\n");
+    free(A);free(B);free(Ccpu);free(Cres);
+    return fail;
+}
+
+/* int4 NATURAL refuse -> rescue: a real reachable trigger (large M + Sn>1 makes run_i4_mc_db's per-core
+ * program count exceed the cap -> -4). Proves the refuse SITE routes to the rescue (rc=0, not -501) and that
+ * the natural path == the forced rescue. No CPU ref (compares the two NPU runs) -> cheap despite big M. */
+static int one_i4_natural(ork_npu *c, int K, int N, int M, const char *tag){
+    printf("  [%-10s] K=%d N=%d M=%d int4 NATURAL refuse->rescue\n", tag, K, N, M);
+    int8_t *A=malloc((size_t)M*K), *B=malloc((size_t)K*N);
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4();
+    for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
+    int32_t *Cnat=malloc((size_t)M*N*4), *Cfor=malloc((size_t)M*N*4);
+    ork_w *w=ork_mm_pack_i4(c,K,N,B);   /* natural gate builds w->sliced (Sn>1) */
+    if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(Cnat);free(Cfor); return 1; }
+    unsetenv("ORK_FORCE_SLICE_RESCUE"); int rn=ork_mm_run_i4(c,w,M,A,Cnat);   /* run_i4_mc_db -4 -> rescue */
+    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rf=ork_mm_run_i4(c,w,M,A,Cfor); unsetenv("ORK_FORCE_SLICE_RESCUE");
+    ork_mm_free(c,w);
+    int fail=0; long f;
+    if(rn==ORK_RC_WEDGE_PRONE){ printf("    NATURAL refuse did NOT route to rescue (-501) -> wiring FAIL\n"); fail=1; }
+    else if(rn||rf){ printf("    rc natural=%d forced=%d FAIL\n",rn,rf); fail=1; }
+    else { long b=diff(Cnat,Cfor,(size_t)M*N,&f); if(b){ printf("    natural != forced rescue: %ld mism FAIL\n",b); fail=1; } }
+    if(!fail) printf("    OK (natural refuse routed to rescue, rc=0, == forced)\n");
+    free(A);free(B);free(Cnat);free(Cfor);
+    return fail;
+}
+
 int main(void){
     setvbuf(stdout,0,_IONBF,0);
     ork_npu *c=ork_npu_init(); if(!c){ printf("init fail\n"); return 1; }
@@ -99,6 +150,10 @@ int main(void){
     fail |= one(c,8192, 8704, 4, 0, "refuse");   /* Sn>1 && K>4096 — the NATURAL refuse-prone gate builds tiles */
     fail |= one_pad(c,1408, 512,  8, 1, "pad-K");    /* K%512!=0 (1408->pad 1536) — PADDING fits the unaligned K, bit-exact */
     fail |= one_pad(c,4224, 8704, 4, 0, "pad-refuse"); /* NATURAL refuse (Sn>1,K>4096) AND unaligned K (4224->4608) — pad + rescue */
+    fail |= one_i4(c, 512,   256,   8, 1, "i4-base");  /* int4 forced small — slice_pack_i4/run_i4/accumulate */
+    fail |= one_i4(c, 512,   16384, 8, 0, "i4-wideN"); /* int4 NATURAL Sn>1 gate — N-scatter (2 tiles) */
+    fail |= one_i4(c, 10240, 128,   8, 0, "i4-wideK"); /* int4 NATURAL K>8192 gate — K-slice int32-accumulate (2 slices) */
+    fail |= one_i4_natural(c, 2048, 16384, 128, "i4-refuse"); /* REAL trigger: M=128 + Sn=2 -> run_i4_mc_db -4 -> rescue */
     printf(fail ? "TEST_SLICE_RESCUE: FAIL\n" : "TEST_SLICE_RESCUE: PASS\n");
     return fail ? 1 : 0;
 }

@@ -4280,6 +4280,13 @@ ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
         tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0,Nc);
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
     }
+    /* SLICE-AND-DICE RESCUE (#33): pre-build doorbell tiles for a REFUSE-PRONE int4 shape (Sn>1 => N>nmax,
+     * or K>8192 => BCHAIN H<2) so ork_mm_run_i4's refuse (ORK_RC_WEDGE_PRONE) instead RUNS the shape by
+     * decomposing it into BCHAIN-legal sub-tiles (raw nibble B only in scope here — pack_i4 keeps none). The
+     * reachable trigger is fused/wide-N int4 prefill (Sn>1, per-core program count > cap). Gated so well-behaved
+     * int4 (Sn==1, K<=8192) builds nothing. !g_in_slice_pack: the sub-tiles below don't recurse. */
+    if(!g_in_slice_pack && !getenv("ORK_NO_SLICE_RESCUE") && ((Sn>1 || K>8192) || getenv("ORK_SLICE_ALL")))
+        w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_I4);
     return w;
 }
 /* Reload pre-tiled NATIVE-W4A4 weight bytes (from ork_w_dump of a DT_I4 weight / a .orkpack native-W4A4
@@ -4401,13 +4408,19 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * batches (synth_i4 mc>1) + bank-width Wb=131072/K N-tiling + weight-loaded-once chaining, self-healing on
      * the doorbell spine. Bit-exact, ~18-25x over the per-row doorbell, and serves the large-M shapes the
      * per-row path refuses (#52). Falls through (-4) to the per-row doorbell for decode (M=1)/non-qualifying. */
+    /* #33 TEST/A-B hook: force a tile-bearing int4 shape onto the slice rescue (bit-exact validation). */
+    if(w->sliced && getenv("ORK_FORCE_SLICE_RESCUE")){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
     if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=run_i4_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     /* decode (M=1) + non-batch shapes ride the per-row doorbell chain (ork_dyn_begin_mc_i4): Sk>1/Sn>1 via
      * chained column/K-slice programs. -4 (over-large chain / unsupported int4 shape) => refuse (rescue-eligible).
      * All blocking int4 paths (i4_mcworker / INCR / CBATCH / blocking BCHAIN) are removed (#45/#52). */
-    if(!g_ork_prof){ int r=run_i4_mc_db(c,w,M,A,C,nc); return r!=-4 ? r : ORK_RC_WEDGE_PRONE; }
+    if(!g_ork_prof){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;
+        if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue the refused shape via BCHAIN sub-tiles, else refuse */
+        return ORK_RC_WEDGE_PRONE; }
     double t0=ork_now_us(); int r=run_i4_mc_db(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++;
-    return r!=-4 ? r : ORK_RC_WEDGE_PRONE;
+    if(r!=-4) return r;
+    if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue */
+    return ORK_RC_WEDGE_PRONE;
 }
 
 /* C[M,N] = A[M,K] x packed weights. dt-keyed: fp16 A -> fp32 C, or int8 A -> int32 C.
@@ -5261,15 +5274,42 @@ static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     free(blk); return w;
 }
 
-/* PRECISION DISPATCH. Only int8 has refuse sites, so only int8 has a sliced rescue. fp16 has NO refused
- * shapes (out-of-envelope fp16 falls to run()'s single-core reference via ORK_RC_F16_SC — a working path,
- * never ORK_RC_WEDGE_PRONE) and its multicore FIT is the CONTIG colsplit, not tiles — so there is no fp16
- * tiled path here. int4 is a gated follow-on (its refuse sites still refuse). */
+/* int4 (W4A4) sub-weight packer (#33): twin of slice_pack_i8, but the tile envelope is BCHAIN's
+ * (run_i4_bchain_db, the per-tile executor): each sub-tile must be Sk==1, Sn==1, N%64==0, and K<=8192 so
+ * BCHAIN's H=16384/K>=2. So K-slice at ks=8192 (K padded to 32 — pack_i4 needs K%32; pad rows are zeroed ->
+ * contribute 0), N-tile at ns=8192 (Sn==1; BCHAIN N-tiles further by bank-width internally). B is the int8
+ * nibble-container [-8,7] (pack_i4's input); a native pack_i4 weight keeps no raw nibbles, so sub-tiles are
+ * re-packed from the caller's B here (as slice_pack_i8 does with ork_mm_pack_i8). */
+static ork_w_sliced *slice_pack_i4(ork_npu *c, int K, int N, const int8_t *B) {
+    if (N % 64) return NULL;                                             /* pack_i4 requires N%64 (a real int4 weight satisfies it); N is not padded */
+    int Kpad = ((K + 31) / 32) * 32;                                    /* pad K to 32 (pack_i4 K%32); zero rows contribute 0 -> bit-exact */
+    int ks = 8192, ns = 8192;                                           /* K-slice <=8192 (BCHAIN H>=2); N-tile <=8192 (Sn==1). both %64 & %32 */
+    int nks = (Kpad + ks - 1) / ks, nnt = (N + ns - 1) / ns;
+    struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
+    w->K = K; w->N = N; w->Kpad = Kpad; w->dtype = DT_I4; w->cap = ork_slice_caps_rk3588(); w->nks = nks; w->nnt = nnt; w->ks = ks; w->ns = ns;
+    w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
+    int8_t *blk = malloc((size_t) ks * ns);
+    if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
+    g_in_slice_pack = 1;
+    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < Kpad ? k0+ks : Kpad, Ks = k1-k0;
+        for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
+            for (int k = 0; k < Ks; k++) { if (k0+k < K) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* real nibble row */
+                                           else          memset(blk + (size_t) k*Nw, 0, Nw); }                        /* PAD row -> zero */
+            ork_w *sw = ork_mm_pack_i4(c, Ks, Nw, blk);                 /* Sk==1, Sn==1, N%64 tile -> BCHAIN-eligible */
+            if (!sw) { g_in_slice_pack = 0; free(blk); ork_mm_free_sliced(c, w); return NULL; }
+            w->sub[ki*nnt + ni] = sw; } }
+    g_in_slice_pack = 0; free(blk); return w;
+}
+
+/* PRECISION DISPATCH. int8 + int4 have refuse sites and thus a sliced rescue. fp16 has NO refused shapes
+ * (out-of-envelope fp16 -> ORK_RC_F16_SC -> single-core reference, a working path; its multicore fit is the
+ * CONTIG colsplit, not tiles) -> no fp16 tiled path. */
 ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dtype) {
     if (!c || !B || K <= 0 || N <= 0) return NULL;
     switch (dtype) {
         case DT_I8:  return slice_pack_i8 (c, K, N, (const int8_t *) B);
-        default:     fprintf(stderr, "[ork] slice-and-dice: int8 only (fp16 has no refused shapes — uses colsplit; int4 follow-on); dtype %d unsupported\n", dtype);
+        case DT_I4:  return slice_pack_i4 (c, K, N, (const int8_t *) B);
+        default:     fprintf(stderr, "[ork] slice-and-dice: int8/int4 only (fp16 has no refused shapes — uses colsplit); dtype %d unsupported\n", dtype);
                      return NULL;
     }
 }
@@ -5341,12 +5381,59 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
     free(Aslc); free(part); free(tasks); return rc;
 }
 
-/* PRECISION DISPATCH. int8 only (see ork_mm_pack_sliced — fp16 has no refused shapes / uses colsplit; int4 follow-on). */
+/* int4 sliced run (#33): decompose a refused int4 shape into BCHAIN-legal sub-tiles (Sk==1, Sn==1, N%64,
+ * K<=8192) and run EACH via run_i4_bchain_db (M>=2) or the per-row doorbell (M==1) — reusing #52's
+ * self-healing / pool / de-tile machinery as a black box — then int32-accumulate the K-slices + scatter N
+ * (int4 C is int32 after BCHAIN's de-tile, so the int8 slice_acc_worker applies verbatim). Tiles run
+ * sequentially (each internally multi-core); a tile that refuses/fails fails the whole rescue -> the caller
+ * refuses (never a blocking fall-back, per #45/#52). */
+static int slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
+    if (!c || !w || !A || !C || M < 1) return -1;
+    int ks = w->ks, ns = w->ns, nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N, Kpad = w->Kpad;
+    int8_t  *Aslc = malloc((size_t) M * Kpad);
+    int32_t *part = malloc((size_t) nks * M * N * sizeof(int32_t));
+    ork_mm_task_i8 *tasks = malloc((size_t) S * sizeof *tasks);
+    if (!Aslc || !part || !tasks) { free(Aslc); free(part); free(tasks); return -1; }
+    size_t aoff = 0, poff = 0; int rc = 0;
+    for (int ki = 0; ki < nks && !rc; ki++) { int k0 = ki*ks, k1 = k0+ks < Kpad ? k0+ks : Kpad, Ks = k1-k0;
+        int8_t *aptr = Aslc + aoff;
+        int real = K - k0; if (real > Ks) real = Ks; if (real < 0) real = 0;   /* real A cols this slice; PAD tail -> 0 */
+        for (int m = 0; m < M; m++) { memcpy(aptr + (size_t) m*Ks, A + (size_t) m*K + k0, real);
+                                      if (real < Ks) memset(aptr + (size_t) m*Ks + real, 0, Ks - real); }
+        aoff += (size_t) M * Ks;
+        for (int ni = 0; ni < nnt && !rc; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
+            int32_t *ptile = part + poff; poff += (size_t) M * Nw;
+            tasks[ki*nnt + ni] = (ork_mm_task_i8){ w->sub[ki*nnt + ni], M, aptr, ptile };
+            int nct = nc>0 ? nc : c->soc->cores; int nb = Nw/64; if (nct > nb) nct = nb; if (nct < 1) nct = 1;
+            int r = (M >= 2) ? run_i4_bchain_db(c, w->sub[ki*nnt + ni], M, aptr, ptile, nct)   /* BCHAIN batch on the doorbell */
+                             : run_i4_mc_db    (c, w->sub[ki*nnt + ni], M, aptr, ptile, nct);  /* M==1 per-row doorbell */
+            if (r < 0) rc = -1; } }
+    if (!rc) {   /* per-core PARALLEL ks-outer int32 accumulate + N scatter (same worker as int8) */
+        int anc = nc>0 ? nc : c->soc->cores; if(anc>ORK_MAXCORE) anc=ORK_MAXCORE; if(anc<1) anc=1;
+        struct slc_acc acc[ORK_MAXCORE];
+        for(int i=0;i<anc;i++){ int cc0=(int)((long)i*N/anc), cc1=(int)((long)(i+1)*N/anc);
+            acc[i]=(struct slc_acc){ tasks, C, nks, nnt, ns, N, M, cc0, cc1 }; }
+        if(anc==1){ slice_acc_worker(&acc[0]); }
+        else {
+            npu_pool_ensure(c);
+            pthread_mutex_lock(&c->pmu);
+            c->pjob=acc; c->pjob_nc=anc; c->pjob_fn=slice_acc_worker; c->pjob_stride=sizeof(struct slc_acc);
+            c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+            pthread_mutex_unlock(&c->pmu);
+            slice_acc_worker(&acc[0]);
+            pthread_mutex_lock(&c->pmu); while(c->pdone < anc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+        }
+    }
+    free(Aslc); free(part); free(tasks); return rc;
+}
+
+/* PRECISION DISPATCH. int8 + int4 (fp16 has no refused shapes -> uses colsplit, not the tiled surface). */
 int ork_mm_run_sliced(ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc) {
     if (!w) return -1;
     switch (w->dtype) {
         case DT_I8:  return slice_run_i8 (c, w, M, (const int8_t *) A, (int32_t *) C, nc);
-        default:     return -3;   /* fp16: colsplit (not tiles); int4: gated follow-on */
+        case DT_I4:  return slice_run_i4 (c, w, M, (const int8_t *) A, (int32_t *) C, nc);
+        default:     return -3;   /* fp16: colsplit (not tiles) */
     }
 }
 
