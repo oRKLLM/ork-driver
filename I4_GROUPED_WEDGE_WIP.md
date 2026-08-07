@@ -1,5 +1,50 @@
 # I4 grouped-W4A4 prefill wedge — WIP recovery doc
 
+## REIMPLEMENTATION SPEC (2026-08-07) — "int4 fully rides the doorbell, no perf regression"
+DEFECT (#33 spec miss): int4 paths drain via BESPOKE code, not the shared doorbell drain ork_dyn_end
+(auto-dump@12189 + recover loop@12163). Inventory:
+  - int8/fp16: ork_dyn_end (THE doorbell drain — poll + mc_recover_resubmit + auto ork_dyn_dump). GOOD.
+  - grouped W4A4: ork_dyn_begin_mc_i4_grouped (submit, on doorbell) + ork_dyn_grouped_end@10885 — BESPOKE
+    poll, NO recover, NO dump (float scale-accumulate tail). <- worst offender.
+  - BCHAIN int4: run_i4_bchain_db@13777 — its OWN 6-reset recover loop@13813 + de-tile (parallel; not ork_dyn_end).
+  - M=1 int4: run_i4_mc_db -> ork_dyn_begin_mc_i4 -> ork_dyn_end? (verify; if yes it already rides it).
+
+PLAN (staged, each `make test` byte-identical + A/B perf-gated):
+  1. EXTRACT a drain-core from ork_dyn_end: `ork_dyn_drain(h, finalize_cb)` = the poll-all-S + recover-missed
+     (mc_recover_resubmit) + auto ork_dyn_dump, with the op-specific tail as a callback:
+       - int8/fp16 finalize = existing int32-widen/copy/oscat (behavior byte-identical -> regression-proof).
+       - grouped finalize   = the float scale-accumulate (move from ork_dyn_grouped_end).
+       - BCHAIN finalize    = the per-line de-tile (move from run_i4_bchain_db); drop its private reset loop.
+     Keep h->i4g / h->esz / h->oM etc. as the per-op descriptors the finalize_cb reads.
+  2. Point ork_dyn_grouped_end + run_i4_bchain_db (+ verify M=1) at ork_dyn_drain. Delete the bespoke polls/resets.
+  3. PERF GATE (AGENTS mandatory): A/B every int4 shape BOTH regimes vs current HEAD — decode M=1 (per-row) and
+     prefill M>=2 (grouped + BCHAIN + the M-chunk rescue). No regression allowed; update thresholds only if faster.
+     NOTE the known perf pathology: native-W4A4 M-chunk rescue = ~1806 micro-submits/forward (SLOW at prefill by
+     design). Riding the doorbell fixes ROBUSTNESS (self-heal + dump), NOT that slowness — do not conflate; the
+     "no regression" bar is vs current int4, and native-W4A4-at-prefill stays opt-in (route B/W8A8 is the default).
+  4. Validate: make test all knobs + mode_probe + the ORK_MIXED_W4A4 full-model prefill (self-heals now, dumps a
+     true stall) + ORK_QUANT=4 route-B unaffected.
+GATING for this whole effort: fresh session, full context (core drain shared by int8/fp16 = highest blast radius).
+
+
+## DATA-DRIVEN REFRAME (2026-08-07, from the doorbell dump — supersedes "hard wedge")
+Wired ork_dyn_dump into the grouped drain (ork_dyn_grouped_end@~10891) + repro'd native-W4A4 prefill
+(ORK_QUANT=4 ORK_MIXED_W4A4=1, F16, P=32) with ORK_GRP_DEBUG. FINDINGS:
+  - DYN-DUMP fired **0 times** — NO userspace-detected stall; every grouped submit completed.
+  - **1806** grouped ops in ONE forward: the M-chunk rescue explodes each native-W4A4 matmul into a swarm
+    of tiny M=3/M=2 submits (M_padded=32 -> ~11 chunks, x28 layers x all projections).
+  - Run was CUT BY TIMEOUT mid-warmup (last line = sched_reserve), NOT stalled.
+=> The "wedge" is dominantly a PERFORMANCE PATHOLOGY (≈1806 micro-submits/forward -> pathologically slow ->
+   timeout cuts it) + INTERMITTENT kernel-recovered doorbell misses (the earlier "reset storms" — recovered
+   transparently, which is why no dump fired), with only a rare genuine hard-hang. Matches AGENTS: native
+   W4A4 "loses to int8 at prefill" — it is not meant to run prefill. Default int4 = route B (W8A8), fast+robust.
+ARCHITECTURAL FIX (the real one, per user): make the grouped drain RIDE ork_dyn_end (auto-dump@12189 +
+   recover loop) instead of bespoke ork_dyn_grouped_end (no recover, silent timeout). Keep only the float
+   scale-accumulate as the custom tail. Then intermittent misses self-heal + rare true stalls auto-dump.
+   (Bolted a stopgap ork_dyn_dump into ork_dyn_grouped_end this session — uncommitted; the ride-ork_dyn_end
+   refactor is the correct replacement.) The perf pathology (M-chunk swarm) is inherent to native-W4A4-at-prefill.
+
+
 ## RESOLVED (2026-08-07) via route B — int4 build+serve now run on the NPU
 Re-routed `ORK_QUANT=4` off the fragile native-W4A4 grouped path onto the **W4A8-inflate (i4a8)**
 path: COMPUTE = W8A8 on the NPU (int4 weights inflated int4->int8, `mul_mat_i8` — robust, no wedge),
@@ -77,6 +122,23 @@ called by `mul_mat_i4`, so it does NOT fix ORK_QUANT=4 grouped. Keep it (improve
 2. Resolve read-back bscale-format match (grouped per-group NG*N vs i4native per-channel N).
 3. THEN the intermittent grouped-prefill wedge (separate; kernels pass standalone — integration/context).
 This is a scoped feature-completion + board validation, best as a focused follow-on.
+
+## setdt=1 RESULT (2026-08-07): SAFE but INSUFFICIENT — wedge still open
+Applied XSPEC[XP_SDP].setdt 0->1 (npu.c:4673). `make test` PASSES all precisions incl.
+TEST_MODE_TRANSITION + CHAIN_XITION (byte-identical, no regression) — so the change is safe + a valid
+correctness fix for the documented mm-after-SDP-skips-reset case. BUT the native-W4A4 full-model prefill
+(`ORK_QUANT=4 ORK_MIXED_W4A4=1`, F16 gguf, P=64) STILL reset-storms (soft-reset count 15->64; no clean
+prefill line; process exits, board recovers, no hard hang). => the SDP-transition was NOT the (whole)
+cause. make test has no full-28-layer native-W4A4 prefill, so it can't catch this. setdt=1 is currently
+UNCOMMITTED (on top of ork-driver 4b8cac7) — safe to keep or revert; does not achieve the wedge fix.
+
+NEXT (deeper cause, fresh context): instrument the ACTUAL wedging submit. The reset storm = the kernel
+timing out a hung grouped submit. With setdt=1 the post-SDP reset now fires, yet it still hangs — so the
+hang is INSIDE the grouped submit under full-model conditions (IOVA/domain/wcache/DRAM-BW), not the entry
+reset. Steps: ORK_GRP_DEBUG full-model prefill -> last [grp] before the storm; then compare that op's
+buffers/domain/warm state vs the standalone pass (which is clean). Candidate: port the BCHAIN 6-reset
+recover loop (run_i4_bchain_db@13813) into the grouped drain (ork_dyn_grouped_end@10885 has NO recover
+loop) so a full-model doorbell-miss self-heals instead of storming.
 
 ## THE WEDGE ITSELF (still open) — nature + leading hypothesis + exact next steps
 NATURE: the grouped submit HANGS in HW in full-model context → kernel `rknpu` soft-resets on the submit

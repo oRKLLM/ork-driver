@@ -4670,7 +4670,7 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
   /* XP_I4_INCR    8552  int4 incr       */ { KWP_NTI, RC_NOTKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },
   /* XP_I4CHAIN    8497  run_chain_i4 (4)*/ { KWP_NONE,RC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,   1 },
   /* XP_I4_STREAM  9014  stream i4 (5)   */ { KWP_NONE,RC_ALWAYS,        TG_BOTH,    WC_ALWAYS,        TG_NONE,    WC_NONE,     1 },
-  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_SDPKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     0 },
+  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_SDPKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },  /* setdt=1: record SDP mode so a following matmul (int4-grouped/fp16/int8) re-transitions -> resets, fixing the mm-after-SDP wedge */
 };
 /* Enter mode `to` via `profile`. Returns 1 if a real transition fired (last_dt changed, or an SDP
  * entry reset was issued), 0 if this was a no-op (from==to). The return lets the two sites that gate a
@@ -10890,7 +10890,8 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
     g_in_doorbell = 1; double t0 = ork_now_us(); int landed = 0;
     for (;;) { int alld = 1; for (int x = 0; x < h->S && alld; x++) if (!ork_dyn_done_i(h, x)) alld = 0;
         if (alld) { landed = 1; break; } if (g_ork_term || ork_now_us() - t0 > 3e6) break; }
-    g_in_doorbell = 0; if (!landed) rc = -1;
+    g_in_doorbell = 0;
+    if (!landed) { rc = -1; ork_dyn_dump(h, "grouped-i4 doorbell miss"); }   /* auto-dump the stall: NPU state + landed/stuck map + stuck op # (was silent-timeout, no dump -> couldn't root-cause) */
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
