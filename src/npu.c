@@ -225,7 +225,8 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
 struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
     struct buf Bbc; int Bbc_valid; /* (A) fp16 CONTIGUOUS weight: all Sk K-slice Bb[ks] concatenated into ONE buffer (built lazily on first ORK_F16_CONTIG colsplit) so the HW chain can walk slice->slice WITHOUT crossing a dma-buf boundary (the cross-buffer CDMA-wild) — enables one chained submit/core like int8. Sn==1 only. */
     struct buf *Bbc_ns; int Bbc_ns_valid; /* (A-wideN) fp16 Sn>1 PER-N-SLICE CONTIGUOUS weights: Sn buffers, Bbc_ns[ns] = that slice's Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated. Each slice is served as a standalone Sn==1 CONTIG colsplit (no cross-buffer wild); built once, resident (reclaimed at ctx teardown like Bbc). */
-    struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */ };
+    struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */
+    struct ork_w_sliced *sliced; /* #33 slice-and-dice rescue: pre-built c_base doorbell tiles for a refuse-prone shape (built at pack time; run at the refuse site instead of ORK_RC_WEDGE_PRONE). NULL for well-behaved weights. Carries its own dtype. */ };
 /* Tier 12f resident-KV handle. MUST match the typedef in include/ork_npu.h. The standalone Makefile build does
  * NOT pull ork_npu.h into this TU, so npu.c defines it; the CMake (ggml-ork) build DOES include the header here,
  * so the guard makes this local copy defer to it (identical shape either way — no conflicting-types). */
@@ -233,6 +234,19 @@ struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; 
 #define ORK_KV_RESIDENT_T
 typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; uint64_t orkd_kv; } ork_kv_resident;
 #endif
+/* slice-and-dice rescue (#33): forward-declared here (full def near ork_mm_pack_sliced, far below) so
+ * pack() can BUILD w->sliced (raw B is only in scope at pack time), ork_mm_free can free it, and
+ * run_multicore's refuse sites can RUN it. Signatures match include/ork_npu.h (repeat typedef/decls are
+ * legal C11 and are compatible whether or not the header is also included in this TU). */
+typedef struct ork_w_sliced ork_w_sliced;
+ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dtype);
+int           ork_mm_run_sliced (ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc);
+void          ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w);
+/* #33 reentrancy guard: slice_pack_i8 packs each sub-tile via ork_mm_pack_i8 -> pack(), which would ITSELF
+ * try to build a w->sliced for that sub-tile (harmless for the natural gate — sub-tiles are Sn==1, never
+ * refuse-prone — but ORK_SLICE_ALL forces it and RECURSES until IOVA fills). Set while packing sub-tiles so
+ * the nested pack() skips its slice-build. Thread-local: concurrent packs on different threads don't clash. */
+static _Thread_local int g_in_slice_pack;
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
  * reuse the bytes, skipping the ~20 per-submit setr scans + validate_regcmd. pcrc holds pcrc_slots×REGCMD_N
@@ -2680,6 +2694,18 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
             struct tile_i8_arg ta={bb,Bi,KTf,0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core full-K rebuild
             bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
         if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    /* SLICE-AND-DICE RESCUE (#33): pre-build doorbell tiles for a REFUSE-PRONE int8 shape so the run
+     * path can RUN it instead of returning ORK_RC_WEDGE_PRONE. The raw B is only in scope HERE (the
+     * packed w keeps no raw weight), so the tiles MUST be built at pack time. Gated to the one shape
+     * class run_multicore actually refuses — wide-N with no single-submit base (Sn>1 && (K>4096 || !Bf),
+     * the slice-by-slice path that refuses on Sk>128 / a failed slice) — so well-behaved weights (Bf
+     * present, or Sn==1 which r_base/r_wideK cover) build NOTHING and pay no extra IOVA. A NULL build
+     * (unaligned to c_base, or IOVA full) just leaves sliced=NULL and the site still refuses (no
+     * regression). ORK_NO_SLICE_RESCUE opts out for A/B. */
+    if(dt==DT_I8 && !g_in_slice_pack && !getenv("ORK_NO_SLICE_RESCUE") &&
+       ((Sn>1 && (K>4096 || !w->Bf))       /* the shape run_multicore actually refuses */
+        || getenv("ORK_SLICE_ALL")))        /* TEST hook: build tiles for ANY int8 shape (small-shape rescue validation) */
+        w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_I8);
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
@@ -4169,6 +4195,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     /* size-bounded consolidated import: Bb[] entries are views into own_bufs[] chunks — destroy each chunk. */
     if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) bdestroy(c->fd,&w->own_bufs[i]);
     free(w->own_bufs);
+    if(c && w->sliced) ork_mm_free_sliced(c, w->sliced);   /* #33 reclaim the rescue tiles' sub-weights + IOVA */
     free(w->Bb); free(w->Bf); free(w->Bfold); free(w->Bi4); free(w->bscale); free(w->fa_lut); free(w);
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
@@ -4700,12 +4727,25 @@ static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv(
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
 #define ORK_RC_F16_SC (-502)   /* internal run_multicore->run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
+/* SLICE-AND-DICE RESCUE (#33): a shape run_multicore has no verified single-submit path for would
+ * return ORK_RC_WEDGE_PRONE. If pack() pre-built doorbell tiles for it (w->sliced), RUN it on those
+ * instead — one chained doorbell submit over c_base tiles, bit-exact. If there are no tiles (a shape
+ * we don't pre-slice) OR the sliced run itself errors, REFUSE — never a blocking fall-back (#45). */
+static int slice_rescue_or_refuse(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
+    if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
+    return ORK_RC_WEDGE_PRONE;
+}
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
     if(nc>c->soc->cores) nc=c->soc->cores;
     if(nc>ORK_MAXCORE)  nc=ORK_MAXCORE;
     if(nc<1) nc=1;
+    /* #33 TEST / A-B hook: force a shape that HAS pre-built tiles (w->sliced) onto the slice rescue even
+     * when its native path would work — to validate the rescue is bit-exact and to A/B its throughput
+     * against the native path. Off by default (only fires with tiles present AND the env set). */
+    if(dt==DT_I8 && w->sliced && getenv("ORK_FORCE_SLICE_RESCUE"))
+        return slice_rescue_or_refuse(c,w,M,A,C,nc);
     /* P3 MIGRATION: int8 matmul (Sn==1, K<=4096 with full-K Bf, nc>1) runs on the NONBLOCK doorbell via
      * ork_dyn_begin_colsplit — sub-nmax N-column split across cores (matching mcworker's t0=i*NN/nc bit-exact),
      * M-tiled within each core. Decode (M=1) is dispatch-bound => faster; prefill (M>1) is compute-bound =>
@@ -4733,7 +4773,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
-        if(!h) return ORK_RC_WEDGE_PRONE;              /* outside the verified doorbell envelope: refuse (rescue-eligible), never wedge-fallback */
+        if(!h) return slice_rescue_or_refuse(c,w,M,A,C,nc);  /* #33: run pre-built doorbell tiles if any, else refuse (never wedge-fallback) */
         return ork_dyn_end(h) < 0 ? -1 : 0;
       }
       if(i8 && w->Sn>1 && (w->K>4096 || !w->Bf)){
@@ -4741,7 +4781,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * K-split colsplit (Bf-free — the validated wide-K path, per slice). cstride=N writes each slice's sub-N
          * result into the wider C at the full row stride. With r_base/r_wideN/r_wideK covering everything else,
          * this closes the LAST int8 M>1 gap (no-Bf Sn>1 and Sn>1&K>4096) — int8 no longer falls to mcworker (#48). */
-        if(w->Sk>128) return ORK_RC_WEDGE_PRONE;                        /* slice-view array bound (unrealistic K) — refuse, never wedge-fallback */
+        if(w->Sk>128) return slice_rescue_or_refuse(c,w,M,A,C,nc);       /* #33: slice-view array bound — run pre-built tiles if any, else refuse */
         int NMAXn=c->soc->nmax, ok=1;
         for(int ns=0; ns<w->Sn && ok; ns++){
             int c0=ns*NMAXn, sw=(w->N-c0<NMAXn)?(w->N-c0):NMAXn;
@@ -4753,9 +4793,10 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             if(!hs || ork_dyn_end(hs)<0) ok=0;
         }
         if(ok) return 0;
-        return ORK_RC_WEDGE_PRONE;   /* a slice ineligible/failed -> refuse (rescue-eligible), never wedge-fallback */
+        return slice_rescue_or_refuse(c,w,M,A,C,nc);   /* #33: a slice ineligible/failed -> run pre-built tiles if any, else refuse */
       }
       if(i8 && M==1){   /* DECODE i8 with no doorbell envelope: reject (no safe decode fallback). With the wide-N slice path above + r_*, this is now a backstop (unreachable for standard shapes). */
+        if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue on pre-built tiles before the scary refuse */
         fprintf(stderr, "[ork] int8 decode M=%d K=%d N=%d Sn=%d Bf=%d has no verified doorbell path; refusing the "
                 "blocking fallback (would risk an unrecoverable NPU wedge) — rescue-eligible (ORK_RC_WEDGE_PRONE)\n", M, w->K, w->N, w->Sn, w->Bf?1:0);
         return ORK_RC_WEDGE_PRONE;
@@ -4921,7 +4962,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     /* mcworker path deleted (#45). Nothing reaches here: fp16 returned ORK_RC_F16_SC above;
      * every int8 M>1 (nc>1, N>=64) returned in the i8 colsplit/refuse block; int8 N<64 never
      * reaches run_multicore (run() shrinks nc->1). Refuse defensively, never a blocking fallback. */
-    return ORK_RC_WEDGE_PRONE;
+    return slice_rescue_or_refuse(c,w,M,A,C,nc);   /* #33: run pre-built doorbell tiles if any, else refuse */
 }
 
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
@@ -5186,12 +5227,14 @@ static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
     int8_t *blk = malloc((size_t) ks * ns);
     if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
+    g_in_slice_pack = 1;   /* #33: the sub-tile packs below must NOT re-trigger the pack-time slice-build (no recursion) */
     for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
         for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
             for (int k = 0; k < Ks; k++) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* gather block */
             ork_w *sw = ork_mm_pack_i8(c, Ks, Nw, blk);
-            if (!sw) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
+            if (!sw) { g_in_slice_pack = 0; free(blk); ork_mm_free_sliced(c, w); return NULL; }
             w->sub[ki*nnt + ni] = sw; } }
+    g_in_slice_pack = 0;
     free(blk); return w;
 }
 
@@ -5229,8 +5272,7 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
             poff += (size_t) M * Nw; } }
     int rc = 0;
     ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);                  /* ONE doorbell submit for all tiles */
-    if (!h) { for (int s = 0; s < S && !rc; s++)                           /* out of envelope: per-tile blocking fallback */
-                  if (ork_mm_run_i8(c, tasks[s].w, M, (const int8_t*)tasks[s].A, (int32_t*)tasks[s].C)) rc = -1; }
+    if (!h) rc = -1;                                                       /* a c_base tile outside the doorbell envelope -> fail; the caller refuses (ORK_RC_WEDGE_PRONE). NEVER a blocking fall-back (#45) */
     else if (ork_dyn_end(h) < 0) rc = -1;
     if (!rc) for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
         for (int ki = 0; ki < nks; ki++) { const int32_t *src = (const int32_t*)tasks[ki*nnt + ni].C;
