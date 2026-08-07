@@ -198,6 +198,13 @@ static int one_i4g(ork_npu *c, int M, int K, int N, int G, const char *tag){
             double e=C[m*N+n]-ex; if(e<0)e=-e; if(e>maxe)maxe=e; }
         if(maxe>=0.05){ printf("    grouped rescue maxerr=%.4f >= 0.05 FAIL\n", maxe); fail=1; }
         else printf("    OK (grouped rescue rc=0, dequant maxerr=%.4f EXACT)\n", maxe); }
+    if(getenv("REPS")){ int reps=atoi(getenv("REPS")); if(reps<1)reps=1;
+        ork_w *w2=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
+        for(int q=0;q<2;q++) ork_mm_run_i4_grouped(c,w2,M,Ai,aS,bS,C);
+        double t0=now_us(); for(int r=0;r<reps;r++) ork_mm_run_i4_grouped(c,w2,M,Ai,aS,bS,C); double us=(now_us()-t0)/reps;
+        ork_w_free(w2);
+        int nc=3, per_row=Sk, rpc=64/per_row; if(rpc<1)rpc=1; int Msub=rpc*nc; int chunks=(M+Msub-1)/Msub;
+        printf("    PERF: grouped rescue (M=%d Sk=%d) = %.1f us/call (~%d M-chunks of %d rows)\n", M, Sk, us, chunks, Msub); }
     free(Af);free(Bf);free(aS);free(bS);free(C);free(Ai);free(Bi);
     return fail;
 }
