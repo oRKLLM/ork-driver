@@ -2706,19 +2706,13 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
        ((Sn>1 && (K>4096 || !w->Bf))       /* the shape run_multicore actually refuses */
         || getenv("ORK_SLICE_ALL")))        /* TEST hook: build tiles for ANY int8 shape (small-shape rescue validation) */
         w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_I8);
-    /* fp16 slice path (#33 stage 4): ROOT-CAUSED DEAD — 6-17x SLOWER than run()'s single-core reference it
-     * would replace (test_slice_rescue REPS=30: ref/sliced 0.16x base, 0.06x wide). ROOT CAUSE (profiled): the
-     * fp16 tiles SERIALIZE across cores — nc=3 but wall = S x per-tile (S=3 -> 3x, S=6 -> 6x), zero multi-core
-     * speedup. Unlike int8 (whose distinct-weight tiles run CONCURRENTLY across cores -> parity), fp16 can't
-     * have distinct weight buffers in flight at once (the cross-buffer HW-prefetch WILD that fp16 CONTIG +
-     * lockstep guard against; fp16 submits blocking — "nonblock re-wedges fp16"). So the multi-core parallelism
-     * that pays for slice-and-dice's tiling overhead is UNAVAILABLE for fp16 — a HW constraint, not a bug. Plus
-     * a ~370us fixed per-fp16-submit cost multiplies across the many small tiles. NOT FIXABLE via slice-and-dice;
-     * the single-core reference (one integrated pass) WINS. Stays OFF by default (fp16 never refuses — it has
-     * that correct, faster backstop). Kept behind ORK_F16_SLICE_RESCUE (bit-exact, opt-in) for the record;
-     * do NOT enable, do NOT re-attempt. If fp16 multicore ever needs speeding, the lever is CONTIG colsplit (#47). */
-    if(dt==DT_F16 && !g_in_slice_pack && (getenv("ORK_F16_SLICE_RESCUE") || getenv("ORK_SLICE_ALL")))
-        w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_F16);
+    /* fp16 gets NO pack-time slice build: fp16's slice-and-dice FIT is the CONTIG column-split (the fp16
+     * colsplit path run_multicore already routes all wide fp16 to — wide-K via its Sk-slice loop + lockstep,
+     * wide-N via Sn slices), NOT distinct weight tiles. The distinct-tile fp16 twin was the WRONG transform:
+     * distinct fp16 weight buffers serialize across cores (measured 6-17x slower than the single-core ref;
+     * int8 tiles run concurrently -> parity, fp16 can't). So fp16 stays on colsplit + the single-core-ref
+     * backstop; the tiled ork_mm_*_sliced(DT_F16) surface exists only as a documented wrong-fit (see that
+     * dispatch). No fp16 w->sliced is ever built here. */
     return w;
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
@@ -4757,7 +4751,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
     /* #33 TEST / A-B hook: force a shape that HAS pre-built tiles (w->sliced) onto the slice rescue even
      * when its native path would work — to validate the rescue is bit-exact and to A/B its throughput
      * against the native path. Off by default (only fires with tiles present AND the env set). */
-    if((dt==DT_I8 || dt==DT_F16) && w->sliced && getenv("ORK_FORCE_SLICE_RESCUE"))
+    if(dt==DT_I8 && w->sliced && getenv("ORK_FORCE_SLICE_RESCUE"))
         return slice_rescue_or_refuse(c,w,M,A,C,nc);
     /* P3 MIGRATION: int8 matmul (Sn==1, K<=4096 with full-K Bf, nc>1) runs on the NONBLOCK doorbell via
      * ork_dyn_begin_colsplit — sub-nmax N-column split across cores (matching mcworker's t0=i*NN/nc bit-exact),
@@ -4971,8 +4965,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * Sn>1 slice-fail) routes to run()'s SINGLE-CORE fp16 reference (bit-exact, no concurrent fetch -> no drop)
      * via ORK_RC_F16_SC. Removes the last fp16 mcworker dependency (#45). int8 is already fully covered/refused
      * above — the blocking mcworker path that used to sit below has been removed (#45). */
-    if(dt==DT_F16){ if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: tiled fp16 doorbell — only present under opt-in ORK_F16_SLICE_RESCUE; MEASURED 6-17x SLOWER than the single-core ref below, so OFF by default (the ref wins) */
-                    return ORK_RC_F16_SC; }   /* default fp16 fall-through: run()'s single-core reference (correct AND faster) */
+    if(dt==DT_F16) return ORK_RC_F16_SC;   /* fp16 out-of-colsplit fall-through: run()'s single-core reference (correct; the tiled fp16 slice was a wrong-fit — fp16's fit is colsplit, above) */
     /* mcworker path deleted (#45). Nothing reaches here: fp16 returned ORK_RC_F16_SC above;
      * every int8 M>1 (nc>1, N>=64) returned in the i8 colsplit/refuse block; int8 N<64 never
      * reaches run_multicore (run() shrinks nc->1). Refuse defensively, never a blocking fallback. */
@@ -5222,7 +5215,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * per-precision doorbell envelope; the decomposer (tile geometry) is dtype-agnostic. ONLY DT_I8 is live today
  * (q8_0 compute path + only precision the multi-core doorbell accepts as tiles); DT_F16/DT_I4 pack returns NULL
  * until their doorbell tile path is built. sub[ki*nnt+ni] holds one c_base-sized packed weight per tile. */
-typedef struct ork_w_sliced { int K, N, dtype; ork_slice_caps cap; int nks, nnt, ks, ns; ork_w **sub; } ork_w_sliced;
+typedef struct ork_w_sliced { int K, N, Kpad, dtype; ork_slice_caps cap; int nks, nnt, ks, ns; ork_w **sub; } ork_w_sliced;
 
 void ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w) {                   /* dtype-agnostic: ork_mm_free frees any sub-weight */
     if (!w) return;
@@ -5233,9 +5226,15 @@ void ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w) {                   /* dtyp
 /* int8 sub-weight packer: decompose K/N and pack each c_base tile from B[K,N]. */
 static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     ork_slice_caps cap = ork_slice_caps_rk3588();
-    if (K % cap.kmul || N % cap.nmul) return NULL;                       /* unaligned: pad not yet supported */
+    if (N % cap.nmul) return NULL;                                       /* N always %32 for a real int8 weight (pack N%32) -> %nmul; defensive */
+    /* PAD (adapter transform): an unaligned K (K%kmul!=0 — rare, odd-dim models / no-Bf) is padded UP to the
+     * next kmul so every K-slice tile is legal. The pad rows are zero-filled (below) and A is zero-padded to
+     * Kpad at run — zeros contribute nothing to the int32 sum, so the result is BIT-EXACT for the real K. N is
+     * never padded (a real int8 weight is already N%32==0 -> N%nmul==0). Kpad==K for the aligned common case
+     * (no behavior change). */
+    int Kpad = ((K + cap.kmul - 1) / cap.kmul) * cap.kmul;
     int ks = (cap.kmax / cap.kmul) * cap.kmul, cap_ns = (cap.nmax / cap.nmul) * cap.nmul;
-    int nks = (K + ks - 1) / ks;
+    int nks = (Kpad + ks - 1) / ks;
     /* BALANCED N-TILING (#33 stage 3 — native colsplit's balanced boundary-split): split N into EQUAL-width
      * tiles (nmul-aligned, <= nmax) using at least `cores` of them, so the doorbell submit hands each core an
      * even column load. The old nmax+remainder tiling put e.g. 8192+512 on 2 cores (3rd idle) = a 2.3x loss;
@@ -5246,14 +5245,15 @@ static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     if (ns > cap_ns) ns = cap_ns; if (ns < nalign) ns = nalign;
     nnt = (N + ns - 1) / ns;                                             /* actual tiles after alignment */
     struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->dtype = DT_I8; w->cap = cap; w->nks = nks; w->nnt = nnt; w->ks = ks; w->ns = ns;
+    w->K = K; w->N = N; w->Kpad = Kpad; w->dtype = DT_I8; w->cap = cap; w->nks = nks; w->nnt = nnt; w->ks = ks; w->ns = ns;
     w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
     int8_t *blk = malloc((size_t) ks * ns);
     if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
     g_in_slice_pack = 1;   /* #33: the sub-tile packs below must NOT re-trigger the pack-time slice-build (no recursion) */
-    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
+    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < Kpad ? k0+ks : Kpad, Ks = k1-k0;   /* K extent over Kpad */
         for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
-            for (int k = 0; k < Ks; k++) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* gather block */
+            for (int k = 0; k < Ks; k++) { if (k0+k < K) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, Nw);   /* real weight row */
+                                           else          memset(blk + (size_t) k*Nw, 0, Nw); }                        /* PAD row -> zero (contributes 0 to the sum) */
             ork_w *sw = ork_mm_pack_i8(c, Ks, Nw, blk);
             if (!sw) { g_in_slice_pack = 0; free(blk); ork_mm_free_sliced(c, w); return NULL; }
             w->sub[ki*nnt + ni] = sw; } }
@@ -5261,43 +5261,16 @@ static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
     free(blk); return w;
 }
 
-/* fp16 sub-weight packer (#33 stage 4): twin of slice_pack_i8. Two fp16-specific differences: (a) the
- * single-slice K cap is soc->ks (2048), NOT int8's 4096, because each sub-tile must pack Sk==1 for the fp16
- * doorbell (ork_mm_run_stream_f16 requires Sn==1 && Sk==1); (b) sub-tiles pack via ork_mm_pack (fp16) and B
- * is fp16. Balanced N-tiling (>= cores, 32-aligned) is identical — 32 satisfies fp16's N%16 pack rule. */
-static ork_w_sliced *slice_pack_f16(ork_npu *c, int K, int N, const f16 *B) {
-    ork_slice_caps cap = ork_slice_caps_rk3588();
-    if (K % 32 || N % 16) return NULL;                                   /* fp16 pack alignment (pack(): K%32, N%16) */
-    int ks = (c->soc->ks / 32) * 32, cap_ns = (cap.nmax / 16) * 16;      /* fp16 single-slice K cap = soc->ks (Sk==1/tile) */
-    if (ks < 32) ks = 32;
-    int nks = (K + ks - 1) / ks;
-    int nnt = (N + cap_ns - 1) / cap_ns; if (nnt < c->soc->cores) nnt = c->soc->cores;   /* balanced, >= cores */
-    int nalign = 32, ns = ((N + nnt - 1) / nnt + nalign - 1) / nalign * nalign;
-    if (ns > cap_ns) ns = cap_ns; if (ns < nalign) ns = nalign;
-    nnt = (N + ns - 1) / ns;
-    struct ork_w_sliced *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->dtype = DT_F16; w->cap = cap; w->nks = nks; w->nnt = nnt; w->ks = ks; w->ns = ns;
-    w->sub = calloc((size_t) nks * nnt, sizeof(ork_w *));
-    f16 *blk = malloc((size_t) ks * ns * sizeof(f16));
-    if (!w->sub || !blk) { free(blk); ork_mm_free_sliced(c, w); return NULL; }
-    g_in_slice_pack = 1;
-    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
-        for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
-            for (int k = 0; k < Ks; k++) memcpy(blk + (size_t) k*Nw, B + (size_t)(k0+k)*N + n0, (size_t) Nw*sizeof(f16));
-            ork_w *sw = ork_mm_pack(c, Ks, Nw, blk);                     /* fp16 pack (Sk==1, Sn==1 tile) */
-            if (!sw) { g_in_slice_pack = 0; free(blk); ork_mm_free_sliced(c, w); return NULL; }
-            w->sub[ki*nnt + ni] = sw; } }
-    g_in_slice_pack = 0; free(blk); return w;
-}
-
-/* PRECISION DISPATCH. dtype selects the per-precision sub-weight packer + (in run) the doorbell envelope. */
+/* PRECISION DISPATCH. Only int8 has refuse sites, so only int8 has a sliced rescue. fp16 has NO refused
+ * shapes (out-of-envelope fp16 falls to run()'s single-core reference via ORK_RC_F16_SC — a working path,
+ * never ORK_RC_WEDGE_PRONE) and its multicore FIT is the CONTIG colsplit, not tiles — so there is no fp16
+ * tiled path here. int4 is a gated follow-on (its refuse sites still refuse). */
 ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dtype) {
     if (!c || !B || K <= 0 || N <= 0) return NULL;
     switch (dtype) {
         case DT_I8:  return slice_pack_i8 (c, K, N, (const int8_t *) B);
-        case DT_F16: return slice_pack_f16(c, K, N, (const f16 *) B);
-        default:     fprintf(stderr, "[ork] slice-and-dice: dtype %d not on the doorbell (int8/fp16 only); see OPS_REGISTRY\n", dtype);
-                     return NULL;   /* DT_I4: doorbell tile envelope not built yet (gated follow-on) */
+        default:     fprintf(stderr, "[ork] slice-and-dice: int8 only (fp16 has no refused shapes — uses colsplit; int4 follow-on); dtype %d unsupported\n", dtype);
+                     return NULL;
     }
 }
 
@@ -5324,21 +5297,23 @@ static void *slice_acc_worker(void *p){
 static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
     int ks = w->ks, ns = w->ns;   /* balanced tile step baked at pack (equal-width N-tiles >= cores) */
-    int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N;
+    int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N, Kpad = w->Kpad;
     /* SINGLE chained doorbell submit over EVERY tile (K-slices x N-tiles) — one begin/end, not nks*nnt
      * round-trips. ork_dyn_begin_mc distributes the S tasks across the nc cores and chains each core's tasks
      * into one PC-chain (weight streamed in one pass), the wedge-safe mirror of the mcworker's CHAIN-KSPLIT.
      * A per K-slice (shared across its N-tiles); each tile's [M,Nw] partial lands in its own plain-malloc slot
      * (forces direct=0 scratch copy-back — see the note above ork_mm_pack_sliced); the K-slices are then
      * summed host-side into C (the NPU has no on-device C+= mode). */
-    int8_t  *Aslc = malloc((size_t) M * K);                               /* [nks] gathered A[:, k0:k1] blocks */
+    int8_t  *Aslc = malloc((size_t) M * Kpad);                            /* [nks] gathered A[:, k0:k1] blocks (padded K, zero tail) */
     int32_t *part = malloc((size_t) nks * M * N * sizeof(int32_t));        /* one [M,Nw] slot per tile */
     ork_mm_task_i8 *tasks = malloc((size_t) S * sizeof *tasks);
     if (!Aslc || !part || !tasks) { free(Aslc); free(part); free(tasks); return -1; }
     size_t aoff = 0, poff = 0;
-    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
+    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < Kpad ? k0+ks : Kpad, Ks = k1-k0;   /* over Kpad */
         int8_t *aptr = Aslc + aoff;
-        for (int m = 0; m < M; m++) memcpy(aptr + (size_t) m*Ks, A + (size_t) m*K + k0, Ks);   /* gather A cols (once per K-slice) */
+        int real = K - k0; if (real > Ks) real = Ks; if (real < 0) real = 0;   /* real A cols this slice; PAD tail -> 0 */
+        for (int m = 0; m < M; m++) { memcpy(aptr + (size_t) m*Ks, A + (size_t) m*K + k0, real);
+                                      if (real < Ks) memset(aptr + (size_t) m*Ks + real, 0, Ks - real); }
         aoff += (size_t) M * Ks;
         for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
             tasks[ki*nnt + ni] = (ork_mm_task_i8){ w->sub[ki*nnt + ni], M, aptr, part + poff };
@@ -5366,70 +5341,12 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
     free(Aslc); free(part); free(tasks); return rc;
 }
 
-/* f32 twin of slice_acc_worker (fp16 partials accumulate in f32; vaddq_f32). Bit-exact to the reference's
- * ks-ascending sum lane-for-lane (same order as the fp16 colsplit accumulate). */
-struct slc_acc_f32 { const ork_mm_task_f16 *tasks; float *C; int nks, nnt, ns, N, M, c0, c1; };
-static void *slice_acc_worker_f32(void *p){
-    struct slc_acc_f32 *a = p; int nnt=a->nnt, nks=a->nks, ns=a->ns, N=a->N, M=a->M, c0=a->c0, c1=a->c1;
-    for(int ni=0; ni<nnt; ni++){ int n0=ni*ns, Nw=(N-n0<ns)?(N-n0):ns;
-        int lo=(n0>c0)?n0:c0, hi=((n0+Nw)<c1)?(n0+Nw):c1; if(lo>=hi) continue;
-        int woff=lo-n0, wlen=hi-lo;
-        for(int ki=0; ki<nks; ki++){ const float *src=(const float*)a->tasks[(size_t)ki*nnt+ni].C;
-            for(int m=0; m<M; m++){ float *cr=a->C+(size_t)m*N+lo; const float *pr=src+(size_t)m*Nw+woff; int n=0;
-                if(ki==0){ for(; n<wlen; n++) cr[n]=pr[n]; }
-                else { for(; n+4<=wlen; n+=4) vst1q_f32(cr+n, vaddq_f32(vld1q_f32(cr+n), vld1q_f32(pr+n)));
-                       for(; n<wlen; n++) cr[n]+=pr[n]; } } } }
-    return NULL;
-}
-/* fp16 sliced run (#33 stage 4): twin of slice_run_i8. Runs all c_base tiles via ork_mm_run_stream_f16 —
- * the SAME nonblock ork_dyn_begin_mc doorbell (dtype rides w), so no new submit machinery and the fp16
- * M-scheduler / CONTIG handling is the proven path's, not ours. f32 partials, per-core parallel accumulate. */
-static int slice_run_f16(ork_npu *c, ork_w_sliced *w, int M, const f16 *A, float *C, int nc) {
-    if (!c || !w || !A || !C || M < 1) return -1;
-    int ks = w->ks, ns = w->ns, nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N;
-    f16   *Aslc = malloc((size_t) M * K * sizeof(f16));
-    float *part = malloc((size_t) nks * M * N * sizeof(float));
-    ork_mm_task_f16 *tasks = malloc((size_t) S * sizeof *tasks);
-    if (!Aslc || !part || !tasks) { free(Aslc); free(part); free(tasks); return -1; }
-    size_t aoff = 0, poff = 0;
-    for (int ki = 0; ki < nks; ki++) { int k0 = ki*ks, k1 = k0+ks < K ? k0+ks : K, Ks = k1-k0;
-        f16 *aptr = Aslc + aoff;
-        for (int m = 0; m < M; m++) memcpy(aptr + (size_t) m*Ks, A + (size_t) m*K + k0, (size_t) Ks*sizeof(f16));
-        aoff += (size_t) M * Ks;
-        for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
-            tasks[ki*nnt + ni] = (ork_mm_task_f16){ w->sub[ki*nnt + ni], M, aptr, part + poff };
-            poff += (size_t) M * Nw; } }
-    int prof = getenv("ORK_SLICE_PROF") != NULL; double tp0 = prof?ork_now_us():0;
-    int rc = ork_mm_run_stream_f16(c, S, tasks) ? -1 : 0;                /* ONE nonblock doorbell submit over all tiles */
-    double tp1 = prof?ork_now_us():0;
-    if (!rc) {
-        int anc = nc>0 ? nc : c->soc->cores; if(anc>ORK_MAXCORE) anc=ORK_MAXCORE; if(anc<1) anc=1;
-        struct slc_acc_f32 acc[ORK_MAXCORE];
-        for(int i=0;i<anc;i++){ int cc0=(int)((long)i*N/anc), cc1=(int)((long)(i+1)*N/anc);
-            acc[i]=(struct slc_acc_f32){ tasks, C, nks, nnt, ns, N, M, cc0, cc1 }; }
-        if(anc==1){ slice_acc_worker_f32(&acc[0]); }
-        else {
-            npu_pool_ensure(c);
-            pthread_mutex_lock(&c->pmu);
-            c->pjob=acc; c->pjob_nc=anc; c->pjob_fn=slice_acc_worker_f32; c->pjob_stride=sizeof(struct slc_acc_f32);
-            c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-            pthread_mutex_unlock(&c->pmu);
-            slice_acc_worker_f32(&acc[0]);
-            pthread_mutex_lock(&c->pmu); while(c->pdone < anc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
-        }
-    }
-    if(prof) fprintf(stderr,"[slice_f16] S=%d nks=%d nnt=%d M=%d K=%d N=%d ks=%d ns=%d  stream=%.0fus accum=%.0fus\n",
-                     S,nks,nnt,M,K,N,ks,ns, tp1-tp0, ork_now_us()-tp1);
-    free(Aslc); free(part); free(tasks); return rc;
-}
-
-/* PRECISION DISPATCH. A/C point at the dtype's element type (int8/int32 for DT_I8; fp16/fp32 for DT_F16). */
+/* PRECISION DISPATCH. int8 only (see ork_mm_pack_sliced — fp16 has no refused shapes / uses colsplit; int4 follow-on). */
 int ork_mm_run_sliced(ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc) {
     if (!w) return -1;
     switch (w->dtype) {
         case DT_I8:  return slice_run_i8 (c, w, M, (const int8_t *) A, (int32_t *) C, nc);
-        case DT_F16: return slice_run_f16(c, w, M, (const f16 *) A, (float *) C, nc);
-        default:     return -3;   /* DT_I4: doorbell tile envelope not built yet (gated follow-on) */
+        default:     return -3;   /* fp16: colsplit (not tiles); int4: gated follow-on */
     }
 }
 
