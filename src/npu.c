@@ -4997,6 +4997,22 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
      * i4_mcworker_g path is removed (#45). */
     ork_dyn_chain *hg=ork_dyn_begin_mc_i4_grouped(c,M,w,A,aScale,bScale,C,0);
     if(hg) return ork_dyn_grouped_end(hg)?-1:0;
+    /* #33 GROUPED RESCUE (M-chunk): the doorbell refused because the per-core program count
+     * (rows/core)*Sn*Sk exceeds the regcmd-buffer cap (~70). Rows are INDEPENDENT, so M-CHUNK the rows —
+     * each chunk is a full grouped matmul (all groups + all N, so the per-group float drain stays intact)
+     * writing its own CONTIGUOUS C rows: no weight repack, no scale slicing, no scatter, just a recursive
+     * call with fewer rows (which no longer refuses once rows/core*Sn*Sk <= cap). Only possible when a SINGLE
+     * row fits (Sn*Sk <= cap); wide-N (Sn>1) or fine-group large-K (Sn*Sk > cap even at 1 row) still refuses —
+     * needs N-tile / K-group-slice (a follow-on). The M>1 gate bounds the recursion (bottoms out at M==1). */
+    int G=w->gsize, Sk=w->K/G, per_row=w->Sn*Sk;
+    if(M>1 && per_row>0 && per_row<=64){                                 /* 64 = margin under the ~70-program/core cap */
+        int nc=budget(c,M); if(nc<1)nc=1; int rpc=64/per_row; if(rpc<1)rpc=1;
+        int Msub=rpc*nc; if(Msub>=M) Msub=M-1; if(Msub<1) Msub=1;
+        int ok=1;
+        for(int m0=0;m0<M && ok;m0+=Msub){ int mm=(M-m0<Msub)?(M-m0):Msub;
+            if(ork_mm_run_i4_grouped(c,w,mm, A+(size_t)m0*w->K, aScale+(size_t)m0*Sk, bScale, C+(size_t)m0*w->N)) ok=0; }
+        if(ok) return 0;
+    }
     return ORK_RC_WEDGE_PRONE;
 }
 

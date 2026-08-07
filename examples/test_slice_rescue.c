@@ -172,6 +172,36 @@ static int one_i4_natural(ork_npu *c, int K, int N, int M, const char *tag){
     return fail;
 }
 
+/* GROUPED int4 rescue (float per-group W4A4): a shape whose per-core program count (M/nc)*Sn*Sk exceeds the
+ * doorbell cap HARD-refuses (ORK_RC_WEDGE_PRONE) — unlike plain int4. The rescue M-chunks the rows. Validate
+ * (gtest convention) the output matches the exact per-group dequant within float rounding (maxe<0.05); rc==0
+ * proves the rescue fired (else the doorbell would have returned -501). */
+static int one_i4g(ork_npu *c, int M, int K, int N, int G, const char *tag){
+    int Sk=K/G; printf("  [%-10s] M=%d K=%d N=%d G=%d grouped (Sk=%d, Pcore~%d)\n", tag, M, K, N, G, Sk, (M+2)/3*Sk);
+    float *Af=malloc((size_t)M*K*4), *aS=malloc((size_t)M*Sk*4), *bS=malloc((size_t)Sk*N*4), *C=malloc((size_t)M*N*4);
+    signed char *Ai=malloc((size_t)M*K), *Bi=malloc((size_t)K*N); float *Bf=malloc((size_t)K*N*4);
+    unsigned sd=7+M+K+N+G;
+    for(size_t i=0;i<(size_t)M*K;i++){ sd=sd*1103515245+12345; Af[i]=((int)(sd>>9)%2001-1000)/1000.0f; }
+    for(size_t i=0;i<(size_t)K*N;i++){ sd=sd*1103515245+12345; Bf[i]=((int)(sd>>9)%2001-1000)/1000.0f; }
+    for(int m=0;m<M;m++)for(int g=0;g<Sk;g++){ float mx=1e-9f; for(int j=0;j<G;j++){ float a=Af[m*K+g*G+j]; if(a<0)a=-a; if(a>mx)mx=a; }
+        aS[m*Sk+g]=mx/7; for(int j=0;j<G;j++){ int q=(int)(Af[m*K+g*G+j]/aS[m*Sk+g]+(Af[m*K+g*G+j]>=0?.5f:-.5f)); if(q>7)q=7; if(q<-8)q=-8; Ai[m*K+g*G+j]=(signed char)q; } }
+    for(int g=0;g<Sk;g++)for(int n=0;n<N;n++){ float mx=1e-9f; for(int j=0;j<G;j++){ float b=Bf[(g*G+j)*N+n]; if(b<0)b=-b; if(b>mx)mx=b; }
+        bS[g*N+n]=mx/7; for(int j=0;j<G;j++){ int q=(int)(Bf[(g*G+j)*N+n]/bS[g*N+n]+(Bf[(g*G+j)*N+n]>=0?.5f:-.5f)); if(q>7)q=7; if(q<-8)q=-8; Bi[(g*G+j)*N+n]=(signed char)q; } }
+    ork_w *w=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
+    if(!w){ printf("    pack_i4_grouped FAIL\n"); free(Af);free(Bf);free(aS);free(bS);free(C);free(Ai);free(Bi); return 1; }
+    int rc=ork_mm_run_i4_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
+    int fail=0;
+    if(rc==ORK_RC_WEDGE_PRONE){ printf("    grouped rescue REFUSED (-501) -> FAIL\n"); fail=1; }
+    else if(rc){ printf("    grouped run rc=%d FAIL\n", rc); fail=1; }
+    else { double maxe=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double ex=0;
+            for(int g=0;g<Sk;g++){ long p=0; for(int j=0;j<G;j++) p+=(long)Ai[m*K+g*G+j]*Bi[(g*G+j)*N+n]; ex+=(double)aS[m*Sk+g]*bS[g*N+n]*p; }
+            double e=C[m*N+n]-ex; if(e<0)e=-e; if(e>maxe)maxe=e; }
+        if(maxe>=0.05){ printf("    grouped rescue maxerr=%.4f >= 0.05 FAIL\n", maxe); fail=1; }
+        else printf("    OK (grouped rescue rc=0, dequant maxerr=%.4f EXACT)\n", maxe); }
+    free(Af);free(Bf);free(aS);free(bS);free(C);free(Ai);free(Bi);
+    return fail;
+}
+
 int main(void){
     setvbuf(stdout,0,_IONBF,0);
     ork_npu *c=ork_npu_init(); if(!c){ printf("init fail\n"); return 1; }
@@ -186,6 +216,7 @@ int main(void){
     fail |= one_i4(c, 512,   16384, 8, 0, "i4-wideN"); /* int4 NATURAL Sn>1 gate — N-scatter (2 tiles) */
     fail |= one_i4(c, 10240, 128,   8, 0, "i4-wideK"); /* int4 NATURAL K>8192 gate — K-slice int32-accumulate (2 slices) */
     fail |= one_i4_natural(c, 2048, 16384, 128, "i4-refuse"); /* REAL trigger: M=128 + Sn=2 -> run_i4_mc_db -4 -> rescue */
+    fail |= one_i4g(c, 64, 2048, 256, 128, "i4g-refuse");     /* GROUPED: M=64 Sk=16 -> Pcore~341 > cap -> hard refuse -> M-chunk rescue */
     printf(fail ? "TEST_SLICE_RESCUE: FAIL\n" : "TEST_SLICE_RESCUE: PASS\n");
     return fail ? 1 : 0;
 }
