@@ -10884,14 +10884,33 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     return h;
 }
 /* Drain the grouped-int4 doorbell: poll all rows' Sk*N int16 partials, then FLOAT scale-accumulate into C[M,N]. */
+static void mc_recover_resubmit(ork_dyn_chain *h);   /* shared doorbell recover (defined below); grouped drain rides it */
 static int ork_dyn_grouped_end(ork_dyn_chain *h) {
     if (!h || !h->i4g) return -2;
     ork_npu *c = h->c; int fd = c->fd, rc = 0;
-    g_in_doorbell = 1; double t0 = ork_now_us(); int landed = 0;
-    for (;;) { int alld = 1; for (int x = 0; x < h->S && alld; x++) if (!ork_dyn_done_i(h, x)) alld = 0;
-        if (alld) { landed = 1; break; } if (g_ork_term || ork_now_us() - t0 > 3e6) break; }
+    /* Drain on the SHARED doorbell recover loop (mirrors ork_dyn_end@12140): poll all rows; on a dropped round
+     * (mc int4 output never landed) mc_recover_resubmit (RESET + re-seed SENT16 via its esz==2 branch + resubmit
+     * each core) and re-poll, up to recov_max; auto-dump only a TRUE stall (recover exhausted). The grouped begin
+     * already stashed mc_nc/mc_dt=DT_I4/mc_dom/mc_subs/mc_Pc, so this self-heals exactly like the int8 mc path. */
+    g_in_doorbell = 1;
+    int recov_max = (h->mc_nc > 0 && h->mc_dt == DT_I4) ? 6 : 0;
+    int landed = 0, edone[1024];
+    for (int recov = 0; ; recov++) {
+        double t0 = ork_now_us();
+        for (int i = 0; i < h->S && i < 1024; i++) edone[i] = 0;
+        double miss_to = (recov < recov_max) ? 300000.0 : 3e6;   /* fast miss-detect while retries remain, else full completion wait */
+        for (;;) { int n = 0; for (int x = 0; x < h->S; x++) { if (!edone[x]) edone[x] = ork_dyn_done_i(h, x); n += edone[x]; }
+            if (n >= h->S) { landed = 1; break; }
+            if (g_ork_term) break;
+            double el = ork_now_us() - t0; if (el > miss_to) break;
+            if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        if (landed || g_ork_term) break;
+        if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
+            mc_recover_resubmit(h); continue; }
+        break;
+    }
     g_in_doorbell = 0;
-    if (!landed) { rc = -1; ork_dyn_dump(h, "grouped-i4 doorbell miss"); }   /* auto-dump the stall: NPU state + landed/stuck map + stuck op # (was silent-timeout, no dump -> couldn't root-cause) */
+    if (!landed) { rc = -1; ork_dyn_dump(h, "grouped-i4 doorbell miss (recover exhausted)"); }
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
