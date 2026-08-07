@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <vector>
 
 // DFlash extension API (exported extern "C" from libllama; see src/llama-ext.h).
@@ -175,6 +176,34 @@ static int run_dflash_bench(const char* target_path, const char* draft_path,
     return 0;
 }
 
+// AUTO-PERSIST build pass: pack every weight into the .orkpack in a SEPARATE untimed pass (WRITE mode, triggered
+// by ORK_PERSIST pointing at an absent/stale file), finalized on teardown. A few tokens through the full graph
+// touch every layer's matmul weights; the pack is pure-CPU weight tiling (M-independent) so a small-M pass yields
+// a pack valid for the full-P timed run — and small M also avoids any large-M submit hazard during the build.
+static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
+    llama_model_params mp = llama_model_default_params(); mp.n_gpu_layers = 0;
+    llama_model* model = llama_model_load_from_file(model_path, mp);
+    if(!model){ fprintf(stderr,"[ork_bench] build: model load FAILED\n"); return 1; }
+    const llama_vocab* vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> toks(rd+8);
+    int nt = llama_tokenize(vocab, ptxt, (int)rd, toks.data(), (int)toks.size(), true, true);
+    if(nt<=0){ llama_model_free(model); fprintf(stderr,"[ork_bench] build: tokenize FAILED (%d)\n",nt); return 1; }
+    // Convert pass = a small prefill (M=nb). A few tokens through the full graph touch every layer's matmul
+    // weights + the output proj; the pack is pure-CPU weight tiling (M-independent) so it is valid for the full-P
+    // timed run. nb kept small (4) so it is fast and stays well under any large-M submit hazard.
+    int nb = nt<4 ? nt : 4;
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = nb+8; cp.n_batch = nb; cp.n_ubatch = nb; cp.n_threads = 4; cp.n_threads_batch = 4;
+    cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    llama_context* ctx = llama_init_from_model(model, cp);
+    if(!ctx){ llama_model_free(model); fprintf(stderr,"[ork_bench] build: ctx init FAILED\n"); return 1; }
+    llama_batch pb = llama_batch_get_one(toks.data(), nb);   // small-M convert forward: packs every weight touched
+    int rc = llama_decode(ctx, pb);              // WRITE mode: pack + dump every weight touched
+    llama_free(ctx); llama_model_free(model);    // teardown -> ork_persist_finalize writes + renames the .orkpack
+    if(rc!=0){ fprintf(stderr,"[ork_bench] build: pack-pass decode rc=%d\n",rc); return 1; }
+    return 0;
+}
+
 int main(int argc, char** argv){
     if (argc < 3){ fprintf(stderr,"usage: %s <model.gguf> <promptfile> [P=128] [G=64] [ubatch=P]\n  DFlash mode: ORK_DFLASH_DRAFT=<draft.gguf> %s <target.gguf> <promptfile> [P] [G]\n",argv[0],argv[0]); return 2; }
     const char* model_path = argv[1];
@@ -188,24 +217,43 @@ int main(int argc, char** argv){
 
     llama_backend_init();
 
-    // GUARD: refuse to run without a prebuilt .orkpack — JIT-packing weights on first use pads the
-    // measured prefill (weight resolve/pack counted in the timed forward), so a run without ORK_PERSIST
-    // reports misleading numbers. Require ORK_PERSIST to point at an EXISTING orkpack; ORK_ALLOW_JIT=1
-    // overrides (for the initial build-the-orkpack run, which legitimately JIT-packs then caches).
-    if (!getenv("ORK_ALLOW_JIT")) {
-        const char* pp = getenv("ORK_PERSIST");
-        if (!pp || !*pp) {
-            fprintf(stderr, "[ork_bench] ERROR: ORK_PERSIST=<model.orkpack> is required (refusing to report JIT-pack-padded runtimes).\n"
-                            "            Set ORK_PERSIST to a prebuilt orkpack, or ORK_ALLOW_JIT=1 to build/JIT-pack.\n");
-            return 3;
+    // AUTO-PERSIST (.orkpack): a transparent, self-populating cache — behaviour keys ONLY on whether the pack
+    // already exists. No ORK_ALLOW_JIT, no manual ORK_PERSIST. The path defaults to <model>.q{4,8}.orkpack next
+    // to the model (int4 and int8 packs differ in content, so they are separate files); ORK_PERSIST overrides.
+    // Present+valid -> continue (the timed run loads it in READ mode). Absent or stale -> BUILD it once NOW in a
+    // separate untimed pass, then continue. (The build MUST be its own pass: WRITE mode forces M=1, so timing a
+    // just-built pack in the same process would be unrepresentative — the timed run must be pure READ mode.)
+    std::string orkpack;
+    if (const char* pp = getenv("ORK_PERSIST")) orkpack = pp;
+    else {
+        // Default location = the model's own folder, matching the existing convention: <model sans .gguf>.orkpack.
+        // A non-default ORK_QUANT (e.g. int4 on a Q8 gguf) yields DIFFERENT tile content, so it gets a distinct
+        // .q<N> name; the default (int8, ORK_QUANT unset or =8) keeps the bare .orkpack so it reuses any pack that
+        // oRKLLM / a prior run already wrote there.
+        std::string base = model_path;
+        if (base.size() > 5 && base.compare(base.size()-5, 5, ".gguf") == 0) base.resize(base.size()-5);
+        const char* q = getenv("ORK_QUANT");
+        bool nondefault = q && *q && q[0] != '8';
+        orkpack = base + (nondefault ? (std::string(".q") + q[0]) : std::string("")) + ".orkpack";
+        setenv("ORK_PERSIST", orkpack.c_str(), 1);   // internal plumbing; the backend reads ORK_PERSIST
+    }
+    if (ggml_backend_ork_orkpack_valid(orkpack.c_str())) {
+        fprintf(stderr, "[ork_bench] orkpack: %s (present — timed run reads it in READ mode)\n", orkpack.c_str());
+    } else {
+        fprintf(stderr,
+            "[ork_bench] ============================================================================\n"
+            "[ork_bench] WARNING: no orkpack at %s — building it now (one-time, untimed pass).\n"
+            "[ork_bench]          Benchmark timing is NOT meaningful on the build invocation. This run\n"
+            "[ork_bench]          pays the one-time pack cost; RE-RUN the same command afterwards for\n"
+            "[ork_bench]          clean steady-state prefill/decode numbers.\n"
+            "[ork_bench] ============================================================================\n",
+            orkpack.c_str());
+        int64_t bt0 = llama_time_us();
+        if (build_orkpack(model_path, ptxt.data(), rd) != 0 || !ggml_backend_ork_orkpack_valid(orkpack.c_str())) {
+            fprintf(stderr, "[ork_bench] ERROR: orkpack build failed (see [ORK PERSIST] messages above).\n"); return 3;
         }
-        FILE* pf = fopen(pp, "rb");
-        if (!pf) {
-            fprintf(stderr, "[ork_bench] ERROR: orkpack not found at '%s' (ORK_PERSIST). Build it first (ORK_ALLOW_JIT=1) or fix the path.\n", pp);
-            return 3;
-        }
-        fclose(pf);
-        fprintf(stderr, "[ork_bench] orkpack: %s\n", pp);
+        fprintf(stderr, "[ork_bench] orkpack build pass done in %.1f s -> %s (re-run for a pure cache-hit measurement)\n",
+                (llama_time_us()-bt0)/1e6, orkpack.c_str());
     }
 
     // TEST HOOK (harness only): exercise the product load-config API instead of env knobs.

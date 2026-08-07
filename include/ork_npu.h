@@ -353,7 +353,7 @@ ork_w       *ork_mm_load_i4(ork_npu *ctx, int K, int N, const void *blob, size_t
  * no native-alloc outlier — for co-resident fused per-tensor weights). K%32,N%32; dump/pack out=NULL ->
  * required byte size. */
 size_t       ork_w_dump_i8_cpu_st(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
-size_t       ork_pack_i4a8_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, void *out, size_t cap);
+size_t       ork_pack_i4a8_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap);  /* nf4: 1=NF4 codebook, 0=uniform (caller routes by source: full-precision->NF4) */
 ork_w       *ork_mm_pack_i8_import(ork_npu *ctx, int K, int N, const int8_t *B);
 
 /* ---- Streaming weight pool: a RAM-resident inflated-int8 cache with CHEAP map/unmap ----

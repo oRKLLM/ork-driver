@@ -209,6 +209,21 @@ static int one_i4g(ork_npu *c, int M, int K, int N, int G, const char *tag){
     return fail;
 }
 
+/* GATED CONFIRMATION (ORK_TEST_BCH=1): a natural BCHAIN shape (Sn=1,Sk=1,N%64==0) at varying M.
+ * Not in the default suite because a wedge-prone chain length would hang `make test`. Reports rc +
+ * a "done" marker (absent => the submit wedged mid-chain). Set ORK_BCH_DEBUG=1 for the geometry line. */
+static int one_i4_bch(ork_npu *c, int K, int N, int M, const char *tag){
+    printf("  [%-12s] K=%d N=%d M=%d int4 NATURAL BCHAIN (Sn=%d Sk-wide=%d N%%64=%d)\n", tag, K, N, M, (N+8191)/8192, K>8192, N%64);
+    int8_t *A=malloc((size_t)M*K), *B=malloc((size_t)K*N); int32_t *C=malloc((size_t)M*N*4);
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4(); for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
+    ork_w *w=ork_mm_pack_i4(c,K,N,B); if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(C); return 1; }
+    printf("    submitting..."); fflush(stdout);
+    int rc=ork_mm_run_i4(c,w,M,A,C);
+    printf(" done rc=%d %s\n", rc, rc==0?"(completed, no wedge)":"(nonzero)");
+    ork_mm_free(c,w); free(A);free(B);free(C);
+    return rc==0?0:1;
+}
+
 int main(void){
     setvbuf(stdout,0,_IONBF,0);
     ork_npu *c=ork_npu_init(); if(!c){ printf("init fail\n"); return 1; }
@@ -224,6 +239,19 @@ int main(void){
     fail |= one_i4(c, 10240, 128,   8, 0, "i4-wideK"); /* int4 NATURAL K>8192 gate — K-slice int32-accumulate (2 slices) */
     fail |= one_i4_natural(c, 2048, 16384, 128, "i4-refuse"); /* REAL trigger: M=128 + Sn=2 -> run_i4_mc_db -4 -> rescue */
     fail |= one_i4g(c, 64, 2048, 256, 128, "i4g-refuse");     /* GROUPED: M=64 Sk=16 -> Pcore~341 > cap -> hard refuse -> M-chunk rescue */
+    if(getenv("ORK_TEST_BCH")){   /* P=128 wedge probe: the Qwen3-1.7B int4 down-proj (K=6144,N=2048) at M=64 (works) vs M=128 (wedges) */
+        printf("  -- ORK_TEST_BCH: BCHAIN chain-length wedge probe (down-proj K=6144 N=2048) --\n");
+        fail |= one_i4_bch(c, 6144, 2048, 64,  "bch-M64");
+        fail |= one_i4_bch(c, 6144, 2048, 128, "bch-M128");
+    }
+    if(getenv("ORK_TEST_GRP")){   /* GROUPED W4A4 wedge sweep: ascending Sk=K/G at M=1 (isolates the grouped submit), then M=32 (rescue) */
+        printf("  -- ORK_TEST_GRP: grouped W4A4 wedge sweep (N=2048, G=128; Sk=K/128) --\n");
+        fail |= one_i4g(c, 1,  2048, 2048, 128, "grp-M1-Sk16");
+        fail |= one_i4g(c, 1,  4096, 2048, 128, "grp-M1-Sk32");
+        fail |= one_i4g(c, 1,  6144, 2048, 128, "grp-M1-Sk48");   /* down-proj group count */
+        fail |= one_i4g(c, 1,  8192, 2048, 128, "grp-M1-Sk64");
+        fail |= one_i4g(c, 32, 6144, 2048, 128, "grp-M32-Sk48");  /* the convert M_padded=32 rescue path */
+    }
     printf(fail ? "TEST_SLICE_RESCUE: FAIL\n" : "TEST_SLICE_RESCUE: PASS\n");
     return fail ? 1 : 0;
 }

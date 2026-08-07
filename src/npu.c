@@ -10822,6 +10822,8 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     (void)K;
     if (Sk > 256) return NULL;                                       /* bounds the per-row aslice[]/program count */
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > M) nc = M;
+    if (getenv("ORK_GRP_DEBUG")) { fprintf(stderr, "[grp] M=%d K=%d N=%d G=%d Sk=%d Sn=%d nc=%d progs/core~%d\n",
+        M, w->K, N, G, Sk, Sn, nc, (M+nc-1)/nc * Sn * Sk); fflush(stderr); }
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
     if (mc_ensure(c, nc)) return NULL;
@@ -13781,6 +13783,8 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
+        fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
     unsigned dom=w->domain;
     if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) dom_activate(c,w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
@@ -14710,13 +14714,13 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
  * replicates the EXACT per-channel quant of ork_mm_pack_i4a8_im (absmax/7 uniform or NF4 codebook, optional
  * imatrix clip-grid, SR with a per-call seed) so the bytes match. Single-threaded (caller parallelizes over
  * experts). out=NULL → required size. K%32,N%32. */
-size_t ork_pack_i4a8_cpu_blob(ork_npu *c, int K, int N, const float *f32, const float *imatrix, void *out, size_t cap){
+size_t ork_pack_i4a8_cpu_blob(ork_npu *c, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap){
     (void)c;
     if(K%32 || N%32 || !f32) return 0;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nibsz=(size_t)K*N/2, need=hdr+sc+nibsz;
     if(!out) return need;
     if(cap<need) return 0;
-    int nf4 = getenv("ORK_NF4")!=NULL;
+    nf4 = nf4 ? 1 : 0;   /* codebook routed by the caller (source-based), not an env flag */
     int sr  = getenv("ORK_SR")!=NULL; uint32_t seed=0x2545F491u;   /* per-call seed matches ork_mm_pack_i4a8_im */
     struct ork_i4a8_hdr h={ORK_I4A8_MAGIC, ORK_I4A8_VER, K, N, (uint32_t)(nf4?ORK_QK_CODEBOOK_NF4:ORK_QK_UNIFORM)};
     char    *p=(char*)out;
