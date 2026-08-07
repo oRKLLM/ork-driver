@@ -1,5 +1,46 @@
 # I4 grouped-W4A4 prefill wedge — WIP recovery doc
 
+## CORRECTION (2026-08-07): int4 SHOULD be a dt-branch in ork_dyn_begin_colsplit (the reference)
+Earlier "BCHAIN can't fold — no h" was WRONG. The int8 REFERENCE is `ork_dyn_begin_colsplit`@11118: a
+dt-parametrized doorbell batch-chain that builds per-core chains into an ork_dyn_chain h, runs PARALLEL
+per-core workers (ork_csub_worker / npu_pool, prepolled), and rides ork_dyn_end for recover+dump. It already
+carries dt==DT_I8 AND dt==DT_F16 branches (fp16 was Stage 1 / #47). => int4 belongs as a **dt==DT_I4 branch
+there**, mirroring fp16 — keeps parallel per-core perf AND unifies onto the shared drain. Feasible, correct.
+
+PLAN (mirror the fp16 Stage-1 branch @11150; this is a #46-#50-scale staged port, bit-exact + perf-gated):
+  1. Route int4 M>=2 (currently -> run_i4_bchain_db@4413) into ork_dyn_begin_colsplit with dt==DT_I4.
+  2. In colsplit, add the dt==DT_I4 per-core branch: A-slice gather (tile_i4_Aslice), synth_i4 per (ns,g) into
+     the core's chain (as run_i4_bchain_db@13850 does), int16 partial scratch in mcc[i], set h->esz=2, h->mc_dt=DT_I4.
+  3. FINALIZE (the int4 tail, analogous to fp16's f32 accumulate / int8 oscat): the bch de-tile int16->int32 C
+     (bch_db_cells mode 2 logic) as the per-core accumulate in the worker, so ork_dyn_end's prepolled path drains it.
+  4. Ride ork_dyn_end: set h->prepolled after the workers drain (like colsplit int8/fp16) so recover+dump come free;
+     delete run_i4_bchain_db's bespoke poll/reset once parity holds (keep it until then).
+  5. VALIDATE: make test byte-identical all precisions; i4/test_chain_i4/perplexity_i4 bit-exact; A/B perf every
+     int4 shape decode M=1 + prefill M>=2 vs run_i4_bchain_db (no regression — colsplit's balanced split + parallel
+     accumulate should match/beat it). Then grouped + this int4-BCHAIN + int8/fp16 ALL ride colsplit+ork_dyn_end.
+SCALE: fp16 colsplit was 5 staged tasks (#46-#50). This is comparable careful work (bit-exact int4 port into the
+shared int8/fp16 colsplit fn = high blast radius) + full validation — a focused effort, not a single fumes-pass.
+
+## SINGLE-DRAIN-CORE UNIFICATION (2026-08-07) — scope reality (evidence-backed)
+DONE (ca5aff6): all int4 paths FUNCTIONALLY on the doorbell recover+dump — grouped shares
+mc_recover_resubmit + ork_dyn_dump with int8's ork_dyn_end; M=1 rides ork_dyn_end; BCHAIN has its own
+equivalent recover. make test all-precisions PASS; native-W4A4 storm-free.
+
+ACHIEVABLE (safe, cleanliness only — NOT done here): fold int8/fp16 (ork_dyn_end) + grouped
+(ork_dyn_grouped_end) onto ONE `ork_dyn_drain_poll(h)` helper (dedup the now-duplicated poll+recover+dump
+loop, ork_dyn_end@12153-12210 == grouped@10890+). CAUTION: ork_dyn_end is the shared int8+fp16 drain
+(highest blast radius) and its g_in_doorbell lifecycle spans into finalize — extract carefully, `make test`
+byte-identical all precisions. Zero functional gain (recover+dump already there) -> low priority; fresh context.
+
+INFEASIBLE without perf regression: **fold BCHAIN in.** run_i4_bchain_db@13777 uses NO ork_dyn_chain h at
+all — struct bchdbw args[] across PARALLEL npu_pool workers (bch_db_worker), poll/de-tile via bch_db_cells
+(per-line int16->int32), own reset loop@13836. Rewriting it onto the serial h-based SENT16 drain would lose
+its parallel per-core de-tile = a direct perf regression (violates the no-regression bar) + correctness risk.
+BCHAIN stays its own drain BY NECESSITY; it already has recover (could add ork_dyn_dump on exhausted recover@13836
+for dump-parity — a small safe follow-on). A true single core spanning both would need a higher-level abstraction
+(per-core worker fn + recover cb + dump) — large, not clearly better; only if a future need justifies it.
+
+
 ## REIMPLEMENTATION SPEC (2026-08-07) — "int4 fully rides the doorbell, no perf regression"
 DEFECT (#33 spec miss): int4 paths drain via BESPOKE code, not the shared doorbell drain ork_dyn_end
 (auto-dump@12189 + recover loop@12163). Inventory:

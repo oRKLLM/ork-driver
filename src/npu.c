@@ -13848,6 +13848,15 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
                      double el=ork_now_us()-t0; if(el>3e6) break; if(el>1000.0){struct timespec ts={0,50000};nanosleep(&ts,NULL);} } }
         missed=0; for(int i=0;i<nc;i++) if(args[i].rc==-2) missed=1;
     }
+    if(missed){   /* Stage 1: recover exhausted -> auto-dump on the SHARED doorbell facility (ork_dyn_dump), like
+                   * ork_dyn_end@12209. BCHAIN's output IS SENT16-sentinel'd (bch_db_cells), so the per-core landed/
+                   * stuck map + ork_npu_dump_state are meaningful. Diagnostic only; no change to regcmd/de-tile/recover. */
+        ork_dyn_chain hd; memset(&hd,0,sizeof hd);
+        hd.c=c; hd.S=nc; hd.P=nc; hd.N=N; hd.mc=1; hd.esz=2; hd.dom=dom;
+        for(int i=0;i<nc && i<ORK_MAXCORE;i++){ hd.outbuf[i]=&c->mcc[i]; hd.outptr[i]=(int32_t*)c->mcc[i].cpu;
+            hd.nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); hd.oM[i]=1; }
+        ork_dyn_dump(&hd,"run_i4_bchain_db incomplete (recover exhausted)");
+    }
     return missed ? -1 : 0;
 }
 struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
