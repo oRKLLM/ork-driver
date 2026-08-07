@@ -2706,11 +2706,17 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
        ((Sn>1 && (K>4096 || !w->Bf))       /* the shape run_multicore actually refuses */
         || getenv("ORK_SLICE_ALL")))        /* TEST hook: build tiles for ANY int8 shape (small-shape rescue validation) */
         w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_I8);
-    /* fp16 slice path (#33 stage 4): MEASURED DEAD — the tiled fp16 doorbell (run_stream_f16) is 6-17x SLOWER
-     * than run()'s single-core reference it was meant to replace (fp16 per-submit doorbell overhead dominates
-     * fine tiling; test_slice_rescue REPS=30: ref/sliced 0.16x base, 0.06x wide). The single-core reference
-     * WINS, so this stays OFF by default (fp16 never refuses — it has that correct, faster backstop). Kept
-     * behind ORK_F16_SLICE_RESCUE (bit-exact, opt-in) for the record; do NOT enable in production. */
+    /* fp16 slice path (#33 stage 4): ROOT-CAUSED DEAD — 6-17x SLOWER than run()'s single-core reference it
+     * would replace (test_slice_rescue REPS=30: ref/sliced 0.16x base, 0.06x wide). ROOT CAUSE (profiled): the
+     * fp16 tiles SERIALIZE across cores — nc=3 but wall = S x per-tile (S=3 -> 3x, S=6 -> 6x), zero multi-core
+     * speedup. Unlike int8 (whose distinct-weight tiles run CONCURRENTLY across cores -> parity), fp16 can't
+     * have distinct weight buffers in flight at once (the cross-buffer HW-prefetch WILD that fp16 CONTIG +
+     * lockstep guard against; fp16 submits blocking — "nonblock re-wedges fp16"). So the multi-core parallelism
+     * that pays for slice-and-dice's tiling overhead is UNAVAILABLE for fp16 — a HW constraint, not a bug. Plus
+     * a ~370us fixed per-fp16-submit cost multiplies across the many small tiles. NOT FIXABLE via slice-and-dice;
+     * the single-core reference (one integrated pass) WINS. Stays OFF by default (fp16 never refuses — it has
+     * that correct, faster backstop). Kept behind ORK_F16_SLICE_RESCUE (bit-exact, opt-in) for the record;
+     * do NOT enable, do NOT re-attempt. If fp16 multicore ever needs speeding, the lever is CONTIG colsplit (#47). */
     if(dt==DT_F16 && !g_in_slice_pack && (getenv("ORK_F16_SLICE_RESCUE") || getenv("ORK_SLICE_ALL")))
         w->sliced = ork_mm_pack_sliced(c, K, N, B, DT_F16);
     return w;
@@ -5393,7 +5399,9 @@ static int slice_run_f16(ork_npu *c, ork_w_sliced *w, int M, const f16 *A, float
         for (int ni = 0; ni < nnt; ni++) { int n0 = ni*ns, n1 = n0+ns < N ? n0+ns : N, Nw = n1-n0;
             tasks[ki*nnt + ni] = (ork_mm_task_f16){ w->sub[ki*nnt + ni], M, aptr, part + poff };
             poff += (size_t) M * Nw; } }
+    int prof = getenv("ORK_SLICE_PROF") != NULL; double tp0 = prof?ork_now_us():0;
     int rc = ork_mm_run_stream_f16(c, S, tasks) ? -1 : 0;                /* ONE nonblock doorbell submit over all tiles */
+    double tp1 = prof?ork_now_us():0;
     if (!rc) {
         int anc = nc>0 ? nc : c->soc->cores; if(anc>ORK_MAXCORE) anc=ORK_MAXCORE; if(anc<1) anc=1;
         struct slc_acc_f32 acc[ORK_MAXCORE];
@@ -5410,6 +5418,8 @@ static int slice_run_f16(ork_npu *c, ork_w_sliced *w, int M, const f16 *A, float
             pthread_mutex_lock(&c->pmu); while(c->pdone < anc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
         }
     }
+    if(prof) fprintf(stderr,"[slice_f16] S=%d nks=%d nnt=%d M=%d K=%d N=%d ks=%d ns=%d  stream=%.0fus accum=%.0fus\n",
+                     S,nks,nnt,M,K,N,ks,ns, tp1-tp0, ork_now_us()-tp1);
     free(Aslc); free(part); free(tasks); return rc;
 }
 
@@ -11465,7 +11475,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * bsync FROM_DEVICE -> CPU copy/scatter to the caller's C) is the reliable completion barrier and is
      * bit-exact. So force scratch for any M>1 op; end() straight-copies (Sn==1) or scatters (Sn>1 wide-N). */
     for (int i = 0; i < S; i++) if (tasks[i].M > 1 || tasks[i].w->K > 4096) { direct = 0; break; }   /* M>1 (ZC-OUT unsafe) and K-split (K>4096: partials+accumulate) both require the scratch path (K<=4096 uses full-K Bf, direct OK) */
-    if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d dom=%u direct=%d N=%d\n", S, dom, direct, N0);
+    if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d nc=%d dt=%d dom=%u direct=%d N=%d\n", S, nc, dt, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)(tasks[p].w->K > 4096 ? tasks[p].w->Sk : 1) * tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N; K-split (K>4096) holds Sk partials */
         if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
