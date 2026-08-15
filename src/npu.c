@@ -136,7 +136,7 @@ struct ork_dom_scratch {
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int scratch_import; /* 1 once a native-int4 weight is bimported: route run scratch via bimport (bcreate EINVALs in a bimport-filled domain). Set by ork_mm_load_i4_import; int8/fp16 never set it. */ int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     /* fused-chain PER-CORE scratch (increment 2: concurrent round-robin — one independent buffer set per core so
      * chains dispatched to different cores never share DRAM). chain_rc = P-program regcmd, chain_tk = P-task array,
      * chain_lrc = LUT-load regcmd (DRAM source), chain_lsc = LUT SDP scratch. Lazily allocated per core on first use. */
@@ -159,6 +159,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
     int dom_active; int dom_cap;   /* dom_cap = allocated length of dom_anchor[] / dom_save[]; grown on demand by dom_reserve, NO fixed cap (domain count = whatever the auto-sizer / ork_npu_domain_alloc drives) */
+    int dom_dirty;   /* #54: a genuine doorbell MISS left an unreaped (dropped) job in dom_active — its completion IRQ never fired, so the kernel's per-job interrupt_count for this domain stays >0 forever. A stuck job makes the NEXT iommu-domain switch time out ("switch iommu domain time out") -> cascade. dom_activate flushes it (ACT_RESET, which aborts+clears stuck jobs, while STILL attached to this domain) before switching away. Set by the int4 doorbell reset-free-resubmit path; single-domain never switches, so it never acts on the flag (matches streaming's safety). */
     /* ORK_DOM_PROFILE: dom_activate cost telemetry (the "domain-swap window"). Steady = pure scratch
      * pointer-swap memcpy; first = one-time per-domain first-touch bcreate(regcmd/task/Af). */
     uint64_t dom_sw_n, dom_sw_first_n; double dom_sw_us, dom_sw_first_us, dom_sw_max_us;
@@ -187,6 +188,14 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * (flushed in one bsync_off). Collapses thousands of per-tile bcreates to a handful of chunks => fast
      * warmup, no IOVA-handle OOM. Also the on-disk form for persisted (pre-packed) weights. */
     struct buf wchunk[64]; int wchunk_n; size_t wchunk_off;
+    /* int4 EXPERT IMPORT ARENA (#54): a per-domain pool of LARGE bimport'd dma-buf chunks, bump-allocated
+     * across MANY experts so each expert's tiles are base+offset VIEWS into a shared chunk. One dma-buf import
+     * PER EXPERT (~9k for the 35B MoE) crams ~2340 IOMMU mappings into a domain -> the NPU wedges mid-prefill;
+     * a few large chunks/domain (same anchor+bimport+bimport-scratch alloc pattern, just coarser granularity)
+     * keeps mappings tiny. Chunks persist for the ctx (MoE experts are resident, never evicted); freed once at
+     * teardown. Views (heap_fd=0, own_bufs=NULL, owns=0) are skipped by ork_mm_free. [64] == ORK_IOVA_NDOM. */
+    struct buf *i4arena; int i4arena_n, i4arena_cap;              /* every chunk ever allocated (teardown bdestroys each) */
+    struct buf i4arena_cur[64]; size_t i4arena_off[64]; int i4arena_curi[64];   /* per-domain open chunk (working copy), write offset, and its index in i4arena[] (for fd-sealing on chunk switch) */
     /* PACK DOMAIN: per-ctx default domain for the NEXT pack/load (set by ork_npu_set_pack_domain for the
      * ggml-ork caller). Read once at each pack's entry to stamp w->domain; from there the weight carries
      * its own domain. Not a process-global — concurrent ctxs don't clobber each other. -1 => default. */
@@ -495,7 +504,11 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
         if(flags & RKNPU_MEM_TRY_ALLOC_SRAM){   /* SRAM path faulted -> DRAM failover (retry once, same IOVA reservation) */
             memset(&c,0,sizeof c); c.size=need; c.flags=flags & ~RKNPU_MEM_TRY_ALLOC_SRAM; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
             if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
-        } else {perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
+        } else {
+            fprintf(stderr,"CREATE FAIL: errno=%d(%s) size=%zuKB dom=%d flags=0x%x bcreate#%ld dom_iova=%zuMB ceil=%zuMB\n",
+                    errno, strerror(errno), need>>10, dom, flags, g_bcreate_n,
+                    (dom>=0&&dom<ORK_IOVA_NDOM?g_iova_bytes[dom]:0)>>20, ork_iova_ceiling()>>20);
+            ork_iova_release(dom,need);return (struct buf){0};}
     }
     struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");ork_iova_release(dom,need);return (struct buf){0};}
@@ -548,7 +561,7 @@ static int dmaheap_open(void){
 static void dmabuf_sync(int heap_fd,uint64_t flags){
     if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
 }
-static struct buf bimport(int fd,size_t size,int domain){
+static struct buf bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     int tr=imp_trace();
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
     size_t sz=pgup(size);
@@ -571,7 +584,10 @@ static struct buf bimport(int fd,size_t size,int domain){
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(g_load_prof){ g_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
     if(tr){ fprintf(stderr,"[IMP]   prime ok (handle=%u) -> MEM_CREATE...\n",ph.handle); fflush(stderr); }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
+    /* memflags: normally 0 (weights are NPU-DMA'd, need no kernel vmap). SCRATCH task/descriptor buffers pass
+     * RKNPU_MEM_KERNEL_MAPPING so the kernel can READ the rknpu_task structs — dropping it (the old flags=0)
+     * gave a malformed task and WEDGED the NPU. Only the kernel-read task buffers need it; data buffers pass 0. */
+    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=memflags; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(g_load_prof){ g_lp_create += ork_now_us()-_t; g_lp_nchunk++; g_lp_bytes+=sz; }
     struct buf b; memset(&b,0,sizeof b);
@@ -580,6 +596,50 @@ static struct buf bimport(int fd,size_t size,int domain){
     g_bimport_n++;
     if(tr){ fprintf(stderr,"[IMP]   MEM_CREATE ok dma=0x%llx -> bimport DONE (imp#%ld dom_bytes=%zuMB)\n",(unsigned long long)b.dma,g_bimport_n,g_iova_bytes[dom>=0&&dom<ORK_IOVA_NDOM?dom:0]>>20); fflush(stderr); }
     return b;
+}
+static struct buf bimport(int fd,size_t size,int domain){ return bimport_f(fd,size,domain,0); }   /* weights: NPU-DMA'd, no kernel vmap */
+/* Run-SCRATCH allocator (task/regcmd/output buffers). int4-RESIDENT runs keep every domain's WEIGHTS bimported
+ * (PRIME_FD); a fresh MEM_CREATE (bcreate) then EINVALs in that domain (MEM_CREATE GEM alloc can't coexist with
+ * imported memory in the same iommu domain), which starved the run scratch (mc_ensure mtk_all -> decode -3). So
+ * for int4 (c->last_dt==DT_I4) route the small scratch through the SAME import path (bimport) as the weights, so
+ * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
+ * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
+ * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
+static struct buf bscratch(ork_npu *c,size_t size,int flags,int dom){
+    /* int8/fp16 (scratch_import unset): bcreate — the proven path, UNCHANGED. int4 RESIDENT (scratch_import set
+     * once weights are bimported): a fresh bcreate GEM can't be placed amid ~GiB of imported SG mappings in the
+     * same domain (kernel EINVAL once the domain is heavy — mc_ensure mtk_all -> decode -3). Route scratch through
+     * the SAME import path so it coexists. The earlier bimport-scratch WEDGE was because bimport forced MEM_CREATE
+     * flags=0, DROPPING RKNPU_MEM_KERNEL_MAPPING (0x8) that the kernel needs to READ task/descriptor buffers ->
+     * malformed task. Fixed: carry KERNEL_MAPPING for the kernel-read buffers (requested flags & 0x8); NPU-DMA'd
+     * data buffers pass 0. */
+    /* #54 int4 RESIDENT (scratch_import set once native-int4 weights are bimported into their domains): a fresh
+     * bcreate GEM draws from the limited CONTIGUOUS/CMA pool, which FRAGMENTS under the resident dma-heap weights
+     * + the GGUF/orkpack mmap pressure and INTERMITTENTLY EINVALs (mc_ensure mtk_all, at a variable domain 3-8 on
+     * fresh boots — nondeterministic = memory pressure, not a clean limit). Route run scratch through the SAME
+     * dma-heap import path as the weights (system memory, NO contiguous requirement) so it never competes for the
+     * contiguous pool. KERNEL-READ task/descriptor buffers (flags & KERNEL_MAPPING) import WITH that flag so the
+     * kernel still gets a vmap to read the rknpu_task structs (the earlier "bimport scratch wedges" was flags=0
+     * DROPPING KERNEL_MAPPING; carrying it fixes the malformed-task wedge — bimport_f already supports this).
+     * Coherency: bsync auto-routes imported buffers (heap_fd set) to dmabuf_sync (rknpu MEM_SYNC doesn't cover
+     * foreign imports). int8/fp16 (scratch_import UNSET) keep bcreate — the proven path, UNCHANGED. */
+    /* Run scratch is ALWAYS bcreate. Importing scratch is a PROVEN DEAD END: kernel-read task buffers (0x40b)
+     * HARD-WEDGE the board (foreign dma-buf has no kernel vmap -> malformed task; 2026-08-08 + 2026-08-09
+     * unreachable/power-cycle), AND importing even the NPU-DMA'd (0x403) scratch corrupts subsequent MEM_CREATE
+     * (errno 14 EFAULT on the next bcreate; 2026-08-09). The contiguous-pool fragmentation under mmap pressure is
+     * instead addressed by REDUCING the footprint (lean/metadata-only GGUF — run from the int4 orkpack directly),
+     * not by importing scratch. int8/fp16/int4 all bcreate here. */
+    (void)c;
+    /* #54 BIMPORT-ONLY MULTI-DOMAIN (ORK_BIMPORT_DOM, opt-in). On the current board boot, native bcreate
+     * (MEM_CREATE GEM alloc) into a NON-0 iommu domain fails outright with EINVAL (test_i4_domains: bcreate#20
+     * dom=1, dom_iova=2MB — not exhaustion), so non-0 domains can't be established at all and every multi-domain
+     * run wedges downstream. dma-heap bimport into a non-0 domain uses a DIFFERENT MEM_CREATE flavor (imported
+     * handle) that may still work where the fresh GEM alloc EINVALs. Route non-0-domain scratch through bimport,
+     * carrying KERNEL_MAPPING for the kernel-read task/descriptor buffers (flags&0x8 -> 0x40b) — dropping it was
+     * the old import-scratch wedge; bimport_f supports it. Domain 0 + int8/fp16 UNCHANGED (bcreate). */
+    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
+      if(bimp && ork_dom(dom)>0){ return bimport_f(c->fd,size,dom,(flags & RKNPU_MEM_KERNEL_MAPPING)); } }
+    return bcreate(c->fd,size,flags,dom);
 }
 /* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
  * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
@@ -635,7 +695,55 @@ static void ork_dom_prime(ork_npu *c, int dom){
     if(d<=0) return;                                  /* domain 0 never needs an anchor */
     if(dom_reserve(c, d+1)) return;                   /* grow arrays to cover domain d (OOM -> skip anchoring) */
     if(c->dom_anchor[d].cpu) return;                  /* already anchored */
+    /* #54 BIMPORT-ONLY (ORK_BIMPORT_DOM): native bcreate EINVALs in non-0 domains on this boot, so the anchor
+     * must be a dma-heap import too. (Quirk 1's native-first requirement can't be honored when bcreate fails;
+     * the weight import that follows is import-first regardless — the probe's bit-exact verify catches any
+     * aliased-IOVA corruption.) */
+    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
+      if(bimp){ c->dom_anchor[d] = bimport(c->fd, 65536, d); return; } }
     c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
+}
+/* #54 FIX: re-establish a domain's IOMMU page-table region before EACH imported dma-buf. The kernel sets up a
+ * domain's page table lazily around the buffer that triggers it; the one up-front anchor (ork_dom_prime) covers
+ * only the FIRST import — a 2nd+ imported dma-buf then lands on aliased IOVAs and the NPU reads it WRONG (probed
+ * bit-exact: 1st import OK, 2nd import maxerr~2835, fixed to 0 by a fresh native bcreate before it). So drop the
+ * stale anchor and bcreate a fresh native one immediately before importing each weight. Cheap (64 KiB); the
+ * previous import's mapping persists after its anchor is freed (verified: 1st weight re-runs bit-exact after). */
+static void ork_dom_reanchor(ork_npu *c, int dom){
+    int d = ork_dom(dom); if(d<=0) return;            /* domain 0 always established */
+    if(dom_reserve(c, d+1)) return;
+    if(c->dom_anchor[d].cpu) bdestroy(c->fd, &c->dom_anchor[d]);
+    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
+      if(bimp){ c->dom_anchor[d] = bimport(c->fd, 65536, d); return; } }   /* #54 bimport-only: bcreate EINVALs in non-0 */
+    c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);
+}
+/* #54 REAP-AT-DOMAIN-BOUNDARY. A genuine int4 doorbell DROP leaves a stuck job in c->dom_active whose completion
+ * IRQ never fired, so the kernel's iommu_domain_refcount for that domain stays >0. The reap that clears it —
+ * rknpu_job_timeout_clean — only fires at the TOP of the NEXT submit ON THAT CORE, and (crucially) that next
+ * submit is normally in the NEXT domain, AFTER the switch: so get_and_switch(D+1) waits on D's refcount>0 and
+ * TIMES OUT ("switch iommu domain time out, id: N") — the reap can never happen across the boundary. FIX: before
+ * switching away from a dirty domain, issue a SAME-DOMAIN per-core dummy (ork_npu_reap_stuck) whose submit runs
+ * timeout_clean(core i) -> clean gem_object_put of the stuck job -> refcount returns to 0, so the switch lands.
+ * (ACT_RESET does NOT do this — source-confirmed rknpu_soft_reset is HW-only, leaves the job list; only
+ * timeout_clean reaps. That's why the earlier ACT_RESET version failed.) No-op unless a real drop set dom_dirty
+ * (rare); clean runs + single-domain pay nothing. Between-ops / pre-teardown only (no live pool workers). */
+static void ork_npu_reap_stuck(ork_npu *c, int nc);   /* fwd: per-core timeout_clean reap (defined below) */
+static int i4_submit_tmo_ms(void);                    /* fwd: bounded int4 doorbell submit timeout (defined near the int4 workers) */
+static void ork_dom_flush_if_dirty(ork_npu *c){
+    if(!c || !c->dom_dirty) return;
+    if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[dom] dirty-REAP on dom=%d (wait-past-timeout + timeout_clean the stuck job before switch)\n", c->dom_active);
+    /* #54 COMBINED BOUNDARY FIX. The switch waits up to 6s for iommu_domain_refcount==0, so a 6s timeout means a
+     * GENUINELY STUCK job (a clean-but-retiring job just delays the switch a few ms). rknpu_job_timeout_clean
+     * (the only thing that reaps a stuck nonblock job — ACT_RESET can't) reaps ONLY a job aged >= its submit
+     * timeout. So: (1) WAIT past the bounded int4 doorbell timeout (i4_submit_tmo_ms) so any dropped job is
+     * reapable + any last in-flight op has time to retire; then (2) per-core reap dummy triggers timeout_clean.
+     * Second reap pass catches a reap-dummy that itself dropped (its own short timeout has elapsed by then).
+     * Only on a dirty (real-drop) boundary — rare — so the ~1.7s is paid only when a switch would otherwise wedge. */
+    { int ms = i4_submit_tmo_ms() + 200; struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+    ork_npu_reap_stuck(c, c->soc->cores);
+    { struct timespec ts = {0, 400*1000000L}; nanosleep(&ts,NULL); }   /* let a dropped reap-dummy pass its 300ms timeout */
+    ork_npu_reap_stuck(c, c->soc->cores);
+    c->dom_dirty=0;
 }
 static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
@@ -672,6 +780,15 @@ static void act(int fd,uint32_t f,uint32_t v){
 static void dom_activate(ork_npu *c,int dom){
     if(dom<0) dom=0;
     if(dom==c->dom_active) return;
+    /* #54 RETIREMENT BARRIER: a nonblock doorbell op is "done" when its output cell lands, which can be BEFORE
+     * the kernel retires the job (completion IRQ). Switching the IOMMU domain while the PRIOR domain's job is
+     * still in-flight races it -> the first submit in the new domain dispatches nothing (task counter 0x0) ->
+     * kernel watchdog soft reset -> corrupts the switch (the int4 multi-domain wedge; byte-diff ruled out a
+     * malformed descriptor, dom0/dom1 submits are byte-identical + run fine). Let the prior domain's just-landed
+     * job retire before switching. Only on a real switch (per-layer, ~tens of times); tunable/off via env. */
+    { static long su=-1; if(su<0){ const char*e=getenv("ORK_DOM_SETTLE_US"); su=e?atol(e):1000; }
+      if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } }
+    ork_dom_flush_if_dirty(c);   /* #54 THE multi-domain fix: if an int4 doorbell drop left a stuck job in the OUTGOING domain, REAP it now (same-domain timeout_clean, still attached to dom_active) so the switch below finds the domain idle instead of timing out -> cascade. See ork_dom_flush_if_dirty. */
     double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
     if(dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
@@ -697,7 +814,7 @@ static void dom_activate(ork_npu *c,int dom){
      * run path lazily (re)allocates them in c->dom_active under their own .size/.cpu guards. */
     int _first = (!neo->used && !c->regcmd.cpu);
     if(_first){
-        c->regcmd=bcreate(c->fd,2097152,0x403,dom); c->task=bcreate(c->fd,524288,0x40b,dom); c->Af=bcreate(c->fd,(size_t)4*32768*2,0x403,dom);
+        c->regcmd=bscratch(c,2097152,0x403,dom); c->task=bscratch(c,524288,0x40b,dom); c->Af=bscratch(c,(size_t)4*32768*2,0x403,dom);
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
             memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     }
@@ -2256,6 +2373,7 @@ ork_npu *ork_npu_init_orkd(void){
  * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
  * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
  * select the transport by calling the desired entry point rather than relying on the env. */
+static int mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
@@ -2291,6 +2409,12 @@ ork_npu *ork_npu_init(void){
     { const char*e=getenv("ORK_NO_SIGCLEAN"); if(!(e&&atoi(e))){
         struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=ork_sig_teardown; sigemptyset(&sa.sa_mask);
         sigaction(SIGTERM,&sa,NULL); sigaction(SIGINT,&sa,NULL); } }
+    /* #54: pre-allocate domain-0 run scratch (mtk_all + per-core mrc/mtk/maf) NOW, while domain 0 is empty. It
+     * would otherwise be bcreate'd lazily at the first forward op, AFTER the dense weights import ~GiB into
+     * domain 0 — where a fresh bcreate EINVALs amid the imports (the mc_ensure mtk_all failure). Best-effort. */
+    mc_ensure(c, c->soc->cores);
+    for(int i=0;i<c->soc->cores;i++){ size_t mcc_need=(size_t)2*1024*1024;   /* also pre-size domain-0 mcc (expert BCHAIN need_o) so it never re-bcreates in the import-heavy domain 0 */
+        if(c->mccsz[i]<mcc_need){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } } }
     g_npu_ctx = c;
     return c;
 }
@@ -2310,7 +2434,8 @@ void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accoun
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 static void ork_npu_xprof_dump(void);
 void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
-    int fd=c->fd; ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
+    int fd=c->fd; ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before teardown's per-domain MEM_DESTROYs switch domains */
+    ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
     if(getenv("ORK_DOM_PROFILE") && c->dom_sw_n){   /* domain-swap window telemetry */
         uint64_t steady_n = c->dom_sw_n - c->dom_sw_first_n; double steady_us = c->dom_sw_us - c->dom_sw_first_us;
         fprintf(stderr, "[ork DOM-SWAP] %llu real switches (%.1f us total, %.2f us max) | first-touch %llu (%.0f us, one-time bcreate) | steady swaps %llu = %.3f us total, %.4f us/swap avg\n",
@@ -2353,6 +2478,7 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
         free(c->dom_save); }
     for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
     if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
+    if(c->i4arena){ for(int i=0;i<c->i4arena_n;i++) if(c->i4arena[i].cpu) bdestroy(fd,&c->i4arena[i]); free(c->i4arena); }   /* #54 int4 expert import arena (bdestroy closes each chunk's heap_fd) */
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
@@ -4184,6 +4310,7 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4);
 void ork_mm_free(ork_npu *c, ork_w *w){
     if(!w) return;
     if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w->fa_lut); free(w); return; }   /* Path B: free the daemon-resident weight */
+    if(c) ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before a per-domain bdestroy switches domains ("failed to destroy memory" + switch-timeout cascade) */
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
@@ -4313,6 +4440,139 @@ ork_w *ork_mm_load_i4(ork_npu *c,int K,int N,const void *blob,size_t n){
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return w;
 }
+/* Native-int4 IMPORT twin of ork_mm_load_i4: identical DT_I4 tile layout (Kp*Nc/2 nibble bytes, KS=ORK_I4_KS,
+ * no Bf) but allocated via bimport (dma-heap + PRIME_FD into the IOMMU) instead of bcreate (MEM_CREATE). MEM_CREATE
+ * faults/EINVALs across non-0 domains AND at scale (a >4GiB resident int4 set — e.g. a resident MoE — hits the
+ * per-domain window edge, the in-kernel rknpu_gem_object_create fault), so ork_mm_load_i4 cannot bring a big int4
+ * weight set resident. This mirrors the PROVEN multi-domain-safe consolidated-chunk import from ork_mm_load_i8_import:
+ * a handful of moderate (~ORK_IMPORT_CHUNK_MB) dma-buf chunks, tiles are page-aligned base+offset VIEWS; ork_mm_free
+ * bdestroys the chunks (own_bufs). Falls back to per-tile bimport on chunk-alloc failure. */
+/* #54 CONSOLIDATED int4 expert load — MIRRORS ork_mm_load_i8_import EXACTLY, extended to share chunks ACROSS
+ * experts. Same proven mechanism: bimport into ~ORK_IMPORT_CHUNK_MB (16MB) dma-buf chunks, tiles are page-aligned
+ * base+offset VIEWS, fds sealed once a chunk is full (GEM handle keeps it alive for NPU reads). The ONLY change
+ * vs the per-weight ork_mm_load_i4_import is that the chunk pool is PERSISTENT per-domain, so MANY experts share
+ * a chunk instead of one dma-buf per expert (~9k imports -> ~2340 mappings/domain -> wedge; 16MB chunks pack
+ * ~32 experts each -> a few hundred total, ~tens/domain — the count the int8 1.7B proves safe). Critically, like
+ * int8 it does NOT set scratch_import: run scratch stays bcreate and coexists with the 16MB import chunks (the
+ * PROVEN int8 model — bimport scratch of ANY kind wedges). Weight owns nothing (owns=0, own_bufs=NULL ->
+ * ork_mm_free skips it); the shared chunks persist for the ctx, freed once in ork_npu_free. int4-only; resident
+ * (no per-expert eviction — the whole MoE design goal). */
+ork_w *ork_mm_load_i4_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K%32||N%64) return NULL;
+    if(dmaheap_open()<0) return NULL;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+    if(n!=need) return NULL;
+    int dom=ork_dom(c->pack_domain); if(dom<0||dom>=64) return NULL;   /* arena tracks [64] domains */
+    ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+    w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=0; w->domain=dom;   /* shared-chunk views: owns nothing */
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
+    ork_dom_prime(c, dom);   /* native anchor establishes a non-0 domain BEFORE importing into it (mirror int8) */
+    size_t chunk_mb=16; const char*cm=getenv("ORK_IMPORT_CHUNK_MB"); if(cm){ long v=atol(cm); if(v>0) chunk_mb=(size_t)v; }
+    size_t chunk_cap=chunk_mb<<20;
+    struct buf *cur=&c->i4arena_cur[dom];
+    if(!cur->cpu || c->i4arena_off[dom]+need > cur->size){   /* switch chunk: keep this whole weight in ONE chunk */
+        size_t csz = need>chunk_cap ? need : chunk_cap;      /* a single expert weight never exceeds 16MB in practice */
+        struct buf nb=bimport(c->fd,csz,dom);
+        if(!nb.cpu){ free(w->Bb); free(w); return NULL; }
+        if(c->i4arena_n>=c->i4arena_cap){ int nc2=c->i4arena_cap?c->i4arena_cap*2:64;
+            struct buf*na=realloc(c->i4arena,(size_t)nc2*sizeof*na);
+            if(!na){ bdestroy(c->fd,&nb); free(w->Bb); free(w); return NULL; }
+            c->i4arena=na; c->i4arena_cap=nc2; }
+        /* fds stay OPEN until teardown (bdestroy closes them). 16MB chunks => ~320 fds for the 35B, under ulimit
+         * (the EMFILE that forced per-weight fd-sealing was ~9k PER-EXPERT imports; consolidation removes it).
+         * Sealing a chunk mid-load — while later chunks in the same domain are still being written — corrupted
+         * the next chunk's reads (weight-32 miscompute); int8 only closes fds after a weight's whole load. */
+        c->i4arena_curi[dom]=c->i4arena_n; c->i4arena[c->i4arena_n++]=nb; *cur=nb; c->i4arena_off[dom]=0;
+    }
+    dmabuf_sync(cur->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);   /* bracket the CPU fill (mirror int8) */
+    size_t off=c->i4arena_off[dom], boff=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t raw=(size_t)Kp*Nc/2, ts=pgup(raw);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+        b->handle=cur->handle; b->obj=cur->obj; b->dma=cur->dma+off; b->cpu=(char*)cur->cpu+off; b->size=ts; b->heap_fd=0; b->domain=dom;
+        memcpy(b->cpu,(const char*)blob+boff,raw); off+=ts; boff+=ts; }}
+    dmabuf_sync(cur->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
+    c->i4arena_off[dom]=off;
+    return w;
+}
+ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
+    if(K%32||N%64) return NULL;
+    if(dmaheap_open()<0) return NULL;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t need=0;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+    if(n!=need) return NULL;
+    ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1; w->domain=ork_dom(c->pack_domain);
+    c->scratch_import=1;   /* weights are now bimported into their domains -> the run scratch must import too (bcreate EINVALs alongside imports); see bscratch */
+    ork_dom_prime(c, w->domain);   /* #54: establish the non-0 domain with ONE native anchor (Quirk 1, NPU-Quirks.md) — MATCH ork_mm_load_i8_import exactly. (Was ork_dom_reanchor/bdestroy+recreate-per-import: destroying the buffer that established the domain is suspected of breaking its lazy-init state at scale; prime-once is the documented proven guard.) */
+    /* #54: pre-allocate THIS domain's run scratch NOW, while it is still LIGHT (only the anchor). mc_ensure's
+     * mtk_all + per-core mrc/mtk/maf are kernel-mapped and MUST be bcreate — allocated later (at the first run,
+     * after this domain fills with imports) a fresh bcreate EINVALs amid the imports (the mc_ensure mtk_all
+     * failure). dom_activate makes w->domain the active set (parking the prior domain's); mc_ensure + the mcc
+     * ensure below alloc once per domain (idempotent: skip if already sized). Generous mcc (>= the expert BCHAIN
+     * need_o ~688 KiB) so BCHAIN never re-grows (=re-bcreates) it in the now-heavy domain. */
+    if(w->domain>0){
+        dom_activate(c, w->domain);
+        mc_ensure(c, c->soc->cores);
+        size_t mcc_need = (size_t)2*1024*1024;   /* covers expert BCHAIN need_o with margin */
+        for(int i=0;i<c->soc->cores;i++)
+            if(c->mccsz[i] < mcc_need){ bdestroy(c->fd,&c->mcc[i]); c->mcc[i]=bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } }
+    }
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    int consolidate = !getenv("ORK_NO_CONSOLIDATE_IMPORT");
+    if(consolidate){
+        size_t chunk_mb = 16; const char*cm=getenv("ORK_IMPORT_CHUNK_MB"); if(cm){ long v=atol(cm); if(v>0) chunk_mb=(size_t)v; }
+        size_t chunk_cap = chunk_mb<<20;
+        int ntiles=Sk*Sn, cap_chunks=ntiles+1;
+        w->own_bufs=calloc(cap_chunks,sizeof(struct buf)); w->n_own_bufs=0;
+        struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
+        int ns,ks; size_t boff=0;
+        for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t ts=pgup((size_t)Kp*Nc/2);
+            if(!cur.cpu || coff+ts>csz){
+                if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
+                size_t rem = need - boff;                       /* cap the chunk to THIS weight's remaining need: a small per-expert weight (~0.5 MiB) must NOT grab a full chunk_cap (16 MiB) chunk — that burned ~16 MiB IOVA PER expert (~15k experts) and blew the domains. */
+                csz = rem < chunk_cap ? rem : chunk_cap; if(csz < ts) csz = ts;
+                cur = bimport(c->fd,csz,w->domain);
+                if(!cur.cpu){ consolidate=0; break; }
+                dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+                w->own_bufs[w->n_own_bufs++]=cur; coff=0;
+            }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
+            b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
+            memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc/2); coff+=ts; boff+=ts;}}
+        if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
+        else { for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]);
+            free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0;
+            memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1; }
+    }
+    if(!consolidate){
+        size_t off=0;
+        for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
+          for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc/2,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+            memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc/2); off+=b->size;
+            dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
+    }
+    /* SEAL the dma-buf fds now that the CPU fill + coherency sync are done. The GEM handle (from MEM_CREATE) and
+     * the mmap keep the buffer alive for NPU reads (via IOMMU b->dma); a resident int4 weight is READ-ONLY after
+     * load, so no later dmabuf_sync is needed (verified: dmabuf_sync is called only in the load/import path, never
+     * per-run). This drops the held-fd count from ~1 per weight (~16k for the 35B MoE -> blew the fd ulimit) to ~0:
+     * load_i4_import runs per-weight, so each weight's fds close before the next weight imports. heap_fd=0 tells
+     * bdestroy the fd is already closed (it still MEM_DESTROYs via the handle). Consolidated tiles are VIEWS
+     * (heap_fd=0 already, never bdestroy'd individually); only the chunks (own_bufs) and per-tile bufs hold fds. */
+    if(!getenv("ORK_NO_SEAL")){   /* TEST: does closing the dma-buf fd (int4-only; int8 keeps them open) alias the next import? */
+    for(int i=0;i<w->n_own_bufs;i++){ if(w->own_bufs[i].heap_fd>0){ close(w->own_bufs[i].heap_fd); w->own_bufs[i].heap_fd=0; } }
+    for(int i=0;i<Sk*Sn;i++){ if(w->Bb[i].heap_fd>0){ close(w->Bb[i].heap_fd); w->Bb[i].heap_fd=0; } }
+    }
+    return w;
+}
 /* grouped pack: K split into groups of G (each its own resident slice) for per-group scales. G%32,
  * K%G, G<=10752. Sk = K/G groups; run_i4_grouped scales each group's partial before accumulating. */
 ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
@@ -4365,6 +4625,7 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
 }
 static int run_i4_bchain_db(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* #52: BCHAIN batch on the nonblock doorbell */
 static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
+static int i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
 static int ork_dyn_grouped_end(ork_dyn_chain *h);  /* B: grouped-int4 float scale-accumulate drain */
 int ork_dyn_end(ork_dyn_chain *h);
@@ -4381,6 +4642,20 @@ static int run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C
     if(!h) return -4;   /* shape/buffer limit -> caller refuses (ORK_RC_WEDGE_PRONE) */
     int d = ork_dyn_end(h);
     return (d == M-1) ? 0 : -1;
+}
+/* #54 COALESCE: run MANY int4 experts (each M>=1 rows) through ONE nonblock doorbell. Decompose every expert's
+ * M rows into M=1 tasks and hand the WHOLE set to ork_dyn_begin_mc_i4 — the doorbell distributes+chains them
+ * across the cores in one submit-set per core (the HW chaining is the doorbell's job; we don't hand-wire it).
+ * Collapses the per-expert submit storm (2059 matmuls x 3 cores) to ~nc submits per _exps tensor. All experts
+ * MUST share one iommu domain (the doorbell = one submit = one domain); the caller streams a layer's experts
+ * into a single domain. Returns 0 ok, -4 refuse (chain/buffer too big -> caller falls back), -1 error. */
+static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
+int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
+    if(!c || ntask<1 || !ex) return -1;
+    for(int e=0;e<ntask;e++){ ork_w*w=ex[e].w;
+        if(!w||w->dtype!=DT_I4||w->Sk!=1||w->Sn!=1||(w->N%64)||ex[e].M<1) return -2;
+        if(w->domain!=ex[0].w->domain || w->K!=ex[0].w->K || w->N!=ex[0].w->N) return -2; }  /* one submit => one domain + one shape */
+    return run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
 }
 /* Async pipelined submit (precision-agnostic) — orkd+ring mode only. Enqueue one matmul for w WITHOUT blocking
  * and get a ticket; ork_mm_collect(ticket) reads C later. Returns <0 if unavailable (no ring, or the op is too
@@ -4401,6 +4676,11 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I4,A,C); if(r!=-2) return r; }
         return orkd_run_i4(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(!w||w->dtype!=DT_I4) return -1;
+    /* Multi-domain: the submit's regcmd/task/scratch AND the weight must live in the SAME iommu domain. Activate
+     * this weight's domain before the int4 submit — mirror the int8 run paths. Without it a resident int4 weight
+     * in domain N submits against the stale dom_active (e.g. 0) -> RKNPU_SUBMIT EINVAL(22) -> self-heal reset ->
+     * retry (correctness held via the reset, but every cross-domain expert submit thrashed -> very slow). */
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
@@ -4410,6 +4690,13 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * per-row path refuses (#52). Falls through (-4) to the per-row doorbell for decode (M=1)/non-qualifying. */
     /* #33 TEST/A-B hook: force a tile-bearing int4 shape onto the slice rescue (bit-exact validation). */
     if(w->sliced && getenv("ORK_FORCE_SLICE_RESCUE")){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
+    if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] run_i4 K=%d N=%d M=%d Sk=%d Sn=%d dom=%d imported=%d -> %s\n",
+        w->K,w->N,M,w->Sk,w->Sn,w->domain,(w->own_bufs&&w->n_own_bufs>0)||w->own_buf_valid,
+        (M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0)?"BCHAIN":(w->sliced&&M>=2)?"SLICE":"mc_i4(per-row)");
+    /* #54: DEFAULT int4 M>1 prefill = BCHAIN (M-batched, the perf path) — now PORTED to ride the SHARED ork_dyn_end
+     * drain (poll + mc_recover_resubmit + reap-at-boundary), so it is multi-domain-safe like int8 colsplit AND
+     * keeps its M-batching. bch_db_worker builds+submits only; ork_dyn_end owns the drain (i4batch hooks). Falls
+     * through (-4) to the per-row doorbell (run_i4_mc_db) for decode (M=1) / non-qualifying shapes. */
     if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=run_i4_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     /* Wide refuse-prone int4 PREFILL (Sn>1 or K>8192 — the shapes pack built w->sliced for): the per-row
      * run_i4_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled
@@ -4482,7 +4769,7 @@ static int submit1_db(ork_npu *c, size_t nout){
 static int mc_ensure(ork_npu *c,int nc){
     int fd=c->fd;
     if(!c->mtk_all.cpu) {
-        c->mtk_all=bcreate(fd, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
+        c->mtk_all=bscratch(c, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
         if(!c->mtk_all.cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate mtk_all task buffer (IOMMU full?)\n");
             return -1;
@@ -4490,7 +4777,7 @@ static int mc_ensure(ork_npu *c,int nc){
     }
     for(int i=0;i<nc;i++){
         if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
-        c->mrc[i]=bcreate(fd,65536,0x403,c->dom_active); c->mtk[i]=bcreate(fd,65536,0x40b,c->dom_active); c->maf[i]=bcreate(fd,(size_t)4*32768*2,0x403,c->dom_active);
+        c->mrc[i]=bscratch(c,65536,0x403,c->dom_active); c->mtk[i]=bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
         if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
             return -1;
@@ -10499,6 +10786,16 @@ struct ork_dyn_chain {
     struct rknpu_submit mc_subs[ORK_MAXCORE];
     int        mc_Pc[ORK_MAXCORE];
     unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    /* #54 BCHAIN-ON-THE-SHARED-DRAIN (i4batch): the M-batched int4 BCHAIN (run_i4_bchain_db) now builds its
+     * per-core programs then rides ork_dyn_end for poll + recover (the PROVEN shared drain int8 colsplit uses),
+     * instead of a hand-rolled per-worker poll/recover. Its output is 2D-tiled (not per-row/dense), so the poll
+     * (ork_dyn_done_i), the recover re-seed (mc_recover_resubmit), and the de-tile (ork_dyn_end writeback) all
+     * delegate to bch_db_cells with this stored geometry — preserving the mode-1 gate, mode-4 collision-tolerance
+     * (SENT16=0x7fff reachable), and mode-2 int16->int32 de-tile. */
+    int        i4batch;                 /* 1 = BCHAIN programs drained by ork_dyn_end via bch_db_cells */
+    int        b_H, b_Wb, b_Wmax, b_NG, b_M, b_N;   /* BCHAIN geometry (shared across cores) */
+    int        b_c0[ORK_MAXCORE], b_c1[ORK_MAXCORE], b_NT[ORK_MAXCORE];   /* per-core N-chunk range + program count */
+    int32_t   *b_C;                    /* caller's int32 C (de-tile destination) */
     int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
                              * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
     int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
@@ -10551,7 +10848,14 @@ static int mtile_cap(int Kred){ double scale=(double)Kred/512.0; int base=(int)(
  * last). Poll all M rows' last cols (M<=64, cheap). Sentinel 0x7fffffff = INT_MAX / fp32 NaN — no valid
  * matmul output equals it, so this is precision-agnostic (int8->int32, fp16->fp32). */
 #define ORK_DYN_SENT16 ((int16_t)0x7fff)   /* int4 (int16 output) sentinel — no valid W4A4 accumulator equals it */
+static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);   /* #54 fwd: BCHAIN tile seed/gate/verify/de-tile (defined below) */
 static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
+    if (h->i4batch) {   /* #54 BCHAIN tile output: mode-1 last-program civac gate (cheap, per-poll), then on pass bsync + mode-3 full verify (once). Matches bch_db_worker's completion check; ork_dyn_end owns the recover. */
+        ork_npu *c = h->c;
+        if (!bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1)) return 0;
+        bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        return bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
+    }
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
     if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row */
         volatile int16_t *o = (volatile int16_t*)h->outptr[i];
@@ -10771,7 +11075,14 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
                 for (int ks = 0; ks < Sk; ks++) {
                     int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS;
                     uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)ks * N * 2 + (size_t)n0 * 2);   /* block ks, columns [n0,n0+Nc) */
-                    uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + ks].dma;                          /* weight N-slice ns, K-slice ks */
+                    struct buf *WT = &w->Bb[(size_t)ns * Sk + ks];
+                    uint32_t bdma = (uint32_t)WT->dma;                                                   /* weight N-slice ns, K-slice ks */
+                    if (getenv("ORK_I4_DIAG")) { unsigned char *bc=(unsigned char*)WT->cpu;
+                        fprintf(stderr,"[i4diag] mc_i4 wdom=%d dom_active=%d imported=%d ns=%d ks=%d Kp=%d Nc=%d | bdma=0x%llx obj=0x%llx size=%zu cpu=%p bytes[0..7]=",
+                            w->domain, c->dom_active, (w->own_bufs&&w->n_own_bufs>0)||w->own_buf_valid, ns, ks, Kp, Nc,
+                            (unsigned long long)WT->dma, (unsigned long long)WT->obj, WT->size, WT->cpu);
+                        if(bc) for(int z=0;z<8;z++) fprintf(stderr,"%02x ",bc[z]); else fprintf(stderr,"(null)");
+                        fprintf(stderr,"| aslice=0x%x cdma=0x%x\n", aslice[ks], cdma); fflush(stderr); }
                     memset(rc, 0, sizeof rc);
                     synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
                     if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
@@ -10801,7 +11112,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }
+        subs[i].timeout = i4_submit_tmo_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
      * esz==2 branch of mc_recover_resubmit re-seeds the full int16 surface). */
@@ -10878,7 +11189,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }
+        subs[i].timeout = i4_submit_tmo_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     ork_install_term();
     return h;
@@ -10906,6 +11217,7 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
             if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
         if (landed || g_ork_term) break;
         if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
+            h->c->dom_dirty = 1;   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty) */
             mc_recover_resubmit(h); continue; }
         break;
     }
@@ -12115,10 +12427,17 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
  * only "never landed"). RESET clears the lost dispatch/job state, then re-clean (cold coherency) + re-seed +
  * resubmit from the stashed per-core submits (c->maf/mrc/mtk[i] still hold this round's program — the chain owns
  * them until end()). int8 (esz=4, int32 SENT) AND int4 (esz=2, full-surface int16 SENT16); validated by mc_miss_repro. */
+static int i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 static void mc_recover_resubmit(ork_dyn_chain *h){
     ork_npu *c = h->c; int fd = c->fd;
+    if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[mc-recover] doorbell MISS -> ACT_RESET + resubmit | dom=%d S=%d nc=%d esz=%d\n", h->mc_dom, h->S, h->mc_nc, h->esz);
     struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
     { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }   /* let the reset fully settle before resubmit — a resubmit into a not-yet-quiesced NPU re-drops (sticky miss) */
+    /* #54 MULTI-DOMAIN: the ACT_RESET above DROPS the NPU's IOMMU domain state. Resubmitting into a non-0
+     * mc_dom then triggers a domain switch that TIMES OUT ("switch iommu domain time out, id: N") and poisons
+     * all subsequent switches (dmesg-confirmed cascade). Re-establish mc_dom's page table with a fresh native
+     * anchor BEFORE the resubmit so the switch lands cleanly. No-op for domain 0 (always established). */
+    if(h->mc_dom > 0) ork_dom_reanchor(c, h->mc_dom);
     struct buf *cl[1024]; int ncl = 0;                                    /* re-clean output surfaces to DRAM */
     for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
         for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
@@ -12133,7 +12452,7 @@ static void mc_recover_resubmit(ork_dyn_chain *h){
     for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
         bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        h->mc_subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }
+        h->mc_subs[i].timeout = (h->esz==2) ? i4_submit_tmo_ms() : mm_timeout_ms(); rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
 }
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
@@ -12162,7 +12481,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         /* miss-detection timeout: a real mc int8 stream/decode op lands well under 300ms, so a sentinel still
          * stuck at that mark is the dropped-round miss (detect fast, resubmit cheap). Non-recoverable chains
          * (single-core, fp16, exhausted retries) keep the full 3s completion wait. */
-        double miss_to = (recov < recov_max) ? 300000.0 : 3e6;
+        double miss_to = (recov < recov_max) ? (h->i4batch ? 2000000.0 : 300000.0) : 3e6;   /* #54 i4batch (M-batched BCHAIN): a legit job — esp. the first submit after an iommu-domain switch — can exceed 300ms; use the old bch 2s window so we don't false-recover a completing job. Per-row/int8 keep the fast 300ms detect. */
         for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
             if (n >= h->S) break;                               /* all tasks, all rows */
             if (g_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
@@ -12182,6 +12501,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         if (last >= h->S - 1 || g_ork_term) break;            /* all done, or interrupted */
         if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */
             if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER] mc int8 round output never landed (attempt %d) — reset + resubmit\n", recov);
+            if (h->mc_dt == DT_I4) h->c->dom_dirty = 1;   /* #54: an int4 doorbell DROP happened -> a stuck job may linger in this domain even after recover (the reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it (ork_dom_flush_if_dirty) BEFORE switching away -> the switch to the next domain won't time out. */
             mc_recover_resubmit(h);
             continue;
         }
@@ -12212,6 +12532,10 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
         if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
+        for (int i = 0; i < h->S; i++)
+            bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
+    }
     /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C.
      * int4 (esz==2): the NPU wrote an int16 accumulator; widen int16->int32 into the caller's int32 C. */
     int NMAXe = h->c->soc->nmax;
@@ -13728,22 +14052,45 @@ cleanup:
 /* mode 0=seed SENT16 (values only; caller bsyncs TO_DEVICE), 1=civac gate (invalidate per 64B line then check),
  * 3=plain full-verify (after bsync FROM_DEVICE, no per-cell DC), 2=de-tile int16->int32 into C. Cache ops are
  * PER-CACHE-LINE (32 int16/line), never per-element — per-element dc over the M*N surface was a ~60ms host wall. */
-static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk){
-    int tk=0;
+static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk,int tk_base){
+    int tk=0;   /* #54 tk_base: this weight's program slot 0 within the shared per-core chain (0 for single-weight; the expert's cumulative program offset for coalesced multi-expert) */
     for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
             if(only_tk>=0 && tk!=only_tk){ tk++; continue; }   /* poll fast-gate: only the given program (last program lands last — chain runs in order) */
-            int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)tk*(size_t)(4*H*Wmax)*64;
+            int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
+            int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
             for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;   /* a 64-int16 block = 2 x 64B cache lines */
                 if(mode==0){ for(int cc=0;cc<64;cc++) og[base+cc]=ORK_DYN_SENT16; }
                 else if(mode==1){ __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory");
                     for(int cc=0;cc<64;cc++) if(((volatile int16_t*)og)[base+cc]==ORK_DYN_SENT16) return 0; }
                 else if(mode==3){ for(int cc=0;cc<64;cc++) if(og[base+cc]==ORK_DYN_SENT16) return 0; }
+                else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
                 else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc++) crow[cc]=og[base+cc]; } }
+            if(mode==4 && !ran) return 0;   /* this program is ENTIRELY sentinel => it truly never ran => real drop */
             tk++; } }
     return 1;
 }
+static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk){
+    return bch_db_cells_off(c,i,c0,c1,Wb,N,NG,M,H,Wmax,C,mode,only_tk,0);   /* single-weight: base slot 0 */
+}
 static int g_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
+/* #54 TCLEAN precondition (mirror fp16 recov_tmo, npu.c ~11238, task #50): the int4 doorbell NONBLOCK submit
+ * timeout MUST be < the poll-detect window (ORK_I4_POLL_MS). rknpu_job_timeout_clean — which runs at the top of
+ * every nonblock submit and is the ONLY thing that cleanly reaps a DROPPED job (ACT_RESET can't; source-confirmed
+ * rknpu_soft_reset is HW-only) — reaps a job only once it is aged >= its own submit timeout. So a dropped job
+ * submitted with an 8s timeout is NOT reapable at the 2s resubmit -> it lingers as a stuck job -> the next
+ * iommu-domain switch times out -> cascade/wedge. Bounding the timeout below the poll window makes every resubmit
+ * (in-worker or post-join) reap the prior drop. A REAL job lands via its completion IRQ well inside the poll
+ * window and is gone before any reap check, so bounding never false-reaps a completing job. Default 3/4 of the
+ * poll window; ORK_I4_SUBMIT_TMO_MS overrides. */
+static int i4_submit_tmo_ms(void){
+    static int t=-1;
+    if(t<0){ const char*e=getenv("ORK_I4_SUBMIT_TMO_MS");
+        if(e) t=atoi(e);
+        else { const char*p=getenv("ORK_I4_POLL_MS"); double pm=p?atof(p):2000.0; t=(int)(pm*0.75); }
+        if(t<10) t=10; }
+    return t;
+}
 struct bchdbw { ork_npu *c; int core, c0, c1, NT, K, N, NG, M, H, Wb, Wmax; ork_w *w; const int8_t *A; int32_t *C; unsigned dom; struct rknpu_submit sub; int rc; };
 /* One NPU core's share of the BCHAIN batch-chain: build its (N-chunk x M-group) programs into its pre-allocated
  * per-core buffers, seed, NONBLOCK submit, poll ITS core (last-program civac gate -> bsync -> full verify), then
@@ -13766,6 +14113,16 @@ static void *bch_db_worker(void *vp){
             uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
             memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+            /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
+             * weight-stationary (N-tile outer, M-group g inner sharing wdma), so g==0 loads the N-tile weight and
+             * g>0 can REUSE the CBUF-resident weight + skip the re-DMA by setting CNA_CBUF_CON0[13]=WEIGHT_REUSE
+             * (0x2000). int4 differs from int8 (2x weight density, different CBUF banks, 0x1040 is the "poison"
+             * K-schedule reg) so this is test-and-see: it may stay bit-exact, may hit the int8 "data-refetch"
+             * correctness gap, or may trip the 0x1040 sensitivity. ORK_I4_WREUSE=1 weight-reuse, 2 +DATA_REUSE[12]. */
+            if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* DEFAULT ON: measured stable ~6% (gate/up ~9%) bit-exact on the MoE expert-triple (test_moe_smoke, M=32). ORK_I4_WREUSE=0 opts out. */
+                if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
+                    for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
+                    setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
             if(g_i4_validate && validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
             if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
                 rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
@@ -13778,27 +14135,51 @@ static void *bch_db_worker(void *vp){
         t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
     bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     memset(&a->sub,0,sizeof a->sub);
-    a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
+    a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
     a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
     a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
-    bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* seed SENT16 */
-    __asm__ volatile("dsb ish":::"memory");
-    a->sub.timeout=mm_timeout_ms(); rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* nonblock */
-    double t0=ork_now_us();
-    for(;;){
-        if(bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,1,NT-1)){                   /* last-program civac gate */
-            bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
-            if(bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,3,-1)){                 /* full verify */
-                bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,a->C,2,-1); a->rc=0; return NULL; } }   /* de-tile NOW (overlaps siblings) */
-        if(g_ork_term){ a->rc=0; return NULL; }
-        double el=ork_now_us()-t0;
-        if(el>300000.0){ a->rc=-2; return NULL; }                                        /* dropped round -> caller recovers serially */
-        if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }              /* HEAVY-JOB BACKOFF */
+    /* #54 int4 completion mode — 3 ways to wait for the chain + drain the DPU writeback:
+     *   0 BLOCKVERIFY (default): seed SENT16, then BLOCKING submit (cheap IRQ kernel-wait, parallel across cores
+     *     exactly like int8 colsplit's ork_csub_worker) + prepolled=0 so ork_dyn_end runs the SENT16 drain-verify
+     *     ONCE, post-completion (the job is already done -> the gate lands immediately/after a short residual
+     *     writeback lag) — NOT the from-t=0 repeated scan. int8 gets away with bare blocking because its writeback
+     *     is coherent by job-done; int4's DPU writeback LAGS completion (why bare blocking miscomputes), so it
+     *     still needs the one verify. Best of both: int8's blocking efficiency + int4's needed drain-verify.
+     *     Measured: the nonblock host-poll (mode 1) cost 22-36% over blocking on the MoE expert shapes.
+     *   1 NONBLOCK (ORK_I4_NB): seed + nonblock doorbell + ork_dyn_end polls from t=0 (pipelined; the expensive
+     *     int4 SENT16 scan spins the whole HW-exec window -> the 22-36%). Kept for A/B.
+     *   2 BLOCKING (ORK_I4_BLOCKING): bare blocking, prepolled=1, NO drain-verify -> MISCOMPUTES. A/B only. */
+    /* MEASURED (test_moe_prog, 2026-08): BLOCKVERIFY(0) 768us > NONBLOCK(1) 712us > BLOCKING(2, miscomputes) 555us.
+     * BLOCKVERIFY lost: the drain-verify (mandatory for int4 correctness — DPU writeback lags job-done) costs MORE
+     * than the blocking submit saves, and NONBLOCK already overlaps its poll-spin with the HW-exec window. So the
+     * "555 blocking" is unattainable-while-correct; NONBLOCK is the best CORRECT option. Default = NONBLOCK(1). */
+    static int i4mode=-1; if(i4mode<0) i4mode = getenv("ORK_I4_BLOCKVERIFY")?0 : (getenv("ORK_I4_BLOCKING")?2 : 1);
+    if(i4mode!=2){   /* BLOCKVERIFY(0) + NONBLOCK(1): seed the SENT16 landing sentinel so ork_dyn_end can drain-verify */
+        bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+        if(i4mode==1){   /* NONBLOCK doorbell: submit + return; ork_dyn_end (prepolled=0) polls from t=0 */
+            a->sub.flags=ork_ppflags()|0x2u; a->sub.timeout=i4_submit_tmo_ms();
+            rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1; a->rc=0; return NULL; }
+        /* BLOCKVERIFY: fall through to the blocking submit; ork_dyn_end (prepolled=0) does the SHORT post-completion drain-verify */
     }
+    a->sub.flags=ork_ppflags();   /* BLOCKING (no |0x2): parallel IRQ kernel-wait across cores (like int8 colsplit); a dropped job aborts -> rknpu_iommu_domain_put (no leak). */
+    c->mwarm[i]=1;
+    for(int attempt=0; attempt<4; attempt++){
+        a->sub.timeout=mm_timeout_ms();
+        int rc=rknpu_submit_ioctl(fd,&a->sub,dom);   /* BLOCKING (0x2 cleared): kernel-waits for job_done or aborts at timeout */
+        if(rc==0){ a->rc=0; return NULL; }
+        if(g_ork_term){ a->rc=0; return NULL; }
+        if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[bch] BLOCKING drop core=%d dom=%u attempt=%d rc=%d -> resubmit (kernel aborted+domain_put, no leak)\n",i,dom,attempt,rc);
+    }
+    a->rc=-2; return NULL;
 }
 static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
     int fd=c->fd, K=w->K, N=w->N;
+    /* accurate wedge telemetry: the BCHAIN worker skips validate_regcmd by default, so g_last_op would
+     * otherwise stay stale (mislabelling BCHAIN submits as the last mc_i4 op in ORK_PRESUBMIT_TRACE). */
+    g_last_op="run_i4_bchain_db"; g_last_K=K; g_last_N=N; g_last_wdom=w->domain;
+    g_last_import=(w->own_buf_valid && w->own_buf.heap_fd>0) || (w->own_bufs && w->n_own_bufs>0 && w->own_bufs[0].heap_fd>0)
+                  || (w->Bb && w->Bb[0].heap_fd>0);
     int H=16384/K; if(H>16)H=16; if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
@@ -13807,8 +14188,13 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
         fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
     unsigned dom=w->domain;
     if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) dom_activate(c,w->domain);
+    if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] bchain w=%p submit_dom=%u dom_active=%d | Bb0.dma=0x%llx Bb0.domain=%d Bb0.obj=0x%llx Bb0.heap_fd=%d | K=%d N=%d M=%d Wb=%d NC=%d\n",
+        (void*)w, dom, c->dom_active, (unsigned long long)w->Bb[0].dma, w->Bb[0].domain, (unsigned long long)w->Bb[0].obj, w->Bb[0].heap_fd, K, N, M, Wb, NC);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
     if(mc_ensure(c,nc)) return -1;
+    if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] scratch dom=%d | W[0x%llx,+0x%llx) mtk_all=0x%llx mrc0=0x%llx maf0=0x%llx mcc0=0x%llx | overlap-check vs W\n",
+        c->dom_active, (unsigned long long)w->Bb[0].dma, (unsigned long long)((size_t)K*N/2),
+        (unsigned long long)c->mtk_all.dma, (unsigned long long)c->mrc[0].dma, (unsigned long long)c->maf[0].dma, (unsigned long long)c->mcc[0].dma);
     if(g_i4_validate<0) g_i4_validate=getenv("ORK_I4_VALIDATE")?1:0;   /* init once on the calling thread (before dispatch) */
     /* pre-size every core's buffers SINGLE-THREADED (no concurrent bcreate in the workers) */
     struct bchdbw args[ORK_MAXCORE];
@@ -13818,51 +14204,166 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
         if(NT<1) continue;
         size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
         size_t need_o=(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
-        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
-        if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,need_af,0x403,c->dom_active); }
-        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,need_tk,0x40b,c->dom_active); }
-        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+        /* #54 SRAM SECONDARY-PIPE probe (ORK_MOE_SRAM_SCRATCH): route the SMALL per-program scratch — regcmd,
+         * activation (maf), tasks, output (mcc) — into on-chip SRAM (separate port from DRAM; weight Bb stays
+         * DRAM). Tests whether feeding the tiny-op reads/writes off a second port speeds the per-program floor.
+         * bcreate fails SRAM over to DRAM if full. */
+        static int msram=-1; if(msram<0) msram=getenv("ORK_MOE_SRAM_SCRATCH")?1:0;   /* SRAM alloc rejects the 0x400 IOMMU-align flag -> drop it + add TRY_ALLOC_SRAM (matches the working ork_dma_alloc_sram path) */
+        unsigned f3 = msram ? (0x003u|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;             /* data scratch (mrc/maf/mcc): cacheable+non-contig, SRAM when on */
+        unsigned fb = msram ? (0x00bu|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x40bu;             /* task buf (mtk): +KERNEL_MAPPING for the kernel read */
+        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bscratch(c,need_rc,(int)f3,c->dom_active); c->mwarm[i]=0; }
+        if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bscratch(c,need_af,(int)f3,c->dom_active); }
+        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bscratch(c,need_tk,(int)fb,c->dom_active); }
+        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,need_o,(int)f3,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
         if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
     }
     c->mc_error=0; g_in_doorbell=1;
-    /* PARALLEL: each pool worker builds+seeds+nonblock-submits+polls+de-tiles its own core */
+    /* PARALLEL: each pool worker builds + seeds + BLOCKING-submits (kernel drains) its own core; a drop aborts
+     * (rknpu_job_abort -> domain_put, no refcount leak) and the worker resubmits. Mirrors int8 ork_csub_worker. */
     npu_pool_ensure(c);
     pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=bch_db_worker; c->pjob_stride=sizeof(struct bchdbw);
     c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
     bch_db_worker(&args[0]);                                                              /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     g_in_doorbell=0;
-    /* collect; serialized recovery for any dropped core (global RESET is safe now — all workers joined) */
-    int missed=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) missed=1; }
-    /* TEST HOOK (ORK_BCH_INJECT_MISS=<core>, read ONCE): force one LANDED core to look dropped so the recovery
-     * path is exercised on demand (make test can't reliably trigger a real doorbell miss) — a byte-exact recovery test. */
-    static int inj=-2; if(inj==-2){ const char*mi=getenv("ORK_BCH_INJECT_MISS"); inj = mi?atoi(mi):-1; }
-    if(inj>=0 && inj<nc && args[inj].rc==0){ args[inj].rc=-2; missed=1;
-        if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[BCH-INJECT] forcing core %d dropped -> exercise shared recover\n",inj); }
-    if(missed){   /* LAZY (perf: clean path pays nothing — no per-call memset of the chain struct): only on a miss,
-                   * build the doorbell descriptor from the per-core BCHAIN state so recovery + dump ride the SHARED
-                   * machinery (mc_recover_resubmit / ork_dyn_dump), same as int8 ork_dyn_end. BCHAIN's output is
-                   * ORK_DYN_SENT16-sentinel'd (bch_db_cells), so the esz==2 re-seed is exact; the int4 regcmd
-                   * (synth_i4) + the bch_db_cells int16->int32 de-tile are UNCHANGED (still done below). */
-        ork_dyn_chain hd; memset(&hd,0,sizeof hd);
-        hd.c=c; hd.S=nc; hd.P=nc; hd.N=N; hd.mc=1; hd.esz=2; hd.dom=dom; hd.mc_nc=nc; hd.mc_dt=DT_I4; hd.mc_dom=dom;
-        for(int i=0;i<nc && i<ORK_MAXCORE;i++){ hd.outbuf[i]=&c->mcc[i]; hd.outptr[i]=(int32_t*)c->mcc[i].cpu;
-            hd.nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); hd.oM[i]=1; hd.mc_subs[i]=args[i].sub; }
-        for(int recov=0; missed && recov<6; recov++){
-            /* recover ONLY the still-missed cores (mc_recover_resubmit resubmits every mc_Pc[i]!=0 core; gating to
-             * the missed set avoids an in-flight resubmit of a landed core racing the next op). */
-            for(int i=0;i<nc;i++) hd.mc_Pc[i] = (args[i].rc==-2) ? args[i].NT : 0;
-            mc_recover_resubmit(&hd);   /* SHARED: RESET + re-seed SENT16 + re-bsync(maf/mrc/mtk) + resubmit the missed cores */
-            for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue; int NT=args[i].NT;
-                double t0=ork_now_us();
-                for(;;){ if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,1,NT-1)){ bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
-                           if(bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,NULL,3,-1)){ bch_db_cells(c,i,args[i].c0,args[i].c1,Wb,N,NG,M,H,Wmax,C,2,-1); args[i].rc=0; break; } }
-                         double el=ork_now_us()-t0; if(el>3e6) break; if(el>1000.0){struct timespec ts={0,50000};nanosleep(&ts,NULL);} } }
-            missed=0; for(int i=0;i<nc;i++) if(args[i].rc==-2) missed=1;
-        }
-        if(missed) ork_dyn_dump(&hd,"run_i4_bchain_db incomplete (recover exhausted)");
+    int missed=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) missed=1; }   /* -1 build err, -2 blocking exhausted */
+    /* #54 The BLOCKING workers already drained every core (prepolled) — ork_dyn_end just de-tiles the int16 tiles
+     * into C (i4batch hook -> bch_db_cells mode-2) and frees h. No leak (blocking abort domain_put's drops), so no
+     * refcount-based recover / reap-at-boundary is needed. On an exhausted drop (rc==-2) fall back (return -1). */
+    ork_dyn_chain *h=calloc(1,sizeof *h); if(!h) return -1;
+    h->c=c; h->S=nc; h->P=nc; h->N=N; h->mc=1; h->esz=2; h->dom=dom; h->mc_nc=nc; h->mc_dt=DT_I4; h->mc_dom=dom;
+    h->prepolled = getenv("ORK_I4_BLOCKING")?1:0;   /* #54 BLOCKVERIFY(default)+NONBLOCK: prepolled=0 => ork_dyn_end drain-verifies (BLOCKVERIFY's verify is short, post-completion). Pure ORK_I4_BLOCKING: prepolled=1, no verify (miscomputes; A/B only). */
+    h->i4batch=1; h->b_H=H; h->b_Wb=Wb; h->b_Wmax=Wmax; h->b_NG=NG; h->b_M=M; h->b_N=N; h->b_C=C;
+    for(int i=0;i<nc && i<ORK_MAXCORE;i++){
+        h->outbuf[i]=&c->mcc[i]; h->outptr[i]=(int32_t*)c->mcc[i].cpu;
+        h->nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); h->oM[i]=1;
+        h->b_c0[i]=args[i].c0; h->b_c1[i]=args[i].c1; h->b_NT[i]=args[i].NT;
+        h->mc_subs[i]=args[i].sub; h->mc_Pc[i]=args[i].NT;
     }
-    return missed ? -1 : 0;
+    if(missed){ free(h); return -1; }   /* a core's blocking submit never completed — don't de-tile garbage; caller falls back */
+    int last=ork_dyn_end(h);   /* prepolled: skips poll, de-tiles (i4batch) into C, frees h */
+    return (last==nc-1) ? 0 : -1;
+}
+/* #54 COALESCED multi-expert BCHAIN. Each core handles a contiguous range of experts (whole N per expert) and
+ * chains ALL its experts' M-batched BCHAIN programs into ONE nonblock doorbell submit — same fast programs as
+ * run_i4_bchain_db, but coalesced across experts (per-tensor, not per-expert; ~nc submits instead of nc x
+ * n_experts). Per-expert A staging into maf, cumulative program index into the shared chain, per-expert de-tile
+ * via bch_db_cells_off. M>=2 only (decode/M=1 is CPU). Drop -> serial per-expert BCHAIN fallback (correctness). */
+struct bchmw { ork_npu *c; int core, e0, e1; const ork_mm_task_i4 *ex; int K,N,H,Wb,Wmax,NC; unsigned dom; struct rknpu_submit sub; int rc; };
+static void *bch_mw_worker(void *vp){
+    struct bchmw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core;
+    int K=a->K,N=a->N,H=a->H,Wb=a->Wb,Wmax=a->Wmax,NC=a->NC; unsigned dom=a->dom;
+    a->rc=0; if(a->e0>=a->e1) return NULL; pin_big_core(i);
+    int NTtot=0; size_t AFtot=0;
+    for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H; NTtot+=NC*NG; AFtot+=(size_t)NG*(size_t)(2*H)*(K/2); }
+    memset(c->maf[i].cpu,0,AFtot);
+    /* stage every expert's A (per M-group, stride-2), contiguously in maf */
+    size_t aoff=0;
+    for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; int M=t->M, NG=(M+H-1)/H;
+        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
+            for(int j=0;j<Hg;j++) tile_i4_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
+        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
+    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    /* build the chained regcmd across all experts (tk = cumulative program index) */
+    aoff=0; int tk=0;
+    for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; ork_w *w=t->w; int M=t->M, NG=(M+H-1)/H;
+        for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
+            uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
+            for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
+                uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
+                uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
+                memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+                if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
+                    if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
+                        for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
+                        setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
+                if(tk<NTtot-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
+                    rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
+                    rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
+                else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
+                memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
+        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
+    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tt=c->mtk[i].cpu; memset(tt,0,(size_t)NTtot*sizeof*tt);
+    for(int q=0;q<NTtot;q++){ tt[q].enable_mask=0xd; tt[q].int_mask=0x300; tt[q].int_clear=0x1ffff;
+        tt[q].regcfg_amount=116; tt[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
+    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    memset(&a->sub,0,sizeof a->sub);
+    a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NTtot; a->sub.task_obj_addr=c->mtk[i].obj;
+    a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
+    a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NTtot};
+    { int tb=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;   /* seed SENT16 for every expert's cells */
+        bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,0,-1,tb); tb+=NC*NG; } }
+    bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+    a->sub.timeout=i4_submit_tmo_ms(); rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
+    int NGl=(a->ex[a->e1-1].M+H-1)/H, NTl=NC*NGl, tbl=NTtot-NTl;   /* last program of the whole chain lands last */
+    double t0=ork_now_us();
+    for(;;){
+        if(bch_db_cells_off(c,i,0,NC,Wb,N,NGl,a->ex[a->e1-1].M,H,Wmax,NULL,1,NTl-1,tbl)){   /* last-program civac gate */
+            bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+            int ok=1, vb=0;
+            for(int e=a->e0;e<a->e1 && ok;e++){ int NG=(a->ex[e].M+H-1)/H;
+                if(!bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,3,-1,vb)) ok=0; vb+=NC*NG; }
+            if(ok){ int db=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;
+                    bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,a->ex[e].C,2,-1,db); db+=NC*NG; }
+                a->rc=0; return NULL; } }
+        if(g_ork_term){ a->rc=0; return NULL; }
+        double el=ork_now_us()-t0; if(el>300000.0){ a->rc=-2; return NULL; }
+        if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }
+    }
+}
+static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
+    int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
+    int H=16384/K; if(H>16)H=16; if(H<2) return -4;
+    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
+    int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
+    if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    unsigned dom=ex[0].w->domain;
+    if(dom!=(unsigned)c->dom_active || (dom && !c->dom_save)) dom_activate(c,(int)dom);
+    g_last_op="run_i4_experts_bchain_db"; g_last_K=K; g_last_N=N; g_last_wdom=(int)dom;
+    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
+    if(mc_ensure(c,nc)) return -1;
+    struct bchmw args[ORK_MAXCORE];
+    int totalNT=0; for(int e=0;e<ntask;e++){ int NG=(ex[e].M+H-1)/H; totalNT+=NC*NG; }
+    int e_start=0, priorNT=0;
+    for(int i=0;i<nc;i++){
+        int targetNT=(int)((long)(i+1)*totalNT/nc), e_end=e_start, accNT=0;
+        while(e_end<ntask){ int NG=(ex[e_end].M+H-1)/H; if(priorNT+accNT+NC*NG>targetNT && e_end>e_start) break; accNT+=NC*NG; e_end++; }
+        if(i==nc-1) e_end=ntask;
+        args[i]=(struct bchmw){c,i,e_start,e_end,ex,K,N,H,Wb,Wmax,NC,dom,{0},0};
+        priorNT+=accNT; e_start=e_end;
+        int cNT=0; size_t cAF=0; for(int e=args[i].e0;e<args[i].e1;e++){ int NG=(ex[e].M+H-1)/H; cNT+=NC*NG; cAF+=(size_t)NG*(size_t)(2*H)*(K/2); }
+        if(cNT<1) continue;
+        size_t need_rc=(size_t)cNT*REGCMD_I4_N*4, need_o=(size_t)cNT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)cNT*sizeof(struct rknpu_task);
+        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bscratch(c,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
+        if(c->maf[i].size<cAF){ bdestroy(fd,&c->maf[i]); c->maf[i]=bscratch(c,cAF,0x403,c->dom_active); }
+        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bscratch(c,need_tk,0x40b,c->dom_active); }
+        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+        if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
+    }
+    c->mc_error=0; g_in_doorbell=1;
+    npu_pool_ensure(c);
+    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=bch_mw_worker; c->pjob_stride=sizeof(struct bchmw);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
+    bch_mw_worker(&args[0]);
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    g_in_doorbell=0;
+    int bad=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) bad=1; }
+    if(bad){   /* a core dropped -> re-run ITS experts serially via the proven per-expert BCHAIN (its first submit's
+                * timeout_clean reaps the dropped coalesced job — bounded i4_submit_tmo_ms made it past-timeout) */
+        for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue;
+            for(int e=args[i].e0;e<args[i].e1;e++) if(run_i4_bchain_db(c, ex[e].w, ex[e].M, ex[e].A, ex[e].C, nc)) return -1; }
+    }
+    ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job (from a coalesced drop or the per-expert fallback) BEFORE the mcc bdestroy / next op switches domains. In-domain, post-join, safe. No-op unless a real miss occurred. */
+    /* #54 RESIDENT MULTI-DOMAIN: the coalesced OUTPUT scratch (mcc, ~33 MB/core for a whole _exps tensor) is
+     * TRANSIENT — its results are already de-tiled to the host C above. Weights stay resident per-domain, but if
+     * mcc were left allocated it would be PARKED per-domain by dom_activate and accumulate one ~100 MB copy per
+     * domain -> across the auto-sized ~16 domains that's ~1.6 GB of bcreate scratch, exhausting the kernel GEM/CMA
+     * pool so a fresh bcreate (even a tiny mtk_all) EINVALs at ~the 5th domain. Free it here so only the ACTIVE
+     * domain's mcc exists; the next run re-allocs it in its own domain. (int8's per-op scratch is tiny so it never
+     * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths. */
+    for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
+    return 0;
 }
 struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
 static void *stream_worker_i4(void *vp) {

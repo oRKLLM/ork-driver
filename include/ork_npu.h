@@ -162,6 +162,8 @@ void         ork_npu_set_ndomains(ork_npu *ctx, int n);
 void        *ork_dma_alloc(ork_npu *ctx, size_t size);
 /** @brief Like ork_dma_alloc but requests on-chip NPU SRAM residence (fails over to DRAM if none/full). */
 void        *ork_dma_alloc_sram(ork_npu *ctx, size_t size);
+/** @brief Like ork_dma_alloc but with explicit RKNPU_MEM_* flags (CACHEABLE=0x2, WRITE_COMBINE=0x4, TRY_ALLOC_SRAM=0x100). */
+void        *ork_dma_alloc_flags(ork_npu *ctx, size_t size, unsigned flags);
 /** @brief Free a buffer returned by ork_dma_alloc(). */
 void         ork_dma_free (ork_npu *ctx, void *ptr);
 
@@ -343,6 +345,14 @@ ork_w       *ork_mm_load_i4a8_import(ork_npu *ctx, int K, int N, const void *blo
  * this weight's Bb dump (Kp*Nc/2 int4 bytes/tile, pgup'd, pack order). The per-channel bscale is persisted by
  * the caller and re-attached separately. Returns a DT_I4 weight (run with ork_mm_run_i4) or NULL on mismatch. */
 ork_w       *ork_mm_load_i4(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+/* As ork_mm_load_i4 but ZERO-alloc via bimport (dma-heap + PRIME_FD) instead of bcreate (MEM_CREATE): the
+ * multi-domain-safe path for a big resident int4 set (MEM_CREATE faults across domains / at scale). Use this
+ * for a >4GiB resident int4 weight set (e.g. a resident MoE); falls back to ork_mm_load_i4 on failure. */
+ork_w       *ork_mm_load_i4_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+/* #54: consolidated int4 load — tiles are views into a shared per-domain bimport arena (few large chunks
+ * across many experts) instead of one dma-buf per weight; avoids per-domain IOMMU mapping saturation on
+ * big MoE. Weight owns nothing; arena is freed at ork_npu_free. int4 resident (no per-weight eviction). */
+ork_w       *ork_mm_load_i4_arena(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 
 /* CPU-side pack/dump helpers linked by the ggml-ork backend (defined at the end of npu.c; no internal
  * callers). ork_w_dump_i8_cpu_st: single-threaded int8 CPU tile — for callers that parallelize at a
@@ -354,6 +364,12 @@ ork_w       *ork_mm_load_i4(ork_npu *ctx, int K, int N, const void *blob, size_t
  * required byte size. */
 size_t       ork_w_dump_i8_cpu_st(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
 size_t       ork_pack_i4a8_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap);  /* nf4: 1=NF4 codebook, 0=uniform (caller routes by source: full-precision->NF4) */
+/* GPTQ int4 weight quant (ork_gptq.c; in-tree, NO external deps). Error-compensated column-sequential rounding
+ * with the calibration Hessian H=X^T X -> uniform symmetric int4 [-8,7] + per-(row,group) scale (native-W4A4
+ * form: dequant w=code*scale; composes with Hadamard = QuaRot). W:[N(out)*K(in)] fp32; H:[K*K] (DESTROYED);
+ * group<=0 => per-row; codes:[N*K] int8; scales:[N*ceil(K/group)] fp32; damp: Hessian damp (0.01 typical).
+ * 0 ok, <0 on error. UNVALIDATED until compared vs AutoGPTQ (task #56); pack gates it behind ORK_GPTQ. */
+int          ork_gptq_i4(int K, int N, const float *W, float *H, int group, int8_t *codes, float *scales, float damp);
 ork_w       *ork_mm_pack_i8_import(ork_npu *ctx, int K, int N, const int8_t *B);
 
 /* ---- Streaming weight pool: a RAM-resident inflated-int8 cache with CHEAP map/unmap ----
@@ -960,6 +976,9 @@ typedef struct {
 } ork_mm_task_i4;
 
 int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+/* #54: run MANY int4 experts (each M>=1) COALESCED through one nonblock doorbell (rows chained across cores,
+ * ~nc submits total). All experts must share one iommu domain. 0 ok / -4 refuse (too big) / <0 err. */
+int          ork_mm_run_i4_experts(ork_npu *ctx, const ork_mm_task_i4 *ex, int ntask, int nc);
 
 /* ---- Dynamic steered submission (NONBLOCK chain + per-op doorbell progress + mid-flight halt) ----
  * Submit an S-task int8 OR fp16 chain NONBLOCK, then watch/steer it from the host. v1: M=1/task (mc: M<=64),
