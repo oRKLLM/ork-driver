@@ -152,6 +152,12 @@ driver fix, not a dead end.
 | `ORK_FFN_GATE_F16` (310) | fp16 gate + fused fp16 SiLU | **PARTIAL** | fused fp16 silu not viable unless `_CPUSILU` set (no probe) | — |
 | `ORK_GATE_ABLATE` (4250) | diagnostic: isolate gate's 3 error sources | diagnostic | — | unset = normal |
 
+## CPU native kernels (`include/ork_native_cpu.h`)
+
+| kernel | purpose | status | probe / evidence | notes |
+|---|---|---|---|---|
+| `ork_cpu_gemm_i4` / `ork_cpu_gemm_nf4` | batched (M>1) int4 / NF4 CPU expert GEMM — 4×4 register-blocked, weight+unpack amortized across rows (the M=1 `ork_cpu_gemv_m1` re-unpacks per row). The MoE-**prefill** accelerator for the ggml-ork CPU cold path. | **PROVEN (bit-exact)** | `test_i4_gemm` (in `make test`): BIT-EXACT vs M separate `ork_cpu_gemv_m1` calls on-board (NEON dotprod); speedup vs M=1 gemv **I4 2.3× / NF4 1.85×** (NF4 faster in absolute time — 1-op `vqtbl1q_s8` unpack vs int4's 2-op sign-extend). | Drives the NF4 CPU-prefill win: **1.33× over native ggml at 35B pp512** via the ggml-ork `ORK_MOE_CPU` route (experts NF4-on-CPU + attn int8-on-NPU). Prefill-only lever (decode M=1 has no rows to amortize). |
+
 ## orkd daemon RPC surface
 
 | name | purpose | status | evidence | notes |
