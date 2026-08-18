@@ -186,6 +186,110 @@ static inline void ork_cpu_gemv_m1(const ork_cpu_w*w,const int8_t*A,float ascale
         out[n]=ascale*w->bscale[n]*(float)d;
     }
 }
+
+/* ---- BATCHED (M>1) int4 GEMM: the prefill lever the M=1 gemv lacks ----
+ * The M=1 gemv re-loads+re-unpacks each weight column per activation row; for prefill (M_e routed rows per
+ * expert) that wastes the (bandwidth-bound) weight read + the int4-unpack ALU M times. This 4x4 register-
+ * blocked microkernel loads+unpacks each 4-column weight tile ONCE per K-step and reuses it across 4 rows
+ * (weight amortized over rows), while each row's activation is reused across the 4 cols (activation amortized
+ * over cols) — the same fusing ggml's repacked Q4_K GEMM gets, but on the shared ork-native int4 format.
+ * 16 int32 accumulators + 4 unpacked weight cols (persist across the 4 rows) + transient activation. */
+static inline ORK_NATIVE_TARGET void ork_gemm_i4_4x4(
+        const uint8_t*b0,const uint8_t*b1,const uint8_t*b2,const uint8_t*b3,
+        const int8_t*a0,const int8_t*a1,const int8_t*a2,const int8_t*a3,int K,int32_t out[4][4]){
+    uint8x16_t m=vdupq_n_u8(0x0f);
+    int32x4_t c00=vdupq_n_s32(0),c01=vdupq_n_s32(0),c02=vdupq_n_s32(0),c03=vdupq_n_s32(0);
+    int32x4_t c10=vdupq_n_s32(0),c11=vdupq_n_s32(0),c12=vdupq_n_s32(0),c13=vdupq_n_s32(0);
+    int32x4_t c20=vdupq_n_s32(0),c21=vdupq_n_s32(0),c22=vdupq_n_s32(0),c23=vdupq_n_s32(0);
+    int32x4_t c30=vdupq_n_s32(0),c31=vdupq_n_s32(0),c32=vdupq_n_s32(0),c33=vdupq_n_s32(0);
+    for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
+        #define ORK_UNP(bb, lov, hiv) uint8x16_t pk##bb=vld1q_u8((bb)+kb); \
+            int8x16_t lov=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vandq_u8(pk##bb,m)),4),4); \
+            int8x16_t hiv=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk##bb,4)),4),4);
+        ORK_UNP(b0,lo0,hi0) ORK_UNP(b1,lo1,hi1) ORK_UNP(b2,lo2,hi2) ORK_UNP(b3,lo3,hi3)
+        #undef ORK_UNP
+        int8x16x2_t av0=vld2q_s8(a0+k), av1=vld2q_s8(a1+k), av2=vld2q_s8(a2+k), av3=vld2q_s8(a3+k);
+        #define ORK_ACC(cr, lov, hiv, ar) cr=vdotq_s32(vdotq_s32(cr, lov, ar.val[0]), hiv, ar.val[1])
+        ORK_ACC(c00,lo0,hi0,av0); ORK_ACC(c01,lo1,hi1,av0); ORK_ACC(c02,lo2,hi2,av0); ORK_ACC(c03,lo3,hi3,av0);
+        ORK_ACC(c10,lo0,hi0,av1); ORK_ACC(c11,lo1,hi1,av1); ORK_ACC(c12,lo2,hi2,av1); ORK_ACC(c13,lo3,hi3,av1);
+        ORK_ACC(c20,lo0,hi0,av2); ORK_ACC(c21,lo1,hi1,av2); ORK_ACC(c22,lo2,hi2,av2); ORK_ACC(c23,lo3,hi3,av2);
+        ORK_ACC(c30,lo0,hi0,av3); ORK_ACC(c31,lo1,hi1,av3); ORK_ACC(c32,lo2,hi2,av3); ORK_ACC(c33,lo3,hi3,av3);
+        #undef ORK_ACC
+    }
+    out[0][0]=vaddvq_s32(c00);out[0][1]=vaddvq_s32(c01);out[0][2]=vaddvq_s32(c02);out[0][3]=vaddvq_s32(c03);
+    out[1][0]=vaddvq_s32(c10);out[1][1]=vaddvq_s32(c11);out[1][2]=vaddvq_s32(c12);out[1][3]=vaddvq_s32(c13);
+    out[2][0]=vaddvq_s32(c20);out[2][1]=vaddvq_s32(c21);out[2][2]=vaddvq_s32(c22);out[2][3]=vaddvq_s32(c23);
+    out[3][0]=vaddvq_s32(c30);out[3][1]=vaddvq_s32(c31);out[3][2]=vaddvq_s32(c32);out[3][3]=vaddvq_s32(c33);
+}
+
+/* Driver: out[m*ldo + n] = ascale[m]*bscale[n]*dot(A[m], W_n) for m in [0,M), n in [n0,n1). I4 only (the
+ * caller gates on fmt==ORK_CPU_I4). A rows stride lda (int8 [K]); out rows stride ldo (f32). 4x4-blocked
+ * with M and N remainders falling back to the M=1 gemv. Bit-exact with M separate ork_cpu_gemv_m1 calls. */
+static inline void ork_cpu_gemm_i4(const ork_cpu_w*w,const int8_t*A,int lda,const float*ascale,
+        float*out,int ldo,int M,int n0,int n1){
+    const int K=w->K; const size_t kh=(size_t)K/2;
+    int mm=0;
+    for(; mm+4<=M; mm+=4){
+        const int8_t*a0=A+(size_t)(mm  )*lda,*a1=A+(size_t)(mm+1)*lda,*a2=A+(size_t)(mm+2)*lda,*a3=A+(size_t)(mm+3)*lda;
+        int n=n0;
+        for(; n+4<=n1; n+=4){ int32_t d[4][4];
+            ork_gemm_i4_4x4(w->nibble+(size_t)(n)*kh, w->nibble+(size_t)(n+1)*kh,
+                            w->nibble+(size_t)(n+2)*kh, w->nibble+(size_t)(n+3)*kh, a0,a1,a2,a3,K,d);
+            for(int i=0;i<4;i++){ const float as=ascale[mm+i]; float*o=out+(size_t)(mm+i)*ldo;
+                o[n  ]=as*w->bscale[n  ]*(float)d[i][0]; o[n+1]=as*w->bscale[n+1]*(float)d[i][1];
+                o[n+2]=as*w->bscale[n+2]*(float)d[i][2]; o[n+3]=as*w->bscale[n+3]*(float)d[i][3]; } }
+        for(int i=0;i<4;i++) ork_cpu_gemv_m1(w, A+(size_t)(mm+i)*lda, ascale[mm+i], out+(size_t)(mm+i)*ldo, n, n1); /* N rem */
+    }
+    for(; mm<M; mm++) ork_cpu_gemv_m1(w, A+(size_t)mm*lda, ascale[mm], out+(size_t)mm*ldo, n0, n1); /* M rem */
+}
+
+/* Batched (M>1) NF4 GEMM: identical 4x4 blocking to the int4 kernel, but the nibble INDEX -> int8 code via
+ * the vqtbl LUT (one instruction, amortized over the 4 rows), so NF4 is ~free vs uniform int4 on CPU while
+ * giving better accuracy (NormalFloat codebook, no Hadamard needed). */
+static inline ORK_NATIVE_TARGET void ork_gemm_nf4_4x4(
+        const uint8_t*b0,const uint8_t*b1,const uint8_t*b2,const uint8_t*b3,
+        const int8_t*a0,const int8_t*a1,const int8_t*a2,const int8_t*a3,int8x16_t lut,int K,int32_t out[4][4]){
+    uint8x16_t m=vdupq_n_u8(0x0f);
+    int32x4_t c00=vdupq_n_s32(0),c01=vdupq_n_s32(0),c02=vdupq_n_s32(0),c03=vdupq_n_s32(0);
+    int32x4_t c10=vdupq_n_s32(0),c11=vdupq_n_s32(0),c12=vdupq_n_s32(0),c13=vdupq_n_s32(0);
+    int32x4_t c20=vdupq_n_s32(0),c21=vdupq_n_s32(0),c22=vdupq_n_s32(0),c23=vdupq_n_s32(0);
+    int32x4_t c30=vdupq_n_s32(0),c31=vdupq_n_s32(0),c32=vdupq_n_s32(0),c33=vdupq_n_s32(0);
+    for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
+        #define ORK_UNP_NF4(bb, lov, hiv) uint8x16_t pk##bb=vld1q_u8((bb)+kb); \
+            int8x16_t lov=vqtbl1q_s8(lut,vandq_u8(pk##bb,m)); \
+            int8x16_t hiv=vqtbl1q_s8(lut,vshrq_n_u8(pk##bb,4));
+        ORK_UNP_NF4(b0,lo0,hi0) ORK_UNP_NF4(b1,lo1,hi1) ORK_UNP_NF4(b2,lo2,hi2) ORK_UNP_NF4(b3,lo3,hi3)
+        #undef ORK_UNP_NF4
+        int8x16x2_t av0=vld2q_s8(a0+k), av1=vld2q_s8(a1+k), av2=vld2q_s8(a2+k), av3=vld2q_s8(a3+k);
+        #define ORK_ACC(cr, lov, hiv, ar) cr=vdotq_s32(vdotq_s32(cr, lov, ar.val[0]), hiv, ar.val[1])
+        ORK_ACC(c00,lo0,hi0,av0); ORK_ACC(c01,lo1,hi1,av0); ORK_ACC(c02,lo2,hi2,av0); ORK_ACC(c03,lo3,hi3,av0);
+        ORK_ACC(c10,lo0,hi0,av1); ORK_ACC(c11,lo1,hi1,av1); ORK_ACC(c12,lo2,hi2,av1); ORK_ACC(c13,lo3,hi3,av1);
+        ORK_ACC(c20,lo0,hi0,av2); ORK_ACC(c21,lo1,hi1,av2); ORK_ACC(c22,lo2,hi2,av2); ORK_ACC(c23,lo3,hi3,av2);
+        ORK_ACC(c30,lo0,hi0,av3); ORK_ACC(c31,lo1,hi1,av3); ORK_ACC(c32,lo2,hi2,av3); ORK_ACC(c33,lo3,hi3,av3);
+        #undef ORK_ACC
+    }
+    out[0][0]=vaddvq_s32(c00);out[0][1]=vaddvq_s32(c01);out[0][2]=vaddvq_s32(c02);out[0][3]=vaddvq_s32(c03);
+    out[1][0]=vaddvq_s32(c10);out[1][1]=vaddvq_s32(c11);out[1][2]=vaddvq_s32(c12);out[1][3]=vaddvq_s32(c13);
+    out[2][0]=vaddvq_s32(c20);out[2][1]=vaddvq_s32(c21);out[2][2]=vaddvq_s32(c22);out[2][3]=vaddvq_s32(c23);
+    out[3][0]=vaddvq_s32(c30);out[3][1]=vaddvq_s32(c31);out[3][2]=vaddvq_s32(c32);out[3][3]=vaddvq_s32(c33);
+}
+static inline void ork_cpu_gemm_nf4(const ork_cpu_w*w,const int8_t*A,int lda,const float*ascale,
+        float*out,int ldo,int M,int n0,int n1){
+    const int K=w->K; const size_t kh=(size_t)K/2;
+    int mm=0;
+    for(; mm+4<=M; mm+=4){
+        const int8_t*a0=A+(size_t)(mm  )*lda,*a1=A+(size_t)(mm+1)*lda,*a2=A+(size_t)(mm+2)*lda,*a3=A+(size_t)(mm+3)*lda;
+        int n=n0;
+        for(; n+4<=n1; n+=4){ int32_t d[4][4];
+            ork_gemm_nf4_4x4(w->nibble+(size_t)(n)*kh, w->nibble+(size_t)(n+1)*kh,
+                             w->nibble+(size_t)(n+2)*kh, w->nibble+(size_t)(n+3)*kh, a0,a1,a2,a3, w->nf4_lut, K, d);
+            for(int i=0;i<4;i++){ const float as=ascale[mm+i]; float*o=out+(size_t)(mm+i)*ldo;
+                o[n  ]=as*w->bscale[n  ]*(float)d[i][0]; o[n+1]=as*w->bscale[n+1]*(float)d[i][1];
+                o[n+2]=as*w->bscale[n+2]*(float)d[i][2]; o[n+3]=as*w->bscale[n+3]*(float)d[i][3]; } }
+        for(int i=0;i<4;i++) ork_cpu_gemv_m1(w, A+(size_t)(mm+i)*lda, ascale[mm+i], out+(size_t)(mm+i)*ldo, n, n1);
+    }
+    for(; mm<M; mm++) ork_cpu_gemv_m1(w, A+(size_t)mm*lda, ascale[mm], out+(size_t)mm*ldo, n0, n1);
+}
 /* ---- PACK (offline, plain C): f32[N][K] -> the lean 32-block planes the dots read ----
  * Per output channel n: absmax -> per-channel scale; quantize; lay out in the 32-block nibble/bit-plane
  * form. NF4 stores the nearest-codebook INDEX in the nibble (lut = round(level*127) applied at inflate).
