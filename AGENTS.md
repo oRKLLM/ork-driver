@@ -141,7 +141,11 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   `REGEN GOLD[...]` values) or to **diagnose a mismatch** (`ORK_FULL_REF=1`). Leave the golden static
   until a *deliberate* output-changing edit, then regen. In use on `test_matmul`, `quant`, `test_sn3`,
   `model` (the reference-bound tests); took full `make test` from ~10-11 min to **~33 s**. NOTE: pass env
-  through `sudo env VAR=…` — a bare `VAR=… sudo …` prefix is stripped by sudo.
+  through `sudo env VAR=…` — a bare `VAR=… sudo …` prefix is stripped by sudo. **Same trap one level up:**
+  the `make test` targets run each test under `$(SUDO)`, and plain `sudo` drops `ORK_*`, so a knob set on a
+  make line reached nothing. `SUDO ?= sudo -E` (commit `b83269e`) fixes it — before that, `ORK_DEBUG_RESET=1
+  make test` printed **0** resets where the real count is **50**. On an older tree, invoke the binary
+  directly (`sudo env KNOB=1 ./test_x`) instead of trusting a knobbed `make test`.
 - **CI board-validation gate (`make check-attest`).** The tests need the NPU, which CI runners lack — so
   CI can't run them. Instead, `make test` on the SBC (on ALL PASS) writes `tests/sbc_attest.txt` =
   sha256 of the NPU-output-determining `.c` sources + the golden-bearing tests; CI `make check-attest`
@@ -281,7 +285,10 @@ mechanism that actually applies at each call site; **don't** default everything 
   `test_ssd_chunk_npu` (int8↔fp16 SSM), the SDP ops (`test_ewmul_{i8,f16,i16}`/`test_silu`/`test_gelu`/
   `test_add`), and **`test_mode_transition`**. A *behavior-preserving* refactor must pass **byte-identical**.
 - Run it once **per keep-warm knob** too: default, then `ORK_SSM_KEEPWARM=0` and `ORK_MIXED_NOTHRASH=1`
-  (the profiles differ only at non-default knobs).
+  (the profiles differ only at non-default knobs). This needs `SUDO = sudo -E` (see §3) — with plain `sudo`
+  the knob never reaches the test and the run silently re-validates the DEFAULT config. Sanity-check that
+  propagation works before trusting a knobbed run: `ORK_TRACE=1 make test-only T=test_bmm` must print
+  `[ork-trace]` lines.
 - `make mode_probe && sudo env ORK_MM_TIMEOUT=2500 timeout 300 ./mode_probe` — the op→op transition
   matrix; confirm which pairs reset/wedge is unchanged.
 - `ORK_DEBUG_RESET=1` — logs every `ACT_RESET` with a counter + caller; diff the count/sites before vs
