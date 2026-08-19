@@ -137,6 +137,10 @@ void         ork_npu_set_priority(ork_npu *ctx, unsigned prio);
  * domain automatically. domain<0 reverts to the process default (env ORK_IOMMU_DOMAIN, else 0). */
 void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
 int          ork_npu_pack_domain(const ork_npu *ctx);   /* current pack domain (for save/restore) */
+/* The currently ACTIVE IOMMU domain. Pure getter. Use it to place a TRANSIENT/scratch weight (e.g. an
+ * attention QK^T / A.V or GDN chunk bmm's dynamic operand) in the domain that is already active, so
+ * running it costs NO domain switch — a switch is where a stuck job stalls the next submit for 60 s. */
+int          ork_npu_active_domain(const ork_npu *ctx);
 void         ork_npu_activate_domain(ork_npu *ctx, int domain);   /* make domain active (establish); alloc in-domain buffers after this */
 int          ork_w_domain(const ork_w *w);   /* the IOMMU domain a packed weight resides in */
 int          ork_npu_uses_orkd(const ork_npu *ctx);   /* 1 = context routes through orkd (serialized); 0 = direct single-stream NPU */

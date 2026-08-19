@@ -2609,6 +2609,13 @@ int ork_npu_domain_free(ork_npu *c,int domain){
     return 0;   /* direct mode: domains aren't pooled — a weight's buffers free with the weight */
 }
 int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   /* current pack domain (save/restore around a domain-targeted alloc) */
+/* Currently ACTIVE iommu domain (the one dom_activate last swapped in), i.e. the domain the NEXT submit
+ * would run in if its weight already lives there. Pure getter, no state change. The point: a caller that
+ * allocates a TRANSIENT/scratch weight (an attention or GDN bmm's dynamic operand) can place it in the
+ * domain that is already active, so running it needs NO dom_activate switch — the switch is what a stuck
+ * (unreaped, IRQ-never-fired) job turns into a 60 s "switch iommu domain" stall on the NEXT submit. See
+ * ork_dom_flush_if_dirty / dom_dirty. Co-domain scratch sidesteps the whole boundary. */
+int  ork_npu_active_domain(const ork_npu *c){ return c ? c->dom_active : 0; }
 /* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
  * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
  * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
