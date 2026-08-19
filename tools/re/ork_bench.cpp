@@ -218,13 +218,14 @@ int main(int argc, char** argv){
     llama_backend_init();
 
     // AUTO-PERSIST (.orkpack): a transparent, self-populating cache — behaviour keys ONLY on whether the pack
-    // already exists. No ORK_ALLOW_JIT, no manual ORK_PERSIST. The path defaults to <model>.q{4,8}.orkpack next
-    // to the model (int4 and int8 packs differ in content, so they are separate files); ORK_PERSIST overrides.
+    // already exists. The backend ALSO derives <model>.orkpack on its own now (so llama-bench/-cli/server get
+    // the same behaviour with no env at all); this block computes the same path for the existence check + the
+    // one-time build pass. ORK_ORKPACK_PATH is the development override (ORK_PERSIST is removed and aborts).
     // Present+valid -> continue (the timed run loads it in READ mode). Absent or stale -> BUILD it once NOW in a
     // separate untimed pass, then continue. (The build MUST be its own pass: WRITE mode forces M=1, so timing a
     // just-built pack in the same process would be unrepresentative — the timed run must be pure READ mode.)
     std::string orkpack;
-    if (const char* pp = getenv("ORK_PERSIST")) orkpack = pp;
+    if (const char* pp = getenv("ORK_ORKPACK_PATH")) orkpack = pp;
     else {
         // Default location = the model's own folder, matching the existing convention: <model sans .gguf>.orkpack.
         // A non-default ORK_QUANT (e.g. int4 on a Q8 gguf) yields DIFFERENT tile content, so it gets a distinct
@@ -235,7 +236,10 @@ int main(int argc, char** argv){
         const char* q = getenv("ORK_QUANT");
         bool nondefault = q && *q && q[0] != '8';
         orkpack = base + (nondefault ? (std::string(".q") + q[0]) : std::string("")) + ".orkpack";
-        setenv("ORK_PERSIST", orkpack.c_str(), 1);   // internal plumbing; the backend reads ORK_PERSIST
+        // Only pin it for the backend when it differs from what the backend itself derives (<model>.orkpack) —
+        // i.e. the non-default ORK_QUANT .q<N> variant. In the default case the backend derives the same path,
+        // so we set NOTHING and the knob-free path is exercised end-to-end.
+        if (nondefault) setenv("ORK_ORKPACK_PATH", orkpack.c_str(), 1);
     }
     if (ggml_backend_ork_orkpack_valid(orkpack.c_str())) {
         fprintf(stderr, "[ork_bench] orkpack: %s (present — timed run reads it in READ mode)\n", orkpack.c_str());

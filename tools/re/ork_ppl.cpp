@@ -1,11 +1,13 @@
 /* ork_ppl.cpp — teacher-forced perplexity harness for the open stack, the quality companion to ork_bench.
  * Drives the llama.cpp C API directly (the ggml-ork backend intercepts MUL_MAT, so ORK_MIXED_DISPATCH /
- * ORK_PERSIST / ORK_QUANT / ORK_OFF all apply), so any q4/int4/int8 matmul-path change gets a PPL number
+ * ORK_QUANT / ORK_OFF all apply; the .orkpack is auto-derived from the model), so any q4/int4/int8 change gets a PPL
  * next to the ork_bench tok/s number — on the SAME model, SAME text, one clock. Perplexity is teacher-
  * forced: decode the whole token window in one pass with per-position logits, PPL = exp(mean NLL) over the
  * next-token targets. A window >= 32 tokens exercises the NPU prefill path (M = window >= the M-threshold).
  *   ork_ppl <model.gguf> <textfile> [window=256] [ubatch=window]
- * Compare: `ORK_OFF=1 ork_ppl …` (CPU fp-ref baseline) vs `ORK_MIXED_DISPATCH=1 ORK_PERSIST=… ork_ppl …`.
+ * Compare: `ORK_OFF=1 ork_ppl …` (CPU/native baseline) vs plain `ork_ppl …` (the ork path; a MoE model
+ * auto-selects experts-NF4-on-CPU + int8 attn on NPU). Pass ubatch to bound M (e.g. 512) — a large
+ * ubatch (2048, llama-perplexity's default) drives wide colsplit into RKNPU_SUBMIT timeouts.
  */
 #include "llama.h"
 #include <cstdio>

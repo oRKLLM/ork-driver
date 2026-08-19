@@ -330,6 +330,44 @@ Reference (Qwen3-1.7B-w8a8, RK3588 board `10.3.0.236`, `-t 4`, warm): librkllmrt
 ### Managing Baseline Thresholds
 When committing new performance optimizations to `ork-driver` or `ggml-ork`, you MUST run the integration benchmark script (`tools/bench_two_turn.sh` via `make bench-llama`) on the Rockchip SBC to ensure there is no significant degradation (e.g., M-scheduling bugs or KV-cache penalties). 
 If your optimizations successfully increase the performance baselines above the current documented numbers, you must explicitly update the threshold constants in the test scripts (e.g., `BASELINE_DECODE` in `tools/bench_two_turn.sh`) to the new, higher values before merging. Do not allow baselines to stagnate or decay.
+### MoE models: the profile is AUTOMATIC (no knobs) — the model type decides
+
+A routed-MoE model (any `GGML_OP_MUL_MAT_ID`, detected at load-time graph planning) auto-selects the
+measured-optimal scheme on RK3588; **nothing needs to be set**:
+
+- orkpack tier: expert/ffn tensors → int4 with the **NF4 codebook** (fixed by model type, so one model =
+  one pack scheme whatever the GGUF's own precision); attn/dense stay int8.
+- **prefill (M>1)**: experts on the CPU via the batched 4×4 NF4 NEON GEMM; attn/dense int8 on the NPU.
+- **decode (M==1)**: **all-CPU** (the NPU per-submit floor loses at M=1) — the fused M=1 gemv fast-path
+  (one activation quant per token, direct-to-dst, persistent OpenMP pool, one-cache-line PRFM prefetch).
+- The `.orkpack` path is **derived from the model** (`<model-dir>/<model-basename>.orkpack`) and BUILT once
+  if absent. `ORK_ORKPACK_PATH` is a **development override only**; `ORK_PERSIST` is retired and aborts.
+
+Measured (qwen3.6-35B-A3B, `-t4`, governors=performance, 1024-tok PPL window, board `.236`):
+
+| | prefill t/s | decode t/s | PPL |
+|---|---|---|---|
+| native ggml (Q4_K experts) | 23.3 | 7.5 | 10.21 |
+| **ork auto-profile** | **36.9 (1.59×)** | 6.3–6.6 (0.85×) | 10.77 (+5.5%) |
+
+So it is a **trade**: +5.5% perplexity and ~15% slower decode for 1.59× prefill. Prefill-heavy workloads
+(long prompts / RAG / batch) win; decode-dominated chat may prefer `ORK_MOE_AUTO=0` (native decode).
+
+**MODEL RECIPE — the single biggest decode lever is a FILE property, not a knob.** Attention precision in
+the GGUF trades prefill for decode, and below 5 bits the NPU declines the source entirely (`sbits<5.0`),
+forfeiting the prefill path:
+
+    llama-quantize --tensor-type attn=q8_0 --tensor-type shexp=q8_0 <f16.gguf> <out.gguf> Q4_K_M
+
+| attn precision in the GGUF | prefill | decode |
+|---|---|---|
+| f16 (16b) | 38.4 | 5.26 |
+| **q8_0 (8b) — balanced optimum** | **36.9** | **6.59** |
+| Q4_K (4.5b — NPU declines it) | 26.8 | 7.42 |
+
+Expert precision in the GGUF is irrelevant (experts come from the pack; re-quantizing NF4 from an already
+Q4_K gguf costs only +0.6% PPL, so the zero-config derived pack needs no f16 source).
+
 ### Env knobs (set on the `llama-bench`/`mc_prof`/`quant` command)
 | var | effect |
 |---|---|
@@ -339,6 +377,25 @@ If your optimizations successfully increase the performance baselines above the 
 | `ORK_PROFILE=1` | per-section timing (quant / NPU run / dequant; decode vs prefill; run_multicore phases) — printed by ggml-ork on free |
 | `ORK_QUANT=4` | int4 W4A4 instead of int8 (experimental, incoherent) |
 | `ORK_DECODE_MC=1` | let M=1 (decode) matmuls split N-tiles across all 3 cores (default: single-core at M=1). +1.62× decode on the big FFN projections (7B-Q8_0, 0.92→1.49 t/s); off by default because small-N decode matmuls lose the multi-core barrier to the single-core dispatch floor. Residual gap to rkllm is the synchronous-execution wall, not core count |
+
+### CPU/MoE probes (sub-second, no model load — the iteration tools)
+- `make test_i4_gemm && sudo ./test_i4_gemm` — batched int4/NF4 GEMM vs the M=1 gemv: bit-exactness + the
+  M>1 speedup (I4 2.3×, NF4 1.85×). In `make test`.
+- `make test_nf4_decode && taskset -c 6 ./test_nf4_decode [NEXP] [K] [N]` — **DRAM-realistic M=1 decode**
+  probe: NEXP distinct weights (default 64 = 32 MB ≫ 3 MB L3) walked once, so every K-step is a cold DRAM
+  read like real MoE decode; reports µs/expert AND achieved GB/s. Use this (NOT `test_i4_gemm`, whose single
+  0.5 MB weight stays L3-resident) for any memory/prefetch work. A/B prefetch at compile time:
+  `gcc -O3 -march=armv8.2-a+dotprod -Iinclude -DORK_PRF_DIST=0 -o /tmp/d0 examples/test_nf4_decode.c -lm`.
+  Measured: the M=1 loop is **latency-bound, not bandwidth-bound** (one A76 gets ~8 GB/s of the ~21.9 GB/s
+  it can stream), which is why `PRFM` one cache line ahead (`ORK_PRF_DIST=64`) wins ~9-11%.
+- `make test_moe_dispatch && sudo ./test_moe_dispatch` — does the ~18µs/program NPU dispatch tax amortize?
+  (separate vs `run_chain_i4` vs `run_i4_experts` vs one big program.) It does: 3.4× decode / 3.67× prefill.
+
+### Perplexity (quality) — use `ork_ppl`, NOT `llama-perplexity`
+`make ork_ppl && sudo ./ork_ppl <model.gguf> <text> [window] [ubatch]` — teacher-forced PPL through the
+same backend/env path as `ork_bench`, one clock. **Pin `ubatch` (e.g. 512)**: `llama-perplexity` defaults to
+`n_batch=2048, n_seq=4` → M=2048 → wide colsplit → `RKNPU_SUBMIT` timeouts + self-heal thrash that can wedge
+the kernel NPU driver (recover with `sudo reboot`; re-pin governors afterwards, they reset).
 
 ### Diagnostic tools (board only; not in `all`/`test`)
 - `make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters] [a]` — per-matmul ork vs the closed RKNN matmul API (same int8 (M,K,N)); `a` arg = the AC-layout probe.

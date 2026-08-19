@@ -323,7 +323,8 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 ### orkpack / streaming / multi-domain (ggml-ork)
 | var | effect |
 |---|---|
-| `ORK_PERSIST=<path>` | load the `.orkpack` if present, else build it on first run and cache |
+| *(automatic)* | the `.orkpack` path is DERIVED from the loaded model (`<model-dir>/<model-basename>.orkpack`); it is loaded if present, else built on first run and cached. No env var needed. |
+| `ORK_ORKPACK_PATH=<path>` | DEVELOPMENT override of the derived `.orkpack` path (`ORK_PERSIST` is removed and aborts with guidance) |
 | `ORK_ORKPACK_TIERMAP`, `ORK_ORKPACK_I4_FFN`, `ORK_ORKPACK_I4_ABOVE_MB`, `ORK_ORKPACK_TIER_FROM_SRC`, `ORK_ORKPACK_CPU` | per-tensor tier selection when converting an orkpack |
 | `ORK_DOMAINS=<n>` | **DEPRECATED** — the domain count is auto-sized from the resident orkpack footprint. Honored **only as a clamp-UP** (force *more* domains than auto, never fewer): a value below the auto count under-provisions IOVA (last-domain overflow → Bf PRIME-fail → warmup wedge) and is ignored with a warning, while a larger value is a valid escape hatch when the auto footprint under-counts. Use `ORK_DOMAIN_LAYERS` for manual layer→domain control. |
 | `ORK_DOMAIN_LAYERS` | manual layers-per-domain (advanced; the auto-sizer byte-balances by default) |

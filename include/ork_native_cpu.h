@@ -37,9 +37,31 @@ static const uint8_t ORK_CPU_BITSEL[16]={1,2,4,8,16,32,64,128,1,2,4,8,16,32,64,1
 
 /* int4 uniform, ork-driver Bi4 CONSECUTIVE layout (byte j = w[2j]low|w[2j+1]high, matches
  * expand_chan_i4_i8): 32 wts/iter; vld2 deinterleaves the activation into even/odd. sign-extend 4-bit. */
+/* DRAM-latency hiding for the M=1 (decode) weight stream: each weight column is read ONCE (no reuse), so
+ * the loop is pure streaming and every K-step stalls on the next 16B nibble block. PRFM (via
+ * __builtin_prefetch) pulls it in while the vdotq/vqtbl of the current block executes.
+ *   ORK_PRF_DIST = bytes ahead (0 = off; 64/128/256 = 1/2/4 cache lines)
+ *   ORK_PRF_LOC  = __builtin_prefetch locality: 0 = PLDL1STRM (use-once, don't pollute), 3 = PLDL1KEEP
+ * A/B them on test_i4_gemm (sub-second, no model): make test_i4_gemm CFLAGS_EXTRA='-DORK_PRF_DIST=...'. */
+/* DIST=64 (one cache line ahead) MEASURED best on RK3588 A76 via test_nf4_decode (32 MB DRAM-cold stream,
+ * single core): NF4 70.6->64.9 us/expert (+8.8%), I4 100.3->90.4 (+11%); 128/256 are worse than 64, and
+ * LOC=3(KEEP) == LOC=0(STRM). The loop is LATENCY-bound, not bandwidth-bound (7.4->8.1 GB/s achieved vs
+ * ~21.9 GB/s a single A76 can stream, ~22% of vdotq peak) — which is why one-line-ahead PRFM wins. */
+#ifndef ORK_PRF_DIST
+#define ORK_PRF_DIST 64
+#endif
+#ifndef ORK_PRF_LOC
+#define ORK_PRF_LOC 0
+#endif
+#if ORK_PRF_DIST > 0
+#define ORK_PRF(p) __builtin_prefetch((const void*)((const char*)(p)+ORK_PRF_DIST),0,ORK_PRF_LOC)
+#else
+#define ORK_PRF(p) ((void)0)
+#endif
 static inline ORK_NATIVE_TARGET int32_t ork_dot_i4(const int8_t*a,const uint8_t*b4,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
+        ORK_PRF(b4+kb);
         uint8x16_t pk=vld1q_u8(b4+kb);                       /* w[k..k+31] as 16 consecutive pairs */
         int8x16_t lo=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vandq_u8(pk,m)),4),4);  /* w[k],w[k+2],..,w[k+30] */
         int8x16_t hi=vshrq_n_s8(vshlq_n_s8(vreinterpretq_s8_u8(vshrq_n_u8(pk,4)),4),4);/* w[k+1],..,w[k+31] */
@@ -52,6 +74,7 @@ static inline ORK_NATIVE_TARGET int32_t ork_dot_i4(const int8_t*a,const uint8_t*
 static inline ORK_NATIVE_TARGET int32_t ork_dot_nf4(const int8_t*a,const uint8_t*b4,int8x16_t lut,int K){
     int32x4_t ac=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
+        ORK_PRF(b4+kb);
         uint8x16_t pk=vld1q_u8(b4+kb);
         int8x16x2_t a2=vld2q_s8(a+k);
         ac=vdotq_s32(ac,vqtbl1q_s8(lut,vandq_u8(pk,m)),a2.val[0]);
@@ -119,6 +142,7 @@ static inline ORK_NATIVE_TARGET void ork_dot_nf4_x4(const int8_t*a,const uint8_t
     const uint8_t*b0=b,*b1=b+stride,*b2=b+2*stride,*b3=b+3*stride;
     int32x4_t c0=vdupq_n_s32(0),c1=vdupq_n_s32(0),c2=vdupq_n_s32(0),c3=vdupq_n_s32(0); uint8x16_t m=vdupq_n_u8(0x0f);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){ int8x16x2_t av=vld2q_s8(a+k);
+        ORK_PRF(b0+kb); ORK_PRF(b1+kb); ORK_PRF(b2+kb); ORK_PRF(b3+kb);
         uint8x16_t p0=vld1q_u8(b0+kb); c0=vdotq_s32(c0,vqtbl1q_s8(lut,vandq_u8(p0,m)),av.val[0]); c0=vdotq_s32(c0,vqtbl1q_s8(lut,vshrq_n_u8(p0,4)),av.val[1]);
         uint8x16_t p1=vld1q_u8(b1+kb); c1=vdotq_s32(c1,vqtbl1q_s8(lut,vandq_u8(p1,m)),av.val[0]); c1=vdotq_s32(c1,vqtbl1q_s8(lut,vshrq_n_u8(p1,4)),av.val[1]);
         uint8x16_t p2=vld1q_u8(b2+kb); c2=vdotq_s32(c2,vqtbl1q_s8(lut,vandq_u8(p2,m)),av.val[0]); c2=vdotq_s32(c2,vqtbl1q_s8(lut,vshrq_n_u8(p2,4)),av.val[1]);
@@ -255,6 +279,7 @@ static inline ORK_NATIVE_TARGET void ork_gemm_nf4_4x4(
     int32x4_t c20=vdupq_n_s32(0),c21=vdupq_n_s32(0),c22=vdupq_n_s32(0),c23=vdupq_n_s32(0);
     int32x4_t c30=vdupq_n_s32(0),c31=vdupq_n_s32(0),c32=vdupq_n_s32(0),c33=vdupq_n_s32(0);
     for(int k=0,kb=0;k+32<=K;k+=32,kb+=16){
+        ORK_PRF(b0+kb); ORK_PRF(b1+kb); ORK_PRF(b2+kb); ORK_PRF(b3+kb);   /* weight stream is the same at M>1 */
         #define ORK_UNP_NF4(bb, lov, hiv) uint8x16_t pk##bb=vld1q_u8((bb)+kb); \
             int8x16_t lov=vqtbl1q_s8(lut,vandq_u8(pk##bb,m)); \
             int8x16_t hiv=vqtbl1q_s8(lut,vshrq_n_u8(pk##bb,4));
