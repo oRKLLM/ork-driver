@@ -15,13 +15,16 @@ stays, siblings `npu/{sdp,f16,i16,i4,ssm}.c` + folder `npu/i8/{regcmd,pack,fold,
 | A | `check_registry.sh` globs all lib sources; `clean:` → `$(COBJ)`; `$(SUDO)` = `sudo -E` | ✅ `b83269e` (+ AGENTS fix `1824466`) |
 | B | rename 43 generic internals to `orki_*` (one TU, no moves) | ✅ `c4541c2` |
 | C | `src/npu/internal.h` (types, macros, `ork_now_us` inline, externs) | ✅ `b685614` |
-| **D** | **`src/npu/ssm.c` — first real TU off the monolith (317 lines)** | 🔄 validating |
-| E–I4 | remaining lifts (sdp → i16 → f16 → i4 → i8/{regcmd,pack,fold,run,probe,chain,dyn}) | ⬜ |
+| D | `src/npu/ssm.c` — first real TU off the monolith (317 lines) | ✅ `ae1fc70` |
+| — | `check-registry` check 5: fixed a 24% blind spot (wrapped prototypes) | ✅ `468a11f` |
+| E | `src/npu/i4.c` — int4 chain/doorbell/stream (728 lines) | ✅ `38e16e9` |
+| F | `src/npu/f16.c` | ⬜ next |
+| G–I | `i8/*` → `i16.c` → `sdp.c` (+ the i4 pack/quant sweep) | ⬜ |
 | J | docs (AGENTS §4 tree, README, OPS_REGISTRY, tools/re/README) | ⬜ |
 | K | attest refresh (if CORE moved) + fork CMake file list | ⬜ |
 
 **Working tree:** on `refactor/modularize-precision`. **Board** synced to the branch, governors pinned.
-**`src/npu.c`: 15,313 → 14,862 lines.**
+**`src/npu.c`: 15,313 → 14,088 lines (−1,225).** internal.h 274, i4.c 728, ssm.c 335.
 
 ### Order changed from the plan: D is `ssm.c`, not `sdp.c`
 
@@ -45,8 +48,41 @@ contiguity, not by the plan's guess at cohesion.**
 | i8 | 157 | 869–14762 | 10 | 2584–4529 (1945), 10746–12653 (1907), 5385–7160 (1775) |
 | core (scaffold) | 250 | 62–14730 | 8 | 62–3392 (3330), 3884–5947, 8695–9991 |
 
-So the order stands as **i16 → f16 → i4 → i8/**, but every lift should take the dominant run first and
-sweep the stragglers second, rather than trying to move a module in one pass.
+**The plan's order was backwards.** It put i16 first for having the fewest functions (21). But function
+count is not the effort — the number of disjoint **splice sites** is, and i16 is the *most* fragmented
+bucket in the file (1.6 fns/site). Lines moved per splice:
+
+| module | lines | sites | lines per splice |
+|---|---:|---:|---:|
+| i8 | ~5,500 | 37 | **148** |
+| i4 | ~2,100 | 17 | 123 |
+| f16 | ~1,900 | 21 | 90 |
+| i16 | ~950 | 14 | **67** |
+
+And fragmentation is not fixed — a module's sites **coalesce as its neighbours vacate**. Simulated for
+i16: **14 sites now → 11 after i8 → 5 if it goes last.** Same 950 lines for a third of the splices.
+
+**Revised order: i4 → f16 → i8 → i16.** i4 next (biggest contiguous run, 1,451 lines, moderate risk);
+i8 third rather than second so the private ABI is proven across three modules before the dyn-API
+entanglement; i16 last, when it has collapsed to ~5 sites. Within each lift: dominant run first,
+stragglers second.
+
+## What each lift actually costs (measured, updated per lift)
+
+| lift | lines moved | boundary in | boundary out | internal.h after |
+|---|---:|---:|---:|---:|
+| D `ssm.c` | 317 | 3 | 3 | 165 |
+| E `i4.c` | 728 | 21 + 4 types/enums | 4 | 274 |
+
+The boundary grows because the monolith is **layer**-organised, so a precision module lifted from the
+middle of a layer reaches back into everything around it. Expect internal.h to keep growing; that is the
+private ABI becoming explicit, not a defect. Every de-static must carry an `ork_`/`orki_` prefix — after
+commit E all 413 exported symbols do, which is cleaner than the pre-split baseline.
+
+**Validation cadence (revised after the wedge):** build + `nm` symbol diff + `check-registry` per lift
+(~40 s, no NPU); full `make test` once per module. **Never cap `make test` from outside** — the board's
+own per-test `timeout 360` is the bound. An outer `timeout 540 make test` killed make mid-test, orphaned
+`test_silu_native` on an in-flight submit, and wedged the NPU into a reboot.
 
 ---
 
