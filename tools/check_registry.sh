@@ -23,7 +23,10 @@ REG=OPS_REGISTRY.md
 [ -f "$REG" ] || { echo "check-registry: $REG missing"; exit 1; }
 fail=0
 
-SRC="src/npu.c include/ork_npu.h"
+# All library sources — globbed, NOT a hardcoded src/npu.c, so these gates keep working as the monolith
+# is split into src/npu/*.c (and deeper). Unmatched globs expand to themselves; the greps just miss them.
+LIBSRC=$(ls src/*.c src/*/*.c src/*/*/*.c 2>/dev/null || true)   # || true: set -e, and the deeper globs may not match yet
+SRC="$LIBSRC include/ork_npu.h"
 GGML="../llama.cpp/ggml/src/ggml-ork/ggml-ork.cpp"
 [ -f "$GGML" ] && SRC="$SRC $GGML"
 
@@ -42,7 +45,7 @@ arts_re=$(printf '%s' "$arts" | paste -sd'|' -)
 probes=$(grep -oE '[a-z0-9_]+_(probe|test|check|stress|bench)|(probe|test)_[a-z0-9_]+' "$REG" | grep -vE '^ork_' | sort -u)
 for p in $probes; do
   printf '%s\n' "$arts" | grep -qx "$p" && continue          # real tools/examples file
-  grep -qE "\b$p\b" src/npu.c 2>/dev/null && continue          # internal probe function
+  grep -qE "\b$p\b" $LIBSRC 2>/dev/null && continue           # internal probe function
   grep -qE "^$p:" Makefile 2>/dev/null && continue             # make target
   echo "check-registry: FAIL — cited probe '$p' has no tools/ or examples/ source, npu.c fn, or make target"
   fail=1
@@ -74,7 +77,7 @@ awk -F'|' -v arts="$arts_re" '
 # Enforces "0 ops not exported": a regcmd byte template that isn't declared as the implementation of some
 # ork_op (in ORK_REGCMD_BIND) is an orphan — an op the SDK can't name. New regcmd with no binding => fail.
 if [ -f src/ork_ops.c ]; then
-  regcmds=$(grep -oE '\bREGCMD_[A-Z0-9_]+\b' src/npu.c 2>/dev/null | grep -vE '_N$' | sort -u)
+  regcmds=$(grep -hoE '\bREGCMD_[A-Z0-9_]+\b' $LIBSRC 2>/dev/null | grep -vE '_N$' | sort -u)
   for rc in $regcmds; do
     grep -qE "\"$rc\"" src/ork_ops.c && continue
     echo "check-registry: FAIL — regcmd '$rc' has no op binding in src/ork_ops.c (ORK_REGCMD_BIND) — orphan regcmd / unexported op"
