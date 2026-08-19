@@ -89,7 +89,7 @@ static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  *   PRESERVED as a distinct, named strategy — the multi-task-submit batch (many 1-row tasks per submit, the
  *   vendor's int4 approach; task_number=rows) is a SEPARATE path and must NOT overwrite/conflate with this.
  *   Env var kept as ORK_I4_MSCHED for back-compat (0=off, 1=on). */
-static int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }
+int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_I4_NSUB: N-subslice the batch path so wide-N (Ncore*K > 131072 weight budget) still batches — split N
  * into ≤131072/K-column chunks, one batch submit each, instead of falling back to per-row. Default OFF until
  * board-validated; when off, msched keeps the weight-fit guard (whole-Ncore batch or per-row). */
@@ -132,7 +132,7 @@ static _Thread_local int g_in_slice_pack;
  * words (slot = core*Sn+ns); pcrc_meta holds 6 words/slot {valid,K,Nc,aA,aB,aC} — the reuse is address-
  * validated (a buffer realloc / dtype thrash changes an addr => miss => re-synth), so it is safe even
  * without ORK_MIXED_NOTHRASH. Allocated lazily on first decode; freed in ork_w_free. rkllm's static-regcmd lever. */  /* owns=1: per-tile bcreate, reclaimable by ork_mm_free; owns=0: arena views (freed at teardown). own_buf: a single dedicated DMA buffer backing ALL of this weight's tiles as base+offset VIEWS (grouped-i4) — reclaimed as one bdestroy by ork_mm_free (own_buf_valid=1), tiles are non-owning views so they are NOT individually destroyed. own_bufs/n_own_bufs: the SIZE-BOUNDED variant (chunked consolidated import) — a weight's tiles are packed into a handful of moderate (ORK_IMPORT_CHUNK_MB, ~16MB) imported dma-buf chunks instead of one giant per-weight buffer (which hangs the DMA_HEAP_ALLOC) or one bimport per tile (which faults the chain-walk with too many foreign mappings); tiles are base+offset views into their chunk; ork_mm_free bdestroys every chunk. Bi4: optional host-side int4-packed (nibble) weight store for pack_i4a8 — the memory-compact form (K*N/2 B) for .orkpack/streaming dump; NPU-side runs int8 (DT_I8). quant_kind: ORK_QK_* — how the nibbles in Bi4 inflate (UNIFORM sign-extend now; CODEBOOK_NF4 LUT reserved). bscale: optional per-output-channel dequant scale (length N) retained alongside Bi4 so the compact int4 form (pack_i4a8 / load_i4a8) can be dumped + reloaded self-contained. domain: this weight's NPU IOMMU domain id (0 = default); its resident tiles live there and its submits run against it — multi-domain residence lets >4 GiB of weights stay resident across domains (the per-domain 32-bit IOVA cap). */
-static int check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
+int orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
     if (a_start < c_end && c_start < a_end) {
         fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
                 name, (void*)a_start, (void*)a_end, (void*)c_start, (void*)c_end);
@@ -183,12 +183,12 @@ static int is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const st
 }
 /* Last regcmd context (set by validate_regcmd) — dumped on a submit failure to PIN which weight/op/domain/
  * import-status faulted (e.g. the multi-domain import scale-fault: errno=22). */
-static const char *g_last_op = "?"; static int g_last_K=0, g_last_N=0, g_last_wdom=-1, g_last_import=0;
-static int orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
+const char *orki_last_op = "?"; int orki_last_K=0, orki_last_N=0, orki_last_wdom=-1, orki_last_import=0;
+int orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
     /* stash context so a later submit failure can name the exact weight/op/domain/import-status that faulted */
-    g_last_op = op ? op : "?";
-    if (w) { g_last_K = w->K; g_last_N = w->N; g_last_wdom = w->domain;
-             g_last_import = (w->own_buf_valid && w->own_buf.heap_fd > 0) ||
+    orki_last_op = op ? op : "?";
+    if (w) { orki_last_K = w->K; orki_last_N = w->N; orki_last_wdom = w->domain;
+             orki_last_import = (w->own_buf_valid && w->own_buf.heap_fd > 0) ||
                              (w->own_bufs && w->n_own_bufs > 0 && w->own_bufs[0].heap_fd > 0) ||
                              (w->Bb && w->Bb[0].heap_fd > 0) || (w->Bf && w->Bf[0].heap_fd > 0); }
     for (int k = 0; k + 1 < n; k += 2) {
@@ -238,7 +238,7 @@ static int orki_int8_ks(ork_npu *c){ (void)c;
  * (no env needed); the engine sets a core budget via ork_npu_set_core_budget.
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
-static int orki_budget(ork_npu*c, int M){
+int orki_budget(ork_npu*c, int M){
     /* M=1 is single-core by default here; the int8 DECODE path in orki_run() overrides to the multi-core budget
      * (it calls orki_budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
      * +40% end-to-end decode (Qwen3-1.7B) and MONOTONIC in the in-model N-sweep: every int8 shape benefits,
@@ -362,7 +362,7 @@ static void ork_sig_teardown(int sig){
             struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); } }
     signal(sig,SIG_DFL); raise(sig);
 }
-static struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
+struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     int dom=ork_dom(domain); size_t need=orki_pgup(size);
     /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (g_sram_total
      * ==0, stock kernel/DTB), drop to DRAM up front — don't even try. If SRAM exists but the alloc faults
@@ -389,7 +389,7 @@ static struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     g_bcreate_n++;
     return b;
 }
-static void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
+void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
     live_del(b->handle); orki_imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
     g_bdestroy_n++;
@@ -475,7 +475,7 @@ static struct buf orki_bimport(int fd,size_t size,int domain){ return orki_bimpo
  * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
  * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
  * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
-static struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
+struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
     /* int8/fp16 (scratch_import unset): bcreate — the proven path, UNCHANGED. int4 RESIDENT (scratch_import set
      * once weights are bimported): a fresh bcreate GEM can't be placed amid ~GiB of imported SG mappings in the
      * same domain (kernel EINVAL once the domain is heavy — mc_ensure mtk_all -> decode -3). Route scratch through
@@ -598,8 +598,8 @@ static void ork_dom_reanchor(ork_npu *c, int dom){
  * timeout_clean reaps. That's why the earlier ACT_RESET version failed.) No-op unless a real drop set dom_dirty
  * (rare); clean runs + single-domain pay nothing. Between-ops / pre-teardown only (no live pool workers). */
 static void ork_npu_reap_stuck(ork_npu *c, int nc);   /* fwd: per-core timeout_clean reap (defined below) */
-static int i4_submit_tmo_ms(void);                    /* fwd: bounded int4 doorbell submit timeout (defined near the int4 workers) */
-static void ork_dom_flush_if_dirty(ork_npu *c){
+int orki_i4_submit_tmo_ms(void);                    /* fwd: bounded int4 doorbell submit timeout (defined near the int4 workers) */
+void ork_dom_flush_if_dirty(ork_npu *c){
     if(!c || !c->dom_dirty) return;
     if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[dom] dirty-REAP on dom=%d (wait-past-timeout + timeout_clean the stuck job before switch)\n", c->dom_active);
     /* #54 COMBINED BOUNDARY FIX. The switch waits up to 6s for iommu_domain_refcount==0, so a 6s timeout means a
@@ -609,15 +609,13 @@ static void ork_dom_flush_if_dirty(ork_npu *c){
      * reapable + any last in-flight op has time to retire; then (2) per-core reap dummy triggers timeout_clean.
      * Second reap pass catches a reap-dummy that itself dropped (its own short timeout has elapsed by then).
      * Only on a dirty (real-drop) boundary — rare — so the ~1.7s is paid only when a switch would otherwise wedge. */
-    { int ms = i4_submit_tmo_ms() + 200; struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+    { int ms = orki_i4_submit_tmo_ms() + 200; struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
     ork_npu_reap_stuck(c, c->soc->cores);
     { struct timespec ts = {0, 400*1000000L}; nanosleep(&ts,NULL); }   /* let a dropped reap-dummy pass its 300ms timeout */
     ork_npu_reap_stuck(c, c->soc->cores);
     c->dom_dirty=0;
 }
-static void orki_bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
-static void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* Reserve `need` contiguous bytes of resident weight storage from the arena pool; returns the backing chunk
  * (and sets *base = byte offset within it) or NULL if a fresh chunk can't be allocated (caller then falls
  * back to per-tile bcreate). Chunk size = ORK_WARENA_CHUNK_MB (default 1 GiB), kept under the single-alloc
@@ -647,7 +645,7 @@ static void orki_act(int fd,uint32_t f,uint32_t v){
  * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
  * use, so the run path's lazy bcreate allocates it in `dom` via c->dom_active). No-op when
  * single-domain (dom==dom_active and only domain 0 ever used). */
-static void orki_dom_activate(ork_npu *c,int dom){
+void orki_dom_activate(ork_npu *c,int dom){
     if(dom<0) dom=0;
     if(dom==c->dom_active) return;
     /* #54 RETIREMENT BARRIER: a nonblock doorbell op is "done" when its output cell lands, which can be BEFORE
@@ -757,7 +755,7 @@ static void dump_submit(struct rknpu_submit *sub) {
 }
 static void trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) dump_submit(sub); }
 
-static int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
     if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
@@ -770,7 +768,7 @@ static int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain)
         if(!tf){ tf=fopen(getenv("ORK_PRESUBMIT_TRACE"),"w"); }
         if(tf){ size_t iov=0; for(int d=0;d<ORK_IOVA_NDOM;d++) iov+=g_iova_bytes[d];
             fprintf(tf,"#%ld op=%s K=%d N=%d wdom=%d imported=%d | submit_dom=%u tasks=%u core=0x%x | iova_total=%zuMiB dom[0]=%zu dom[1]=%zu dom[2]=%zu | crt=%ld imp=%ld dst=%ld live=%ld\n",
-                    ++sn, g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import,
+                    ++sn, orki_last_op, orki_last_K, orki_last_N, orki_last_wdom, orki_last_import,
                     sub->iommu_domain_id, sub->task_number, sub->core_mask, iov>>20,
                     g_iova_bytes[0]>>20, g_iova_bytes[1]>>20, g_iova_bytes[2]>>20,
                     g_bcreate_n, g_bimport_n, g_bdestroy_n, g_bcreate_n+g_bimport_n-g_bdestroy_n);
@@ -805,7 +803,7 @@ static int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain)
         }
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
                 rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
-                g_last_op, g_last_K, g_last_N, g_last_wdom, g_last_import);
+                orki_last_op, orki_last_K, orki_last_N, orki_last_wdom, orki_last_import);
         /* live per-domain IOVA usage AT THE FAILURE POINT: shows whether the domain overflowed (size/pressure)
          * vs a non-size DMA-walk stall. g_iova_bytes counts resident tiles + imports + transient scratch. */
         { size_t tot=0; for(int d=0; d<ORK_IOVA_NDOM; d++) if(g_iova_bytes[d]){ fprintf(stderr,"  [iova@fail] domain %d live=%zu MiB (ceil %zu MiB)\n", d, g_iova_bytes[d]>>20, ork_iova_ceiling()>>20); tot+=g_iova_bytes[d]; }
@@ -819,7 +817,6 @@ static int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain)
 }
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
-static void orki_setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
 #include "ork_regs.h"
 /* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
  * offset) from the rocket-cross-referenced table and validates the value fits the register's defined field
@@ -952,8 +949,8 @@ static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t a
     orki_setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,           mc-1);
     for(int i=0;i<g_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
-static unsigned mm_timeout_ms(void);   /* fwd (defined below) */
-static uint32_t ork_ppflags(void);     /* fwd (defined below) */
+unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
+uint32_t ork_ppflags(void);     /* fwd (defined below) */
 /* #39 WEIGHT-RESIDENT M-FOLD CHAIN (task_number=P). Each of P tasks is a width-`w` mfold tile built by the
  * validated synth_i8_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all
  * P tasks (HW PC-chain), amortizing the weight-DMA over M=P*w rows. Chain descriptor written at words 216-219
@@ -997,7 +994,7 @@ int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _CSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
     _CSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; }        /* warm */
     orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -1074,7 +1071,7 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _CAPSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
     _CAPSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; }        /* warm */
     orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -1127,7 +1124,7 @@ int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _MSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
     _MSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto mdone; }
     { double t0=ork_now_us();
@@ -1181,7 +1178,7 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _VSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
+        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
     _VSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; }
     orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -1208,7 +1205,7 @@ static void *ork_fbc_thread(void *vp){
     sub.flags=ork_ppflags(); sub.task_number=(uint32_t)a->P; sub.task_obj_addr=a->tk->obj; sub.fence_fd=-1;
     sub.core_mask=1u<<a->core;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)a->P};
-    sub.timeout=mm_timeout_ms();
+    sub.timeout=orki_mm_timeout_ms();
     a->rc = orki_rknpu_submit_ioctl(a->fd,&sub,a->dom);
     return NULL;
 }
@@ -1802,7 +1799,7 @@ static unsigned ew_timeout_ms(void){ static int t=-1; if(t<0){const char*e=geten
 /* Matmul-path submit timeout (ms). ORK_MM_TIMEOUT lets a mode-transition wedge-search fail fast (~1-2s)
  * instead of the 60s job timeout — the kernel soft-resets on timeout either way, so a short guard is safe
  * for RE. Default 60000 (unchanged production behavior). Mirrors ew_timeout_ms for the run/chain paths. */
-static unsigned mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_MM_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
+unsigned orki_mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv("ORK_MM_TIMEOUT"); t=e?atoi(e):60000;} return (unsigned)(t>0?t:60000); }
 
 /* Generalize the standalone element-wise MUL op (REGCMD_MUL{,_F16,_I16}) from the captured M=8,N=64 geometry
  * to arbitrary (M tokens = RDMA width, N channels). Derived by capturing the op at N=128 and M=16 and diffing:
@@ -1929,7 +1926,7 @@ static void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int sh
 static struct { uint32_t blk, reg, val; } g_i4_fovr[16]; static int g_i4_fovr_n=0;
 void ork_i4_fuzz_clear(void){ g_i4_fovr_n=0; }
 void ork_i4_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i4_fovr_n<16){ g_i4_fovr[g_i4_fovr_n].blk=blk; g_i4_fovr[g_i4_fovr_n].reg=reg; g_i4_fovr[g_i4_fovr_n].val=val; g_i4_fovr_n++; } }
-static void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
@@ -2243,7 +2240,7 @@ ork_npu *ork_npu_init_orkd(void){
  * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
  * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
  * select the transport by calling the desired entry point rather than relying on the env. */
-static int orki_mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
+int orki_mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
@@ -2383,7 +2380,7 @@ void *ork_dma_import_fd(ork_npu *c, int dmabuf_fd, size_t size){
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
-static struct buf *orki_dma_find(ork_npu *c, const void *p){
+struct buf *orki_dma_find(ork_npu *c, const void *p){
     for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
         if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
     return NULL;
@@ -4258,7 +4255,7 @@ static void tile_i4_Bslice(uint8_t*dst,const int8_t*B,int K,int N,int k0,int Kp,
     }
 }
 /* a Kp-slice of one A row -> native (Kp/32,1,32) int4 */
-static void tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
+void orki_tile_i4_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp){
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     int col = 0;
     int8x16_t vmask = vdupq_n_s8(0x0f);
@@ -4521,9 +4518,9 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
      * while the caller (e.g. ggml-ork) maintains the 50% footprint reduction on disk. */
     return ork_mm_pack_i8(c, K, N, B);
 }
-static int run_i4_bchain_db(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* #52: BCHAIN batch on the nonblock doorbell */
+int orki_run_i4_bchain_db(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,int nc);  /* #52: BCHAIN batch on the nonblock doorbell */
 static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
-static int i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
+int orki_i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
 static int ork_dyn_grouped_end(ork_dyn_chain *h);  /* B: grouped-int4 float scale-accumulate drain */
 int ork_dyn_end(ork_dyn_chain *h);
@@ -4547,13 +4544,13 @@ static int run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C
  * Collapses the per-expert submit storm (2059 matmuls x 3 cores) to ~nc submits per _exps tensor. All experts
  * MUST share one iommu domain (the doorbell = one submit = one domain); the caller streams a layer's experts
  * into a single domain. Returns 0 ok, -4 refuse (chain/buffer too big -> caller falls back), -1 error. */
-static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
+int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
 int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     if(!c || ntask<1 || !ex) return -1;
     for(int e=0;e<ntask;e++){ ork_w*w=ex[e].w;
         if(!w||w->dtype!=DT_I4||w->Sk!=1||w->Sn!=1||(w->N%64)||ex[e].M<1) return -2;
         if(w->domain!=ex[0].w->domain || w->K!=ex[0].w->K || w->N!=ex[0].w->N) return -2; }  /* one submit => one domain + one shape */
-    return run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
+    return orki_run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
 }
 /* Async pipelined submit (precision-agnostic) — orkd+ring mode only. Enqueue one matmul for w WITHOUT blocking
  * and get a ticket; ork_mm_collect(ticket) reads C later. Returns <0 if unavailable (no ring, or the op is too
@@ -4579,7 +4576,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * in domain N submits against the stale dom_active (e.g. 0) -> RKNPU_SUBMIT EINVAL(22) -> self-heal reset ->
      * retry (correctness held via the reset, but every cross-domain expert submit thrashed -> very slow). */
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
-    if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=orki_budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
     /* DEFAULT int4 M>1 prefill: BCHAIN batch-chain on the NONBLOCK doorbell (run_i4_bchain_db) — H-row native
@@ -4595,7 +4592,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * drain (poll + mc_recover_resubmit + reap-at-boundary), so it is multi-domain-safe like int8 colsplit AND
      * keeps its M-batching. bch_db_worker builds+submits only; ork_dyn_end owns the drain (i4batch hooks). Falls
      * through (-4) to the per-row doorbell (run_i4_mc_db) for decode (M=1) / non-qualifying shapes. */
-    if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=run_i4_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
+    if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=orki_run_i4_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     /* Wide refuse-prone int4 PREFILL (Sn>1 or K>8192 — the shapes pack built w->sliced for): the per-row
      * run_i4_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled
      * rescue (measured 663ms -> 107ms at M=128 N=16384). Decode (M==1) stays on the per-row path (cheap). */
@@ -4622,7 +4619,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * OFF) — ping-pong swaps register banks the instant a task's register config is done, which can race a task's
  * SRAM/side-effect commit and STALL (errno 110), esp. in mixed/chained programs. RE knob to test whether a
  * chain stall is the ping-pong race (vs IOVA). Default unchanged (0x5). */
-static uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO_PINGPONG"); v=(e&&atoi(e))?1:5;} return (uint32_t)v; }
+uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO_PINGPONG"); v=(e&&atoi(e))?1:5;} return (uint32_t)v; }
 static int orki_submit1(ork_npu *c){
     int fd=c->fd;
     static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
@@ -4632,7 +4629,7 @@ static int orki_submit1(ork_npu *c){
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
-    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
+    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
@@ -4652,10 +4649,10 @@ static int orki_submit1_db(ork_npu *c, size_t nout){
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     volatile int32_t *o=(volatile int32_t*)c->Cc.cpu; size_t li=nout-1;
     int reps=c->warmed?1:2;
-    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
+    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
-        double pt=ork_now_us(), cap=(double)mm_timeout_ms()*1000.0;
+        double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0;
         for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
@@ -4664,7 +4661,7 @@ static int orki_submit1_db(ork_npu *c, size_t nout){
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
  * so this is dynamic, not hardwired to a chip's core total. ---- */
-static int orki_mc_ensure(ork_npu *c,int nc){
+int orki_mc_ensure(ork_npu *c,int nc){
     int fd=c->fd;
     if(!c->mtk_all.cpu) {
         c->mtk_all=orki_bscratch(c, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
@@ -4711,7 +4708,7 @@ void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?g_mc_synth[core]:0; }
 
-static void orki_pin_big_core(int id){
+void orki_pin_big_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
     if(off) return;
 #if defined(__linux__)
@@ -4752,7 +4749,7 @@ static void *npu_pool_worker(void *vp){
             pthread_mutex_lock(&c->pmu); if(++c->pdone==nc-1) pthread_cond_signal(&c->pdn); pthread_mutex_unlock(&c->pmu); }
     }
 }
-static void npu_pool_ensure(ork_npu *c){
+void orki_npu_pool_ensure(ork_npu *c){
     if(c->pool_n) return;
     orki_pin_big_core(0);                           /* calling thread drives NPU core 0 — keep it big too */
     c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
@@ -4829,7 +4826,6 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; orki_act(c->fd,RKNPU_ACT_RES
  * OCK_SW = run_stream_* round-robin (multi-submit, per-core); OCK_HW = run_chain_i8 / chain_progs
  * PC-chain (one submit, task_number>1); OCK_FUSED = run_chain_i8_ffn static regcmd graph (carries
  * in-chain SDP/LUT ops — ping-pong/LUT-commit rules differ; that specialness lives in the chain body). */
-enum ork_chain_kind { OCK_NONE=0, OCK_SW, OCK_HW, OCK_FUSED };
 /* keep-warm predicate selector (from = c->last_dt, to = target marker) */
 enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
 /* reset condition selector */
@@ -4840,8 +4836,6 @@ enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
 enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
 struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
 /* transition profiles — one row per distinct historical site (line refs = pre-refactor src/npu.c) */
-enum { XP_MC_MM, XP_SC_MM, XP_CHAIN_NT, XP_STREAM_I8, XP_STREAM_F16,
-       XP_I4_MC, XP_I4_MWARM, XP_I4_INCR, XP_I4CHAIN, XP_I4_STREAM, XP_SDP, XP_NPROFILE };
 static const struct ork_xspec XSPEC[XP_NPROFILE] = {
   /* XP_MC_MM      3596  run_multicore   */ { KWP_MC,  RC_I8ENTRY,       TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT_NOTKW, 1 },
   /* XP_SC_MM      4211  run single-core */ { KWP_SC,  RC_I8ENTRY,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NT_NOTKW, 1 },
@@ -4872,7 +4866,7 @@ static void ork_npu_xprof_dump(void){
     for(int p=0;p<XP_NPROFILE;p++){ long tot=0; for(int f=0;f<8;f++) tot+=g_xcount[p][f]; if(!tot) continue;
         fprintf(stderr,"  %-11s:",XPNAME[p]); for(int f=0;f<8;f++) if(g_xcount[p][f]) fprintf(stderr," %s=%ld",XFROM[f],g_xcount[p][f]); fprintf(stderr,"\n"); }
 }
-static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
+int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     const struct ork_xspec *x=&XSPEC[profile];
     int from=c->last_dt, fd=c->fd;
     /* Record the chaining mechanism as transition state. For the common case it has NO bearing on the
@@ -5174,7 +5168,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 
 int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
-    if(check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* Grouped int4 runs on the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float scale-accumulate
      * drain). NULL (chain/scratch too big / ineligible) => refuse (rescue-eligible); the blocking
      * i4_mcworker_g path is removed (#45). */
@@ -5379,7 +5373,7 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_F16,A,C); if(r!=-2) return r; }
         return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_F16)return -1;
-    if(check_overlap("ork_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K * 2, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K * 2, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     return orki_run(c,w,M,A,C);
 }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
@@ -5393,7 +5387,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I8,A,C); if(r!=-2) return r; }
         return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_I8) return -1;
-    if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real
      * orki_run (NOT a synthetic tool). A garbage => backend act-quant (stage 2); C garbage w/ sane A => weight
      * bytes/tiling (stage 1); both sane => the garbage is dequant/scales (stage 4). Flushed per line. */
@@ -5572,7 +5566,7 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
             acc[i]=(struct slc_acc){ tasks, C, nks, nnt, ns, N, M, cc0, cc1 }; }
         if(anc==1){ slice_acc_worker(&acc[0]); }
         else {
-            npu_pool_ensure(c);
+            orki_npu_pool_ensure(c);
             pthread_mutex_lock(&c->pmu);
             c->pjob=acc; c->pjob_nc=anc; c->pjob_fn=slice_acc_worker; c->pjob_stride=sizeof(struct slc_acc);
             c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
@@ -5585,7 +5579,7 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
 }
 
 /* int4 sliced orki_run (#33): decompose a refused int4 shape into BCHAIN-legal sub-tiles (Sk==1, Sn==1, N%64,
- * K<=8192) and run EACH via run_i4_bchain_db (M>=2) or the per-row doorbell (M==1) — reusing #52's
+ * K<=8192) and run EACH via orki_run_i4_bchain_db (M>=2) or the per-row doorbell (M==1) — reusing #52's
  * self-healing / pool / de-tile machinery as a black box — then int32-accumulate the K-slices + scatter N
  * (int4 C is int32 after BCHAIN's de-tile, so the int8 slice_acc_worker applies verbatim). Tiles run
  * sequentially (each internally multi-core); a tile that refuses/fails fails the whole rescue -> the caller
@@ -5608,7 +5602,7 @@ static int slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
             int32_t *ptile = part + poff; poff += (size_t) M * Nw;
             tasks[ki*nnt + ni] = (ork_mm_task_i8){ w->sub[ki*nnt + ni], M, aptr, ptile };
             int nct = nc>0 ? nc : c->soc->cores; int nb = Nw/64; if (nct > nb) nct = nb; if (nct < 1) nct = 1;
-            int r = (M >= 2) ? run_i4_bchain_db(c, w->sub[ki*nnt + ni], M, aptr, ptile, nct)   /* BCHAIN batch on the doorbell */
+            int r = (M >= 2) ? orki_run_i4_bchain_db(c, w->sub[ki*nnt + ni], M, aptr, ptile, nct)   /* BCHAIN batch on the doorbell */
                              : run_i4_mc_db    (c, w->sub[ki*nnt + ni], M, aptr, ptile, nct);  /* M==1 per-row doorbell */
             if (r < 0) rc = -1; } }
     if (!rc) {   /* per-core PARALLEL ks-outer int32 accumulate + N scatter (same worker as int8) */
@@ -5618,7 +5612,7 @@ static int slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
             acc[i]=(struct slc_acc){ tasks, C, nks, nnt, ns, N, M, cc0, cc1 }; }
         if(anc==1){ slice_acc_worker(&acc[0]); }
         else {
-            npu_pool_ensure(c);
+            orki_npu_pool_ensure(c);
             pthread_mutex_lock(&c->pmu);
             c->pjob=acc; c->pjob_nc=anc; c->pjob_fn=slice_acc_worker; c->pjob_stride=sizeof(struct slc_acc);
             c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
@@ -6230,7 +6224,7 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
+    for(int rep=0;rep<3;rep++){ sub.timeout=orki_mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
         if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -6258,7 +6252,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();   /* rep0 warmup (cold buffer stale), rep1 real */
+    for(int rep=0;rep<2;rep++){ sub.timeout=orki_mm_timeout_ms();   /* rep0 warmup (cold buffer stale), rep1 real */
         if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
@@ -6291,7 +6285,7 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
+    for(int rep=0;rep<3;rep++){ sub.timeout=orki_mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
         if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -6343,7 +6337,7 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();
+    for(int rep=0;rep<3;rep++){ sub.timeout=orki_mm_timeout_ms();
         double t0=ork_now_us();
         if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
@@ -6603,7 +6597,7 @@ int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
       t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj;
-    sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=mm_timeout_ms();
+    sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=orki_mm_timeout_ms();
     int ok=-1;
     for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ ok=-1; continue; } orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }   /* fp16 cold 2-pass re-warm */
     if(ok==0){ uint16_t *od=(uint16_t*)out, *os=(uint16_t*)O.cpu; for(size_t i=0;i<(size_t)M*N;i++) od[i]=os[i]; }   /* CONTIGUOUS fp16 readback */
@@ -8295,7 +8289,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
-    g_last_op="silu_i16_op"; g_last_K=M; g_last_N=N; g_last_wdom=0; g_last_import=0;   /* accurate wedge telemetry (no validate_regcmd here) */
+    orki_last_op="silu_i16_op"; orki_last_K=M; orki_last_N=N; orki_last_wdom=0; orki_last_import=0;   /* accurate wedge telemetry (no validate_regcmd here) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* int16 atom-8, 2-byte, surf_stride=M*16 */
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
      * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
@@ -8395,7 +8389,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
  * (0x1070/0x1110/0x4020 — the only addresses a plain INT8_MM_INT8_TO_INT32 regcmd references) to them,
  * submits single-core task_number=1 (chain-links ignored at n=1), warms once, times `iters`. rkllm's task
  * descriptor is identical to ork's (enable=0xd,int_mask=0x300,regcfg_amount=108 — verified from capture).
- * SAFETY: mm_timeout_ms() so a bad regcmd self-terminates (soft, reboot-recoverable) rather than hanging. */
+ * SAFETY: orki_mm_timeout_ms() so a bad regcmd self-terminates (soft, reboot-recoverable) rather than hanging. */
 int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
                       const int8_t *Adata, int Abytes, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us){
     int fd=c->fd; if(fd<0) return -3; if(rn<8 || rn>2048 || M<1 || (K%32) || (N%16)) return -2;
@@ -8435,7 +8429,7 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _RSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
-        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
     /* #39 intermittency probe: the raw mfold replay bypasses ork_npu_enter, so it never does the
      * mode-ENTRY ACT_RESET that the normal path fires when the schedule/precision mode changes. The
      * mfold is an unusual-mode regcmd entered right after an int8-normal warmup — hypothesis: the
@@ -8481,7 +8475,7 @@ int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, i
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _SSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
-        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
     size_t acp=(size_t)astride; if(acp>aszg)acp=aszg;
     memset(A.cpu,0,aszg); memcpy(A.cpu,Avar,acp); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);   /* warm w/ variant 0 */
     _SSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
@@ -8524,7 +8518,7 @@ int ork_npu_replay_i8_amap(ork_npu *c, const uint32_t *regcmd, int rn, int M, in
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub; int8_t *ab=(int8_t*)A.cpu; int32_t *cb=(int32_t*)Cc.cpu;
     #define _ASUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
-        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
+        sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
     #define _FILLA(pl) do{ for(size_t j=0;j<aszg;j++) ab[j]=(int8_t)((pl<0)?1:((j>>(7*(pl)))&0x7f)); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
     /* warm */
     memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[0]]=1; orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -8665,7 +8659,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
+      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_mm_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
 
@@ -8682,7 +8676,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
       orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       int ok=-1; double t1=0;
-      for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms(); double t0=ork_now_us();
+      for(int rep=0;rep<3;rep++){ sub.timeout=orki_mm_timeout_ms(); double t0=ork_now_us();
           if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ ok=-1; break; }
           orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
       if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
@@ -9347,7 +9341,7 @@ static void *ork_pcfd_thread(void *vp){
     sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=a->tk->obj; sub.fence_fd=-1;   /* BLOCKING per-core submit */
     sub.core_mask=1u<<a->core;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    sub.timeout=mm_timeout_ms();
+    sub.timeout=orki_mm_timeout_ms();
     ork_kmsg("PCFD core=%d submit START fd=%d task_obj=0x%llx", a->core, a->fd, (unsigned long long)a->tk->obj);
     a->rc = orki_rknpu_submit_ioctl(a->fd,&sub,0);   /* buffers all live in domain 0 */
     ork_kmsg("PCFD core=%d submit DONE rc=%d", a->core, a->rc);
@@ -9506,7 +9500,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     for(int i=0;i<ntask;i++){memset(&t[i],0,sizeof t[i]);t[i].flags=0;t[i].op_idx=i;t[i].enable_mask=0xd;t[i].int_mask=0x300;t[i].int_clear=0x1ffff;t[i].regcfg_amount=108;t[i].regcmd_addr=c->regcmd.dma + i * sizeof(rc);}
     orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();
+    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_mm_timeout_ms();
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     if(orki_rknpu_submit_ioctl(fd,&sub,-1)){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -1;} orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
@@ -9547,7 +9541,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();
+    for(int rep=0;rep<2;rep++){ sub.timeout=orki_mm_timeout_ms();
         if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
         orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
     orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
@@ -9605,7 +9599,7 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
         struct buf extra[2] = {W, O};
         if (orki_validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
         memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        sub.timeout=mm_timeout_ms(); ok=-1;
+        sub.timeout=orki_mm_timeout_ms(); ok=-1;
         for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
             orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
@@ -9724,7 +9718,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     
     int ok = -1;
     for (int rep = 0; rep < 2; rep++) {
-        sub.timeout = mm_timeout_ms();
+        sub.timeout = orki_mm_timeout_ms();
         if (orki_rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
         orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         for (int i = 0; i < S; i++) {
@@ -9824,7 +9818,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     sub.core_mask = RKNPU_CORE0_MASK;
     sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
-    sub.timeout = mm_timeout_ms();
+    sub.timeout = orki_mm_timeout_ms();
     if (orki_rknpu_submit_ioctl(fd, &sub, -1)) {
         perror("Warmup failed");
     }
@@ -10191,7 +10185,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         // falls back to per-task run_i8 (which K-splits correctly). -3 distinguishes this from bad-arg -2.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
         // M>mcap is fine — the synth loop M-tiles it into multiple chained programs (Step B below).
-        if (check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
+        if (orki_check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
     /* P1a — SPINE MIGRATION (submit consolidation). Route the plain (ss==NULL) M=1 single-slice resident-C
@@ -10505,7 +10499,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     int reps = do_steer ? 1 : (c->warmed ? 1 : 2);
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
-        sub.timeout = mm_timeout_ms();
+        sub.timeout = orki_mm_timeout_ms();
         if (fdb_on) {   /* seed the final-output sentinel and clean it to DRAM before the NONBLOCK submit */
             for (size_t e = 0; e < fno; e++) fdb[e] = 0x7fffffff;   /* == ORK_DYN_SENT (defined below) */
             orki_bsync(fd, fbuf, RKNPU_MEM_SYNC_TO_DEVICE);
@@ -10513,7 +10507,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
         if (fdb_on) {   /* doorbell drain: last-word gate, then a full-surface verify (bounded) */
-            double pt = ork_now_us(), cap = (double)mm_timeout_ms() * 1000.0;
+            double pt = ork_now_us(), cap = (double)orki_mm_timeout_ms() * 1000.0;
             for (;;) { __asm__ volatile("dc civac,%0"::"r"(&fdb[fno-1]):"memory"); if (fdb[fno-1] != 0x7fffffff) break; if (ork_now_us()-pt > cap) break; }
             for (;;) { int dn = 1; for (size_t e = 0; e < fno; e++) { __asm__ volatile("dc civac,%0"::"r"(&fdb[e]):"memory"); if (fdb[e] == 0x7fffffff) { dn = 0; break; } } if (dn || ork_now_us()-pt > cap) break; }
         }
@@ -10593,7 +10587,7 @@ int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *c
     if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
         orki_dom_activate(c, chains[0][0].w->domain);
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
-    npu_pool_ensure(c);
+    orki_npu_pool_ensure(c);
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
     pthread_mutex_lock(&c->pmu);
@@ -10631,7 +10625,7 @@ int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *c
     if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
         orki_dom_activate(c, chains[0][0].w->domain);
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
-    npu_pool_ensure(c);
+    orki_npu_pool_ensure(c);
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
     pthread_mutex_lock(&c->pmu);
@@ -10651,78 +10645,16 @@ int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *c
  * for runtime routing. v1 constraints: M=1 per task, single-slice conforming K (K%512==0, K<=4096), and A/C
  * resident in ork_dma_alloc buffers (so we hold DMA addrs + poll outputs coherently). One program per task
  * (P==S). Steering must lead the sequencer by ~1-2 ops (time it off ork_dyn_progress). */
-struct ork_dyn_chain {
-    ork_npu *c; int S, P, N, reserve, mc, spin_end; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core; spin_end = reserve if the tail is a persistent spin (forward-chained), else 0 */
-    struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
-    int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
-    int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
-    int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
-    int        oSk[1024];       /* per-op K-split count: >1 => the op's output is oSk partial [M,N] blocks in scratch
-                                 * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
-    int        ostride[1024];   /* per-op copy-back dst row stride (elements): >0 => end() writes [M, nout/M] scratch
-                                 * to dst at this row stride (a column-slice of a wider C, colsplit M>1). 0 = contiguous. */
-    int        ocol0[1024];     /* colsplit balanced wide-N: this core's first C column (c0). With oscat, end()
-                                 * recomputes the within-slice segment widths from (ocol0, nout/oM, N, nmax). */
-    int8_t     oscat[1024];     /* 1 => balanced wide-N BOUNDARY-SCATTER copy-back: scratch is segment-major
-                                 * [M,segw] blocks (each program contiguous, no notch); end() scatters each segment
-                                 * to C[c0+coff .. ) at row-stride N, segment widths cut at nmax slice boundaries. */
-    int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
-    struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
-    int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
-                                 * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
-                                 * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
-    int        mc_nc;           /* DIAG/RECOVER (ork_dyn_begin_mc only; 0 elsewhere): core count for this round */
-    int        mc_rc[8];        /* DIAG: per-core submit-ioctl return code (0 = accepted) */
-    uint64_t   dma_rw0;         /* NPU cumulative dma_rw BEFORE the round; delta = HW work (0 => never dispatched) */
-    /* RECOVER context: ork_dyn_end resubmits the round on a not-dispatched miss (the ~1/4000 concurrent
-     * NONBLOCK dispatch race). c->maf/mrc/mtk[i] still hold the round's data (not reused until end), so the
-     * stashed submits replay it. int8 only (mc_dt); fp16 drains in-submit. */
-    struct rknpu_submit mc_subs[ORK_MAXCORE];
-    int        mc_Pc[ORK_MAXCORE];
-    unsigned   mc_dom; int mc_seed_all; int mc_dt;
-    /* #54 BCHAIN-ON-THE-SHARED-DRAIN (i4batch): the M-batched int4 BCHAIN (run_i4_bchain_db) now builds its
-     * per-core programs then rides ork_dyn_end for poll + recover (the PROVEN shared drain int8 colsplit uses),
-     * instead of a hand-rolled per-worker poll/recover. Its output is 2D-tiled (not per-row/dense), so the poll
-     * (ork_dyn_done_i), the recover re-seed (mc_recover_resubmit), and the de-tile (ork_dyn_end writeback) all
-     * delegate to bch_db_cells with this stored geometry — preserving the mode-1 gate, mode-4 collision-tolerance
-     * (SENT16=0x7fff reachable), and mode-2 int16->int32 de-tile. */
-    int        i4batch;                 /* 1 = BCHAIN programs drained by ork_dyn_end via bch_db_cells */
-    int        b_H, b_Wb, b_Wmax, b_NG, b_M, b_N;   /* BCHAIN geometry (shared across cores) */
-    int        b_c0[ORK_MAXCORE], b_c1[ORK_MAXCORE], b_NT[ORK_MAXCORE];   /* per-core N-chunk range + program count */
-    int32_t   *b_C;                    /* caller's int32 C (de-tile destination) */
-    int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
-                             * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
-    int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
-                             * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
-    /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
-     * blocks scaled + FLOAT-accumulated — C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]. */
-    int          i4g;              /* 1 = grouped-int4 float drain */
-    const float *i4g_aS, *i4g_bS;  /* activation scale (M*Sk), weight scale (Sk*N) — caller host arrays */
-    float       *i4g_Cf;           /* float output C[M,N] */
-    int          i4g_N, i4g_Sk;    /* N + group count */
-    /* SEQ chain (ork_dyn_begin_seq_i8 — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
-     * all ops share ONE output scratch; per-op layout/esz differ (matmul int32 dense, SDP int8 EWCUBE). */
-    int        seq;             /* 1 = built by begin_seq_i8 */
-    int        seq_term;        /* (single-core) op index whose terminal int32 last-col sentinel gates completion */
-    int        seq_nc;          /* seq cores in this round (1 = single-core; >1 = groups spread across cores) */
-    int        seq_term_c[ORK_MAXCORE];   /* per-core terminal op index (its last program, a matmul = sentinel) */
-    struct buf seq_out;         /* shared output scratch for all seq ops (freed in seq_end) */
-    uint8_t    oesz8[1024];     /* per-op output element bytes: 4=int32 matmul, 1=int8 SDP, 2=int16 SDP (silu) */
-    uint8_t    ocube[1024];     /* per-op output layout: 1=EWCUBE-i8 (int8 SDP), 2=EWCUBEH-i16 (int16 SDP), 0=dense [M,N] (matmul) */
-    size_t     ooff[1024];      /* per-op byte offset into seq_out */
-    struct buf silu_lrc, silu_lsc;   /* int16-SiLU HW-chain: the LUT-load regcmd + SRAM buffers, resident across the chain; freed in seq_end */
-    int        silu_lut;        /* 1 = a silu LUT-load prologue ran (Lrc/Lsc valid) */
-};
 /* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
  * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
  * mid-submit risks an IOMMU/NPU wedge). A chained handler sets a flag; the poll breaks on it and DRAINS
  * (bsync + writeback + free) before the process terminates. If the signal arrives while NOT in a doorbell
  * (idle), the original disposition fires immediately — the handler never swallows SIGTERM. */
-static volatile sig_atomic_t g_ork_term = 0, g_in_doorbell = 0;
+volatile sig_atomic_t orki_ork_term = 0, orki_in_doorbell = 0;
 static struct sigaction g_prev_sig[2];   /* [0]=SIGTERM, [1]=SIGINT */
 static void ork_term_handler(int sig) {
-    g_ork_term = 1;
-    if (!g_in_doorbell) { int k = (sig == SIGINT) ? 1 : 0; sigaction(sig, &g_prev_sig[k], NULL); raise(sig); }   /* idle: honor original disposition now */
+    orki_ork_term = 1;
+    if (!orki_in_doorbell) { int k = (sig == SIGINT) ? 1 : 0; sigaction(sig, &g_prev_sig[k], NULL); raise(sig); }   /* idle: honor original disposition now */
     /* in a doorbell poll: just flag — the poll breaks, drains, then re-raises with the original disposition */
 }
 static void ork_install_term(void) {
@@ -10741,14 +10673,13 @@ static int orki_mtile_cap(int Kred){ double scale=(double)Kred/512.0; int base=(
  * word doorbell RACES (end() returns before earlier rows land; M=1 is safe since within a row last-col IS
  * last). Poll all M rows' last cols (M<=64, cheap). Sentinel 0x7fffffff = INT_MAX / fp32 NaN — no valid
  * matmul output equals it, so this is precision-agnostic (int8->int32, fp16->fp32). */
-#define ORK_DYN_SENT16 ((int16_t)0x7fff)   /* int4 (int16 output) sentinel — no valid W4A4 accumulator equals it */
-static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);   /* #54 fwd: BCHAIN tile seed/gate/verify/de-tile (defined below) */
+int orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);   /* #54 fwd: BCHAIN tile seed/gate/verify/de-tile (defined below) */
 static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
     if (h->i4batch) {   /* #54 BCHAIN tile output: mode-1 last-program civac gate (cheap, per-poll), then on pass bsync + mode-3 full verify (once). Matches bch_db_worker's completion check; ork_dyn_end owns the recover. */
         ork_npu *c = h->c;
-        if (!bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1)) return 0;
+        if (!orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1)) return 0;
         orki_bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
-        return bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
+        return orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
     }
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
     if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row */
@@ -10833,7 +10764,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
     sub.flags = ork_ppflags(); sub.task_number = reserve; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)reserve};
-    sub.timeout = mm_timeout_ms();
+    sub.timeout = orki_mm_timeout_ms();
     int _dbg = getenv("ORK_DYN_DEBUG") != NULL;
     sub.flags |= 0x2u;   /* NONBLOCK: returns so the host can steer/poll */
     /* Cold mode-establishment needs a warm pass, but a BLOCKING multi-task submit (flags 0x5) EINVALs +
@@ -10842,7 +10773,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     #define ORK_DYN_SEED() do { for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while (0)
     if (!c->warmed) {
-        ORK_DYN_SEED(); sub.timeout = mm_timeout_ms();
+        ORK_DYN_SEED(); sub.timeout = orki_mm_timeout_ms();
         if (!orki_rknpu_submit_ioctl(fd, &sub, h->dom)) {                 /* warm pass */
             double tw = ork_now_us(); for (;;) { int alld = 1;
                 for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
@@ -10894,7 +10825,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     }
     if (_dbg) fprintf(stderr, "[dyn] spin applied (spin_end=%d); seeding + real submit now\n", h->spin_end);
     ORK_DYN_SEED();
-    sub.timeout = mm_timeout_ms();
+    sub.timeout = orki_mm_timeout_ms();
     int rr = orki_rknpu_submit_ioctl(fd, &sub, h->dom);
     if (_dbg) fprintf(stderr, "[dyn] NONBLOCK submit rc=%d (flags=0x%x task_number=%u)\n", rr, sub.flags, sub.task_number);
     if (rr) { free(h); return NULL; }
@@ -10959,7 +10890,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
             uint32_t aslice[16];
             for (int ks = 0; ks < Sk; ks++) { int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; size_t asz = (size_t)Kp / 2;
                 if (astage + asz > AF->size) { free(h); return NULL; }
-                tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
+                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
                 aslice[ks] = (uint32_t)(AF->dma + astage); astage += asz; }
             /* A1 N-tile x A2 K-split: one program per (N-slice ns, K-slice ks). The row's output is Sk blocks
              * of [N] int16 (block ks = the K-slice-ks partial; column-slices write their [Nc] within it); the
@@ -11006,7 +10937,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
      * esz==2 branch of mc_recover_resubmit re-seeds the full int16 surface). */
@@ -11052,7 +10983,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
             uint32_t aslice[256];                                    /* this row's Sk group A-slices (each G nibbles) */
             for (int g = 0; g < Sk; g++) { size_t asz = (size_t)G / 2;
                 if (astage + asz > AF->size) { free(h); return NULL; }
-                tile_i4_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
+                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
                 aslice[g] = (uint32_t)(AF->dma + astage); astage += asz; }
             for (int ns = 0; ns < Sn; ns++) { int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
                 for (int g = 0; g < Sk; g++) {
@@ -11083,7 +11014,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     ork_install_term();
     return h;
@@ -11097,7 +11028,7 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
      * (mc int4 output never landed) mc_recover_resubmit (RESET + re-seed SENT16 via its esz==2 branch + resubmit
      * each core) and re-poll, up to recov_max; auto-dump only a TRUE stall (recover exhausted). The grouped begin
      * already stashed mc_nc/mc_dt=DT_I4/mc_dom/mc_subs/mc_Pc, so this self-heals exactly like the int8 mc path. */
-    g_in_doorbell = 1;
+    orki_in_doorbell = 1;
     int recov_max = (h->mc_nc > 0 && h->mc_dt == DT_I4) ? 6 : 0;
     int landed = 0, edone[1024];
     for (int recov = 0; ; recov++) {
@@ -11106,16 +11037,16 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
         double miss_to = (recov < recov_max) ? 300000.0 : 3e6;   /* fast miss-detect while retries remain, else full completion wait */
         for (;;) { int n = 0; for (int x = 0; x < h->S; x++) { if (!edone[x]) edone[x] = ork_dyn_done_i(h, x); n += edone[x]; }
             if (n >= h->S) { landed = 1; break; }
-            if (g_ork_term) break;
+            if (orki_ork_term) break;
             double el = ork_now_us() - t0; if (el > miss_to) break;
             if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
-        if (landed || g_ork_term) break;
+        if (landed || orki_ork_term) break;
         if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
             h->c->dom_dirty = 1;   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty) */
             mc_recover_resubmit(h); continue; }
         break;
     }
-    g_in_doorbell = 0;
+    orki_in_doorbell = 0;
     if (!landed) { rc = -1; ork_dyn_dump(h, "grouped-i4 doorbell miss (recover exhausted)"); }
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
@@ -11128,7 +11059,7 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
             cr[n] = acc; } }
     __asm__ volatile("dsb ish":::"memory");
     free(h);
-    if (g_ork_term) { sigaction(SIGTERM, &g_prev_sig[0], NULL); raise(SIGTERM); }
+    if (orki_ork_term) { sigaction(SIGTERM, &g_prev_sig[0], NULL); raise(SIGTERM); }
     return rc;
 }
 
@@ -11257,7 +11188,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
       } else {
         int nb = getenv("ORK_COLSPLIT_NB") != NULL;
         if (!nb) a->subs[i].flags &= ~0x2u;   /* blocking (default here) */
-        a->subs[i].timeout = (a->h->mc_dt == DT_F16 && mm_timeout_ms() > 8000) ? 8000 : mm_timeout_ms();   /* fp16 (incl. CONTIG): cap wedge-detect at 8s so a CDMA-wild fault falls to the run-level reset+resubmit fast, not a 60s stall */
+        a->subs[i].timeout = (a->h->mc_dt == DT_F16 && orki_mm_timeout_ms() > 8000) ? 8000 : orki_mm_timeout_ms();   /* fp16 (incl. CONTIG): cap wedge-detect at 8s so a CDMA-wild fault falls to the run-level reset+resubmit fast, not a 60s stall */
         int _csrc = orki_rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
         if (_csrc && a->h->mc_dt == DT_F16) c->mc_error = 1;   /* CONTIG fp16 wedge: signal the run-level recovery (reset + resubmit / nc=1 backstop) */
         if (i == 0 && a->h->f16_contig) { const char *fwe = getenv("ORK_F16_FORCE_WEDGE");   /* TEST-ONLY fault injection for the
@@ -11608,7 +11539,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
     if (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* DEFAULT: per-core submit+accumulate on pool threads (ork_csub_worker); ORK_COLSPLIT_SERIAL forces the legacy inline path below */
         struct ork_csub cs[ORK_MAXCORE];
         for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0, csub_barrier };
-        npu_pool_ensure(c);
+        orki_npu_pool_ensure(c);
         pthread_mutex_lock(&c->pmu); c->pjob = cs; c->pjob_nc = nc; c->pjob_fn = ork_csub_worker;
         c->pjob_stride = sizeof(struct ork_csub); c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
         pthread_mutex_unlock(&c->pmu);
@@ -11624,7 +11555,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             * interleaved decode/stream regime (M<=64 — a shared-scratch dirty line would evict over the NPU write and
             * resurrect a mid-row SENT); cold-only for prefill (M>64, not interleaved — avoids the per-op full flush). */
         c->mwarm[i] = 1;
-        subs[i].timeout = mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], w->domain);
+        subs[i].timeout = orki_mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], w->domain);
     }
     if (fp16_hard && c->mc_error) {   /* dropped fp16 K-slice — DON'T resubmit (sticky re-drop + D-state hang, campaign4).
         * Clean-reap the stuck job + int8 health-gate, then leave mc_error set for the run-level nc=1 bit-exact backstop. */
@@ -11870,7 +11801,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     #define ORK_MC_ROUND() do { h->mc_nc = nc; h->dma_rw0 = ork_npu_dma_rw(c); for (int i = 0; i < nc; i++) if (Pc[i]) { \
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
-        subs[i].timeout = mm_timeout_ms(); { int _rc = orki_rknpu_submit_ioctl(fd, &subs[i], dom); if (i < 8) h->mc_rc[i] = _rc; } } } while (0)
+        subs[i].timeout = orki_mm_timeout_ms(); { int _rc = orki_rknpu_submit_ioctl(fd, &subs[i], dom); if (i < 8) h->mc_rc[i] = _rc; } } } while (0)
     /* Clean the whole per-op output surface to DRAM (dedup by buffer) so no dirty CPU line can evict over the
      * NPU's writes; marks the cores warm. Re-runnable (used by the cold clean-before AND the dispatch-recover). */
     #define ORK_MC_CLEAN() do { struct buf *_cl[1024]; int _ncl = 0; \
@@ -12106,7 +12037,7 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
         for(int m=0;m<M;m++){ volatile int32_t*db=&o[(size_t)m*N+(N-1)]; *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     ork_install_term();
-    for(int i=0;i<nc;i++){ subs[i].timeout=mm_timeout_ms(); if(orki_rknpu_submit_ioctl(fd,&subs[i],c->dom_active)){ /* a core rejected: drain what we can */ } }
+    for(int i=0;i<nc;i++){ subs[i].timeout=orki_mm_timeout_ms(); if(orki_rknpu_submit_ioctl(fd,&subs[i],c->dom_active)){ /* a core rejected: drain what we can */ } }
     return h;
 }
 /* Single-group / single-core convenience wrapper (Stage 2 API): one dependent chain on one core. */
@@ -12119,13 +12050,13 @@ int ork_dyn_seq_end(ork_dyn_chain *h){
     if(!h||!h->seq) return -2;
     ork_npu *c=h->c; int fd=c->fd; int rc=0;
     int nc = h->seq_nc>0 ? h->seq_nc : 1;
-    g_in_doorbell=1; double t0=ork_now_us(); int landed=0;
+    orki_in_doorbell=1; double t0=ork_now_us(); int landed=0;
     for(;;){ int done=1;                                 /* wait until EVERY core's terminal matmul sentinel is overwritten */
         for(int i=0;i<nc && done;i++){ int ti=h->seq_term_c[i]; if(ti<0)continue; int Mt=h->oM[ti], Nt=h->nout[ti]/(Mt?Mt:1);
             volatile int32_t *o=(volatile int32_t*)((char*)h->seq_out.cpu+h->ooff[ti]);
             for(int m=0;m<Mt;m++){ volatile int32_t*db=&o[(size_t)m*Nt+(Nt-1)]; __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){done=0;break;} } }
-        if(done){landed=1;break;} if(g_ork_term||ork_now_us()-t0>3e6) break; }
-    g_in_doorbell=0;
+        if(done){landed=1;break;} if(orki_ork_term||ork_now_us()-t0>3e6) break; }
+    orki_in_doorbell=0;
     if(!landed) rc=-1;
     orki_bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int i=0;i<h->S;i++){ if(!h->dst[i]) continue; int M=h->oM[i], N=h->nout[i]/(M?M:1);
@@ -12136,7 +12067,7 @@ int ork_dyn_seq_end(ork_dyn_chain *h){
             for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=src[ORK_SEQCUBE(m,nn,M)]; } }
     if(h->silu_lut){ orki_bdestroy(fd,&h->silu_lrc); orki_bdestroy(fd,&h->silu_lsc); }   /* release the resident LUT buffers */
     orki_bdestroy(fd,&h->seq_out); free(h);
-    if(g_ork_term){ int k=0; sigaction(SIGTERM,&g_prev_sig[k],NULL); raise(SIGTERM); }
+    if(orki_ork_term){ int k=0; sigaction(SIGTERM,&g_prev_sig[k],NULL); raise(SIGTERM); }
     return rc;
 }
 /* SPIN-KEEP-ALIVE PROBE — validates the persistent-job mechanism. Program 0 is a CIRCULAR spin (its next
@@ -12193,7 +12124,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     sub.flags=ork_ppflags()|0x2u; sub.task_number=P; sub.task_obj_addr=c->task.obj; sub.core_mask=1; sub.fence_fd=-1;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
-    sub.timeout=mm_timeout_ms();
+    sub.timeout=orki_mm_timeout_ms();
     c->warmed=1;
     if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ SPIN_CLEAN(); return -1; }
     if(spin_us>0){ struct timespec ts={spin_us/1000000,(long)(spin_us%1000000)*1000}; nanosleep(&ts,0); }
@@ -12321,7 +12252,7 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
  * only "never landed"). RESET clears the lost dispatch/job state, then re-clean (cold coherency) + re-seed +
  * resubmit from the stashed per-core submits (c->maf/mrc/mtk[i] still hold this round's program — the chain owns
  * them until end()). int8 (esz=4, int32 SENT) AND int4 (esz=2, full-surface int16 SENT16); validated by mc_miss_repro. */
-static int i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
+int orki_i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 static void mc_recover_resubmit(ork_dyn_chain *h){
     ork_npu *c = h->c; int fd = c->fd;
     if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[mc-recover] doorbell MISS -> ACT_RESET + resubmit | dom=%d S=%d nc=%d esz=%d\n", h->mc_dom, h->S, h->mc_nc, h->esz);
@@ -12346,7 +12277,7 @@ static void mc_recover_resubmit(ork_dyn_chain *h){
     for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        h->mc_subs[i].timeout = (h->esz==2) ? i4_submit_tmo_ms() : mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
+        h->mc_subs[i].timeout = (h->esz==2) ? orki_i4_submit_tmo_ms() : orki_mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
 }
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
@@ -12363,7 +12294,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     }
     /* Wait until EVERY task's every row is done (not just the highest index — multi-core cores finish
      * out of order, so a high task done does NOT imply the lower ones are). 500us-no-progress = stall/halt. */
-    g_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on g_ork_term and drains before the process ends */
+    orki_in_doorbell = 1;   /* graceful SIGTERM: the poll below breaks on orki_ork_term and drains before the process ends */
     int edone[1024];
     int last = -1;
     int recov_max = (h->mc_nc > 0 && (h->mc_dt == DT_I8 || h->mc_dt == DT_I4)) ? 6 : 0;   /* mc int8/int4 rounds carry stashed context to resubmit; a few retries clear a sticky/correlated drop */
@@ -12378,7 +12309,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         double miss_to = (recov < recov_max) ? (h->i4batch ? 2000000.0 : 300000.0) : 3e6;   /* #54 i4batch (M-batched BCHAIN): a legit job — esp. the first submit after an iommu-domain switch — can exceed 300ms; use the old bch 2s window so we don't false-recover a completing job. Per-row/int8 keep the fast 300ms detect. */
         for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
             if (n >= h->S) break;                               /* all tasks, all rows */
-            if (g_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
+            if (orki_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
             /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
              * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau
              * just means cores haven't caught up yet — breaking there bailed with n<S. mc: wait all-done/timeout. */
@@ -12392,7 +12323,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
              * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
             if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
         last = ork_dyn_progress(h);
-        if (last >= h->S - 1 || g_ork_term) break;            /* all done, or interrupted */
+        if (last >= h->S - 1 || orki_ork_term) break;            /* all done, or interrupted */
         if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */
             if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER] mc int8 round output never landed (attempt %d) — reset + resubmit\n", recov);
             if (h->mc_dt == DT_I4) h->c->dom_dirty = 1;   /* #54: an int4 doorbell DROP happened -> a stuck job may linger in this domain even after recover (the reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it (ork_dom_flush_if_dirty) BEFORE switching away -> the switch to the next domain won't time out. */
@@ -12428,7 +12359,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         if (!seen) { orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
     if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
         for (int i = 0; i < h->S; i++)
-            bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
+            orki_bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
     }
     /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C.
      * int4 (esz==2): the NPU wrote an int16 accumulator; widen int16->int32 into the caller's int32 C. */
@@ -12502,8 +12433,8 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
     for (int i = 0; i < h->nascr; i++) orki_bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h);
-    g_in_doorbell = 0;
-    if (g_ork_term) {   /* a SIGTERM/SIGINT arrived mid-poll: we've drained + written back cleanly — now honor it */
+    orki_in_doorbell = 0;
+    if (orki_ork_term) {   /* a SIGTERM/SIGINT arrived mid-poll: we've drained + written back cleanly — now honor it */
         sigaction(SIGTERM, &g_prev_sig[0], NULL); sigaction(SIGINT, &g_prev_sig[1], NULL); raise(SIGTERM);
     }
     return r; }
@@ -12634,7 +12565,7 @@ int ork_pc_run(ork_pc_chain *pc) {
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
     sub.flags = ork_ppflags() | 0x2u; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
-    sub.timeout = mm_timeout_ms();
+    sub.timeout = orki_mm_timeout_ms();
     #define ORK_PC_SEED() do { for (int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while(0)
     ORK_PC_SEED();
     if (!pc->warmed) {   /* cold: throwaway NONBLOCK warm pass, poll, reseed (blocking multi-task submit EINVALs) */
@@ -12787,7 +12718,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit s; memset(&s,0,sizeof s);
     s.flags=0x1u|0x2u;   /* PC | NONBLOCK; ping-pong OFF (SDP present) */
-    s.task_number=3; s.task_obj_addr=c->mtk[0].obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=mm_timeout_ms();
+    s.task_number=3; s.task_obj_addr=c->mtk[0].obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=orki_mm_timeout_ms();
     s.subcore_task[0]=(struct rknpu_subcore_task){0,3};
     int e=orki_rknpu_submit_ioctl(fd,&s,c->dom_active);
     int okall=0;
@@ -13116,7 +13047,7 @@ static void *stream_worker(void *vp) {
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
         sub.flags = ork_ppflags(); sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
-        sub.timeout = mm_timeout_ms();
+        sub.timeout = orki_mm_timeout_ms();
         /* A freshly-allocated NPU output buffer returns stale on its FIRST write, so prime THIS core's
          * output buffer with a throwaway submit on its first use (mirror mcworker's reps=c->mwarm[i]?1:2).
          * Per-core + deterministic: the old coarse whole-stream 2-pass could miss a core whose buffer the
@@ -13190,7 +13121,7 @@ static void *stream_worker_f16(void *vp){
         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
         sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        sub.timeout=mm_timeout_ms();
+        sub.timeout=orki_mm_timeout_ms();
         int reps=c->mwarm[i]?1:2;
         for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
         c->mwarm[i]=1;
@@ -13242,7 +13173,7 @@ static void *stream_worker_i8sk(void *vp){
         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
         sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        sub.timeout=mm_timeout_ms();
+        sub.timeout=orki_mm_timeout_ms();
         int reps=c->mwarm[i]?1:2;
         for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
         c->mwarm[i]=1;
@@ -13268,7 +13199,7 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     for(int i=0;i<nc;i++){
         if(c->maf[i].size<maxMK){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
         if(c->mccsz[i]<maxMN4){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
-    int rc=0; npu_pool_ensure(c);
+    int rc=0; orki_npu_pool_ensure(c);
     struct streamw_i8sk sw[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) sw[i]=(struct streamw_i8sk){c,i,S,tasks,&ctr,0};
     pthread_mutex_lock(&c->pmu);
@@ -13318,7 +13249,7 @@ static void *stream_worker_f16ch(void *vp){
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     sub.flags=ork_ppflags(); sub.task_number=cnt; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)cnt};
-    sub.timeout=mm_timeout_ms();
+    sub.timeout=orki_mm_timeout_ms();
     int reps=c->mwarm[i]?1:2;
     for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,a->tasks[i].w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->mwarm[i]=1;
@@ -13345,7 +13276,7 @@ int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks)
         if(c->mtk[i].size<needtk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bcreate(fd,needtk,0x40b,c->dom_active); if(!c->mtk[i].cpu)return -1; }
         if(c->maf[i].size<maxMK){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
         if(c->mccsz[i]<maxMN4){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
-    int rc=0; npu_pool_ensure(c);
+    int rc=0; orki_npu_pool_ensure(c);
     struct streamw_f16ch sw[ORK_MAXCORE];
     for(int i=0;i<nc;i++) sw[i]=(struct streamw_f16ch){c,i,nc,S,tasks,0};
     pthread_mutex_lock(&c->pmu);
@@ -13375,710 +13306,6 @@ done:
 }
 
 
-int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
-    if (!c) return -1;
-    if (S < 1 || S > 1024) return -2;
-    if (!tasks) return -2;
-
-    /* Single matmul: use the optimized run_i4 path (multi-core column-split) rather than the
-     * single-core chain path. Chaining only pays off when batching S>1 independent matmuls. */
-    if (S == 1) return ork_mm_run_i4(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
-
-    /* chained weights share one submit => one domain; swap in that domain's scratch */
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
-    int fd = c->fd;
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        if (!w || w->dtype != DT_I4) return -2;
-        if (tasks[i].M != 1) return -2;
-        if (w->Sn != 1 || w->Sk != 1) return -2;
-        if (check_overlap("ork_mm_run_chain_i4", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
-    }
-
-    ork_npu_enter(c, 4 /* DT_I4_CHAIN */, XP_I4CHAIN, OCK_HW);
-
-    int ok = 0;
-    int max_K = 0, max_N = 0;
-    for (int i = 0; i < S; i++) {
-        if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
-        if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
-        struct buf *abuf = orki_dma_find(c, tasks[i].A);
-        if (abuf) orki_bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
-    }
-
-    struct buf chain_A = orki_bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
-    struct buf chain_C = orki_bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
-    if (!chain_A.cpu || !chain_C.cpu) {
-        if (chain_A.cpu) orki_bdestroy(fd, &chain_A);
-        if (chain_C.cpu) orki_bdestroy(fd, &chain_C);
-        return -1;
-    }
-
-    uint32_t act_dma[1024];
-    uint32_t out_dma[1024];
-
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        uint8_t *A_dst = (uint8_t*)chain_A.cpu + (size_t)i * max_K;
-        tile_i4_Aslice(A_dst, tasks[i].A, 0, w->K);
-        act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
-        out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
-    }
-    orki_bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
-
-    /* Clean-before-write the int16 output scratch. chain_C is bcreate'd fresh each call and the kernel can
-     * hand back a recycled DMA region carrying dirty CPU cache lines (from a prior occupant). Those lines
-     * evict to DRAM AFTER the NPU writes chain_C, clobbering the NPU output -> "correct run 0, garbage runs
-     * 1+" on warm reuse. Dirty the whole surface then clean it to DRAM (TO_DEVICE) so no stale line survives
-     * to evict later -- same full-surface clean-before as ork_dyn_begin_mc_i4's doorbell scratch. */
-    memset(chain_C.cpu, 0, (size_t)S * max_N * 2);
-    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_TO_DEVICE);
-
-    struct buf extra[2] = {chain_A, chain_C};
-    uint32_t rc[REGCMD_I4_N];
-
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
-        if (orki_validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
-
-        if (i < S - 1) {
-            uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
-            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
-            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-            rc[218] = 0x0014 | (0x0037 << 16);
-            rc[219] = (0x0101 << 16) | (0);
-        } else {
-            rc[216] = 0;
-            rc[217] = 0;
-            rc[218] = 0x00000014;
-            rc[219] = 0x01010000;
-        }
-        memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
-    }
-    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
-
-    /* Mirror the validated i4_mcworker multi-task path exactly: one rknpu_task per chained regcmd,
-     * task_number=S, subcore={0,S}, and the same reps/submit discipline (rknpu_submit_ioctl with a
-     * cold-buffer warmup rep + orki_bsync(C) between reps). The kernel programs first_task+last_task and
-     * the HW PC-chain (rc[216..219]) walks the middle; it waits until the HW task counter reaches S. */
-    struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
-    for (int i = 0; i < S; i++) {
-        t[i].enable_mask = 0xd;
-        t[i].int_mask = 0x300;
-        t[i].int_clear = 0x1ffff;
-        t[i].regcfg_amount = 116;
-        t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4;
-    }
-    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-
-    static int tc = -2;
-    if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
-
-    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = ork_ppflags(); sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
-    sub.core_mask = 1u << tc;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
-
-    int reps = c->warmed ? 1 : 2;
-    for (int rep = 0; rep < reps; rep++) {
-        int last = (rep == reps - 1);
-        sub.timeout = mm_timeout_ms();
-        if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { ok = -1; goto cleanup; } continue; }
-        orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
-    }
-    c->warmed = 1;
-
-    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
-    for (int i = 0; i < S; i++) {
-        int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
-        int32_t *C = tasks[i].C;
-        int N = tasks[i].w->N;
-
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        int col = 0;
-        for (; col <= N - 16; col += 16) {
-            int16x8_t vo16_0 = vld1q_s16(&o[col]);
-            int16x8_t vo16_1 = vld1q_s16(&o[col + 8]);
-            vst1q_s32(&C[col], vmovl_s16(vget_low_s16(vo16_0)));
-            vst1q_s32(&C[col + 4], vmovl_s16(vget_high_s16(vo16_0)));
-            vst1q_s32(&C[col + 8], vmovl_s16(vget_low_s16(vo16_1)));
-            vst1q_s32(&C[col + 12], vmovl_s16(vget_high_s16(vo16_1)));
-        }
-        for (; col < N; col++) {
-            C[col] = o[col];
-        }
-#else
-        for (int col = 0; col < N; col++) {
-            C[col] = o[col];
-        }
-#endif
-
-        struct buf *cbuf = orki_dma_find(c, tasks[i].C);
-        if (cbuf) orki_bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
-    }
-
-cleanup:
-    orki_bdestroy(fd, &chain_A);
-    orki_bdestroy(fd, &chain_C);
-    return ok;
-}
-
-/* EXPERIMENTAL int4 NONBLOCK-doorbell probe — byte-for-byte the ork_mm_run_chain_i4 build (M=1 int4 PC-chain,
- * host A staged via tile_i4_Aslice, int16 output scratch), with EXACTLY TWO deltas vs the working reference:
- *   (1) submit flags get NONBLOCK (|0x2u) — the ioctl returns immediately instead of blocking to completion;
- *   (2) completion is detected by polling an int16 output-SENTINEL (0x7fff seeded into each op's last int16
- *       column, dc cvac'd) rather than the blocking ioctl's implicit done.
- * Everything else — synth_i4, the rc[216..219] chain descriptor, regcfg_amount=116, task_number=S, the int16
- * ->int32 de-tile — is identical. This isolates the ONE question the coordinator posed: does the int4 int16-
- * output datapath survive the doorbell's non-blocking sentinel poll (or does int16 output + async race it)? */
-#define ORK_I4_SENT16 ((int16_t)0x7fff)
-int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
-    if (!c) return -1;
-    if (S < 1 || S > 1024) return -2;
-    if (!tasks) return -2;
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
-    int fd = c->fd;
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        if (!w || w->dtype != DT_I4) return -2;
-        if (tasks[i].M != 1) return -2;                      /* int4 HW chain is M=1 only (like run_chain_i4) */
-        if (w->Sn != 1 || w->Sk != 1) return -2;
-    }
-    ork_npu_enter(c, 4 /* DT_I4_CHAIN */, XP_I4CHAIN, OCK_HW);
-    int ok = 0, max_K = 0, max_N = 0;
-    for (int i = 0; i < S; i++) {
-        if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
-        if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
-        struct buf *abuf = orki_dma_find(c, tasks[i].A);
-        if (abuf) orki_bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
-    }
-    struct buf chain_A = orki_bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
-    struct buf chain_C = orki_bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
-    if (!chain_A.cpu || !chain_C.cpu) { if (chain_A.cpu) orki_bdestroy(fd,&chain_A); if (chain_C.cpu) orki_bdestroy(fd,&chain_C); return -1; }
-    uint32_t act_dma[1024], out_dma[1024];
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        tile_i4_Aslice((uint8_t*)chain_A.cpu + (size_t)i * max_K, tasks[i].A, 0, w->K);
-        act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
-        out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
-    }
-    orki_bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf extra[2] = {chain_A, chain_C};
-    uint32_t rc[REGCMD_I4_N];
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
-        if (orki_validate_regcmd("ork_dyn_i4_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
-        if (i < S - 1) { uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
-            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-            rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
-        } else { rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000; }
-        memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
-        if (i == 0 && getenv("ORK_I4PROBE_DUMP")) { fprintf(stderr,"[i4probe] op0 regcmd desc rc[216..219]=%08x %08x %08x %08x  aA=%08x aC=%08x\n",rc[216],rc[217],rc[218],rc[219],act_dma[0],out_dma[0]); }
-    }
-    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
-    for (int i = 0; i < S; i++) { t[i].enable_mask = 0xd; t[i].int_mask = 0x300; t[i].int_clear = 0x1ffff;
-        t[i].regcfg_amount = 116; t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4; }
-    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-    /* seed the FULL int16 output surface with the sentinel (int4's int16 write order over N is NOT
-     * guaranteed last-col-last, unlike int8/fp16, so a single last-col sentinel poll races; poll ALL
-     * elements written — mirrors the fp16 full-surface seed). */
-    for (int i = 0; i < S; i++) { int N = tasks[i].w->N; int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i*max_N*2);
-        for (int col = 0; col < N; col++){ volatile int16_t *db = (volatile int16_t*)&o[col];
-            *db = ORK_I4_SENT16; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
-    __asm__ volatile("dsb ish":::"memory");
-    struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = ork_ppflags() | 0x2u;                        /* DELTA 1: NONBLOCK (vs run_chain_i4's blocking) */
-    sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1; sub.core_mask = 1;
-    sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
-    sub.timeout = mm_timeout_ms();
-    c->warmed = 1;
-    if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { ok = -1; goto cleanup; }
-    /* DELTA 2: poll the FULL int16 output surface to completion (every element != sentinel) instead of a
-     * blocking wait. Op i is "done" only when ALL N of its int16 columns have been overwritten. */
-    double t0 = ork_now_us();
-    for (;;) { int alld = 1;
-        for (int i = 0; i < S && alld; i++) { int N = tasks[i].w->N; int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i*max_N*2);
-            for (int col = 0; col < N; col++){ volatile int16_t *db = (volatile int16_t*)&o[col];
-                __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_I4_SENT16){ alld = 0; break; } } }
-        if (alld || ork_now_us() - t0 > 3e6) break; }
-    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
-    for (int i = 0; i < S; i++) {                            /* int16 -> int32 de-tile into caller C (== run_chain_i4) */
-        int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
-        int32_t *C = tasks[i].C; int N = tasks[i].w->N;
-        for (int col = 0; col < N; col++) C[col] = o[col];
-        struct buf *cbuf = orki_dma_find(c, tasks[i].C); if (cbuf) orki_bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
-    }
-cleanup:
-    orki_bdestroy(fd, &chain_A); orki_bdestroy(fd, &chain_C);
-    return ok;
-}
-
-/* #52 (B): BCHAIN batch-chain on the NONBLOCK doorbell (self-healing) — the int4 M>1 prefill path.
- * Reuses BCHAIN's proven H-row batch orki_synth (synth_i4 mc=2*Hg) + bank-width Wb=131072/K N-tiling + de-tile
- * (og[(4*j+4*Hg*b)*64+cc] -> C[g*H+j][n0+b*64+cc]) VERBATIM, but submits NONBLOCK (flags|0x2) and detects
- * completion by civac-polling the WRITTEN (strided) int16 cell-set for the SENT16 sentinel — the batch output
- * is a 2D-tiled strided subset (write-order not last-col-last, like the per-row int4 path), so we seed+poll
- * exactly the written cells and never the padding. A dropped round self-heals via RESET+re-seed+resubmit
- * (mc_recover_resubmit model), so a miss never hard-wedges (unlike the removed blocking BCHAIN). Single host
- * thread submits all cores nonblock then polls them. -4 = ineligible (caller falls back); -1 = unrecovered. */
-/* mode 0=seed SENT16 (values only; caller bsyncs TO_DEVICE), 1=civac gate (invalidate per 64B line then check),
- * 3=plain full-verify (after bsync FROM_DEVICE, no per-cell DC), 2=de-tile int16->int32 into C. Cache ops are
- * PER-CACHE-LINE (32 int16/line), never per-element — per-element dc over the M*N surface was a ~60ms host wall. */
-static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk,int tk_base){
-    int tk=0;   /* #54 tk_base: this weight's program slot 0 within the shared per-core chain (0 for single-weight; the expert's cumulative program offset for coalesced multi-expert) */
-    for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
-        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-            if(only_tk>=0 && tk!=only_tk){ tk++; continue; }   /* poll fast-gate: only the given program (last program lands last — chain runs in order) */
-            int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
-            int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
-            for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;   /* a 64-int16 block = 2 x 64B cache lines */
-                if(mode==0){ for(int cc=0;cc<64;cc++) og[base+cc]=ORK_DYN_SENT16; }
-                else if(mode==1){ __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory");
-                    for(int cc=0;cc<64;cc++) if(((volatile int16_t*)og)[base+cc]==ORK_DYN_SENT16) return 0; }
-                else if(mode==3){ for(int cc=0;cc<64;cc++) if(og[base+cc]==ORK_DYN_SENT16) return 0; }
-                else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
-                else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc++) crow[cc]=og[base+cc]; } }
-            if(mode==4 && !ran) return 0;   /* this program is ENTIRELY sentinel => it truly never ran => real drop */
-            tk++; } }
-    return 1;
-}
-static int bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk){
-    return bch_db_cells_off(c,i,c0,c1,Wb,N,NG,M,H,Wmax,C,mode,only_tk,0);   /* single-weight: base slot 0 */
-}
-static int g_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
-/* #54 TCLEAN precondition (mirror fp16 recov_tmo, npu.c ~11238, task #50): the int4 doorbell NONBLOCK submit
- * timeout MUST be < the poll-detect window (ORK_I4_POLL_MS). rknpu_job_timeout_clean — which runs at the top of
- * every nonblock submit and is the ONLY thing that cleanly reaps a DROPPED job (ACT_RESET can't; source-confirmed
- * rknpu_soft_reset is HW-only) — reaps a job only once it is aged >= its own submit timeout. So a dropped job
- * submitted with an 8s timeout is NOT reapable at the 2s resubmit -> it lingers as a stuck job -> the next
- * iommu-domain switch times out -> cascade/wedge. Bounding the timeout below the poll window makes every resubmit
- * (in-worker or post-join) reap the prior drop. A REAL job lands via its completion IRQ well inside the poll
- * window and is gone before any reap check, so bounding never false-reaps a completing job. Default 3/4 of the
- * poll window; ORK_I4_SUBMIT_TMO_MS overrides. */
-static int i4_submit_tmo_ms(void){
-    static int t=-1;
-    if(t<0){ const char*e=getenv("ORK_I4_SUBMIT_TMO_MS");
-        if(e) t=atoi(e);
-        else { const char*p=getenv("ORK_I4_POLL_MS"); double pm=p?atof(p):2000.0; t=(int)(pm*0.75); }
-        if(t<10) t=10; }
-    return t;
-}
-struct bchdbw { ork_npu *c; int core, c0, c1, NT, K, N, NG, M, H, Wb, Wmax; ork_w *w; const int8_t *A; int32_t *C; unsigned dom; struct rknpu_submit sub; int rc; };
-/* One NPU core's share of the BCHAIN batch-chain: build its (N-chunk x M-group) programs into its pre-allocated
- * per-core buffers, seed, NONBLOCK submit, poll ITS core (last-program civac gate -> bsync -> full verify), then
- * de-tile ITS core. Runs on the npu_pool (parallel build+de-tile across cores; de-tile overlaps the sibling
- * cores' still-running compute). NO reset here — a global RKNPU_ACT_RESET would corrupt live sibling cores; a
- * completion miss returns rc=-2 and the caller recovers serially after join. rc: 0 ok / -1 build-err / -2 miss. */
-static void *bch_db_worker(void *vp){
-    struct bchdbw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, NT=a->NT;
-    int K=a->K,N=a->N,NG=a->NG,M=a->M,H=a->H,Wb=a->Wb,Wmax=a->Wmax; unsigned dom=a->dom;
-    a->rc=0; if(NT<1) return NULL;
-    orki_pin_big_core(i);
-    uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
-    for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-        for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
-    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    int tk=0;
-    for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
-        uint32_t wdma=(uint32_t)(a->w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
-        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
-            uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
-            uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-            memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
-            /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
-             * weight-stationary (N-tile outer, M-group g inner sharing wdma), so g==0 loads the N-tile weight and
-             * g>0 can REUSE the CBUF-resident weight + skip the re-DMA by setting CNA_CBUF_CON0[13]=WEIGHT_REUSE
-             * (0x2000). int4 differs from int8 (2x weight density, different CBUF banks, 0x1040 is the "poison"
-             * K-schedule reg) so this is test-and-see: it may stay bit-exact, may hit the int8 "data-refetch"
-             * correctness gap, or may trip the 0x1040 sensitivity. ORK_I4_WREUSE=1 weight-reuse, 2 +DATA_REUSE[12]. */
-            if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* DEFAULT ON: measured stable ~6% (gate/up ~9%) bit-exact on the MoE expert-triple (test_moe_smoke, M=32). ORK_I4_WREUSE=0 opts out. */
-                if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
-                    for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
-                    orki_setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
-            if(g_i4_validate && orki_validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
-            if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
-                rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
-                rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
-            else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
-            memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
-    for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
-        t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    memset(&a->sub,0,sizeof a->sub);
-    a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
-    a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
-    a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NT};
-    /* #54 int4 completion mode — 3 ways to wait for the chain + drain the DPU writeback:
-     *   0 BLOCKVERIFY (default): seed SENT16, then BLOCKING submit (cheap IRQ kernel-wait, parallel across cores
-     *     exactly like int8 colsplit's ork_csub_worker) + prepolled=0 so ork_dyn_end runs the SENT16 drain-verify
-     *     ONCE, post-completion (the job is already done -> the gate lands immediately/after a short residual
-     *     writeback lag) — NOT the from-t=0 repeated scan. int8 gets away with bare blocking because its writeback
-     *     is coherent by job-done; int4's DPU writeback LAGS completion (why bare blocking miscomputes), so it
-     *     still needs the one verify. Best of both: int8's blocking efficiency + int4's needed drain-verify.
-     *     Measured: the nonblock host-poll (mode 1) cost 22-36% over blocking on the MoE expert shapes.
-     *   1 NONBLOCK (ORK_I4_NB): seed + nonblock doorbell + ork_dyn_end polls from t=0 (pipelined; the expensive
-     *     int4 SENT16 scan spins the whole HW-exec window -> the 22-36%). Kept for A/B.
-     *   2 BLOCKING (ORK_I4_BLOCKING): bare blocking, prepolled=1, NO drain-verify -> MISCOMPUTES. A/B only. */
-    /* MEASURED (test_moe_prog, 2026-08): BLOCKVERIFY(0) 768us > NONBLOCK(1) 712us > BLOCKING(2, miscomputes) 555us.
-     * BLOCKVERIFY lost: the drain-verify (mandatory for int4 correctness — DPU writeback lags job-done) costs MORE
-     * than the blocking submit saves, and NONBLOCK already overlaps its poll-spin with the HW-exec window. So the
-     * "555 blocking" is unattainable-while-correct; NONBLOCK is the best CORRECT option. Default = NONBLOCK(1). */
-    static int i4mode=-1; if(i4mode<0) i4mode = getenv("ORK_I4_BLOCKVERIFY")?0 : (getenv("ORK_I4_BLOCKING")?2 : 1);
-    if(i4mode!=2){   /* BLOCKVERIFY(0) + NONBLOCK(1): seed the SENT16 landing sentinel so ork_dyn_end can drain-verify */
-        bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
-        if(i4mode==1){   /* NONBLOCK doorbell: submit + return; ork_dyn_end (prepolled=0) polls from t=0 */
-            a->sub.flags=ork_ppflags()|0x2u; a->sub.timeout=i4_submit_tmo_ms();
-            orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1; a->rc=0; return NULL; }
-        /* BLOCKVERIFY: fall through to the blocking submit; ork_dyn_end (prepolled=0) does the SHORT post-completion drain-verify */
-    }
-    a->sub.flags=ork_ppflags();   /* BLOCKING (no |0x2): parallel IRQ kernel-wait across cores (like int8 colsplit); a dropped job aborts -> rknpu_iommu_domain_put (no leak). */
-    c->mwarm[i]=1;
-    for(int attempt=0; attempt<4; attempt++){
-        a->sub.timeout=mm_timeout_ms();
-        int rc=orki_rknpu_submit_ioctl(fd,&a->sub,dom);   /* BLOCKING (0x2 cleared): kernel-waits for job_done or aborts at timeout */
-        if(rc==0){ a->rc=0; return NULL; }
-        if(g_ork_term){ a->rc=0; return NULL; }
-        if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[bch] BLOCKING drop core=%d dom=%u attempt=%d rc=%d -> resubmit (kernel aborted+domain_put, no leak)\n",i,dom,attempt,rc);
-    }
-    a->rc=-2; return NULL;
-}
-static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
-    if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
-    int fd=c->fd, K=w->K, N=w->N;
-    /* accurate wedge telemetry: the BCHAIN worker skips validate_regcmd by default, so g_last_op would
-     * otherwise stay stale (mislabelling BCHAIN submits as the last mc_i4 op in ORK_PRESUBMIT_TRACE). */
-    g_last_op="run_i4_bchain_db"; g_last_K=K; g_last_N=N; g_last_wdom=w->domain;
-    g_last_import=(w->own_buf_valid && w->own_buf.heap_fd>0) || (w->own_bufs && w->n_own_bufs>0 && w->own_bufs[0].heap_fd>0)
-                  || (w->Bb && w->Bb[0].heap_fd>0);
-    int H=16384/K; if(H>16)H=16; if(H<2) return -4;
-    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
-    int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
-    if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
-        fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
-    unsigned dom=w->domain;
-    if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c,w->domain);
-    if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] bchain w=%p submit_dom=%u dom_active=%d | Bb0.dma=0x%llx Bb0.domain=%d Bb0.obj=0x%llx Bb0.heap_fd=%d | K=%d N=%d M=%d Wb=%d NC=%d\n",
-        (void*)w, dom, c->dom_active, (unsigned long long)w->Bb[0].dma, w->Bb[0].domain, (unsigned long long)w->Bb[0].obj, w->Bb[0].heap_fd, K, N, M, Wb, NC);
-    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if(orki_mc_ensure(c,nc)) return -1;
-    if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] scratch dom=%d | W[0x%llx,+0x%llx) mtk_all=0x%llx mrc0=0x%llx maf0=0x%llx mcc0=0x%llx | overlap-check vs W\n",
-        c->dom_active, (unsigned long long)w->Bb[0].dma, (unsigned long long)((size_t)K*N/2),
-        (unsigned long long)c->mtk_all.dma, (unsigned long long)c->mrc[0].dma, (unsigned long long)c->maf[0].dma, (unsigned long long)c->mcc[0].dma);
-    if(g_i4_validate<0) g_i4_validate=getenv("ORK_I4_VALIDATE")?1:0;   /* init once on the calling thread (before dispatch) */
-    /* pre-size every core's buffers SINGLE-THREADED (no concurrent bcreate in the workers) */
-    struct bchdbw args[ORK_MAXCORE];
-    for(int i=0;i<nc;i++){
-        int lc0=(int)((long)i*NC/nc), lc1=(int)((long)(i+1)*NC/nc), NT=(lc1-lc0)*NG;
-        args[i]=(struct bchdbw){c,i,lc0,lc1,NT,K,N,NG,M,H,Wb,Wmax,w,A,C,dom,{0},0};
-        if(NT<1) continue;
-        size_t need_rc=(size_t)NT*REGCMD_I4_N*4, need_af=(size_t)NG*(size_t)(2*H)*(K/2);
-        size_t need_o=(size_t)NT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)NT*sizeof(struct rknpu_task);
-        /* #54 SRAM SECONDARY-PIPE probe (ORK_MOE_SRAM_SCRATCH): route the SMALL per-program scratch — regcmd,
-         * activation (maf), tasks, output (mcc) — into on-chip SRAM (separate port from DRAM; weight Bb stays
-         * DRAM). Tests whether feeding the tiny-op reads/writes off a second port speeds the per-program floor.
-         * bcreate fails SRAM over to DRAM if full. */
-        static int msram=-1; if(msram<0) msram=getenv("ORK_MOE_SRAM_SCRATCH")?1:0;   /* SRAM alloc rejects the 0x400 IOMMU-align flag -> drop it + add TRY_ALLOC_SRAM (matches the working ork_dma_alloc_sram path) */
-        unsigned f3 = msram ? (0x003u|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;             /* data scratch (mrc/maf/mcc): cacheable+non-contig, SRAM when on */
-        unsigned fb = msram ? (0x00bu|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x40bu;             /* task buf (mtk): +KERNEL_MAPPING for the kernel read */
-        if(c->mrc[i].size<need_rc){ orki_bdestroy(fd,&c->mrc[i]); c->mrc[i]=orki_bscratch(c,need_rc,(int)f3,c->dom_active); c->mwarm[i]=0; }
-        if(c->maf[i].size<need_af){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bscratch(c,need_af,(int)f3,c->dom_active); }
-        if(c->mtk[i].size<need_tk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bscratch(c,need_tk,(int)fb,c->dom_active); }
-        if(c->mccsz[i]<need_o){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,need_o,(int)f3,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
-        if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
-    }
-    c->mc_error=0; g_in_doorbell=1;
-    /* PARALLEL: each pool worker builds + seeds + BLOCKING-submits (kernel drains) its own core; a drop aborts
-     * (rknpu_job_abort -> domain_put, no refcount leak) and the worker resubmits. Mirrors int8 ork_csub_worker. */
-    npu_pool_ensure(c);
-    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=bch_db_worker; c->pjob_stride=sizeof(struct bchdbw);
-    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
-    bch_db_worker(&args[0]);                                                              /* core 0 on the calling thread */
-    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
-    g_in_doorbell=0;
-    int missed=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) missed=1; }   /* -1 build err, -2 blocking exhausted */
-    /* #54 The BLOCKING workers already drained every core (prepolled) — ork_dyn_end just de-tiles the int16 tiles
-     * into C (i4batch hook -> bch_db_cells mode-2) and frees h. No leak (blocking abort domain_put's drops), so no
-     * refcount-based recover / reap-at-boundary is needed. On an exhausted drop (rc==-2) fall back (return -1). */
-    ork_dyn_chain *h=calloc(1,sizeof *h); if(!h) return -1;
-    h->c=c; h->S=nc; h->P=nc; h->N=N; h->mc=1; h->esz=2; h->dom=dom; h->mc_nc=nc; h->mc_dt=DT_I4; h->mc_dom=dom;
-    h->prepolled = getenv("ORK_I4_BLOCKING")?1:0;   /* #54 BLOCKVERIFY(default)+NONBLOCK: prepolled=0 => ork_dyn_end drain-verifies (BLOCKVERIFY's verify is short, post-completion). Pure ORK_I4_BLOCKING: prepolled=1, no verify (miscomputes; A/B only). */
-    h->i4batch=1; h->b_H=H; h->b_Wb=Wb; h->b_Wmax=Wmax; h->b_NG=NG; h->b_M=M; h->b_N=N; h->b_C=C;
-    for(int i=0;i<nc && i<ORK_MAXCORE;i++){
-        h->outbuf[i]=&c->mcc[i]; h->outptr[i]=(int32_t*)c->mcc[i].cpu;
-        h->nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); h->oM[i]=1;
-        h->b_c0[i]=args[i].c0; h->b_c1[i]=args[i].c1; h->b_NT[i]=args[i].NT;
-        h->mc_subs[i]=args[i].sub; h->mc_Pc[i]=args[i].NT;
-    }
-    if(missed){ free(h); return -1; }   /* a core's blocking submit never completed — don't de-tile garbage; caller falls back */
-    int last=ork_dyn_end(h);   /* prepolled: skips poll, de-tiles (i4batch) into C, frees h */
-    return (last==nc-1) ? 0 : -1;
-}
-/* #54 COALESCED multi-expert BCHAIN. Each core handles a contiguous range of experts (whole N per expert) and
- * chains ALL its experts' M-batched BCHAIN programs into ONE nonblock doorbell submit — same fast programs as
- * run_i4_bchain_db, but coalesced across experts (per-tensor, not per-expert; ~nc submits instead of nc x
- * n_experts). Per-expert A staging into maf, cumulative program index into the shared chain, per-expert de-tile
- * via bch_db_cells_off. M>=2 only (decode/M=1 is CPU). Drop -> serial per-expert BCHAIN fallback (correctness). */
-struct bchmw { ork_npu *c; int core, e0, e1; const ork_mm_task_i4 *ex; int K,N,H,Wb,Wmax,NC; unsigned dom; struct rknpu_submit sub; int rc; };
-static void *bch_mw_worker(void *vp){
-    struct bchmw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core;
-    int K=a->K,N=a->N,H=a->H,Wb=a->Wb,Wmax=a->Wmax,NC=a->NC; unsigned dom=a->dom;
-    a->rc=0; if(a->e0>=a->e1) return NULL; orki_pin_big_core(i);
-    int NTtot=0; size_t AFtot=0;
-    for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H; NTtot+=NC*NG; AFtot+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    memset(c->maf[i].cpu,0,AFtot);
-    /* stage every expert's A (per M-group, stride-2), contiguously in maf */
-    size_t aoff=0;
-    for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; int M=t->M, NG=(M+H-1)/H;
-        for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-            for(int j=0;j<Hg;j++) tile_i4_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
-        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    /* build the chained regcmd across all experts (tk = cumulative program index) */
-    aoff=0; int tk=0;
-    for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; ork_w *w=t->w; int M=t->M, NG=(M+H-1)/H;
-        for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
-            uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
-            for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
-                uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
-                uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-                memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
-                if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
-                    if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
-                        for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
-                        orki_setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
-                if(tk<NTtot-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
-                    rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
-                    rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
-                else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
-                memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tt=c->mtk[i].cpu; memset(tt,0,(size_t)NTtot*sizeof*tt);
-    for(int q=0;q<NTtot;q++){ tt[q].enable_mask=0xd; tt[q].int_mask=0x300; tt[q].int_clear=0x1ffff;
-        tt[q].regcfg_amount=116; tt[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    memset(&a->sub,0,sizeof a->sub);
-    a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NTtot; a->sub.task_obj_addr=c->mtk[i].obj;
-    a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
-    a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NTtot};
-    { int tb=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;   /* seed SENT16 for every expert's cells */
-        bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,0,-1,tb); tb+=NC*NG; } }
-    orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
-    a->sub.timeout=i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
-    int NGl=(a->ex[a->e1-1].M+H-1)/H, NTl=NC*NGl, tbl=NTtot-NTl;   /* last program of the whole chain lands last */
-    double t0=ork_now_us();
-    for(;;){
-        if(bch_db_cells_off(c,i,0,NC,Wb,N,NGl,a->ex[a->e1-1].M,H,Wmax,NULL,1,NTl-1,tbl)){   /* last-program civac gate */
-            orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
-            int ok=1, vb=0;
-            for(int e=a->e0;e<a->e1 && ok;e++){ int NG=(a->ex[e].M+H-1)/H;
-                if(!bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,3,-1,vb)) ok=0; vb+=NC*NG; }
-            if(ok){ int db=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;
-                    bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,a->ex[e].C,2,-1,db); db+=NC*NG; }
-                a->rc=0; return NULL; } }
-        if(g_ork_term){ a->rc=0; return NULL; }
-        double el=ork_now_us()-t0; if(el>300000.0){ a->rc=-2; return NULL; }
-        if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }
-    }
-}
-static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
-    int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
-    int H=16384/K; if(H>16)H=16; if(H<2) return -4;
-    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
-    int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
-    if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
-    unsigned dom=ex[0].w->domain;
-    if(dom!=(unsigned)c->dom_active || (dom && !c->dom_save)) orki_dom_activate(c,(int)dom);
-    g_last_op="run_i4_experts_bchain_db"; g_last_K=K; g_last_N=N; g_last_wdom=(int)dom;
-    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if(orki_mc_ensure(c,nc)) return -1;
-    struct bchmw args[ORK_MAXCORE];
-    int totalNT=0; for(int e=0;e<ntask;e++){ int NG=(ex[e].M+H-1)/H; totalNT+=NC*NG; }
-    int e_start=0, priorNT=0;
-    for(int i=0;i<nc;i++){
-        int targetNT=(int)((long)(i+1)*totalNT/nc), e_end=e_start, accNT=0;
-        while(e_end<ntask){ int NG=(ex[e_end].M+H-1)/H; if(priorNT+accNT+NC*NG>targetNT && e_end>e_start) break; accNT+=NC*NG; e_end++; }
-        if(i==nc-1) e_end=ntask;
-        args[i]=(struct bchmw){c,i,e_start,e_end,ex,K,N,H,Wb,Wmax,NC,dom,{0},0};
-        priorNT+=accNT; e_start=e_end;
-        int cNT=0; size_t cAF=0; for(int e=args[i].e0;e<args[i].e1;e++){ int NG=(ex[e].M+H-1)/H; cNT+=NC*NG; cAF+=(size_t)NG*(size_t)(2*H)*(K/2); }
-        if(cNT<1) continue;
-        size_t need_rc=(size_t)cNT*REGCMD_I4_N*4, need_o=(size_t)cNT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)cNT*sizeof(struct rknpu_task);
-        if(c->mrc[i].size<need_rc){ orki_bdestroy(fd,&c->mrc[i]); c->mrc[i]=orki_bscratch(c,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
-        if(c->maf[i].size<cAF){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bscratch(c,cAF,0x403,c->dom_active); }
-        if(c->mtk[i].size<need_tk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bscratch(c,need_tk,0x40b,c->dom_active); }
-        if(c->mccsz[i]<need_o){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
-        if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
-    }
-    c->mc_error=0; g_in_doorbell=1;
-    npu_pool_ensure(c);
-    pthread_mutex_lock(&c->pmu); c->pjob=args; c->pjob_nc=nc; c->pjob_fn=bch_mw_worker; c->pjob_stride=sizeof(struct bchmw);
-    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
-    bch_mw_worker(&args[0]);
-    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
-    g_in_doorbell=0;
-    int bad=0; for(int i=0;i<nc;i++){ if(args[i].rc==-1) return -1; if(args[i].rc==-2) bad=1; }
-    if(bad){   /* a core dropped -> re-run ITS experts serially via the proven per-expert BCHAIN (its first submit's
-                * timeout_clean reaps the dropped coalesced job — bounded i4_submit_tmo_ms made it past-timeout) */
-        for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue;
-            for(int e=args[i].e0;e<args[i].e1;e++) if(run_i4_bchain_db(c, ex[e].w, ex[e].M, ex[e].A, ex[e].C, nc)) return -1; }
-    }
-    ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job (from a coalesced drop or the per-expert fallback) BEFORE the mcc bdestroy / next op switches domains. In-domain, post-join, safe. No-op unless a real miss occurred. */
-    /* #54 RESIDENT MULTI-DOMAIN: the coalesced OUTPUT scratch (mcc, ~33 MB/core for a whole _exps tensor) is
-     * TRANSIENT — its results are already de-tiled to the host C above. Weights stay resident per-domain, but if
-     * mcc were left allocated it would be PARKED per-domain by dom_activate and accumulate one ~100 MB copy per
-     * domain -> across the auto-sized ~16 domains that's ~1.6 GB of bcreate scratch, exhausting the kernel GEM/CMA
-     * pool so a fresh orki_bcreate (even a tiny mtk_all) EINVALs at ~the 5th domain. Free it here so only the ACTIVE
-     * domain's mcc exists; the next run re-allocs it in its own domain. (int8's per-op scratch is tiny so it never
-     * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths. */
-    for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
-    return 0;
-}
-struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
-static void *stream_worker_i4(void *vp) {
-    struct streamw4 *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core;
-    orki_pin_big_core(i);
-    int k; a->rc = 0;
-    uint32_t rc[REGCMD_I4_N];
-    while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
-        const ork_mm_task_i4 *t = &a->tasks[k];
-        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N;
-        uint32_t bdma = (uint32_t)w->Bb[0].dma;
-        uint8_t *abase = c->maf[i].cpu;                       /* per-row stride K bytes (nibble-pack uses K/2) */
-        /* ROUND-ROBIN + BATCH: if the native batch scheduler is on and this task's weight fits resident
-         * (N*K<=131072), batch its M rows in H-row submits (mc=2H, stride-2 A at slot 2j, de-tile 4j+4H*b) —
-         * one core batches a whole small matmul, round-robin, no barrier. Else fall through to per-row. */
-        int Hcap = 16384 / K; if (Hcap > 16) Hcap = 16; if (Hcap < 1) Hcap = 1;
-        if (ork_i4_batch() && Hcap >= 2 && M >= 2 && (size_t)N * K <= 131072) {
-            int NBc = N / 64;
-            for (int m0 = 0; m0 < M; m0 += Hcap) {
-                int H = (M - m0 < Hcap) ? (M - m0) : Hcap;
-                for (int j = 0; j < H; j++)                   /* real row j at A-slot 2j (stride-2 input) */
-                    tile_i4_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
-                orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
-                memset(rc, 0, sizeof rc);
-                orki_synth_i4(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
-                rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;   /* single task */
-                memcpy(c->mrc[i].cpu, rc, REGCMD_I4_N * 4);
-                orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-                struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, sizeof *mt);
-                mt[0].enable_mask = 0xd; mt[0].int_mask = 0x300; mt[0].int_clear = 0x1ffff;
-                mt[0].regcfg_amount = 116; mt[0].regcmd_addr = c->mrc[i].dma;
-                orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-                struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-                sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
-                sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
-                int reps = c->mwarm[i] ? 1 : 2;
-                for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = mm_timeout_ms();
-                    if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
-                    orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE); }
-                c->mwarm[i] = 1;
-                int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;   /* de-tile: o[(4j+4H*b)*64+cc] -> C[m0+j][b*64+cc] */
-                for (int j = 0; j < H; j++) for (int b = 0; b < NBc; b++) {
-                    size_t base = (size_t)(4 * j + 4 * H * b) * 64;
-                    int32_t *crow = C + (size_t)(m0 + j) * N + b * 64;
-                    for (int cc = 0; cc < 64; cc++) crow[cc] = o[base + cc];
-                }
-            }
-            continue;   /* task done via batch; skip the per-row path below */
-        }
-        for (int m = 0; m < M; m++) tile_i4_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
-            memset(rc, 0, sizeof rc);
-            orki_synth_i4(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
-                     (uint32_t)(c->mcc[i].dma + (size_t)m * N * 2));
-            if (m < M - 1) {
-                uint64_t nd = c->mrc[i].dma + (size_t)(m + 1) * REGCMD_I4_N * 4;
-                rc[216] = 0x0010 | ((nd & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nd >> 16) & 0xffff);
-                rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
-            } else { rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000; }
-            memcpy((char *)c->mrc[i].cpu + (size_t)m * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
-        }
-        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)M * sizeof *mt);
-        for (int q = 0; q < M; q++) {
-            mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
-            mt[q].regcfg_amount = 116; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I4_N * 4;
-        }
-        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-        sub.flags = ork_ppflags(); sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
-        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
-        /* Prime THIS core's buffers on its first use (mwarm[i]): a freshly-allocated NPU output buffer
-         * returns stale on its first write, so the first task to land on a core does a throwaway warmup
-         * rep then the real rep. Per-core (not an outer double-pass) because tasks are pulled round-robin
-         * — a core that idles in pass 0 would otherwise stay unprimed and zero-fill the next task it grabs.
-         * Same idiom as the run_multicore / chain workers. */
-        int reps = c->mwarm[i] ? 1 : 2;
-        for (int rep = 0; rep < reps; rep++) {
-            int last = (rep == reps - 1);
-            sub.timeout = mm_timeout_ms();
-            if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
-            orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
-        }
-        c->mwarm[i] = 1;
-        int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;        /* widen int16 NPU output -> int32 caller C */
-        for (int row = 0; row < M; row++) {
-            int16_t *orow = o + (size_t)row * N; int32_t *crow = C + (size_t)row * N;
-            for (int col = 0; col < N; col++) crow[col] = orow[col];
-        }
-    }
-    return NULL;
-}
-int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
-    if (!c || S < 1 || !tasks) return -2;
-    /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
-    const int mrc_cap = 65536 / (REGCMD_I4_N * 4);
-    size_t maxMK = 0, maxMN2 = 0;
-    for (int i = 0; i < S; i++) {
-        ork_w *w = tasks[i].w;
-        if (!w || w->dtype != DT_I4 || tasks[i].M <= 0) return -2;
-        if (w->Sn != 1 || w->Sk != 1) return -2;              /* single-slice weight only (no K/N split) */
-        if (tasks[i].M > mrc_cap) return -2;                  /* M single-row regcmds must fit one mrc buffer */
-        size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 2;
-        /* batch (msched) output spans up to 4*HCAP(=16)*N int16 = 128*N bytes; only for tasks that FIT the
-         * weight orki_budget (N*K<=131072, i.e. small N), so the bump is small. */
-        if(ork_i4_batch() && (size_t)w->N*w->K<=131072){ size_t bn=(size_t)128*w->N; if(bn>mn)mn=bn; }
-        if (mk > maxMK) maxMK = mk; if (mn > maxMN2) maxMN2 = mn;
-    }
-    int fd = c->fd;
-    int cold = 0;   /* warmup pass needed on a fresh stream-i4 mode OR freshly-allocated per-core buffer */
-    if (ork_npu_enter(c, 5 /* DT_I4_STREAM */, XP_I4_STREAM, OCK_SW)) cold = 1;
-    int nc = orki_budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
-    if (orki_mc_ensure(c, nc)) return -1;
-    for (int i = 0; i < nc; i++) {
-        if (c->maf[i].size < maxMK) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
-        if (c->mccsz[i] < maxMN2) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, maxMN2, 0x403, c->dom_active); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
-    }
-    int rc = 0;
-    if (cold) for (int i = 0; i < nc; i++) c->mwarm[i] = 0;   /* fresh mode/buffer => each core re-primes (per-core warmup in the worker) */
-    npu_pool_ensure(c);
-    struct streamw4 sw[ORK_MAXCORE];
-    /* Single dispatch: priming is per-core inside the worker (mwarm[i]), so the result is correct
-     * regardless of how the round-robin atomic counter assigns tasks to cores — no outer double-pass
-     * (which left a core that idled in the first pass unprimed, zero-filling whatever task it then grabbed). */
-    int ctr = 0;
-    for (int i = 0; i < nc; i++) sw[i] = (struct streamw4){c, i, S, tasks, &ctr, 0};
-    pthread_mutex_lock(&c->pmu);
-    c->pjob = sw; c->pjob_nc = nc; c->pjob_fn = stream_worker_i4; c->pjob_stride = sizeof(struct streamw4);
-    c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
-    pthread_mutex_unlock(&c->pmu);
-    stream_worker_i4(&sw[0]);                             /* core 0 on the calling thread */
-    pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
-    for (int i = 0; i < nc; i++) if (sw[i].rc) rc = -1;
-    c->warmed = 1;
-    return rc;
-}
 
 /* ===================== ASYNC SUBMIT (CPU‖NPU overlap foundation) =====================
  * The RKNPU SUBMIT ioctl is synchronous: the kernel blocks the calling thread until the NPU job

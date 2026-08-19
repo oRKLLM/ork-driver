@@ -158,8 +158,117 @@ void          ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w);
 #include <time.h>
 static inline double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
 
+/* hot, tiny, and on the per-submit path (orki_setr 517 call sites, orki_bsync 604) — keep them
+ * header-inline so the split does not cost the inlining the monolith had. */
+#include <string.h>
+#include <sys/ioctl.h>
+static inline void orki_setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
+static inline void orki_bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+static inline void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+
 /* ---- cross-module internals (extern; defined in npu.c or a src/npu/*.c module) ---- */
 void orki_pin_little_core(int id);          /* npu.c  — pin the caller to an idle A55 */
 void orki_ssm_pool_free(ork_npu *c);        /* npu/ssm.c — release the persistent SSM scan pool (ork_npu_free) */
+
+#include <signal.h>
+
+/* ---- shared enums/markers the precision modules need (moved out of npu.c at the i4 lift) ---- */
+enum { XP_MC_MM, XP_SC_MM, XP_CHAIN_NT, XP_STREAM_I8, XP_STREAM_F16,
+       XP_I4_MC, XP_I4_MWARM, XP_I4_INCR, XP_I4CHAIN, XP_I4_STREAM, XP_SDP, XP_NPROFILE };
+enum ork_chain_kind { OCK_NONE=0, OCK_SW, OCK_HW, OCK_FUSED };
+#define ORK_DYN_SENT16 ((int16_t)0x7fff)   /* int4 (int16 output) sentinel — no valid W4A4 accumulator equals it */
+
+/* the dynamic steered-submission chain handle — i4.c builds these directly */
+struct ork_dyn_chain {
+    ork_npu *c; int S, P, N, reserve, mc, spin_end; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core; spin_end = reserve if the tail is a persistent spin (forward-chained), else 0 */
+    struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
+    int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
+    int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
+    int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
+    int        oSk[1024];       /* per-op K-split count: >1 => the op's output is oSk partial [M,N] blocks in scratch
+                                 * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
+    int        ostride[1024];   /* per-op copy-back dst row stride (elements): >0 => end() writes [M, nout/M] scratch
+                                 * to dst at this row stride (a column-slice of a wider C, colsplit M>1). 0 = contiguous. */
+    int        ocol0[1024];     /* colsplit balanced wide-N: this core's first C column (c0). With oscat, end()
+                                 * recomputes the within-slice segment widths from (ocol0, nout/oM, N, nmax). */
+    int8_t     oscat[1024];     /* 1 => balanced wide-N BOUNDARY-SCATTER copy-back: scratch is segment-major
+                                 * [M,segw] blocks (each program contiguous, no notch); end() scatters each segment
+                                 * to C[c0+coff .. ) at row-stride N, segment widths cut at nmax slice boundaries. */
+    int32_t   *dst[1024];       /* mc: caller's C to copy the in-domain mcc output back to (end); NULL = write-in-place */
+    struct buf ascr[1024]; int nascr;   /* scratch A copies (freed in end); zero-copy A miscomputes at M=1 */
+    int        esz;             /* output element size in bytes: 4 = int8/fp16 (int32/fp32, NPU writes C directly),
+                                 * 2 = int4 (W4A4 writes an int16 accumulator to scratch, end() widens to int32).
+                                 * 0 (calloc default) is treated as 4 — only the int4 doorbell sets 2. */
+    int        mc_nc;           /* DIAG/RECOVER (ork_dyn_begin_mc only; 0 elsewhere): core count for this round */
+    int        mc_rc[8];        /* DIAG: per-core submit-ioctl return code (0 = accepted) */
+    uint64_t   dma_rw0;         /* NPU cumulative dma_rw BEFORE the round; delta = HW work (0 => never dispatched) */
+    /* RECOVER context: ork_dyn_end resubmits the round on a not-dispatched miss (the ~1/4000 concurrent
+     * NONBLOCK dispatch race). c->maf/mrc/mtk[i] still hold the round's data (not reused until end), so the
+     * stashed submits replay it. int8 only (mc_dt); fp16 drains in-submit. */
+    struct rknpu_submit mc_subs[ORK_MAXCORE];
+    int        mc_Pc[ORK_MAXCORE];
+    unsigned   mc_dom; int mc_seed_all; int mc_dt;
+    /* #54 BCHAIN-ON-THE-SHARED-DRAIN (i4batch): the M-batched int4 BCHAIN (run_i4_bchain_db) now builds its
+     * per-core programs then rides ork_dyn_end for poll + recover (the PROVEN shared drain int8 colsplit uses),
+     * instead of a hand-rolled per-worker poll/recover. Its output is 2D-tiled (not per-row/dense), so the poll
+     * (ork_dyn_done_i), the recover re-seed (mc_recover_resubmit), and the de-tile (ork_dyn_end writeback) all
+     * delegate to bch_db_cells with this stored geometry — preserving the mode-1 gate, mode-4 collision-tolerance
+     * (SENT16=0x7fff reachable), and mode-2 int16->int32 de-tile. */
+    int        i4batch;                 /* 1 = BCHAIN programs drained by ork_dyn_end via bch_db_cells */
+    int        b_H, b_Wb, b_Wmax, b_NG, b_M, b_N;   /* BCHAIN geometry (shared across cores) */
+    int        b_c0[ORK_MAXCORE], b_c1[ORK_MAXCORE], b_NT[ORK_MAXCORE];   /* per-core N-chunk range + program count */
+    int32_t   *b_C;                    /* caller's int32 C (de-tile destination) */
+    int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
+                             * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
+    int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
+                             * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
+    /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
+     * blocks scaled + FLOAT-accumulated — C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]. */
+    int          i4g;              /* 1 = grouped-int4 float drain */
+    const float *i4g_aS, *i4g_bS;  /* activation scale (M*Sk), weight scale (Sk*N) — caller host arrays */
+    float       *i4g_Cf;           /* float output C[M,N] */
+    int          i4g_N, i4g_Sk;    /* N + group count */
+    /* SEQ chain (ork_dyn_begin_seq_i8 — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
+     * all ops share ONE output scratch; per-op layout/esz differ (matmul int32 dense, SDP int8 EWCUBE). */
+    int        seq;             /* 1 = built by begin_seq_i8 */
+    int        seq_term;        /* (single-core) op index whose terminal int32 last-col sentinel gates completion */
+    int        seq_nc;          /* seq cores in this round (1 = single-core; >1 = groups spread across cores) */
+    int        seq_term_c[ORK_MAXCORE];   /* per-core terminal op index (its last program, a matmul = sentinel) */
+    struct buf seq_out;         /* shared output scratch for all seq ops (freed in seq_end) */
+    uint8_t    oesz8[1024];     /* per-op output element bytes: 4=int32 matmul, 1=int8 SDP, 2=int16 SDP (silu) */
+    uint8_t    ocube[1024];     /* per-op output layout: 1=EWCUBE-i8 (int8 SDP), 2=EWCUBEH-i16 (int16 SDP), 0=dense [M,N] (matmul) */
+    size_t     ooff[1024];      /* per-op byte offset into seq_out */
+    struct buf silu_lrc, silu_lsc;   /* int16-SiLU HW-chain: the LUT-load regcmd + SRAM buffers, resident across the chain; freed in seq_end */
+    int        silu_lut;        /* 1 = a silu LUT-load prologue ran (Lrc/Lsc valid) */
+};
+
+/* ---- scaffold internals the precision modules call (de-static'd at the lift that needed them) ---- */
+int      orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end);
+unsigned orki_mm_timeout_ms(void);
+void     orki_npu_pool_ensure(ork_npu *c);
+uint32_t ork_ppflags(void);
+int      ork_i4_batch(void);
+void     ork_dom_flush_if_dirty(ork_npu *c);
+int      ork_npu_enter(ork_npu *c, int to, int profile, int chain);
+struct buf orki_bcreate(int fd, size_t size, uint32_t flags, int domain);
+void     orki_bdestroy(int fd, struct buf *b);
+struct buf orki_bscratch(ork_npu *c, size_t size, int flags, int dom);
+int      orki_budget(ork_npu *c, int M);
+struct buf *orki_dma_find(ork_npu *c, const void *p);
+void     orki_dom_activate(ork_npu *c, int dom);
+int      orki_mc_ensure(ork_npu *c, int nc);
+void     orki_pin_big_core(int id);
+int      orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain);
+void     orki_synth_i4(uint32_t *rc, int mc, int K, int N, uint32_t aA, uint32_t aB, uint32_t aC);
+int      orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n);
+void     orki_tile_i4_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
+extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_wdom, orki_last_import;
+extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;
+
+/* ---- provided BY src/npu/i4.c to the scaffold ---- */
+int  orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);
+int  orki_i4_submit_tmo_ms(void);
+int  orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
+int  orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);
 
 #endif /* ORK_NPU_INTERNAL_H */

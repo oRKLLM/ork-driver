@@ -18,7 +18,7 @@ ifneq ($(GIT_HASH),)
 CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
 PREFIX  ?= /usr/local
-CORE    := src/npu.c src/npu/ssm.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c src/ork_ops.c
+CORE    := src/npu.c src/npu/i4.c src/npu/ssm.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c src/ork_ops.c
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
