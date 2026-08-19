@@ -372,7 +372,9 @@ size_t       ork_pack_i4a8_cpu_blob(ork_npu *ctx, int K, int N, const float *f32
  * with the calibration Hessian H=X^T X -> uniform symmetric int4 [-8,7] + per-(row,group) scale (native-W4A4
  * form: dequant w=code*scale; composes with Hadamard = QuaRot). W:[N(out)*K(in)] fp32; H:[K*K] (DESTROYED);
  * group<=0 => per-row; codes:[N*K] int8; scales:[N*ceil(K/group)] fp32; damp: Hessian damp (0.01 typical).
- * 0 ok, <0 on error. UNVALIDATED until compared vs AutoGPTQ (task #56); pack gates it behind ORK_GPTQ. */
+ * 0 ok, <0 on error. NOT YET IMPLEMENTED — the current src/ork_gptq.c is a stub returning -ENOSYS; the
+ * real quantizer is written but parked until it is cross-checked against AutoGPTQ on a fixed (W,H)
+ * golden (task #56). Nothing routes through it; the pack gates it behind ORK_GPTQ. */
 int          ork_gptq_i4(int K, int N, const float *W, float *H, int group, int8_t *codes, float *scales, float damp);
 ork_w       *ork_mm_pack_i8_import(ork_npu *ctx, int K, int N, const int8_t *B);
 

@@ -22,7 +22,7 @@ CORE    := src/npu.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activa
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
-COBJ    := $(CORE:.c=.o) src/orkd_client.o   # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD). Not in CORE/ATTEST — it's RPC transport, not an NPU-output source.
+COBJ    := $(CORE:.c=.o) src/orkd_client.o src/ork_gptq.o   # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
 # Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
