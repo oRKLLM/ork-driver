@@ -101,7 +101,7 @@ static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
 static double ork_now_us(void);
 static int    g_ork_prof = 0;
 /* ORK_LOAD_PROF: per-phase breakdown of the .orkpack import path — where load time actually goes.
- * Accumulated across every bimport()/load; dumped (and reset) at teardown by ork_load_prof_dump(). */
+ * Accumulated across every orki_bimport()/load; dumped (and reset) at teardown by ork_load_prof_dump(). */
 static int    g_load_prof = 0;   /* set from ORK_LOAD_PROF in ork_npu_init, like g_ork_prof */
 static double g_lp_alloc=0, g_lp_mmap=0, g_lp_prime=0, g_lp_create=0, g_lp_memcpy=0, g_lp_bf=0;
 static long   g_lp_nchunk=0; static size_t g_lp_bytes=0;
@@ -136,7 +136,7 @@ struct ork_dom_scratch {
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int scratch_import; /* 1 once a native-int4 weight is bimported: route run scratch via bimport (bcreate EINVALs in a bimport-filled domain). Set by ork_mm_load_i4_import; int8/fp16 never set it. */ int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int scratch_import; /* 1 once a native-int4 weight is bimported: route run scratch via orki_bimport (bcreate EINVALs in a bimport-filled domain). Set by ork_mm_load_i4_import; int8/fp16 never set it. */ int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     /* fused-chain PER-CORE scratch (increment 2: concurrent round-robin — one independent buffer set per core so
      * chains dispatched to different cores never share DRAM). chain_rc = P-program regcmd, chain_tk = P-task array,
      * chain_lrc = LUT-load regcmd (DRAM source), chain_lsc = LUT SDP scratch. Lazily allocated per core on first use. */
@@ -161,7 +161,7 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
     int dom_active; int dom_cap;   /* dom_cap = allocated length of dom_anchor[] / dom_save[]; grown on demand by dom_reserve, NO fixed cap (domain count = whatever the auto-sizer / ork_npu_domain_alloc drives) */
     int dom_dirty;   /* #54: a genuine doorbell MISS left an unreaped (dropped) job in dom_active — its completion IRQ never fired, so the kernel's per-job interrupt_count for this domain stays >0 forever. A stuck job makes the NEXT iommu-domain switch time out ("switch iommu domain time out") -> cascade. dom_activate flushes it (ACT_RESET, which aborts+clears stuck jobs, while STILL attached to this domain) before switching away. Set by the int4 doorbell reset-free-resubmit path; single-domain never switches, so it never acts on the flag (matches streaming's safety). */
     /* ORK_DOM_PROFILE: dom_activate cost telemetry (the "domain-swap window"). Steady = pure scratch
-     * pointer-swap memcpy; first = one-time per-domain first-touch bcreate(regcmd/task/Af). */
+     * pointer-swap memcpy; first = one-time per-domain first-touch orki_bcreate(regcmd/task/Af). */
     uint64_t dom_sw_n, dom_sw_first_n; double dom_sw_us, dom_sw_first_us, dom_sw_max_us;
     int dom_next;   /* direct-mode domain allocator counter (ork_npu_domain_alloc hands out 1,2,3,…); Path B asks the daemon instead */
     /* Per-domain native "anchor": one small NATIVE bcreate per non-0 domain, allocated BEFORE any dma-buf
@@ -244,17 +244,17 @@ struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; 
 typedef struct { ork_w *wkt, *wv; int HD, Lmax, Kp; uint64_t orkd_kv; } ork_kv_resident;
 #endif
 /* slice-and-dice rescue (#33): forward-declared here (full def near ork_mm_pack_sliced, far below) so
- * pack() can BUILD w->sliced (raw B is only in scope at pack time), ork_mm_free can free it, and
+ * orki_pack() can BUILD w->sliced (raw B is only in scope at pack time), ork_mm_free can free it, and
  * run_multicore's refuse sites can RUN it. Signatures match include/ork_npu.h (repeat typedef/decls are
  * legal C11 and are compatible whether or not the header is also included in this TU). */
 typedef struct ork_w_sliced ork_w_sliced;
 ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dtype);
 int           ork_mm_run_sliced (ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc);
 void          ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w);
-/* #33 reentrancy guard: slice_pack_i8 packs each sub-tile via ork_mm_pack_i8 -> pack(), which would ITSELF
+/* #33 reentrancy guard: slice_pack_i8 packs each sub-tile via ork_mm_pack_i8 -> orki_pack(), which would ITSELF
  * try to build a w->sliced for that sub-tile (harmless for the natural gate — sub-tiles are Sn==1, never
  * refuse-prone — but ORK_SLICE_ALL forces it and RECURSES until IOVA fills). Set while packing sub-tiles so
- * the nested pack() skips its slice-build. Thread-local: concurrent packs on different threads don't clash. */
+ * the nested orki_pack() skips its slice-build. Thread-local: concurrent packs on different threads don't clash. */
 static _Thread_local int g_in_slice_pack;
 /* pcrc: PRECOMPILED regcmd cache (ORK_PRECOMP_RC) — the M=1 decode regcmd for this weight is FIXED across
  * tokens (same weight tiles + reused per-core AF/CC scratch => same K/N/addresses), so synth it ONCE and
@@ -314,7 +314,7 @@ static int is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const st
 /* Last regcmd context (set by validate_regcmd) — dumped on a submit failure to PIN which weight/op/domain/
  * import-status faulted (e.g. the multi-domain import scale-fault: errno=22). */
 static const char *g_last_op = "?"; static int g_last_K=0, g_last_N=0, g_last_wdom=-1, g_last_import=0;
-static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
+static int orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
     /* stash context so a later submit failure can name the exact weight/op/domain/import-status that faulted */
     g_last_op = op ? op : "?";
     if (w) { g_last_K = w->K; g_last_N = w->N; g_last_wdom = w->domain;
@@ -355,7 +355,7 @@ static int validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n
  * path is the existing, bit-exact-validated per-slice/chain-ksplit accumulation — no new regcmd; every
  * program still goes through validate_regcmd, and accumulation == full-K == the CPU ref. WEDGE-SAFE:
  * it reuses the proven wide-K accumulate; an out-of-range value is ignored (falls back to KS=1024). */
-static int int8_ks(ork_npu *c){ (void)c;
+static int orki_int8_ks(ork_npu *c){ (void)c;
     static int kt=-2;
     if(kt==-2){ const char*e=getenv("ORK_KTILE"); kt=e?atoi(e):0;
         if(kt && (kt<32 || kt%32)) kt=0; }   /* must be a multiple of 32; else ignore */
@@ -368,9 +368,9 @@ static int int8_ks(ork_npu *c){ (void)c;
  * (no env needed); the engine sets a core budget via ork_npu_set_core_budget.
  * The driver automatically selects the core count by N-tile count, and uses full-K single-submits
  * when M is small, K<=10752, precision is int8, and it fits within IOVA. */
-static int budget(ork_npu*c, int M){
-    /* M=1 is single-core by default here; the int8 DECODE path in run() overrides to the multi-core budget
-     * (it calls budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
+static int orki_budget(ork_npu*c, int M){
+    /* M=1 is single-core by default here; the int8 DECODE path in orki_run() overrides to the multi-core budget
+     * (it calls orki_budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
      * +40% end-to-end decode (Qwen3-1.7B) and MONOTONIC in the in-model N-sweep: every int8 shape benefits,
      * so there is no per-shape threshold and no env knob (the old ORK_DECODE_MC gate is gone). mc_prof's warm
      * loop had mis-measured a crossover that doesn't exist in real cold decode. fp16/int4 M==1 stay single-core
@@ -391,7 +391,7 @@ static int budget(ork_npu*c, int M){
 } /* effective max cores */
 
 
-static size_t pgup(size_t s){return (s+4095)&~((size_t)4095);}
+static size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
 /* PER-WEIGHT IOMMU DOMAIN. The rk_iommu v2 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, not per
  * device, so spreading weights over multiple domains keeps >4 GiB resident at once. ORK_IOMMU_DOMAIN
  * is the process-wide DEFAULT domain (env, default 0). Each ork_w then carries its own `domain`:
@@ -472,16 +472,16 @@ static void live_del(uint32_t h){ pthread_mutex_lock(&g_live_mu);
 /* IMPORT REGISTRY (fd-reap recovery, task #47). A parallel registry holding POINTERS to every dma-buf-IMPORTED
  * buf (bimport / bimport_fd) — the ones whose backing pages PERSIST across a DRM-fd close (the client/heap holds
  * the dma-buf fd). ork_ctx_fd_reap() walks this to RE-IMPORT each buffer into the reopened fd and rewrite its
- * handle/IOVA/obj/cpu IN PLACE, so resident weights survive a close+reopen with NO re-pack (only bcreate'd buffers
+ * handle/IOVA/obj/cpu IN PLACE, so resident weights survive a close+reopen with NO re-orki_pack (only bcreate'd buffers
  * — scratch — are lost, and those lazily re-create). Pointers are stable (Bb[]/own_bufs[] are calloc'd arrays);
  * bdestroy unregisters. Values-registry g_live is for SIGTERM MEM_DESTROY; this one is for reap re-import. */
 static struct buf **g_imp=NULL; static int g_imp_n=0, g_imp_cap=0;
-static void imp_reg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
+static void orki_imp_reg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
     for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ pthread_mutex_unlock(&g_live_mu); return; }   /* dedupe */
     if(g_imp_n==g_imp_cap){ int nc=g_imp_cap?g_imp_cap*2:128; void*p=realloc(g_imp,(size_t)nc*sizeof*g_imp); if(p){g_imp=p;g_imp_cap=nc;} }
     if(g_imp_n<g_imp_cap) g_imp[g_imp_n++]=b;
     pthread_mutex_unlock(&g_live_mu); }
-static void imp_unreg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
+static void orki_imp_unreg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
     for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ g_imp[i]=g_imp[--g_imp_n]; break; }
     pthread_mutex_unlock(&g_live_mu); }
 static volatile sig_atomic_t g_sig_busy=0;
@@ -492,8 +492,8 @@ static void ork_sig_teardown(int sig){
             struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); } }
     signal(sig,SIG_DFL); raise(sig);
 }
-static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
-    int dom=ork_dom(domain); size_t need=pgup(size);
+static struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
+    int dom=ork_dom(domain); size_t need=orki_pgup(size);
     /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (g_sram_total
      * ==0, stock kernel/DTB), drop to DRAM up front — don't even try. If SRAM exists but the alloc faults
      * (SRAM full/contended), retry once in DRAM below. Keeps the async submit path portable. */
@@ -519,9 +519,9 @@ static struct buf bcreate(int fd,size_t size,uint32_t flags,int domain){
     g_bcreate_n++;
     return b;
 }
-static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
+static void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
-    live_del(b->handle); imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
+    live_del(b->handle); orki_imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
     g_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
@@ -529,13 +529,13 @@ static void bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->s
  * Reused across every ewmul/add call so the per-op MEM_CREATE/MEM_DESTROY churn (which dominates the
  * standalone-op cost and fragments the IOVA window) is paid ONCE, not per call. 0 on success, -1 on alloc
  * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
-static int ppu_scratch3(ork_npu *c,size_t sz){
+static int orki_ppu_scratch3(ork_npu *c,size_t sz){
     if(sz<4096) sz=4096;
     if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu && c->ppu_a.domain==c->dom_active) return 0;   /* realloc if the active domain changed (persistent scratch must live in c->dom_active) */
-    bdestroy(c->fd,&c->ppu_a); bdestroy(c->fd,&c->ppu_b); bdestroy(c->fd,&c->ppu_o);
-    c->ppu_a=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
-    c->ppu_b=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_b.cpu){bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
-    c->ppu_o=bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_o.cpu){bdestroy(c->fd,&c->ppu_a);bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
+    orki_bdestroy(c->fd,&c->ppu_a); orki_bdestroy(c->fd,&c->ppu_b); orki_bdestroy(c->fd,&c->ppu_o);
+    c->ppu_a=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
+    c->ppu_b=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_b.cpu){orki_bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
+    c->ppu_o=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_o.cpu){orki_bdestroy(c->fd,&c->ppu_a);orki_bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
     c->ppu_sz=sz; return 0;
 }
 
@@ -561,10 +561,10 @@ static int dmaheap_open(void){
 static void dmabuf_sync(int heap_fd,uint64_t flags){
     if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
 }
-static struct buf bimport_f(int fd,size_t size,int domain,uint32_t memflags){
+static struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     int tr=imp_trace();
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
-    size_t sz=pgup(size);
+    size_t sz=orki_pgup(size);
     int dtr=ork_dom(domain);   /* domain id for the trace (final `dom` computed post-mmap, same value) */
     if(tr){ fprintf(stderr,"[IMP] bimport dom=%d sz=%zuKB (imp#%ld, dom_bytes=%zuMB): DMA_HEAP_ALLOC...\n",dtr,sz>>10,g_bimport_n,g_iova_bytes[dtr>=0&&dtr<ORK_IOVA_NDOM?dtr:0]>>20); fflush(stderr); }
     double _t = g_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
@@ -597,7 +597,7 @@ static struct buf bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     if(tr){ fprintf(stderr,"[IMP]   MEM_CREATE ok dma=0x%llx -> bimport DONE (imp#%ld dom_bytes=%zuMB)\n",(unsigned long long)b.dma,g_bimport_n,g_iova_bytes[dom>=0&&dom<ORK_IOVA_NDOM?dom:0]>>20); fflush(stderr); }
     return b;
 }
-static struct buf bimport(int fd,size_t size,int domain){ return bimport_f(fd,size,domain,0); }   /* weights: NPU-DMA'd, no kernel vmap */
+static struct buf orki_bimport(int fd,size_t size,int domain){ return orki_bimport_f(fd,size,domain,0); }   /* weights: NPU-DMA'd, no kernel vmap */
 /* Run-SCRATCH allocator (task/regcmd/output buffers). int4-RESIDENT runs keep every domain's WEIGHTS bimported
  * (PRIME_FD); a fresh MEM_CREATE (bcreate) then EINVALs in that domain (MEM_CREATE GEM alloc can't coexist with
  * imported memory in the same iommu domain), which starved the run scratch (mc_ensure mtk_all -> decode -3). So
@@ -605,7 +605,7 @@ static struct buf bimport(int fd,size_t size,int domain){ return bimport_f(fd,si
  * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
  * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
  * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
-static struct buf bscratch(ork_npu *c,size_t size,int flags,int dom){
+static struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
     /* int8/fp16 (scratch_import unset): bcreate — the proven path, UNCHANGED. int4 RESIDENT (scratch_import set
      * once weights are bimported): a fresh bcreate GEM can't be placed amid ~GiB of imported SG mappings in the
      * same domain (kernel EINVAL once the domain is heavy — mc_ensure mtk_all -> decode -3). Route scratch through
@@ -638,15 +638,15 @@ static struct buf bscratch(ork_npu *c,size_t size,int flags,int dom){
      * carrying KERNEL_MAPPING for the kernel-read task/descriptor buffers (flags&0x8 -> 0x40b) — dropping it was
      * the old import-scratch wedge; bimport_f supports it. Domain 0 + int8/fp16 UNCHANGED (bcreate). */
     { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp && ork_dom(dom)>0){ return bimport_f(c->fd,size,dom,(flags & RKNPU_MEM_KERNEL_MAPPING)); } }
-    return bcreate(c->fd,size,flags,dom);
+      if(bimp && ork_dom(dom)>0){ return orki_bimport_f(c->fd,size,dom,(flags & RKNPU_MEM_KERNEL_MAPPING)); } }
+    return orki_bcreate(c->fd,size,flags,dom);
 }
 /* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
  * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
  * This is the cross-process zero-copy primitive behind ork_dma_import_fd (the orkd daemon's data plane). */
-static struct buf bimport_fd(int fd,int dbuf,size_t size,int domain){
+static struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
     if(dbuf<0) return (struct buf){0};
-    size_t sz=pgup(size);
+    size_t sz=orki_pgup(size);
     void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
     if(p==MAP_FAILED){ perror("mmap(import_fd)"); return (struct buf){0}; }
     int dom=ork_dom(domain);
@@ -673,7 +673,7 @@ static struct buf bimport_fd(int fd,int dbuf,size_t size,int domain){
  * here (so it becomes non-NULL exactly when multi-domain is first entered, preserving the single-vs-multi
  * signal the run paths key on). Called from every multi-domain entry: dom_activate, ork_dom_prime,
  * ork_npu_domain_alloc, ork_npu_set_ndomains. Returns 0 ok, -1 on OOM (caller degrades gracefully). */
-static int dom_reserve(ork_npu *c, int need){
+static int orki_dom_reserve(ork_npu *c, int need){
     if(need <= c->dom_cap) return 0;
     int nc = c->dom_cap ? c->dom_cap : 2; while(nc < need) nc *= 2;
     struct buf *na = realloc(c->dom_anchor, (size_t)nc*sizeof *na);
@@ -689,19 +689,19 @@ static int dom_reserve(ork_npu *c, int need){
 /* Public: pre-size the ctx for `n` IOMMU domains — the backend calls this once with the auto-sizer's
  * n_domains so no per-weight grow happens mid-load. Only meaningful for n>1 (n<=1 = single-domain, leaves
  * dom_save NULL). Safe to call repeatedly; only ever grows. */
-void ork_npu_set_ndomains(ork_npu *c, int n){ if(c && n>1) dom_reserve(c, n); }
+void ork_npu_set_ndomains(ork_npu *c, int n){ if(c && n>1) orki_dom_reserve(c, n); }
 static void ork_dom_prime(ork_npu *c, int dom){
     int d = ork_dom(dom);
     if(d<=0) return;                                  /* domain 0 never needs an anchor */
-    if(dom_reserve(c, d+1)) return;                   /* grow arrays to cover domain d (OOM -> skip anchoring) */
+    if(orki_dom_reserve(c, d+1)) return;                   /* grow arrays to cover domain d (OOM -> skip anchoring) */
     if(c->dom_anchor[d].cpu) return;                  /* already anchored */
     /* #54 BIMPORT-ONLY (ORK_BIMPORT_DOM): native bcreate EINVALs in non-0 domains on this boot, so the anchor
      * must be a dma-heap import too. (Quirk 1's native-first requirement can't be honored when bcreate fails;
      * the weight import that follows is import-first regardless — the probe's bit-exact verify catches any
      * aliased-IOVA corruption.) */
     { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp){ c->dom_anchor[d] = bimport(c->fd, 65536, d); return; } }
-    c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
+      if(bimp){ c->dom_anchor[d] = orki_bimport(c->fd, 65536, d); return; } }
+    c->dom_anchor[d] = orki_bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
 }
 /* #54 FIX: re-establish a domain's IOMMU page-table region before EACH imported dma-buf. The kernel sets up a
  * domain's page table lazily around the buffer that triggers it; the one up-front anchor (ork_dom_prime) covers
@@ -711,11 +711,11 @@ static void ork_dom_prime(ork_npu *c, int dom){
  * previous import's mapping persists after its anchor is freed (verified: 1st weight re-runs bit-exact after). */
 static void ork_dom_reanchor(ork_npu *c, int dom){
     int d = ork_dom(dom); if(d<=0) return;            /* domain 0 always established */
-    if(dom_reserve(c, d+1)) return;
-    if(c->dom_anchor[d].cpu) bdestroy(c->fd, &c->dom_anchor[d]);
+    if(orki_dom_reserve(c, d+1)) return;
+    if(c->dom_anchor[d].cpu) orki_bdestroy(c->fd, &c->dom_anchor[d]);
     { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp){ c->dom_anchor[d] = bimport(c->fd, 65536, d); return; } }   /* #54 bimport-only: bcreate EINVALs in non-0 */
-    c->dom_anchor[d] = bcreate(c->fd, 65536, 0x403, d);
+      if(bimp){ c->dom_anchor[d] = orki_bimport(c->fd, 65536, d); return; } }   /* #54 bimport-only: bcreate EINVALs in non-0 */
+    c->dom_anchor[d] = orki_bcreate(c->fd, 65536, 0x403, d);
 }
 /* #54 REAP-AT-DOMAIN-BOUNDARY. A genuine int4 doorbell DROP leaves a stuck job in c->dom_active whose completion
  * IRQ never fired, so the kernel's iommu_domain_refcount for that domain stays >0. The reap that clears it —
@@ -745,20 +745,20 @@ static void ork_dom_flush_if_dirty(ork_npu *c){
     ork_npu_reap_stuck(c, c->soc->cores);
     c->dom_dirty=0;
 }
-static void bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+static void orki_bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
-static void bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+static void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 /* Reserve `need` contiguous bytes of resident weight storage from the arena pool; returns the backing chunk
  * (and sets *base = byte offset within it) or NULL if a fresh chunk can't be allocated (caller then falls
  * back to per-tile bcreate). Chunk size = ORK_WARENA_CHUNK_MB (default 1 GiB), kept under the single-alloc
  * cap; a weight larger than the default chunk gets its own exact-size chunk. */
-static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
+static struct buf *orki_warena_reserve(ork_npu *c,size_t need,size_t *base){
     size_t a=(need+4095u)&~(size_t)4095u;
     if(c->wchunk_n==0 || c->wchunk_off+a > c->wchunk[c->wchunk_n-1].size){
         if(c->wchunk_n >= (int)(sizeof c->wchunk/sizeof c->wchunk[0])) return NULL;
         const char *e=getenv("ORK_WARENA_CHUNK_MB"); long mb=e?atol(e):1024; if(mb<=0) return NULL;
         size_t csz=(size_t)mb*1024u*1024u; if(a>csz) csz=a;
-        struct buf b=bcreate(c->fd,csz,0x403,-1);
+        struct buf b=orki_bcreate(c->fd,csz,0x403,-1);
         if(!b.cpu){ fprintf(stderr,"[ork] WARNING: weight arena chunk %zuMB alloc failed — falling back to per-buffer\n",csz/1024u/1024u); return NULL; }
         c->wchunk[c->wchunk_n++]=b; c->wchunk_off=0;
     }
@@ -766,7 +766,7 @@ static struct buf *warena_reserve(ork_npu *c,size_t need,size_t *base){
     *base=c->wchunk_off; c->wchunk_off+=a;
     return ch;
 }
-static void act(int fd,uint32_t f,uint32_t v){
+static void orki_act(int fd,uint32_t f,uint32_t v){
     if(f==RKNPU_ACT_RESET){ static long n=0; if(getenv("ORK_DEBUG_RESET")){ void*ra=__builtin_return_address(0); Dl_info di;
         if(dladdr(ra,&di)) fprintf(stderr,"[ork] ACT_RESET #%ld off=0x%lx obj=%s\n",++n,(unsigned long)((char*)ra-(char*)di.dli_fbase),di.dli_fname);
         else fprintf(stderr,"[ork] ACT_RESET #%ld ra=%p\n",++n,ra); } }
@@ -777,7 +777,7 @@ static void act(int fd,uint32_t f,uint32_t v){
  * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
  * use, so the run path's lazy bcreate allocates it in `dom` via c->dom_active). No-op when
  * single-domain (dom==dom_active and only domain 0 ever used). */
-static void dom_activate(ork_npu *c,int dom){
+static void orki_dom_activate(ork_npu *c,int dom){
     if(dom<0) dom=0;
     if(dom==c->dom_active) return;
     /* #54 RETIREMENT BARRIER: a nonblock doorbell op is "done" when its output cell lands, which can be BEFORE
@@ -790,7 +790,7 @@ static void dom_activate(ork_npu *c,int dom){
       if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } }
     ork_dom_flush_if_dirty(c);   /* #54 THE multi-domain fix: if an int4 doorbell drop left a stuck job in the OUTGOING domain, REAP it now (same-domain timeout_clean, still attached to dom_active) so the switch below finds the domain idle instead of timing out -> cascade. See ork_dom_flush_if_dirty. */
     double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
-    if(dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
+    if(orki_dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
     old->used=1; old->regcmd=c->regcmd; old->task=c->task; old->Af=c->Af; old->Cc=c->Cc; old->ccsz=c->ccsz; old->warmed=c->warmed;
@@ -814,9 +814,9 @@ static void dom_activate(ork_npu *c,int dom){
      * run path lazily (re)allocates them in c->dom_active under their own .size/.cpu guards. */
     int _first = (!neo->used && !c->regcmd.cpu);
     if(_first){
-        c->regcmd=bscratch(c,2097152,0x403,dom); c->task=bscratch(c,524288,0x40b,dom); c->Af=bscratch(c,(size_t)4*32768*2,0x403,dom);
+        c->regcmd=orki_bscratch(c,2097152,0x403,dom); c->task=orki_bscratch(c,524288,0x40b,dom); c->Af=orki_bscratch(c,(size_t)4*32768*2,0x403,dom);
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
-            memcpy(c->task.cpu,&t,sizeof t); bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            memcpy(c->task.cpu,&t,sizeof t); orki_bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     }
     { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
@@ -887,7 +887,7 @@ static void dump_submit(struct rknpu_submit *sub) {
 }
 static void trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) dump_submit(sub); }
 
-static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+static int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
     if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     trace_submit(sub);
@@ -949,38 +949,38 @@ static int rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
 }
 /* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
-static void setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
+static void orki_setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
 #include "ork_regs.h"
 /* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
  * offset) from the rocket-cross-referenced table and validates the value fits the register's defined field
  * bits (a value with bits outside them is a bug — flagged, then written so behavior is preserved). This is
- * the normal path. RE / unbounded writes (specify block+offset+value with NO bounds) use setr() directly —
+ * the normal path. RE / unbounded writes (specify block+offset+value with NO bounds) use orki_setr() directly —
  * that is the "raw override" the fuzzer hooks (ork_i8_fuzz_add/ork_f16_fuzz_add) already ride. */
-static void setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
+static void orki_setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
     const ork_reg_desc *d=&ORK_REGS[id];
     if(v & ~d->mask) fprintf(stderr,"[ork] WARN reg %s (%04x:%04x): value %#x has bits outside field mask %#x\n",d->name,d->blk,d->off,v,d->mask);
-    setr(rc,n,d->blk,d->off,v);
+    orki_setr(rc,n,d->blk,d->off,v);
 }
-/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of synth(). Inert by default. */
+/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_synth(). Inert by default. */
 static struct { uint32_t blk, reg, val; } g_f16_fovr[16]; static int g_f16_fovr_n=0;
 void ork_f16_fuzz_clear(void){ g_f16_fovr_n=0; }
 void ork_f16_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_f16_fovr_n<16){ g_f16_fovr[g_f16_fovr_n].blk=blk; g_f16_fovr[g_f16_fovr_n].reg=reg; g_f16_fovr[g_f16_fovr_n].val=val; g_f16_fovr_n++; } }
 /* sched=1: single-submit internal M-scheduler (clean power-of-2 Kp); sched=0: one M-tile. */
-static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
+static void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     memcpy(rc,REGCMD,REGCMD_N*4);
-    setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE0,K*N*2);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE1,K*2);
-    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON1,K/32);setrn(rc,REGCMD_N,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,K/8);
-    setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE3,mc);
-    setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,REGCMD_N,RK_PDP_OUT_M,(mc-1)<<16);
-    setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));setrn(rc,REGCMD_N,RK_DPU_DST_N2,N-1);setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
-    setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_N,RK_PDP_OUT_N,N-1);
+    orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE0,K*N*2);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE1,K*2);
+    orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON1,K/32);orki_setrn(rc,REGCMD_N,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,K/8);
+    orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0,0x10000|mc);orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE3,mc);
+    orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);orki_setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);orki_setrn(rc,REGCMD_N,RK_PDP_OUT_M,(mc-1)<<16);
+    orki_setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));orki_setrn(rc,REGCMD_N,RK_DPU_DST_N2,N-1);orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,REGCMD_N,RK_PDP_OUT_N,N-1);
     if(sched){
-        int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*rows);
-        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see synth_i8 (65..127-row tile needs the next K-schedule) */
-        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,v);
-    } else { setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*(mc+1)); }
-    setrn(rc,REGCMD_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_N,RK_DPU_DST_BASE_ADDR,aC);
-    for(int i=0;i<g_f16_fovr_n;i++) setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides (raw/unbounded) */
+        int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*rows);
+        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see orki_synth_i8 (65..127-row tile needs the next K-schedule) */
+        int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,v);
+    } else { orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*(mc+1)); }
+    orki_setrn(rc,REGCMD_N,RK_CNA_FEATURE_DATA_ADDR,aA);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_DATA_ADDR,aB);orki_setrn(rc,REGCMD_N,RK_DPU_DST_BASE_ADDR,aC);
+    for(int i=0;i<g_f16_fovr_n;i++) orki_setr(rc,REGCMD_N,g_f16_fovr[i].blk,g_f16_fovr[i].reg,g_f16_fovr[i].val);  /* RE fuzzer overrides (raw/unbounded) */
 }
 /* synth_i16 — int16 matmul regcmd (emulated W16A16 coherence layer). Same 2-BYTE geometry as the fp16 synth
  * (int16 tiles are byte-identical layout to fp16), but the CNA precision (REG_CNA_CONV_CON1 @ 0x100c) is
@@ -988,10 +988,10 @@ static void synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_
  * 2-byte geometry (hangs on int8's 1-byte). Integer datapath => NOTHRASH-stable with int8 layers, rides the
  * fp16 matmul scaffolding. Output stage: start with the fp16 template's (empirical), refine to integer if the
  * accumulate/convert needs it. ORK_I16_CON1 overrides 0x100c for on-board RE of the exact int16 encoding. */
-static void synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
-    synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
+static void orki_synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
+    orki_synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
     uint32_t con1=0x20000090u; const char*e=getenv("ORK_I16_CON1"); if(e) con1=(uint32_t)strtoul(e,NULL,0);
-    setrn(rc,REGCMD_N,RK_CNA_CONV_CON1,con1);             /* FP16(2)->INT16(1) precision */
+    orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON1,con1);             /* FP16(2)->INT16(1) precision */
 }
 /* RE fuzzer hook for int8 (tools; batch-mode RE): (block,reg,val) overrides applied at the END of synth_i8.
  * Inert by default (n=0) — production unaffected. Mirrors the int4 g_i4_fovr hooks. */
@@ -1001,15 +1001,15 @@ void ork_i8_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i8_fovr_n<16)
 /* int8/w8a8: A,B int8 -> C int32. Differs from fp16: weight amount/stride (no x2), K-passes
  * ceil(K/64), 0x107c=K/16, rows-budget 2x (int8 packs 2x rows/CBUF), and the 0x1040 schedule
  * uses effective K = K/2. cbuf is the fp16 budget; int8 rows = 2*cbuf/K. */
-static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
+static void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
     memcpy(rc,REGCMD_I8,REGCMD_I8_N*4);
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE0,K*N);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE1,K);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K+63)/64);setrn(rc,REGCMD_I8_N,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,K/16);
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,mc);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,(mc-1)<<16);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE0,K*N);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE1,K);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K+63)/64);orki_setrn(rc,REGCMD_I8_N,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,K/16);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,0x10000|mc);orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,mc);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,mc-1);orki_setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);orki_setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,(mc-1)<<16);
     int s=stride>0?stride:N;
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((s-1)<<16)|(N-1));setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/4)-1)<<16)|((N/4)-1));
-    setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_I8_N,RK_PDP_OUT_N,N-1);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((s-1)<<16)|(N-1));orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/4)-1)<<16)|((N/4)-1));
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,REGCMD_I8_N,RK_PDP_OUT_N,N-1);
     if(sched){
         int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
         /* DEBUG knob (ORK_RCAP, default off): override the 0x1010 row-count hint. MEASURED NEUTRAL —
@@ -1018,7 +1018,7 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
          * only for RE/diagnostics. */
         static int rcap=-2; if(rcap==-2){const char*e=getenv("ORK_RCAP"); rcap=e?atoi(e):-1;}
         if(rcap>0) R=rcap;
-        int rows=(mc+1<R)?(mc+1):R; setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*rows);
+        int rows=(mc+1<R)?(mc+1):R; orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*rows);
         /* 0x1040 = K-reduction schedule, selected per 64-row group. MUST be ceil(mc/64): a tile of
          * 65..127 rows spills past the first 64-row group, so it needs the NEXT schedule (the one a
          * full 128-row tile uses), not the <=64 schedule. floor(mc/64) gave 65..127-row tiles the
@@ -1027,10 +1027,10 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b;
         static int r1040=-2; if(r1040==-2){const char*e=getenv("ORK_R1040"); r1040=e?atoi(e):-1;}
         if(r1040>0) v=r1040;   /* EXPERIMENTAL: override the CBUF_CON0 bank alloc (rknn's captured 0x75 for the 30-row tile) */
-        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
-    } else { setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*(mc+1)); }
-    setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,aC);
-    for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);  /* RE fuzzer overrides (win over all) */
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
+    } else { orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,16*(mc+1)); }
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,aA);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,aB);orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,aC);
+    for(int i=0;i<g_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 /* #39 PORT (RE): dump ork's synth_i8 regcmd words for (mc,K,N) with sentinel addresses, so a tool can diff
  * against rkllm's captured regcmd and read off the exact field delta (schedule + feature-layout) the M-fold
@@ -1051,36 +1051,36 @@ static void synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
  * The "2160" is capture-specific (K=3584,N=1216) pending a K/N-general derivation. GATED: only synthesized on
  * the explicit m-fold path; the default matmul is untouched. */
 static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
-    synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
+    orki_synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
     /* --- register-level clone of rkllm's captured M=36 mfold (named via ork_regs.h) --- */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_GROUP_LINE);            /* GROUP_LINE_OFF feature-read (rkllm SETS this for the big-M fold tasks) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,      0x20);                     /* FEATURE_GRAINS=2 */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into CNA WIDTH (W=M,H=1) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR, OKC_DATA_SIZE0(mc,1));
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                       /* 0x1028 = M */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,     mc);                       /* 0x102c = M */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);           /* DATA_ENTRIES = (K/64)*M */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,  (uint32_t)(2160/mc));           /* REAL surface stride 2160/M (60@36,108@20); NOT the wedge-prone sentinel */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_GROUP_LINE);            /* GROUP_LINE_OFF feature-read (rkllm SETS this for the big-M fold tasks) */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,      0x20);                     /* FEATURE_GRAINS=2 */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,     OKC_DATA_SIZE0(mc,1));     /* fold M into CNA WIDTH (W=M,H=1) */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR, OKC_DATA_SIZE0(mc,1));
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE_BATCH,mc);                       /* 0x1028 = M */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE3,     mc);                       /* 0x102c = M */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(uint32_t)(K/64)*mc);           /* DATA_ENTRIES = (K/64)*M */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON2,  (uint32_t)(2160/mc));           /* REAL surface stride 2160/M (60@36,108@20); NOT the wedge-prone sentinel */
     /* CBUF/DMA schedule — rkllm M=36 LITERALS (per-M formula still open; validated at M=36 only) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,       0x60);                     /* 0x107c */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,      0x84);                     /* 0x1040 bank split + K-reduction schedule */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,0x600);                   /* 0x4024 output surface stride */
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,    0x3000);                  /* 0x40c0 surface/elem-size CONFIG */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,       0x60);                     /* 0x107c */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,      0x84);                     /* 0x1040 bank split + K-reduction schedule */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_SURF_STRIDE,0x600);                   /* 0x4024 output surface stride */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,    0x3000);                  /* 0x40c0 surface/elem-size CONFIG */
     /* extra CNA regs rkllm sets (constant across the captured M values) */
-    setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON3, 0x9);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON0, 0xb);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON1, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON2, 0x10000);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON3, 0x10000); setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON4, 0x10000);
-    setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON0, 0xf000f);
-    setrn(rc,REGCMD_I8_N,RK_PDP_R3010, 0x1);                               /* 0x0801:0x3010 */
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON3, 0x9);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON0, 0xb);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON1, 0x10000); orki_setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON2, 0x10000);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON3, 0x10000); orki_setrn(rc,REGCMD_I8_N,RK_CNA_CVT_CON4, 0x10000);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON0, 0xf000f);
+    orki_setrn(rc,REGCMD_I8_N,RK_PDP_R3010, 0x1);                               /* 0x0801:0x3010 */
     /* DPU output stage */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,  OKV_OUT_PREC_INT32);      /* 0x4010 int32 accumulate-out */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH, mc-1);                   /* 0x4030 out WIDTH=M-1 */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);                      /* 0x4034 */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH, 0);                      /* 0x4038 no notch */
-    setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,     mc-1);                   /* 0x405c WIDTH_WDMA=M-1 */
-    setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,           mc-1);
-    for(int i=0;i<g_i8_fovr_n;i++) setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,  OKV_OUT_PREC_INT32);      /* 0x4010 int32 accumulate-out */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_WIDTH, mc-1);                   /* 0x4030 out WIDTH=M-1 */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_HEIGHT,0);                      /* 0x4034 */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH, 0);                      /* 0x4038 no notch */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_WDMA_SIZE_1,     mc-1);                   /* 0x405c WIDTH_WDMA=M-1 */
+    orki_setrn(rc,REGCMD_I8_N,RK_PDP_OUT_M,           mc-1);
+    for(int i=0;i<g_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
 static unsigned mm_timeout_ms(void);   /* fwd (defined below) */
 static uint32_t ork_ppflags(void);     /* fwd (defined below) */
@@ -1098,21 +1098,21 @@ int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
     /* 8x guard rig (like the replay path): a malformed mfold DMA that over-reads/writes lands in MAPPED memory
      * (diagnosable) instead of hanging the AXI/IOMMU bus (errno-110). */
     size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
-    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
     memcpy(A.cpu,Apacked,(size_t)P*tileA); memcpy(B.cpu,Bpacked,(size_t)K*N);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rcbuf=(uint32_t*)RC.cpu;
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;   /* P-task array (c->task is 512KB / flag 0x40b) */
     for(int t=0;t<P;t++){
         uint32_t rc[REGCMD_I8_N];
         synth_i8_mfold(rc, w, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems);
-        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A */
-        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared weight */
-        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A */
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared weight */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
         /* chain-link at fixed words 216-219, PROVEN run_chain_i8/mcworker_pref_chain encoding. Terminal clears. */
         if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
             rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
@@ -1123,21 +1123,21 @@ int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
         tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
         tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
-    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _CSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
-    _CSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; }        /* warm */
-    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    _CSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; }        /* warm */
+    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Craw) memcpy(Craw,Cc.cpu,(size_t)P*tileC*4);
     { double t0=ork_now_us();
-      for(int i=0;i<iters;i++){ _CSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; } }
+      for(int i=0;i<iters;i++){ _CSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; } }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _CSUB
 cdone:
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 /* #39 WEIGHT-RESIDENT M-FOLD CHAIN using a CAPTURED bit-exact tile regcmd (task #39: "chain the captured m8
  * tile"). Identical machinery to ork_npu_mfold_chain, but each of P tasks is a memcpy of `tile_rc` (rkllm's
@@ -1152,13 +1152,13 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
     int dom=c->dom_active;
     size_t tileA=(size_t)w*K, tileC=(size_t)w*N;
     size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
-    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
     memcpy(A.cpu,Apacked,(size_t)P*tileA); memcpy(B.cpu,Bpacked,(size_t)K*N);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rcbuf=(uint32_t*)RC.cpu;
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
     int ncopy = trn<REGCMD_I8_N ? trn : REGCMD_I8_N;   /* copy the FULL tile incl. its descriptor region, like ork_npu_replay_i8 */
@@ -1172,15 +1172,15 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
             if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
         int wreuse = (t>0) && getenv("ORK_MFOLD_WREUSE");
-        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A rows */
-        if(!wreuse) setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);               /* shared weight; on a REUSE tile leave it (fetch is skipped; re-writing may trigger release) */
-        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A rows */
+        if(!wreuse) orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);               /* shared weight; on a REUSE tile leave it (fetch is skipped; re-writing may trigger release) */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
         /* #39 NOVEL: set CNA_CBUF_CON0 WEIGHT_REUSE (0x1040 bit13, per rocket_registers.h) on non-loader tiles so
          * the HW reuses the weight tile 0 left resident in CBUF and SKIPS the re-DMA — a HW feature rkllm never
          * uses (bit13=0 in all captured tiles). ORK_MFOLD_WREUSE=1 to try; tile 0 loads normally. */
         if(wreuse){
             uint32_t cur=0; for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && ((rc[k+1]>>16)&0xffff)==0x201){ cur=rc[k]>>16; break; }
-            setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u);
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u);
         }
         /* #39 EXPERIMENT: append "inherited" reg-writes a mid-chain big-M tile OMITS (it relies on earlier tasks
          * having set them). ORK_MFOLD_INJECT="blk:reg:val,..." appends them after the 108-reg tile, bumping
@@ -1200,21 +1200,21 @@ int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32
         tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
         tk[t].regcfg_amount=(uint32_t)nreg; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
-    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _CAPSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
-    _CAPSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; }        /* warm */
-    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    _CAPSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; }        /* warm */
+    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Craw) memcpy(Craw,Cc.cpu,(size_t)P*tileC*4);
     { double t0=ork_now_us();
-      for(int i=0;i<iters;i++){ _CAPSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; } }
+      for(int i=0;i<iters;i++){ _CAPSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto capdone; } }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _CAPSUB
 capdone:
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 /* #39 TIMING PROBE: replay P DIFFERENT captured tiles (tiles = P*rn words, e.g. rkllm's real chain tasks IN
  * ORDER) as one task_number=P weight-resident chain, rebasing each tile's A/W/C onto shared buffers (uniform
@@ -1227,12 +1227,12 @@ int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint
     int dom=c->dom_active;
     size_t tileA=(size_t)w*K, tileC=(size_t)w*N;
     size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
-    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rcbuf=(uint32_t*)RC.cpu;
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
     int ncopy = rn<REGCMD_I8_N ? rn : REGCMD_I8_N;
@@ -1241,9 +1241,9 @@ int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint
         memcpy(rc, tiles+(size_t)t*rn, (size_t)ncopy*4);                                       /* this task's captured regcmd */
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;    /* neutralize captured descriptor */
             if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
-        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));
-        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared resident weight */
-        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared resident weight */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));
         if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
             rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
             rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
@@ -1253,19 +1253,19 @@ int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint
         tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
         tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
-    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _MSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
-    _MSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto mdone; }
+    _MSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto mdone; }
     { double t0=ork_now_us();
-      for(int i=0;i<iters;i++){ _MSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto mdone; } }
+      for(int i=0;i<iters;i++){ _MSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto mdone; } }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _MSUB
 mdone:
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 /* #39 UNIFIED per-tile fold chain with REAL operands + Craw return — the tool for Path-1 (state-setter + big-M)
  * and Path-2 (weight-reuse). P tiles, per-tile width ws[t], per-tile captured regcmd tiles[t*rn..]. A packed as
@@ -1279,13 +1279,13 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
     size_t Aoff[65], Coff[65], atot=0, ctot=0;   /* per-tile byte/elem offsets in the concat packing */
     for(int t=0;t<P;t++){ Aoff[t]=atot; Coff[t]=ctot; atot+=(size_t)ws[t]*K; ctot+=(size_t)ws[t]*N; }
     size_t asz=atot*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=ctot*4*8+65536;
-    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
     memcpy(A.cpu,Apacked,atot); memcpy(B.cpu,Bpacked,(size_t)K*N);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rcbuf=(uint32_t*)RC.cpu; struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
     int ncopy = rn<REGCMD_I8_N ? rn : REGCMD_I8_N;
     for(int t=0;t<P;t++){
@@ -1293,11 +1293,11 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
         memcpy(rc, tiles+(size_t)t*rn, (size_t)ncopy*4);
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
             if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
-        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + Aoff[t]));
-        if(!(wreuse&&t>0)) setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
-        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + Coff[t]*4));
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + Aoff[t]));
+        if(!(wreuse&&t>0)) orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + Coff[t]*4));
         if(wreuse&&t>0){ uint32_t cur=0; for(int k=0;k+1<REGCMD_I8_N;k+=2) if((rc[k]&0xffff)==0x1040 && ((rc[k+1]>>16)&0xffff)==0x201){ cur=rc[k]>>16; break; }
-            setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u); }
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0, cur|0x2000u); }
         if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
             rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
             rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
@@ -1307,20 +1307,20 @@ int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const 
         tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
         tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
-    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _VSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); \
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
-    _VSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; }
-    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    _VSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; }
+    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Craw) memcpy(Craw,Cc.cpu,ctot*4);
-    { double t0=ork_now_us(); for(int i=0;i<iters;i++){ _VSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; } }
+    { double t0=ork_now_us(); for(int i=0;i<iters;i++){ _VSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto vdone; } }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _VSUB
 vdone:
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 /* #39 Path-1 TOKEN-TILER executor: run P fold sub-tiles of one M_total-token batch as ONE multi-task submit over a
  * SHARED batch cube. Unlike ork_npu_mfold_chain_v (concatenated per-tile buffers), all tiles read/write the SAME
@@ -1339,7 +1339,7 @@ static void *ork_fbc_thread(void *vp){
     sub.core_mask=1u<<a->core;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)a->P};
     sub.timeout=mm_timeout_ms();
-    a->rc = rknpu_submit_ioctl(a->fd,&sub,a->dom);
+    a->rc = orki_rknpu_submit_ioctl(a->fd,&sub,a->dom);
     return NULL;
 }
 /* fire the nc per-core submits CONCURRENTLY (one thread each) and wait; 0 ok, -1 if any core errored */
@@ -1364,18 +1364,18 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
     int gstart[3]={0,0,0}, gsz[3]={0,0,0};
     { int base=P/nc, rem=P%nc, s=0; for(int g=0;g<nc;g++){ gsz[g]=base+(g<rem?1:0); gstart[g]=s; s+=gsz[g]; } }
     size_t asz=(size_t)Mtot*K*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)Mtot*N*4*8+65536;
-    struct buf A =bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RC=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     /* one OWN task buffer PER CORE in `dom` (like the multicore run path's c->mtk[i]) — each holds its core's
      * tasks from index 0, so each per-core submit uses subcore_task={0,gsz}. (Using c->task, which lives in the
      * default domain, EINVALs when dom!=default.) */
-    struct buf TK[3]={{0}}; for(int g=0;g<nc;g++){ TK[g]=bcreate(fd,(size_t)(gsz[g]+2)*sizeof(struct rknpu_task),0x40b,dom);
-        if(!TK[g].cpu){ for(int q=0;q<g;q++) bdestroy(fd,&TK[q]); bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return -2; } }
+    struct buf TK[3]={{0}}; for(int g=0;g<nc;g++){ TK[g]=orki_bcreate(fd,(size_t)(gsz[g]+2)*sizeof(struct rknpu_task),0x40b,dom);
+        if(!TK[g].cpu){ for(int q=0;q<g;q++) orki_bdestroy(fd,&TK[q]); orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return -2; } }
     memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
     memcpy(A.cpu,Apacked,(size_t)Mtot*K); memcpy(B.cpu,Bpacked,(size_t)K*N);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rcbuf=(uint32_t*)RC.cpu;
     int ncopy = rn<REGCMD_I8_N ? rn : REGCMD_I8_N;
     for(int t=0;t<P;t++){
@@ -1384,9 +1384,9 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;   /* neutralize captured descriptor */
             if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
         uint64_t roff=(uint64_t)row_off[t]*16;                                                  /* row offset in the shared cube */
-        setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+roff));
-        setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                           /* shared weight */
-        setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma+roff));
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+roff));
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                           /* shared weight */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma+roff));
         /* which core-group owns this tile, and its local index */
         int g=0; while(g<nc-1 && t>=gstart[g+1]) g++;
         int j=t-gstart[g], glast=(t==gstart[g]+gsz[g]-1);
@@ -1408,23 +1408,23 @@ int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row
                 uint32_t v=(rc[k]>>16)|0x2000u; if(wrm>=2) v|=0x1000u; rc[k]=(v<<16)|0x1040; break; }
             /* FC_SKIP (0x1060): FC_SKIP_EN[0] | FC_SKIP_DATA[31:16] — sweep the companion count via ORK_WR_FCSKIP
              * (raw 0x1060 value; e.g. 0x0e000001 = FC_SKIP_DATA=K, EN=1). EN alone errored the submit. */
-            if(fcsset) setr(rc,REGCMD_I8_N,0x201,0x1060,fcs); } }
+            if(fcsset) orki_setr(rc,REGCMD_I8_N,0x201,0x1060,fcs); } }
         memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
         struct rknpu_task *tkg=(struct rknpu_task*)TK[g].cpu; memset(&tkg[j],0,sizeof tkg[j]);
         tkg[j].enable_mask=0xd; tkg[j].int_mask=0x300; tkg[j].int_clear=0x1ffff;
         tkg[j].regcfg_amount=108; tkg[j].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
     }
-    bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    for(int g=0;g<nc;g++) bsync(fd,&TK[g],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    for(int g=0;g<nc;g++) orki_bsync(fd,&TK[g],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1;
     if(ork_fold_submit_all(fd,dom,TK,gsz,nc)) goto fbdone;                                       /* warm */
-    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Craw) memcpy(Craw,Cc.cpu,(size_t)Mtot*N*4);
     { double t0=ork_now_us(); for(int i=0;i<iters;i++){ if(ork_fold_submit_all(fd,dom,TK,gsz,nc)) goto fbdone; }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
 fbdone:
-    for(int g=0;g<nc;g++) bdestroy(fd,&TK[g]);
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);bdestroy(fd,&RC); return ret;
+    for(int g=0;g<nc;g++) orki_bdestroy(fd,&TK[g]);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 #include "regcmd_fold_refs.h"
 /* #39 fold run-path helpers: build a size-m sub-tile from the baked template, patch its 4 M_total regs. */
@@ -1490,27 +1490,27 @@ int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_
     uint32_t *tmpl=malloc((size_t)P*232*4); if(!tmpl) return -2;
     for(int t=0;t<P;t++) if(fold_build_tile(mt[t],M,tmpl+(size_t)t*232)){ free(tmpl); return -2; }
     size_t asz=(size_t)M*K*8+(1u<<20);
-    struct buf A=bcreate(fd,asz,0x403,dom); if(!A.cpu){free(tmpl);return -2;}
+    struct buf A=orki_bcreate(fd,asz,0x403,dom); if(!A.cpu){free(tmpl);return -2;}
     memset(A.cpu,0,asz);
     { int8_t*Ap=(int8_t*)A.cpu; for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
     struct buf W[3]={{0}},Cc[3]={{0}},RC[3]={{0}},TK[3]={{0}}; int rc_ret=-1;
     size_t wsz=(size_t)K*NS*8+(1u<<20), csz=(size_t)M*NS*4*8+65536;
     for(int s=0;s<nslice;s++){
-        W[s]=bcreate(fd,wsz,0x403,dom); Cc[s]=bcreate(fd,csz,0x403,dom);
-        RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
+        W[s]=orki_bcreate(fd,wsz,0x403,dom); Cc[s]=orki_bcreate(fd,csz,0x403,dom);
+        RC[s]=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); TK[s]=orki_bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
         if(!W[s].cpu||!Cc[s].cpu||!RC[s].cpu||!TK[s].cpu) goto opdone;
         memset(W[s].cpu,0,wsz); memset(Cc[s].cpu,0,csz);
         int n0=s*NS, ns=(N-n0<NS)?(N-n0):NS; int8_t*Ws=(int8_t*)W[s].cpu;
         for(int k=0;k<K;k++)for(int n=0;n<ns;n++) Ws[fold_woff(n,k,K)]=Wraw[(size_t)k*N+(n0+n)];
-        bsync(fd,&W[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&W[s],RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);
         uint32_t*rcbuf=(uint32_t*)RC[s].cpu; struct rknpu_task*tk=(struct rknpu_task*)TK[s].cpu;
         for(int t=0;t<P;t++){
             uint32_t rc[REGCMD_I8_N]; memcpy(rc, tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
             uint64_t rf=(uint64_t)roff[t]*16;
-            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+rf));
-            setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W[s].dma);
-            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc[s].dma+rf));
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma+rf));
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W[s].dma);
+            orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc[s].dma+rf));
             if(t<P-1){ uint64_t nxt=RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
                 rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
                 rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101u<<16)|0;
@@ -1519,18 +1519,18 @@ int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_
             memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
             tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC[s].dma+(uint64_t)t*REGCMD_I8_N*4;
         }
-        bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&RC[s],RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     { int gszP[3]={P,P,P};
       if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto opdone;                 /* warm (concurrent, core s = slice s) */
-      for(int s=0;s<nslice;s++) bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+      for(int s=0;s<nslice;s++) orki_bsync(fd,&Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
       if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)Cc[s].cpu;
           for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
       double t0=ork_now_us(); for(int it=0;it<iters;it++){ if(ork_fold_submit_all(fd,dom,TK,gszP,nslice)) goto opdone; }
       if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); rc_ret=0; }
 opdone:
-    for(int s=0;s<3;s++){ if(W[s].cpu)bdestroy(fd,&W[s]); if(Cc[s].cpu)bdestroy(fd,&Cc[s]); if(RC[s].cpu)bdestroy(fd,&RC[s]); if(TK[s].cpu)bdestroy(fd,&TK[s]); }
-    bdestroy(fd,&A); free(tmpl); return rc_ret;
+    for(int s=0;s<3;s++){ if(W[s].cpu)orki_bdestroy(fd,&W[s]); if(Cc[s].cpu)orki_bdestroy(fd,&Cc[s]); if(RC[s].cpu)orki_bdestroy(fd,&RC[s]); if(TK[s].cpu)orki_bdestroy(fd,&TK[s]); }
+    orki_bdestroy(fd,&A); free(tmpl); return rc_ret;
 }
 /* #39 RESIDENT mfold SCRATCH. Split into (a) the SHARED nc16 input buffer c->fold_A (keyed M,domain) marshaled
  * ONCE per input and reused by every same-input weight (the shared-input fold batch), and (b) a small cache
@@ -1540,30 +1540,30 @@ opdone:
 struct fold_scratch { int M, N, nslice, P, domain; int roff[64]; uint32_t *tmpl; struct buf *Cc, *RC, *TK; };
 static void fold_scratch_free1(ork_npu *c, struct fold_scratch *fs){
     if(!fs) return;
-    if(fs->Cc) for(int s=0;s<fs->nslice;s++) if(fs->Cc[s].cpu) bdestroy(c->fd,&fs->Cc[s]);
-    if(fs->RC) for(int s=0;s<fs->nslice;s++) if(fs->RC[s].cpu) bdestroy(c->fd,&fs->RC[s]);
-    if(fs->TK) for(int s=0;s<fs->nslice;s++) if(fs->TK[s].cpu) bdestroy(c->fd,&fs->TK[s]);
+    if(fs->Cc) for(int s=0;s<fs->nslice;s++) if(fs->Cc[s].cpu) orki_bdestroy(c->fd,&fs->Cc[s]);
+    if(fs->RC) for(int s=0;s<fs->nslice;s++) if(fs->RC[s].cpu) orki_bdestroy(c->fd,&fs->RC[s]);
+    if(fs->TK) for(int s=0;s<fs->nslice;s++) if(fs->TK[s].cpu) orki_bdestroy(c->fd,&fs->TK[s]);
     free(fs->Cc); free(fs->RC); free(fs->TK); free(fs->tmpl); free(fs);
 }
 static void fold_scratch_free(ork_npu *c){   /* free ALL entries + the shared A (teardown) */
     for(int i=0;i<c->fold_scr_n;i++){ fold_scratch_free1(c,c->fold_scr[i]); c->fold_scr[i]=NULL; }
     c->fold_scr_n=0;
-    if(c->fold_A.cpu) bdestroy(c->fd,&c->fold_A);
+    if(c->fold_A.cpu) orki_bdestroy(c->fd,&c->fold_A);
     c->fold_A.cpu=NULL; c->fold_A_M=0; c->fold_A_dom=0;
 }
 /* Ensure the shared nc16 input buffer exists for (M,domain); rebuild on key change. Then fold_fill_A marshals
  * the row-major Araw into it (once per input — the batch reuses it across weights). */
 static int fold_A_ensure(ork_npu *c, int M, int dom){
     if(c->fold_A.cpu && c->fold_A_M==M && c->fold_A_dom==dom) return 0;
-    if(c->fold_A.cpu) bdestroy(c->fd,&c->fold_A);
+    if(c->fold_A.cpu) orki_bdestroy(c->fd,&c->fold_A);
     size_t asz=(size_t)M*FOLD_REF_K*8+(1u<<20);
-    c->fold_A=bcreate(c->fd,asz,0x403,dom); if(!c->fold_A.cpu){ c->fold_A_M=0; return -1; }
+    c->fold_A=orki_bcreate(c->fd,asz,0x403,dom); if(!c->fold_A.cpu){ c->fold_A_M=0; return -1; }
     memset(c->fold_A.cpu,0,asz); c->fold_A_M=M; c->fold_A_dom=dom; return 0;   /* zero the nc16 pad once */
 }
 static void fold_fill_A(ork_npu *c, int M, const int8_t *Araw){
     int8_t*Ap=(int8_t*)c->fold_A.cpu; int K=FOLD_REF_K;
     for(int i=0;i<M;i++)for(int k=0;k<K;k++) Ap[fold_nc16(i,k,M)]=Araw[(size_t)i*K+k];
-    bsync(c->fd,&c->fold_A,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(c->fd,&c->fold_A,RKNPU_MEM_SYNC_TO_DEVICE);
 }
 /* Get (or lazily build + cache) the per-(M,N,domain) C/RC/TK scratch. TK built once (references only RC offsets). */
 static struct fold_scratch *fold_scr_get(ork_npu *c, int M, int N, int dom){
@@ -1584,14 +1584,14 @@ static struct fold_scratch *fold_scr_get(ork_npu *c, int M, int N, int dom){
     fs->Cc=calloc(nslice,sizeof(struct buf)); fs->RC=calloc(nslice,sizeof(struct buf)); fs->TK=calloc(nslice,sizeof(struct buf));
     if(!fs->Cc||!fs->RC||!fs->TK){ fold_scratch_free1(c,fs); return NULL; }
     for(int s=0;s<nslice;s++){
-        fs->Cc[s]=bcreate(fd,csz,0x403,dom);
-        fs->RC[s]=bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom);
-        fs->TK[s]=bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
+        fs->Cc[s]=orki_bcreate(fd,csz,0x403,dom);
+        fs->RC[s]=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom);
+        fs->TK[s]=orki_bcreate(fd,(size_t)(P+2)*sizeof(struct rknpu_task),0x40b,dom);
         if(!fs->Cc[s].cpu||!fs->RC[s].cpu||!fs->TK[s].cpu){ fold_scratch_free1(c,fs); return NULL; }
         struct rknpu_task*tk=(struct rknpu_task*)fs->TK[s].cpu;
         for(int t=0;t<P;t++){ memset(&tk[t],0,sizeof tk[t]); tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
             tk[t].regcfg_amount=108; tk[t].regcmd_addr=fs->RC[s].dma+(uint64_t)t*REGCMD_I8_N*4; }
-        bsync(fd,&fs->TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&fs->TK[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     if(c->fold_scr_n<8) c->fold_scr[c->fold_scr_n++]=fs;         /* insert; evict oldest if full (rare: >8 distinct shapes) */
     else { fold_scratch_free1(c,c->fold_scr[0]); memmove(&c->fold_scr[0],&c->fold_scr[1],7*sizeof c->fold_scr[0]); c->fold_scr[7]=fs; }
@@ -1606,21 +1606,21 @@ static int fold_run_one(ork_npu *c, ork_w *w, struct fold_scratch *fs, int dom, 
         for(int t=0;t<P;t++){
             uint32_t rc[REGCMD_I8_N]; memcpy(rc, fs->tmpl+(size_t)t*232, (size_t)REGCMD_I8_N*4);
             uint64_t rf=(uint64_t)fs->roff[t]*16;
-            setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(c->fold_A.dma+rf));
-            setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)w->Bfold[s].dma);
-            setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(fs->Cc[s].dma+rf));
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(c->fold_A.dma+rf));
+            orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)w->Bfold[s].dma);
+            orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(fs->Cc[s].dma+rf));
             if(t<P-1){ uint64_t nxt=fs->RC[s].dma+(uint64_t)(t+1)*REGCMD_I8_N*4;
                 rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
                 rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101u<<16)|0;
             } else { rc[216]=0x0010; rc[217]=(0x0101u<<16); rc[218]=0x0014; rc[219]=(0x0101u<<16); }
             memcpy(rcbuf+(size_t)t*REGCMD_I8_N, rc, sizeof rc);
         }
-        bsync(fd,&fs->RC[s],RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean CPU C lines before the DPU writes (DMA coherency) */
+        orki_bsync(fd,&fs->RC[s],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean CPU C lines before the DPU writes (DMA coherency) */
     }
     { int gsz[3]={P,P,P}; for(int r=0;r*NC<nslice;r++){ int rn=nslice-r*NC; if(rn>NC)rn=NC;
         if(ork_fold_submit_all(fd,dom,&fs->TK[r*NC],gsz,rn)) return -2; } }
-    for(int s=0;s<nslice;s++) bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
+    for(int s=0;s<nslice;s++) orki_bsync(fd,&fs->Cc[s],RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Cout) for(int s=0;s<nslice;s++){ int n0=s*NS,ns=(N-n0<NS)?(N-n0):NS; int32_t*cs=(int32_t*)fs->Cc[s].cpu;
         for(int i=0;i<M;i++)for(int n=0;n<ns;n++) Cout[(size_t)i*N+(n0+n)]=cs[fold_c4(i,n,M)]; }
     return 0;
@@ -1709,7 +1709,7 @@ int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int o
     if(!c || outn < REGCMD_I8_N) return -2;
     if(getenv("ORK_MFOLD")){ synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }
     int sched = (K==1024 || K==512);
-    synth_i8((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, sched, c->soc->cbuf_elems, 0);
+    orki_synth_i8((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, sched, c->soc->cbuf_elems, 0);
     return REGCMD_I8_N;
 }
 
@@ -1744,21 +1744,21 @@ int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int o
  * compute regcmd, whose 0x1040 K-reduction schedule is validated for K>=512 (the prefill domain); at
  * tiny K (<=128) that schedule's small-K branch miscomputes and the requant reads garbage. FFN/attn
  * matmuls are all K>=512, so this is not a practical limit. */
-static void set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
+static void orki_set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x0124);                             /* int8 output row byte-stride config (const; int32=0x07fc) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,0x0020);                             /* output element size = 1 byte (int32=0x0080) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);                              /* requant multiplier */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);                             /* requant shift (>>) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x0124);                             /* int8 output row byte-stride config (const; int32=0x07fc) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,0x0020);                             /* output element size = 1 byte (int32=0x0080) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);                              /* requant multiplier */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);                             /* requant shift (>>) */
 }
 /* PHASE 1 (#35 chained FFN): INT16 matmul output stage — requant int32 acc -> int16 (scale mult/2^shift),
  * 2-byte elements. Between int8 (0x40c0=0x20,0x4050=0x0124) and int32 (0x40c0=0x80,0x4050=0x07fc); int16 is
  * the 2x-denser-than-int32 midpoint. THESE ARE BEST-GUESS and env-overridable (ORK_I16OUT_*) so the encoding
  * can be SWEPT on-board (like i16_matmul_test did for the fp16/int16 output regs). This is the RE crux: the
  * on-NPU int32->int16 requant that lets the matmul feed the int16 silu inside one chain. */
-static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
+static void orki_set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
     /* SOLVED (wedge + layout) 2026-07-21 via i16out_fix_probe layout sweep: the int16 output stage now writes
      * COMPACT CONTIGUOUS int16 (row-major m*N+n, M*N*2 bytes, 128/128 correct, no stall, no buffer overflow).
@@ -1774,12 +1774,12 @@ static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
     unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0000036e;
     unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;
     unsigned r38=getenv("ORK_I16OUT_4038")?strtoul(getenv("ORK_I16OUT_4038"),0,0):(unsigned)((((s/8)-1)<<16)|((N/8)-1));
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,r38);
-    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,r38);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);
 }
 
 /* PHASE 1 (#35 chained FFN) — the SHIM the user asked for: instead of the CLOSED int16-matmul-output,
@@ -1788,7 +1788,7 @@ static void set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
  * survives the fp16 CVT this yields a fast int8 matmul writing a COHERENT fp16 intermediate (no
  * per-tensor requant floor) for the fp16 silu. WEDGE-PRONE (proc-precision mismatch, per set_f16_silu
  * warning); env-overridable for the sweep. N-derived geometry, constants from regcmd_array_4x32x16.h. */
-static void set_f16_out(uint32_t*rc,int N,int stride){
+static void orki_set_f16_out(uint32_t*rc,int N,int stride){
     int s=stride>0?stride:N; (void)s;
     unsigned r04=getenv("ORK_F16OUT_4004")?strtoul(getenv("ORK_F16OUT_4004"),0,0):0x0000000e;
     /* 0x4010 DATA_FORMAT fields (rocket registers.xml, confirmed by our ewmul fp16=0x48000002):
@@ -1799,22 +1799,22 @@ static void set_f16_out(uint32_t*rc,int N,int stride){
     unsigned rc0=getenv("ORK_F16OUT_40c0")?strtoul(getenv("ORK_F16OUT_40c0"),0,0):0x00000040; /* 2-byte elem */
     unsigned r84=getenv("ORK_F16OUT_4084")?strtoul(getenv("ORK_F16OUT_4084"),0,0):0x00000001; /* gain */
     unsigned r88=getenv("ORK_F16OUT_4088")?strtoul(getenv("ORK_F16OUT_4088"),0,0):0x00000000; /* shift */
-    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,r04);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
-    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
-    setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,0);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,r84);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,r88);
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R40C4,0);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,r04);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_N2,N-1);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,0);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,r84);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,r88);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R40C4,0);
 }
 
 /* fp16-IN fp16-OUT DPU output stage, reconstructed from the VENDOR conv task[0] (conv_mul.rknn, decoded against
  * rocket_registers.h) — the config that actually emits fp16 to memory AND hands off cleanly to a chained fp16 SDP.
- * set_f16_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
+ * orki_set_f16_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
  * writes 0x4084=1 WITHOUT DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16), so the fp16 CVT is never enabled. Here we take
  * the vendor's mode/bypass/CVT registers verbatim and keep only the matmul-shaped output GEOMETRY (N channels). */
 static void set_f16_out_fp16in(uint32_t*rc,int M,int N){
@@ -1826,37 +1826,37 @@ static void set_f16_out_fp16in(uint32_t*rc,int M,int N){
      * set_mul_geom's OUTPUT side (0x4024/0x4030/0x403c/0x4058/0x405c/0x40c0 = M*16 / M-1 / N), overriding synth's
      * contiguous fp32-atom geometry. M param needed for the M*16 surface stride. */
     /* Precision/bypass/CVT regs from the captured vendor fp16->fp16 MATMUL (cap_fp16f16.dec). */
-    setrn(rc,REGCMD_N,RK_DPU_S_POINTER,0x0000000e);
-    setrn(rc,REGCMD_N,RK_DPU_FEATURE_MODE_CFG,0x000001e4);                       /* FEATURE_MODE OUTPUT_MODE=2 */
-    setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,0x48000002);                       /* DATA_FORMAT fp16/fp16/fp16 */
-    setrn(rc,REGCMD_N,RK_DPU_BS_CFG,0x00000053);                       /* BS FULLY BYPASSED (matmul, NOT conv's 0x20150) */
-    setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000126);                       /* BS_OW_CFG */
-    setrn(rc,REGCMD_N,RK_DPU_BN_CFG,0x00000053);                       /* BN fully bypassed */
-    setrn(rc,REGCMD_N,RK_DPU_EW_CFG,0x00000383);                       /* EW fully bypassed */
-    setrn(rc,REGCMD_N,RK_DPU_EW_CVT_SCALE,0x00000001);
-    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);
-    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,0x00010001);                       /* OUT_CVT_SCALE: FP32TOFP16_EN=1 | scale=1  <-- KEY */
-    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,0x00000000);
-    setrn(rc,REGCMD_N,RK_DPU_R40C4,0x00000000);
+    orki_setrn(rc,REGCMD_N,RK_DPU_S_POINTER,0x0000000e);
+    orki_setrn(rc,REGCMD_N,RK_DPU_FEATURE_MODE_CFG,0x000001e4);                       /* FEATURE_MODE OUTPUT_MODE=2 */
+    orki_setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,0x48000002);                       /* DATA_FORMAT fp16/fp16/fp16 */
+    orki_setrn(rc,REGCMD_N,RK_DPU_BS_CFG,0x00000053);                       /* BS FULLY BYPASSED (matmul, NOT conv's 0x20150) */
+    orki_setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000126);                       /* BS_OW_CFG */
+    orki_setrn(rc,REGCMD_N,RK_DPU_BN_CFG,0x00000053);                       /* BN fully bypassed */
+    orki_setrn(rc,REGCMD_N,RK_DPU_EW_CFG,0x00000383);                       /* EW fully bypassed */
+    orki_setrn(rc,REGCMD_N,RK_DPU_EW_CVT_SCALE,0x00000001);
+    orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);
+    orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,0x00010001);                       /* OUT_CVT_SCALE: FP32TOFP16_EN=1 | scale=1  <-- KEY */
+    orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,0x00000000);
+    orki_setrn(rc,REGCMD_N,RK_DPU_R40C4,0x00000000);
     if(getenv("ORK_F16_ATOM8")){
         /* ATOM-8 fp16 output — geometry taken EXACTLY from the bit-exact atom-8 SDP (REGCMD_MUL_F16 / set_mul_geom):
          * surface stride M*16, 0x4050 BS_OW_CFG=0x2 (OD_BYPASS, SIZE_E=0 — NOT the contiguous 0x126 or the int16
          * 0x248 that hung), 0x4038=0. This makes the fp16 matmul emit the PC16 atom-8 layout the SDP reads, so
          * ork_npu_mul_perchan_f16 can consume it directly (no reshape, no notch). */
         uint32_t s=(uint32_t)(M*16);
-        setrn(rc,REGCMD_N,RK_DPU_DST_SURF_STRIDE,s);                            /* DST_SURF_STRIDE = M*16 */
-        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
-        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,0);
-        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,0);
-        setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
-        setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000002);                   /* BS_OW_CFG = 0x2 (atom-8; KEY) */
-        setrn(rc,REGCMD_N,RK_DPU_DST_N2,(uint32_t)(N-1));
-        setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
-        setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,s);                            /* SURFACE_ADD = M*16 */
+        orki_setrn(rc,REGCMD_N,RK_DPU_DST_SURF_STRIDE,s);                            /* DST_SURF_STRIDE = M*16 */
+        orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+        orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_HEIGHT,0);
+        orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,0);
+        orki_setrn(rc,REGCMD_N,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
+        orki_setrn(rc,REGCMD_N,RK_DPU_BS_OW_CFG,0x00000002);                   /* BS_OW_CFG = 0x2 (atom-8; KEY) */
+        orki_setrn(rc,REGCMD_N,RK_DPU_DST_N2,(uint32_t)(N-1));
+        orki_setrn(rc,REGCMD_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+        orki_setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,s);                            /* SURFACE_ADD = M*16 */
     } else {
         (void)M;                                                      /* CONTIGUOUS [M][N] (cap_fp16f16); PROVEN 512/512 standalone */
-        setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/8)-1)<<16)|((N/8)-1));
-        setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,0x00000020);
+        orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_NOTCH,(((N/8)-1)<<16)|((N/8)-1));
+        orki_setrn(rc,REGCMD_N,RK_DPU_SURFACE_ADD,0x00000020);
     }
 }
 
@@ -1893,21 +1893,21 @@ int ork_ppu_fuse_enabled(ork_npu *c){
  * track out_scale. Until gen(in_scale,out_scale) is calibrated bit-exact, callers pass the register values
  * directly (a captured/known-good set). Params: r_mult,r_shift -> R (0x4084/0x4088); out_bias -> 0x4080;
  * idx_off -> 0x4110; cfg4068 -> 0x4068 (unobserved). */
-static void set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
+static void orki_set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
-    set_i8_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040); /* activation mode bit 0x0002 (fixed) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);    /* per-scale field, no observed output effect (replay) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302); /* fixed */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);   /* output bias / asymmetric zero-point (silu(0) -> out_bias) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068); /* LUT config (fixed) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500); /* LUT config (fixed) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);    /* index offset -> C0 (silu-zero index ~512) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000); /* fixed config (scale-independent) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000); /* fixed config */
-    setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0); /* fixed config */
+    orki_set_i8_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); orki_setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040); /* activation mode bit 0x0002 (fixed) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);    /* per-scale field, no observed output effect (replay) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302); /* fixed */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);   /* output bias / asymmetric zero-point (silu(0) -> out_bias) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068); /* LUT config (fixed) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500); /* LUT config (fixed) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);    /* index offset -> C0 (silu-zero index ~512) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000); /* fixed config (scale-independent) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000); /* fixed config */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0); /* fixed config */
 }
 
 /* ── Fused EW-mul (SwiGLU dual-input) output stage ───────────────────────────────────────────────
@@ -1941,37 +1941,37 @@ static unsigned mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=geten
  * atom (16 for int8, 8 for the 2-byte fp16/int16) sets the cube; both give surf_stride = M*16 bytes. */
 static void set_mul_geom(uint32_t *rc,int n,int M,int N){
     uint32_t sstride=(uint32_t)(M*16);
-    setrn(rc,n,RK_SDP_500C,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
-    setrn(rc,n,RK_SDP_5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
-    setrn(rc,n,RK_SDP_5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
-    setrn(rc,n,RK_SDP_5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
-    setrn(rc,n,RK_DPU_DST_SURF_STRIDE,sstride);                  /* output surface stride */
-    setrn(rc,n,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
-    setrn(rc,n,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
-    setrn(rc,n,RK_DPU_DST_N2,(uint32_t)(N-1));
-    setrn(rc,n,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
-    setrn(rc,n,RK_DPU_SURFACE_ADD,sstride);                  /* SURFACE_ADD = M*16 */
+    orki_setrn(rc,n,RK_SDP_500C,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+    orki_setrn(rc,n,RK_SDP_5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+    orki_setrn(rc,n,RK_SDP_5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+    orki_setrn(rc,n,RK_SDP_5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
+    orki_setrn(rc,n,RK_DPU_DST_SURF_STRIDE,sstride);                  /* output surface stride */
+    orki_setrn(rc,n,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+    orki_setrn(rc,n,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
+    orki_setrn(rc,n,RK_DPU_DST_N2,(uint32_t)(N-1));
+    orki_setrn(rc,n,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+    orki_setrn(rc,n,RK_DPU_SURFACE_ADD,sstride);                  /* SURFACE_ADD = M*16 */
 }
 
 /* Apply ork's synth_i8 matmul GEOMETRY (same formulas as synth_i8, sched=1) onto an arbitrary regcmd `rc`
  * of length `n`. Used to inject ork's geometry into RKNN's EW-mul TEMPLATE (REGCMD_EWMUL_LIN) — which keeps
  * RKNN's register ORDER + EW output-stage/lane (so it executes) while making the conv engine read ork's own
  * [Nt][Kt][32][32] A/B tile layout (so acc is correct). Addresses (0x1070/0x1110/0x4020) patched by caller. */
-static void apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
-    setrn(rc,n,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);setrn(rc,n,RK_CNA_WEIGHT_SIZE0,K*N);setrn(rc,n,RK_CNA_WEIGHT_SIZE1,K);
-    setrn(rc,n,RK_CNA_CBUF_CON1,(K+63)/64);setrn(rc,n,RK_CNA_FC_DATA_SIZE1,K);setrn(rc,n,RK_CNA_DMA_CON1,K/16);
-    setrn(rc,n,RK_CNA_DATA_SIZE0,0x10000|mc);setrn(rc,n,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);setrn(rc,n,RK_CNA_DATA_SIZE3,mc);
-    setrn(rc,n,RK_DPU_DATA_CUBE_HEIGHT,mc-1);setrn(rc,n,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);setrn(rc,n,RK_PDP_OUT_M,(mc-1)<<16);
-    setrn(rc,n,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));setrn(rc,n,RK_DPU_DST_N2,N-1);setrn(rc,n,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
-    setrn(rc,n,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,n,RK_PDP_OUT_N,N-1);
+static void orki_apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
+    orki_setrn(rc,n,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE0,K*N);orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE1,K);
+    orki_setrn(rc,n,RK_CNA_CBUF_CON1,(K+63)/64);orki_setrn(rc,n,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,n,RK_CNA_DMA_CON1,K/16);
+    orki_setrn(rc,n,RK_CNA_DATA_SIZE0,0x10000|mc);orki_setrn(rc,n,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);orki_setrn(rc,n,RK_CNA_DATA_SIZE3,mc);
+    orki_setrn(rc,n,RK_DPU_DATA_CUBE_HEIGHT,mc-1);orki_setrn(rc,n,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);orki_setrn(rc,n,RK_PDP_OUT_M,(mc-1)<<16);
+    orki_setrn(rc,n,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));orki_setrn(rc,n,RK_DPU_DST_N2,N-1);orki_setrn(rc,n,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,n,RK_PDP_OUT_N,N-1);
     int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-    int rows=(mc+1<R)?(mc+1):R; setrn(rc,n,RK_CNA_CONV_CON2,16*rows);
+    int rows=(mc+1<R)?(mc+1):R; orki_setrn(rc,n,RK_CNA_CONV_CON2,16*rows);
     double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
-    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,n,RK_CNA_CBUF_CON0,v);
+    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,n,RK_CNA_CBUF_CON0,v);
 }
 
 /* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
- * already filled by synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
+ * already filled by orki_synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
  * [108 reg entries] [REGCMD_EW_LANE 18 entries] [8-word trailer]. */
 static void splice_ew_lane(uint32_t*rc,const uint32_t*base){
     memcpy(rc,               base,             216*4);                 /* 108 register entries (0x10xx/0x30xx/0x40xx) */
@@ -1989,63 +1989,63 @@ static void splice_ew_lane(uint32_t*rc,const uint32_t*base){
  * EW_OP_SRC(6,1=rdma) EW_LUT_BYPASS(7) EW_OP_CVT_BYPASS(8) EW_RELU_BYPASS(9). EW_CVT 0x4074 offset /
  * 0x4078 {scale[0-15],shift[16-21]} scales the operand. RDMA: 0x5034 ERDMA_CFG(en+mode), 0x5038 EW_BASE,
  * 0x5040 EW_SURF_STRIDE, 0x500c/5010/5014 = W-1/H-1/C-1, 0x5068 {E,N,B,M}_WEIGHT. Submit enable_mask=0x1d. */
-static void set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG){
-    set_i8_out8(rc,N,stride,mult,shift);                         /* ork conv + int8-out; OUT_CVT gain=0x4084/88 */
+static void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG){
+    orki_set_i8_out8(rc,N,stride,mult,shift);                         /* ork conv + int8-out; OUT_CVT gain=0x4084/88 */
     int s=stride>0?stride:N;
     if(getenv("ORK_EW_REGOP")){
         /* DECISIVE ISOLATION: EW multiply with a REGISTER-constant operand (EW_OP_SRC=0, bit6=0), NO RDMA.
          * out = up_acc * EW_OP_VALUE_0. If this works, the EW stage is fine on ork geometry & the RDMA is the
          * wedge; if it wedges, the EW stage itself is incompatible with ork's dense conv geometry. */
-        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x90400284);          /* EW_CFG mul, OP_SRC=0 (register operand) */
-        setrn(rc,REGCMD_I8_N,RK_DPU_EW_OP_VALUE_0,(uint32_t)strtoul(getenv("ORK_EW_REGOP"),0,0)); /* EW_OP_VALUE_0 */
-        setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);
-        setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x90400284);          /* EW_CFG mul, OP_SRC=0 (register operand) */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_OP_VALUE_0,(uint32_t)strtoul(getenv("ORK_EW_REGOP"),0,0)); /* EW_OP_VALUE_0 */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);
     } else if(!getenv("ORK_EW_NOMUL")){
         /* EW_CFG: multiply(bit2), operand from RDMA(bit6), operand-CVT active(bit8=0), LUT+ReLU bypass(7,9).
          * ORK_EW_CFG / ORK_EW_ERDMA override EW_CFG / ERDMA_CFG for int8-vs-int16 data-size tuning. */
         uint32_t ewcfg=0x904002c4; { const char*e=getenv("ORK_EW_CFG"); if(e) ewcfg=(uint32_t)strtoul(e,0,0); }
-        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,ewcfg);
-        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
-        setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,ewcfg);
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
         /* output-stage EW-active bits (required so the DPU expects the element-wise/RDMA stage; mode bits,
          * geometry-independent). ORK_EW_NO50=skip individual ones during bisection. */
-        setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
-        setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
-        { const char*eo=getenv("ORK_EW_COFF"); if(eo) setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(eo,0,0)); }
-        { const char*es=getenv("ORK_EW_CSCL"); if(es) setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(es,0,0)); }
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
+        orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
+        { const char*eo=getenv("ORK_EW_COFF"); if(eo) orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(eo,0,0)); }
+        { const char*es=getenv("ORK_EW_CSCL"); if(es) orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(es,0,0)); }
         /* DPU_RDMA (0x50xx): fetch silu(gate) as the element-wise operand at EW_BASE (0x5038).
          * ORK_EW_SPTR overrides RDMA_S_POINTER (0x5004): 0xe = PP mode (producer/consumer ping-pong, needs a
          * partner to advance the pointer — deadlocks in a standalone shot); try 0/1 for single-shot no-PP. */
         { uint32_t sp=0x0000000e; const char*e=getenv("ORK_EW_SPTR"); if(e) sp=(uint32_t)strtoul(e,0,0);
-          setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,sp); }
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);       /* RDMA_OPERATION_ENABLE (only in EW-memory path) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,M-1);              /* RDMA_DATA_CUBE_WIDTH  = M-1 */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);       /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,N-1);              /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+          orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,sp); }
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);       /* RDMA_OPERATION_ENABLE (only in EW-memory path) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,M-1);              /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);       /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,N-1);              /* RDMA_DATA_CUBE_CHANNEL= N-1 */
         uint32_t erdma=0x40000004; { const char*e=getenv("ORK_EW_ERDMA"); if(e) erdma=(uint32_t)strtoul(e,0,0); }
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);            /* RDMA_ERDMA_CFG: enable(bit0=0)+data_size/mode */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,aG);               /* RDMA_EW_BASE_ADDR = silu(gate) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,aG);               /* RDMA_SRC_BASE_ADDR (valid) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);            /* RDMA_ERDMA_CFG: enable(bit0=0)+data_size/mode */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,aG);               /* RDMA_EW_BASE_ADDR = silu(gate) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,aG);               /* RDMA_SRC_BASE_ADDR (valid) */
         /* rocket rkt_regcmd.c element-wise: the operand is read via the BRDMA channel from SRC_BASE (0x5018),
          * with BRDMA_DATA_USE=1 (0x501c bits1-4 => value 0x2). (I earlier wrongly DISABLED BRDMA -> the RDMA
          * never delivered the operand -> DPU hung.) NRDMA off; BS_BASE valid (not the stale RKNN addr). */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);       /* RDMA_BRDMA_CFG: BRDMA_DATA_USE=1 (on) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5028,0x00000000);       /* RDMA_NRDMA_CFG: NRDMA_DATA_USE=0 (off) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5020,aG);               /* RDMA_BS_BASE_ADDR: valid (not stale RKNN) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,s);                /* RDMA_EW_SURF_STRIDE (dense = N) */
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,s);
-        setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,s);
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);       /* RDMA_BRDMA_CFG: BRDMA_DATA_USE=1 (on) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5028,0x00000000);       /* RDMA_NRDMA_CFG: NRDMA_DATA_USE=0 (off) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5020,aG);               /* RDMA_BS_BASE_ADDR: valid (not stale RKNN) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,s);                /* RDMA_EW_SURF_STRIDE (dense = N) */
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,s);
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,s);
         /* 0x5044 (FEATURE_MODE_CFG int8) + 0x5068 (RDMA_WEIGHT=0x01010101) come from REGCMD_EW_LANE as-is. */
         /* ORK_EW_STRIDE overrides EW_SURF_STRIDE (cube atom-16 layout probe: M*16) */
         { const char*e=getenv("ORK_EW_STRIDE"); if(e){ uint32_t v=(uint32_t)strtoul(e,0,0);
-            setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,v); setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,v); setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,v); } }
+            orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5040,v); orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_506C,v); orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_504C,v); } }
         /* PC_OPERATION_ENABLE (regcmd trailer, reg 0x8 lane 0x81): ork's REGCMD_I8 trailer has 0x0d
          * (CNA|CORE|DPU) — the DPU_RDMA block (bit 0x10) is NOT enabled, so the RDMA never runs and the DPU
          * waits forever. RKNN's EW op has 0x1d here. Enable the RDMA block in the regcmd's own op-enable. */
-        setrn(rc,REGCMD_I8_EW_N,RK_PC_OPERATION_ENABLE,0x0000001d);
+        orki_setrn(rc,REGCMD_I8_EW_N,RK_PC_OPERATION_ENABLE,0x0000001d);
     }
     /* ORK_EW_BIAS overrides 0x4080 (output offset/bias) */
-    { const char*e=getenv("ORK_EW_BIAS"); if(e) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_EW_BIAS"); if(e) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(e,0,0)); }
 }
 
 /* W4A4 (int4 A x int4 B -> int16 C) — uses the CAPTURED librknnrt regcmd verbatim (REGCMD_I4) as
@@ -2054,24 +2054,24 @@ static void set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,u
  * and the A/B/C addresses are parameterized. The captured program is M=1 (each task of the closed
  * runtime's M-tiling), so callers M-tile by looping rows. See ROADMAP. */
 /* RE fuzzer hook (tools/i4_multim_fuzz.c): up to 16 (block,reg,val) overrides applied at the very END of
- * synth_i4 (win over the K/N/mc-derived regs). Inert by default (n_on=0) — production is unaffected. Only
+ * orki_synth_i4 (win over the K/N/mc-derived regs). Inert by default (n_on=0) — production is unaffected. Only
  * the fuzzer flips these on, so it can sweep the int4 regcmd space to crack the multi-M K-schedule wall. */
 static struct { uint32_t blk, reg, val; } g_i4_fovr[16]; static int g_i4_fovr_n=0;
 void ork_i4_fuzz_clear(void){ g_i4_fovr_n=0; }
 void ork_i4_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i4_fovr_n<16){ g_i4_fovr[g_i4_fovr_n].blk=blk; g_i4_fovr[g_i4_fovr_n].reg=reg; g_i4_fovr[g_i4_fovr_n].val=val; g_i4_fovr_n++; } }
-static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+static void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
-    setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
-    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
-    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE1,K/2);                 /* weight row bytes */
-    setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON1,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
-    setrn(rc,REGCMD_I4_N,RK_CNA_FC_DATA_SIZE1,K);
-    setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);setrn(rc,REGCMD_I4_N,RK_PDP_OUT_N,N-1);
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE1,K/2);                 /* weight row bytes */
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON1,(K+127)/128);        /* K-passes: ceil(K/128) (captured scaling) */
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_FC_DATA_SIZE1,K);
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,REGCMD_I4_N,RK_PDP_OUT_N,N-1);
     /* N-output-stride regs, parameterized for wide-N single-submit (verified vs N=64 & N=128
      * captures: 0x403c=(N-1)dup, 0x4058=N-1, 0x3018=N-1 above). 0x40c0/0x4050 are CONSTANT across N
      * (0x80/0x7fe — left at REGCMD_I4). */
-    setrn(rc,REGCMD_I4_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
-    setrn(rc,REGCMD_I4_N,RK_DPU_DST_N2,N-1);
+    orki_setrn(rc,REGCMD_I4_N,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));
+    orki_setrn(rc,REGCMD_I4_N,RK_DPU_DST_N2,N-1);
     /* Multi-M scheduler (mc>1) — native batch mode (NVDLA D_BATCH_NUMBER analog): one submit computes H
      * rows with the weight streamed ONCE, output at stride-2 (logical row m -> physical row 2m; int16 result
      * in an int32-stepped DMA). Reached only via ORK_I4_MSCHED (gated OFF; production callers pass mc=1 ->
@@ -2095,28 +2095,28 @@ static void synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint
          *   0x01 M-count 0x1020/0x1084/0x102c   0x02 0x4034(PPU rows)   0x04 0x3014(DPU)
          *   0x08 0x4038(out width/4)            0x10 0x1010(CNA hint)   0x20 0x1040(K-schedule=POISON) */
         static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x5f;}
-        setrn(rc,REGCMD_I4_N,RK_DPU_WDMA_SIZE_1,0);                                   /* the trigger (always) */
+        orki_setrn(rc,REGCMD_I4_N,RK_DPU_WDMA_SIZE_1,0);                                   /* the trigger (always) */
         /* 0x107c = K/16 : the batch activation-cube-size reg (Exp-2026-07-07 fuzz). Captured as 4 (tuned to
          * the M=4/K=64 capture); setting it to K/16 restores the native 4-ROW batch at ANY K — bit-exact at
          * K=512/1024/2048 (0x20/0x40/0x80). This lifts multi-M from 1 row to 4 rows/submit at production K
          * (4x fewer weight streams). Narrow: only K/16 gives 4 (neighbors give 2); 4 is the cap for this reg. */
-        if(mregs&0x40) setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON1,(uint32_t)(K/16));
-        if(mregs&0x01){ setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0,0x10000|mc_phys);setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc_phys);setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE3,mc_phys); }
-        if(mregs&0x02) setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_HEIGHT,mc_phys-1);
-        if(mregs&0x04) setrn(rc,REGCMD_I4_N,RK_PDP_OUT_M,(mc_phys-1)<<16);
-        if(mregs&0x08) setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
-        if(mregs&0x10) setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,16*(mc_phys+1));
+        if(mregs&0x40) orki_setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON1,(uint32_t)(K/16));
+        if(mregs&0x01){ orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0,0x10000|mc_phys);orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc_phys);orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE3,mc_phys); }
+        if(mregs&0x02) orki_setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_HEIGHT,mc_phys-1);
+        if(mregs&0x04) orki_setrn(rc,REGCMD_I4_N,RK_PDP_OUT_M,(mc_phys-1)<<16);
+        if(mregs&0x08) orki_setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+        if(mregs&0x10) orki_setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,16*(mc_phys+1));
         if(mregs&0x20){ double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=mc_phys/64; if(mg<1)mg=1;
-            int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,v); }
+            int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,v); }
         /* ORK_I4_1040: direct override of the K-reduction schedule reg (RE: find the int4 multi-row value —
          * the int8 formula corrupts, omitting it leaves only row0 for K>64). Applied last, wins over mregs&0x20. */
-        { const char*e=getenv("ORK_I4_1040"); if(e) setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,(uint32_t)strtoul(e,0,0)); }
+        { const char*e=getenv("ORK_I4_1040"); if(e) orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,(uint32_t)strtoul(e,0,0)); }
         /* ORK_I4_1010: override CNA row/activation-cube reg (RE: multi-M computes rows_computed*K=256 elems —
          * a fixed activation-cube budget; find the reg that enlarges it so K=2048 gets >1 row). */
-        { const char*e=getenv("ORK_I4_1010"); if(e) setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,(uint32_t)strtoul(e,0,0)); }
+        { const char*e=getenv("ORK_I4_1010"); if(e) orki_setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,(uint32_t)strtoul(e,0,0)); }
     }
-    setrn(rc,REGCMD_I4_N,RK_CNA_FEATURE_DATA_ADDR,aA);setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_DATA_ADDR,aB);setrn(rc,REGCMD_I4_N,RK_DPU_DST_BASE_ADDR,aC);
-    for(int i=0;i<g_i4_fovr_n;i++) setr(rc,REGCMD_I4_N,g_i4_fovr[i].blk,g_i4_fovr[i].reg,g_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
+    orki_setrn(rc,REGCMD_I4_N,RK_CNA_FEATURE_DATA_ADDR,aA);orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_DATA_ADDR,aB);orki_setrn(rc,REGCMD_I4_N,RK_DPU_DST_BASE_ADDR,aC);
+    for(int i=0;i<g_i4_fovr_n;i++) orki_setr(rc,REGCMD_I4_N,g_i4_fovr[i].blk,g_i4_fovr[i].reg,g_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
 /* Read-only sanity check: the benchmark methodology requires the DDR (dmc) governor at 'performance'
@@ -2175,7 +2175,7 @@ void ork_npu_dump_state(ork_npu *c, const char *label){
      * captured after EVERY submit; 0 => the last job did NO work (faulted/never ran). (2) per-task int_status
      * from the shared task buffer (read after a FROM_DEVICE sync). */
     struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;   /* NULL after an fd-reap (task buffer died with the fd, re-created lazily on the next run) — guard the deref */
-    if(t) bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(t) orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
     fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=%s0x%x 0x%x 0x%x 0x%x\n",
             label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)g_fd_hw_raw_last, t?"":"(no task buf) ",
             t?t[0].int_status:0u, t?t[1].int_status:0u, t?t[2].int_status:0u, t?t[3].int_status:0u);
@@ -2221,7 +2221,7 @@ int ork_ctx_fd_reap(ork_npu *c){
     close(c->fd);
     int nf=open(card,O_RDWR); if(nf<0){ perror("FD-REAP reopen"); c->fd=-1; return -1; }
     prctl(PR_SET_TIMERSLACK,(unsigned long)1000,0UL,0UL,0UL);
-    act(nf,RKNPU_POWER_ON,0); act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    orki_act(nf,RKNPU_POWER_ON,0); orki_act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     c->fd=nf;
     /* all prior IOMMU mappings + live handles are gone with the old fd */
     pthread_mutex_lock(&g_live_mu); g_live_n=0; g_live_fd=nf; pthread_mutex_unlock(&g_live_mu);
@@ -2256,28 +2256,28 @@ int ork_ctx_fd_reap(ork_npu *c){
  * (A comprehensive fp16/SDP/PPU self-test is fine for HEALTHY validation but is the wrong tool here — it blocks.) */
 static int ork_dummy_probe(ork_npu *c){
     int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
-    struct buf A=bcreate(fd,(size_t)K,0x403,dom), B=bcreate(fd,(size_t)K*N,0x403,dom), Cc=bcreate(fd,(size_t)N*4,0x403,dom);
-    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(B.cpu)bdestroy(fd,&B); if(Cc.cpu)bdestroy(fd,&Cc); return 0; }
+    struct buf A=orki_bcreate(fd,(size_t)K,0x403,dom), B=orki_bcreate(fd,(size_t)K*N,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*4,0x403,dom);
+    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(B.cpu)orki_bdestroy(fd,&B); if(Cc.cpu)orki_bdestroy(fd,&Cc); return 0; }
     memset(A.cpu,1,K); memset(B.cpu,1,(size_t)K*N);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
     __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
     uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    synth_i8(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit s; memset(&s,0,sizeof s);
     s.flags=0x1|0x2u;   /* PC | NONBLOCK: ioctl returns immediately, cannot enter the kernel continue-wait */
     s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=300;
     s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    int rr=rknpu_submit_ioctl(fd,&s,dom), ok=0;
+    int rr=orki_rknpu_submit_ioctl(fd,&s,dom), ok=0;
     if(rr==0){ double t0=ork_now_us();   /* host-side bounded poll — no kernel wait, cannot hang */
         for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory");
             if(*db!=0x7fffffff){ ok=(*db==K); break; }
             if(ork_now_us()-t0>300000.0) break;   /* 300ms host cap => doorbell never landed => still wedged */ } }
-    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
     return ok;
 }
 /* REAP stuck async jobs the CLEAN way (task #47 Bug#2): the vendor driver reaps a stuck/timed-out async job via
@@ -2291,25 +2291,25 @@ static int ork_dummy_probe(ork_npu *c){
 static void ork_npu_reap_stuck(ork_npu *c, int nc){
     int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems;  unsigned dom=c->dom_active;
     if(nc<1) nc=1; if(nc>c->soc->cores) nc=c->soc->cores;
-    struct buf A=bcreate(fd,(size_t)K*2,0x403,dom), B=bcreate(fd,(size_t)K*N*2,0x403,dom), Cc=bcreate(fd,(size_t)N*2,0x403,dom);
-    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(B.cpu)bdestroy(fd,&B); if(Cc.cpu)bdestroy(fd,&Cc); return; }
+    struct buf A=orki_bcreate(fd,(size_t)K*2,0x403,dom), B=orki_bcreate(fd,(size_t)K*N*2,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*2,0x403,dom);
+    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(B.cpu)orki_bdestroy(fd,&B); if(Cc.cpu)orki_bdestroy(fd,&Cc); return; }
     memset(A.cpu,0,(size_t)K*2); memset(B.cpu,0,(size_t)K*N*2);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N]; int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); set_f16_out_fp16in(rc,1,N);
-    memcpy(c->regcmd.cpu,rc,(size_t)REGCMD_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); set_f16_out_fp16in(rc,1,N);
+    memcpy(c->regcmd.cpu,rc,(size_t)REGCMD_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int i=0;i<nc;i++){
         struct rknpu_submit s; memset(&s,0,sizeof s);
         s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=1u<<i; s.fence_fd=-1; s.timeout=300;
         s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        rknpu_submit_ioctl(fd,&s,dom);   /* triggers rknpu_job_timeout_clean(core i) -> clean reap of a timed-out stuck job */
+        orki_rknpu_submit_ioctl(fd,&s,dom);   /* triggers rknpu_job_timeout_clean(core i) -> clean reap of a timed-out stuck job */
         ork_kmsg("reap-stuck: fp16 nonblock dummy core=%d (trigger timeout_clean)", i);
         struct timespec ds={0,3000000}; nanosleep(&ds,NULL);   /* let this core's dummy land + the scheduled cleanup_work run */
     }
-    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
 }
 /* Self-healing recovery: detect -> DUMP everything -> soft RESET -> DUMMY-op probe. Returns 1 if the dummy op
  * PASSES (NPU recovered — caller keeps going), 0 if it FAILS (NPU still broken — caller should throw a fault
@@ -2329,24 +2329,24 @@ int ork_npu_recover(ork_npu *c, const char *label){
  * did NOT land in the window (the expected fault). May soft-reset or IOMMU-fault the NPU — that's the point. */
 int ork_npu_force_fault(ork_npu *c){
     if(!c) return -1; int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
-    struct buf A=bcreate(fd,(size_t)K,0x403,dom), Cc=bcreate(fd,(size_t)N*4,0x403,dom);
-    if(!A.cpu||!Cc.cpu){ if(A.cpu)bdestroy(fd,&A); if(Cc.cpu)bdestroy(fd,&Cc); return -1; }
-    memset(A.cpu,1,K); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf A=orki_bcreate(fd,(size_t)K,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*4,0x403,dom);
+    if(!A.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(Cc.cpu)orki_bdestroy(fd,&Cc); return -1; }
+    memset(A.cpu,1,K); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
     volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
     __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
     uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    synth_i8(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit s; memset(&s,0,sizeof s);
     s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=500;
     s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    int rr=rknpu_submit_ioctl(fd,&s,dom), landed=0;
+    int rr=orki_rknpu_submit_ioctl(fd,&s,dom), landed=0;
     if(rr==0){ double t0=ork_now_us(); for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=0x7fffffff){landed=1;break;} if(ork_now_us()-t0>1000000.0) break; } }
     fprintf(stderr,"[FORCE-FAULT] bogus-weight matmul submit rc=%d, doorbell %s (rw counters unreliable; watch dmesg for DMA_READ_ERROR/soft reset)\n", rr, landed?"LANDED (no fault?!)":"did NOT land (faulted as intended)");
-    bdestroy(fd,&A); bdestroy(fd,&Cc);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&Cc);
     return landed;
 }
 
@@ -2373,7 +2373,7 @@ ork_npu *ork_npu_init_orkd(void){
  * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
  * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
  * select the transport by calling the desired entry point rather than relying on the env. */
-static int mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
+static int orki_mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
@@ -2391,8 +2391,8 @@ ork_npu *ork_npu_init(void){
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default 50µs): precise short nanosleeps for the doorbell backoffs */
-    act(fd,RKNPU_GET_DRV_VERSION,0);act(fd,RKNPU_POWER_ON,0);act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in bcreate (see g_sram_total). */
+    orki_act(fd,RKNPU_GET_DRV_VERSION,0);orki_act(fd,RKNPU_POWER_ON,0);orki_act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in orki_bcreate (see g_sram_total). */
     { struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_TOTAL_SRAM_SIZE;
       if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) g_sram_total=a.value;
       if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
@@ -2400,11 +2400,11 @@ ork_npu *ork_npu_init(void){
                   g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
     ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
-    c->regcmd=bcreate(fd,2097152,0x403,-1); c->task=bcreate(fd,524288,0x40b,-1); c->Af=bcreate(fd,(size_t)4*32768*2,0x403,-1);
+    c->regcmd=orki_bcreate(fd,2097152,0x403,-1); c->task=orki_bcreate(fd,524288,0x40b,-1); c->Af=orki_bcreate(fd,(size_t)4*32768*2,0x403,-1);
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
-    memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    memcpy(c->task.cpu,&t,sizeof t); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
-    /* graceful teardown: MEM_DESTROY all live mappings on SIGTERM/SIGINT so a killed run (e.g. `timeout`)
+    /* graceful teardown: MEM_DESTROY all live mappings on SIGTERM/SIGINT so a killed orki_run (e.g. `timeout`)
      * releases its IOMMU domains instead of stranding them until reboot (see the live-buffer registry). */
     { const char*e=getenv("ORK_NO_SIGCLEAN"); if(!(e&&atoi(e))){
         struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=ork_sig_teardown; sigemptyset(&sa.sa_mask);
@@ -2412,9 +2412,9 @@ ork_npu *ork_npu_init(void){
     /* #54: pre-allocate domain-0 run scratch (mtk_all + per-core mrc/mtk/maf) NOW, while domain 0 is empty. It
      * would otherwise be bcreate'd lazily at the first forward op, AFTER the dense weights import ~GiB into
      * domain 0 — where a fresh bcreate EINVALs amid the imports (the mc_ensure mtk_all failure). Best-effort. */
-    mc_ensure(c, c->soc->cores);
+    orki_mc_ensure(c, c->soc->cores);
     for(int i=0;i<c->soc->cores;i++){ size_t mcc_need=(size_t)2*1024*1024;   /* also pre-size domain-0 mcc (expert BCHAIN need_o) so it never re-bcreates in the import-heavy domain 0 */
-        if(c->mccsz[i]<mcc_need){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } } }
+        if(c->mccsz[i]<mcc_need){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } } }
     g_npu_ctx = c;
     return c;
 }
@@ -2454,9 +2454,9 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
         if(g_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
                                    g_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/g_prof_submits, g_prof_submit_chained,
                                    g_prof_i8_calls?(double)g_prof_submits/g_prof_i8_calls:0.0);
-        /* HW-vs-poll split (task #19): run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
-         * poll/idle = run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
-        if(g_fd_n) fprintf(stderr,"[ork FD-SPLIT] run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
+        /* HW-vs-poll split (task #19): orki_run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
+         * poll/idle = orki_run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
+        if(g_fd_n) fprintf(stderr,"[ork FD-SPLIT] orki_run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
                                    g_prof_i8_us/1e3, g_fd_n, g_fd_ioctl_us/1e3, 100.0*g_fd_ioctl_us/(g_prof_i8_us+1e-9),
                                    g_fd_hw_us/1e3, 100.0*g_fd_hw_us/(g_prof_i8_us+1e-9),
                                    (g_prof_i8_us-g_fd_ioctl_us)/1e3, 100.0*(g_prof_i8_us-g_fd_ioctl_us)/(g_prof_i8_us+1e-9),
@@ -2466,19 +2466,19 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
         for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
     fold_scratch_free(c);   /* #39 resident mfold scratch */
-    bdestroy(fd,&c->regcmd);bdestroy(fd,&c->task);bdestroy(fd,&c->Af);bdestroy(fd,&c->Cc);bdestroy(fd,&c->mtk_all);
-    bdestroy(fd,&c->ppu_a);bdestroy(fd,&c->ppu_b);bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
-    for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&c->mrc[i]);bdestroy(fd,&c->mtk[i]);bdestroy(fd,&c->maf[i]);bdestroy(fd,&c->mcc[i]);
-        bdestroy(fd,&c->chain_rc[i]);bdestroy(fd,&c->chain_tk[i]);bdestroy(fd,&c->chain_lrc[i]);bdestroy(fd,&c->chain_lsc[i]);}   /* multi-core matmul + per-core chain scratch, one pass */
+    orki_bdestroy(fd,&c->regcmd);orki_bdestroy(fd,&c->task);orki_bdestroy(fd,&c->Af);orki_bdestroy(fd,&c->Cc);orki_bdestroy(fd,&c->mtk_all);
+    orki_bdestroy(fd,&c->ppu_a);orki_bdestroy(fd,&c->ppu_b);orki_bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
+    for(int i=0;i<ORK_MAXCORE;i++){orki_bdestroy(fd,&c->mrc[i]);orki_bdestroy(fd,&c->mtk[i]);orki_bdestroy(fd,&c->maf[i]);orki_bdestroy(fd,&c->mcc[i]);
+        orki_bdestroy(fd,&c->chain_rc[i]);orki_bdestroy(fd,&c->chain_tk[i]);orki_bdestroy(fd,&c->chain_lrc[i]);orki_bdestroy(fd,&c->chain_lsc[i]);}   /* multi-core matmul + per-core chain scratch, one pass */
     /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
     if(c->dom_save){ for(int d=0;d<c->dom_cap;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
         struct ork_dom_scratch *s=&c->dom_save[d];
-        bdestroy(fd,&s->regcmd);bdestroy(fd,&s->task);bdestroy(fd,&s->Af);bdestroy(fd,&s->Cc);bdestroy(fd,&s->mtk_all);
-        for(int i=0;i<ORK_MAXCORE;i++){bdestroy(fd,&s->mrc[i]);bdestroy(fd,&s->mtk[i]);bdestroy(fd,&s->maf[i]);bdestroy(fd,&s->mcc[i]);} }
+        orki_bdestroy(fd,&s->regcmd);orki_bdestroy(fd,&s->task);orki_bdestroy(fd,&s->Af);orki_bdestroy(fd,&s->Cc);orki_bdestroy(fd,&s->mtk_all);
+        for(int i=0;i<ORK_MAXCORE;i++){orki_bdestroy(fd,&s->mrc[i]);orki_bdestroy(fd,&s->mtk[i]);orki_bdestroy(fd,&s->maf[i]);orki_bdestroy(fd,&s->mcc[i]);} }
         free(c->dom_save); }
-    for(int i=0;i<c->dma_n;i++) bdestroy(fd,&c->dma_tab[i]);
-    if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
-    if(c->i4arena){ for(int i=0;i<c->i4arena_n;i++) if(c->i4arena[i].cpu) bdestroy(fd,&c->i4arena[i]); free(c->i4arena); }   /* #54 int4 expert import arena (bdestroy closes each chunk's heap_fd) */
+    for(int i=0;i<c->dma_n;i++) orki_bdestroy(fd,&c->dma_tab[i]);
+    if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) orki_bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
+    if(c->i4arena){ for(int i=0;i<c->i4arena_n;i++) if(c->i4arena[i].cpu) orki_bdestroy(fd,&c->i4arena[i]); free(c->i4arena); }   /* #54 int4 expert import arena (bdestroy closes each chunk's heap_fd) */
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
@@ -2486,19 +2486,19 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
  * residency automatically (no API change); the caller just allocates A/C here. ---- */
 void *ork_dma_alloc(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bcreate(c->fd,size,0x401,c->pack_domain); if(!b.cpu) return NULL;
+    struct buf b=orki_bcreate(c->fd,size,0x401,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_free(ork_npu *c, void *ptr){
     if(!c||!ptr) return;
-    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; memset(&c->dma_tab[c->dma_n], 0, sizeof(struct buf)); return; }
+    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ orki_bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; memset(&c->dma_tab[c->dma_n], 0, sizeof(struct buf)); return; }
 }
 /* Zero-copy IMPORT (no alloc, no copy) — see header. Registered in dma_tab like ork_dma_alloc so
  * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
 void *ork_dma_import(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
     ork_dom_prime(c, c->pack_domain);   /* establish a non-0 domain before importing into it (see ork_dom_prime) */
-    struct buf b=bimport(c->fd,size,c->pack_domain); if(!b.cpu) return NULL;
+    struct buf b=orki_bimport(c->fd,size,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
@@ -2510,11 +2510,11 @@ void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
 void *ork_dma_import_fd(ork_npu *c, int dmabuf_fd, size_t size){
     if(!c || dmabuf_fd<0 || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
     ork_dom_prime(c, c->pack_domain);
-    struct buf b=bimport_fd(c->fd, dmabuf_fd, size, c->pack_domain); if(!b.cpu) return NULL;
+    struct buf b=orki_bimport_fd(c->fd, dmabuf_fd, size, c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
-static struct buf *dma_find(ork_npu *c, const void *p){
+static struct buf *orki_dma_find(ork_npu *c, const void *p){
     for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
         if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
     return NULL;
@@ -2522,7 +2522,7 @@ static struct buf *dma_find(ork_npu *c, const void *p){
 /* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
  * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
 void ork_dma_import_sync(ork_npu *c, void *ptr, size_t size){
-    (void)size; struct buf *b=dma_find(c,ptr); if(!b) return;
+    (void)size; struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     /* For imported dma-bufs the dma-buf's own SYNC ioctl flushes the CPU caches (the rknpu MEM_SYNC
      * does not cover foreign imports). END|WRITE = "CPU done writing" -> clean to device. */
     dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
@@ -2530,7 +2530,7 @@ void ork_dma_import_sync(ork_npu *c, void *ptr, size_t size){
 /* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
  * device after a host write (the bsync the streaming fill would issue). Not in the public header. */
 void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
-    struct buf *b=dma_find(c,ptr); if(!b) return;
+    struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     struct rknpu_mem_sync s; memset(&s,0,sizeof s);
     s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
     s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
@@ -2542,7 +2542,7 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
  * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
 void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
+    struct buf b=orki_bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
     c->dma_tab[c->dma_n++]=b; return b.cpu;
 }
 /* ork_dma_alloc that requests on-chip SRAM residence (fails over to DRAM if the NPU has no SRAM / it is full).
@@ -2552,7 +2552,7 @@ void *ork_dma_alloc_sram(ork_npu *c, size_t size){ return ork_dma_alloc_flags(c,
  * so the NPU reads correct data, WITHOUT the FROM_DEVICE invalidate. This is the bsync a cacheable
  * weight buffer needs before submit (the "clean cost" the probe measures separately). */
 void ork_dma_clean_to_device(ork_npu *c, void *ptr, size_t size){
-    struct buf *b=dma_find(c,ptr); if(!b) return;
+    struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     struct rknpu_mem_sync s; memset(&s,0,sizeof s);
     s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
     s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
@@ -2600,7 +2600,7 @@ int ork_npu_domain_alloc(ork_npu *c){
     if(!c) return -1;
     if(c->daemon) return orkd_domain_alloc(c->daemon);
     if(c->dom_next < 1) c->dom_next = 1;
-    if(dom_reserve(c, c->dom_next+1)) return -1;   /* grow arrays to cover the new domain (no fixed cap); OOM -> fail */
+    if(orki_dom_reserve(c, c->dom_next+1)) return -1;   /* grow arrays to cover the new domain (no fixed cap); OOM -> fail */
     return c->dom_next++;
 }
 int ork_npu_domain_free(ork_npu *c,int domain){
@@ -2619,7 +2619,7 @@ int  ork_npu_active_domain(const ork_npu *c){ return c ? c->dom_active : 0; }
 /* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
  * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
  * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
-void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) dom_activate(c, domain<0?0:domain); }
+void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) orki_dom_activate(c, domain<0?0:domain); }
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 int  ork_npu_uses_orkd(const ork_npu *c){ return (c && c->daemon) ? 1 : 0; }   /* 1 = this ctx routes through orkd (serialized); 0 = DIRECT NPU (single-stream — don't run concurrent direct processes) */
 
@@ -2719,7 +2719,7 @@ static void tile_i8_range(int lo,int hi,void *a){
             t->Bi[(size_t)(t->k0+kt*32+kk)*t->N+(t->n0+nt*32+nl)];
 }
 /* Inflate a contiguous [nt] range of int8 weight columns straight into the fp16 [Nt][Kt][16][32] tile
- * layout, scaled per-output-channel: wf16 = (f16)((float)i8 * bscale[n]). Same mapping pack() uses for
+ * layout, scaled per-output-channel: wf16 = (f16)((float)i8 * bscale[n]). Same mapping orki_pack() uses for
  * DT_F16, but the source element is a dequantized int8 code instead of a stored fp16 — so the resulting
  * tile bytes are BIT-IDENTICAL to ork_mm_pack of the row-major dequantized weight. Emulated W8A16. */
 struct tile_i8f16_arg { f16 *bb; const int8_t *Bi; const float *bscale; int KT, k0, n0, N; };
@@ -2752,9 +2752,9 @@ static void tile_i8_to_f16_range(int lo,int hi,void *a){
 #endif
     }
 }
-static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
+static ork_w *orki_pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
-    int KS=dt ? int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
+    int KS=dt ? orki_int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_dom(c->pack_domain); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     /* FIX 2 (gated, ORK_CONSOLIDATE_I8): consolidate all int8 Bb tiles into ONE per-weight DMA buffer,
@@ -2763,19 +2763,19 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
      * reclaims the single buffer. Each tile's regcmd bdma is own_buf.dma+off (validate_regcmd + the run
      * path read it exactly like a per-tile dma — same as the validated grouped-i4 own_buf path). Off by
      * default: this touches the regcmd ADDRESS MATH that wedged the wide-N path before; opt-in to de-risk.
-     * Falls back to per-tile owning bcreate (below) on any alloc failure. */
+     * Falls back to per-tile owning orki_bcreate (below) on any alloc failure. */
     int consolidate = (dt==DT_I8) && getenv("ORK_CONSOLIDATE_I8");
     if(consolidate){
         size_t wtotal=0;
         for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
           for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;(void)k0;
-            wtotal += pgup((size_t)Kp*Nc*esz);}}
-        struct buf own=bcreate(c->fd,wtotal,0x403,w->domain);
+            wtotal += orki_pgup((size_t)Kp*Nc*esz);}}
+        struct buf own=orki_bcreate(c->fd,wtotal,0x403,w->domain);
         if(own.cpu){
             w->own_buf=own; w->own_buf_valid=1; w->owns=0;   /* tiles are views; reclaim own_buf as one */
             size_t off=0;
             for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-              for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=pgup((size_t)Kp*Nc*esz);
+              for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=orki_pgup((size_t)Kp*Nc*esz);
                 struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
                 /* size = PAGE-PADDED tile (== per-tile bcreate's b->size) so ork_w_dump byte-matches the
                  * non-consolidated layout and round-trips through ork_mm_load_i8. */
@@ -2784,8 +2784,8 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
                 for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
                     bb[nt*KT*32*32+kt*32*32+nl*32+kk]=Bi[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
                 off += ts;}}
-            bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-            bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
         } else { consolidate=0; }   /* alloc failed → per-tile fallback below */
     }
     if(!consolidate)
@@ -2799,10 +2799,10 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
          * needs resident weights to persist across the reap. Registered in the import registry for in-place remap. */
         int f16imp = (dt==DT_F16) && getenv("ORK_F16_IMPORT_W");
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
-        *b = f16imp ? bimport(c->fd,(size_t)Kp*Nc*esz,w->domain) : bcreate(c->fd,(size_t)Kp*Nc*esz,wflags,w->domain);
+        *b = f16imp ? orki_bimport(c->fd,(size_t)Kp*Nc*esz,w->domain) : orki_bcreate(c->fd,(size_t)Kp*Nc*esz,wflags,w->domain);
         if(!b->cpu){
-            fprintf(stderr,"[ork] ERROR: %s failed to allocate weight buffer Bb[%zu] in pack (size=%zu)\n",f16imp?"bimport":"bcreate",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
-            for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
+            fprintf(stderr,"[ork] ERROR: %s failed to allocate weight buffer Bb[%zu] in orki_pack (size=%zu)\n",f16imp?"bimport":"bcreate",(size_t)ns*Sk+ks,(size_t)Kp*Nc*esz);
+            for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]);
             free(w->Bb); free(w); return NULL;
         }
         if(f16imp) dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);   /* imports: bracket the CPU fill (rknpu MEM_SYNC doesn't cover foreign imports) */
@@ -2813,20 +2813,20 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
             struct tile_i8_arg ta={bb,Bi,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core tiling
         }
         if(f16imp) dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
-        if(f16imp) imp_reg(b);}}   /* register for fd-reap in-place re-import */
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+        if(f16imp) orki_imp_reg(b);}}   /* register for fd-reap in-place re-import */
     /* AUTO full-K decode layout (int8, K<=10752): lets the multi-core decode do
      * one full-K submit/core instead of ~K/1024 K-slices. ~2x weight memory — IOVA-FITS GUARD: if
      * any bcreate fails (IOMMU full on a big model), abandon Bf entirely → decode falls back to the
      * K-split path (correct, just slower). No crash, no ceiling guess. */
-    if(dt==DT_I8 && K<=10752 && !getenv("ORK_NO_BF") && !(int8_ks(c)<K && getenv("ORK_KTILE"))){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+    if(dt==DT_I8 && K<=10752 && !getenv("ORK_NO_BF") && !(orki_int8_ks(c)<K && getenv("ORK_KTILE"))){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/nt_sz;
-            struct buf*b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
+            struct buf*b=&w->Bf[ns]; *b=orki_bcreate(c->fd,(size_t)K*Nc*esz,0x403,w->domain);
             if(!b->cpu){ ok=0; break; }                 /* IOVA full → give up on Bf */
             int8_t*bb=b->cpu; const int8_t*Bi=B;
             struct tile_i8_arg ta={bb,Bi,KTf,0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta);   // all-core full-K rebuild
-            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+            orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     /* SLICE-AND-DICE RESCUE (#33): pre-build doorbell tiles for a REFUSE-PRONE int8 shape so the run
      * path can RUN it instead of returning ORK_RC_WEDGE_PRONE. The raw B is only in scope HERE (the
      * packed w keeps no raw weight), so the tiles MUST be built at pack time. Gated to the one shape
@@ -2850,10 +2850,10 @@ static ork_w *pack(ork_npu *c,int K,int N,const void *B,int dt){
 }
 ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_f16(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_F16; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: fp16 pack in the daemon (remember the domain so runs carry it) */
-    return pack(c,K,N,B,DT_F16); }
+    return orki_pack(c,K,N,B,DT_F16); }
 ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: pack resident in the daemon (remember the domain so runs carry it) */
-    return pack(c,K,N,B,DT_I8);  }
+    return orki_pack(c,K,N,B,DT_I8);  }
 
 /* ---- Tier 12f: RESIDENT K/V with per-key APPEND (decode attention) -----------------------------------------
  * A decode step appends ONE key to the KV cache, then attends over all keys. Repacking K^T/V from scratch each
@@ -2895,7 +2895,7 @@ ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax){
 int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow){
     if(!c || !kv || key<0 || key>=kv->Lmax || !kcol || !vrow) return -2;
     if(c->daemon) return orkd_kv_append(c->daemon, kv->orkd_kv, key, kv->HD, kcol, vrow);   /* orkd: daemon writes the tile bytes */
-    int HD=kv->HD, Kp=kv->Kp, Lmax=kv->Lmax, KS=int8_ks(c);
+    int HD=kv->HD, Kp=kv->Kp, Lmax=kv->Lmax, KS=orki_int8_ks(c);
     /* The M=1 matmul reads the FULL-K blob Bf when present (bdma = Bf?Bf:Bb), so Bf is authoritative; Bb is the
      * K-sliced fallback. Update BOTH. Bf is a single full-K tile per N-slice (Sn==1 here): KTf=K/32, layout
      * bb[nt*KTf*1024 + kt*1024 + nl*32 + kk] (nt=n/32,kt=k/32,nl=n%32,kk=k%32). */
@@ -2903,18 +2903,18 @@ int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, 
     { int KTf=Kp/32, nt=key/32, nl=key%32;
       if(kv->wkt->Bf){ int8_t *bf=(int8_t*)kv->wkt->Bf[0].cpu;
         for(int k=0;k<HD;k++) bf[(size_t)nt*KTf*1024 + (size_t)(k/32)*1024 + (size_t)nl*32 + (k%32)] = kcol[k];
-        bsync(c->fd, &kv->wkt->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+        orki_bsync(c->fd, &kv->wkt->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
       int8_t *bb=(int8_t*)kv->wkt->Bb[0].cpu;
       for(int k=0;k<HD;k++) bb[(size_t)nt*KTf*1024 + (size_t)(k/32)*1024 + (size_t)nl*32 + (k%32)] = kcol[k];
-      bsync(c->fd, &kv->wkt->Bb[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+      orki_bsync(c->fd, &kv->wkt->Bb[0], RKNPU_MEM_SYNC_TO_DEVICE); }
     /* --- V [Lmax,HD]: element [k=key][n=e]. Bf single full-K tile (KTf=Lmax/32); Bb K-sliced tile ks_idx=key/KS. --- */
     { if(kv->wv->Bf){ int KTf=Lmax/32; int8_t *bf=(int8_t*)kv->wv->Bf[0].cpu;
         for(int e=0;e<HD;e++) bf[(size_t)(e/32)*KTf*1024 + (size_t)(key/32)*1024 + (size_t)(e%32)*32 + (key%32)] = vrow[e];
-        bsync(c->fd, &kv->wv->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
+        orki_bsync(c->fd, &kv->wv->Bf[0], RKNPU_MEM_SYNC_TO_DEVICE); }
       int ks_idx=key/KS, k0=ks_idx*KS, Kp_t=(Lmax-k0<KS)?(Lmax-k0):KS, KTt=Kp_t/32, lk=key-k0, kt=lk/32, kk=lk%32;
       int8_t *bb=(int8_t*)kv->wv->Bb[ks_idx].cpu;
       for(int e=0;e<HD;e++) bb[(size_t)(e/32)*KTt*1024 + (size_t)kt*1024 + (size_t)(e%32)*32 + kk] = vrow[e];
-      bsync(c->fd, &kv->wv->Bb[ks_idx], RKNPU_MEM_SYNC_TO_DEVICE); }
+      orki_bsync(c->fd, &kv->wv->Bb[ks_idx], RKNPU_MEM_SYNC_TO_DEVICE); }
     return 0;
 }
 void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv){ if(!kv)return;
@@ -2943,10 +2943,10 @@ ork_w *ork_mm_f16_scratch(ork_npu *c,int K,int N){
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){free(w);return NULL;}
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;(void)k0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc*2,0x403,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++)bdestroy(c->fd,&w->Bb[i]); free(w->Bb);free(w);return NULL; }
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc*2,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++)orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb);free(w);return NULL; }
         /* fresh buffers need the double init-sync (a single TO leaves the device side uninitialized). */
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return w;
 }
 /* Fill an fp16 scratch (from ork_mm_f16_scratch, same K,N) with wf16[k,n]=(f16)((float)i8[k*N+n]*bscale[n]).
@@ -2962,7 +2962,7 @@ int ork_mm_inflate_i8_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *b
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
         struct tile_i8f16_arg ta={b->cpu,i8,bscale,KT,k0,n0,N};
         ork_parallel_for(NN,tile_i8_to_f16_range,&ta);
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
 
@@ -2986,11 +2986,11 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
  * to size. K%32, N%32. Byte-identical to the pack+dump path (fresh DMA bufs are zeroed; we zero-pad). */
 size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%32) || (N%32)) return 0;
-    int KS=int8_ks(c), NMAX=c->soc->nmax;
+    int KS=orki_int8_ks(c), NMAX=c->soc->nmax;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
-      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=pgup((size_t)Kp*Nc);
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=orki_pgup((size_t)Kp*Nc);
         if(out){ if(off+tsz>cap) return 0;
             int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
             struct tile_i8_arg ta={bb,B,KT,k0,n0,N}; ork_parallel_for(NN,tile_i8_range,&ta); }
@@ -2999,14 +2999,14 @@ size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
 }
 /* Produce the Bf (full-K re-tiled) blob for weight B[K,N] straight from raw row-major int8, PURE-CPU — the
  * on-disk companion to ork_w_dump_i8_cpu so a .orkpack can carry Bf and the loader skips the runtime rebuild.
- * Layout: Sn page-padded tiles; tile ns = pgup(K*Nc), holding [nt][ktf][32][32] over the FULL K (KTf=K/32).
+ * Layout: Sn page-padded tiles; tile ns = orki_pgup(K*Nc), holding [nt][ktf][32][32] over the FULL K (KTf=K/32).
  * Byte-identical to the load-time Bf rebuild / ork_mm_repack_i8's Bf tiling. Only the Bf run envelope
  * (K%512==0 && K<=4096) has a Bf; returns 0 otherwise. Pass out=NULL to size. */
 size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%512) || K>4096 || (N%32)) return 0;
     int NMAX=c->soc->nmax, Sn=(N+NMAX-1)/NMAX, KTf=K/32;
     size_t off=0;
-    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32; size_t tsz=pgup((size_t)K*Nc);
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32; size_t tsz=orki_pgup((size_t)K*Nc);
         if(out){ if(off+tsz>cap) return 0;
             int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
@@ -3016,7 +3016,7 @@ size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
 }
 /* #39 mfold: fold-layout (rkllm M-fold, fold_woff) weight blob for B[K,N] straight from raw row-major int8,
  * PURE-CPU — the on-disk companion (orkpack v5 "Bfold") so the run path skips the per-call fold_woff repack
- * that otherwise kills mfold. Layout: nslice tiles (NS=FOLD_REF_N wide); tile s = pgup(K*sliceW) holding
+ * that otherwise kills mfold. Layout: nslice tiles (NS=FOLD_REF_N wide); tile s = orki_pgup(K*sliceW) holding
  * fold_woff(n,k,K) for that slice's columns. Only K==FOLD_REF_K && N<=3*FOLD_REF_N (the baked-ref fold
  * envelope); returns 0 otherwise. Byte-identical to ork_npu_fold_op_i8's per-slice W pack. out=NULL to size. */
 size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
@@ -3024,7 +3024,7 @@ size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *o
     if(!B || K!=FOLD_REF_K || N<1 || (N%32)) return 0;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return 0;   /* N up to 64*1216 (covers gate/up N=18944) */
     size_t off=0;
-    for(int s=0;s<nslice;s++){ int n0=s*NS, sw=(N-n0<NS)?(N-n0):NS; size_t tsz=pgup((size_t)K*sw);
+    for(int s=0;s<nslice;s++){ int n0=s*NS, sw=(N-n0<NS)?(N-n0):NS; size_t tsz=orki_pgup((size_t)K*sw);
         if(out){ if(off+tsz>cap) return 0;
             int8_t *ws=(int8_t*)out+off; memset(ws,0,tsz);
             for(int k=0;k<K;k++)for(int n=0;n<sw;n++) ws[fold_woff(n,k,K)]=B[(size_t)k*N+(n0+n)]; }
@@ -3054,7 +3054,7 @@ int ork_npu_busy(ork_npu *ctx){
 /* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
  * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
  * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack
- * order. Returns NULL on shape/size mismatch. Mirrors pack()'s int8 geometry (KS=1024).
+ * order. Returns NULL on shape/size mismatch. Mirrors orki_pack()'s int8 geometry (KS=1024).
  * Also rebuilds the full-K Bf buffer (K<=10752) — Bf is not dumped (it's a regenerable re-tiling of the
  * SAME bytes), but the decode fast path AND run_chain_i8 (Sk>1 experts) need it, so a loaded weight must
  * carry it to be a first-class drop-in for a packed one. Bf is reconstructed from Bb (un-tile → B[K][N] →
@@ -3064,27 +3064,27 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; need+=pgup((size_t)Kp*Nc);}}
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; need+=orki_pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     /* Rebuild Bf (full-K layout) so loaded weights chain + decode like packed ones. The Bb tiles are
      * 32x32 blocks: Bb[ns][ks] holds B[k0+kt*32+kk][n0+nt*32+nl] at [nt][kt][nl][kk]. Bf[ns] re-tiles the
      * full K dimension (KTf=K/32) of the SAME logical B for that N-slice.
      * ONLY build Bf where a full-K submit is actually valid (K%512==0 && K<=4096) — the same envelope
-     * run() / run_chain_i8 use. Outside it (e.g. K=1792 ffn_down experts) Bf would never be read and just
+     * orki_run() / run_chain_i8 use. Outside it (e.g. K=1792 ffn_down experts) Bf would never be read and just
      * doubles resident NPU bytes, exhausting the 4 GiB IOMMU window when many experts are loaded. Those
      * weights run via the K-split Bb path (run_i8), which doesn't need Bf. */
     if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
-            struct buf*bf=&w->Bf[ns]; *bf=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain);
+            struct buf*bf=&w->Bf[ns]; *bf=orki_bcreate(c->fd,(size_t)K*Nc,0x403,w->domain);
             if(!bf->cpu){ ok=0; break; }                /* IOVA full → give up on Bf */
             int8_t*fb=bf->cpu;
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
@@ -3093,8 +3093,8 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
                     int ktf=(k0/32)+kt;   /* full-K tile index */
                     fb[(size_t)nt*KTf*32*32+(size_t)ktf*32*32+nl*32+kk]=
                         sb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]; }}
-            bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE);}
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+            orki_bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,bf,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
 
@@ -3103,17 +3103,17 @@ ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
 ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K!=FOLD_REF_K || N<1 || (N%32)) return NULL;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return NULL;
-    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=pgup((size_t)K*sw);}
+    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=orki_pgup((size_t)K*sw);}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
     w->K=K;w->N=N;w->dtype=DT_I8;w->owns=1;w->domain=ork_dom(c->pack_domain);
     w->Bfold=calloc(nslice,sizeof(struct buf)); w->fold_ns=nslice;
     size_t off=0;
-    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; size_t tsz=pgup((size_t)K*sw);
-        struct buf*b=&w->Bfold[s]; *b=bcreate(c->fd,tsz,0x403,w->domain);
-        if(!b->cpu){ for(int i=0;i<s;i++) bdestroy(c->fd,&w->Bfold[i]); free(w->Bfold); free(w); return NULL; }
+    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; size_t tsz=orki_pgup((size_t)K*sw);
+        struct buf*b=&w->Bfold[s]; *b=orki_bcreate(c->fd,tsz,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<s;i++) orki_bdestroy(c->fd,&w->Bfold[i]); free(w->Bfold); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,tsz); off+=tsz;
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); }
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); }
     return w;
 }
 /* #39 attach a fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") to an EXISTING loaded/packed
@@ -3123,15 +3123,15 @@ int ork_w_attach_fold_i8(ork_npu *c, ork_w *w, const void *blob, size_t n){
     if(!c||!w||w->K!=FOLD_REF_K||w->N<1||(w->N%32)) return -1;
     if(w->Bfold) return 0;
     const int NS=FOLD_REF_N; int nslice=(w->N+NS-1)/NS; if(nslice<1||nslice>64) return -1;
-    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; need+=pgup((size_t)w->K*sw);}
+    size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; need+=orki_pgup((size_t)w->K*sw);}
     if(n!=need) return -1;
     struct buf *bf=calloc(nslice,sizeof(struct buf)); if(!bf) return -2;
     size_t off=0;
-    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; size_t tsz=pgup((size_t)w->K*sw);
-        bf[s]=bcreate(c->fd,tsz,0x403,w->domain);
-        if(!bf[s].cpu){ for(int i=0;i<s;i++)bdestroy(c->fd,&bf[i]); free(bf); return -2; }
+    for(int s=0;s<nslice;s++){int n0=s*NS,sw=(w->N-n0<NS)?(w->N-n0):NS; size_t tsz=orki_pgup((size_t)w->K*sw);
+        bf[s]=orki_bcreate(c->fd,tsz,0x403,w->domain);
+        if(!bf[s].cpu){ for(int i=0;i<s;i++)orki_bdestroy(c->fd,&bf[i]); free(bf); return -2; }
         memcpy(bf[s].cpu,(const char*)blob+off,tsz); off+=tsz;
-        bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE); }
+        orki_bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE); }
     w->Bfold=bf; w->fold_ns=nslice; return 0;
 }
 /* Zero-copy IMPORT variant of ork_mm_load_i8: each resident tile is a dma-buf the NPU reads in place
@@ -3145,7 +3145,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=orki_pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     g_imp_wn++;
@@ -3158,7 +3158,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
      * is a page-aligned base+offset VIEW (chunk.dma+off) into its chunk, NOT one bimport per tile. This is the
      * middle ground between the two extremes that both fail: (a) one bimport PER TILE — a PC-chained K-split
      * submit (ffn_down, Sk up to 19) then walks Sk separate imported IOMMU mappings and the CDMA chain-walker
-     * TIMES OUT (errno=110) in a non-0 domain; (b) one GIANT per-weight bimport (~68MB) — 1 mapping (no chain
+     * TIMES OUT (errno=110) in a non-0 domain; (b) one GIANT per-weight orki_bimport (~68MB) — 1 mapping (no chain
      * fault) but the big DMA_HEAP_ALLOC HANGS. Bounded chunks give few mappings per chain (down-proj 68MB / 16MB
      * -> ~3-5 chunks, within the 1.7B's proven-safe ~6) AND proven-safe alloc sizes (per-tile <=8MB never hung).
      * Chunks are bump-filled in tile order (ns outer, ks inner) so a submit's K-slices land in adjacent chunks.
@@ -3172,11 +3172,11 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
         int ns,ks; size_t boff=0;                            /* offset into blob (matches need layout) */
         for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
-          for(ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; size_t ts=pgup((size_t)Kp*Nc);
+          for(ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS; size_t ts=orki_pgup((size_t)Kp*Nc);
             if(!cur.cpu || coff+ts>csz){                    /* need a new chunk */
                 if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
                 csz = ts>chunk_cap ? ts : chunk_cap;        /* a single tile never exceeds cap in practice */
-                cur = bimport(c->fd,csz,w->domain);
+                cur = orki_bimport(c->fd,csz,w->domain);
                 if(!cur.cpu){ consolidate=0; break; }
                 dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
                 w->own_bufs[w->n_own_bufs++]=cur; coff=0;
@@ -3186,7 +3186,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             double _m=g_load_prof?ork_now_us():0; memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); if(g_load_prof) g_lp_memcpy+=ork_now_us()-_m; coff+=ts; boff+=ts;}}
         if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
         else { /* alloc failed mid-way: tear down the chunks we grabbed, fall back to per-tile below */
-            for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]);
+            for(int i=0;i<w->n_own_bufs;i++) orki_bdestroy(c->fd,&w->own_bufs[i]);
             free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0;
             memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1;
         }
@@ -3195,8 +3195,8 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         size_t off=0;
         for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
           for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
-            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
-            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bimport(c->fd,(size_t)Kp*Nc,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
             memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc); off+=b->size;
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
@@ -3204,7 +3204,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     /* Bf full-K rebuild (same envelope as ork_mm_load_i8): imported too, abandoned on failure. */
     if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
-            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
+            struct buf*bf=&w->Bf[ns]; *bf=orki_bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
             int8_t*fb=bf->cpu; double _bf=g_load_prof?ork_now_us():0;
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
@@ -3218,7 +3218,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
                            sb + (size_t)nt*KT*32*32,
                            (size_t)KT*32*32);}
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); if(g_load_prof) g_lp_bf+=ork_now_us()-_bf;}
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
 
@@ -3233,7 +3233,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
  * caller fills *ptr then calls ork_dmabuf_seal(fd) to flush before passing the fd to the daemon. */
 int ork_dmabuf_alloc(size_t size, void **ptr){
     int hf=dmaheap_open(); if(hf<0) return -1;
-    size_t sz=pgup(size);
+    size_t sz=orki_pgup(size);
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
     if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(client)"); return -1; }
     int dbuf=(int)a.fd;
@@ -3249,7 +3249,7 @@ void ork_dmabuf_seal(int dbuf){ if(dbuf>=0) dmabuf_sync(dbuf,DMA_BUF_SYNC_END|DM
 /* DAEMON: adopt client-passed pre-tiled int8 weight dma-buf(s) as a resident weight WITHOUT tiling or
  * allocating weight bytes — PRIME-import into the current pack_domain and lay tiles as base+offset VIEWS.
  * `bb_fd` holds the Bb tiles; `bf_fd` (>=0) holds the full-K Bf region in ITS OWN import so Bf has its own
- * IOMMU obj — matching pack()/load_i8, NOT a view into Bb (a shared-obj Bf wedges the base-matmul doorbell:
+ * IOMMU obj — matching orki_pack()/load_i8, NOT a view into Bb (a shared-obj Bf wedges the base-matmul doorbell:
  * soft-reset recovery loop). Each import is one own_bufs[] chunk (freed once by ork_mm_free); the tile views
  * carry heap_fd=-1 so the Bf free-loop skips them. Returns the ork_w (owns=0) or NULL. ALWAYS consumes both
  * fds. The client already CPU-flushed the bytes (ork_dmabuf_seal), so no sync here. */
@@ -3264,7 +3264,7 @@ ork_w *ork_mm_adopt_imported_i8(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_
      * client still chooses the domain. NOT zero-copy. True zero-copy needs a non-chained/coalesced submit structure
      * (the on-NPU coalesced-chain RE) — set ORK_ADOPT_ZC to use the (wedge-prone) zero-copy VIEW path for that work. */
     if(!getenv("ORK_ADOPT_ZC")){
-        size_t sz=pgup(bb_bytes); void *p=mmap(NULL,sz,PROT_READ,MAP_SHARED,bb_fd,0);
+        size_t sz=orki_pgup(bb_bytes); void *p=mmap(NULL,sz,PROT_READ,MAP_SHARED,bb_fd,0);
         close(bb_fd); if(bf_fd>=0) close(bf_fd);            /* bf ignored — ork_mm_load_i8 rebuilds Bf natively */
         if(p==MAP_FAILED) return NULL;
         ork_w *w=ork_mm_load_i8(c,K,N,p,bb_bytes);         /* native bcreate + copy + native Bf (uses c->pack_domain) */
@@ -3276,22 +3276,22 @@ ork_w *ork_mm_adopt_imported_i8(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t bbneed=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; bbneed+=pgup((size_t)Kp*Nc);}}
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; bbneed+=orki_pgup((size_t)Kp*Nc);}}
     if(bb_bytes<bbneed){ close(bb_fd); if(bf_fd>=0) close(bf_fd); return NULL; }
     int dom=ork_dom(c->pack_domain);
     ork_dom_prime(c,dom);                            /* native anchor BEFORE importing into a non-0 domain */
-    struct buf bbimp=bimport_fd(c->fd,bb_fd,bb_bytes,dom);
+    struct buf bbimp=orki_bimport_fd(c->fd,bb_fd,bb_bytes,dom);
     if(!bbimp.cpu){ close(bb_fd); if(bf_fd>=0) close(bf_fd); return NULL; }   /* bimport_fd doesn't close on failure */
-    ork_w *w=calloc(1,sizeof *w); if(!w){ bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); return NULL; }
+    ork_w *w=calloc(1,sizeof *w); if(!w){ orki_bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); return NULL; }
     w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=0; w->domain=dom;
     w->own_bufs=calloc(2,sizeof(struct buf)); w->n_own_bufs=0;   /* [0]=Bb import [1]=Bf import; ork_mm_free bdestroys each */
-    if(!w->own_bufs){ bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); free(w); return NULL; }
+    if(!w->own_bufs){ orki_bdestroy(c->fd,&bbimp); if(bf_fd>=0) close(bf_fd); free(w); return NULL; }
     w->own_bufs[w->n_own_bufs++]=bbimp;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     if(!w->Bb){ ork_mm_free(c,w); if(bf_fd>=0) close(bf_fd); return NULL; }
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; size_t ts=pgup((size_t)Kp*Nc);
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; size_t ts=orki_pgup((size_t)Kp*Nc);
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
         b->handle=bbimp.handle; b->obj=bbimp.obj; b->dma=bbimp.dma+off; b->cpu=(char*)bbimp.cpu+off; b->size=ts; b->domain=dom; b->heap_fd=-1;
         off+=ts;}}
@@ -3299,14 +3299,14 @@ ork_w *ork_mm_adopt_imported_i8(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_
      * the one Bf import via own_bufs[1]. On any Bf failure, Bf=NULL (base matmuls then 501-error, surfacing it)
      * but the weight itself stays valid (Bb resident). */
     if(bf_fd>=0 && bf_bytes){
-        size_t bfneed=0; for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; bfneed+=pgup((size_t)K*Nc);}
+        size_t bfneed=0; for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; bfneed+=orki_pgup((size_t)K*Nc);}
         if(bf_bytes>=bfneed){
-            struct buf bfimp=bimport_fd(c->fd,bf_fd,bf_bytes,dom);
+            struct buf bfimp=orki_bimport_fd(c->fd,bf_fd,bf_bytes,dom);
             if(bfimp.cpu){
                 w->own_bufs[w->n_own_bufs++]=bfimp;
                 w->Bf=calloc(Sn,sizeof(struct buf));
                 if(w->Bf){ size_t fo=0;
-                    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; size_t fs=pgup((size_t)K*Nc);
+                    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX; size_t fs=orki_pgup((size_t)K*Nc);
                         struct buf*bf=&w->Bf[ns];
                         bf->handle=bfimp.handle; bf->obj=bfimp.obj; bf->dma=bfimp.dma+fo; bf->cpu=(char*)bfimp.cpu+fo; bf->size=fs; bf->domain=dom; bf->heap_fd=-1;
                         fo+=fs;} }
@@ -3332,11 +3332,11 @@ ork_w *ork_mm_import_i8(ork_npu *c,int K,int N,const void *blob,size_t n,size_t 
     /* Bf dma-buf (separate buffer so the daemon imports it into its OWN obj) */
     void *pbf=NULL; int bf_fd=-1;
     if(bf_bytes){ bf_fd=ork_dmabuf_alloc(bf_bytes,&pbf);
-        if(bf_fd<0){ munmap(pbb,pgup(bb_bytes)); close(bb_fd); return NULL; }
+        if(bf_fd<0){ munmap(pbb,orki_pgup(bb_bytes)); close(bb_fd); return NULL; }
         memcpy(pbf,(const char*)blob+bf_off,bf_bytes); ork_dmabuf_seal(bf_fd); }
     uint64_t id=orkd_import_i8(c->daemon,K,N,bb_fd,bf_fd,(uint64_t)bb_bytes,(uint64_t)bf_bytes);
-    munmap(pbb,pgup(bb_bytes)); close(bb_fd);        /* daemon holds its own SCM_RIGHTS dups */
-    if(bf_fd>=0){ munmap(pbf,pgup(bf_bytes)); close(bf_fd); }
+    munmap(pbb,orki_pgup(bb_bytes)); close(bb_fd);        /* daemon holds its own SCM_RIGHTS dups */
+    if(bf_fd>=0){ munmap(pbf,orki_pgup(bf_bytes)); close(bf_fd); }
     if(!id) return NULL;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
     w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain);
@@ -3355,13 +3355,13 @@ int ork_mm_repack_i8(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1; int8_t*bb=b->cpu;
         for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
             bb[nt*KT*32*32+kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     if(w->Bf && K<=10752){ int KTf=K/32;
         for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
             struct buf*b=&w->Bf[ns]; if(!b->cpu) continue; int8_t*bb=b->cpu;
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
                 bb[(size_t)nt*KTf*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(n0+nt*32+nl)];
-            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+            orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
 /* Re-tile fp16 B[K,N] (row-major) into an EXISTING fp16 ork_w (from ork_mm_f16_scratch/ork_mm_pack, same
@@ -3377,13 +3377,13 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1; f16*bb=b->cpu;
         for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
             bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     /* DERIVED-COPY COHERENCE (defect fix). The fp16 MULTI-CORE colsplit does NOT read Bb: it builds a
      * CONTIGUOUS concatenation of the Sk K-slice tiles ONCE and caches it on the weight (w->Bbc for
      * Sn==1, w->Bbc_ns[] for Sn>1) behind a *_valid latch that was never cleared. A repack that
      * refreshed only Bb was therefore INVISIBLE to ork_mm_run()/run_multicore — every multi-core submit
      * after the first kept computing against the FIRST weight ever packed into this slot, silently.
-     * Single-core run() and ork_mm_run_stream_f16{,_chain} read Bb directly and were always correct,
+     * Single-core orki_run() and ork_mm_run_stream_f16{,_chain} read Bb directly and were always correct,
      * which is why this only surfaced in a repack-per-batch-slice caller (ggml-ork's ork_bmm_fp16:
      * batch slice 0 correct, every later slice stale — probe: scratchpad bmm_probe, Hkv=16/rk2=1 gave
      * NRMSE 1.37 from head 1 on multi-core, PASS with ORK_NPU_MC=1). Refresh the copies in place: K,N
@@ -3392,14 +3392,14 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
         for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*N*2;
             if(off+sz>w->Bbc.size || !w->Bb[ks].cpu) break;
             memcpy((char*)w->Bbc.cpu+off, w->Bb[ks].cpu, sz); off+=sz;}
-        bsync(c->fd,&w->Bbc,RKNPU_MEM_SYNC_TO_DEVICE);}
+        orki_bsync(c->fd,&w->Bbc,RKNPU_MEM_SYNC_TO_DEVICE);}
     if(w->Bbc_ns_valid && w->Bbc_ns){
         for(int ns=0;ns<Sn;ns++){ if(!w->Bbc_ns[ns].cpu) continue;
             int c0=ns*NMAX, sw=(N-c0<NMAX)?(N-c0):NMAX; size_t off=0;
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*sw*2;
                 if(off+sz>w->Bbc_ns[ns].size || !w->Bb[(size_t)ns*Sk+ks].cpu) break;
                 memcpy((char*)w->Bbc_ns[ns].cpu+off, w->Bb[(size_t)ns*Sk+ks].cpu, sz); off+=sz;}
-            bsync(c->fd,&w->Bbc_ns[ns],RKNPU_MEM_SYNC_TO_DEVICE);}}
+            orki_bsync(c->fd,&w->Bbc_ns[ns],RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
 /* ---- Diagnostic only (tools/dmabuf_fill_probe.c): a load_i8 variant whose resident Bb tiles are
@@ -3412,17 +3412,17 @@ ork_w *ork_mm_load_i8_flags(ork_npu *c,int K,int N,const void *blob,size_t n,uns
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=orki_pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,flags,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc,flags,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return w;
 }
 /* Diagnostic accessors over an ork_w's resident Bb tiles (for the fill probe): number of tiles, and
@@ -3433,13 +3433,13 @@ size_t ork_w_tile_size(const ork_w *w,int i){ return (w&&w->Bb&&i>=0&&i<w->Sk*w-
 /* clean-only flush (TO_DEVICE) of tile i — the bsync a cacheable weight buffer needs before submit. */
 void   ork_w_tile_clean(ork_npu *c,const ork_w *w,int i){
     if(!w||!w->Bb||i<0||i>=w->Sk*w->Sn||!w->Bb[i].cpu) return;
-    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
 }
-/* the full TO|FROM then TO bsync (the current ork_dma_bsync_to_device pattern), per tile. */
+/* the full TO|FROM then TO orki_bsync (the current ork_dma_bsync_to_device pattern), per tile. */
 void   ork_w_tile_bsync_full(ork_npu *c,const ork_w *w,int i){
     if(!w||!w->Bb||i<0||i>=w->Sk*w->Sn||!w->Bb[i].cpu) return;
-    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(c->fd,&w->Bb[i],RKNPU_MEM_SYNC_TO_DEVICE);
 }
 
 /* ---- NEON SIMD pack/repack DIRECTLY from f32[N][K] (n-major, as ggml's to_float produces) ----
@@ -3472,7 +3472,7 @@ static inline void quant32_f32_i8(int8_t *dst, const float *fr, float inv) {
 #endif
 }
 /* tile f32[N][K] -> int8 NPU layout (Bb K-split + Bf full-K) via precomputed per-channel inv[]. Each
- * buffer gets the full init sync (TO|FROM then TO) that pack() uses — fresh buffers need it (a single TO
+ * buffer gets the full init sync (TO|FROM then TO) that orki_pack() uses — fresh buffers need it (a single TO
  * leaves the device side uninitialized -> the NPU submit wedges/times out). */
 static void tile_f32_i8(ork_npu *c, ork_w *w, int K, int N, const float *f32, const float *inv) {
     int KS = 1024, NMAX = c->soc->nmax, Sk = w->Sk, Sn = w->Sn, fd = c->fd;
@@ -3483,7 +3483,7 @@ static void tile_f32_i8(ork_npu *c, ork_w *w, int K, int N, const float *f32, co
             int n = n0+nt*32+nl; const float *frn = f32 + (size_t)n*K + k0; float iv = inv[n];
             for (int kt = 0; kt < KT; kt++) quant32_f32_i8(bb + ((size_t)nt*KT*32*32 + (size_t)kt*32*32 + nl*32), frn + kt*32, iv);
         }
-        bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+        orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
     if (w->Bf && K <= 10752) { int KTf = K/32;
         for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
             struct buf *b = &w->Bf[ns]; if (!b->cpu) continue; int8_t *bb = b->cpu;
@@ -3491,7 +3491,7 @@ static void tile_f32_i8(ork_npu *c, ork_w *w, int K, int N, const float *f32, co
                 int n = n0+nt*32+nl; const float *frn = f32 + (size_t)n*K; float iv = inv[n];
                 for (int kt = 0; kt < KTf; kt++) quant32_f32_i8(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), frn + kt*32, iv);
             }
-            bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+            orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
 }
 ork_w *ork_mm_pack_i8_f32(ork_npu *c, int K, int N, const float *f32, float *bscale_out) {
     if (K % 32 || N % 32) return NULL;
@@ -3501,12 +3501,12 @@ ork_w *ork_mm_pack_i8_f32(ork_npu *c, int K, int N, const float *f32, float *bsc
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
-        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = orki_bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) orki_bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752 && !getenv("ORK_NO_BF")) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
-        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+            struct buf *b = &w->Bf[ns]; *b = orki_bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) orki_bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     float *inv = malloc((size_t)N * sizeof(float)); if (!inv) { ork_w_free(w); return NULL; }
     chan_scales_f32(f32, K, N, inv, bscale_out);
     tile_f32_i8(c, w, K, N, f32, inv);
@@ -3682,7 +3682,7 @@ static void tile_i8_to_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i
             for (int kt = 0; kt < KT; kt++)
                 memcpy(bb + ((size_t)nt*KT*32*32 + (size_t)kt*32*32 + nl*32), src + kt*32, 32);
         }
-        bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+        orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
     if (w->Bf && K <= 10752) { int KTf = K/32;
         for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX, NN = Nc/32;
             struct buf *b = &w->Bf[ns]; if (!b->cpu) continue; int8_t *bb = b->cpu;
@@ -3691,7 +3691,7 @@ static void tile_i8_to_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i
                 for (int kt = 0; kt < KTf; kt++)
                     memcpy(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), src + kt*32, 32);
             }
-            bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
+            orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); } }
 }
 /* DIRECT int4 -> int8-tiled fill: inflate w's nibble store straight into its resident DMA tiles, no f32.
  * (kind selects UNIFORM sign-extend vs NF4 LUT.) Uses a per-channel linear-int8 scratch i8scratch[N*K]
@@ -3765,12 +3765,12 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
-        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = orki_bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) orki_bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752 && !getenv("ORK_NO_BF")) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
-        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+            struct buf *b = &w->Bf[ns]; *b = orki_bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) orki_bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     /* compact int4 nibble store (n-major, K contiguous): the memory-win form, kept on the ork_w */
     w->Bi4_bytes = (size_t)N * (K/2);
     w->Bi4 = malloc(w->Bi4_bytes);
@@ -3854,12 +3854,12 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if(K<=10752 && !getenv("ORK_NO_BF")){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b=&w->Bf[ns]; *b=bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+            struct buf *b=&w->Bf[ns]; *b=orki_bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     /* retain the compact store + scales so the loaded weight re-dumps byte-identically */
     w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
     if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
@@ -3928,12 +3928,12 @@ ork_w *ork_mm_load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;(void)n0;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bimport(c->fd,(size_t)Kp*Nc,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf*b=&w->Bf[ns]; *b=bimport(c->fd,(size_t)K*Nc,w->domain); if(!b->cpu) ok=0; }
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+            struct buf*b=&w->Bf[ns]; *b=orki_bimport(c->fd,(size_t)K*Nc,w->domain); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
     if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
     memcpy(w->bscale,p,sc); p+=sc; memcpy(w->Bi4,p,nib);
@@ -3968,7 +3968,7 @@ void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind) {
 }
 void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a8_kind(w, qf32, w ? w->quant_kind : 0); }
 /* tile inflated codes qf32[N*K] into w's existing resident DMA buffers (inv=1; codes are exact). Reuses
- * the production tile_f32_i8 — same memcpy/quant + bsync(TO_DEVICE) the steady-state stream would issue. */
+ * the production tile_f32_i8 — same memcpy/quant + orki_bsync(TO_DEVICE) the steady-state stream would issue. */
 void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1) {
     if (!w) return;
     tile_f32_i8(c, w, w->K, w->N, qf32, inv1);
@@ -4014,7 +4014,7 @@ struct ork_stage {
 /* bare DMA-heap dma-buf: alloc + mmap, NO PRIME/MEM_CREATE (no IOVA yet). heap_fd = dma-buf fd. */
 static struct buf bstage_alloc(size_t size){
     int hf=dmaheap_open(); if(hf<0) return (struct buf){0};
-    size_t sz=pgup(size);
+    size_t sz=orki_pgup(size);
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
     if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(stage)"); return (struct buf){0}; }
     int dbuf=(int)a.fd;
@@ -4087,7 +4087,7 @@ void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src){
  * tile directly into this slot's BARE dma-bufs (RAM-backed, NO IOVA / NO bcreate). The int8 counterpart
  * of ork_stage_fill (which inflates int4 first). Lets a caller add a freshly-quantized weight to the
  * stream pool WITHOUT the transient IOVA pack that would compete with the pool's mapped hot set. Tiling
- * is parallelized across all cores (ork_parallel_for + tile_i8_range) — same layout as pack()/load_i8. */
+ * is parallelized across all cores (ork_parallel_for + tile_i8_range) — same layout as orki_pack()/load_i8. */
 void ork_stage_fill_i8(ork_npu *c, struct ork_stage *s, const int8_t *B){
     if(!s || !B) return;
     int K=s->K, N=s->N, KS=1024, NMAX=c->soc->nmax, Sk=s->Sk, Sn=s->Sn;
@@ -4191,7 +4191,7 @@ struct ork_stream_entry *ork_stream_pool_add_i8(struct ork_stream_pool *p, int K
     int KS=1024, NMAX=p->c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=pgup((size_t)Kp*Nc);}}
+      for(int ks=0;ks<Sk;ks++){int Kp=(K-ks*KS<KS)?(K-ks*KS):KS;(void)n0; need+=orki_pgup((size_t)Kp*Nc);}}
     if(n!=need) return NULL;
     struct ork_stream_entry *e=pool_new_entry(p,K,N); if(!e) return NULL;
     struct ork_stage *s=e->stg; size_t off=0;
@@ -4241,7 +4241,7 @@ static int pool_unmap_lru(struct ork_stream_pool *p, struct ork_stream_entry *ke
 /* RUN a pooled weight, SELF-MANAGING the IOVA sliding window: if the entry isn't currently mapped, map
  * it — and if that fails because the 4 GiB IOVA window is full, evict (unmap) the LRU mapped entry and
  * retry until it fits (self-calibrating; no budget guess). The LRU MECHANISM lives here in ork-driver;
- * the caller only sets the RAM budget (how many entries are held resident). 0 ok / -1 (OOM / bad args). */
+ * the caller only sets the RAM orki_budget (how many entries are held resident). 0 ok / -1 (OOM / bad args). */
 int  ork_stream_pool_run  (struct ork_stream_pool *p, struct ork_stream_entry *e, int M, const int8_t *A, int32_t *C){
     if(!p||!e) return -1;
     if(!e->mapped){
@@ -4305,8 +4305,8 @@ static int tile_dequant_i8(ork_npu *c, ork_w *w, int K, int N, ork_dequant_row_f
             for (int kt = 0; kt < KTf; kt++) quant32_f32_i8(bb + ((size_t)nt*KTf*32*32 + (size_t)kt*32*32 + nl*32), sc + kt*32, iv); } }
     }
     free(sc);
-    for (int i = 0; i < Sk*Sn; i++) { struct buf *b = &w->Bb[i]; if (b->cpu) { bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
-    if (w->Bf) for (int ns = 0; ns < Sn; ns++) { struct buf *b = &w->Bf[ns]; if (b->cpu) { bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
+    for (int i = 0; i < Sk*Sn; i++) { struct buf *b = &w->Bb[i]; if (b->cpu) { orki_bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
+    if (w->Bf) for (int ns = 0; ns < Sn; ns++) { struct buf *b = &w->Bf[ns]; if (b->cpu) { orki_bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
     return 0;
 }
 ork_w *ork_mm_pack_i8_dequant(ork_npu *c, int K, int N, ork_dequant_row_fn fn, void *dctx, float *bscale_out) {
@@ -4317,12 +4317,12 @@ ork_w *ork_mm_pack_i8_dequant(ork_npu *c, int K, int N, ork_dequant_row_fn fn, v
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
       for (int ks = 0; ks < Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
-        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
+        struct buf *b = &w->Bb[(size_t)ns*Sk+ks]; *b = orki_bcreate(c->fd, (size_t)Kp*Nc, 0x403, w->domain);
+        if (!b->cpu) { for (int i = 0; i < ns*Sk+ks; i++) orki_bdestroy(c->fd, &w->Bb[i]); free(w->Bb); free(w); return NULL; } } }
     if (K <= 10752 && !getenv("ORK_NO_BF")) { w->Bf = calloc(Sn, sizeof(struct buf)); int ok = 1;
         for (int ns = 0; ns < Sn && ok; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
-            struct buf *b = &w->Bf[ns]; *b = bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
-        if (!ok) { for (int ns = 0; ns < Sn; ns++) bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
+            struct buf *b = &w->Bf[ns]; *b = orki_bcreate(c->fd, (size_t)K*Nc, 0x403, w->domain); if (!b->cpu) ok = 0; }
+        if (!ok) { for (int ns = 0; ns < Sn; ns++) orki_bdestroy(c->fd, &w->Bf[ns]); free(w->Bf); w->Bf = NULL; } }
     if (tile_dequant_i8(c, w, K, N, fn, dctx, bscale_out) != 0) { ork_w_free(w); return NULL; }
     return w;
 }
@@ -4342,21 +4342,21 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     if(c) ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before a per-domain bdestroy switches domains ("failed to destroy memory" + switch-timeout cascade) */
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
-        if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) bdestroy(c->fd,&w->Bb[i]);
+        if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) orki_bdestroy(c->fd,&w->Bb[i]);
     }
-    /* Bf is normally its own per-N-slice bcreate/bimport (never a view), even when Bb is consolidated into
+    /* Bf is normally its own per-N-slice bcreate/orki_bimport (never a view), even when Bb is consolidated into
      * own_buf — so reclaim it whenever present, independent of owns. EXCEPTION: ork_mm_adopt_imported_i8 lays
      * Bf as base+offset VIEWS into a dedicated Bf import (own_bufs[1]); those carry heap_fd=-1 and must NOT be
      * individually destroyed (the backing import is reclaimed once via own_bufs below). Native Bf has heap_fd>=0. */
     if(c && w->Bf) for(int i=0;i<w->Sn;i++)
-        if(w->Bf[i].cpu && w->Bf[i].heap_fd>=0) bdestroy(c->fd,&w->Bf[i]);
-    if(c && w->Bfold) for(int i=0;i<w->fold_ns;i++) if(w->Bfold[i].cpu) bdestroy(c->fd,&w->Bfold[i]);   /* #39 mfold resident weight */
+        if(w->Bf[i].cpu && w->Bf[i].heap_fd>=0) orki_bdestroy(c->fd,&w->Bf[i]);
+    if(c && w->Bfold) for(int i=0;i<w->fold_ns;i++) if(w->Bfold[i].cpu) orki_bdestroy(c->fd,&w->Bfold[i]);   /* #39 mfold resident weight */
     /* dedicated single-buffer weights (grouped-i4, or consolidated int8): Bb[] entries are VIEWS (share
      * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
      * of a sub-pointer). Reclaims IOVA. */
-    if(c && w->own_buf_valid) bdestroy(c->fd,&w->own_buf);
+    if(c && w->own_buf_valid) orki_bdestroy(c->fd,&w->own_buf);
     /* size-bounded consolidated import: Bb[] entries are views into own_bufs[] chunks — destroy each chunk. */
-    if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) bdestroy(c->fd,&w->own_bufs[i]);
+    if(c && w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) if(w->own_bufs[i].cpu) orki_bdestroy(c->fd,&w->own_bufs[i]);
     free(w->own_bufs);
     if(c && w->sliced) ork_mm_free_sliced(c, w->sliced);   /* #33 reclaim the rescue tiles' sub-weights + IOVA */
     free(w->Bb); free(w->Bf); free(w->Bfold); free(w->Bi4); free(w->bscale); free(w->fa_lut); free(w);
@@ -4427,14 +4427,14 @@ ork_w *ork_mm_pack_i4(ork_npu *c,int K,int N,const int8_t *B){
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     for(int ns=0;ns<Sn;ns++)for(int ks=0;ks<Sk;ks++){
         int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
         if(!b->cpu){
             fprintf(stderr,"[ork] ERROR: bcreate failed to allocate weight buffer Bb[%zu] in pack_i4 (size=%zu)\n",(size_t)ns*Sk+ks,(size_t)Kp*Nc/2);
-            for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]);
+            for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]);
             ork_w_free(w); return NULL;
         }
         tile_i4_Bslice(b->cpu,B,K,N,k0,Kp,n0,Nc);
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
     }
     /* SLICE-AND-DICE RESCUE (#33): pre-build doorbell tiles for a REFUSE-PRONE int4 shape (Sn>1 => N>nmax,
      * or K>8192 => BCHAIN H<2) so ork_mm_run_i4's refuse (ORK_RC_WEDGE_PRONE) instead RUNS the shape by
@@ -4456,21 +4456,21 @@ ork_w *ork_mm_load_i4(ork_npu *c,int K,int N,const void *blob,size_t n){
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=orki_pgup((size_t)Kp*Nc/2);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1; w->domain=ork_dom(c->pack_domain);
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
-        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc/2,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         memcpy(b->cpu,(const char*)blob+off,b->size); off+=b->size;
-        bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     return w;
 }
 /* Native-int4 IMPORT twin of ork_mm_load_i4: identical DT_I4 tile layout (Kp*Nc/2 nibble bytes, KS=ORK_I4_KS,
- * no Bf) but allocated via bimport (dma-heap + PRIME_FD into the IOMMU) instead of bcreate (MEM_CREATE). MEM_CREATE
+ * no Bf) but allocated via orki_bimport (dma-heap + PRIME_FD into the IOMMU) instead of orki_bcreate (MEM_CREATE). MEM_CREATE
  * faults/EINVALs across non-0 domains AND at scale (a >4GiB resident int4 set — e.g. a resident MoE — hits the
  * per-domain window edge, the in-kernel rknpu_gem_object_create fault), so ork_mm_load_i4 cannot bring a big int4
  * weight set resident. This mirrors the PROVEN multi-domain-safe consolidated-chunk import from ork_mm_load_i8_import:
@@ -4492,7 +4492,7 @@ ork_w *ork_mm_load_i4_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
-      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=orki_pgup((size_t)Kp*Nc/2);}}
     if(n!=need) return NULL;
     int dom=ork_dom(c->pack_domain); if(dom<0||dom>=64) return NULL;   /* arena tracks [64] domains */
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
@@ -4504,11 +4504,11 @@ ork_w *ork_mm_load_i4_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
     struct buf *cur=&c->i4arena_cur[dom];
     if(!cur->cpu || c->i4arena_off[dom]+need > cur->size){   /* switch chunk: keep this whole weight in ONE chunk */
         size_t csz = need>chunk_cap ? need : chunk_cap;      /* a single expert weight never exceeds 16MB in practice */
-        struct buf nb=bimport(c->fd,csz,dom);
+        struct buf nb=orki_bimport(c->fd,csz,dom);
         if(!nb.cpu){ free(w->Bb); free(w); return NULL; }
         if(c->i4arena_n>=c->i4arena_cap){ int nc2=c->i4arena_cap?c->i4arena_cap*2:64;
             struct buf*na=realloc(c->i4arena,(size_t)nc2*sizeof*na);
-            if(!na){ bdestroy(c->fd,&nb); free(w->Bb); free(w); return NULL; }
+            if(!na){ orki_bdestroy(c->fd,&nb); free(w->Bb); free(w); return NULL; }
             c->i4arena=na; c->i4arena_cap=nc2; }
         /* fds stay OPEN until teardown (bdestroy closes them). 16MB chunks => ~320 fds for the 35B, under ulimit
          * (the EMFILE that forced per-weight fd-sealing was ~9k PER-EXPERT imports; consolidation removes it).
@@ -4519,7 +4519,7 @@ ork_w *ork_mm_load_i4_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
     dmabuf_sync(cur->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);   /* bracket the CPU fill (mirror int8) */
     size_t off=c->i4arena_off[dom], boff=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
-      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t raw=(size_t)Kp*Nc/2, ts=pgup(raw);
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t raw=(size_t)Kp*Nc/2, ts=orki_pgup(raw);
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
         b->handle=cur->handle; b->obj=cur->obj; b->dma=cur->dma+off; b->cpu=(char*)cur->cpu+off; b->size=ts; b->heap_fd=0; b->domain=dom;
         memcpy(b->cpu,(const char*)blob+boff,raw); off+=ts; boff+=ts; }}
@@ -4533,7 +4533,7 @@ ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
-      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=pgup((size_t)Kp*Nc/2);}}
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; need+=orki_pgup((size_t)Kp*Nc/2);}}
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4; w->owns=1; w->domain=ork_dom(c->pack_domain);
     c->scratch_import=1;   /* weights are now bimported into their domains -> the run scratch must import too (bcreate EINVALs alongside imports); see bscratch */
@@ -4545,11 +4545,11 @@ ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
      * ensure below alloc once per domain (idempotent: skip if already sized). Generous mcc (>= the expert BCHAIN
      * need_o ~688 KiB) so BCHAIN never re-grows (=re-bcreates) it in the now-heavy domain. */
     if(w->domain>0){
-        dom_activate(c, w->domain);
-        mc_ensure(c, c->soc->cores);
+        orki_dom_activate(c, w->domain);
+        orki_mc_ensure(c, c->soc->cores);
         size_t mcc_need = (size_t)2*1024*1024;   /* covers expert BCHAIN need_o with margin */
         for(int i=0;i<c->soc->cores;i++)
-            if(c->mccsz[i] < mcc_need){ bdestroy(c->fd,&c->mcc[i]); c->mcc[i]=bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } }
+            if(c->mccsz[i] < mcc_need){ orki_bdestroy(c->fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } }
     }
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     int consolidate = !getenv("ORK_NO_CONSOLIDATE_IMPORT");
@@ -4561,12 +4561,12 @@ ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
         int ns,ks; size_t boff=0;
         for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
-          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t ts=pgup((size_t)Kp*Nc/2);
+          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t ts=orki_pgup((size_t)Kp*Nc/2);
             if(!cur.cpu || coff+ts>csz){
                 if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
                 size_t rem = need - boff;                       /* cap the chunk to THIS weight's remaining need: a small per-expert weight (~0.5 MiB) must NOT grab a full chunk_cap (16 MiB) chunk — that burned ~16 MiB IOVA PER expert (~15k experts) and blew the domains. */
                 csz = rem < chunk_cap ? rem : chunk_cap; if(csz < ts) csz = ts;
-                cur = bimport(c->fd,csz,w->domain);
+                cur = orki_bimport(c->fd,csz,w->domain);
                 if(!cur.cpu){ consolidate=0; break; }
                 dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
                 w->own_bufs[w->n_own_bufs++]=cur; coff=0;
@@ -4575,7 +4575,7 @@ ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
             memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc/2); coff+=ts; boff+=ts;}}
         if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
-        else { for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]);
+        else { for(int i=0;i<w->n_own_bufs;i++) orki_bdestroy(c->fd,&w->own_bufs[i]);
             free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0;
             memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1; }
     }
@@ -4583,8 +4583,8 @@ ork_w *ork_mm_load_i4_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         size_t off=0;
         for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;(void)n0;
           for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc/2,w->domain);
-            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bimport(c->fd,(size_t)Kp*Nc/2,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
             memcpy(b->cpu,(const char*)blob+off,(size_t)Kp*Nc/2); off+=b->size;
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}}
@@ -4614,11 +4614,11 @@ ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
      * allocation => fast warmup, no IOVA-handle OOM, and — crucially — RECLAIMABLE: ork_mm_free destroys
      * own_buf (returning its IOVA to the 4 GiB window), so drop/reload of a grouped weight does NOT leak
      * (streaming / MoE-swap). The whole region is flushed to device in a single bsync. Falls back to
-     * per-tile owning bcreate (also reclaimable) if the dedicated alloc fails. */
+     * per-tile owning orki_bcreate (also reclaimable) if the dedicated alloc fails. */
     size_t wtotal=0;
     for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         wtotal += (((size_t)G*Nc/2)+4095u)&~(size_t)4095u; }
-    struct buf own=bcreate(c->fd,wtotal,0x403,w->domain);
+    struct buf own=orki_bcreate(c->fd,wtotal,0x403,w->domain);
     if(own.cpu){
         w->own_buf=own; w->own_buf_valid=1;
         size_t off=0;
@@ -4629,17 +4629,17 @@ ork_w *ork_mm_pack_i4_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
             tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
             off += (ts+4095u)&~(size_t)4095u;
         }
-        bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-        bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync_off(c->fd,own.obj,0,wtotal,RKNPU_MEM_SYNC_TO_DEVICE);
     } else {
         w->owns=1;   /* per-tile owning bcreate: reclaimable by ork_mm_free */
         for(int ns=0;ns<Sn;ns++)for(int g=0;g<Sk;g++){
             int k0=g*G,n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=bcreate(c->fd,(size_t)G*Nc/2,0x403,w->domain);
+            struct buf*b=&w->Bb[(size_t)ns*Sk+g]; *b=orki_bcreate(c->fd,(size_t)G*Nc/2,0x403,w->domain);
             if(!b->cpu){ fprintf(stderr,"[ork] ERROR: weight alloc failed (G=%d Nc=%d) in pack_i4_grouped\n",G,Nc);
-                for(int i=0;i<ns*Sk+g;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+                for(int i=0;i<ns*Sk+g;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
             tile_i4_Bslice(b->cpu,B,K,N,k0,G,n0,Nc);
-            bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
         }
     }
     return w;
@@ -4709,10 +4709,10 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * this weight's domain before the int4 submit — mirror the int8 run paths. Without it a resident int4 weight
      * in domain N submits against the stale dom_active (e.g. 0) -> RKNPU_SUBMIT EINVAL(22) -> self-heal reset ->
      * retry (correctness held via the reset, but every cross-domain expert submit thrashed -> very slow). */
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
-    int nc=budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
+    int nc=orki_budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
     /* DEFAULT int4 M>1 prefill: BCHAIN batch-chain on the NONBLOCK doorbell (run_i4_bchain_db) — H-row native
      * batches (synth_i4 mc>1) + bank-width Wb=131072/K N-tiling + weight-loaded-once chaining, self-healing on
      * the doorbell spine. Bit-exact, ~18-25x over the per-row doorbell, and serves the large-M shapes the
@@ -4754,7 +4754,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * SRAM/side-effect commit and STALL (errno 110), esp. in mixed/chained programs. RE knob to test whether a
  * chain stall is the ping-pong race (vs IOVA). Default unchanged (0x5). */
 static uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO_PINGPONG"); v=(e&&atoi(e))?1:5;} return (uint32_t)v; }
-static int submit1(ork_npu *c){
+static int orki_submit1(ork_npu *c){
     int fd=c->fd;
     static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
@@ -4764,18 +4764,18 @@ static int submit1(ork_npu *c){
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
     int reps=c->warmed?1:2;
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
-        if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
-        bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
+        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
-/* P3 #7: doorbell variant of submit1 for the single-core matmul path (run()'s run_fullk_dec / run_loop) —
+/* P3 #7: doorbell variant of submit1 for the single-core matmul path (orki_run()'s run_fullk_dec / run_loop) —
  * NONBLOCK submit + host-bounded poll on c->Cc instead of the kernel-blocking submit. The plain matmul output
  * is int32 (int8 A·B) or fp32 (fp16), so 0x7fffffff is a safe sentinel (a real int32 accumulator, or a finite
  * fp32 result, won't equal that exact NaN bit pattern). nout = mc*Nc elements written this tile. Poll = last-
  * word gate then a full-surface verify (matmul writeback is last-col-last, so the gate is sound; the verify
  * covers any residual lag). The int8-OUTPUT submit1 callers (fused SiLU/out8) have no safe sentinel and keep
  * the blocking submit1; the ZC-OUT (cbuf) case writes the user buffer, not c->Cc, and also keeps submit1. */
-static int submit1_db(ork_npu *c, size_t nout){
+static int orki_submit1_db(ork_npu *c, size_t nout){
     int fd=c->fd;
     static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags()|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
@@ -4785,20 +4785,20 @@ static int submit1_db(ork_npu *c, size_t nout){
     int reps=c->warmed?1:2;
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
-        if(rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
         double pt=ork_now_us(), cap=(double)mm_timeout_ms()*1000.0;
         for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
-        bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
 /* ---- multi-core (ORK_NPU_MC=<n>): use n cores (capped at soc->cores). Split each N-slice's
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
  * so this is dynamic, not hardwired to a chip's core total. ---- */
-static int mc_ensure(ork_npu *c,int nc){
+static int orki_mc_ensure(ork_npu *c,int nc){
     int fd=c->fd;
     if(!c->mtk_all.cpu) {
-        c->mtk_all=bscratch(c, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
+        c->mtk_all=orki_bscratch(c, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
         if(!c->mtk_all.cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate mtk_all task buffer (IOMMU full?)\n");
             return -1;
@@ -4806,13 +4806,13 @@ static int mc_ensure(ork_npu *c,int nc){
     }
     for(int i=0;i<nc;i++){
         if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
-        c->mrc[i]=bscratch(c,65536,0x403,c->dom_active); c->mtk[i]=bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
+        c->mrc[i]=orki_bscratch(c,65536,0x403,c->dom_active); c->mtk[i]=orki_bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=orki_bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
         if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
             return -1;
         }
         struct rknpu_task t;memset(&t,0,sizeof t);t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->mrc[i].dma;
-        memcpy(c->mtk[i].cpu,&t,sizeof t); bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        memcpy(c->mtk[i].cpu,&t,sizeof t); orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_task *tall = (struct rknpu_task*)c->mtk_all.cpu;
         tall[i] = t;
     }
@@ -4822,18 +4822,18 @@ static int mc_ensure(ork_npu *c,int nc){
         struct rknpu_task *t = (struct rknpu_task*)c->mtk[i].cpu;
         if (t->regcfg_amount != reg_amt) {
             t->regcfg_amount = reg_amt;
-            bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         }
         if (tall[i].regcfg_amount != reg_amt) {
             tall[i].regcfg_amount = reg_amt;
         }
     }
-    bsync(fd,&c->mtk_all,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->mtk_all,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     return 0;
 }
 static double ork_now_us(void);   /* fwd (defined below) */
 /* ORK_MCPROF diagnostic: per-core phase timing (copy / submit / acc). Populated by the single-core
- * run() path (the multi-core matmul now runs on the doorbell colsplit, which reports via its own
+ * orki_run() path (the multi-core matmul now runs on the doorbell colsplit, which reports via its own
  * poll/backoff timers, not g_mc_*). Read via ork_npu_mc_timing. */
 #define MCPROF_MAX 8
 static double g_mc_copy[MCPROF_MAX], g_mc_sub[MCPROF_MAX], g_mc_acc[MCPROF_MAX]; static long g_mc_n[MCPROF_MAX];
@@ -4843,7 +4843,7 @@ void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
     if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
 double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?g_mc_synth[core]:0; }
 
-static void pin_big_core(int id){
+static void orki_pin_big_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
     if(off) return;
 #if defined(__linux__)
@@ -4862,7 +4862,7 @@ static void pin_big_core(int id){
  * IO-bound / memory-bound work (e.g. the SSM double-buffer marshalling helper) that should run on the
  * idle little cluster WHILE the big cores are saturated by ggml's threadpool + the NPU pool. The A55 is
  * ~2x slower but it's free time overlapped with the NPU submit. Honors ORK_NO_AFFINITY. */
-static void pin_little_core(int id){
+static void orki_pin_little_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
     if(off) return;
 #if defined(__linux__)
@@ -4874,7 +4874,7 @@ static void pin_little_core(int id){
 }
 static void *npu_pool_worker(void *vp){
     struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
-    pin_big_core(id);                          /* keep this worker off the little cores */
+    orki_pin_big_core(id);                          /* keep this worker off the little cores */
     for(;;){
         pthread_mutex_lock(&c->pmu);
         while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
@@ -4886,7 +4886,7 @@ static void *npu_pool_worker(void *vp){
 }
 static void npu_pool_ensure(ork_npu *c){
     if(c->pool_n) return;
-    pin_big_core(0);                           /* calling thread drives NPU core 0 — keep it big too */
+    orki_pin_big_core(0);                           /* calling thread drives NPU core 0 — keep it big too */
     c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
     for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,npu_pool_worker,&c->pwa[i]); }
 }
@@ -4910,7 +4910,7 @@ void ork_npu_floor_reset(void){ g_fd_ioctl_us=0; g_fd_hw_us=0; g_fd_hw_raw_last=
  *                ACT_RESET). No explicit HW reset here. Tests whether re-warm alone clears the wedge.
  *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
 void ork_npu_mode_invalidate(ork_npu *c){ if(!c) return; c->last_dt=-1; c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++) c->mwarm[i]=0; }
-void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0); ork_npu_mode_invalidate(c); }
+void ork_npu_mode_reset(ork_npu *c){ if(!c) return; orki_act(c->fd,RKNPU_ACT_RESET,0); ork_npu_mode_invalidate(c); }
 
 /* ============================ MODE-TRANSITION LAYER (ork_npu_enter) ============================
  * SINGLE owner of "what does moving the NPU's stateful regcmd datapath from mode X to mode Y
@@ -4948,7 +4948,7 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; act(c->fd,RKNPU_ACT_RESET,0)
  *                    therefore KEEP-WARM-AWARE: rst=RC_SDPKW (reset iff !ork_sdp_noreset(), i.e. only
  *                    when the ORK_SDP_NORESET skip is OFF), setdt=0 (no marker, leaves last_dt). This is
  *                    the op-local SDP reset expressed AS DATA — byte-identical to the historical inline
- *                    `if(!ork_sdp_noreset()) act(RESET)`, default-SKIP so it does NOT re-introduce the
+ *                    `if(!ork_sdp_noreset()) orki_act(RESET)`, default-SKIP so it does NOT re-introduce the
  *                    churn ORK_SSM_KEEPWARM removes. NEVER set XP_SDP to RC_ALWAYS (that forces the reset).
  *                    Wired via ork_npu_enter(c, c->last_dt, XP_SDP, OCK_NONE); SDP ops still not yet
  *                    converted keep the inline form (identical behavior) pending a Phase-2 sweep.
@@ -5036,7 +5036,7 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
-    if(rst){ act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
+    if(rst){ orki_act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
     int wclr=0;
     switch(x->wc){
       case WC_NOTKW:         wclr=!kw; break;
@@ -5065,10 +5065,10 @@ static int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
  * legacy mcworker fallback has been removed. See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
 static int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):1; } return v; }   /* colsplit is the ONLY fp16 multicore path (#45); ORK_F16_COLSPLIT=0 -> single-core fp16 reference (never mcworker) */
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
-#define ORK_RC_F16_SC (-502)   /* internal run_multicore->run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */
+#define ORK_RC_F16_SC (-502)   /* internal run_multicore->orki_run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */
 static void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near the doorbell poll) */
 /* SLICE-AND-DICE RESCUE (#33): a shape run_multicore has no verified single-submit path for would
- * return ORK_RC_WEDGE_PRONE. If pack() pre-built doorbell tiles for it (w->sliced), RUN it on those
+ * return ORK_RC_WEDGE_PRONE. If orki_pack() pre-built doorbell tiles for it (w->sliced), RUN it on those
  * instead — one chained doorbell submit over c_base tiles, bit-exact. If there are no tiles (a shape
  * we don't pre-slice) OR the sliced run itself errors, REFUSE — never a blocking fall-back (#45). */
 static int slice_rescue_or_refuse(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
@@ -5149,7 +5149,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * per-core K-chain never crosses a dma-buf boundary (the cross-buffer prefetch WILD that CONTIG prevents).
          * Cores split THAT slice's columns; end() writes the sub-N result into the wider C at the full row-stride N
          * via task.cstride. Sn sequential begin/end. Any ineligible/wedged slice abandons colsplit for this matmul
-         * and falls through to run()'s single-core fp16 reference via ORK_RC_F16_SC (correctness). This removes fp16 wide-N's mcworker dependency
+         * and falls through to orki_run()'s single-core fp16 reference via ORK_RC_F16_SC (correctness). This removes fp16 wide-N's mcworker dependency
          * (task #45) using the validated Sn==1 no-drop path per slice. */
         int NMAXn = c->soc->nmax, KSn = c->soc->ks;
         if (!w->Bbc_ns_valid) {   /* build the per-N-slice CONTIG weights ONCE (resident; reclaimed at teardown like Bbc) */
@@ -5159,12 +5159,12 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 int c0 = ns*NMAXn, sw = (w->N - c0 < NMAXn) ? (w->N - c0) : NMAXn;
                 size_t tot = 0;
                 for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSn, Kp = (w->K-k0<KSn)?(w->K-k0):KSn; tot += (size_t)Kp*sw*2; }
-                w->Bbc_ns[ns] = bcreate(fd, tot, 0x403, w->domain);
+                w->Bbc_ns[ns] = orki_bcreate(fd, tot, 0x403, w->domain);
                 if (!w->Bbc_ns[ns].cpu) { build_ok = 0; break; }
                 size_t off = 0;
                 for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSn, Kp = (w->K-k0<KSn)?(w->K-k0):KSn; size_t sz = (size_t)Kp*sw*2;
                     memcpy((char*)w->Bbc_ns[ns].cpu + off, w->Bb[(size_t)ns*w->Sk + ks].cpu, sz); off += sz; }
-                bsync(fd, &w->Bbc_ns[ns], RKNPU_MEM_SYNC_TO_DEVICE);
+                orki_bsync(fd, &w->Bbc_ns[ns], RKNPU_MEM_SYNC_TO_DEVICE);
             }
             if (build_ok) w->Bbc_ns_valid = 1;   /* partial/failed build -> stays invalid; the slice loop bails to the single-core fp16 reference */
         }
@@ -5187,13 +5187,13 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             }
             if (wideN_ok) return 0;
             fprintf(stderr, "[ork] fp16 wide-N colsplit ineligible/wedge (K=%d N=%d Sn=%d) — single-core fp16 reference backstop\n", w->K, w->N, w->Sn);
-            c->mc_error = 0;   /* fall through to run()'s single-core fp16 reference (ORK_RC_F16_SC) for the whole matmul */
+            c->mc_error = 0;   /* fall through to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC) for the whole matmul */
         }
     }
     if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> single-core fp16 reference */
         /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
          * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
-         * touch). h==NULL (ineligible / buffers too small) FALLS BACK to run()'s single-core fp16 reference (ORK_RC_F16_SC). */
+         * touch). h==NULL (ineligible / buffers too small) FALLS BACK to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC). */
         ork_install_term();
         ork_mm_task_i8 tf = { .w = w, .M = M, .A = (const int8_t*)A, .C = (int32_t*)C };
         int ncf = nc; if (ncf > c->soc->cores) ncf = c->soc->cores;
@@ -5229,7 +5229,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             ork_kmsg("F16-WEDGE attempt %d/%d rc=%d mc_error=%d (K=%d N=%d M=%d)", attempt, fp16_recov_max, rc, c->mc_error, w->K, w->N, M);
             ork_npu_dump_state(c, "fp16-wedge PRE-recovery"); fflush(stderr);
             if (getenv("ORK_F16_FDCLOSE")) {   /* PROBE (ORK_F16_FDCLOSE): does closing the DRM fd REAP the poisoned mapping
-                * CLEANLY (drm_release cancels the stuck job + tears down its IOMMU maps), unlike our bsync (which NULL-derefs
+                * CLEANLY (drm_release cancels the stuck job + tears down its IOMMU maps), unlike our orki_bsync (which NULL-derefs
                 * in rknpu_gem_sync_ioctl)? Isolate: close -> reopen -> _exit(0) so the answer isn't masked by stale-buffer
                 * teardown. netconsole shows whether a gem_sync/still-mapped fires between 'begin' and 'reopened'. */
                 int oldfd = c->fd;
@@ -5237,7 +5237,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 close(oldfd);
                 ork_kmsg("FDCLOSE-REAP: close() returned WITHOUT synchronous crash — reopening %s", c->soc->card);
                 int nf = open(c->soc->card, O_RDWR);
-                if (nf >= 0) { act(nf, RKNPU_POWER_ON, 0); }
+                if (nf >= 0) { orki_act(nf, RKNPU_POWER_ON, 0); }
                 ork_kmsg("FDCLOSE-REAP: reopened fd=%d (errno=%d) — close+reopen SURVIVED; _exit(0) (skip stale teardown)", nf, nf<0?errno:0);
                 fflush(NULL);
                 _exit(0);
@@ -5279,7 +5279,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         if (fp16_healed) return 0;
         if (!fp16_ineligible) {   /* recovery exhausted (repeated wilds survive resets = a genuinely stuck NPU): FINAL
             * BACKSTOP = de-escalate to single-core (nc=1: no concurrent fetch -> the bit-exact reference, never wedges).
-            * Slow but correct + safe. Falls through to run()'s single-core fp16 reference (ORK_RC_F16_SC) with a cold re-warm. */
+            * Slow but correct + safe. Falls through to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC) with a cold re-warm. */
             fprintf(stderr, "[ork] fp16 colsplit wedge (K=%d N=%d M=%d) — de-escalating to single-core\n", w->K, w->N, M);
             if (getenv("ORK_F16_TCLEAN")) {   /* TCLEAN: the last colsplit attempt left dropped/stuck jobs on ALL cores; nc=1
                 * below only submits to core 0, so cores 1..n would keep a stuck job that UAFs at process teardown (close(fd)
@@ -5292,16 +5292,16 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             c->mc_error = 0; nc = 1;
             c->warmed = 0; for (int z = 0; z < ORK_MAXCORE; z++) c->mwarm[z] = 0;
         }
-        /* fp16_ineligible: fall through to run()'s single-core fp16 reference (ORK_RC_F16_SC) at the original nc. */
+        /* fp16_ineligible: fall through to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC) at the original nc. */
     }
     /* fp16 NEVER falls to the blocking mcworker: every fp16 fallback (colsplit ineligible, wedge de-escalation,
-     * Sn>1 slice-fail) routes to run()'s SINGLE-CORE fp16 reference (bit-exact, no concurrent fetch -> no drop)
+     * Sn>1 slice-fail) routes to orki_run()'s SINGLE-CORE fp16 reference (bit-exact, no concurrent fetch -> no drop)
      * via ORK_RC_F16_SC. Removes the last fp16 mcworker dependency (#45). int8 is already fully covered/refused
      * above — the blocking mcworker path that used to sit below has been removed (#45). */
-    if(dt==DT_F16) return ORK_RC_F16_SC;   /* fp16 out-of-colsplit fall-through: run()'s single-core reference (correct; the tiled fp16 slice was a wrong-fit — fp16's fit is colsplit, above) */
+    if(dt==DT_F16) return ORK_RC_F16_SC;   /* fp16 out-of-colsplit fall-through: orki_run()'s single-core reference (correct; the tiled fp16 slice was a wrong-fit — fp16's fit is colsplit, above) */
     /* mcworker path deleted (#45). Nothing reaches here: fp16 returned ORK_RC_F16_SC above;
      * every int8 M>1 (nc>1, N>=64) returned in the i8 colsplit/refuse block; int8 N<64 never
-     * reaches run_multicore (run() shrinks nc->1). Refuse defensively, never a blocking fallback. */
+     * reaches run_multicore (orki_run() shrinks nc->1). Refuse defensively, never a blocking fallback. */
     return slice_rescue_or_refuse(c,w,M,A,C,nc);   /* #33: run pre-built doorbell tiles if any, else refuse */
 }
 
@@ -5322,7 +5322,7 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
      * needs N-tile / K-group-slice (a follow-on). The M>1 gate bounds the recursion (bottoms out at M==1). */
     int G=w->gsize, Sk=w->K/G, per_row=w->Sn*Sk;
     if(M>1 && per_row>0 && per_row<=64){                                 /* 64 = margin under the ~70-program/core cap */
-        int nc=budget(c,M); if(nc<1)nc=1; int rpc=64/per_row; if(rpc<1)rpc=1;
+        int nc=orki_budget(c,M); if(nc<1)nc=1; int rpc=64/per_row; if(rpc<1)rpc=1;
         int Msub=rpc*nc; if(Msub>=M) Msub=M-1; if(Msub<1) Msub=1;
         int ok=1;
         for(int m0=0;m0<M && ok;m0+=Msub){ int mm=(M-m0<Msub)?(M-m0):Msub;
@@ -5332,18 +5332,18 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
     return ORK_RC_WEDGE_PRONE;
 }
 
-static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
+static int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* multi-domain residence: swap in this domain's scratch (regcmd/task/Af/Cc/mc-*) so the submit's
      * buffers all live in the weight's domain (c->dom_active), and make any lazy scratch bcreate below
      * land there too. Submits stamp their own iommu_domain_id from w->domain (per-submit, no global).
      * No-op for the common single-domain case (w->domain==0, dom_active==0). */
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     /* auto-tuner: pick cores ≤ budget, capped so each gets ≥2 N-tiles (tiny matmuls don't pay the
      * multi-core spawn). budget defaults to all soc cores; ORK_NPU_MC / set_core_budget cap it. */
-    /* int8 M=1 decode: use the multi-core budget (split N across cores) — validated +40% end-to-end, every
-     * shape benefits (in-model sweep monotonic). budget(c,2) skips the M==1 single-core default + honors
-     * ORK_NPU_MC. fp16/int4 M==1 keep single-core (budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
-    int b=(M==1 && w->dtype==DT_I8) ? budget(c,2) : budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
+    /* int8 M=1 decode: use the multi-core orki_budget (split N across cores) — validated +40% end-to-end, every
+     * shape benefits (in-model sweep monotonic). orki_budget(c,2) skips the M==1 single-core default + honors
+     * ORK_NPU_MC. fp16/int4 M==1 keep single-core (orki_budget(c,1)==1). NN<nc*2 shrink below guards tiny int8 N. */
+    int b=(M==1 && w->dtype==DT_I8) ? orki_budget(c,2) : orki_budget(c, M), cores=c->soc->cores, NN=w->N/(w->dtype?32:16);
     int nc=b<cores?b:cores; if(nc>NN)nc=NN; while(nc>1 && NN<nc*2)nc--;
     /* NOTE: imported weights on a non-0 IOMMU domain run MULTI-CORE safely — the per-domain native anchor
      * (ork_dom_prime, called at import time) establishes the domain so the spawned cores read correct IOVAs.
@@ -5351,15 +5351,15 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * K-slices) — that was a fresh-domain establishment race, NOT a core issue (single-core corrupted too).
      * No single-core gate is needed; see the >4GiB-import notes (wiki Tier 10 / NPU-Quirks). */
     if(nc>1){ int rmc=run_multicore(c,w,M,A,C,nc); if(rmc!=ORK_RC_F16_SC) return rmc; }   /* ORK_RC_F16_SC: fp16 fallback -> fall through to the single-core fp16 reference below (no mcworker) */
-    pin_big_core(0);                                   /* single-core path also runs on the calling thread */
+    orki_pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see the fp16 colsplit path) */
-    int KS=dt ? int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
+    int KS=dt ? orki_int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
     /* ORK_MIXED_NOTHRASH extended to fp16: don't ccsz=0 (which forces a Cc REALLOC) on a dtype switch — under
-     * near-full-domain IOVA pressure that per-layer realloc bcreate-FAILS -> run() returns -1 (single-core) or
+     * near-full-domain IOVA pressure that per-layer realloc bcreate-FAILS -> orki_run() returns -1 (single-core) or
      * races the reset -> WEDGE (multi-core). Reusing the (per-domain, dom_activate-swapped) Cc when it still
      * fits avoids both. warmed=0 still re-warms (handles the stale-first-output). The realloc guard below still
      * reallocs on a genuine size grow. */
@@ -5387,10 +5387,10 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         size_t sz=(size_t)rows*Kp*1;
         if(sz>maxaf)maxaf=sz;
     }
-    if(c->ccsz<maxout){bdestroy(fd,&c->Cc);c->Cc=bcreate(fd,maxout,0x403,c->dom_active);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu){fprintf(stderr, "[ork] ERROR: failed to allocate single-core/pre-core output buffer Cc (size=%zu, IOMMU full?)\n", maxout);return -1;}}
+    if(c->ccsz<maxout){orki_bdestroy(fd,&c->Cc);c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu){fprintf(stderr, "[ork] ERROR: failed to allocate single-core/pre-core output buffer Cc (size=%zu, IOMMU full?)\n", maxout);return -1;}}
     if(c->Af.size<maxaf){
-        bdestroy(fd,&c->Af);
-        c->Af=bcreate(fd,maxaf,0x403,c->dom_active);
+        orki_bdestroy(fd,&c->Af);
+        c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active);
         if(!c->Af.cpu){
             fprintf(stderr, "[ork] ERROR: failed to allocate activation buffer Af (size=%zu, IOMMU full?)\n", maxaf);
             return -1;
@@ -5411,11 +5411,11 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         /* zero-copy: if A / C live in ork_dma_alloc buffers, the regcmd reads/writes them in place
          * (no gather/writeout memcpy). Output zero-copy needs a single N-slice (Nc==N, contiguous).
          * Opt-in (ORK_ZC_OUT) + off by default. */
-        struct buf *abuf=dma_find(c,A);   /* INPUT zero-copy: validated correct, default on */
-        struct buf *cbuf=(getenv("ORK_ZC_OUT"))?dma_find(c,C):NULL;
-        if(abuf) bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
+        struct buf *abuf=orki_dma_find(c,A);   /* INPUT zero-copy: validated correct, default on */
+        struct buf *cbuf=(getenv("ORK_ZC_OUT"))?orki_dma_find(c,C):NULL;
+        if(abuf) orki_bsync(fd,abuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* flush the producer's CPU writes once */
         if(cbuf) {
-            bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean dirty CPU cache lines so they don't evict over NPU output */
+            orki_bsync(fd,cbuf,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean dirty CPU cache lines so they don't evict over NPU output */
             c->warmed=0;             /* re-warm the fresh output buffer (necessary but not sufficient) */
         }
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -5425,26 +5425,26 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 uint32_t adma;
                 if(abuf){ adma=(uint32_t)(abuf->dma + ((const char*)A-(const char*)abuf->cpu) + (size_t)m0*K); }
                 else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
-                       bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); adma=(uint32_t)c->Af.dma; }
+                       orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); adma=(uint32_t)c->Af.dma; }
                 double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
                 uint32_t cdma=cbuf?(uint32_t)(cbuf->dma + ((const char*)C-(const char*)cbuf->cpu) + (size_t)m0*N*4):(uint32_t)c->Cc.dma;
-                uint32_t rc[REGCMD_N]; synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF,cbuf?N:Nc);
-                if (validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
-                memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-                if(cbuf){ if(submit1(c)) return -1; }                       /* ZC-OUT writes user C, not c->Cc -> keep blocking */
-                else    { if(submit1_db(c,(size_t)mc*Nc)) return -1; }      /* P3 #7: c->Cc int32 output rides the doorbell */
+                uint32_t rc[REGCMD_N]; orki_synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF,cbuf?N:Nc);
+                if (orki_validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
+                memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+                if(cbuf){ if(orki_submit1(c)) return -1; }                       /* ZC-OUT writes user C, not c->Cc -> keep blocking */
+                else    { if(orki_submit1_db(c,(size_t)mc*Nc)) return -1; }      /* P3 #7: c->Cc int32 output rides the doorbell */
                 double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
                 
                 /* For output zero copy, the NPU writes directly to the user-provided C buffer.
                  * We MUST invalidate the CPU cache here so the host reads the fresh NPU output instead of stale cache lines. */
-                if(cbuf) bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
+                if(cbuf) orki_bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
                 
                 if(!cbuf){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
                 g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
             }
         }
         if(cbuf){
-            bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
             if(w->Sn>1){
                 int32_t *C_ptr = (int32_t*)C;
                 for (int r = M - 1; r >= 1; r--) {
@@ -5468,7 +5468,7 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
      * swreduce_probe T2 = MM_I8 after exp_i8). Set it here so the matmul never inherits an SDP task. */
     if(dt==DT_I8){ struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
         t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma;
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
         int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
@@ -5489,14 +5489,14 @@ static int run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             double _tc0=ork_now_us();
             if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j]; }
             else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j]; }
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
-            if(dt==DT_F16) synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
-            else           synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
-            if (validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            if(submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
+            if(dt==DT_F16) orki_synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
+            else           orki_synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
+            if (orki_validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            if(orki_submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
             double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
             if(dt==DT_F16){ float  *cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
             else { int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
@@ -5513,7 +5513,7 @@ int ork_mm_run   (ork_npu *c,ork_w *w,int M,const f16    *A,float   *C){
         return orkd_run_f16(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_F16)return -1;
     if(check_overlap("ork_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K * 2, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
-    return run(c,w,M,A,C);
+    return orki_run(c,w,M,A,C);
 }
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
@@ -5528,7 +5528,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w->dtype!=DT_I8) return -1;
     if(check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real
-     * run (NOT a synthetic tool). A garbage => backend act-quant (stage 2); C garbage w/ sane A => weight
+     * orki_run (NOT a synthetic tool). A garbage => backend act-quant (stage 2); C garbage w/ sane A => weight
      * bytes/tiling (stage 1); both sane => the garbage is dequant/scales (stage 4). Flushed per line. */
     static int rtr=-1; if(rtr<0){ const char*e=getenv("ORK_RUN_TRACE"); rtr=e?atoi(e):0; }
     static long rn=0; long myn=rn++; int trace = rtr && myn<(long)rtr;
@@ -5548,7 +5548,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         /* fold declined (alloc/shape) — fall through to the normal path, no behavior change */
     }
     double t0 = g_ork_prof ? ork_now_us() : 0;
-    int r = run(c,w,M,A,C);
+    int r = orki_run(c,w,M,A,C);
     if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; }
     if(trace){ long cmn=2147483647L,cmx=-2147483648L,cz=0; size_t nc=(size_t)M*w->N;
         for(size_t i=0;i<nc;i++){ int32_t v=C[i]; if(v<cmn)cmn=v; if(v>cmx)cmx=v; if(!v)cz++; }
@@ -5589,7 +5589,7 @@ static ork_w_sliced *slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B) {
      * even column load. The old nmax+remainder tiling put e.g. 8192+512 on 2 cores (3rd idle) = a 2.3x loss;
      * equal tiles >= cores mirror ork_dyn_begin_colsplit's t0=i*N/nc balance. */
     int nnt = (N + cap_ns - 1) / cap_ns; if (nnt < c->soc->cores) nnt = c->soc->cores;
-    int nalign = 32;                                                     /* int8 pack() needs each tile width %32==0 (fp16 %16); N%32==0 holds for any packed int8 weight, so all tiles stay valid */
+    int nalign = 32;                                                     /* int8 orki_pack() needs each tile width %32==0 (fp16 %16); N%32==0 holds for any packed int8 weight, so all tiles stay valid */
     int ns = ((N + nnt - 1) / nnt + nalign - 1) / nalign * nalign;       /* equal width, 32-aligned */
     if (ns > cap_ns) ns = cap_ns; if (ns < nalign) ns = nalign;
     nnt = (N + ns - 1) / ns;                                             /* actual tiles after alignment */
@@ -5672,7 +5672,7 @@ static void *slice_acc_worker(void *p){
 }
 static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
-    int ks = w->ks, ns = w->ns;   /* balanced tile step baked at pack (equal-width N-tiles >= cores) */
+    int ks = w->ks, ns = w->ns;   /* balanced tile step baked at orki_pack (equal-width N-tiles >= cores) */
     int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N, Kpad = w->Kpad;
     /* SINGLE chained doorbell submit over EVERY tile (K-slices x N-tiles) — one begin/end, not nks*nnt
      * round-trips. ork_dyn_begin_mc distributes the S tasks across the nc cores and chains each core's tasks
@@ -5717,7 +5717,7 @@ static int slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int
     free(Aslc); free(part); free(tasks); return rc;
 }
 
-/* int4 sliced run (#33): decompose a refused int4 shape into BCHAIN-legal sub-tiles (Sk==1, Sn==1, N%64,
+/* int4 sliced orki_run (#33): decompose a refused int4 shape into BCHAIN-legal sub-tiles (Sk==1, Sn==1, N%64,
  * K<=8192) and run EACH via run_i4_bchain_db (M>=2) or the per-row doorbell (M==1) — reusing #52's
  * self-healing / pool / de-tile machinery as a black box — then int32-accumulate the K-slices + scatter N
  * (int4 C is int32 after BCHAIN's de-tile, so the int8 slice_acc_worker applies verbatim). Tiles run
@@ -5788,18 +5788,18 @@ int ork_mm_run_sliced(ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C
  * bit-exact ceiling the plain int8 matmul uses (synth_i8 sets 0x1040 from mc, so the fused output stage
  * inherits the exact schedule). Was hardcoded 64 (conservative) — that DOUBLED submits at prefill
  * (mc=128@K2048). K<=4096 here so Kp==K. See AGENTS.md "weight-DMA amortization". */
-static inline int fused_mtile(int K,int M){
+static inline int orki_fused_mtile(int K,int M){
     double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale);
     int mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0; int chunk = mg_max*64;
     const char*e=getenv("ORK_FUSED_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }  /* A/B override (validation) */
     if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
 }
-/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (synth() uses scale=K/256, vs int8's K/512
+/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (orki_synth() uses scale=K/256, vs int8's K/512
  * since int8 packs 2 rows per CBUF slot) gives the SAME bit-exact M-tile ceiling mg_max*64. The old
  * ork_mm_run_f16_silu chunk=16 was a stale over-conservative cap far below this (64 @K2048, 320 @K512) —
  * bit-exact validated (tools/silu_f16_check: M-tile 16==32==64 @K2048, 16==320 @K512, 384>ceil DIFFERS).
  * ORK_F16_MTILE overrides (validation / probing above the ceiling). */
-static inline int f16_mtile(int K,int M){
+static inline int orki_f16_mtile(int K,int M){
     double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale);
     int mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0; int chunk = mg_max*64;
     const char*e=getenv("ORK_F16_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }
@@ -5812,59 +5812,59 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror run()) */
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);  /* submit's buffers must live in the weight's domain (mirror orki_run()) */
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64: doubled prefill submits) */
+    int chunk=orki_fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64: doubled prefill submits) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
     /* realloc Af/Cc if too small OR in the WRONG domain: chained FFN weights (gate/up/down) can live in
-     * different IOMMU domains, and dom_activate() above may have switched dom_active — a submit against a
+     * different IOMMU domains, and orki_dom_activate() above may have switched dom_active — a submit against a
      * buffer whose IOVA was reserved in another domain faults the NPU (soft reset). Keep them in dom_active. */
-    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     /* build the LUT-load regcmd once (fixed silu*S PWL LUT, or the supplied lut[]) */
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
-    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){orki_bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     /* Stream the LUT into PPU SRAM ONCE (enable 0x18) — it persists across the matmul submits below, so we
      * DON'T reload per M-tile (that was ~half the submits at prefill). Then per N-slice x M-tile: matmul +
-     * fused-SiLU via submit1() (warmed c->Cc + correct domain — a hand-rolled submit to a fresh buffer gives
+     * fused-SiLU via orki_submit1() (warmed c->Cc + correct domain — a hand-rolled submit to a fresh buffer gives
      * bias-only output; submit1's warmed c->Cc is the validated bit-exact path vs the probe). */
     int rc_ret=0;
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       /* ping-pong OFF (0x1 = RKNPU_JOB_PC, NOT 0x5) for the LUT-load submit: ping-pong (1<<2) signals the
        * task "config done" the instant its register config completes, racing the LUT's SRAM-commit side
        * effect — the following matmul submit then reads a half-committed LUT -> wrong silu -> garbage output
        * (non-deterministic, worsens with scale: bit-exact-looking per-op but PPL blows up over many tokens).
        * See AGENTS.md / NPU-Quirks "Ping-pong races a chained task's side effect". */
       struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x1;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
+      if(orki_rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma;
-        bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);   /* re-sync the resident weight to device */
+        orki_bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);   /* re-sync the resident weight to device */
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             /* matmul + fused-SiLU output stage -> int8 in c->Cc (via submit1: warmup + domain) */
             uint32_t rc[REGCMD_I8_N];
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
-            if(validate_regcmd("i8_silu",c,rc,REGCMD_I8_N,w,NULL,0)){ rc_ret=-1; break; }   /* stamp real op/weight so a submit-failure dump isn't a STALE probe label (mis-diagnosis) + sanity-check addrs */
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            if(orki_validate_regcmd("i8_silu",c,rc,REGCMD_I8_N,w,NULL,0)){ rc_ret=-1; break; }   /* stamp real op/weight so a submit-failure dump isn't a STALE probe label (mis-diagnosis) + sanity-check addrs */
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-            if(submit1(c)){ rc_ret=-1; break; }
+              orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(orki_submit1(c)){ rc_ret=-1; break; }
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
     }
-    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     return rc_ret;
 }
 
@@ -5895,23 +5895,23 @@ static void set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_
         e=getenv("ORK_SILU_38DIV"); div38=e?atoi(e):8;                              /* group stride divisor (int8=16,int32=4,int16=8) */
         const char*g=getenv("ORK_SILU_4084"); if(g){ ovg=1; r84=(uint32_t)strtoul(g,0,0);
             const char*s=getenv("ORK_SILU_4088"); r88=s?(uint32_t)strtoul(s,0,0):0; } }  /* CVT gain override (fp16=0x00010001) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,ovg?r84:(uint32_t)r_mult);   /* CVT gain (int R mantissa, or fp16 0x00010001) */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,ovg?r88:(uint32_t)r_shift);  /* CVT shift */
-    setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r4010);              /* output precision (PREC field) + LUT/activation enable */
-    setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,r40c0);              /* output element size */
-    setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r4050);              /* output row byte-stride config */
-    setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/div38)-1)<<16)|((N/div38)-1)); /* output group stride */
-    setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040);
-    setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);
-    setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302);
-    setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000);
-    setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,ovg?r84:(uint32_t)r_mult);   /* CVT gain (int R mantissa, or fp16 0x00010001) */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,ovg?r88:(uint32_t)r_shift);  /* CVT shift */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); orki_setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r4010);              /* output precision (PREC field) + LUT/activation enable */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,r40c0);              /* output element size */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r4050);              /* output row byte-stride config */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((N/div38)-1)<<16)|((N/div38)-1)); /* output group stride */
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CFG,0x00000302);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4108,0x00000068);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R410C,0x00050500);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4110,idx_off);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R411C,0x00004000);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000);
+    orki_setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0);
 }
 
 /* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
@@ -5924,89 +5924,89 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=fused_mtile(K,M);
+    int chunk=orki_fused_mtile(K,M);
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX*4;   /* int32 output: 4 bytes/elem */
-    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
-    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){orki_bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     int rc_ret=0;
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       /* ping-pong OFF (0x1 = RKNPU_JOB_PC, NOT 0x5) for the LUT-load submit: ping-pong (1<<2) signals the
        * task "config done" the instant its register config completes, racing the LUT's SRAM-commit side
        * effect — the following matmul submit then reads a half-committed LUT -> wrong silu -> garbage output
        * (non-deterministic, worsens with scale: bit-exact-looking per-op but PPL blows up over many tokens).
        * See AGENTS.md / NPU-Quirks "Ping-pong races a chained task's side effect". */
       struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x1;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
+      if(orki_rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma;
-        bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
+            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
             set_i8_silu32(rc,Nc,r_mult,r_shift,out_bias,idx_off,cfg4068);
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-            if(submit1(c)){ rc_ret=-1; break; }
+              orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(orki_submit1(c)){ rc_ret=-1; break; }
             /* output element width from the sweep (int16=2,int32=4). Sign-extend to the int32 C[] the caller reads. */
             static int obytes=0; if(!obytes){ const char*e=getenv("ORK_SILU_OBYTES"); obytes=e?atoi(e):2; }
             if(obytes==2){ int16_t*cc=(int16_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
             else         { int32_t*cc=(int32_t*)c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
         }
     }
-    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     return rc_ret;
 }
 
 /* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
  * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)
  * so the silu value is emitted at fp16→fp32 precision, NOT quantized to int8. Same flying-mode LUT-stage regs
- * as set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
+ * as orki_set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
  * set_i8_silu's set_i8_out8 override to int8). This is the "end-goal" higher-precision fused gate — currently
  * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
  * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     { const char*e=getenv("ORK_F16_C4004"); uint32_t v=e?(uint32_t)strtoul(e,0,0):0x0030;
-      setrn(rc,REGCMD_N,RK_DPU_S_POINTER,v); setrn(rc,REGCMD_N,RK_SDP_5004,v); } /* activation mode on */
+      orki_setrn(rc,REGCMD_N,RK_DPU_S_POINTER,v); orki_setrn(rc,REGCMD_N,RK_SDP_5004,v); } /* activation mode on */
     /* 0x4010 = fp16 output CVT (post-LUT). Deliberately kept at REGCMD's 0xa8000002 (fp16->fp32); overriding
      * is WEDGE-PRONE (proc-precision mismatch). ORK_F16_C4010 for the upper-bank RE probe only. */
-    { const char*e=getenv("ORK_F16_C4010"); if(e) setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_F16_C4010"); if(e) orki_setrn(rc,REGCMD_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); }
     /* index/output gain (0x4084/0x4088): REGCMD's default is ~1 -> gate barely moves the LUT index (curve
      * under-sampled). Env-override to spread gate over the LUT (fp16 analog of the int8 acc->index R). */
-    { const char*g=getenv("ORK_F16_R84"); if(g){ setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(g,0,0));
-        const char*s=getenv("ORK_F16_R88"); setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,s?(uint32_t)strtoul(s,0,0):0); } }
-    { const char*e=getenv("ORK_F16_C4060"); setrn(rc,REGCMD_N,RK_DPU_BN_CFG,e?(uint32_t)strtoul(e,0,0):0x00020040); }   /* silu LUT-stage config (shared with the int8 fused path) */
+    { const char*g=getenv("ORK_F16_R84"); if(g){ orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(g,0,0));
+        const char*s=getenv("ORK_F16_R88"); orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_SHIFT,s?(uint32_t)strtoul(s,0,0):0); } }
+    { const char*e=getenv("ORK_F16_C4060"); orki_setrn(rc,REGCMD_N,RK_DPU_BN_CFG,e?(uint32_t)strtoul(e,0,0):0x00020040); }   /* silu LUT-stage config (shared with the int8 fused path) */
     /* 0x4064 = fp16 index-scale param. REGCMD's default gives a small gate-dependent spread; 0xffff7dc8
      * (standalone silu) COLLAPSES it. Keep REGCMD's default unless env-overridden (calibration RE). */
-    { const char*e=getenv("ORK_F16_C4064"); if(e) setrn(rc,REGCMD_N,RK_DPU_BN_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
+    { const char*e=getenv("ORK_F16_C4064"); if(e) orki_setrn(rc,REGCMD_N,RK_DPU_BN_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
     /* 0x4044 = BS_ALU_OPERAND (za), a PRE-LUT bias on the accumulator. The fp16 index only spreads for
      * NEGATIVE acc; setting za shifts the gate negative so positive gates fall into the spreading region
      * (negatives then clamp ~0, ~= silu(neg)). Env-overridable for the calibration crack. */
-    { const char*e=getenv("ORK_F16_ZA"); if(e) setrn(rc,REGCMD_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
-    setrn(rc,REGCMD_N,RK_DPU_BN_MUL_CFG,cfg4068);
-    { const char*e=getenv("ORK_F16_C4070"); setrn(rc,REGCMD_N,RK_DPU_EW_CFG,e?(uint32_t)strtoul(e,0,0):0x00000302); }
-    setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
-    { const char*e=getenv("ORK_F16_C4108"); setrn(rc,REGCMD_N,RK_DPU_R4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
-    { const char*e=getenv("ORK_F16_C410C"); setrn(rc,REGCMD_N,RK_DPU_R410C,e?(uint32_t)strtoul(e,0,0):0x00050500); }
-    setrn(rc,REGCMD_N,RK_DPU_R4110,idx_off);
-    { const char*e=getenv("ORK_F16_C411C"); setrn(rc,REGCMD_N,RK_DPU_R411C,e?(uint32_t)strtoul(e,0,0):0x00004000); }
-    { const char*e=getenv("ORK_F16_C4128"); setrn(rc,REGCMD_N,RK_DPU_R4128,e?(uint32_t)strtoul(e,0,0):0x40320000); }
-    { const char*e=getenv("ORK_F16_C412C"); setrn(rc,REGCMD_N,RK_DPU_R412C,e?(uint32_t)strtoul(e,0,0):0x000001a0); }
+    { const char*e=getenv("ORK_F16_ZA"); if(e) orki_setrn(rc,REGCMD_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(e,0,0)); }
+    orki_setrn(rc,REGCMD_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    { const char*e=getenv("ORK_F16_C4070"); orki_setrn(rc,REGCMD_N,RK_DPU_EW_CFG,e?(uint32_t)strtoul(e,0,0):0x00000302); }
+    orki_setrn(rc,REGCMD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    { const char*e=getenv("ORK_F16_C4108"); orki_setrn(rc,REGCMD_N,RK_DPU_R4108,e?(uint32_t)strtoul(e,0,0):0x00000068); }
+    { const char*e=getenv("ORK_F16_C410C"); orki_setrn(rc,REGCMD_N,RK_DPU_R410C,e?(uint32_t)strtoul(e,0,0):0x00050500); }
+    orki_setrn(rc,REGCMD_N,RK_DPU_R4110,idx_off);
+    { const char*e=getenv("ORK_F16_C411C"); orki_setrn(rc,REGCMD_N,RK_DPU_R411C,e?(uint32_t)strtoul(e,0,0):0x00004000); }
+    { const char*e=getenv("ORK_F16_C4128"); orki_setrn(rc,REGCMD_N,RK_DPU_R4128,e?(uint32_t)strtoul(e,0,0):0x40320000); }
+    { const char*e=getenv("ORK_F16_C412C"); orki_setrn(rc,REGCMD_N,RK_DPU_R412C,e?(uint32_t)strtoul(e,0,0):0x000001a0); }
     /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
 }
 
@@ -6014,7 +6014,7 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
  * "end-goal" precise on-NPU gate: recovers the full PPL gap the int8 silu output loses (ablation), at the cost
  * of the fp16 matmul (~3.3x int8, tools/f16_gate_bench) — a measured net-loss TODAY, so gated OFF, built out
  * for a future pipeline where it pays off. w = fp16 weight (ork_mm_pack), A = fp16 [M,K], C = fp32 [M,N] silu.
- * K%32, N<=nmax. fp16 M-tile = f16_mtile(K) = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was a stale
+ * K%32, N<=nmax. fp16 M-tile = orki_f16_mtile(K) = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was a stale
  * chunk=16; the real "latent bug" is only ABOVE that ceiling — bit-exact validated, see f16_mtile / silu_f16_check).
  * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): RUNS on-NPU (no wedge) AND now CALIBRATED accurate —
  * tools/silu_f16_calib cracked it to mean|err|~0.08 / max 0.75 over silu[-8,8] (~1%, on par with int8 silu).
@@ -6034,46 +6034,46 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%32 || N%16 || N>NMAX) return -2;
     if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
-    if(DT_F16!=c->last_dt){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)c->warmed=0; if(!ork_nothrash()&&!kw)c->ccsz=0; c->last_dt=DT_F16; }   /* NOTHRASH: reuse Cc, no realloc under IOVA pressure (see run()) */
-    int chunk=f16_mtile(K,M);   /* fp16 M-tile = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was hardcoded 16, ~4-20x too small); ORK_F16_MTILE overrides */
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
+    if(DT_F16!=c->last_dt){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)c->warmed=0; if(!ork_nothrash()&&!kw)c->ccsz=0; c->last_dt=DT_F16; }   /* NOTHRASH: reuse Cc, no realloc under IOVA pressure (see orki_run()) */
+    int chunk=orki_f16_mtile(K,M);   /* fp16 M-tile = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was hardcoded 16, ~4-20x too small); ORK_F16_MTILE overrides */
     size_t maxaf=(size_t)chunk*K*2, maxout=(size_t)chunk*NMAX*4;   /* A fp16 (2B), C fp32 (4B) */
-    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
-    struct buf Lsc=bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){bdestroy(fd,&Lrc);return -2;}
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active); if(!Lrc.cpu)return -2;
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,c->dom_active); if(!Lsc.cpu){orki_bdestroy(fd,&Lrc);return -2;}
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     int rc_ret=0;
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       /* ping-pong OFF (0x1 = RKNPU_JOB_PC, NOT 0x5) for the LUT-load submit: ping-pong (1<<2) signals the
        * task "config done" the instant its register config completes, racing the LUT's SRAM-commit side
        * effect — the following matmul submit then reads a half-committed LUT -> wrong silu -> garbage output
        * (non-deterministic, worsens with scale: bit-exact-looking per-op but PPL blows up over many tokens).
        * See AGENTS.md / NPU-Quirks "Ping-pong races a chained task's side effect". */
       struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x1;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
+      if(orki_rknpu_submit_ioctl(fd,&ls,c->dom_active)) rc_ret=-1; }
     /* fp16 single-N-tile (N<=NMAX); K single-slice (caller keeps K within the fp16 envelope). */
     for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
         ork_f16*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-        bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
         uint32_t rc[REGCMD_N];
-        synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
+        orki_synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
         set_f16_silu(rc,out_bias,idx_off,cfg4068);
-        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
           t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_N; t->regcmd_addr=c->regcmd.dma;
-          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-        if(submit1(c)){ rc_ret=-1; break; }
+          orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(orki_submit1(c)){ rc_ret=-1; break; }
         float*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<N;n++) C[(size_t)(m0+r)*N+n]=cc[(size_t)r*N+n];
     }
-    bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     return rc_ret;
 }
 
@@ -6180,7 +6180,7 @@ int ork_mm_run_f16_fused_act(ork_npu *c, ork_w *w, int M, const ork_f16 *A, floa
 int ork_mm_run_f16_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
                        double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
     if(!A||!C||M<1) return -2;
-    ork_w *w=ork_mm_pack_f16_fused_act(c,K,N,B,fn,fnctx,in_lo,in_hi);   /* calibrate + pack (one-shot) */
+    ork_w *w=ork_mm_pack_f16_fused_act(c,K,N,B,fn,fnctx,in_lo,in_hi);   /* calibrate + orki_pack (one-shot) */
     if(!w) return -2;
     int rc=ork_mm_run_f16_fused_act(c,w,M,A,C);
     ork_mm_free(c,w);
@@ -6220,37 +6220,37 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
     int chunk=64; if(chunk>M)chunk=M;
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
-    if(c->Af.size<maxaf){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    if(c->Af.size<maxaf){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     /* 2nd-input (G) buffer, over-allocated >=64KiB so the captured 0x5020/0x5038 partner offsets land in-bounds */
     size_t gsz=(size_t)chunk*NMAX; if(gsz<0x10000)gsz=0x10000;
-    struct buf Gb=bcreate(fd,gsz,0x403,c->dom_active); if(!Gb.cpu)return -2;
+    struct buf Gb=orki_bcreate(fd,gsz,0x403,c->dom_active); if(!Gb.cpu)return -2;
     int rc_ret=0;
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
         uint64_t wbase=w->Bf[ns].dma;
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             int8_t*gd=Gb.cpu; memset(gd,0,gsz); for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) gd[(size_t)r*Nc+n]=G[(size_t)(m0+r)*N+(n0+n)];
-            bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
-            act(fd,RKNPU_ACT_RESET,0);
+            orki_bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_act(fd,RKNPU_ACT_RESET,0);
             uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
-            synth_i8(base,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_synth_i8(base,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
             splice_ew_lane(rc,base);
-            set_i8_ewmul(rc,mc,Nc,0,mult,shift,(uint32_t)Gb.dma);
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_set_i8_ewmul(rc,mc,Nc,0,mult,shift,(uint32_t)Gb.dma);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_I8_EW_N/2; t->regcmd_addr=c->regcmd.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-            if(submit1(c)){ rc_ret=-1; break; }   /* submit1: warmed c->Cc + correct domain (a hand-rolled submit gives bias-only) */
+              orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(orki_submit1(c)){ rc_ret=-1; break; }   /* submit1: warmed c->Cc + correct domain (a hand-rolled submit gives bias-only) */
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
     }
-    bdestroy(fd,&Gb);
+    orki_bdestroy(fd,&Gb);
     return rc_ret;
 }
 
@@ -6262,27 +6262,27 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64) */
+    int chunk=orki_fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
     /* realloc on size OR domain change (see ork_mm_run_i8_silu: cross-domain reuse faults the NPU) */
-    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     int rc_ret=0;
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-        uint64_t wbase=w->Bf[ns].dma; bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        uint64_t wbase=w->Bf[ns].dma; orki_bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            set_i8_out8(rc,Nc,0,mult,shift);
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_set_i8_out8(rc,Nc,0,mult,shift);
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-            if(submit1(c)){ rc_ret=-1; break; }
+              orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(orki_submit1(c)){ rc_ret=-1; break; }
             int8_t*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];
         }
     }
@@ -6299,26 +6299,26 @@ int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int m
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%512 || K>4096 || N%32) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
-    int chunk=fused_mtile(K,M);
+    int chunk=orki_fused_mtile(K,M);
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX*2;                 /* int16 output = 2 bytes/elem */
-    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ bdestroy(fd,&c->Af); c->Af=bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
-    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ bdestroy(fd,&c->Cc); c->Cc=bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
+    if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
+    if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     int rc_ret=0;
     for(int ns=0;ns<w->Sn && rc_ret==0;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
-        uint64_t wbase=w->Bf[ns].dma; bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+        uint64_t wbase=w->Bf[ns].dma; orki_bsync(fd,&w->Bf[ns],RKNPU_MEM_SYNC_TO_DEVICE);
         for(int m0=0;m0<M && rc_ret==0;m0+=chunk){ int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
-            bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            set_i16_out(rc,Nc,0,mult,shift);                                  /* int32 acc -> int16 LINEAR out */
-            memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_set_i16_out(rc,Nc,0,mult,shift);                                  /* int32 acc -> int16 LINEAR out */
+            memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-              bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-            if(submit1(c)){ rc_ret=-1; break; }
+              orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+            if(orki_submit1(c)){ rc_ret=-1; break; }
             short*cc=c->Cc.cpu; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) C[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n];   /* int16 LINEAR readback */
         }
     }
@@ -6340,62 +6340,62 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
                            const int8_t *A,const int8_t *B,int32_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     if(mode==1){   /* override with the rkllm-captured M-tile program */
-        setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);
-        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K/64)*M);
-        setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,4*M);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K/64)*M);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,4*M);
         int mg=(M+7)/8; int v=0xb1-0x0f*(mg-1); if(v<0x1b)v=0x1b;
-        setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
-        setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,(M<<16)|1);
-        setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,(M<<16)|1);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,v);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0,(M<<16)|1);
+        orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE0_MIR,(M<<16)|1);
     }
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_mtile_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_mtile_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*4); if(us)*us=t1; }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
 int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
+    orki_synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();   /* rep0 warmup (cold buffer stale), rep1 real */
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6409,28 +6409,28 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
                           int mult,int shift,int8_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int8 output: M*N bytes */
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* int8 output: M*N bytes */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    set_i8_out8(rc,N,0,mult,shift);           /* rewrite output stage: int32 -> int8 requantize */
+    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_set_i8_out8(rc,N,0,mult,shift);           /* rewrite output stage: int32 -> int8 requantize */
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_i8_out8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_i8_out8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();   /* rep0/1 warmup, rep2 timed */
         double t0=ork_now_us();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6444,43 +6444,43 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
                           int mult,int shift,int16_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
     size_t obytes=getenv("ORK_I16_OBYTES")?strtoul(getenv("ORK_I16_OBYTES"),0,0):(size_t)M*N*2;  /* enlarge to capture a strided layout */
     if(obytes<(size_t)M*N*2) obytes=(size_t)M*N*2;
-    struct buf O=bcreate(fd,obytes,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 output */
-    memset(O.cpu,0,obytes); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    struct buf O=orki_bcreate(fd,obytes,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* int16 output */
+    memset(O.cpu,0,obytes); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    if(getenv("ORK_MM_F16OUT")) set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
+    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    if(getenv("ORK_MM_F16OUT")) orki_set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
     else if(getenv("ORK_MM_I32OUT")) { /* CONTROL: skip set_i16_out -> synth_i8's default int32 output (works standalone) */ }
-    else                        set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
+    else                        orki_set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
     /* TOGGLE SWEEP: restore individual output-stage regs to their int32 (completing) values to isolate the
      * WDMA terminal-count stall. Each ORK_MM_R<reg>=<hex> overrides one reg AFTER set_i16_out. */
     { const char*e;
-      if((e=getenv("ORK_MM_R4010"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4038"))) setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4050"))) setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4084"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4088"))) setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R40c0"))) setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,(uint32_t)strtoul(e,0,0)); }
+      if((e=getenv("ORK_MM_R4010"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4038"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4050"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4084"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R4088"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_MM_R40c0"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,(uint32_t)strtoul(e,0,0)); }
     if(getenv("ORK_MM_DUMPRC")){ const char*tag=getenv("ORK_MM_I32OUT")?"I32":"I16"; /* dump the assembled 0x40xx output stage for diffing */
         for(int k=0;k+1<REGCMD_I8_N;k+=2){ uint32_t r=rc[k]&0xffff, v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
             if(r>=0x4000 && r<0x4100) fprintf(stderr,"[%s] 0x%04x = 0x%08x\n",tag,r,v); } }
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_i16_out", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_i16_out", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms();
         double t0=ork_now_us();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1;
         if(getenv("ORK_MM_DUMPOUT")){ /* LAYOUT MAP: caller made values distinct; print int16-slot -> value for every nonzero slot in the (enlarged) O */
             const int16_t*oc=O.cpu; long ns=(long)(obytes/2); int shown=0; long firstrow_end=-1, secondrow_start=-1; int prev=-1;
@@ -6489,12 +6489,12 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
                 if(prev>=0 && v<prev && secondrow_start<0){ firstrow_end=i-1; secondrow_start=i; } prev=v; shown++; if(shown%8==0&&shown<=64)fprintf(stderr,"\n"); } }
             fprintf(stderr,"\n[i16map] total nonzero=%d  (row-wrap at slot ~%ld => row byte-stride ~%ld)\n",shown,secondrow_start,secondrow_start*2); } }
     else if(getenv("ORK_MM_DUMPOUT")){ /* partial-write signature: how far did the WDMA get before the stall? */
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); int16_t*oc=O.cpu; long last=-1; int tot=0,rows=0;
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); int16_t*oc=O.cpu; long last=-1; int tot=0,rows=0;
         for(long i=0;i<(long)M*N;i++) if(oc[i]){ tot++; if(i>last)last=i; }
         for(int m=0;m<M;m++){ int rnz=0; for(int n=0;n<N;n++) if(oc[(size_t)m*N+n])rnz++; if(rnz)rows++; }
         fprintf(stderr,"[dumpout] M=%d N=%d: nonzero=%d/%d  rows-with-data=%d/%d  last-nz-elem=%ld (row %ld/%d)\n",
                 M,N,tot,M*N,rows,M,last,last<0?-1:last/N,M); }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6506,27 +6506,27 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
 int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *raw){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 weight tile [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)2*M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* 2x, int32 */
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)2*M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* 2x, int32 */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
     int i8sched=1; { const char*e=getenv("ORK_I8_PROBE_SCHED"); if(e) i8sched=atoi(e); }  /* 0 = no 0x1040 streaming schedule (batch test) */
-    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,i8sched,CBUF,0);   /* ork_i8_fuzz overrides apply inside */
+    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,i8sched,CBUF,0);   /* ork_i8_fuzz overrides apply inside */
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_i8_mm", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_i8_mm", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*4);
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6538,16 +6538,16 @@ int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
 int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_us,double *nb_us,int *ok_block,int *ok_nb){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     memset(W.cpu,1,(size_t)K*N);                                  /* int8 weight all-1 (layout-agnostic) */
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}   /* int32 out */
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);  /* act all-1 -> out=K */
-    act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}   /* int32 out */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);  /* act all-1 -> out=K */
+    orki_act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.task_number=1; sub.task_obj_addr=c->task.obj;
     sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=4000; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     volatile int32_t *dbell=(volatile int32_t*)((char*)O.cpu + (size_t)(M*N-1)*4);  /* last output int32 = doorbell */
@@ -6555,9 +6555,9 @@ int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_u
     volatile int32_t *o0=(volatile int32_t*)O.cpu, *ol=(volatile int32_t*)dbell;  /* check endpoints */
     /* ---- BLOCKING: flags=0x5 via the proper submit path (domain/bookkeeping) ---- */
     *o0=SENT; *ol=SENT; __asm__ volatile("dc cvac,%0"::"r"(o0):"memory"); __asm__ volatile("dc cvac,%0"::"r"(ol):"memory"); __asm__ volatile("dsb ish":::"memory"); /* seed endpoints (like the doorbell) so CIVAC can read fresh */
-    sub.flags=0x5; rknpu_submit_ioctl(fd,&sub,-1); rknpu_submit_ioctl(fd,&sub,-1);  /* warm (mode + first-cold) */
+    sub.flags=0x5; orki_rknpu_submit_ioctl(fd,&sub,-1); orki_rknpu_submit_ioctl(fd,&sub,-1);  /* warm (mode + first-cold) */
     double t0=ork_now_us();
-    for(int i=0;i<iters;i++){ sub.flags=0x5; if(rknpu_submit_ioctl(fd,&sub,-1)){*ok_block=0;} }
+    for(int i=0;i<iters;i++){ sub.flags=0x5; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){*ok_block=0;} }
     if(block_us)*block_us=(ork_now_us()-t0)/iters;
     { for(long s=0;s<2000000L && (*o0==SENT||*ol==SENT);s++){ __asm__ volatile("dc civac,%0"::"r"(o0):"memory"); __asm__ volatile("dc civac,%0"::"r"(ol):"memory"); __asm__ volatile("dsb ish":::"memory"); }
       *ok_block=(*o0==K && *ol==K);
@@ -6567,16 +6567,16 @@ int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_u
     for(int i=0;i<iters;i++){
         *dbell=SENT; __asm__ volatile("dc cvac, %0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); /* seed sentinel in DRAM */
         sub.flags=0x7;                                             /* PC|PINGPONG|NONBLOCK */
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ polled_ok=0; break; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ polled_ok=0; break; }
         long s=0; for(;s<20000000L;s++){ __asm__ volatile("dc civac, %0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
             if(*dbell!=SENT) break; }                              /* busy-poll: NPU overwrote the doorbell = done */
         if(s>=20000000L){ polled_ok=0; break; }                   /* poll timed out */
     }
     if(nb_us)*nb_us=(ork_now_us()-t0)/iters;
-    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     { int32_t*o=O.cpu; *ok_nb=(polled_ok && o[0]==K && o[M*N-1]==K);
       if(getenv("ORK_DBELL_DBG"))fprintf(stderr,"[dbg-nb] o[0]=%d o[last]=%d K=%d polled_ok=%d\n",o[0],o[M*N-1],K,polled_ok); }
-    bdestroy(fd,&W); bdestroy(fd,&O);
+    orki_bdestroy(fd,&W); orki_bdestroy(fd,&O);
     return 0;
 }
 
@@ -6589,30 +6589,30 @@ int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
                          double *npu_solo,double *cpu_solo,double *overlap_wall,int *ok){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
-    memset(W.cpu,1,(size_t)K*N); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    memset(W.cpu,1,(size_t)K*N); orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.task_number=1; sub.task_obj_addr=c->task.obj;
     sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=4000; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     volatile int32_t *dbell=(volatile int32_t*)((char*)O.cpu + (size_t)(M*N-1)*4);
     const int32_t SENT=0x7ffffff;
     const int RN=512; float*Wc=malloc((size_t)RN*RN*4),*xc=malloc(RN*4),*yc=malloc(RN*4);  /* CPU "router" state */
-    if(!Wc||!xc||!yc){free(Wc);free(xc);free(yc);bdestroy(fd,&W);bdestroy(fd,&O);return -2;}
+    if(!Wc||!xc||!yc){free(Wc);free(xc);free(yc);orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -2;}
     for(int i=0;i<RN*RN;i++)Wc[i]=(float)(((unsigned)i*2654435761u)>>28)*0.01f; for(int i=0;i<RN;i++)xc[i]=1.0f;
 #define CPU_ROUTER() do{ for(int r=0;r<cpu_reps;r++){ for(int a=0;a<RN;a++){ float acc=0; const float*wr=Wc+(size_t)a*RN; \
         for(int b=0;b<RN;b++)acc+=wr[b]*xc[b]; yc[a]=acc; } xc[0]=yc[RN-1]*1e-9f; } }while(0)  /* cross-rep dep -> no DCE */
-    sub.flags=0x5; rknpu_submit_ioctl(fd,&sub,-1); rknpu_submit_ioctl(fd,&sub,-1);  /* warm */
+    sub.flags=0x5; orki_rknpu_submit_ioctl(fd,&sub,-1); orki_rknpu_submit_ioctl(fd,&sub,-1);  /* warm */
     int okk=1;
     /* (1) NPU solo: nonblock submit + doorbell poll, NO cpu work */
     double t0=ork_now_us();
     for(int i=0;i<iters;i++){ *dbell=SENT; __asm__ volatile("dc cvac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
-        sub.flags=0x7; if(rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
+        sub.flags=0x7; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
         long s=0; for(;s<20000000L && *dbell==SENT;s++){ __asm__ volatile("dc civac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); }
         if(s>=20000000L){okk=0;break;} }
     if(npu_solo)*npu_solo=(ork_now_us()-t0)/iters;
@@ -6622,43 +6622,43 @@ int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
     /* (3) OVERLAP: nonblock submit, run the router in the shadow, THEN poll for NPU completion */
     t0=ork_now_us();
     for(int i=0;i<iters;i++){ *dbell=SENT; __asm__ volatile("dc cvac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory");
-        sub.flags=0x7; if(rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
+        sub.flags=0x7; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){okk=0;break;}
         CPU_ROUTER();                                              /* CPU works while the NPU crunches */
         long s=0; for(;s<20000000L && *dbell==SENT;s++){ __asm__ volatile("dc civac,%0"::"r"(dbell):"memory"); __asm__ volatile("dsb ish":::"memory"); }
         if(s>=20000000L){okk=0;break;} }
     if(overlap_wall)*overlap_wall=(ork_now_us()-t0)/iters;
     *ok=okk;
-    free(Wc);free(xc);free(yc); bdestroy(fd,&W);bdestroy(fd,&O);
+    free(Wc);free(xc);free(yc); orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
 #undef CPU_ROUTER
     return 0;
 }
 
-/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via synth(). Weight tile [NT][KT][16][32]
+/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via orki_synth(). Weight tile [NT][KT][16][32]
  * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
- * bit patterns (uint16). ork_f16_fuzz overrides apply inside synth(). 0/ok -1 wedged -2 dims. */
+ * bit patterns (uint16). ork_f16_fuzz overrides apply inside orki_synth(). 0/ok -1 wedged -2 dims. */
 int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,float *raw){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%16||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;   /* fp16 weight: 2 B/elem */
+    struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;   /* fp16 weight: 2 B/elem */
     int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;      /* fp16 weight tile [Ntile=16][Ktile=32][16][32] */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)2*M*N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}   /* fp32 out, 2x */
-    uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)2*M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}   /* fp32 out, 2x */
+    uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_N];
-    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);   /* ork_f16_fuzz overrides apply inside */
+    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);   /* ork_f16_fuzz overrides apply inside */
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_f16_mm", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_f16_mm", c, rc, REGCMD_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*4);
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6669,12 +6669,12 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
     int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
     size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
-    struct buf O=bcreate(fd,osz,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
+    struct buf O=orki_bcreate(fd,osz,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
     /* ORK_F16_ROWPITCH=S: DISCOVERY probe — store the activation rows at pitch S>K (padding between rows) and
      * read them via CNA LINE_STRIDE=S/8. Validates the CNA reads STRIDED/non-contiguous activations directly
      * (the densify lever). Default: contiguous (pitch=K). */
@@ -6682,21 +6682,21 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     uint16_t*ad=c->Af.cpu;
     if(rowpitch!=K){ for(int j=0;j<M*rowpitch;j++)ad[j]=0xdead; for(int m=0;m<M;m++)for(int k=0;k<K;k++)ad[(size_t)m*rowpitch+k]=A[(size_t)m*K+k]; }
     else for(int j=0;j<M*K;j++)ad[j]=A[j];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset; keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
-    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
-    if(rowpitch!=K) setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
+    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    if(rowpitch!=K) orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
     if(!getenv("ORK_F16_FP32OUT")) set_f16_out_fp16in(rc,M,N);        /* vendor fp16-out stage (atom-8); skip => synth's native fp32-out (compute sanity) */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     sub.timeout=to_ms;
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }  /* fp16 cold 2-pass re-warm */
+    for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }  /* fp16 cold 2-pass re-warm */
     if(ok==0){
         int ewc=getenv("ORK_F16_ATOM8")?1:0;                          /* readback matches the output layout: default CONTIGUOUS; ORK_F16_ATOM8 => atom-8 */
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+(ewc?EWCUBEH(m,n):((size_t)(m*N+n)*2)));
@@ -6706,7 +6706,7 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
             for(int i=0;i<nf;i++) fprintf(stderr," %d=%.3g",first[i],(double)*(ork_f16*)&o[first[i]]);
             fprintf(stderr,"\n"); }
         ok=0; }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     #undef EWCUBEH
     return ok;
 }
@@ -6723,25 +6723,25 @@ int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
     if(w->dtype!=DT_F16||w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks, N<=nmax) */
     int K=w->K, N=w->N, fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
-    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) dom_activate(c,w->domain);   /* activate the weight's IOMMU domain */
+    if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);   /* activate the weight's IOMMU domain */
     size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
-    struct buf O=bcreate(fd,osz,0x403,w->domain); if(!O.cpu) return -1; memset(O.cpu,0,osz);
+    struct buf O=orki_bcreate(fd,osz,0x403,w->domain); if(!O.cpu) return -1; memset(O.cpu,0,osz);
     uint16_t *ad=c->Af.cpu; const uint16_t *as=(const uint16_t*)A; for(int j=0;j<M*K;j++) ad[j]=as[j];   /* stage A (contiguous fp16) */
-    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                          /* prime fp16 pipeline (keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);                            /* run_stream_f16 rule; small K => 0 */
-    synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
+    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
     set_f16_out_fp16in(rc,M,N);                                              /* PROVEN vendor fp16-out stage (default CONTIGUOUS) */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj;
     sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=mm_timeout_ms();
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }   /* fp16 cold 2-pass re-warm */
+    for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ ok=-1; continue; } orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }   /* fp16 cold 2-pass re-warm */
     if(ok==0){ uint16_t *od=(uint16_t*)out, *os=(uint16_t*)O.cpu; for(size_t i=0;i<(size_t)M*N;i++) od[i]=os[i]; }   /* CONTIGUOUS fp16 readback */
-    bdestroy(fd,&O);
+    orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6754,32 +6754,32 @@ int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
 int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,int apitch,const uint16_t *B,uint16_t *out){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)||apitch<K||(apitch&7)) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
     { int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;
       for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)]; }
     size_t asz=(size_t)M*apitch*2; if(asz<4096)asz=4096; size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
-    struct buf Adev=bcreate(fd,asz,0x403,-1), O=bcreate(fd,osz,0x403,-1);
-    if(!Adev.cpu||!O.cpu){ bdestroy(fd,&W);bdestroy(fd,&Adev);bdestroy(fd,&O); return -2; }
+    struct buf Adev=orki_bcreate(fd,asz,0x403,-1), O=orki_bcreate(fd,osz,0x403,-1);
+    if(!Adev.cpu||!O.cpu){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&Adev);orki_bdestroy(fd,&O); return -2; }
     { uint16_t*ad=Adev.cpu; for(size_t i=0;i<asz/2;i++)ad[i]=0xdead;                 /* junk padding between rows */
       for(int m=0;m<M;m++)for(int k=0;k<K;k++) ad[(size_t)m*apitch+k]=A[(size_t)m*K+k]; }  /* A row @ pitch (as the KV-view sits in the DMA buffer) */
     memset(O.cpu,0,osz);
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Adev,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Adev,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
-    setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
+    orki_synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
+    orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
     set_f16_out_fp16in(rc,M,N);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n];  /* contiguous fp16 out */
-    bdestroy(fd,&W);bdestroy(fd,&Adev);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&Adev);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6794,51 +6794,51 @@ int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
     int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
     size_t osz=(size_t)M*N*2; if(osz<4096)osz=4096;
-    struct buf O=bcreate(fd,osz,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
-    struct buf SB=bcreate(fd,4096,0x403,-1); if(!SB.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} memset(SB.cpu,0,4096);
+    struct buf O=orki_bcreate(fd,osz,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;} memset(O.cpu,0,osz);
+    struct buf SB=orki_bcreate(fd,4096,0x403,-1); if(!SB.cpu){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -2;} memset(SB.cpu,0,4096);
     { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=*(const ork_f16*)&scale[n]; }   /* per-channel scale, CONTIGUOUS [N] fp16 */
     uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset) */
     uint32_t base[REGCMD_N], rc[REGCMD_I8_EW_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    orki_synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
     set_f16_out_fp16in(base,M,N);                                   /* main lane: fp16 CONTIGUOUS out */
     splice_ew_lane(rc,base);                                        /* add the 0x50xx EW-operand lane */
     /* EW-mul: multiply the on-chip fp16 accumulator by the per-channel operand. fp16 EW config + per-channel ERDMA. */
     uint32_t ewcfg=getenv("ORK_F16EW_CFG")?strtoul(getenv("ORK_F16EW_CFG"),0,0):0x108003c4;   /* vendor fp16 EW mul */
     uint32_t erdma=getenv("ORK_F16EW_ERDMA")?strtoul(getenv("ORK_F16EW_ERDMA"),0,0):0x00000008;/* per-channel + 2-byte */
     uint32_t r4050=getenv("ORK_F16EW_4050")?strtoul(getenv("ORK_F16EW_4050"),0,0):0x00000127; /* out row cfg + EW-enable bit0 */
-    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CFG,ewcfg);
-    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_OFFSET,0x00000000);
-    setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_SCALE,0x00000001);
-    setrn(rc,REGCMD_I8_EW_N,RK_DPU_BS_OW_CFG,r4050);
-    { const char*e=getenv("ORK_F16EW_4010"); if(e) setrn(rc,REGCMD_I8_EW_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* fp16 DATA_FORMAT + EW-enable bits sweep */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,0x0000000e);
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);               /* RDMA_OPERATION_ENABLE */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,(uint32_t)(M-1));          /* WIDTH=M-1 */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);              /* HEIGHT=1 */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,(uint32_t)(N-1));          /* CHANNEL=N-1 */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,(uint32_t)SB.dma);         /* EW operand = scale[N] */
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,(uint32_t)SB.dma);
-    setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);              /* BRDMA_DATA_USE=1 */
-    memcpy(c->regcmd.cpu,rc,REGCMD_I8_EW_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CFG,ewcfg);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_OFFSET,0x00000000);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_DPU_EW_CVT_SCALE,0x00000001);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_DPU_BS_OW_CFG,r4050);
+    { const char*e=getenv("ORK_F16EW_4010"); if(e) orki_setrn(rc,REGCMD_I8_EW_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* fp16 DATA_FORMAT + EW-enable bits sweep */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5004,0x0000000e);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5008,0x00000001);               /* RDMA_OPERATION_ENABLE */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_500C,(uint32_t)(M-1));          /* WIDTH=M-1 */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5010,0x00000000);              /* HEIGHT=1 */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5014,(uint32_t)(N-1));          /* CHANNEL=N-1 */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5034,erdma);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5038,(uint32_t)SB.dma);         /* EW operand = scale[N] */
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_5018,(uint32_t)SB.dma);
+    orki_setrn(rc,REGCMD_I8_EW_N,RK_SDP_501C,0x00000002);              /* BRDMA_DATA_USE=1 */
+    memcpy(c->regcmd.cpu,rc,REGCMD_I8_EW_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x1d; tk->int_mask=0x300; tk->int_clear=0x1ffff;               /* 0x1d: enable EW/second lane */
     tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->regcmd_addr=(uint32_t)c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=to_ms;
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; } orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n];  /* CONTIGUOUS */
-    bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&SB);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB);
     return ok;
 }
 
@@ -6854,47 +6854,47 @@ int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const in
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* PPU EW-mul RE'd against the rk3588 PPU layout only */
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}         /* int8 output */
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}         /* int8 output */
     /* over-allocate the 2nd-input buffer: the captured 0x5020/0x5038 partner offsets (+0x4080/+0x400 from
      * base) must land IN-BOUNDS or the IOMMU faults (submit timeout). 64 KiB covers them for these shapes. */
     size_t gsz=(size_t)M*N; if(gsz<0x10000)gsz=0x10000;
-    struct buf Gb=bcreate(fd,gsz,0x403,-1); if(!Gb.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* 2nd input */
-    memset(Gb.cpu,0,gsz); memcpy(Gb.cpu,G,(size_t)M*N); bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    struct buf Gb=orki_bcreate(fd,gsz,0x403,-1); if(!Gb.cpu){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -2;} /* 2nd input */
+    memset(Gb.cpu,0,gsz); memcpy(Gb.cpu,G,(size_t)M*N); orki_bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
-    synth_i8(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_synth_i8(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     splice_ew_lane(rc,base);                                    /* insert the 0x50xx second-input lane */
-    set_i8_ewmul(rc,M,N,0,mult,shift,(uint32_t)Gb.dma);           /* int8 requant + EW-mul + 2nd-input addr */
+    orki_set_i8_ewmul(rc,M,N,0,mult,shift,(uint32_t)Gb.dma);           /* int8 requant + EW-mul + 2nd-input addr */
     if(getenv("ORK_EW_DUMP")){                                  /* inspect the assembled regcmd, no submit */
         printf("# assembled EW-mul regcmd (%d entries) aG=0x%x aC=0x%x\n",REGCMD_I8_EW_N/2,(uint32_t)Gb.dma,(uint32_t)O.dma);
         for(int k=0;k+1<REGCMD_I8_EW_N;k+=2){uint32_t w0=rc[k],w1=rc[k+1];
             printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,w0&0xffff,w1>>16,((w0>>16)&0xffff)|((w1&0xffff)<<16));}
-        bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb); return 0;
+        orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Gb); return 0;
     }
     struct buf extra[3] = {W, O, Gb};
-    if (validate_regcmd("probe_i8_ewmul", c, rc, REGCMD_I8_EW_N, NULL, extra, 3)) { bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_i8_ewmul", c, rc, REGCMD_I8_EW_N, NULL, extra, 3)) { orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Gb); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     /* bump the task's register-config count 108 -> 126 AND enable_mask 0xd -> 0x1d (the 0x10 bit enables the
      * PPU / second DPU lane; the captured EW-mul op runs at enable=0x1d, same as the SiLU compute op) for
      * this submit, then restore (c->task is shared). */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;
     uint32_t saved=tk->regcfg_amount, saved_en=tk->enable_mask;
-    tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=REGCMD_I8_EW_N/2; tk->enable_mask=0x1d; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0;
     for(int rep=0;rep<3;rep++){ sub.timeout=ew_timeout_ms();
         double t0=ork_now_us();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saved; tk->enable_mask=saved_en; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);  /* restore shared task */
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saved; tk->enable_mask=saved_en; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);  /* restore shared task */
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
-    bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Gb);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Gb);
     return ok;
 }
 
@@ -6908,42 +6908,42 @@ int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,i
                                 const void*gl,int Gsz,void*out,int Osz,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
-    struct buf I=bcreate(fd,4096,0x403,-1); if(!I.cpu) return -2;
-    struct buf Wt=bcreate(fd,32768,0x403,-1); if(!Wt.cpu){bdestroy(fd,&I);return -2;}
-    struct buf Gl=bcreate(fd,8192,0x403,-1); if(!Gl.cpu){bdestroy(fd,&I);bdestroy(fd,&Wt);return -2;}
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);return -2;}
+    struct buf I=orki_bcreate(fd,4096,0x403,-1); if(!I.cpu) return -2;
+    struct buf Wt=orki_bcreate(fd,32768,0x403,-1); if(!Wt.cpu){orki_bdestroy(fd,&I);return -2;}
+    struct buf Gl=orki_bcreate(fd,8192,0x403,-1); if(!Gl.cpu){orki_bdestroy(fd,&I);orki_bdestroy(fd,&Wt);return -2;}
+    struct buf O=orki_bcreate(fd,4096,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&I);orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&Gl);return -2;}
     memset(I.cpu,0,4096); memset(Wt.cpu,0,32768); memset(Gl.cpu,0,8192); memset(O.cpu,0,4096);
     if(in) memcpy(I.cpu, in, Isz<4096?Isz:4096);
     if(wt) memcpy((char*)Wt.cpu+0x2300, wt, Wsz<(32768-0x2300)?Wsz:(32768-0x2300)); /* weights at captured +0x2300 */
     if(gl) memcpy((char*)Gl.cpu+0x400, gl, Gsz<(8192-0x400)?Gsz:(8192-0x400));      /* silu(gate) at captured +0x400 */
-    bsync(fd,&I,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Gl,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&I,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Gl,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_EWMUL_N]; memcpy(rc,REGCMD_EWMUL,sizeof rc);
     /* ORK_EW_MULT/ORK_EW_SHIFT: override the captured requant (0x4084/0x4088, captured >>29 kills small acc)
      * so the output is interpretable when driving the verbatim op with our own uniform data. */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
-      if(em) setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
-      if(es) setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
-    setrn(rc,REGCMD_EWMUL_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)I.dma);          /* input x */
-    setrn(rc,REGCMD_EWMUL_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma+0x2300);  /* weights */
-    setrn(rc,REGCMD_EWMUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);          /* output */
-    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5018,(uint32_t)Gl.dma+0x400);   /* 2nd-input silu(gate) */
-    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5038,(uint32_t)Gl.dma+0x800);   /* 2nd-input partner */
-    setrn(rc,REGCMD_EWMUL_N,RK_SDP_5020,(uint32_t)Wt.dma+0x2480);  /* 2nd-input param (in weight buf) */
+      if(em) orki_setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) orki_setrn(rc,REGCMD_EWMUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)I.dma);          /* input x */
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma+0x2300);  /* weights */
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);          /* output */
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_SDP_5018,(uint32_t)Gl.dma+0x400);   /* 2nd-input silu(gate) */
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_SDP_5038,(uint32_t)Gl.dma+0x800);   /* 2nd-input partner */
+    orki_setrn(rc,REGCMD_EWMUL_N,RK_SDP_5020,(uint32_t)Wt.dma+0x2480);  /* 2nd-input param (in weight buf) */
     if(getenv("ORK_EW_DUMP")){ printf("# verbatim EW-mul regcmd, in=0x%x wt=0x%x gl=0x%x out=0x%x\n",
         (uint32_t)I.dma,(uint32_t)Wt.dma,(uint32_t)Gl.dma,(uint32_t)O.dma);
         for(int k=0;k+1<REGCMD_EWMUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
-        bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);bdestroy(fd,&O); return 0; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bdestroy(fd,&I);orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&Gl);orki_bdestroy(fd,&O); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
-    tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=126; tk->enable_mask=0x1d; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms();
     double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ if(out)memcpy(out,O.cpu,Osz<4096?Osz:4096); if(us)*us=t1; }
-    bdestroy(fd,&I);bdestroy(fd,&Wt);bdestroy(fd,&Gl);bdestroy(fd,&O);
+    orki_bdestroy(fd,&I);orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&Gl);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -6955,7 +6955,7 @@ int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,i
 int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const int8_t *G,int8_t *C,double *us){
     const int M=8,K=512,N=64; int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
-    struct buf Wt=bcreate(fd,0x18000,0x403,-1); if(!Wt.cpu) return -2;   /* weights + 0x5020 param region */
+    struct buf Wt=orki_bcreate(fd,0x18000,0x403,-1); if(!Wt.cpu) return -2;   /* weights + 0x5020 param region */
     int NN=N/32,KT=K/32; int8_t*bb=Wt.cpu;
     /* LAYOUT-INVARIANT probe trick: fill the WHOLE weight buffer with B[0] so the matmul reads the same
      * value no matter how RKNN's op tiles it (acc = K*A*B[0] for every output, independent of layout).
@@ -6966,62 +6966,62 @@ int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const 
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
     { const char*e=getenv("ORK_EW_S20"); if(e){ uint32_t v=(uint32_t)strtoul(e,0,0); for(int i=0;i<N;i++)((uint32_t*)((char*)Wt.cpu+0x8080))[i]=v; } }
-    bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&Wt);return -2;}
-    struct buf Gb=bcreate(fd,4096,0x403,-1); if(!Gb.cpu){bdestroy(fd,&Wt);bdestroy(fd,&O);return -2;}
-    memset(O.cpu,0,4096); memset(Gb.cpu,0,4096); memcpy(Gb.cpu,G,(size_t)M*N); bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&Wt,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,4096,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&Wt);return -2;}
+    struct buf Gb=orki_bcreate(fd,4096,0x403,-1); if(!Gb.cpu){orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&O);return -2;}
+    memset(O.cpu,0,4096); memset(Gb.cpu,0,4096); memcpy(Gb.cpu,G,(size_t)M*N); orki_bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
     int8_t*ad=c->Af.cpu; memset(ad,(unsigned char)A[0],0x8000); for(int j=0;j<M*K;j++)ad[j]=A[j];  /* fill for layout-invariance */
-    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_EWMUL_LIN_N]; memcpy(rc,REGCMD_EWMUL_LIN,sizeof rc);
     /* EMITTER: inject ork's matmul geometry into RKNN's EW template (unless ORK_EW_VERBATIM) so the conv
      * engine reads ork's [Nt][Kt][32][32] A/B layout while keeping RKNN's register order + EW output stage. */
     if(!getenv("ORK_EW_VERBATIM")){
-        apply_ork_geom(rc,REGCMD_EWMUL_LIN_N,M,K,N,c->soc->cbuf_elems);
+        orki_apply_ork_geom(rc,REGCMD_EWMUL_LIN_N,M,K,N,c->soc->cbuf_elems);
         /* Also inject ork's DENSE int8-out output-stage byte config (set_i8_out8) so the output writes dense
          * [M][N] where ork reads it — the template's RKNN output-byte config produced bias-only garbage.
          * Keep the SDP element-wise MULTIPLY enable (0x4070=0x904002c4) + 0x4050 bit0 (2nd-input enable). */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_PRECISION,0x00000000);    /* int8-out (clear int32 bit) */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DATA_CUBE_NOTCH,(((N/16)-1)<<16)|((N/16)-1)); /* dense output group stride */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_BS_OW_CFG,0x00000125);    /* int8 row config + 2nd-input enable (bit0) */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_SURFACE_ADD,0x00000020);    /* output element size = 1 byte (dense) */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);    /* zero bias for the probe */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_500C,M-1);           /* 2nd-lane geometry -> ork's (M,N) */
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5010,M-1);
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5014,N-1);
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5040,N);
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_504C,N);
-        setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_506C,N);
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_PRECISION,0x00000000);    /* int8-out (clear int32 bit) */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DATA_CUBE_NOTCH,(((N/16)-1)<<16)|((N/16)-1)); /* dense output group stride */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_BS_OW_CFG,0x00000125);    /* int8 row config + 2nd-input enable (bit0) */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_SURFACE_ADD,0x00000020);    /* output element size = 1 byte (dense) */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_OFFSET,0x00000000);    /* zero bias for the probe */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_500C,M-1);           /* 2nd-lane geometry -> ork's (M,N) */
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5010,M-1);
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5014,N-1);
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5040,N);
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_504C,N);
+        orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_506C,N);
     }
     /* ORK_EW_MULT/SHIFT override the captured requant so small test accumulators requant to a readable value. */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT");
-      if(em) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
-      if(es) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
+      if(em) orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0)); }
     uint32_t gstride = getenv("ORK_EW_VERBATIM") ? 0x80 : (uint32_t)N;  /* 2nd-input row stride */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)c->Af.dma);        /* input A */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma);           /* up-weights */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5018,(uint32_t)Gb.dma);           /* silu(gate) 2nd input */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5038,(uint32_t)Gb.dma+gstride);   /* 2nd-input partner = base+stride */
-    setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5020,(uint32_t)Wt.dma+0x8080);    /* 2nd-input param (in weight buf) */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)c->Af.dma);        /* input A */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)Wt.dma);           /* up-weights */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5018,(uint32_t)Gb.dma);           /* silu(gate) 2nd input */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5038,(uint32_t)Gb.dma+gstride);   /* 2nd-input partner = base+stride */
+    orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_SDP_5020,(uint32_t)Wt.dma+0x8080);    /* 2nd-input param (in weight buf) */
     /* ORK_EW_NOMUL: turn OFF the EW multiply (0x4070 -> plain 0x0302) to read R=requant(acc) alone —
      * isolates "does the matmul+requant work" from "does the multiply work". */
-    if(getenv("ORK_EW_NOMUL")) setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_EW_CFG,0x00000302);
+    if(getenv("ORK_EW_NOMUL")) orki_setrn(rc,REGCMD_EWMUL_LIN_N,RK_DPU_EW_CFG,0x00000302);
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_EWMUL_LIN_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
-        bdestroy(fd,&Wt);bdestroy(fd,&O);bdestroy(fd,&Gb); return 0; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Gb); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
-    tk->regcfg_amount=126; tk->enable_mask=0x1d; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=126; tk->enable_mask=0x1d; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
     if(ok==0 && getenv("ORK_EW_SCAN")){ int nz=0,first=-1; signed char*o=O.cpu;
         for(int i=0;i<4096;i++){ if(o[i]){ nz++; if(first<0)first=i; } }
         printf("  [scan] output-buffer nonzero bytes=%d first@0x%x  bytes@first: ",nz,first);
         for(int i=(first<0?0:first);i<(first<0?16:first+16);i++)printf("%d ",o[i]); printf("\n"); }
-    bdestroy(fd,&Wt);bdestroy(fd,&O);bdestroy(fd,&Gb);
+    orki_bdestroy(fd,&Wt);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Gb);
     return ok;
 }
 
@@ -7034,51 +7034,51 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(n<1||n>4096) return -2;
-    struct buf A=bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,4096,0x403,-1); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,4096,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,4096,0x403,-1); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,4096,0x403,-1); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,4096,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,4096);memset(B.cpu,0,4096);memset(O.cpu,0,4096);
     memcpy(A.cpu,a,n);memcpy(B.cpu,b,n);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);   /* clear device-side output (op writes only part -> avoid stale) */
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);   /* clear device-side output (op writes only part -> avoid stale) */
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
-    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* operand a (SRDMA) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* operand b (ERDMA element-wise) */
     { const char*em=getenv("ORK_EW_MULT"),*es=getenv("ORK_EW_SHIFT"),*eb=getenv("ORK_EW_BIAS");
       const char*co=getenv("ORK_EW_COFF"),*cs=getenv("ORK_EW_CSCL");
-      if(em) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
-      if(es) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0));
-      if(eb) setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(eb,0,0));
-      if(co) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
-      if(cs) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
+      if(em) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(em,0,0));
+      if(es) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(es,0,0));
+      if(eb) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(eb,0,0));
+      if(co) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(co,0,0));   /* EW_CVT_OFFSET = zb (operand b zero-pt) */
+      if(cs) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_SCALE,(uint32_t)strtoul(cs,0,0));   /* EW_CVT_SCALE (operand b) */
       const char*ao=getenv("ORK_EW_AOFF");
-      if(ao) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(ao,0,0));   /* BS_ALU_OPERAND = za (operand a zero-pt) */
+      if(ao) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,(uint32_t)strtoul(ao,0,0));   /* BS_ALU_OPERAND = za (operand a zero-pt) */
       /* SDP DPU ALU-mode registers (rocket rocket_registers.h: 0x4040=BS_CFG, 0x4048=BS_MUL_CFG,
        * 0x4070=EW_CFG w/ EW_ALU_ALGO bits[19:16]: MAX=0,MIN=1,SUM=2,EQL=3). Override to retarget the
        * ALU function (e.g. ADD-routing + algo=0 => on-NPU max(a,b)). RE hooks for building max-reduce. */
       const char*r40=getenv("ORK_EW_R40"),*r48=getenv("ORK_EW_R48"),*r70=getenv("ORK_EW_R70");
-      if(r40) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_CFG,(uint32_t)strtoul(r40,0,0));
-      if(r48) setrn(rc,REGCMD_MUL_N,RK_DPU_BS_MUL_CFG,(uint32_t)strtoul(r48,0,0));
-      if(r70) setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0));
+      if(r40) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_CFG,(uint32_t)strtoul(r40,0,0));
+      if(r48) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_MUL_CFG,(uint32_t)strtoul(r48,0,0));
+      if(r70) orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0));
       const char*r34=getenv("ORK_EW_R34");   /* ERDMA_CFG 0x5034: ERDMA_DATA_MODE bits[31:30] — per-channel operand-b broadcast RE */
-      if(r34) setrn(rc,REGCMD_MUL_N,RK_SDP_5034,(uint32_t)strtoul(r34,0,0)); }
+      if(r34) orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5034,(uint32_t)strtoul(r34,0,0)); }
     if(getenv("ORK_EW_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2) printf("  [%3d] reg=%04x lane=%04x val=%08x\n",k/2,rc[k]&0xffff,rc[k+1]>>16,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16));
-        bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O); return 0; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O); return 0; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t sa=tk->regcfg_amount,se=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=sa; tk->enable_mask=se; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=sa; tk->enable_mask=se; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ memcpy(out,O.cpu,n); if(us)*us=t1; }
     if(ok==0 && getenv("ORK_EW_SCAN")){ signed char*o=O.cpu; int nz=0,first=-1,last=-1;
         for(int i=0;i<4096;i++){ if(o[i]){ nz++; if(first<0)first=i; last=i; } }
         printf("  [scan4k] nonzero=%d span[0x%x..0x%x]  vals@first: ",nz,first,last);
         for(int i=(first<0?0:first);i<(first<0?16:first+24)&&i<4096;i++)printf("%d ",o[i]); printf("\n"); }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -7095,34 +7095,34 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* NVDLA cube, atom=16, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;                    /* int8 cube = M*N bytes */
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=up[m*N+n]; bc[p]=silu[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     /* no per-call ACT_RESET: it costs tens of ms/op and is not needed for the SDP element-wise op
      * (validated bit-exact without it) — the reset only mattered for entering int8-matmul mode. */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* up  (SRDMA)  */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* silu (ERDMA) */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);         /* OUT_CVT_SCALE = gain mantissa */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);        /* OUT_CVT_SHIFT */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0);                      /* zo = 0 (OUT_CVT_OFFSET) */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0);                      /* za = 0 (BS_ALU_OPERAND) */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);                      /* zb = 0 (EW_CVT_OFFSET) */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);        /* output */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);        /* up  (SRDMA)  */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);        /* silu (ERDMA) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);         /* OUT_CVT_SCALE = gain mantissa */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);        /* OUT_CVT_SHIFT */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0);                      /* zo = 0 (OUT_CVT_OFFSET) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0);                      /* za = 0 (BS_ALU_OPERAND) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);                      /* zb = 0 (EW_CVT_OFFSET) */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=oc[EWCUBE(m,n)]; if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     #undef EWCUBE
     return ok;
 }
@@ -7139,22 +7139,22 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* BYTE offset, fp16 atom=8, surf_stride=M*16 */
     const uint16_t *u16=(const uint16_t*)up,*s16=(const uint16_t*)silu; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* fp16 cube = M*N*2 bytes */
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=u16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=s16[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
-    setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     /* NONBLOCK DOORBELL (spine uniformity + system latency): a blocking submit stalls this thread in-kernel for
      * the whole op (uninterruptible, D-state-wedge-prone; in orkd it also blocks servicing other clients).
      * Submit NONBLOCK with ping-pong OFF, and detect completion by a FULL-SURFACE poll of the fp16 output seeded
@@ -7165,12 +7165,12 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
         for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     #undef EWCUBEH
     return ok;
 }
@@ -7210,33 +7210,33 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* 2-byte atom=8 cube (fp16/int16), surf_stride=M*16 */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* int16 cube = M*N*2 bytes */
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);     /* OUT_CVT_SCALE (gain mantissa) */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);    /* OUT_CVT_SHIFT */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0);                  /* zo=0 */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0);                  /* za=0 */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);                  /* zb=0 */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);     /* OUT_CVT_SCALE (gain mantissa) */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);    /* OUT_CVT_SHIFT */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0);                  /* zo=0 */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0);                  /* za=0 */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);                  /* zb=0 */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     #undef EWCUBEH
     return ok;
 }
@@ -7252,35 +7252,35 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu,*bc=B.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBE(m,n); ac[p]=a[m*N+n]; bc[p]=b[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_N,M,N);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)B.dma);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,bscale);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,(uint32_t)za);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)zb);
-    setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)zo);
-    { const char*r70=getenv("ORK_EW_R70"); if(r70) setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0)); }  /* EW_ALU_ALGO override: SUM(2)->MAX(0)/MIN(1) */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)B.dma);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,bscale);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,(uint32_t)za);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)zb);
+    orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)zo);
+    { const char*r70=getenv("ORK_EW_R70"); if(r70) orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,(uint32_t)strtoul(r70,0,0)); }  /* EW_ALU_ALGO override: SUM(2)->MAX(0)/MIN(1) */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     #undef EWCUBE
     return ok;
 }
@@ -7297,11 +7297,11 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     #define RMCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf W0=bcreate(fd,sz,0x403,-1), W1=bcreate(fd,sz,0x403,-1);
-    if(!W0.cpu||!W1.cpu){ bdestroy(fd,&W0);bdestroy(fd,&W1); return -2; }
+    struct buf W0=orki_bcreate(fd,sz,0x403,-1), W1=orki_bcreate(fd,sz,0x403,-1);
+    if(!W0.cpu||!W1.cpu){ orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1); return -2; }
     memset(W0.cpu,0,sz); memset(W1.cpu,0,sz);
     { int8_t*wc=W0.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) wc[RMCUBE(m,n)]=a[(size_t)m*N+n]; }
-    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18;
@@ -7310,28 +7310,28 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
         int h=cur_n/2;
         uint32_t rc[REGCMD_ADD_N]; memcpy(rc,REGCMD_ADD,sizeof rc);
         set_mul_geom(rc,REGCMD_ADD_N,M,h);
-        setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)oth->dma);                                  /* out */
-        setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)cur->dma);                                  /* a = ch [0,h) */
-        setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)(cur->dma+(uint32_t)((size_t)(h/16)*M*16))); /* b = ch [h,2h) */
-        setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,28);      /* identity out-cvt */
-        setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,0x4000);                                              /* identity b-scale */
-        setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,0);
-        setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,0x904002c0);                                          /* EW_ALU_ALGO = MAX(0) */
-        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_setrn(rc,REGCMD_ADD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)oth->dma);                                  /* out */
+        orki_setrn(rc,REGCMD_ADD_N,RK_SDP_5018,(uint32_t)cur->dma);                                  /* a = ch [0,h) */
+        orki_setrn(rc,REGCMD_ADD_N,RK_SDP_5038,(uint32_t)(cur->dma+(uint32_t)((size_t)(h/16)*M*16))); /* b = ch [h,2h) */
+        orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SCALE,0x4000); orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_SHIFT,28);      /* identity out-cvt */
+        orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_SCALE,0x4000);                                              /* identity b-scale */
+        orki_setrn(rc,REGCMD_ADD_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CVT_OFFSET,0); orki_setrn(rc,REGCMD_ADD_N,RK_DPU_OUT_CVT_OFFSET,0);
+        orki_setrn(rc,REGCMD_ADD_N,RK_DPU_EW_CFG,0x904002c0);                                          /* EW_ALU_ALGO = MAX(0) */
+        memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
         sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
         { struct buf*t=cur; cur=oth; oth=t; } cur_n=h;
     }
     if(ok==0){
-        bsync(fd,cur,RKNPU_MEM_SYNC_FROM_DEVICE); int8_t*r=cur->cpu;
+        orki_bsync(fd,cur,RKNPU_MEM_SYNC_FROM_DEVICE); int8_t*r=cur->cpu;
         for(int m=0;m<M;m++){ int mx=-128; for(int n=0;n<cur_n;n++){ int v=r[RMCUBE(m,n)]; if(v>mx)mx=v; } out[m]=(int8_t)mx; }
         if(us)*us=ork_now_us()-t0;
     }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    bdestroy(fd,&W0); bdestroy(fd,&W1);
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bdestroy(fd,&W0); orki_bdestroy(fd,&W1);
     #undef RMCUBE
     return ok;
 }
@@ -7385,16 +7385,16 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
         for(int nt=0;nt<NT;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++) \
           bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=(src)[(size_t)(kt*32+kk)*(NN)+(nt*16+nl)]; }while(0)
     size_t gsz=(size_t)M*N*2; if(gsz<4096)gsz=4096;
-    struct buf W1=bcreate(fd,(size_t)K*N*2,0x403,-1), G=bcreate(fd,gsz,0x403,-1),
-               W2=bcreate(fd,(size_t)N*N*2,0x403,-1), O=bcreate(fd,gsz,0x403,-1);
-    if(!W1.cpu||!G.cpu||!W2.cpu||!O.cpu){ bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O); return -1; }
+    struct buf W1=orki_bcreate(fd,(size_t)K*N*2,0x403,-1), G=orki_bcreate(fd,gsz,0x403,-1),
+               W2=orki_bcreate(fd,(size_t)N*N*2,0x403,-1), O=orki_bcreate(fd,gsz,0x403,-1);
+    if(!W1.cpu||!G.cpu||!W2.cpu||!O.cpu){ orki_bdestroy(fd,&W1);orki_bdestroy(fd,&G);orki_bdestroy(fd,&W2);orki_bdestroy(fd,&O); return -1; }
     TILE(W1.cpu,B,K,N);                                             /* weight1 = B[K][N] */
     { uint16_t*d=W2.cpu; memset(d,0,(size_t)N*N*2); uint16_t*Draw=calloc((size_t)N*N,2);   /* weight2 = diag(scale)[N][N] */
       for(int n=0;n<N;n++) Draw[(size_t)n*N+n]=scale[n]; TILE(W2.cpu,Draw,N,N); free(Draw); }
     memset(G.cpu,0,gsz); memset(O.cpu,0,gsz);
     { uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }    /* activation1 = A (only host->dev copy of an INPUT) */
-    bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&W2,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&W2,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* layer owns the reset (keep-warm-aware; no redundant manual reset) */
     uint32_t to_ms=3000; { const char*e=getenv("ORK_EW_TIMEOUT"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v)to_ms=v; } }
     struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu;
@@ -7407,31 +7407,31 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
         /* SINGLE-SUBMIT: PC-chain matmul1 -> matmul2 (both uniform enable=0xd, like run_chain_i8). G resident. */
         static uint32_t mm1[REGCMD_N], mm2[REGCMD_N];
         int s1=((K&(K-1))==0 && K>=128 && K<2048), s2=((N&(N-1))==0 && N>=128 && N<2048);
-        synth(mm1,M,K,N,pass[0].aA,pass[0].aW,pass[0].aO,s1,CBUF); set_f16_out_fp16in(mm1,M,N);
-        synth(mm2,M,N,N,pass[1].aA,pass[1].aW,pass[1].aO,s2,CBUF); set_f16_out_fp16in(mm2,M,N);
+        orki_synth(mm1,M,K,N,pass[0].aA,pass[0].aW,pass[0].aO,s1,CBUF); set_f16_out_fp16in(mm1,M,N);
+        orki_synth(mm2,M,N,N,pass[1].aA,pass[1].aW,pass[1].aO,s2,CBUF); set_f16_out_fp16in(mm2,M,N);
         ork_chain_prog progs[2]={ {mm1,REGCMD_N,0xd,108,216}, {mm2,REGCMD_N,0xd,108,-1} };
         int crc=ork_npu_chain_progs(c,2,progs,c->dom_active);
-        if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+        if(!crc){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
             for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n]; }
-        bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O);
+        orki_bdestroy(fd,&W1);orki_bdestroy(fd,&G);orki_bdestroy(fd,&W2);orki_bdestroy(fd,&O);
         #undef TILE
         return crc;
     }
     for(int p=0; p<2 && ok==0; p++){
         uint32_t rc[REGCMD_N];
         int sched=((pass[p].K2&(pass[p].K2-1))==0 && pass[p].K2>=128 && pass[p].K2<2048);
-        synth(rc,M,pass[p].K2,pass[p].N2,pass[p].aA,pass[p].aW,pass[p].aO,sched,CBUF);
+        orki_synth(rc,M,pass[p].K2,pass[p].N2,pass[p].aA,pass[p].aW,pass[p].aO,sched,CBUF);
         set_f16_out_fp16in(rc,M,pass[p].N2);
-        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         memset(tk,0,sizeof *tk); tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff;
-        tk->regcfg_amount=108; tk->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-        int done=-1; for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ done=-1; continue; }
-            if(p==0) bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); else bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); done=0; }
+        tk->regcfg_amount=108; tk->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        int done=-1; for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ done=-1; continue; }
+            if(p==0) orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); else orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); done=0; }
         if(done) ok=-1;
     }
     if(ok==0){ if(us)*us=ork_now_us()-t0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=((uint16_t*)O.cpu)[(size_t)m*N+n]; }  /* CONTIGUOUS */
-    bdestroy(fd,&W1);bdestroy(fd,&G);bdestroy(fd,&W2);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W1);orki_bdestroy(fd,&G);orki_bdestroy(fd,&W2);orki_bdestroy(fd,&O);
     #undef TILE
     return ok;
 }
@@ -7447,30 +7447,30 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     #define PCH16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* fp16 cube byte offset, atom=8, surf=M*16 */
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+PCH16(m,n))=a16[(size_t)m*N+n];
     for(int n=0;n<N;n++) ((uint16_t*)B.cpu)[n]=b16[n];               /* per-channel vector CONTIGUOUS [N] (fp16) */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_F16_N]; memcpy(rc,REGCMD_MUL_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_F16_N,M,N);
-    setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
-    setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5038,(uint32_t)B.dma);
+    orki_setrn(rc,REGCMD_MUL_F16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
     sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
     sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+PCH16(m,n)); }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
     #undef PCH16
     return ok;
 }
@@ -7489,8 +7489,8 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
     if(M<1||M>64||N<8||N>8192||(N&7)) return -2;
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,4096,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,4096);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) ((uint16_t*)A.cpu)[(size_t)m*N+n]=a16[(size_t)m*N+n];  /* CONTIGUOUS in */
     /* PER-ELEMENT operand (vendor DATA_MODE=2): per 8-channel tile t, an [8 chan][M row] block = scale[8t+j]
@@ -7499,7 +7499,7 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
       ork_f16 one=(ork_f16)1.0f; int ones=getenv("ORK_MULC_ONES")?1:0;
       for(int t=0;t<NT0;t++)for(int j=0;j<8;j++)for(int m=0;m<M;m++)
         bb[(size_t)t*M*8 + (chmaj?(j*M+m):(m*8+j))]=ones?*(uint16_t*)&one:b16[t*8+j]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; leaves last_dt) */
     /* TILED per the vendor (task13): one SDP task per 8-channel group (CHANNEL=7). Each tile reads its 8
      * contiguous columns of A via NOTCH (LINE skip = N-8 for the row stride) and writes an 8xM atom block to
@@ -7508,42 +7508,42 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
     int NT=N/8; double t0=ork_now_us(); int ok=0;
     for(int t=0; t<NT && ok==0; t++){
         uint32_t rc[REGCMD_MUL_F16_NOTCH_N]; memcpy(rc,REGCMD_MUL_F16_NOTCH,sizeof rc);
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5018,(uint32_t)(A.dma+(size_t)t*8*2));   /* input cols 8t..8t+7 */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5038,(uint32_t)(B.dma+(size_t)t*M*8*2)); /* per-element operand block for tile t */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(O.dma+(size_t)t*M*16));  /* tile slot: 8xM atom block */
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5018,(uint32_t)(A.dma+(size_t)t*8*2));   /* input cols 8t..8t+7 */
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5038,(uint32_t)(B.dma+(size_t)t*M*8*2)); /* per-element operand block for tile t */
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(O.dma+(size_t)t*M*16));  /* tile slot: 8xM atom block */
         /* COMPACT atom-8 output for the 8-channel tile (override the vendor's downstream 0x400 stride) so the
          * readback O+t*M*16 + m*16 + j*2 matches (1 surface, M rows). */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)(M*16));                  /* DST_SURF_STRIDE */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,0);
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N_DIMS,(uint32_t)((7<<16)|7));             /* 8 channels */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N2,7);
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_SURFACE_ADD,(uint32_t)(M*16));
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_SURF_STRIDE,(uint32_t)(M*16));                  /* DST_SURF_STRIDE */
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,0);
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N_DIMS,(uint32_t)((7<<16)|7));             /* 8 channels */
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DST_N2,7);
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_SURFACE_ADD,(uint32_t)(M*16));
         if(getenv("ORK_MULC_HROW")){                                                    /* rows as HEIGHT lines (LINE_NOTCH acts between heights) */
-            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,0);                             /* RDMA WIDTH = 1 */
-            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5010,(uint32_t)(M-1));               /* RDMA HEIGHT = M-1 (rows) */
-            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,0);                             /* DPU WIDTH = 1 */
-            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,(uint32_t)(M-1));               /* DPU HEIGHT = M-1 */
+            orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,0);                             /* RDMA WIDTH = 1 */
+            orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5010,(uint32_t)(M-1));               /* RDMA HEIGHT = M-1 (rows) */
+            orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_WIDTH,0);                             /* DPU WIDTH = 1 */
+            orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_DATA_CUBE_HEIGHT,(uint32_t)(M-1));               /* DPU HEIGHT = M-1 */
         } else {
-            setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,(uint32_t)(M-1));               /* WIDTH = M-1 */
+            orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_500C,(uint32_t)(M-1));               /* WIDTH = M-1 */
         }
         /* vendor task13 is PER-ELEMENT (DATA_MODE=2, compiler broadcast [1,1,N]->[M,N]); switch to PER-CHANNEL
          * (DATA_MODE=0) so an [N] scale operand applies per output channel. */
         uint32_t ewcfg=getenv("ORK_MULC_EW")?strtoul(getenv("ORK_MULC_EW"),0,0):0x20800384; /* vendor: EW mul, DATA_MODE=2 (per-element), fp16 */
         uint32_t erdma=getenv("ORK_MULC_ERDMA")?strtoul(getenv("ORK_MULC_ERDMA"),0,0):0x8000000a; /* vendor: per-element, 2-byte */
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_EW_CFG,ewcfg);
-        setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5034,erdma);
-        if(N!=64){ setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5048,(uint32_t)((N-8)<<19)); } /* SRC_DMA_CFG.LINE_NOTCH_ADDR[31:19]=N-8 (row-stride skip) */
-        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_DPU_EW_CFG,ewcfg);
+        orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5034,erdma);
+        if(N!=64){ orki_setrn(rc,REGCMD_MUL_F16_NOTCH_N,RK_SDP_5048,(uint32_t)((N-8)<<19)); } /* SRC_DMA_CFG.LINE_NOTCH_ADDR[31:19]=N-8 (row-stride skip) */
+        memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
         sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
         sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
     }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(ok==0){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
         /* read back: tile t's slot O+t*M*16 is CHANNEL-MAJOR (channel j outer, row m inner): element (j*M+m). */
         for(int t=0;t<NT;t++)for(int m=0;m<M;m++)for(int j=0;j<8;j++)
             o16[(size_t)m*N + t*8 + j]=*(uint16_t*)((char*)O.cpu + (size_t)t*M*16 + (size_t)(j*M + m)*2);
@@ -7554,7 +7554,7 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
             for(int m=0;m<M;m++){ fprintf(stderr,"[dump] A[%d][0..7]:",m); for(int j=0;j<8;j++)fprintf(stderr," %g",(double)a[(size_t)m*N+j]); fprintf(stderr,"\n"); }
             fprintf(stderr,"[dump] O tile0 [0..%d]:",M*8-1); for(int i=0;i<M*8;i++)fprintf(stderr," %g",(double)o[i]); fprintf(stderr,"\n"); }
     }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
     return ok;
 }
 
@@ -7565,32 +7565,32 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* 2-byte atom=8 cube */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+PC16(m,n))=a[(size_t)m*N+n];
     for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
     sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
     sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
     #undef PC16
     return ok;
 }
@@ -7601,8 +7601,8 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
 struct ork_rsh_patch { ork_npu *c; struct rknpu_task marker; uint32_t idx; uint32_t delay_us;
     int rcmode; uint32_t *rcword; uint32_t rcval0,rcval1; };  /* rcmode: patch a regcmd word in c->regcmd instead of a descriptor */
 static void *ork_rsh_patcher(void *p){ struct ork_rsh_patch *a=p; usleep(a->delay_us);
-    if(a->rcmode){ a->rcword[0]=a->rcval0; a->rcword[1]=a->rcval1; bsync(a->c->fd,&a->c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); }
-    else { struct rknpu_task *tk=(struct rknpu_task*)a->c->task.cpu; tk[a->idx]=a->marker; bsync(a->c->fd,&a->c->task,RKNPU_MEM_SYNC_TO_DEVICE); }
+    if(a->rcmode){ a->rcword[0]=a->rcval0; a->rcword[1]=a->rcval1; orki_bsync(a->c->fd,&a->c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); }
+    else { struct rknpu_task *tk=(struct rknpu_task*)a->c->task.cpu; tk[a->idx]=a->marker; orki_bsync(a->c->fd,&a->c->task,RKNPU_MEM_SYNC_TO_DEVICE); }
     __asm__ __volatile__("dsb sy":::"memory"); return NULL; }
 
 /* RE (WIP, RESHAPE_WIP.md): FULL-CHAIN REPLAY of the vendor gemm+reshape (task0-10) to validate the reshape
@@ -7627,9 +7627,9 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     #define TK(j) TK[(T0)+(j)]
     const char *path=getenv("ORK_RESHAPE_IMG"); if(!path)path="gemm_mul_image.bin";
     FILE *f=fopen(path,"rb"); if(!f) return -2;
-    struct buf BIG=bcreate(fd,ISZ,0x403,-1); if(!BIG.cpu){fclose(f);return -2;}
+    struct buf BIG=orki_bcreate(fd,ISZ,0x403,-1); if(!BIG.cpu){fclose(f);return -2;}
     memset(BIG.cpu,0,ISZ);
-    size_t rd=fread(BIG.cpu,1,ISZ,f); fclose(f); if(rd<ISZ){ bdestroy(fd,&BIG); return -2; }
+    size_t rd=fread(BIG.cpu,1,ISZ,f); fclose(f); if(rd<ISZ){ orki_bdestroy(fd,&BIG); return -2; }
     /* inject DISTINCT input (@0xfffef000, imgoff 0x2000) so gemm_out is non-degenerate -> derivable perm */
     if(getenv("ORK_RESHAPE_INJECT")){ uint16_t*x=(uint16_t*)((char*)BIG.cpu+0x2000);      /* task0 input @0xfffef000 */
         for(int i=0;i<512;i++){ float v=(float)((i%37)-8)*0.25f; __fp16 h=(__fp16)v; memcpy(&x[i],&h,2); } }
@@ -7677,8 +7677,8 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     }
     /* ZERO gemm-out (0x3000) + reshape-out (0x3a00) so FRESH computation is distinguishable from baked image data. */
     if(getenv("ORK_RESHAPE_ZERO")){ memset((char*)BIG.cpu+0x3000,0,0x400); memset((char*)BIG.cpu+0x3680,0,0x400); }
-    bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(!inimg) bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!inimg) orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t tn=(uint32_t)NT; { const char*e=getenv("ORK_RESHAPE_TN"); if(e){unsigned v=(unsigned)strtoul(e,0,0); if(v>=1)tn=v;} } /* TREADMILL = #descriptors (task_number must match; a big RING beats the prefetcher) */
     if(tn>13000)tn=13000;                                          /* c->task=512KB / ~40B per rknpu_task */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof(*tk)*tn);
@@ -7694,14 +7694,14 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
         for(uint32_t j=0;j<tn;j++) tk[j]=tk[NT-1];                /* ring = cheap reshape-delta dummy */
         parg.idx=tn/2; { const char*e=getenv("ORK_RESHAPE_PATCH_US"); parg.delay_us=e?(uint32_t)strtoul(e,0,0):50; }
         parg.rcmode=0;
-        if(getenv("ORK_RESHAPE_PATCHRC")){ /* alt: patch the shared DUMMY regcmd's 0x4020 output -> 0x3000, mid-run (tests regcmd live re-read) */
+        if(getenv("ORK_RESHAPE_PATCHRC")){ /* alt: patch the shared DUMMY regcmd's 0x4020 output -> 0x3000, mid-orki_run (tests regcmd live re-read) */
             uint32_t *drc=cr+cro[NT-1]; int dnw=(int)eamt[NT-1]*2+16; parg.rcword=NULL;
             for(int k=0;k+1<dnw;k+=2){ if((drc[k]&0xffff)==0x4020 && (drc[k+1]>>16)==0x1001){ parg.rcword=drc+k;
                 uint32_t nv=(uint32_t)BIG.dma+0x3000; parg.rcval0=0x4020|((nv&0xffff)<<16); parg.rcval1=(0x1001u<<16)|((nv>>16)&0xffff); break; } }
             if(parg.rcword) parg.rcmode=1; }
-        memset((char*)BIG.cpu+0x3000,0,0x400); bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); patching=1;
+        memset((char*)BIG.cpu+0x3000,0,0x400); orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); patching=1;
     }
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     uint32_t flg=0x5; { const char*e=getenv("ORK_RESHAPE_FLAGS"); if(e)flg=(uint32_t)strtoul(e,0,0); }  /* vendor used 0x5 */
     sub.flags=flg; sub.task_number=tn; sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK;
@@ -7709,15 +7709,15 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,tn}; /* vendor sets all 3 */
     if(patching) pthread_create(&pth,NULL,ork_rsh_patcher,&parg);   /* fire the mid-submit far-ahead descriptor patch */
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    else bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    else orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(patching){ pthread_join(pth,NULL); int mnz=0; uint16_t*mg=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<512;i++)if(mg[i])mnz++;
         fprintf(stderr,"[patch] ring=%u idx=%u delay=%uus -> gemm-marker(0x3000) nz=%d -> %s\n",
             tn,parg.idx,parg.delay_us,mnz, mnz?"WRITTEN (live far-ahead patch HONORED)":"zero (patch NOT honored / prefetched)"); }
     if(gemm_raw){ uint16_t*g=(uint16_t*)((char*)BIG.cpu+0x3000); for(int i=0;i<gemm_words;i++)gemm_raw[i]=g[i]; }       /* 0xffff0000 */
     uint32_t roff=0x3680; { const char*e=getenv("ORK_RESHAPE_ROUT"); if(e)roff=(uint32_t)strtoul(e,0,0); } /* reshape-out read offset (0x3680 atom-8 base; 0x3280=task2 out) */
     if(reshape_raw){ uint16_t*r=(uint16_t*)((char*)BIG.cpu+roff); for(int i=0;i<reshape_words;i++)reshape_raw[i]=r[i]; }
-    bdestroy(fd,&BIG);
+    orki_bdestroy(fd,&BIG);
     #undef TK
     return ok;
 }
@@ -7738,29 +7738,29 @@ int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_
         3823,3894,3959,4030,4095};
     size_t isz=(size_t)M*N*2; if(isz<4096)isz=4096;
     size_t osz=(size_t)M*N*2*2; if(osz<8192)osz=8192;   /* generous output room */
-    struct buf In=bcreate(fd,isz,0x403,-1), W=bcreate(fd,8192,0x403,-1), O=bcreate(fd,osz,0x403,-1);
-    if(!In.cpu||!W.cpu||!O.cpu){ bdestroy(fd,&In);bdestroy(fd,&W);bdestroy(fd,&O); return -2; }
+    struct buf In=orki_bcreate(fd,isz,0x403,-1), W=orki_bcreate(fd,8192,0x403,-1), O=orki_bcreate(fd,osz,0x403,-1);
+    if(!In.cpu||!W.cpu||!O.cpu){ orki_bdestroy(fd,&In);orki_bdestroy(fd,&W);orki_bdestroy(fd,&O); return -2; }
     memset(In.cpu,0,isz); memset(W.cpu,0,8192); memset(O.cpu,0,osz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) ((uint16_t*)In.cpu)[(size_t)m*N+n]=src[(size_t)m*N+n];
     for(int i=0;i<64;i++) ((uint16_t*)W.cpu)[WPOS[i]]=0x3c00;   /* fp16 1.0 permutation (channel reorder) */
-    bsync(fd,&In,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&In,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
     uint32_t rc[REGCMD_RESHAPE_F16_N]; memcpy(rc,REGCMD_RESHAPE_F16,sizeof rc);
-    setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)In.dma);    /* input base (CNA activation) */
-    setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W.dma);     /* weight base (permutation) */
-    setrn(rc,REGCMD_RESHAPE_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);    /* output base (DPU) */
+    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)In.dma);    /* input base (CNA activation) */
+    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W.dma);     /* weight base (permutation) */
+    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);    /* output base (DPU) */
     { const char*e;   /* RE: reconcile the reshape read geometry to OUR contiguous [M][N] input pitch */
-      if((e=getenv("ORK_RSH_107C"))) setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON1,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_RSH_1080"))) setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON2,(uint32_t)strtoul(e,0,0)); }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+      if((e=getenv("ORK_RSH_107C"))) orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON1,(uint32_t)strtoul(e,0,0));
+      if((e=getenv("ORK_RSH_1080"))) orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON2,(uint32_t)strtoul(e,0,0)); }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    else { bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }   /* coherent buffer: read partial write on fail too */
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    else { orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }   /* coherent buffer: read partial write on fail too */
     if(out_raw){ int w=(int)(osz/2); if(w>out_words)w=out_words; for(int i=0;i<w;i++) out_raw[i]=((uint16_t*)O.cpu)[i]; }
-    bdestroy(fd,&In);bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&In);orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -7791,46 +7791,46 @@ int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int
     #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)          /* 2-byte atom=8 cube (int16 out) */
     size_t sza=(size_t)M*N*4; if(sza<4096)sza=4096;
     size_t szo=(size_t)M*N*2; if(szo<4096)szo=4096;
-    struct buf A=bcreate(fd,sza,0x403,-1), O=bcreate(fd,szo,0x403,-1), B=bcreate(fd,4096,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    struct buf A=orki_bcreate(fd,sza,0x403,-1), O=orki_bcreate(fd,szo,0x403,-1), B=orki_bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
     memset(A.cpu,0,sza); memset(O.cpu,0,szo); memset(B.cpu,0,4096);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int32_t*)((char*)A.cpu+PC32(m,n))=a[(size_t)m*N+n];
     for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (keep-warm-aware) */
     uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
     #define RQENV(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_PRECISION,RQENV("ORK_RQ_4010",0x30000001)); /* OUT int16 | IN int32 | PROC int16 */
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5040,RQENV("ORK_RQ_MSTRIDE",(uint32_t)(M*32))); /* main int32 surf stride */
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);        /* main input = int32 G */
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);        /* per-channel scale vector */
-    setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
-    { const char*e=getenv("ORK_RQ_5044"); if(e) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_PRECISION,RQENV("ORK_RQ_4010",0x30000001)); /* OUT int16 | IN int32 | PROC int16 */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5040,RQENV("ORK_RQ_MSTRIDE",(uint32_t)(M*32))); /* main int32 surf stride */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);        /* main input = int32 G */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);        /* per-channel scale vector */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
+    { const char*e=getenv("ORK_RQ_5044"); if(e) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
     /* OVER-FETCH hack: RDMA input dims (0x500c width / 0x5014 channel) are DECOUPLED from the DPU output dims
      * (0x4058/0x405c). If the RDMA is stuck 2-byte fetching 2E but the DPU consumes 4E (int32) -> 50% starve,
      * INFLATE the RDMA element count so it fetches 4E bytes -> both terminal counts hit together -> clean. */
     { const char*e;
-      if((e=getenv("ORK_RQ_5014"))) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
-      if((e=getenv("ORK_RQ_500C"))) setrn(rc,REGCMD_MUL_I16_N,RK_SDP_500C,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
+      if((e=getenv("ORK_RQ_5014"))) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
+      if((e=getenv("ORK_RQ_500C"))) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_500C,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
     #undef RQENV
     if(getenv("ORK_RQ_DUMP")){ for(int k=0;k+1<REGCMD_MUL_I16_N;k+=2){ unsigned rg=rc[k]&0xffff; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
         if(rg==0x4010||rg==0x4020||rg==0x4024||rg==0x40c0||rg==0x5018||rg==0x5034||rg==0x5038||rg==0x5040||rg==0x5044||rg==0x4084||rg==0x4088) fprintf(stderr,"  [rq] reg=%04x val=%08x\n",rg,v);} }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
     sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
     sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
     else if(getenv("ORK_RQ_DUMP")){ int nz=0; int16_t*oc=O.cpu; for(size_t i=0;i<(size_t)M*N;i++) if(oc[i])nz++; fprintf(stderr,"  [rq] submit FAILED (errno path); O nonzero=%d/%d\n",nz,M*N); }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
     #undef PC32
     #undef PC16
     return ok;
@@ -7847,32 +7847,32 @@ int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int 
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     #define PCCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), B=bcreate(fd,sz,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&B); return -2; }
+    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,sz,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
     { int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[PCCUBE(m,n)]=a[(size_t)m*N+n]; }
     { int8_t*bc=B.cpu; for(int n=0;n<N;n++) bc[n]=b[n]; }                        /* per-channel vector: CONTIGUOUS [N] (not surface-strided) */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* a (SRDMA, per-element) */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);            /* b (ERDMA / EW_BASE) */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5034,0x00000004);                /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=1 */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); /* za/zb/zo = 0 (drop captured zero-points) */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* a (SRDMA, per-element) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B.dma);            /* b (ERDMA / EW_BASE) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5034,0x00000004);                /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=1 */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); /* za/zb/zo = 0 (drop captured zero-points) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
     sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
     sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=oc[PCCUBE(m,n)]; }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&B);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
     #undef PCCUBE
     return ok;
 }
@@ -7889,36 +7889,36 @@ int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     #define BSCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1), O=bcreate(fd,sz,0x403,-1), S=bcreate(fd,4096,0x403,-1);
-    if(!A.cpu||!O.cpu||!S.cpu){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&S); return -2; }
+    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), S=orki_bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!S.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&S); return -2; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(S.cpu,0,4096);
     { int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[BSCUBE(m,n)]=a[(size_t)m*N+n]; }
     /* per-channel scale vector b[N]: try the EW-operand cube layout for a single width row (width=1). */
     { int8_t*sc=S.cpu; for(int n=0;n<N;n++) sc[(n/16)*16 + (n%16)]=scale[n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     /* EW MUL out=a*b, b (ERDMA 0x5038) as a PER-CHANNEL vector via ERDMA_DATA_MODE (0x5034 bits[31:30]). */
     uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc);
     set_mul_geom(rc,REGCMD_MUL_N,M,N);
-    setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* input a (SRDMA, per-element) */
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)S.dma);            /* scale b (ERDMA / EW_BASE) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);            /* output */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A.dma);            /* input a (SRDMA, per-element) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)S.dma);            /* scale b (ERDMA / EW_BASE) */
     #define ENV32(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
-    setrn(rc,REGCMD_MUL_N,RK_SDP_5034,ENV32("ORK_ERDMA",0x40000000)); /* ERDMA_CFG: ERDMA_DATA_MODE bits[31:30] (sweep per-channel) */
-    setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,ENV32("ORK_BS_GAIN",0x00004000)); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,28); /* out gain */
+    orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5034,ENV32("ORK_ERDMA",0x40000000)); /* ERDMA_CFG: ERDMA_DATA_MODE bits[31:30] (sweep per-channel) */
+    orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,ENV32("ORK_BS_GAIN",0x00004000)); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,28); /* out gain */
     #undef ENV32
     if(getenv("ORK_BS_DUMP")){ for(int k=0;k+1<REGCMD_MUL_N;k+=2){ unsigned rg=rc[k]&0xffff,ln=rc[k+1]>>16; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); if(rg==0x4020||rg==0x4070||rg==0x5018||rg==0x5034||rg==0x5038) printf("  reg=%04x lane=%04x val=%08x\n",rg,ln,v);} }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
     sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
     sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=ew_timeout_ms();
     int ok=-1; double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,-1)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ int8_t*oc=O.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=oc[BSCUBE(m,n)]; }
-    bdestroy(fd,&A); bdestroy(fd,&O); bdestroy(fd,&S);
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&S);
     #undef BSCUBE
     return ok;
 }
@@ -7954,30 +7954,30 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    if(ppu_scratch3(c,sz)) return -2;                          /* reuse persistent scratch (no per-op churn) */
+    if(orki_ppu_scratch3(c,sz)) return -2;                          /* reuse persistent scratch (no per-op churn) */
     struct buf A=c->ppu_a, B=c->ppu_b, O=c->ppu_o;
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(uint16_t*)((char*)A.cpu+p)=a16[m*N+n]; *(uint16_t*)((char*)B.cpu+p)=b16[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_F16_N]; memcpy(rc,REGCMD_ADD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_F16_N,M,N);
-    setrn(rc,REGCMD_ADD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5038,(uint32_t)B.dma);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_ADD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_ADD_F16_N,RK_SDP_5038,(uint32_t)B.dma);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     /* NONBLOCK DOORBELL (spine uniformity): ping-pong OFF + full-surface fp16 inf-poison poll — see ork_npu_ewmul_f16. */
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); *db=0x7c00; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ double cap=(double)ew_timeout_ms()*1000.0;
         for(;;){ int done=1; for(int m=0;m<M&&done;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==0x7c00u){done=0;break;} } if(done)break; if(ork_now_us()-t0>cap)break; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     /* scratch persists (ppu_scratch3) — not destroyed */
     #undef EWCUBEH
@@ -8000,19 +8000,19 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=bcreate(fd,sz,0x403,dom); if(!B.cpu){bdestroy(fd,&A);return -2;}
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
     memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
         *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
     uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5038,(uint32_t)B.dma);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5038,(uint32_t)B.dma);
     /* EXPERIMENTAL: int16 add is NOT bit-exact over the signed range. Isolated: the ERDMA/X2 operand (0x5038, via
      * 0x4078) is exact for BOTH signs; the SRDMA/X1 operand (0x5018, via 0x4084) is exact for POSITIVE but HALVES
      * NEGATIVES (int8's X1 didn't — a int16-specific X1 sign/shift behavior). 0x4048 and the shift couple into it,
@@ -8023,20 +8023,20 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     if((e=getenv("ORK_ADD16_R84")))r84=(uint32_t)strtoul(e,0,16);
     if((e=getenv("ORK_ADD16_R88")))r88=(uint32_t)strtoul(e,0,16);
     if((e=getenv("ORK_ADD16_R78")))r78=(uint32_t)strtoul(e,0,16);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_MUL_CFG,r48);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SCALE,r84);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SHIFT,r88);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_SCALE,r78);
-    setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_OFFSET,0); setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_MUL_CFG,r48);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SCALE,r84);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SHIFT,r88);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_SCALE,r78);
+    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_OFFSET,0); orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&O);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
     #undef EWCUBEH
     return ok;
 }
@@ -8060,53 +8060,53 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* int8 atom-16 cube, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
     int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[EWCUBE(m,n)]=in[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
 
     /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) ---- */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) WEDGED\n"); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
-      if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] submit1 (LUT-load) ok\n");
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] orki_submit1 (LUT-load) WEDGED\n"); orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
+      if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] orki_submit1 (LUT-load) ok\n");
     }
 
     /* ---- submit 2: standalone SiLU op (enable=0x18, regcfg=69) reading the resident LUT ---- */
     uint32_t rc[REGCMD_SILU_STD_N]; memcpy(rc,REGCMD_SILU_STD,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
-    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0);                 /* single-input: no ERDMA 2nd operand */
-    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);                 /* (set_mul_geom is for the 2-input EW-mul) */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);   /* output */
-    setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,(uint32_t)A.dma);   /* input (SRDMA) */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);  /* R mantissa */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift); /* R shift */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);          /* out_bias */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,idx_off);           /* C0 index offset */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,cfg4064);           /* index param */
-    setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,cfg4068);           /* index param */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0);                 /* single-input: no ERDMA 2nd operand */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);                 /* (set_mul_geom is for the 2-input EW-mul) */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);   /* output */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,(uint32_t)A.dma);   /* input (SRDMA) */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);  /* R mantissa */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift); /* R shift */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,out_bias);          /* out_bias */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,idx_off);           /* C0 index offset */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,cfg4064);           /* index param */
+    orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,cfg4068);           /* index param */
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     /* full task setup — submit-1 repointed regcmd_addr at the LUT-load buffer, so re-point it here */
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBE
     return ok;
 }
@@ -8124,58 +8124,58 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* fp16 atom-8, 2-byte, surf_stride=M*16 */
     const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
-     * A standalone SDP LUT-op runs right after a matmul that may have dom_activate()'d a NON-0 domain
+     * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
     int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+EWCUBEH(m,n))=i16[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
 
     /* submit 1: LUT-load */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
        * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
        * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
        * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
 
     /* submit 2: standalone fp16 activation op */
     uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_F16_N,M,N);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5040,0);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5038,0);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_R4110,idx_off);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_ALU_CFG,cfg4064);
-    setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_MUL_CFG,cfg4068);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5040,0);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5038,0);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_R4110,idx_off);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_ALU_CFG,cfg4064);
+    orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBEH
     return ok;
 }
@@ -8191,45 +8191,45 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;              /* orig x */
-    struct buf S=bcreate(fd,sz,0x403,-1); if(!S.cpu){bdestroy(fd,&A);return -2;} /* stage-1 sigmoid intermediate */
-    struct buf O=bcreate(fd,sz,0x403,-1); if(!O.cpu){bdestroy(fd,&A);bdestroy(fd,&S);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)ln*4,0x403,-1); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,-1); if(!A.cpu)return -2;              /* orig x */
+    struct buf S=orki_bcreate(fd,sz,0x403,-1); if(!S.cpu){orki_bdestroy(fd,&A);return -2;} /* stage-1 sigmoid intermediate */
+    struct buf O=orki_bcreate(fd,sz,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)ln*4,0x403,-1); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);orki_bdestroy(fd,&O);return -2;}
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,-1); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(S.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(uint16_t*)((char*)A.cpu+EWCUBEH(m,n))=i16[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
-    #define SUBMIT1(REG,RN,RA) do{ memcpy(c->regcmd.cpu,(REG),(size_t)(RN)*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); \
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&S,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
+    #define SUBMIT1(REG,RN,RA) do{ memcpy(c->regcmd.cpu,(REG),(size_t)(RN)*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); \
         struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk); \
         tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(RA); tk->regcmd_addr=c->regcmd.dma; \
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); \
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); \
         struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; \
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }while(0)
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; } }while(0)
     /* submit 1: fp16 LUT-load (verbatim; patch only the scratch out addr) — uses Lrc not c->regcmd (2210 words) */
     memcpy(Lrc.cpu,loader,(size_t)ln*4);
-    setrn((uint32_t*)Lrc.cpu,ln,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn((uint32_t*)Lrc.cpu,ln,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,-1)){ bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
     /* submit 2: stage-1 (REGCMD_SILU_STD_F16, sigmoid via LE-LUT) VERBATIM, x@A -> sigmoid@S */
     { uint32_t rc[REGCMD_SILU_STD_F16_N]; memcpy(rc,REGCMD_SILU_STD_F16,sizeof rc);
-      setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)S.dma);
-      setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
+      orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)S.dma);
+      orki_setrn(rc,REGCMD_SILU_STD_F16_N,RK_SDP_5018,(uint32_t)A.dma);
       SUBMIT1(rc,REGCMD_SILU_STD_F16_N,69); }
     /* submit 3: stage-2 (REGCMD_SILU_F16_T2, x*sigmoid) VERBATIM, sigmoid@S (0x5018) * x@A (0x5038) -> O */
     { uint32_t rc[REGCMD_SILU_F16_T2_N]; memcpy(rc,REGCMD_SILU_F16_T2,sizeof rc);
-      setrn(rc,REGCMD_SILU_F16_T2_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-      setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5018,(uint32_t)S.dma);
-      setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5038,(uint32_t)A.dma);
+      orki_setrn(rc,REGCMD_SILU_F16_T2_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+      orki_setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5018,(uint32_t)S.dma);
+      orki_setrn(rc,REGCMD_SILU_F16_T2_N,RK_SDP_5038,(uint32_t)A.dma);
       SUBMIT1(rc,REGCMD_SILU_F16_T2_N,69); }
-    bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) o16[m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=0;
-    bdestroy(fd,&A);bdestroy(fd,&S);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&S);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef SUBMIT1
     #undef EWCUBEH
     return 0;
@@ -8249,17 +8249,17 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
 int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    struct buf IN=bcreate(fd,32768,0x403,-1), OUT=bcreate(fd,32768,0x403,-1),
-               SCR=bcreate(fd,237568,0x403,-1), LUT=bcreate(fd,65536,0x403,-1),
-               WT=bcreate(fd,(size_t)(SM_WT_WORDS+64)*4,0x403,-1);
+    struct buf IN=orki_bcreate(fd,32768,0x403,-1), OUT=orki_bcreate(fd,32768,0x403,-1),
+               SCR=orki_bcreate(fd,237568,0x403,-1), LUT=orki_bcreate(fd,65536,0x403,-1),
+               WT=orki_bcreate(fd,(size_t)(SM_WT_WORDS+64)*4,0x403,-1);
     if(!IN.cpu||!OUT.cpu||!SCR.cpu||!LUT.cpu||!WT.cpu){
-        bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -2; }
+        orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT); return -2; }
     memcpy(IN.cpu,in,32768); memset(OUT.cpu,0,32768); memset(SCR.cpu,0,237568); memset(LUT.cpu,0,65536);
     memcpy(WT.cpu,SM_WT,(size_t)SM_WT_WORDS*4);
-    bsync(fd,&IN,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&SCR,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&LUT,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&WT,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&IN,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&SCR,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&LUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&WT,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     /* address-rebase helper: patch a task's regcmd in place (addr regs -> our buffers; chain -> `nextdma`
      * or 0 to terminate). Returns nothing; operates on rc[0..nw). */
     #define SM_REBASE(rc,nw,nextdma,nextamt) do{ for(int k=0;k+1<(nw);k+=2){ \
@@ -8291,8 +8291,8 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
         double t0=ork_now_us();
         const uint32_t IB=0xfffae000u, IE=0xfffff000u; size_t ISZ=IE-IB;   /* out|in|scratch|regcmd+wt */
         static const uint32_t TADDR[9]={0xffffab00u,0xffffad80u,0xffffb000u,0xffffb280u,0xffffb380u,0xffffd600u,0xffffd880u,0xffffdc00u,0xffffde40u};
-        struct buf BIG=bcreate(fd,ISZ,0x403,-1);
-        if(!BIG.cpu){ bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT); return -2; }
+        struct buf BIG=orki_bcreate(fd,ISZ,0x403,-1);
+        if(!BIG.cpu){ orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT); return -2; }
         memset(BIG.cpu,0,ISZ);
         uint32_t delta=(uint32_t)BIG.dma - IB;
         memcpy((char*)BIG.cpu + (0xfffb6000u-IB), in, 32768);                       /* input @ h4 */
@@ -8311,7 +8311,7 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
             tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
             tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=(uint32_t)BIG.dma + (TADDR[j]-IB);
         }
-        bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
         /* flags=0x1 (RKNPU_JOB_PC only) — match the vendor softmax. The default 0x5 sets RKNPU_JOB_PINGPONG
          * (0x4) too; ping-pong double-buffers the register banks across tasks, and its bank-swap racing the
@@ -8319,16 +8319,16 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
         s.flags=0x1; s.task_number=(uint32_t)NT; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
         s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT};
         fprintf(stderr,"[softmax-replay] FULLIMG: %d-task chain, contiguous image, single-delta rebase, PINGPONG OFF (flags=0x1)\n",NT);
-        int r=rknpu_submit_ioctl(fd,&s,-1)?-1:0;
-        if(r==0){ bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,BIG.cpu,32768); if(us)*us=ork_now_us()-t0; }  /* output @ h5 = BIG+0 */
+        int r=orki_rknpu_submit_ioctl(fd,&s,-1)?-1:0;
+        if(r==0){ orki_bsync(fd,&BIG,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,BIG.cpu,32768); if(us)*us=ork_now_us()-t0; }  /* output @ h5 = BIG+0 */
         else fprintf(stderr,"[softmax-replay] FULLIMG chain failed\n");
-        bdestroy(fd,&BIG); bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+        orki_bdestroy(fd,&BIG); orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT);
         return r;
     }
     /* KERNEL-SEQUENCED (the accel/rocket model): submit each task as its OWN task_number=1 program, in
      * dataflow order 0..8 — one task per PC program, no in-regcmd PC-chain (0101:0x0010) rewriting. Each
      * task is the proven single-task submit path; intermediates persist in the resident SCR/IN/OUT/LUT
-     * buffers between submits, and NO reset happens between them (act(RESET) ran once above), so the exp
+     * buffers between submits, and NO reset happens between them (orki_act(RESET) ran once above), so the exp
      * LUT that task4 loads into DPU SRAM survives for task5's exp. This is the correct sequencing model:
      * the earlier hardware-chained (task_number=9 + 0101 chain) attempts stalled at the chained LUT load. */
     static const int ORDER[9]={0,1,2,3,4,5,6,7,8};   /* capture/dataflow order */
@@ -8365,15 +8365,15 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
                     tks[j].enable_mask=SM_TASK_ENABLE[t]; tks[j].int_mask=0x300; tks[j].int_clear=0x1ffff;
                     tks[j].regcfg_amount=SM_TASK_AMT[t]; tks[j].regcmd_addr=c->regcmd.dma+(size_t)loc[j]*4;
                 }
-                bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+                orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
                 struct rknpu_submit s; memset(&s,0,sizeof s);
                 s.flags=0x5; s.task_number=(uint32_t)ntt; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
                 s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)ntt};
-                if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] SPLIT seg %d ([%d,%d)) failed\n",seg,s0,s1); rc_ret=-1; }
+                if(orki_rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] SPLIT seg %d ([%d,%d)) failed\n",seg,s0,s1); rc_ret=-1; }
             }
             fprintf(stderr,"[softmax-replay] 2SUBMIT-SPLIT: chain [0..4] + chain [5..8] (vendor-aligned)\n");
-            if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
-            bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+            if(rc_ret==0){ orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+            orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT);
             return rc_ret;
         }
         int NT=getenv("ORK_SM_NTASK")?atoi(getenv("ORK_SM_NTASK")):9; if(NT<1)NT=1; if(NT>9)NT=9;  /* RE: bisect */
@@ -8387,15 +8387,15 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
             tk[j].enable_mask=SM_TASK_ENABLE[t]; tk[j].int_mask=0x300; tk[j].int_clear=0x1ffff;
             tk[j].regcfg_amount=SM_TASK_AMT[t]; tk[j].regcmd_addr=c->regcmd.dma+(size_t)VOFF[j]*4;
         }
-        bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
         s.flags=0x5; s.task_number=(uint32_t)NT; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=3000;
         s.subcore_task[0]=(struct rknpu_subcore_task){0,(uint32_t)NT};
         fprintf(stderr,"[softmax-replay] 1SUBMIT: %d-task hardware chain, vendor-exact aligned layout\n",NT);
-        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 9-task chain failed\n"); rc_ret=-1; }
-        if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
-        bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+        if(orki_rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] 9-task chain failed\n"); rc_ret=-1; }
+        if(rc_ret==0){ orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+        orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT);
         return rc_ret;
     }
     for(int j=0;j<9 && rc_ret==0;j++){ int t=ORDER[j]; int nw=SM_TASK_WORDS[t];
@@ -8404,17 +8404,17 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
         struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
         tk->enable_mask=SM_TASK_ENABLE[t]; tk->int_mask=0x300; tk->int_clear=0x1ffff;
         tk->regcfg_amount=SM_TASK_AMT[t]; tk->regcmd_addr=c->regcmd.dma;
-        bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit s; memset(&s,0,sizeof s);
         s.flags=0x5; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK;
         s.fence_fd=-1; s.timeout=3000;
         s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        if(rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] task %d (enable=0x%x amt=%d) submit failed\n",t,SM_TASK_ENABLE[t],SM_TASK_AMT[t]); rc_ret=-1; }
+        if(orki_rknpu_submit_ioctl(fd,&s,-1)){ fprintf(stderr,"[softmax-replay] task %d (enable=0x%x amt=%d) submit failed\n",t,SM_TASK_ENABLE[t],SM_TASK_AMT[t]); rc_ret=-1; }
     }
-    if(rc_ret==0){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
+    if(rc_ret==0){ orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(out,OUT.cpu,32768); if(us)*us=ork_now_us()-t0; }
     #undef SM_REBASE
-    bdestroy(fd,&IN);bdestroy(fd,&OUT);bdestroy(fd,&SCR);bdestroy(fd,&LUT);bdestroy(fd,&WT);
+    orki_bdestroy(fd,&IN);orki_bdestroy(fd,&OUT);orki_bdestroy(fd,&SCR);orki_bdestroy(fd,&LUT);orki_bdestroy(fd,&WT);
     return rc_ret;
 }
 
@@ -8432,40 +8432,40 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     g_last_op="silu_i16_op"; g_last_K=M; g_last_N=N; g_last_wdom=0; g_last_import=0;   /* accurate wedge telemetry (no validate_regcmd here) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* int16 atom-8, 2-byte, surf_stride=M*16 */
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
-     * A standalone SDP LUT-op runs right after a matmul that may have dom_activate()'d a NON-0 domain
+     * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
     int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* Build the LUT-load regcmd content + the activation regcmd ONCE. */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memcpy(rc,REGCMD_SILU_STD_I16,sizeof rc);
     set_mul_geom(rc,REGCMD_SILU_STD_I16_N,M,N);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,idx_off);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,cfg4064);
-    setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,cfg4068);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)r_mult);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)r_shift);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,out_bias);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,idx_off);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,cfg4064);
+    orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,cfg4068);
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* #35: the int16 silu is a STANDALONE pure-SDP op (enable_mask 0x18). IN A CHAIN, its submit wedges in
      * the chain CONTEXT (works standalone at every shape, i16_shape_probe). NO userspace mitigation fixes
@@ -8479,10 +8479,10 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * MISREAD — dmesg "RKNPU: soft reset" counts the DELIBERATE ACT_RESET (ORK_DEBUG_RESET: 23 act calls ->
      * 27 dmesg entries), not hardware wedges (errno=110 count = 0 in a full chain run). Removing it: int16
      * chain prefill 28->68 tok/s, PPL 19.02 unchanged, 0 real wedges. Default OFF; ORK_I16_RESET re-enables. */
-    if(getenv("ORK_I16_RESET")) act(fd,RKNPU_ACT_RESET,0);
+    if(getenv("ORK_I16_RESET")) orki_act(fd,RKNPU_ACT_RESET,0);
     /* MODE-TRANSITION FIX (mode_probe RE): this LUT op memsets the SHARED c->task to its own SDP descriptor
      * (regcfg_amount 1097 then 69, enable_mask 0x18) and previously left it that way. The single-core matmul
-     * path (run()/submit1) does NOT rebuild c->task — it relies on the init value (regcfg_amount=108,
+     * path (orki_run()/submit1) does NOT rebuild c->task — it relies on the init value (regcfg_amount=108,
      * enable_mask=0xd, regcmd_addr=c->regcmd.dma) persisting. So a later SINGLE-CORE matmul (e.g. the SSD
      * CumBA bmm, N=16) submitted a 108-word matmul regcmd under this stale 69-reg/0x18 SDP task -> the NPU
      * dispatched no task (task counter 0x0) -> errno=110 wedge that ACT_RESET can't clear (poisoned software
@@ -8491,15 +8491,15 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
     struct rknpu_task *tk0=(struct rknpu_task*)c->task.cpu;
     uint32_t sv_amt=tk0->regcfg_amount, sv_en=tk0->enable_mask; uint64_t sv_addr=tk0->regcmd_addr;
     #define SILU_RESTORE_TASK() do{ tk0->regcfg_amount=sv_amt; tk0->enable_mask=sv_en; tk0->regcmd_addr=sv_addr; \
-        bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
+        orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ SILU_RESTORE_TASK(); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; } }
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ SILU_RESTORE_TASK(); orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; } }
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=69; tk->regcmd_addr=c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     /* ORK_I16_DUMP: dump the exact submit context so the WEDGING chain submit can be diffed byte-for-byte
@@ -8511,10 +8511,10 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
             (unsigned long long)Lrc.dma,Lrc.domain,(unsigned long long)Lsc.dma,Lsc.domain,
             (unsigned long long)c->regcmd.dma,tk->regcfg_amount,(unsigned long long)c->task.obj,c->last_dt,c->warmed);
         fflush(stderr); }
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
     SILU_RESTORE_TASK();     /* leave the shared c->task as the matmul path expects (see save above) */
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBEH
     #undef SILU_RESTORE_TASK
     return ok;
@@ -8539,17 +8539,17 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
      * reads out-of-bounds lands in MAPPED memory (garbage -> diagnosable) instead of hanging the AXI/IOMMU bus
      * (the hard-wedge failure mode). The extra pages are mapped in the same IOVA domain and never freed early. */
     size_t aszg=(size_t)M*K*8+(1u<<20), bszg=bsz*8+(1u<<20);
-    struct buf A =bcreate(fd,aszg,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bszg,0x403,dom);            if(!B.cpu) {bdestroy(fd,&A);return -2;}
+    struct buf A =orki_bcreate(fd,aszg,0x403,dom);            if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bszg,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
     memset(A.cpu,0,aszg); memset(B.cpu,0,bszg);          /* zero the guard region so OOB reads see zeros, not stale */
     size_t cszg=(size_t)M*N*4*8+65536;                   /* #39: oversize C 8x as an OOB guard while RE'ing the mfold output stride (a wrong stride writes in-bounds -> diagnosable, not a wedge) */
-    struct buf Cc=bcreate(fd,cszg,0x403,dom);            if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom);   if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf Cc=orki_bcreate(fd,cszg,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RCb=orki_bcreate(fd,(size_t)rn*4,0x403,dom);   if(!RCb.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     if(Adata){ size_t acp=(Abytes>0)?(size_t)Abytes:(size_t)M*K; if(acp>aszg)acp=aszg; memcpy(A.cpu,Adata,acp); }   /* real captured A (full span, incl. any fold padding), clamped to the buffer */
     else memset(A.cpu,1,(size_t)M*K);   /* garbage (timing only) */
     if(Bdata) memcpy(B.cpu,Bdata,(Bbytes>0)?(size_t)Bbytes:(size_t)K*N); else memset(B.cpu,1,bsz);   /* real captured strided weight, or garbage */
     memset(Cc.cpu,0,cszg);
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
     /* #39 SAFETY: neutralize any PC chain descriptor (0x0101:0x0010 next-regcmd-addr / 0x0014 next-amount)
      * baked into a CAPTURED regcmd. We submit task_number=1 (single task), so the chain link is meaningless
@@ -8559,14 +8559,14 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
      * path already did this; doing it here makes every ork_npu_replay_i8 caller — incl. replay_mm_i8 — safe.) */
     for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
         if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
-    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
-    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);            /* B (weights) */
-    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C output IOVA (the ONLY output address; 0x40c0/SURFACE_ADD is a config value, NOT an address — do not patch it) */
+    orki_setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
+    orki_setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);            /* B (weights) */
+    orki_setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);          /* C output IOVA (the ONLY output address; 0x40c0/SURFACE_ADD is a config value, NOT an address — do not patch it) */
     if(getenv("ORK_REPLAY_IOVA")) fprintf(stderr,"[replay-iova] A=%#x B=%#x C=%#x RC=%#x task=%#x\n",(unsigned)A.dma,(unsigned)B.dma,(unsigned)Cc.dma,(unsigned)RCb.dma,(unsigned)c->task.dma);  /* #39: observe IOVA stability across runs (intermittency diag) */
-    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _RSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
         sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
@@ -8577,15 +8577,15 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
      * reset here so we can A/B whether it makes the submit deterministic (one-time ~107ms, before the
      * timed loop, so it doesn't taint the per-submit timing). */
     if(getenv("ORK_REPLAY_RESET")){ struct rknpu_action a={.flags=RKNPU_ACT_RESET,.value=0}; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); }
-    _RSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto done; }          /* warm */
-    bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+    _RSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto done; }          /* warm */
+    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(Cout) memcpy(Cout,Cc.cpu,(size_t)M*N*4);           /* computed output for correctness check vs captured C */
     { double t0=ork_now_us();
-      for(int i=0;i<iters;i++){ _RSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)){ goto done; } }
+      for(int i=0;i<iters;i++){ _RSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto done; } }
       if(us) *us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
     #undef _RSUB
 done:
-    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc); orki_bdestroy(fd,&RCb); return ret;
 }
 /* #39 A-layout solver: submit a FIXED (captured) regcmd for `nvar` A-variants, reusing ONE buffer set so the
  * IOVA is stable across submits. The fresh-alloc-per-call path (ork_npu_replay_i8 called N times) intermittently
@@ -8598,38 +8598,38 @@ int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, i
     int dom=c->dom_active;
     size_t bsz=(Bbytes>(int)((size_t)K*N))?(size_t)Bbytes:(size_t)K*N;
     size_t aszg=(size_t)M*K*8+(1u<<20), bszg=bsz*8+(1u<<20), cszg=(size_t)M*N*4*8+65536;
-    struct buf A =bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RCb=orki_bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     memset(B.cpu,0,bszg); if(Bdata)memcpy(B.cpu,Bdata,(Bbytes>0)?(size_t)Bbytes:(size_t)K*N); else memset(B.cpu,1,bsz);
-    bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
     for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff,b=(rc[k+1]>>16)&0xffff; if(b==0x101&&(o==0x0010||o==0x0014)){rc[k]&=0xffff;rc[k+1]&=0xffff0000u;} }
-    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
-    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
-    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
-    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
+    orki_setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+    orki_setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
+    orki_bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub;
     #define _SSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
         sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
     size_t acp=(size_t)astride; if(acp>aszg)acp=aszg;
-    memset(A.cpu,0,aszg); memcpy(A.cpu,Avar,acp); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);   /* warm w/ variant 0 */
-    _SSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
+    memset(A.cpu,0,aszg); memcpy(A.cpu,Avar,acp); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);   /* warm w/ variant 0 */
+    _SSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
     for(int v=0; v<nvar; v++){
-        memset(A.cpu,0,aszg); memcpy(A.cpu, Avar+(size_t)v*astride, acp); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
-        memset(Cc.cpu,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
-        _SSUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
-        bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+        memset(A.cpu,0,aszg); memcpy(A.cpu, Avar+(size_t)v*astride, acp); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(Cc.cpu,0,(size_t)M*N*4); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+        _SSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto sdone;
+        orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
         memcpy(Couts+(size_t)v*M*N, Cc.cpu, (size_t)M*N*4);
     }
     ret=0;
     #undef _SSUB
 sdone:
-    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc); orki_bdestroy(fd,&RCb); return ret;
 }
 /* #39 A-layout MAPPER (Route A): recover the fold's A-read map — for each weight one-hot position Bpos[i]
  * (= ork_woff byte for logical (n0, k0_i)), which A-buffer BYTE OFFSET does the fold pull for each output
@@ -8643,36 +8643,36 @@ int ork_npu_replay_i8_amap(ork_npu *c, const uint32_t *regcmd, int rn, int M, in
     int fd=c->fd; if(fd<0)return -3; if(rn<8||rn>2048||M<1||(K%32)||(N%16)||nk0<1)return -2;
     int dom=c->dom_active;
     size_t aszg=(size_t)M*K*8+(1u<<20), bszg=(size_t)K*N*8+(1u<<20), cszg=(size_t)M*N*4*8+65536;
-    struct buf A =bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
-    struct buf B =bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {bdestroy(fd,&A);return -2;}
-    struct buf Cc=bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){bdestroy(fd,&A);bdestroy(fd,&B);return -2;}
-    struct buf RCb=bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){bdestroy(fd,&A);bdestroy(fd,&B);bdestroy(fd,&Cc);return -2;}
+    struct buf A =orki_bcreate(fd,aszg,0x403,dom);          if(!A.cpu)  return -2;
+    struct buf B =orki_bcreate(fd,bszg,0x403,dom);          if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
+    struct buf Cc=orki_bcreate(fd,cszg,0x403,dom);          if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
+    struct buf RCb=orki_bcreate(fd,(size_t)rn*4,0x403,dom); if(!RCb.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
     uint32_t *rc=(uint32_t*)RCb.cpu; memcpy(rc,regcmd,(size_t)rn*4);
     for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff,b=(rc[k+1]>>16)&0xffff; if(b==0x101&&(o==0x0010||o==0x0014)){rc[k]&=0xffff;rc[k+1]&=0xffff0000u;} }
-    setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
-    setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
-    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
-    bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);
+    orki_setrn(rc,rn,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);
+    orki_setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)Cc.dma);
+    orki_bsync(fd,&RCb,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=108; tk->regcmd_addr=RCb.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int ret=-1; struct rknpu_submit sub; int8_t *ab=(int8_t*)A.cpu; int32_t *cb=(int32_t*)Cc.cpu;
     #define _ASUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->task.obj; \
         sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=mm_timeout_ms(); sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; }while(0)
-    #define _FILLA(pl) do{ for(size_t j=0;j<aszg;j++) ab[j]=(int8_t)((pl<0)?1:((j>>(7*(pl)))&0x7f)); bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
+    #define _FILLA(pl) do{ for(size_t j=0;j<aszg;j++) ab[j]=(int8_t)((pl<0)?1:((j>>(7*(pl)))&0x7f)); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
     /* warm */
-    memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[0]]=1; bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    _FILLA(-1); _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone;
+    memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[0]]=1; orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    _FILLA(-1); _ASUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto adone;
     for(int i=0;i<nk0;i++){
-        memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[i]]=1; bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(B.cpu,0,bszg); ((int8_t*)B.cpu)[Bpos[i]]=1; orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
         /* presence: A=1 -> C==1 at this k0's output slots */
-        _FILLA(-1); memset(cb,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
-        _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone; bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+        _FILLA(-1); memset(cb,0,(size_t)M*N*4); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+        _ASUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto adone; orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
         int t=0; for(int idx=0; idx<M*N && t<M; idx++) if(cb[idx]!=0){ rpos[(size_t)i*M+t]=idx; t++; }
         cnt[i]=t;
         for(int p=0;p<3;p++){
-            _FILLA(p); memset(cb,0,(size_t)M*N*4); bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
-            _ASUB(); if(rknpu_submit_ioctl(fd,&sub,dom)) goto adone; bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+            _FILLA(p); memset(cb,0,(size_t)M*N*4); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
+            _ASUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)) goto adone; orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
             for(int tt=0;tt<t;tt++){ int32_t d=cb[rpos[(size_t)i*M+tt]]&0x7f;
                 if(p==0) aoff[(size_t)i*M+tt]=d; else aoff[(size_t)i*M+tt]|=(int32_t)d<<(7*p); }
         }
@@ -8681,7 +8681,7 @@ int ork_npu_replay_i8_amap(ork_npu *c, const uint32_t *regcmd, int rn, int M, in
     #undef _ASUB
     #undef _FILLA
 adone:
-    bdestroy(fd,&A); bdestroy(fd,&B); bdestroy(fd,&Cc); bdestroy(fd,&RCb); return ret;
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc); orki_bdestroy(fd,&RCb); return ret;
 }
 int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
                            const int16_t *in,int M,int N,int16_t *out,double *us){
@@ -8690,45 +8690,45 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     if(M<1||M>8192||N<8||N>8192||(N&7)||rn>REGCMD_SILU_STD_I16_N) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
-     * A standalone SDP LUT-op runs right after a matmul that may have dom_activate()'d a NON-0 domain
+     * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
      * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
      * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
      * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
     int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf O=bcreate(fd,sz,0x403,dom); if(!O.cpu){bdestroy(fd,&A);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);return -2;}
-    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;}
+    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
+    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
       for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
           lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
        * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
        * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
        * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
     uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
     set_mul_geom(rc,rn,M,N);
-    setrn(rc,rn,RK_SDP_5040,0); setrn(rc,rn,RK_SDP_5038,0);
-    setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(rc,rn,RK_SDP_5018,(uint32_t)A.dma);
-    memcpy(c->regcmd.cpu,rc,(size_t)rn*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_setrn(rc,rn,RK_SDP_5040,0); orki_setrn(rc,rn,RK_SDP_5038,0);
+    orki_setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,rn,RK_SDP_5018,(uint32_t)A.dma);
+    memcpy(c->regcmd.cpu,rc,(size_t)rn*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
     tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(uint32_t)(rn/2-4); tk->regcmd_addr=c->regcmd.dma;
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1; double t1=0; sub.timeout=ew_timeout_ms(); double t0=ork_now_us();
     /* ORK_I16_DUMP: dump the exact submit context so the WEDGING chain submit can be diffed byte-for-byte
@@ -8740,9 +8740,9 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
             (unsigned long long)Lrc.dma,Lrc.domain,(unsigned long long)Lsc.dma,Lsc.domain,
             (unsigned long long)c->regcmd.dma,tk->regcfg_amount,(unsigned long long)c->task.obj,c->last_dt,c->warmed);
         fflush(stderr); }
-    if(!rknpu_submit_ioctl(fd,&sub,dom)){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBEH
     return ok;
 }
@@ -8773,54 +8773,54 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
      * SiLU probes (ork_npu_probe_silu_std_i16). dom==0 for every single-domain caller => behavior-preserving.
      * ORK_SILU_DOM0=1 forces dom0 (A/B / disable the fix). */
     int dom = getenv("ORK_SILU_DOM0") ? 0 : c->dom_active;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,dom); if(!W.cpu) return -2;
     int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N,0x403,dom); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
-    struct buf Lsc=bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -2;} /* LUT-load regcmd */
+    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;} /* LUT-load scratch (reg 0x4020) */
+    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     /* Prime against a fresh-buffer stale-read/wedge — but ONLY when the NPU isn't already int8-warm. The chain
      * builds the fused-SiLU LUT via this probe once per layer during prep; an unconditional ~107ms ACT_RESET
      * fired ~once/layer (28 cold resets on the first forward pass, hurting cold TTFT/pp128). When int8-live the
      * probe's own 3-rep warmup (below) flushes stale reads, so the reset is redundant. ORK_PROBE_RESET=1 forces
      * it (fallback). Standalone/cold callers still reset. LUT calibration is unaffected (validated bit-exact). */
-    if(!ORK_I8_LIVE(c->last_dt) || getenv("ORK_PROBE_RESET")) act(fd,RKNPU_ACT_RESET,0);
+    if(!ORK_I8_LIVE(c->last_dt) || getenv("ORK_PROBE_RESET")) orki_act(fd,RKNPU_ACT_RESET,0);
 
     /* ---- submit 1: LUT-load (enable=0x18, regcfg=1097) — streams the silu LUT into PPU SRAM ---- */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma); /* patch the one output addr */
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma); /* patch the one output addr */
     if(lut){ uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;   /* override LUT data: stream lut[] into the 0x4104 writes in order */
         for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&sub,dom)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
 
     /* ---- submit 2: matmul compute (enable=0x1d, regcfg=108) reading the resident LUT ---- */
     uint32_t rc[REGCMD_I8_N];
-    synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
     if(getenv("ORK_FUSED_DUMP")){ for(int k=0;k+1<REGCMD_I8_N;k+=2) fprintf(stderr,"PROBE %04x=%08x l=%04x\n",rc[k]&0xffff,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16),rc[k+1]>>16); }
     struct buf extra[2]={W,O};
-    if(validate_regcmd("probe_i8_silu",c,rc,REGCMD_I8_N,NULL,extra,2)){ bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(orki_validate_regcmd("probe_i8_silu",c,rc,REGCMD_I8_N,NULL,extra,2)){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
       t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       int ok=-1; double t1=0;
       for(int rep=0;rep<3;rep++){ sub.timeout=mm_timeout_ms(); double t0=ork_now_us();
-          if(rknpu_submit_ioctl(fd,&sub,dom)){ ok=-1; break; }
-          bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
+          if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ ok=-1; break; }
+          orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
       if(ok==0){ memcpy(C,O.cpu,(size_t)M*N); if(us)*us=t1; }
-      bdestroy(fd,&W);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+      orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
       return ok;
     }
 }
@@ -9022,65 +9022,65 @@ int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
 
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
-    struct buf Wd=bcreate(fd,32*32,0x403,dom), Ad=bcreate(fd,32,0x403,dom), Cd=bcreate(fd,32*4,0x403,dom);
+    struct buf A=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom);
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=orki_bcreate(fd,4096,0x403,dom);
+    struct buf Wd=orki_bcreate(fd,32*32,0x403,dom), Ad=orki_bcreate(fd,32,0x403,dom), Cd=orki_bcreate(fd,32*4,0x403,dom);
     if(!A.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu||!Wd.cpu||!Ad.cpu||!Cd.cpu){ goto fail; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(Cd.cpu,0,32*4);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
     { int8_t*wd=Wd.cpu,*ad=Ad.cpu; for(int i=0;i<32*32;i++)wd[i]=1; for(int i=0;i<32;i++)ad[i]=1; }   /* all-1s -> C[n]=32 iff task0 matmul ran */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* submit 1: LUT-load (separate; loads the silu LUT into SDP SRAM, ping-pong OFF) */
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&s,dom)) goto fail; }
+      if(orki_rknpu_submit_ioctl(fd,&s,dom)) goto fail; }
 
     /* build the 2-task chain in c->regcmd: [0]=matmul (32x32) with descriptor -> [1]=silu */
     { uint32_t *mm=(uint32_t*)c->regcmd.cpu;                  /* task0 regcmd at word 0 */
       uint32_t *si=(uint32_t*)((char*)c->regcmd.cpu + (size_t)REGCMD_I8_N*4);   /* task1 regcmd */
       memset(mm,0,REGCMD_I8_N*4);
-      synth_i8(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,1,CBUF,0);
+      orki_synth_i8(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,1,CBUF,0);
       uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;         /* next = silu regcmd addr */
       mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;   /* next register-amount = (silu regcfg+3)/2 */
       memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
       set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
-      bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
+      orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
       struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
       tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
       tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=nx;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=2;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();
       s.subcore_task[0]=(struct rknpu_subcore_task){0,2};
       double t0=ork_now_us();
-      if(rknpu_submit_ioctl(fd,&s,dom)) goto fail;
-      bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE);
+      if(orki_rknpu_submit_ioctl(fd,&s,dom)) goto fail;
+      orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE);
       if(us)*us=ork_now_us()-t0;
     }
     for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n));
     if(mm_ran){ int32_t*cd=Cd.cpu; int nz=0; for(int i=0;i<32;i++) if(cd[i]!=0) nz=1; *mm_ran=nz; }   /* did task0 (matmul) run? */
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);orki_bdestroy(fd,&Wd);orki_bdestroy(fd,&Ad);orki_bdestroy(fd,&Cd);
     #undef EWCUBEH
     return 0;
 fail:
-    bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);orki_bdestroy(fd,&Wd);orki_bdestroy(fd,&Ad);orki_bdestroy(fd,&Cd);
     #undef EWCUBEH
     return -1;
 }
@@ -9107,46 +9107,46 @@ int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
     for(int k=lo;k<=hi;k++){ if(qn[k])continue; int a=k,b=k; while(a>lo&&!qn[a])a--; while(b<hi&&!qn[b])b++;
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
-    struct buf Wd=bcreate(fd,32*32*2,0x403,dom), Ad=bcreate(fd,32*2,0x403,dom), Cd=bcreate(fd,32*4,0x403,dom); /* fp16 A/W, fp32 C */
+    struct buf A=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom);
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=orki_bcreate(fd,4096,0x403,dom);
+    struct buf Wd=orki_bcreate(fd,32*32*2,0x403,dom), Ad=orki_bcreate(fd,32*2,0x403,dom), Cd=orki_bcreate(fd,32*4,0x403,dom); /* fp16 A/W, fp32 C */
     int ret=-1; int16_t *inb=malloc((size_t)M*N*2);
     if(!A.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu||!Wd.cpu||!Ad.cpu||!Cd.cpu||!inb){ goto mfail; }
     memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(Cd.cpu,0,32*4);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int16_t v=(int16_t)((m*N+n)%20000-8000); inb[m*N+n]=v; *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=v; }
     { uint16_t*wd=Wd.cpu,*ad=Ad.cpu; for(int i=0;i<32*32;i++)wd[i]=0x3c00; for(int i=0;i<32;i++)ad[i]=0x3c00; } /* fp16 1.0 -> C=32 */
-    bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Wd,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&Ad,RKNPU_MEM_SYNC_TO_DEVICE);
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&s,dom)) goto mfail; }
+      if(orki_rknpu_submit_ioctl(fd,&s,dom)) goto mfail; }
     /* chain: [0]=FP16 matmul (synth) -> [1]=int16 silu */
     { uint32_t *mm=(uint32_t*)c->regcmd.cpu, *si=(uint32_t*)((char*)c->regcmd.cpu+(size_t)REGCMD_I8_N*4);
       memset(mm,0,REGCMD_I8_N*4);
-      synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,0,CBUF);   /* FP16 matmul task0 (sched=0: K=32<96 small-K 0x1040 fix) */
+      orki_synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,0,CBUF);   /* FP16 matmul task0 (sched=0: K=32<96 small-K 0x1040 fix) */
       uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;
       mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;
       memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
       set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma); setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
-      setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
-      bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+      orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
+      orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
       struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,2*sizeof *tk);
       tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=c->regcmd.dma;
       tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=nx;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=2;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,2};
       double t0=ork_now_us();
-      for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&s,dom)) goto mfail;   /* rep0 primes fresh buffers */
-          bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE); }
+      for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&s,dom)) goto mfail;   /* rep0 primes fresh buffers */
+          orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&Cd,RKNPU_MEM_SYNC_FROM_DEVICE); }
       if(us)*us=ork_now_us()-t0; }
     { float *cd=Cd.cpu; int ok=1; for(int i=0;i<32;i++) if(fabs(cd[i]-32.0)>0.5) ok=0; if(mm_ok)*mm_ok=ok; }   /* fp16 matmul: C=32 */
     { int ok=1,bad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double ref=silu_f(inb[m*N+n]*in_scale)/out_scale;
@@ -9154,7 +9154,7 @@ int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
       ok=(bad<=(M*N)/20); if(silu_ok)*silu_ok=ok; }
     ret=0;
 mfail:
-    free(inb); bdestroy(fd,&A);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);bdestroy(fd,&Wd);bdestroy(fd,&Ad);bdestroy(fd,&Cd);
+    free(inb); orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);orki_bdestroy(fd,&Wd);orki_bdestroy(fd,&Ad);orki_bdestroy(fd,&Cd);
     #undef EWCUBEH
     return ret;
 }
@@ -9189,49 +9189,49 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
 
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom);
-    struct buf G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom);       /* G = matmul int16 out = silu in */
-    struct buf Lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=bcreate(fd,4096,0x403,dom);
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,dom);
+    struct buf G=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom);       /* G = matmul int16 out = silu in */
+    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom), Lsc=orki_bcreate(fd,4096,0x403,dom);
     if(!W.cpu||!G.cpu||!O.cpu||!Lrc.cpu||!Lsc.cpu){ fprintf(stderr,"[gatesilu] buffer alloc failed\n"); goto gfail; }
     { int NN=N/32,KT=K/32; int8_t*bb=W.cpu;                                  /* int8 weight tile [Nt][Kt][32][32] */
       for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
     memset(G.cpu,0,sz); memset(O.cpu,0,sz);
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
 
     /* submit 1: silu LUT-load (separate, ping-pong off). ORK_GS_NOLUT skips it -> matmul becomes the FIRST
-     * NPU op after act(RESET) (diagnostic: does a preceding SDP LUT-load poison the following int8 matmul?). */
+     * NPU op after orki_act(RESET) (diagnostic: does a preceding SDP LUT-load poison the following int8 matmul?). */
     if(!getenv("ORK_GS_NOLUT")){
     memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
+    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
     { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
         lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu] LUT-load submit failed (errno=%d)\n",errno); goto gfail; } }
+      if(orki_rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu] LUT-load submit failed (errno=%d)\n",errno); goto gfail; } }
     }
 
     /* build the 2 chained programs: [0] matmul int16-out -> G ; [1] silu G -> O */
     static uint32_t mm[REGCMD_I8_N], si[REGCMD_SILU_STD_I16_N];
-    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);
-    set_i16_out(mm,N,0,mult,shift);
+    orki_synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);
+    orki_set_i16_out(mm,N,0,mult,shift);
     memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
     set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)G.dma);            /* silu INPUT = matmul OUTPUT */
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
-    setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5018,(uint32_t)G.dma);            /* silu INPUT = matmul OUTPUT */
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000u);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14u);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0u);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064);
+    orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
 
     double t0=ork_now_us();
     if(getenv("ORK_GS_SEQ")){
@@ -9239,34 +9239,34 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
          * task_number=1 submits, no reset between (act RESET ran above). Isolates the int16 DATA bridge
          * (does the matmul int16 output layout match the silu EWCUBEH input?) from the HW chain-walk. */
         fprintf(stderr,"[gatesilu-seq] submitting matmul (int16-out) task_number=1...\n");
-        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma;
-          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
           struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] matmul submit failed errno=%d\n",errno); goto gfail; } }
+          if(orki_rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] matmul submit failed errno=%d\n",errno); goto gfail; } }
         fprintf(stderr,"[gatesilu-seq] matmul OK; submitting silu task_number=1...\n");
-        bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);   /* keep G resident for the silu */
-        memcpy(c->regcmd.cpu,si,REGCMD_SILU_STD_I16_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE);   /* keep G resident for the silu */
+        memcpy(c->regcmd.cpu,si,REGCMD_SILU_STD_I16_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=69; t->regcmd_addr=(uint32_t)c->regcmd.dma;
-          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
           struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=0x1;s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] silu submit failed errno=%d\n",errno); goto gfail; } }
+          if(orki_rknpu_submit_ioctl(fd,&s,dom)){ fprintf(stderr,"[gatesilu-seq] silu submit failed errno=%d\n",errno); goto gfail; } }
     } else {
         ork_chain_prog progs[2] = { { mm, REGCMD_I8_N, 0xd, 108, 216 }, { si, REGCMD_SILU_STD_I16_N, 0x18, 69, -1 } };
         int crc=ork_npu_chain_progs(c,2,progs,dom);
         if(crc){ fprintf(stderr,"[gatesilu] chain_progs rc=%d (errno=%d) — -2 no-descriptor-slot/bad-args, -1 submit wedge\n",crc,errno); goto gfail; }
     }
-    bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     if(us)*us=ork_now_us()-t0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){
         if(gate_out) gate_out[m*N+n]=*(int16_t*)((char*)G.cpu+EWCUBEH(m,n));
         out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n));
     }
-    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBEH
     return 0;
 gfail:
-    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&Lrc);bdestroy(fd,&Lsc);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBEH
     return -1;
 }
@@ -9283,8 +9283,8 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,dom), G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom), SB=bcreate(fd,4096,0x403,dom);
-    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB); return -1; }
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,dom), G=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom), SB=orki_bcreate(fd,4096,0x403,dom);
+    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB); return -1; }
     { int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
       for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
@@ -9303,40 +9303,40 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
      * Next lever = capture a vendor GEMM with fp16-out (how the vendor emits fp16 from a matmul-class op). */
     uint32_t r34=0x00000008u;                                                 /* ERDMA per-channel + 2-byte (int16 SDP) */
     { int16_t*sb=(int16_t*)SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }      /* int16 per-channel scale CONTIGUOUS [N] */
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     if(getenv("ORK_I16_ENTER")) ork_npu_enter(c,DT_I8,XP_SC_MM,OCK_NONE);   /* layer entry */
-    else act(fd,RKNPU_ACT_RESET,0);                                         /* gatesilu-style bare reset (proven for this chained int16-out matmul) */
+    else orki_act(fd,RKNPU_ACT_RESET,0);                                         /* gatesilu-style bare reset (proven for this chained int16-out matmul) */
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
-    synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
-    set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
-    { const char*e=getenv("ORK_I16_MM4010"); if(e) setrn(mm,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
+    orki_synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
+    orki_set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
+    { const char*e=getenv("ORK_I16_MM4010"); if(e) orki_setrn(mm,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
     /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
      * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
      * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
     if(getenv("ORK_I16_MULTMPL")){   /* OLD: standalone-captured REGCMD_MUL_I16 (hangs chained — no chained-ERDMA arming) */
         memcpy(pc,REGCMD_MUL_I16,sizeof pc);
         set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
-        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)G.dma);
-        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)SB.dma);
-        setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5034,r34);
-        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2);
-        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
-        setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_CFG,0x00000053); setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BN_CFG,0x00000053);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)G.dma);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)SB.dma);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5034,r34);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
+        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_CFG,0x00000053); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BN_CFG,0x00000053);
     } else {   /* CHAIN-SAFE int16 SDP = the PROVEN chained fp16 template (REGCMD_MUL_F16_CHAIN, vendor conv->mul
                 * chained-ERDMA arming), patched precision fp16->int16: 0x4010 int16 DATA_FORMAT, int16 requant
                 * (m2/s2), ERDMA per-channel 2-byte. The chain-safe arming (0x5004/0x5008/0x5044/BS-bypass) is
                 * inherited verbatim — that's what REGCMD_MUL_I16 lacked. */
         memcpy(pc,REGCMD_MUL_F16_CHAIN,REGCMD_MUL_F16_CHAIN_N*4);
         set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
         uint32_t r10=getenv("ORK_I16_R4010")?strtoul(getenv("ORK_I16_R4010"),0,0):0x24000001; /* int16 DATA_FORMAT (was fp16 0x48000002) */
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_PRECISION,r10);
-        setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_PRECISION,r10);
+        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
     }
     double t0=ork_now_us();
     int crc;
@@ -9348,25 +9348,25 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
         /* mirror the WORKING standalone (mul_perchan_i16): the task already points at c->regcmd from init — only
          * flip regcfg_amount + enable_mask (NO memset / regcmd_addr, which would clobber init's task config). */
         struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask; crc=0;
-        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        { tk->regcfg_amount=108; tk->enable_mask=0xd; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        { tk->regcfg_amount=108; tk->enable_mask=0xd; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
           struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] MATMUL submit failed errno=%d dom=%d\n",errno,dom);} else bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); }   /* matmul -> atom-8 int16 G (device-resident) */
+          if(orki_rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] MATMUL submit failed errno=%d dom=%d\n",errno,dom);} else orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); }   /* matmul -> atom-8 int16 G (device-resident) */
         if(!crc){ ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer */
-          memcpy(c->regcmd.cpu,pc,REGCMD_MUL_I16_N*4); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-          tk->regcfg_amount=69; tk->enable_mask=0x18; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+          memcpy(c->regcmd.cpu,pc,REGCMD_MUL_I16_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+          tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
           struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] SDP submit failed errno=%d dom=%d\n",errno,dom);} else bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }              /* SDP per-channel scale (reads G atom-8 in place) -> O */
-        tk->regcfg_amount=saa; tk->enable_mask=see; bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);   /* restore shared task */
+          if(orki_rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] SDP submit failed errno=%d dom=%d\n",errno,dom);} else orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }              /* SDP per-channel scale (reads G atom-8 in place) -> O */
+        tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);   /* restore shared task */
     } else {
         ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
         crc=ork_npu_chain_progs(c,2,progs,dom);
-        if(crc){ bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); int gnz=0; int16_t*g=(int16_t*)G.cpu; for(int i=0;i<M*N;i++) if(g[i])gnz++;
+        if(crc){ orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); int gnz=0; int16_t*g=(int16_t*)G.cpu; for(int i=0;i<M*N;i++) if(g[i])gnz++;
             fprintf(stderr,"[i16chain] chain_progs crc=%d errno=%d — G nonzero=%d/%d (task0 matmul %s)\n",crc,errno,gnz,M*N,gnz?"COMPLETED":"did NOT complete"); }
     }
-    if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+    if(!crc){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }  /* int16 O */
-    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB);
     #undef EWCUBEH
     return crc;
 }
@@ -9383,8 +9383,8 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_HW);                    /* prime the fp16 pipeline (2-pass cold re-warm) — synth's fp16 matmul writes zeros unwarmed */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf W=bcreate(fd,(size_t)K*N*2,0x403,dom), G=bcreate(fd,sz,0x403,dom), O=bcreate(fd,sz,0x403,dom), SB=bcreate(fd,4096,0x403,dom);
-    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB); return -1; }
+    struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,dom), G=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom), SB=orki_bcreate(fd,4096,0x403,dom);
+    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB); return -1; }
     { int NN=N/16,KT=K/32; uint16_t*bb=W.cpu;                                     /* fp16 weight tile [N/16][K/32][16][32] */
       for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)]; }
@@ -9392,24 +9392,24 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     { uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }                   /* fp16 activation raw [M][K] */
     uint32_t r34=0x00000008u;                                                     /* ERDMA per-channel + 2-byte (fp16 SDP) */
     { ork_f16*sb=(ork_f16*)SB.cpu; for(int n=0;n<N;n++) sb[n]=*(const ork_f16*)&scale[n]; }  /* fp16 per-channel scale CONTIGUOUS [N] */
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);                                /* run_stream_f16's rule; small K => sched=0 (sched=1 miscomputes small K) */
-    synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,sched,CBUF); /* prog0: FP16 matmul -> G (CONTIGUOUS [M][N]) */
+    orki_synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,sched,CBUF); /* prog0: FP16 matmul -> G (CONTIGUOUS [M][N]) */
     set_f16_out_fp16in(mm,M,N);                                                   /* fp16-out ATOM-8 stage (matches the SDP's set_mul_geom layout) */
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
     set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);                /* INPUT = matmul OUTPUT (bridge) */
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,r34);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);                /* INPUT = matmul OUTPUT (bridge) */
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,r34);
     double t0=ork_now_us();
     ork_chain_prog progs[2]={ {mm,REGCMD_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,-1} };
     int crc=ork_npu_chain_progs(c,2,progs,dom);
-    if(!crc){ bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
+    if(!crc){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); }
-    bdestroy(fd,&W);bdestroy(fd,&G);bdestroy(fd,&O);bdestroy(fd,&SB);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB);
     #undef EWCUBEH
     return crc;
 }
@@ -9427,29 +9427,29 @@ int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *n
     if (Kp % 32 || N % 32 || N > c->soc->nmax || M < 1 || M > 64 || (N & 7)) return -2;
     ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);
     size_t gsz = (size_t)M * N * 2; if (gsz < 4096) gsz = 4096;
-    struct buf W0 = bcreate(fd,(size_t)Kp*N*2,0x403,dom), W1 = bcreate(fd,(size_t)Kp*N*2,0x403,dom);
-    struct buf G0 = bcreate(fd,gsz,0x403,dom), G1 = bcreate(fd,gsz,0x403,dom);
-    struct buf GI = bcreate(fd,gsz,0x403,dom), GO = bcreate(fd,gsz,0x403,dom), SB = bcreate(fd,4096,0x403,dom);
+    struct buf W0 = orki_bcreate(fd,(size_t)Kp*N*2,0x403,dom), W1 = orki_bcreate(fd,(size_t)Kp*N*2,0x403,dom);
+    struct buf G0 = orki_bcreate(fd,gsz,0x403,dom), G1 = orki_bcreate(fd,gsz,0x403,dom);
+    struct buf GI = orki_bcreate(fd,gsz,0x403,dom), GO = orki_bcreate(fd,gsz,0x403,dom), SB = orki_bcreate(fd,4096,0x403,dom);
     if (!W0.cpu||!W1.cpu||!G0.cpu||!G1.cpu||!GI.cpu||!GO.cpu||!SB.cpu) {
-        bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&G0);bdestroy(fd,&G1);bdestroy(fd,&GI);bdestroy(fd,&GO);bdestroy(fd,&SB); return -1; }
+        orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1);orki_bdestroy(fd,&G0);orki_bdestroy(fd,&G1);orki_bdestroy(fd,&GI);orki_bdestroy(fd,&GO);orki_bdestroy(fd,&SB); return -1; }
     { int NN=N/16, KT=Kp/32; uint16_t *b0=W0.cpu, *b1=W1.cpu;   /* fp16 weight tile [N/16][Kp/32][16][32]; W0 all 1.0, W1 all 1.0 shifted (distinct) */
       for (int nt=0;nt<NN;nt++) for (int kt=0;kt<KT;kt++) for (int nl=0;nl<16;nl++) for (int kk=0;kk<32;kk++) {
           size_t o=(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk; b0[o]=0x3c00; b1[o]=0x3c00; } }   /* 0x3c00 = fp16 1.0 */
     { uint16_t *ad=c->Af.cpu; for (int j=0;j<M*Kp;j++) ad[j]=0x3c00; }   /* A = 1.0 */
     memset(G0.cpu,0,gsz); memset(G1.cpu,0,gsz); memset(GI.cpu,0,gsz); memset(GO.cpu,0,gsz); memset(SB.cpu,0,4096);
     { uint16_t *sb=SB.cpu; for (int n=0;n<N;n++) sb[n]=0x3c00; }   /* identity per-channel scale (fp16 1.0) */
-    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&G0,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&G1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&GI,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&GO,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&G0,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&G1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&GI,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&GO,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm0[REGCMD_N], mm1[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
     int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
-    synth(mm0,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)G0.dma,sched,CBUF); set_f16_out_fp16in(mm0,M,N);
-    synth(mm1,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G1.dma,sched,CBUF); set_f16_out_fp16in(mm1,M,N);
+    orki_synth(mm0,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)G0.dma,sched,CBUF); set_f16_out_fp16in(mm0,M,N);
+    orki_synth(mm1,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G1.dma,sched,CBUF); set_f16_out_fp16in(mm1,M,N);
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc); set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)GO.dma);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)GI.dma);   /* gap INPUT = dummy scratch (NOT the matmul output) */
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
-    setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)GO.dma);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)GI.dma);   /* gap INPUT = dummy scratch (NOT the matmul output) */
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
+    orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);
     double t0 = ork_now_us(); int crc;
     if (use_gap) { ork_chain_prog p[3] = { {mm0,REGCMD_N,0xd,108,216}, {pc,REGCMD_MUL_F16_CHAIN_N,0x18,69,138}, {mm1,REGCMD_N,0xd,108,-1} };
         crc = ork_npu_chain_progs(c,3,p,dom); }
@@ -9457,10 +9457,10 @@ int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *n
         crc = ork_npu_chain_progs(c,2,p,dom); }
     if (us) *us = ork_now_us()-t0;
     long z0=0, z1=0;
-    if (!crc) { bsync(fd,&G0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&G1,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if (!crc) { orki_bsync(fd,&G0,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&G1,RKNPU_MEM_SYNC_FROM_DEVICE);
         uint16_t *g0=G0.cpu, *g1=G1.cpu; for (int e=0;e<M*N;e++){ if(g0[e])z0++; if(g1[e])z1++; } }
     if (nz0) *nz0=z0; if (nz1) *nz1=z1;
-    bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&G0);bdestroy(fd,&G1);bdestroy(fd,&GI);bdestroy(fd,&GO);bdestroy(fd,&SB);
+    orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1);orki_bdestroy(fd,&G0);orki_bdestroy(fd,&G1);orki_bdestroy(fd,&GI);orki_bdestroy(fd,&GO);orki_bdestroy(fd,&SB);
     return crc;
 }
 
@@ -9484,7 +9484,7 @@ static void *ork_pcfd_thread(void *vp){
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     sub.timeout=mm_timeout_ms();
     ork_kmsg("PCFD core=%d submit START fd=%d task_obj=0x%llx", a->core, a->fd, (unsigned long long)a->tk->obj);
-    a->rc = rknpu_submit_ioctl(a->fd,&sub,0);   /* buffers all live in domain 0 */
+    a->rc = orki_rknpu_submit_ioctl(a->fd,&sub,0);   /* buffers all live in domain 0 */
     ork_kmsg("PCFD core=%d submit DONE rc=%d", a->core, a->rc);
     return NULL;
 }
@@ -9501,43 +9501,43 @@ int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const 
     struct buf wbuf[ORK_MAXCORE]={{0}}, wimp[ORK_MAXCORE]={{0}}, abuf[ORK_MAXCORE]={{0}},
                cob[ORK_MAXCORE]={{0}}, rcb[ORK_MAXCORE]={{0}}, tkb[ORK_MAXCORE]={{0}};
     int shared_dbuf=-1, ret=-1;
-    for(int i=0;i<cores;i++){ cfd[i]=open(card,O_RDWR); if(cfd[i]<0) goto done; act(cfd[i],RKNPU_POWER_ON,0); }
+    for(int i=0;i<cores;i++){ cfd[i]=open(card,O_RDWR); if(cfd[i]<0) goto done; orki_act(cfd[i],RKNPU_POWER_ON,0); }
     if(mode==1){   /* ONE shared full-N weight imported into every fd; tile the FULL B once via the primary map */
         size_t wsz=(size_t)K*N*2;
-        wimp[0]=bimport(cfd[0],wsz,0); if(!wimp[0].cpu) goto done; shared_dbuf=wimp[0].heap_fd;
-        for(int i=1;i<cores;i++){ wimp[i]=bimport_fd(cfd[i],shared_dbuf,wsz,0); if(!wimp[i].cpu) goto done; wimp[i].heap_fd=0; }
+        wimp[0]=orki_bimport(cfd[0],wsz,0); if(!wimp[0].cpu) goto done; shared_dbuf=wimp[0].heap_fd;
+        for(int i=1;i<cores;i++){ wimp[i]=orki_bimport_fd(cfd[i],shared_dbuf,wsz,0); if(!wimp[i].cpu) goto done; wimp[i].heap_fd=0; }
         int NNf=N/16, KT=K/32; ork_f16*bb=wimp[0].cpu;                          /* full tile [N/16][K/32][16][32] */
         for(int nt=0;nt<NNf;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
             bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
-        for(int i=0;i<cores;i++) bsync(cfd[i],&wimp[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean each fd's mapping of the import */
+        for(int i=0;i<cores;i++) orki_bsync(cfd[i],&wimp[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* clean each fd's mapping of the import */
     }
     for(int i=0;i<cores;i++){
         int n0=i*Ncol; uint32_t aB;
         if(mode==1){ aB=(uint32_t)(wimp[i].dma + (size_t)n0*K*2); }   /* col-tile slice: n0%16==0 => byte off = n0*K*2 (n0/16 whole tiles, each K/32*16*32*2 = K*32*2 B) */
         else {
-            wbuf[i]=bcreate(cfd[i],(size_t)K*Ncol*2,0x403,0); if(!wbuf[i].cpu) goto done;
+            wbuf[i]=orki_bcreate(cfd[i],(size_t)K*Ncol*2,0x403,0); if(!wbuf[i].cpu) goto done;
             int NN=Ncol/16, KT=K/32; ork_f16*bb=wbuf[i].cpu;                   /* per-core tile [Ncol/16][K/32][16][32] of B's cols [n0,n0+Ncol) */
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
                 bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(n0+nt*16+nl)];
-            bsync(cfd[i],&wbuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(cfd[i],&wbuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
             aB=(uint32_t)wbuf[i].dma;
         }
-        abuf[i]=bcreate(cfd[i],(size_t)M*K*2,0x403,0); if(!abuf[i].cpu) goto done;   /* full [M][K] activation (every core needs all of A) */
+        abuf[i]=orki_bcreate(cfd[i],(size_t)M*K*2,0x403,0); if(!abuf[i].cpu) goto done;   /* full [M][K] activation (every core needs all of A) */
         { ork_f16*ad=abuf[i].cpu; for(int j=0;j<M*K;j++) ad[j]=A[j]; }
-        bsync(cfd[i],&abuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(cfd[i],&abuf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         size_t csz=(size_t)M*Ncol*4; if(csz<4096) csz=4096;              /* fp16-out uses M*Ncol*2; over-alloc to 4B/elem, harmless */
-        cob[i]=bcreate(cfd[i],csz,0x403,0); if(!cob[i].cpu) goto done;
-        memset(cob[i].cpu,0,csz); bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* seed */
-        rcb[i]=bcreate(cfd[i],(size_t)REGCMD_N*4,0x403,0); if(!rcb[i].cpu) goto done;
-        tkb[i]=bcreate(cfd[i],4096,0x40b,0); if(!tkb[i].cpu) goto done;
+        cob[i]=orki_bcreate(cfd[i],csz,0x403,0); if(!cob[i].cpu) goto done;
+        memset(cob[i].cpu,0,csz); orki_bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_TO_DEVICE);   /* seed */
+        rcb[i]=orki_bcreate(cfd[i],(size_t)REGCMD_N*4,0x403,0); if(!rcb[i].cpu) goto done;
+        tkb[i]=orki_bcreate(cfd[i],4096,0x40b,0); if(!tkb[i].cpu) goto done;
         uint32_t rc[REGCMD_N];
-        synth(rc,M,K,Ncol,(uint32_t)abuf[i].dma,aB,(uint32_t)cob[i].dma,sched,CBUF);
+        orki_synth(rc,M,K,Ncol,(uint32_t)abuf[i].dma,aB,(uint32_t)cob[i].dma,sched,CBUF);
         set_f16_out_fp16in(rc,M,Ncol);                                   /* fp16-out, contiguous [M][Ncol] (no ORK_F16_ATOM8) */
         memcpy(rcb[i].cpu,rc,(size_t)REGCMD_N*4);
-        bsync(cfd[i],&rcb[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(cfd[i],&rcb[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task*t=(struct rknpu_task*)tkb[i].cpu; memset(t,0,sizeof *t);
         t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=rcb[i].dma;
-        bsync(cfd[i],&tkb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(cfd[i],&tkb[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     { double t0=ork_now_us();                                            /* concurrent per-core-fd submit: one blocking thread/core */
       pthread_t th[ORK_MAXCORE]; struct ork_pcfd_arg ar[ORK_MAXCORE]; int made=0;
@@ -9546,7 +9546,7 @@ int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const 
       for(int i=0;i<made;i++) pthread_join(th[i],NULL);
       if(us) *us=ork_now_us()-t0; }
     for(int i=0;i<cores;i++){ int n0=i*Ncol;                             /* read fp16-out back, de-column into Cout[M,N] fp32 */
-        bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(cfd[i],&cob[i],RKNPU_MEM_SYNC_FROM_DEVICE);
         const ork_f16*cf=(const ork_f16*)cob[i].cpu;
         for(int m=0;m<M;m++) for(int n=0;n<Ncol;n++) Cout[(size_t)m*N+n0+n]=(float)cf[(size_t)m*Ncol+n];
     }
@@ -9554,8 +9554,8 @@ int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const 
 done:
     for(int i=0;i<cores;i++){
         if(cfd[i]<0) continue;
-        bdestroy(cfd[i],&tkb[i]); bdestroy(cfd[i],&rcb[i]); bdestroy(cfd[i],&cob[i]); bdestroy(cfd[i],&abuf[i]);
-        if(mode==1) bdestroy(cfd[i],&wimp[i]); else bdestroy(cfd[i],&wbuf[i]);   /* wimp[0] closes the shared dbuf once (heap_fd zeroed on i>0) */
+        orki_bdestroy(cfd[i],&tkb[i]); orki_bdestroy(cfd[i],&rcb[i]); orki_bdestroy(cfd[i],&cob[i]); orki_bdestroy(cfd[i],&abuf[i]);
+        if(mode==1) orki_bdestroy(cfd[i],&wimp[i]); else orki_bdestroy(cfd[i],&wbuf[i]);   /* wimp[0] closes the shared dbuf once (heap_fd zeroed on i>0) */
         close(cfd[i]);
     }
     return ret;
@@ -9624,35 +9624,35 @@ int ork_npu_exp_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,dou
 int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,double*us_batched){
     int fd=c->fd,CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||ntask<1||ntask>32) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
-    memset(W.cpu,1,(size_t)K*N); bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    int8_t*ad=c->Af.cpu; memset(ad,1,K); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
+    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
+    memset(W.cpu,1,(size_t)K*N); orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    int8_t*ad=c->Af.cpu; memset(ad,1,K); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
+    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+    if (orki_validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
     for (int i = 0; i < ntask; i++) {
         memcpy((char*)c->regcmd.cpu + i * sizeof(rc), rc, sizeof(rc));
     }
-    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=c->task.cpu;                 /* task[] array: ntask tasks, separate regcmd spaces */
     for(int i=0;i<ntask;i++){memset(&t[i],0,sizeof t[i]);t[i].flags=0;t[i].op_idx=i;t[i].enable_mask=0xd;t[i].int_mask=0x300;t[i].int_clear=0x1ffff;t[i].regcfg_amount=108;t[i].regcmd_addr=c->regcmd.dma + i * sizeof(rc);}
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* single-core: set all subcore_task entries to avoid kernel UAPI timeout/Oops */
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=mm_timeout_ms();
     sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
+    if(orki_rknpu_submit_ioctl(fd,&sub,-1)){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -1;} orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); /* warm */
     double t0=ork_now_us();                          /* (a) ntask separate ioctls */
     for(int i=0;i<ntask;i++){ sub.task_number=1; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-        if(rknpu_submit_ioctl(fd,&sub,-1)){bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -1;} orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }
     *us_unbatched=ork_now_us()-t0;
     sub.task_number=ntask; sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)ntask};
     t0=ork_now_us();                                 /* (b) one ioctl, ntask tasks */
-    if(rknpu_submit_ioctl(fd,&sub,-1)){perror("batched SUBMIT");bdestroy(fd,&W);bdestroy(fd,&O);return -1;} bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(orki_rknpu_submit_ioctl(fd,&sub,-1)){perror("batched SUBMIT");orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);return -1;} orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE);
     *us_batched=ork_now_us()-t0;
-    bdestroy(fd,&W);bdestroy(fd,&O); return 0;
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O); return 0;
 }
 
 /* RE: probe in-place K-slicing of a FULL-K weight buffer (for a single-layout decode+prefill).
@@ -9666,26 +9666,26 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
                             const f16 *A,const f16 *B,float *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(Kfull%32||Kp%32||N%16||N>c->soc->nmax||Kp>Kfull) return -2;
-    struct buf W=bcreate(fd,(size_t)Kfull*N*2,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)Kfull*N*2,0x403,-1); if(!W.cpu) return -2;
     int NN=N/16,KTf=Kfull/32; f16*bb=W.cpu;     /* full-K fp16 layout [Ntile][KTfull][16][32] */
     for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KTf;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
         bb[(size_t)nt*KTf*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*16+nl)];
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}
-    f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
+    f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N];
-    synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
-    setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
-    for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
+    orki_synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
+    for(int i=0;i<nov && i<4;i++) orki_setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_slice_f16", c, rc, REGCMD_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_slice_f16", c, rc, REGCMD_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=-1;
     for(int rep=0;rep<2;rep++){ sub.timeout=mm_timeout_ms();
-        if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,O.cpu,(size_t)N*4); ok=0; }
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -9721,32 +9721,32 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
                      const int8_t *A,const int8_t *B,int16_t *C){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;        /* B int4: half bytes */
+    struct buf W=orki_bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;        /* B int4: half bytes */
     tile_i4_B(W.cpu,B,K,N,nibB);
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
     /* M-tiling: the captured W4A4 program runs M=1 per task; we replicate it per row. Each row's A is
      * its own native (K/32,1,32) block (contiguous K/2 bytes); each row's C is (N/8,1,8) = N int16. */
     uint8_t*ad=c->Af.cpu;
     for(int m=0;m<M;m++) tile_i4_A(ad+(size_t)m*(K/2), A+(size_t)m*K, 1, K, nibA);
-    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=0;
     for(int m=0;m<M && ok==0;m++){
-        act(fd,RKNPU_ACT_RESET,0);
+        orki_act(fd,RKNPU_ACT_RESET,0);
         uint32_t rc[REGCMD_I4_N];
-        synth_i4(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
-        for(int i=0;i<nov && i<4;i++) setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
+        orki_synth_i4(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
+        for(int i=0;i<nov && i<4;i++) orki_setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
         struct buf extra[2] = {W, O};
-        if (validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-        memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+        if (orki_validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+        memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         sub.timeout=mm_timeout_ms(); ok=-1;
-        for(int rep=0;rep<2;rep++){ if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-            bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+        for(int rep=0;rep<2;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+            orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
         if(ok==0){ int16_t*cr=(int16_t*)((char*)O.cpu+(size_t)m*N*2);   /* row m: native (N/8,1,8) */
             for(int nt=0;nt<N/8;nt++)for(int nl=0;nl<8;nl++) C[(size_t)m*N + nt*8+nl] = cr[nt*8+nl]; }
     }
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
@@ -9758,67 +9758,67 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
 int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int16_t *raw){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax||M<1) return -2;
-    struct buf W=bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;
+    struct buf W=orki_bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;
     tile_i4_B(W.cpu,B,K,N,0);
-    bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct buf O=bcreate(fd,(size_t)2*M*N*2,0x403,-1); if(!O.cpu){bdestroy(fd,&W);return -2;}  /* 2x: stride-2 multi-M writes physical rows 0..2(M-1) */
+    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct buf O=orki_bcreate(fd,(size_t)2*M*N*2,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* 2x: stride-2 multi-M writes physical rows 0..2(M-1) */
     /* A layout selector via ORK_I4_ALAY: 0=(K/32,M,32) interleaved, 1=per-row contiguous (K/32,1,32)
      * x M (what the captured M=1 program reads). Lets the probe tell whether the program is single-row. */
     { int alay=getenv("ORK_I4_ALAY")?atoi(getenv("ORK_I4_ALAY")):0;
       if(alay) for(int m=0;m<M;m++) tile_i4_A((uint8_t*)c->Af.cpu+(size_t)m*(K/2),A+(size_t)m*K,1,K,0);
       else tile_i4_A(c->Af.cpu,A,M,K,0); }
-    bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I4_N];
-    synth_i4(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
+    orki_synth_i4(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
     struct buf extra[2] = {W, O};
-    if (validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    if (orki_validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     /* Fill c->task with the INT4 regcfg count (116 = REGCMD_I4_N/2). init/reset stamp the shared c->task
      * with the int8 count (108); a 108-reg task over a 116-reg int4 regcmd -> kernel EINVAL. Normal int4
      * runs fill their own MC task bufs; the probe uses the legacy c->task, so it must set the int4 count. */
     { struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd; t.int_mask=0x300; t.int_clear=0x1ffff; t.regcfg_amount=REGCMD_I4_N/2; t.regcmd_addr=c->regcmd.dma;
-      memcpy(c->task.cpu,&t,sizeof t); bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
+      memcpy(c->task.cpu,&t,sizeof t); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     /* ORK_I4_PROBE_TO_MS: submit timeout (default 60s). The fuzzer sets this low (e.g. 1500) so a wedging
      * candidate has the KERNEL time out the job fast and return an error in-process — the fuzzer blacklists
      * it and continues, with no external SIGINT-during-submit (the documented wedge/corruption risk). */
     uint32_t to_ms=60000; { const char*e=getenv("ORK_I4_PROBE_TO_MS"); if(e){ unsigned v=(unsigned)strtoul(e,0,0); if(v) to_ms=v; } }
     int ok=-1;
-    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
-        bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
+    for(int rep=0;rep<2;rep++){ sub.timeout=to_ms; if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; continue; }
+        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; }
     if(ok==0) memcpy(raw,O.cpu,(size_t)2*M*N*2);   /* caller supplies a 2*M*N int16 buffer (stride-2) */
-    bdestroy(fd,&W);bdestroy(fd,&O);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
     return ok;
 }
 
 int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, const int8_t *B, int32_t *C) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     if (K % 32 || N % 32 || N > c->soc->nmax || S < 1 || S > 32) return -2;
-    struct buf W = bcreate(fd, (size_t)K * N, 0x403,-1); if (!W.cpu) return -2;
+    struct buf W = orki_bcreate(fd, (size_t)K * N, 0x403,-1); if (!W.cpu) return -2;
     int NN = N / 32, KT = K / 32; int8_t *bb = W.cpu;
     for (int nt = 0; nt < NN; nt++) for (int kt = 0; kt < KT; kt++) for (int nl = 0; nl < 32; nl++) for (int kk = 0; kk < 32; kk++)
         bb[(size_t)nt * KT * 32 * 32 + (size_t)kt * 32 * 32 + nl * 32 + kk] = B[(size_t)(kt * 32 + kk) * N + (nt * 32 + nl)];
-    bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
     
-    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403,-1); if (!O.cpu) { bdestroy(fd, &W); return -2; }
+    struct buf O = orki_bcreate(fd, (size_t)S * 4096, 0x403,-1); if (!O.cpu) { orki_bdestroy(fd, &W); return -2; }
     
     int8_t *ad = c->Af.cpu;
     for (int i = 0; i < S; i++) {
         for (int j = 0; j < K; j++) ad[i * K + j] = A[i * K + j];
     }
-    bsync(fd, &c->Af, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &c->Af, RKNPU_MEM_SYNC_TO_DEVICE);
     
-    act(fd, RKNPU_ACT_RESET, 0);
+    orki_act(fd, RKNPU_ACT_RESET, 0);
     
     uint32_t rc[REGCMD_I8_N];
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(c->Af.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
+        orki_synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
+        orki_setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         struct buf extra[2] = {W, O};
-        if (validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { bdestroy(fd,&W); bdestroy(fd,&O); return -1; }
+        if (orki_validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
         
         if (i < S - 1) {
             uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I8_N * 4;
@@ -9834,7 +9834,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
         }
         memcpy((char*)c->regcmd.cpu + i * sizeof(rc), rc, sizeof(rc));
     }
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
     
     struct rknpu_task *t = c->task.cpu;
     memset(t, 0, S * sizeof(struct rknpu_task));
@@ -9845,7 +9845,7 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
         t[i].regcfg_amount = 108;
         t[i].regcmd_addr = c->regcmd.dma + i * REGCMD_I8_N * 4;
     }
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     sub.task_start = 0;
@@ -9860,15 +9860,15 @@ int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, con
     int ok = -1;
     for (int rep = 0; rep < 2; rep++) {
         sub.timeout = mm_timeout_ms();
-        if (rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
-        bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (orki_rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
+        orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         for (int i = 0; i < S; i++) {
             memcpy(C + i * N, (char*)O.cpu + i * 4096, (size_t)N * 4);
         }
         ok = 0;
     }
     
-    bdestroy(fd, &W); bdestroy(fd, &O);
+    orki_bdestroy(fd, &W); orki_bdestroy(fd, &O);
     return ok;
 }
 
@@ -9876,35 +9876,35 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     if (K % 32 || N % 32 || N > c->soc->nmax || S < 1 || S > 64) return -2;
     
-    struct buf W = bcreate(fd, (size_t)K * N, 0x403,-1);
-    struct buf A = bcreate(fd, (size_t)S * K, 0x403,-1);
-    struct buf O = bcreate(fd, (size_t)S * 4096, 0x403,-1);
+    struct buf W = orki_bcreate(fd, (size_t)K * N, 0x403,-1);
+    struct buf A = orki_bcreate(fd, (size_t)S * K, 0x403,-1);
+    struct buf O = orki_bcreate(fd, (size_t)S * 4096, 0x403,-1);
     
-    struct buf regs_chain = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
-    struct buf regs_sep = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
+    struct buf regs_chain = orki_bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
+    struct buf regs_sep = orki_bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403,-1);
     
-    struct buf task_chain = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
-    struct buf task_sep = bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
+    struct buf task_chain = orki_bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
+    struct buf task_sep = orki_bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b,-1);
     
     if (!W.cpu || !A.cpu || !O.cpu || !regs_chain.cpu || !regs_sep.cpu || !task_chain.cpu || !task_sep.cpu) {
         fprintf(stderr, "[ork] ERROR: failed to allocate benchmark_chain buffers (IOMMU full?)\n");
-        bdestroy(fd, &W); bdestroy(fd, &A); bdestroy(fd, &O);
-        bdestroy(fd, &regs_chain); bdestroy(fd, &regs_sep);
-        bdestroy(fd, &task_chain); bdestroy(fd, &task_sep);
+        orki_bdestroy(fd, &W); orki_bdestroy(fd, &A); orki_bdestroy(fd, &O);
+        orki_bdestroy(fd, &regs_chain); orki_bdestroy(fd, &regs_sep);
+        orki_bdestroy(fd, &task_chain); orki_bdestroy(fd, &task_sep);
         return -2;
     }
     
     memset(W.cpu, 1, (size_t)K * N);
     memset(A.cpu, 1, (size_t)S * K);
-    bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd, &A, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &A, RKNPU_MEM_SYNC_TO_DEVICE);
     
     uint32_t rc[REGCMD_I8_N];
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
+        orki_synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
+        orki_setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         
         if (i < S - 1) {
             uint64_t next_dma = regs_chain.dma + (i + 1) * REGCMD_I8_N * 4;
@@ -9917,17 +9917,17 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         }
         memcpy((char*)regs_chain.cpu + i * REGCMD_I8_N * 4, rc, sizeof(rc));
     }
-    bsync(fd, &regs_chain, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &regs_chain, RKNPU_MEM_SYNC_TO_DEVICE);
     
     for (int i = 0; i < S; i++) {
         uint32_t act_dma = (uint32_t)(A.dma + i * K);
         uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
+        orki_synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
+        orki_setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
         rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;
         memcpy((char*)regs_sep.cpu + i * REGCMD_I8_N * 4, rc, sizeof(rc));
     }
-    bsync(fd, &regs_sep, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &regs_sep, RKNPU_MEM_SYNC_TO_DEVICE);
     
     struct rknpu_task *tk_chain = task_chain.cpu;
     memset(tk_chain, 0, S * sizeof(struct rknpu_task));
@@ -9938,7 +9938,7 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         tk_chain[i].regcfg_amount = 108;
         tk_chain[i].regcmd_addr = regs_chain.dma + i * REGCMD_I8_N * 4;
     }
-    bsync(fd, &task_chain, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &task_chain, RKNPU_MEM_SYNC_TO_DEVICE);
     
     struct rknpu_task *tk_sep = task_sep.cpu;
     memset(tk_sep, 0, S * sizeof(struct rknpu_task));
@@ -9949,9 +9949,9 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         tk_sep[i].regcfg_amount = 108;
         tk_sep[i].regcmd_addr = regs_sep.dma + i * REGCMD_I8_N * 4;
     }
-    bsync(fd, &task_sep, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &task_sep, RKNPU_MEM_SYNC_TO_DEVICE);
     
-    act(fd, RKNPU_ACT_RESET, 0);
+    orki_act(fd, RKNPU_ACT_RESET, 0);
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
     sub.flags = ork_ppflags();
     sub.task_number = S;
@@ -9960,17 +9960,17 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
     sub.timeout = mm_timeout_ms();
-    if (rknpu_submit_ioctl(fd, &sub, -1)) {
+    if (orki_rknpu_submit_ioctl(fd, &sub, -1)) {
         perror("Warmup failed");
     }
-    bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
     
     double t_sep_start = ork_now_us();
     for (int it = 0; it < iters; it++) {
         for (int s = 0; s < S; s++) {
             struct rknpu_task *tk_dest = c->task.cpu;
             memcpy(tk_dest, &tk_sep[s], sizeof(struct rknpu_task));
-            bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE);
             
             struct rknpu_submit sub_s; memset(&sub_s, 0, sizeof(sub_s));
             sub_s.flags = 0x5;
@@ -9980,11 +9980,11 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
             sub_s.fence_fd = -1;
             sub_s.subcore_task[0] = sub_s.subcore_task[1] = sub_s.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
             sub_s.timeout = 60000;
-            if (rknpu_submit_ioctl(fd, &sub_s, -1)) {
+            if (orki_rknpu_submit_ioctl(fd, &sub_s, -1)) {
                 perror("Separate submit failed");
                 break;
             }
-            bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
         }
     }
     double t_sep = ork_now_us() - t_sep_start;
@@ -9999,11 +9999,11 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
         sub_c.fence_fd = -1;
         sub_c.subcore_task[0] = sub_c.subcore_task[1] = sub_c.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
         sub_c.timeout = 60000;
-        if (rknpu_submit_ioctl(fd, &sub_c, -1)) {
+        if (orki_rknpu_submit_ioctl(fd, &sub_c, -1)) {
             perror("Chained submit failed");
             break;
         }
-        bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     double t_chain = ork_now_us() - t_chain_start;
     
@@ -10016,9 +10016,9 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
            S, t_chain, avg_chain, avg_chain / S);
     printf("  Speedup: %.2fx\n", avg_sep / avg_chain);
     
-    bdestroy(fd, &W); bdestroy(fd, &A); bdestroy(fd, &O);
-    bdestroy(fd, &regs_chain); bdestroy(fd, &regs_sep);
-    bdestroy(fd, &task_chain); bdestroy(fd, &task_sep);
+    orki_bdestroy(fd, &W); orki_bdestroy(fd, &A); orki_bdestroy(fd, &O);
+    orki_bdestroy(fd, &regs_chain); orki_bdestroy(fd, &regs_sep);
+    orki_bdestroy(fd, &task_chain); orki_bdestroy(fd, &task_sep);
     return 0;
 }
 const char *ork_npu_version(void){
@@ -10033,7 +10033,7 @@ const char *ork_npu_version(void){
  * requires a major bump, while minor/patch stay backward-compatible. See ork_npu.h. */
 uint32_t ork_pack_format_version(void){ return ORK_PACK_FORMAT_VERSION; }   /* decoupled from the library MAJOR — bump only on a real on-disk format change (see ork_npu.h) */
 
-/* Max M rows a single full-K int8 submit handles at this K (mirrors run()'s M>1 Bf tiling, npu.c
+/* Max M rows a single full-K int8 submit handles at this K (mirrors orki_run()'s M>1 Bf tiling, npu.c
  * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
  * caller must split the task into M-tiles. Guards against wedging the (shared) NPU on an oversized mc. */
 static int chain_fullk_mcap_i8(ork_npu *c, int K) {
@@ -10207,7 +10207,7 @@ int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, in
 
 /* OPTION B: chain [... -> gate matmul(int8-out) -> silu-SDP -> ...] where task[sdp_task] is a STANDALONE int8
  * silu-SDP op reading task[sdp_task-1]'s (gate) output via aliased buffers (the vendor's matmul->SDP pattern),
- * NOT a fused matmul output stage. The gate task (sdp_task-1) gets set_i8_out8 (int8 output, requant
+ * NOT a fused matmul output stage. The gate task (sdp_task-1) gets orki_set_i8_out8 (int8 output, requant
  * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_npu_silu_i8).
  * tasks[sdp_task].C receives int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int ork_mm_run_chain_i8_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int sdp_task,
@@ -10278,7 +10278,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
     if (tasks[0].w) {  /* chained weights share one submit => one domain; swap in that domain's scratch */
-        if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+        if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     }
 
     /* step-1 core-parameterize: the whole chain (LUT-load + program submit) runs on this one core, so
@@ -10293,14 +10293,14 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     if (S == 1) return ork_mm_run_i8(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
-    int KS_CHAIN = int8_ks(c);   // K-slice size for the FFN chain down projection (default 1024)
+    int KS_CHAIN = orki_int8_ks(c);   // K-slice size for the FFN chain down projection (default 1024)
 
     /* increment 2 (concurrent round-robin): this chain runs entirely on core `chain_cc` using its OWN scratch
      * set (chain_rc/tk/lrc/lsc[chain_cc]), so chains dispatched to different cores never share DRAM. Lazily
      * allocated per core in the current domain (single-domain assumption, as the prior shared LUT buffers had).
      * regcmd 1MB (~1160 programs) / task 256KB bound the chain size; P is bounds-checked at the build site. */
     struct buf *RC=&c->chain_rc[chain_cc], *TK=&c->chain_tk[chain_cc], *LRC=&c->chain_lrc[chain_cc], *LSC=&c->chain_lsc[chain_cc];
-    if(!RC->cpu){ *RC=bcreate(fd,1048576,0x403,c->dom_active); *TK=bcreate(fd,262144,0x40b,c->dom_active);
+    if(!RC->cpu){ *RC=orki_bcreate(fd,1048576,0x403,c->dom_active); *TK=orki_bcreate(fd,262144,0x40b,c->dom_active);
         if(!RC->cpu||!TK->cpu){ return -2; } }
 
     // 1. Validate all tasks
@@ -10320,8 +10320,8 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                          (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && w->K > 4096;
         if (ffn_ksplit) { if (w->K % KS_CHAIN != 0 || !w->Bb) return -2; continue; }
         if (w->Sk != 1 && !w->Bf) return -2;
-        // The full-K Bf submit uses synth_i8(sched=1), whose 0x1040 K-reduction schedule is only valid for
-        // K%512==0 && K<=4096 (same envelope as run()'s M>1 Bf path; 512/1024 are covered, 1536-4096 too).
+        // The full-K Bf submit uses orki_synth_i8(sched=1), whose 0x1040 K-reduction schedule is only valid for
+        // K%512==0 && K<=4096 (same envelope as orki_run()'s M>1 Bf path; 512/1024 are covered, 1536-4096 too).
         // For other K (e.g. 768 down_proj, or K>4096) a full-K single submit is WRONG — reject so the caller
         // falls back to per-task run_i8 (which K-splits correctly). -3 distinguishes this from bad-arg -2.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
@@ -10390,22 +10390,22 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         int N = w->N;
 
         // Resolve input activations buffer
-        struct buf *abuf = dma_find(c, tasks[i].A);
+        struct buf *abuf = orki_dma_find(c, tasks[i].A);
         if (abuf) {
-            if (!ALREADY_SYNCED(abuf)) bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared input: sync once
+            if (!ALREADY_SYNCED(abuf)) orki_bsync(fd, abuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared input: sync once
             act_dma[i] = (uint32_t)(abuf->dma + ((const char*)tasks[i].A - (const char*)abuf->cpu));
         } else {
-            tmp_A[i] = bcreate(fd, (size_t)M * K, 0x403, c->dom_active);
+            tmp_A[i] = orki_bcreate(fd, (size_t)M * K, 0x403, c->dom_active);
             if (!tmp_A[i].cpu) { ok = -1; goto cleanup; }
             memcpy(tmp_A[i].cpu, tasks[i].A, (size_t)M * K);
-            bsync(fd, &tmp_A[i], RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd, &tmp_A[i], RKNPU_MEM_SYNC_TO_DEVICE);
             act_dma[i] = (uint32_t)tmp_A[i].dma;
         }
 
         // Resolve output buffer
-        struct buf *cbuf = dma_find(c, tasks[i].C);
+        struct buf *cbuf = orki_dma_find(c, tasks[i].C);
         if (cbuf) {
-            if (!ALREADY_SYNCED(cbuf)) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared output region: sync once
+            if (!ALREADY_SYNCED(cbuf)) orki_bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);   // shared output region: sync once
             out_dma[i] = (uint32_t)(cbuf->dma + ((const char*)tasks[i].C - (const char*)cbuf->cpu));
             cbufs[i] = cbuf;
         } else {
@@ -10413,9 +10413,9 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
                              (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && K > 4096;
             size_t osz = ffn_ksplit ? (size_t)(K / KS_CHAIN) * M * N * 4 : (size_t)M * N * 4;
-            tmp_C[i] = bcreate(fd, osz, 0x403, c->dom_active);
+            tmp_C[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!tmp_C[i].cpu) { ok = -1; goto cleanup; }
-            bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_TO_DEVICE);
             out_dma[i] = (uint32_t)tmp_C[i].dma;
         }
     }
@@ -10464,10 +10464,10 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             uint32_t glu_dma = out_dma[ss->ops[i].in0];
             for (int ks = 0; ks < Sk; ks++, p++) {
                 memset(rc, 0, sizeof(rc));
-                bsync(fd, &w->Bb[ks], RKNPU_MEM_SYNC_TO_DEVICE);
-                synth_i8(rc, M, KS_CHAIN, N, glu_dma + (uint32_t)((size_t)ks * KS_CHAIN * M),
+                orki_bsync(fd, &w->Bb[ks], RKNPU_MEM_SYNC_TO_DEVICE);
+                orki_synth_i8(rc, M, KS_CHAIN, N, glu_dma + (uint32_t)((size_t)ks * KS_CHAIN * M),
                          (uint32_t)w->Bb[ks].dma, out_dma[i] + (uint32_t)((size_t)ks * M * N * 4), 1, CBUF, 0);
-                if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
+                if (orki_validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
                 if (p < P - 1) {   // chain to the next K-slice (or terminate on the last)
                     uint64_t next_dma = RC->dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
                     rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
@@ -10482,7 +10482,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         for (int m0 = 0; m0 < M; m0 += mcap, p++) {
             int mc = (M - m0 < mcap) ? (M - m0) : mcap;
             memset(rc, 0, sizeof(rc));
-            // Let synth_i8(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
+            // Let orki_synth_i8(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
             // Do NOT hardcode it (the old 0xb1 was an M=1 value; for mc>16 it computes rows past the
             // first 64-group against the wrong K-partition — same class as the full-K prefill bug).
             int kind = CHAIN_KIND(i);
@@ -10494,18 +10494,18 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                 int tn = (kind == OP_SILU) ? REGCMD_SILU_STD_N : REGCMD_MUL_N;
                 memcpy(rc, tmpl, (size_t)tn * 4);
                 set_mul_geom(rc, tn, mc, N);
-                setrn(rc, tn,RK_DPU_DST_BASE_ADDR, out_dma[i]);              // output
-                setrn(rc, tn,RK_SDP_5018, out_dma[in0]);            // operand a = prior output, ALIASED
+                orki_setrn(rc, tn,RK_DPU_DST_BASE_ADDR, out_dma[i]);              // output
+                orki_setrn(rc, tn,RK_SDP_5018, out_dma[in0]);            // operand a = prior output, ALIASED
                 if (kind == OP_SILU) {
-                    setrn(rc, tn,RK_SDP_5040, 0); setrn(rc, tn,RK_SDP_5038, 0);   // single-input
-                    setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->r_mult); setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->r_shift);
-                    setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, ss->out_bias);
-                    setrn(rc, tn,RK_DPU_R4110, ss->idx_off); setrn(rc, tn,RK_DPU_BN_ALU_CFG, ss->cfg4064); setrn(rc, tn,RK_DPU_BN_MUL_CFG, ss->cfg4068);
+                    orki_setrn(rc, tn,RK_SDP_5040, 0); orki_setrn(rc, tn,RK_SDP_5038, 0);   // single-input
+                    orki_setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->r_mult); orki_setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->r_shift);
+                    orki_setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, ss->out_bias);
+                    orki_setrn(rc, tn,RK_DPU_R4110, ss->idx_off); orki_setrn(rc, tn,RK_DPU_BN_ALU_CFG, ss->cfg4064); orki_setrn(rc, tn,RK_DPU_BN_MUL_CFG, ss->cfg4068);
                 } else {   // OP_EWMUL: out = a (*) b ; b = second prior output (silu*up for glu)
                     int in1 = ss->ops[i].in1;
-                    setrn(rc, tn,RK_SDP_5038, out_dma[in1]);        // operand b, ALIASED
-                    setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->ops[i].mult); setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->ops[i].shift);
-                    setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, 0); setrn(rc, tn,RK_DPU_BS_ALU_CFG, 0); setrn(rc, tn,RK_DPU_EW_CVT_OFFSET, 0);
+                    orki_setrn(rc, tn,RK_SDP_5038, out_dma[in1]);        // operand b, ALIASED
+                    orki_setrn(rc, tn,RK_DPU_OUT_CVT_SCALE, (uint32_t)ss->ops[i].mult); orki_setrn(rc, tn,RK_DPU_OUT_CVT_SHIFT, (uint32_t)ss->ops[i].shift);
+                    orki_setrn(rc, tn,RK_DPU_OUT_CVT_OFFSET, 0); orki_setrn(rc, tn,RK_DPU_BS_ALU_CFG, 0); orki_setrn(rc, tn,RK_DPU_EW_CVT_OFFSET, 0);
                 }
             } else {
                 // activation source: ops[i].in0 >= 0 -> a PRIOR task's output (aliased, e.g. down reads glu);
@@ -10513,12 +10513,12 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
                 uint32_t a_dma = (ss && ss->ops && ss->ops[i].in0 >= 0)
                                ? out_dma[ss->ops[i].in0]
                                : act_dma[i] + (uint32_t)((size_t)m0 * K);
-                synth_i8(rc, mc, K, N, a_dma,
+                orki_synth_i8(rc, mc, K, N, a_dma,
                          bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
-                if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
-                else if (kind == OP_MM8) set_i8_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)
-                else if (ss && !ss->ops && ss->sdp_task >= 1 && i == ss->sdp_task - 1) set_i8_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);   // legacy gate->silu
-                if (validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
+                if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) orki_set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
+                else if (kind == OP_MM8) orki_set_i8_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)
+                else if (ss && !ss->ops && ss->sdp_task >= 1 && i == ss->sdp_task - 1) orki_set_i8_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);   // legacy gate->silu
+                if (orki_validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
                 uint64_t next_dma = RC->dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
@@ -10537,7 +10537,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             memcpy((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
     }
-    bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, RC, RKNPU_MEM_SYNC_TO_DEVICE);
 
     // FUSED-SiLU LUT-load: stream the gate task's silu LUT into SDP SRAM ONCE before the chain (enable 0x18,
     // ping-pong OFF). It persists into the chain submit; the gate task's set_i8_silu output stage reads it.
@@ -10549,25 +10549,25 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         static int sticky=-1; if(sticky<0) sticky=getenv("ORK_CHAIN_LUT_STICKY")?1:0;
         int cc = chain_cc;   /* this chain's target core (hoisted above) */
         if (!LRC->cpu) {   /* one-time per-core alloc */
-            *LRC = bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
-            *LSC = bcreate(fd, 4096, 0x403, c->dom_active);
+            *LRC = orki_bcreate(fd, (size_t)REGCMD_SILU_LUT_N * 4, 0x403, c->dom_active);
+            *LSC = orki_bcreate(fd, 4096, 0x403, c->dom_active);
             if (!LRC->cpu || !LSC->cpu) { ok = -2; goto cleanup; }
         }
         if (c->chain_lut_p[cc] != ss->lut) {   /* (re)build THIS core's Lrc only when its LUT identity changes */
             memcpy(LRC->cpu, REGCMD_SILU_LUT, REGCMD_SILU_LUT_N * 4);
-            setrn((uint32_t*)LRC->cpu, REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR, (uint32_t)LSC->dma);
+            orki_setrn((uint32_t*)LRC->cpu, REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR, (uint32_t)LSC->dma);
             { uint32_t *lr=(uint32_t*)LRC->cpu; int j=0;
               for (int k=0; k+1<REGCMD_SILU_LUT_N; k+=2) if ((lr[k]&0xffff)==0x4104) {
                   int32_t v = (j<ss->nlut) ? (int32_t)ss->lut[j] : 0; j++;
                   lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } }
-            bsync(fd, LRC, RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd, LRC, RKNPU_MEM_SYNC_TO_DEVICE);
             c->chain_lut_p[cc] = ss->lut; c->chain_lut_devloaded[cc] = 0;   /* new LUT patched -> this core's SRAM copy is stale */
         }
         /* load the LUT into core cc's (physically per-core) SDP SRAM; skip only if sticky AND already resident on cc */
         if (!(sticky && c->chain_lut_devloaded[cc])) {
             struct rknpu_task *lt=TK->cpu; memset(lt,0,sizeof *lt);
             lt->enable_mask=0x18; lt->int_mask=0x300; lt->int_clear=0x1ffff; lt->regcfg_amount=1097; lt->regcmd_addr=LRC->dma;
-            bsync(fd,TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd,TK,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
             c->chain_task_built[cc]=0;   /* the LUT-load just memset this core's task DRAM -> chain array no longer resides there */
             struct rknpu_submit ls; memset(&ls,0,sizeof ls); ls.flags=0x1; ls.task_number=1; ls.task_obj_addr=TK->obj;
             ls.core_mask=1u<<cc; ls.fence_fd=-1; ls.timeout=ew_timeout_ms();
@@ -10575,7 +10575,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
              * the kernel commits subcore_task[cc]; leaving it zero NULL-derefs rknpu_job_subcore_commit and wedges.
              * This LUT-load previously set only [0] -> fine on core 0, but the FIRST submit on core 1/2 wedged. */
             ls.subcore_task[0]=ls.subcore_task[1]=ls.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-            if (rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
+            if (orki_rknpu_submit_ioctl(fd,&ls,tasks[0].w->domain)) { ok=-1; goto cleanup; }
             c->chain_lut_devloaded[cc] = 1;
         }
     }
@@ -10601,7 +10601,7 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
             int k = CHAIN_KIND(i);
             if (k == OP_SILU || k == OP_EWMUL) { t[prog_off[i]].enable_mask = 0x18; t[prog_off[i]].regcfg_amount = 69; }
         }
-        bsync(fd, TK, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd, TK, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         c->chain_task_P[chain_cc] = P; c->chain_task_built[chain_cc] = 1;   /* this core's chain_tk now holds the P-array */
       } }
     struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
@@ -10643,9 +10643,9 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
         sub.timeout = mm_timeout_ms();
         if (fdb_on) {   /* seed the final-output sentinel and clean it to DRAM before the NONBLOCK submit */
             for (size_t e = 0; e < fno; e++) fdb[e] = 0x7fffffff;   /* == ORK_DYN_SENT (defined below) */
-            bsync(fd, fbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+            orki_bsync(fd, fbuf, RKNPU_MEM_SYNC_TO_DEVICE);
         }
-        if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
+        if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { perror("SUBMIT chained"); submit_ok = -1; } continue; }
         submit_ok = 0;
         if (fdb_on) {   /* doorbell drain: last-word gate, then a full-surface verify (bounded) */
             double pt = ork_now_us(), cap = (double)mm_timeout_ms() * 1000.0;
@@ -10665,9 +10665,9 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
     // 7. Sync memory back and copy results
     for (int i = 0; i < S; i++) {
         if (cbufs[i]) {
-            bsync(fd, cbufs[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd, cbufs[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         } else {
-            bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd, &tmp_C[i], RKNPU_MEM_SYNC_FROM_DEVICE);
             if (submit_ok == 0) {
                 int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
                                  (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && tasks[i].w->K > 4096;
@@ -10686,10 +10686,10 @@ static int run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, con
 
 cleanup:
     for (int i = 0; i < S; i++) {
-        bdestroy(fd, &tmp_A[i]);
-        bdestroy(fd, &tmp_C[i]);
+        orki_bdestroy(fd, &tmp_A[i]);
+        orki_bdestroy(fd, &tmp_C[i]);
     }
-    bdestroy(fd, &Lrc); bdestroy(fd, &Lsc);   /* fused-SiLU LUT buffers (no-op when ss==NULL: {0}) */
+    orki_bdestroy(fd, &Lrc); orki_bdestroy(fd, &Lsc);   /* fused-SiLU LUT buffers (no-op when ss==NULL: {0}) */
     return ok;
 }
 
@@ -10702,7 +10702,7 @@ cleanup:
  * same op graph (ops[]) + scales + domain; each carries its own S-task array (chains[i]). */
 struct chainrr_w { ork_npu *c; int core; int nchains; const ork_mm_task_i8 *const *chains; const int *S; const struct chain_silu_spec *ss; int *ctr; int rc; };
 static void *chainrr_worker(void *vp){
-    struct chainrr_w *a=vp; pin_big_core(a->core); a->rc=0; int k;
+    struct chainrr_w *a=vp; orki_pin_big_core(a->core); a->rc=0; int k;
     while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->nchains){
         int r=run_chain_i8_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
         if(r) a->rc=r;
@@ -10726,7 +10726,7 @@ int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *c
     int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
     /* establish SHARED state ONCE single-threaded (workers skip via force_core>=0): domain + int8-chain mode */
     if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
-        dom_activate(c, chains[0][0].w->domain);
+        orki_dom_activate(c, chains[0][0].w->domain);
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
     npu_pool_ensure(c);
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
@@ -10764,7 +10764,7 @@ int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *c
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
     int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
     if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
-        dom_activate(c, chains[0][0].w->domain);
+        orki_dom_activate(c, chains[0][0].w->domain);
     ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
     npu_pool_ensure(c);
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
@@ -10868,7 +10868,7 @@ static void ork_install_term(void) {
 /* int8 M-tile row cap for a K-reduction width Kred: the 0x1040 schedule holds at most mg_max*64 rows in one
  * regcmd (a bigger tile spills the K-partition and miscomputes). = 64 @ K<=4096, larger as K shrinks. Used to
  * M-tile M>64 into chained programs and as the K-split per-slice defensive cap. */
-static int mtile_cap(int Kred){ double scale=(double)Kred/512.0; int base=(int)(177.0-15.0*(scale-1.0)), slope=(int)(15.0*scale);
+static int orki_mtile_cap(int Kred){ double scale=(double)Kred/512.0; int base=(int)(177.0-15.0*(scale-1.0)), slope=(int)(15.0*scale);
     int mg = base >= 0x1b ? (base-0x1b)/slope + 1 : 0; int cap = mg * 64; return cap < 1 ? 1 : cap; }
 #define ORK_DYN_SENT 0x7fffffff
 /* Per-row completion: a task is done only when EVERY row's last column has been overwritten. The M-tile
@@ -10882,7 +10882,7 @@ static inline int ork_dyn_done_i(ork_dyn_chain *h, int i){
     if (h->i4batch) {   /* #54 BCHAIN tile output: mode-1 last-program civac gate (cheap, per-poll), then on pass bsync + mode-3 full verify (once). Matches bch_db_worker's completion check; ork_dyn_end owns the recover. */
         ork_npu *c = h->c;
         if (!bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1)) return 0;
-        bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         return bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
     }
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
@@ -10916,8 +10916,8 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1) return NULL;
         if (w->K % 512 || w->K > 4096) return NULL;
         if (w->Sk != 1 && !w->Bf) return NULL;
-        if (!dma_find(c, (void*)tasks[i].C)) return NULL; }   /* C must be resident (doorbell poll + writeback); A is copied to scratch */
-    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+        if (!orki_dma_find(c, (void*)tasks[i].C)) return NULL; }   /* C must be resident (doorbell poll + writeback); A is copied to scratch */
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     int fd = c->fd, CBUF = c->soc->cbuf_elems, P = S;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
@@ -10925,22 +10925,22 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     uint32_t rc[REGCMD_I8_N + 4];
     const void *seenA[1024]; uint32_t seenAdma[1024]; int nseenA = 0;   /* dedup scratch copies of a shared A pointer */
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K, N = w->N;
-        struct buf *cb = dma_find(c, (void*)tasks[i].C);
+        struct buf *cb = orki_dma_find(c, (void*)tasks[i].C);
         /* A: copy into a scratch DMA buffer (zero-copy A is bit-wrong at M=1 — the known ZC-A M=1 bug),
          * deduped by pointer (a shared activation is copied once). */
         uint32_t adma;
-        struct buf *ab = dma_find(c, (void*)tasks[i].A);
-        if (ab) { bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)tasks[i].A - (const char*)ab->cpu)); }
+        struct buf *ab = orki_dma_find(c, (void*)tasks[i].A);
+        if (ab) { orki_bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)tasks[i].A - (const char*)ab->cpu)); }
         else { int hit = -1; for (int j = 0; j < nseenA; j++) if (seenA[j] == tasks[i].A) { hit = j; break; }
                if (hit >= 0) adma = seenAdma[hit];
-               else { struct buf s = bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) { for (int j=0;j<h->nascr;j++) bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
-                      memcpy(s.cpu, tasks[i].A, (size_t)K); bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s;
+               else { struct buf s = orki_bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) { for (int j=0;j<h->nascr;j++) orki_bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
+                      memcpy(s.cpu, tasks[i].A, (size_t)K); orki_bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s;
                       if (nseenA < 1024) { seenA[nseenA] = tasks[i].A; seenAdma[nseenA] = adma; nseenA++; } } }
         uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memset(rc, 0, sizeof rc);
-        synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
-        if (validate_regcmd("ork_dyn", c, rc, REGCMD_I8_N, w, h->ascr, h->nascr)) { for (int j=0;j<h->nascr;j++) bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
+        orki_synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
+        if (orki_validate_regcmd("ork_dyn", c, rc, REGCMD_I8_N, w, h->ascr, h->nascr)) { for (int j=0;j<h->nascr;j++) orki_bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
         if (i < P - 1) { uint64_t nx = c->regcmd.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
             rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
             rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -10955,7 +10955,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     int reserve = P; { const char *e = getenv("ORK_DYN_RESERVE"); if (e) { int r = atoi(e); if (r > reserve) reserve = r; if (reserve > 1024) reserve = 1024; } }
     h->reserve = reserve;
     for (int p = P; p < reserve; p++) memcpy((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);   /* rc still holds program S-1 (terminator) */
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);   /* TERMINATING chain (0..S-1) for the warm pass; the spin tail (if any) is applied AFTER warm — see below */
+    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);   /* TERMINATING chain (0..S-1) for the warm pass; the spin tail (if any) is applied AFTER warm — see below */
     /* task_number=reserve PC-chain model (like run_chain_i8): kernel programs PC from task[0]; the HW walks via
      * each program's in-regcmd next-descriptor (0x0010/0x0014), bounded by task_number. ALL reserve descriptors
      * must be present (task_number=1 runs program 0 ONLY — measured; it does NOT walk). */
@@ -10964,7 +10964,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff; \
         t[p].regcfg_amount = 108; t[p].regcmd_addr = c->regcmd.dma + (size_t)p * REGCMD_I8_N * 4; } } while (0)
     ORK_DYN_TASKS();
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
     sub.flags = ork_ppflags(); sub.task_number = reserve; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)reserve};
@@ -10978,7 +10978,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while (0)
     if (!c->warmed) {
         ORK_DYN_SEED(); sub.timeout = mm_timeout_ms();
-        if (!rknpu_submit_ioctl(fd, &sub, h->dom)) {                 /* warm pass */
+        if (!orki_rknpu_submit_ioctl(fd, &sub, h->dom)) {                 /* warm pass */
             double tw = ork_now_us(); for (;;) { int alld = 1;
                 for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
                     __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_DYN_SENT) { alld = 0; break; } }
@@ -11005,13 +11005,13 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
          * outputs 0..S-1 land; the tail spins harmlessly. spinA/spinC park in h->ascr (freed by ork_dyn_end). */
         ork_w *lw = tasks[S - 1].w; int lK = lw->K, lN = lw->N;
         uint32_t lB = lw->Bf ? (uint32_t)lw->Bf[0].dma : (uint32_t)lw->Bb[0].dma;
-        struct buf spinA = bcreate(fd, (size_t)lK, 0x403, c->dom_active);
-        struct buf spinC = bcreate(fd, (size_t)lN * 4, 0x403, c->dom_active);
+        struct buf spinA = orki_bcreate(fd, (size_t)lK, 0x403, c->dom_active);
+        struct buf spinC = orki_bcreate(fd, (size_t)lN * 4, 0x403, c->dom_active);
         if (spinA.cpu && spinC.cpu && h->nascr + 2 <= 1024) {
-            memset(spinA.cpu, 0, (size_t)lK); bsync(fd, &spinA, RKNPU_MEM_SYNC_TO_DEVICE);
+            memset(spinA.cpu, 0, (size_t)lK); orki_bsync(fd, &spinA, RKNPU_MEM_SYNC_TO_DEVICE);
             h->ascr[h->nascr++] = spinA; h->ascr[h->nascr++] = spinC;
             uint32_t rcs[REGCMD_I8_N + 4]; memset(rcs, 0, sizeof rcs);
-            synth_i8(rcs, 1, lK, lN, (uint32_t)spinA.dma, lB, (uint32_t)spinC.dma, 1, CBUF, 0);
+            orki_synth_i8(rcs, 1, lK, lN, (uint32_t)spinA.dma, lB, (uint32_t)spinC.dma, 1, CBUF, 0);
             for (int p = P; p < reserve; p++) {
                 uint32_t *slot = (uint32_t*)((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4);
                 memcpy(slot, rcs, REGCMD_I8_N * 4);
@@ -11024,13 +11024,13 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             lr[216] = 0x0010 | ((nx & 0xffff) << 16); lr[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
             lr[218] = 0x0014 | (0x0037u << 16);       lr[219] = (0x0101 << 16);
             h->spin_end = reserve;
-            bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
-        } else { if (spinA.cpu) bdestroy(fd, &spinA); if (spinC.cpu) bdestroy(fd, &spinC); }   /* alloc failed: no spin, stay terminating */
+            orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+        } else { if (spinA.cpu) orki_bdestroy(fd, &spinA); if (spinC.cpu) orki_bdestroy(fd, &spinC); }   /* alloc failed: no spin, stay terminating */
     }
     if (_dbg) fprintf(stderr, "[dyn] spin applied (spin_end=%d); seeding + real submit now\n", h->spin_end);
     ORK_DYN_SEED();
     sub.timeout = mm_timeout_ms();
-    int rr = rknpu_submit_ioctl(fd, &sub, h->dom);
+    int rr = orki_rknpu_submit_ioctl(fd, &sub, h->dom);
     if (_dbg) fprintf(stderr, "[dyn] NONBLOCK submit rc=%d (flags=0x%x task_number=%u)\n", rr, sub.flags, sub.task_number);
     if (rr) { free(h); return NULL; }
     if (_dbg) { usleep((unsigned)(P*80u+4000u)); for (int i = 0; i < S && i < 8; i++) { volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(h->N-1));
@@ -11063,9 +11063,9 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk > 16) return NULL;   /* int4 HW chain: M=1; A1: Sn>1 N-tiled; A2: Sk>1 K-split (int16 partials summed in end) — Sk bounded (per-row A-slice array) */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* one submit => one domain */
-    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if (mc_ensure(c, nc)) return NULL;
+    if (orki_mc_ensure(c, nc)) return NULL;
     int fd = c->fd;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1; h->esz = 2;
@@ -11073,7 +11073,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
     /* int4 ALWAYS copy-back: per-core in-domain int16 scratch (M=1 => N int16/op), widened in end() */
     for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].w->N * tasks[p].w->Sk * 2;   /* Sk int16 partial blocks/row (A2 K-split; Sk==1 => N int16) */
-        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
     int NMAX = c->soc->nmax, KS = ORK_I4_KS;
@@ -11113,8 +11113,8 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
                         if(bc) for(int z=0;z<8;z++) fprintf(stderr,"%02x ",bc[z]); else fprintf(stderr,"(null)");
                         fprintf(stderr,"| aslice=0x%x cdma=0x%x\n", aslice[ks], cdma); fflush(stderr); }
                     memset(rc, 0, sizeof rc);
-                    synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
-                    if (validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    orki_synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
+                    if (orki_validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
                         rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -11139,9 +11139,9 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i
         for (int col = 0; col < N; col++){ o[col] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[col]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = i4_submit_tmo_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
      * esz==2 branch of mc_recover_resubmit re-seeds the full int16 surface). */
@@ -11164,9 +11164,9 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > M) nc = M;
     if (getenv("ORK_GRP_DEBUG")) { fprintf(stderr, "[grp] M=%d K=%d N=%d G=%d Sk=%d Sn=%d nc=%d progs/core~%d\n",
         M, w->K, N, G, Sk, Sn, nc, (M+nc-1)/nc * Sn * Sk); fflush(stderr); }
-    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
+    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if (mc_ensure(c, nc)) return NULL;
+    if (orki_mc_ensure(c, nc)) return NULL;
     int fd = c->fd, NMAX = c->soc->nmax;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = M; h->P = M; h->N = N; h->dom = w->domain; h->reserve = M; h->mc = 1; h->esz = 2;
@@ -11174,7 +11174,7 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
     unsigned dom = w->domain;
     for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) continue;
         size_t osz = (size_t)P * Sk * N * 2;                         /* rows-on-core x Sk int16 blocks of [N] */
-        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
@@ -11194,8 +11194,8 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
                     uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)g * N * 2 + (size_t)n0 * 2);   /* block g, cols [n0,n0+Nc) */
                     uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + g].dma;
                     memset(rc, 0, sizeof rc);
-                    synth_i4(rc, 1, G, Nc, aslice[g], bdma, cdma);
-                    if (validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    orki_synth_i4(rc, 1, G, Nc, aslice[g], bdma, cdma);
+                    if (orki_validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
                         rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -11216,9 +11216,9 @@ static ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, c
         for (int e = 0; e < no; e++) { o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = i4_submit_tmo_ms(); rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     ork_install_term();
     return h;
@@ -11255,7 +11255,7 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
-        if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+        if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
     int N = h->i4g_N, Sk = h->i4g_Sk; const float *aS = h->i4g_aS, *bS = h->i4g_bS; float *Cf = h->i4g_Cf;
     for (int m = 0; m < h->S; m++) { const int16_t *blk = (const int16_t*)h->outptr[m]; float *cr = Cf + (size_t)m * N;
         for (int n = 0; n < N; n++) { float acc = 0;
@@ -11269,7 +11269,7 @@ static int ork_dyn_grouped_end(ork_dyn_chain *h) {
 
 /* P3: sub-nmax N-COLUMN tiling across cores on the NONBLOCK doorbell (int8, Sn==1, K<=4096 Bf, M 1..64).
  * A single matmul C[M,N] is split by N-columns across nc cores exactly as run_multicore does (t0=i*NN/nc);
- * each core computes its [M,Ncore] column range into per-core scratch (M-tiled into mtile_cap(K)-row chained
+ * each core computes its [M,Ncore] column range into per-core scratch (M-tiled into orki_mtile_cap(K)-row chained
  * programs when M>cap), NONBLOCK, and end() copies each range back to C's columns [c0,c0+Ncore) at row-stride
  * N (strided for M>1). This gives the doorbell run_multicore's TILE-parallel multi-core for one matmul (the
  * op-partition would otherwise pin a single op to one core). Scratch+copy-back (not direct output): multi-core
@@ -11286,10 +11286,10 @@ struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dy
 static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
     int cold = !c->mwarm[i];   /* capture BEFORE the bsync section sets mwarm=1 — fp16 uses it for the cold-buffer warmup */
     if (a->active) {
-        if (a->h->oSk[i] <= 1) bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf bsync (unused for i>0, double for i=0) */
-        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        if (a->hardened || !c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        if (a->h->oSk[i] <= 1) orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf orki_bsync (unused for i>0, double for i=0) */
+        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (a->hardened || !c->mwarm[i]) orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         c->mwarm[i] = 1;
     }
     /* NO barrier + BLOCKING submit — EXACTLY the mcworker: 3 pool threads, each does a blocking submit on its
@@ -11341,7 +11341,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             s.subcore_task[0] = s.subcore_task[1] = s.subcore_task[2] = (struct rknpu_subcore_task){(uint32_t)kstart, (uint32_t)np_ks};
             if (i == 0) trace_submit(&s);   /* ORK_TRACE: dump the doorbell fp16 per-slice regcmd sequence (core 0) */
             if (stag_us && i > 0) { struct timespec ts = {0, (long)i * stag_us * 1000}; nanosleep(&ts, NULL); }   /* variant A: offset core i so the 3 cores don't hit the CDMA with fp16 weight fetches at the same instant */
-            int src = rknpu_submit_ioctl(fd, &s, w->domain);
+            int src = orki_rknpu_submit_ioctl(fd, &s, w->domain);
             if (f16_sentinel) {   /* SENTINEL RECOVERY: NONBLOCK submit returned immediately — now CPU poll-DRAIN this slice's
                 * partial (last-word gate, then full-slice civac verify), with a TIGHT timeout. Fast wedge-detect + CPU never
                 * stuck in-kernel. The full surface was SENT-seeded (hardened_w=1 for fp16). Timeout/reject -> mc_error -> run-level recovery. */
@@ -11373,7 +11373,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             } else {   /* BLOCKING (default): the kernel drains this slice; ORK_F16_RECOV (opt-in, DISPROVEN) resubmits on fault */
                 for (int rt = 0; f16_recov && src && rt < 4; rt++) {
                     struct timespec rs = {0, 3000000 + (long)i * 2000000}; nanosleep(&rs, NULL);
-                    src = rknpu_submit_ioctl(fd, &s, w->domain);
+                    src = orki_rknpu_submit_ioctl(fd, &s, w->domain);
                 }
                 if (src) c->mc_error = 1;
             }
@@ -11393,7 +11393,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
         int nb = getenv("ORK_COLSPLIT_NB") != NULL;
         if (!nb) a->subs[i].flags &= ~0x2u;   /* blocking (default here) */
         a->subs[i].timeout = (a->h->mc_dt == DT_F16 && mm_timeout_ms() > 8000) ? 8000 : mm_timeout_ms();   /* fp16 (incl. CONTIG): cap wedge-detect at 8s so a CDMA-wild fault falls to the run-level reset+resubmit fast, not a 60s stall */
-        int _csrc = rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
+        int _csrc = orki_rknpu_submit_ioctl(fd, &a->subs[i], a->w->domain);
         if (_csrc && a->h->mc_dt == DT_F16) c->mc_error = 1;   /* CONTIG fp16 wedge: signal the run-level recovery (reset + resubmit / nc=1 backstop) */
         if (i == 0 && a->h->f16_contig) { const char *fwe = getenv("ORK_F16_FORCE_WEDGE");   /* TEST-ONLY fault injection for the
             * CONTIG in-place heal loop (no real NPU fault; the submit above succeeded): flag a simulated drop for the first N
@@ -11413,7 +11413,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                 double el = ork_now_us() - pt; if (el > 3e6) break;
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
       }
-        bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         /* WIDE-K PARALLEL ACCUMULATE: sum this core's Sk [M,Ncore] partials into its C columns HERE, in this
          * pool thread — matching mcworker's chain-ksplit (each core accumulates its own partials in parallel)
          * instead of the SERIAL sum in ork_dyn_end (measured ~31ms serial vs ~13ms NPU submit on ffn_down =
@@ -11459,17 +11459,17 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
 static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
     int dt = w->dtype;   /* DT_I8 today; fp16/int4 branches keyed on this (Stage 0: dt==DT_I8 == byte-identical) */
-    int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
+    int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = orki_mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (dt == DT_F16 && w->Sk > 1 && nc > 2 && getenv("ORK_F16_2CORE")) nc = 2;   /* variant B: fewer concurrent fp16 fetchers (reliability/speed trade) */
-    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) dom_activate(c, w->domain);
+    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
     /* Enter the correct PRECISION mode. fp16 must enter the fp16 mode EXACTLY as mcworker does
      * (DT_F16, XP_MC_MM) — entering the int8-chain mode (DT_I8_CHAIN) for fp16 leaves the stateful
      * regcmd datapath mismatched, which intermittently DMA-wilds / soft-resets the NPU on the fp16
      * submits. int8 keeps the HW-chain mode. This is the doorbell-vs-mcworker difference. */
     if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_MC_MM, OCK_NONE);
     else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
-    if (mc_ensure(c, nc)) return NULL;
+    if (orki_mc_ensure(c, nc)) return NULL;
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
     h->mc_dt = dt;   /* set EARLY: ork_csub_worker (runs before the tail below) reads it for the accumulate dtype */
@@ -11487,39 +11487,39 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         size_t aesz = (dt == DT_F16) ? 2 : 1;   /* A element bytes: fp16 2, int8 1 */
-        if ((size_t)M * K * aesz > AF->size) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
+        if ((size_t)M * K * aesz > AF->size) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
         if (dt == DT_F16) {   /* fp16 colsplit (Stage 1): K-sliced Bb + host f32 accumulate; Sn==1 (gated). Mirrors the
-            * int8 WIDE-K branch with synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
-            * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only synth()+Bb+dtype differ). */
+            * int8 WIDE-K branch with orki_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
+            * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_synth()+Bb+dtype differ). */
             int CBUFf = (CBUF > 32768) ? 32768 : CBUF;   /* fp16 M-scheduler is validated only to the 32768-tile; a larger cbuf miscomputes mc>~cap (mcworker applies the same cap) */
             int KS = c->soc->ks, RBf = CBUFf;   /* fp16: RB = cbuf (int8 doubles it) */
             struct rknpu_task *tkf = (struct rknpu_task*)c->mtk[i].cpu;
             size_t ksz = (size_t)w->Sk * M * Ncore * 4;   /* Sk f32 partials [ks][M][Ncore] */
-            if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
+            if (c->mccsz[i] < ksz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, ksz, 0x403, c->dom_active);
                 if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; }
             struct buf *CC = &c->mcc[i];
             /* pre-grow mrc/mtk for this core: fp16 chunks are small (<=8 @ K>=2048) => Sk*ceil(M/chunk) programs.
              * bound generously (512); tkf re-fetched after any grow. */
             size_t needrc = (size_t)512 * REGCMD_N * 4, needtk = (size_t)512 * sizeof(struct rknpu_task);
-            if (RC->size < needrc) { bdestroy(fd, &c->mrc[i]); c->mrc[i] = bcreate(fd, needrc, 0x403, c->dom_active);
+            if (RC->size < needrc) { orki_bdestroy(fd, &c->mrc[i]); c->mrc[i] = orki_bcreate(fd, needrc, 0x403, c->dom_active);
                 if (!c->mrc[i].cpu) { free(h); return NULL; } RC = &c->mrc[i]; c->mwarm[i] = 0; }
-            if (c->mtk[i].size < needtk) { bdestroy(fd, &c->mtk[i]); c->mtk[i] = bcreate(fd, needtk, 0x40b, c->dom_active);
+            if (c->mtk[i].size < needtk) { orki_bdestroy(fd, &c->mtk[i]); c->mtk[i] = orki_bcreate(fd, needtk, 0x40b, c->dom_active);
                 if (!c->mtk[i].cpu) { free(h); return NULL; } tkf = (struct rknpu_task*)c->mtk[i].cpu; }
             struct buf *AFS = &c->maf[0];   /* gather A ONCE (shared, read-only across cores): fp16 [Sk][M][Kp] */
             if (i == 0) { f16 *afg = (f16*)AFS->cpu; const f16 *Af = (const f16*)t->A; size_t goff = 0;
               for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                   for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, Af + (size_t)m*K + k0, (size_t)Kp*2);   /* per-row memcpy (== int8 wide-K gather); Sk==1 => contiguous. Scalar j-loop was a big fixed cost on low-M shapes. */
                   goff += (size_t)M*Kp; }
-              bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+              orki_bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
             uint32_t a_base = (uint32_t)AFS->dma;
             int contig = (w->Sn == 1) && !getenv("ORK_F16_NO_CONTIG");   /* (A) DEFAULT-ON for Sn==1: ONE chained submit/core over a CONTIGUOUS weight (Bbc) — no cross-buffer boundary => no HW cross-boundary prefetch => no CDMA wild => no drop (validated 500-iter 0-drop + shape-suite bit-exact, 2.6x). Sn>1 (multi-N-slice) keeps the per-slice path + the recovery net. ORK_F16_NO_CONTIG opts out for A/B. */
             if (contig && i == 0 && !w->Bbc_valid) {   /* build the contiguous weight ONCE (single-threaded build): concat all Sk K-slice tiles into one buffer */
                 size_t tot = 0; for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS; tot += (size_t)Kp*N*2; }
-                w->Bbc = bcreate(fd, tot, 0x403, w->domain);
+                w->Bbc = orki_bcreate(fd, tot, 0x403, w->domain);
                 if (w->Bbc.cpu) { size_t off = 0;
                     for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS; size_t sz = (size_t)Kp*N*2;
                         memcpy((char*)w->Bbc.cpu + off, w->Bb[ks].cpu, sz); off += sz; }
-                    bsync(fd, &w->Bbc, RKNPU_MEM_SYNC_TO_DEVICE); w->Bbc_valid = 1; }
+                    orki_bsync(fd, &w->Bbc, RKNPU_MEM_SYNC_TO_DEVICE); w->Bbc_valid = 1; }
             }
             if (contig && !w->Bbc_valid) contig = 0;   /* alloc failed -> fall back to the per-slice SW-chain */
             h->f16_contig = contig;
@@ -11529,20 +11529,20 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             uint32_t gap_pc[REGCMD_MUL_F16_CHAIN_N];
             if (gap) {
                 if (i == 0 && !w->Bgap_valid) {   /* build the dummy gap buffers ONCE (shared, single-threaded here) */
-                    w->Bgap[0]=bcreate(fd,4096,0x403,w->domain); w->Bgap[1]=bcreate(fd,4096,0x403,w->domain); w->Bgap[2]=bcreate(fd,4096,0x403,w->domain);
+                    w->Bgap[0]=orki_bcreate(fd,4096,0x403,w->domain); w->Bgap[1]=orki_bcreate(fd,4096,0x403,w->domain); w->Bgap[2]=orki_bcreate(fd,4096,0x403,w->domain);
                     if (w->Bgap[0].cpu && w->Bgap[1].cpu && w->Bgap[2].cpu) {
                         memset(w->Bgap[0].cpu,0,4096); memset(w->Bgap[1].cpu,0,4096);
                         { uint16_t *sb=(uint16_t*)w->Bgap[2].cpu; for (int e=0;e<GAPN;e++) sb[e]=0x3c00; }   /* identity per-channel scale (fp16 1.0) */
-                        bsync(fd,&w->Bgap[0],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&w->Bgap[1],RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&w->Bgap[2],RKNPU_MEM_SYNC_TO_DEVICE);
+                        orki_bsync(fd,&w->Bgap[0],RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&w->Bgap[1],RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&w->Bgap[2],RKNPU_MEM_SYNC_TO_DEVICE);
                         w->Bgap_valid = 1;
                     }
                 }
                 if (!w->Bgap_valid) gap = 0;
                 else { memcpy(gap_pc, REGCMD_MUL_F16_CHAIN, sizeof gap_pc); set_mul_geom(gap_pc, REGCMD_MUL_F16_CHAIN_N, GAPM, GAPN);
-                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_DPU_DST_BASE_ADDR, (uint32_t)w->Bgap[1].dma);
-                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5018, (uint32_t)w->Bgap[0].dma);
-                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5038, (uint32_t)w->Bgap[2].dma);
-                    setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5034, 0x00000008); }
+                    orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_DPU_DST_BASE_ADDR, (uint32_t)w->Bgap[1].dma);
+                    orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5018, (uint32_t)w->Bgap[0].dma);
+                    orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5038, (uint32_t)w->Bgap[2].dma);
+                    orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5034, 0x00000008); }
             }
             int np2 = 0; size_t goff = 0, sloff = 0; char kb[512] = {0}; unsigned char pcp[600] = {0};   /* pcp[p]=1 => program p is a perchan drain-gap (not a matmul) */
             for (int ks = 0; ks < w->Sk; ks++) {
@@ -11555,9 +11555,9 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
                     if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, REGCMD_N * 4);
-                    synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + (goff + (size_t)m0*Kp)*2), wbase,
+                    orki_synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + (goff + (size_t)m0*Kp)*2), wbase,
                           (uint32_t)(CC->dma + ((size_t)ks*M + m0)*Ncore*4), sched, CBUFf);
-                    if (validate_regcmd("ork_dyn_colsplit_f16", c, rc, REGCMD_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (orki_validate_regcmd("ork_dyn_colsplit_f16", c, rc, REGCMD_N, w, NULL, 0)) { free(h); return NULL; }
                     memcpy((char*)RC->cpu + (size_t)np2*REGCMD_N*4, rc, REGCMD_N*4);
                     np2++;
                 }
@@ -11593,7 +11593,7 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         uint32_t adma = (uint32_t)AF->dma;
         if (K <= 4096) memcpy(AF->cpu, t->A, (size_t)M * K);   /* full A[M,K] for base/wide-N. WIDE-K (K>4096) re-gathers A into AF as [Sk][M][Kp] below, so this full copy would be pure waste there — skip it. */
         size_t osz = (size_t)M * Ncore * 4;
-        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; }
         struct buf *CC = &c->mcc[i];
         if (K > 4096 || !w->Bf) {   /* WIDE-K (K>4096) or NO-Bf (K<=4096, ORK_NO_BF) colsplit (Sn==1, ANY M): the Bf-FREE per-core K-split — Sk*(M-tile) partial
@@ -11602,9 +11602,9 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
             * strided by the FULL K, but synth reads A contiguous [mc,Kp], so gather A[M,K] -> AF as a per-slice-
             * contiguous [Sk][M][Kp] layout first. Each K-slice's Kp<=KS gives an mg_max*64 cap >=320, so M<=256
             * prefill fits one program/slice; M-tiled defensively for larger M. */
-            int KS = int8_ks(c);
+            int KS = orki_int8_ks(c);
             size_t ksz = (size_t)w->Sk * M * Ncore * 4;
-            if (c->mccsz[i] < ksz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, ksz, 0x403, c->dom_active);
+            if (c->mccsz[i] < ksz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, ksz, 0x403, c->dom_active);
                 if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = ksz; c->mwarm[i] = 0; CC = &c->mcc[i]; }
             /* A[M,K]->[Sk][M][Kp] is IDENTICAL for every core (A is not core-dependent — only the weight column
              * range differs per core). Gather it ONCE into maf[0] (shared, read-only) and point every core's
@@ -11615,19 +11615,19 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
               for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                   for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, (const int8_t*)t->A + (size_t)m*K + k0, (size_t)Kp);
                   goff += (size_t)M*Kp; }
-              bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+              orki_bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
             uint32_t a_base = (uint32_t)AFS->dma;   /* shared gathered A for all cores */
             int np2 = 0; size_t goff = 0;
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
-                int kcap = mtile_cap(Kp); if (kcap < 1) kcap = 1;   /* rows/program for this K-slice */
+                int kcap = orki_mtile_cap(Kp); if (kcap < 1) kcap = 1;   /* rows/program for this K-slice */
                 uint32_t wbase = (uint32_t)(w->Bb[ks].dma + (uint64_t)(c0 / nt_sz) * Kp * nt_sz);   /* K-slice ks weight, column sub-range */
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M - m0 < kcap) ? (M - m0) : kcap;
                     if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, sizeof rc);
-                    synth_i8(rc, mc, Kp, Ncore, (uint32_t)(a_base + goff + (size_t)m0*Kp), wbase,
+                    orki_synth_i8(rc, mc, Kp, Ncore, (uint32_t)(a_base + goff + (size_t)m0*Kp), wbase,
                              (uint32_t)(CC->dma + ((size_t)ks * M + m0) * Ncore * 4), sched, CBUF, 0);   /* [mc,Ncore] rows [m0,+mc) of partial ks */
-                    if (validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (orki_validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                     np2++;
                 }
@@ -11661,9 +11661,9 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
               for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                   if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
                   memset(rc, 0, sizeof rc);
-                  synth_i8(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
+                  orki_synth_i8(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
                            (uint32_t)(CC->dma + (segbase + (size_t)m0 * segw) * 4), 1, CBUF, 0);   /* [mc,segw] contiguous block */
-                  if (validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                  if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                   np++;
               }
@@ -11753,13 +11753,13 @@ static ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t
         h->prepolled = 1;   /* workers already submitted + drained every core; ork_dyn_end skips its poll */
     } else
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        if (hardened || !c->mwarm[i]) bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: ALWAYS for the
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (hardened || !c->mwarm[i]) orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: ALWAYS for the
             * interleaved decode/stream regime (M<=64 — a shared-scratch dirty line would evict over the NPU write and
             * resurrect a mid-row SENT); cold-only for prefill (M>64, not interleaved — avoids the per-op full flush). */
         c->mwarm[i] = 1;
-        subs[i].timeout = mm_timeout_ms(); rknpu_submit_ioctl(fd, &subs[i], w->domain);
+        subs[i].timeout = mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], w->domain);
     }
     if (fp16_hard && c->mc_error) {   /* dropped fp16 K-slice — DON'T resubmit (sticky re-drop + D-state hang, campaign4).
         * Clean-reap the stuck job + int8 health-gate, then leave mc_error set for the run-level nc=1 bit-exact backstop. */
@@ -11826,7 +11826,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * (a 2D/3D program grid) is a follow-up; those stay M<=64. */
         if (tasks[i].M > 64 && (dt != DT_I8 || w->Sn != 1 || w->K > 4096 || !w->Bf)) return NULL;
         /* G1 N-tiling: int8 accepts Sn>1 (each N-slice = one strided-output sub-op, synth_i8 stride arg).
-         * fp16 stays Sn==1 — the fp16 `synth()` has no output-stride arg, so a strided column-slice can't be
+         * fp16 stays Sn==1 — the fp16 `orki_synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
         if (dt == DT_I8 ? (w->K % 512) : (w->K % 32)) return NULL;   /* int8: full-K Bf schedule needs K%512. fp16: single-slice small-K (the SSM scan, K%32) allowed — uses Bb + the K-dependent sched below. */
@@ -11840,10 +11840,10 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
         if (w->Sk != 1 && !w->Bf && !ksplit) return NULL;   /* non-ksplit Sk>1 needs the full-K Bf; ksplit uses the Bb K-slices */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
-    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_STREAM_F16, OCK_HW);   /* fp16 pipeline (layer owns reset, keep-warm-aware) */
     else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
-    if (mc_ensure(c, nc)) return NULL;
+    if (orki_mc_ensure(c, nc)) return NULL;
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     if (dt == DT_F16 && CBUF > 32768) CBUF = 32768;   /* fp16 M-scheduler validated only to the 32768 tile (int8-only cbuf raise) */
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
@@ -11855,7 +11855,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * the caller places C in the node's domain (Lever 1: per-domain output). Any mismatch/absence => in-domain
      * per-core scratch c->mcc[i] + copy-back in end. */
     int direct = 1;
-    for (int i = 0; i < S; i++) { struct buf *cb = dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
+    for (int i = 0; i < S; i++) { struct buf *cb = orki_dma_find(c, (void*)tasks[i].C); if (!cb || cb->domain != (int)dom) { direct = 0; break; } }
     /* M>1 NEVER uses direct (zero-copy) output: the direct path is coherency-unreliable for M>1 (validated —
      * M=8 direct output drops thousands of words to 0, non-deterministically, at Sn==1 AND Sn>1; the same
      * ZC-OUT class that keeps output zero-copy off by default). The scratch path (NPU -> cacheable mcc ->
@@ -11865,7 +11865,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
     if (getenv("ORK_DYN_DEBUG")) fprintf(stderr, "[dyn_mc] S=%d nc=%d dt=%d dom=%u direct=%d N=%d\n", S, nc, dt, dom, direct, N0);
     if (!direct) for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
         size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)(tasks[p].w->K > 4096 ? tasks[p].w->Sk : 1) * tasks[p].M * tasks[p].w->N * 4;   /* per-op M*N; K-split (K>4096) holds Sk partials */
-        if (c->mccsz[i] < osz) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, osz, 0x403, c->dom_active);
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }   /* fresh scratch => "cold" so the clean-before-round fires (dirty-line coherency) */
     uint32_t rc[REGCMD_I8_N + 4];
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
@@ -11876,14 +11876,14 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         /* PROGRAM count (task_number) is decoupled from OP count: an op with Sn>1 N-slices emits Sn
          * chained programs (each a strided-output sub-op), so a core's program count is sum-of-Sn, not nop. */
         int Pcore = 0; for (int p = lo; p < hi; p++) { ork_w *ww = tasks[p].w; int MM = tasks[p].M;   /* programs/op: K-split=>Sk, wide-M=>ceil(M/cap), else Sn (N-tile/plain) */
-            if (ww->K > 4096) Pcore += ww->Sk; else if (MM > 64) Pcore += (MM + mtile_cap(ww->K) - 1) / mtile_cap(ww->K); else Pcore += ww->Sn; }
+            if (ww->K > 4096) Pcore += ww->Sk; else if (MM > 64) Pcore += (MM + orki_mtile_cap(ww->K) - 1) / orki_mtile_cap(ww->K); else Pcore += ww->Sn; }
         Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I8_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
         /* A-staging need: K-split GATHERS every K-slice's [M,Kp] tile (sum = M*K) and all Sk tiles must be
          * resident at once (one chained submit); non-K-split stages [M,K]*esz. Grow maf (default 256KB) if a
          * wide-K M>1 op needs more (e.g. ffn_down M=64 => ~1.2MB). */
         size_t afneed = 0; for (int p = lo; p < hi; p++) { ork_w *ww = tasks[p].w; afneed += (size_t)tasks[p].M * ww->K * ((ww->K > 4096) ? 1 : ((dt == DT_F16) ? 2 : 1)); }
-        if (c->maf[i].size < afneed) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, afneed, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } }
+        if (c->maf[i].size < afneed) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, afneed, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         size_t astage = 0, coff = 0; int pp = 0;   /* pp = program (task) index within this core's chain */
         for (int p = 0; p < nop; p++) {
@@ -11895,19 +11895,19 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                 * partials into C (the NPU has no on-device C+= mode). A_ks is GATHERED into a contiguous
                 * [M,Kp] tile (synth_i8 reads A row-stride Kp; the caller's A has row-stride K) — for M==1 the
                 * gather is a plain Kp-byte copy. Output is always scratch (partials + accumulate). */
-                int KS = int8_ks(c); int gi = lo + p;
+                int KS = orki_int8_ks(c); int gi = lo + p;
                 uint32_t cbase = (uint32_t)(CC->dma + coff);
                 for (int ks = 0; ks < Sk; ks++) {
                     int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; int sched = (Kp == 1024 || Kp == 512);
                     /* defensive: the whole M-tile must fit one program for this Kp (mg_max*64 K-reduction cap).
                      * default KS=1024 gives cap>=320 so M<=64 always fits; a pathological ORK_KTILE could not. */
-                    if (M > mtile_cap(Kp)) { free(h); return NULL; }   /* would need M-tile chunking within a K-slice — not implemented */
+                    if (M > orki_mtile_cap(Kp)) { free(h); return NULL; }   /* would need M-tile chunking within a K-slice — not implemented */
                     if (astage + (size_t)M * Kp > AF->size) { free(h); return NULL; }
                     for (int r = 0; r < M; r++) memcpy((char*)AF->cpu + astage + (size_t)r*Kp, (const char*)t->A + (size_t)r*K + k0, Kp);   /* gather [M,Kp] */
                     uint32_t aks = (uint32_t)(AF->dma + astage); astage += (size_t)M * Kp;
                     memset(rc, 0, sizeof rc);
-                    synth_i8(rc, M, Kp, N, aks, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * M * N * 4), sched, CBUF, 0);   /* [M,N] partial ks */
-                    if (validate_regcmd("ork_dyn_mc_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    orki_synth_i8(rc, M, Kp, N, aks, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * M * N * 4), sched, CBUF, 0);   /* [M,N] partial ks */
+                    if (orki_validate_regcmd("ork_dyn_mc_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
                         rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -11926,13 +11926,13 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             if (M > 64) {   /* ------- wide-M PREFILL (Sn==1, K<=4096 full-K Bf): M-tile into mtile_cap-row programs -------
                 * Each M-tile computes rows [m0,m0+mc) of [M,N] (A rows are contiguous: adma+m0*K); the tiles
                 * write disjoint row ranges of the [M,N] scratch, chained; end() straight-copies [M,N] to C. */
-                int mcap = mtile_cap(K); int gi = lo + p;
+                int mcap = orki_mtile_cap(K); int gi = lo + p;
                 uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
                 uint32_t cbase = (uint32_t)(CC->dma + coff);   /* scratch (direct forced off for M>1) */
                 for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                     memset(rc, 0, sizeof rc);
-                    synth_i8(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
-                    if (validate_regcmd("ork_dyn_mc_mt", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                    orki_synth_i8(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+                    if (orki_validate_regcmd("ork_dyn_mc_mt", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
                         rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -11946,7 +11946,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                 coff += (size_t)M * N * 4;
                 continue;
             }
-            struct buf *cb = direct ? dma_find(c, (void*)t->C) : NULL;
+            struct buf *cb = direct ? orki_dma_find(c, (void*)t->C) : NULL;
             /* Per-op output base: C in place (direct) or in-domain scratch. The Sn N-slices write DISJOINT
              * column ranges [n0,n0+Nc) of this [M,N]-laid-out output, each at row-stride N (synth_i8 stride arg)
              * -> no host scatter (the strided write lands columns directly; scratch stays plain [M,N] for copy-back). */
@@ -11963,9 +11963,9 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                                      : cbase + (uint32_t)((size_t)n0 * 4);                                 /* column offset into [M,N] output */
                 memset(rc, 0, sizeof rc);
                 if (dt == DT_F16) { int schedf = ((K & (K-1)) == 0 && K >= 128);                            /* fp16 0x1040 sched: on for pow2 K>=128 (the doorbell's original always-on covered K512/1024/2048), off only for small/non-pow2 K (the SSM scan). NO <2048 upper bound — K=2048 (test_bmm) MUST stay sched=1 or the job hangs. */
-                                    synth   (rc, M, K, Nc, adma, bdma, cdma, schedf, CBUF); }               /* fp16: Sn==1 only (no stride arg) — guarded above */
-                else              synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
-                if (validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                                    orki_synth   (rc, M, K, Nc, adma, bdma, cdma, schedf, CBUF); }               /* fp16: Sn==1 only (no stride arg) — guarded above */
+                else              orki_synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
+                if (orki_validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                 if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                     rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
                     rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
@@ -12003,15 +12003,15 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         else { for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } } __asm__ volatile("dsb ish":::"memory"); } while (0)
     #define ORK_MC_ROUND() do { h->mc_nc = nc; h->dma_rw0 = ork_npu_dma_rw(c); for (int i = 0; i < nc; i++) if (Pc[i]) { \
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
-        subs[i].timeout = mm_timeout_ms(); { int _rc = rknpu_submit_ioctl(fd, &subs[i], dom); if (i < 8) h->mc_rc[i] = _rc; } } } while (0)
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \
+        subs[i].timeout = mm_timeout_ms(); { int _rc = orki_rknpu_submit_ioctl(fd, &subs[i], dom); if (i < 8) h->mc_rc[i] = _rc; } } } while (0)
     /* Clean the whole per-op output surface to DRAM (dedup by buffer) so no dirty CPU line can evict over the
      * NPU's writes; marks the cores warm. Re-runnable (used by the cold clean-before AND the dispatch-recover). */
     #define ORK_MC_CLEAN() do { struct buf *_cl[1024]; int _ncl = 0; \
         for (int x = 0; x < S; x++) { struct buf *b = h->outbuf[x]; int seen = 0; \
             for (int j = 0; j < _ncl; j++) if (_cl[j] == b) seen = 1; \
-            if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (_ncl < 1024) _cl[_ncl++] = b; } } \
+            if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (_ncl < 1024) _cl[_ncl++] = b; } } \
         for (int i = 0; i < nc; i++) c->mwarm[i] = 1; } while (0)
     int cold = 0; for (int i = 0; i < nc; i++) if (Pc[i] && !c->mwarm[i]) cold = 1;
     /* INTERLEAVE-SAFE (decode/stream, all tasks M<=64): this output surface (per-core scratch or resident C) is
@@ -12093,7 +12093,7 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
     if(o->kind==ORK_OP_MM_I8){ ork_w *w=o->w; int K=w->K,N=w->N,M=o->M;
         memcpy((char*)AF->cpu+*astage, o->A, (size_t)M*K); uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*K;
         uint32_t wdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
-        synth_i8(rc,M,K,N,adma,wdma,(uint32_t)(h->seq_out.dma+*coff),1,CBUF,0);
+        orki_synth_i8(rc,M,K,N,adma,wdma,(uint32_t)(h->seq_out.dma+*coff),1,CBUF,0);
         rcw=REGCMD_I8_N; dslot=216; regcfg=108; enable=0xd;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=4; h->ocube[gi]=0;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*4;
@@ -12103,10 +12103,10 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) *(int16_t*)(a+EWCUBEH_S(m,nn))=ha[m*N+nn];
         uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N*2;
         memcpy(rc,REGCMD_SILU_STD_I16,REGCMD_SILU_STD_I16_N*4); set_mul_geom(rc,REGCMD_SILU_STD_I16_N,M,N);
-        setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
-        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,adma);
-        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
-        setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
+        orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5038,0);
+        orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_SDP_5018,adma);
+        orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SCALE,0x4000); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_SHIFT,14); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
+        orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_R4110,ORK_SILU16_IDXOFF); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_ALU_CFG,ORK_SILU16_C4064); orki_setrn(rc,REGCMD_SILU_STD_I16_N,RK_DPU_BN_MUL_CFG,ORK_SILU16_C4068);
         rcw=REGCMD_SILU_STD_I16_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=2; h->ocube[gi]=2;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N*2;
@@ -12116,10 +12116,10 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn];
         uint32_t adma=(uint32_t)(AF->dma+*astage); *astage+=(size_t)M*N;
         memcpy(rc,REGCMD_SILU_STD,REGCMD_SILU_STD_N*4); set_mul_geom(rc,REGCMD_SILU_STD_N,M,N);
-        setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0); setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);
-        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,adma);
-        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,0x4000); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,14); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,0);
-        setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,ORK_SILU_IDXOFF); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,ORK_SILU_C4064); setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,ORK_SILU_C4068);
+        orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5040,0); orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5038,0);
+        orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); orki_setrn(rc,REGCMD_SILU_STD_N,RK_SDP_5018,adma);
+        orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SCALE,0x4000); orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_SHIFT,14); orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_OUT_CVT_OFFSET,0);
+        orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_R4110,ORK_SILU_IDXOFF); orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_ALU_CFG,ORK_SILU_C4064); orki_setrn(rc,REGCMD_SILU_STD_N,RK_DPU_BN_MUL_CFG,ORK_SILU_C4068);
         rcw=REGCMD_SILU_STD_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=1; h->ocube[gi]=1;
         h->ooff[gi]=*coff; h->dst[gi]=(int32_t*)o->C; *coff+=(size_t)M*N;
@@ -12128,9 +12128,9 @@ static void seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct b
         for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++){ a[ORK_SEQCUBE(m,nn,M)]=ha[m*N+nn]; b[ORK_SEQCUBE(m,nn,M)]=hb[m*N+nn]; }
         uint32_t adma=(uint32_t)(AF->dma+*astage), bdma=(uint32_t)(AF->dma+*astage+(size_t)M*N); *astage+=(size_t)2*M*N;
         memcpy(rc,REGCMD_MUL,REGCMD_MUL_N*4); set_mul_geom(rc,REGCMD_MUL_N,M,N);
-        setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); setrn(rc,REGCMD_MUL_N,RK_SDP_5018,adma); setrn(rc,REGCMD_MUL_N,RK_SDP_5038,bdma);
-        setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)o->mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)o->shift);
-        setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
+        orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(h->seq_out.dma+*coff)); orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,adma); orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,bdma);
+        orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)o->mult); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)o->shift);
+        orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
         rcw=REGCMD_MUL_N; dslot=138; regcfg=69; enable=0x18;
         h->outptr[gi]=(int32_t*)((char*)h->seq_out.cpu+*coff); h->oM[gi]=M; h->nout[gi]=M*N; h->oesz8[gi]=1; h->ocube[gi]=1;
         h->ooff[gi]=*coff; h->dst[gi]=o->C; *coff+=(size_t)M*N;
@@ -12167,9 +12167,9 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     for(int g=0;g<ngroups;g++){ long cost=0; for(int i=gstart[g];i<gstart[g+1];i++){ const ork_seq_op*o=&ops[i];
             cost += (o->kind==ORK_OP_MM_I8)?(long)o->w->K*o->w->N:(long)o->M*o->N; }
         int best=0; for(int i=1;i<nc;i++) if(load[i]<load[best]) best=i; core_of[g]=best; load[best]+=cost; }
-    if(mc_ensure(c,nc)) return NULL;
+    if(orki_mc_ensure(c,nc)) return NULL;
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
-    if(have_dom && (dom!=c->dom_active || (dom && !c->dom_save))) dom_activate(c, dom);
+    if(have_dom && (dom!=c->dom_active || (dom && !c->dom_save))) orki_dom_activate(c, dom);
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     /* per-core program count + staging/output need; total output for the shared seq_out */
     int Pc[ORK_MAXCORE]; size_t afn[ORK_MAXCORE]; size_t outneed=0;
@@ -12181,10 +12181,10 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
             else if(o->kind==ORK_OP_SILU_I8){ afn[i]+=(size_t)o->M*o->N; outneed+=(size_t)o->M*o->N; }        /* int8 unary */
             else { afn[i]+=(size_t)2*o->M*o->N; outneed+=(size_t)o->M*o->N; } } }
     for(int i=0;i<nc;i++){ if((size_t)Pc[i]*REGCMD_I8_N*4>c->mrc[i].size || (size_t)Pc[i]*sizeof(struct rknpu_task)>c->mtk[i].size) return NULL;
-        if(afn[i]>c->maf[i].size){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,afn[i],0x403,c->dom_active); if(!c->maf[i].cpu) return NULL; } }
+        if(afn[i]>c->maf[i].size){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bcreate(fd,afn[i],0x403,c->dom_active); if(!c->maf[i].cpu) return NULL; } }
     ork_dyn_chain *h=calloc(1,sizeof *h); if(!h) return NULL;
     h->c=c; h->S=n; h->P=n; h->mc=0; h->seq=1; h->seq_nc=nc; h->dom=have_dom?dom:0;
-    h->seq_out=bcreate(fd, outneed<4096?4096:outneed, 0x403, c->dom_active);
+    h->seq_out=orki_bcreate(fd, outneed<4096?4096:outneed, 0x403, c->dom_active);
     if(!h->seq_out.cpu){ free(h); return NULL; }
     memset(h->seq_out.cpu,0,h->seq_out.size);
     /* int16-SiLU HW-chain prologue: load the silu curve into SDP SRAM ONCE (ping-pong OFF — the #35 LUT
@@ -12192,20 +12192,20 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
      * here BEFORE the chain submit (cached after the first call). Lrc/Lsc stay alive until seq_end. */
     if(has_silu){
         int16_t lut[1030];   /* the LUT loader (REGCMD_SILU_LUT) is common; only the curve values + compute idx params differ by precision */
-        if(silu_kind==ORK_OP_SILU_I16){ if(build_act_lut16(c, silu_f, silu_is, silu_os, lut)){ bdestroy(fd,&h->seq_out); free(h); return NULL; } }
-        else { if(silu_calibrate_idx(c)){ bdestroy(fd,&h->seq_out); free(h); return NULL; } silu_build_curve(c, silu_f, silu_is, silu_os, lut); }
-        h->silu_lrc=bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active);
-        h->silu_lsc=bcreate(fd,4096,0x403,c->dom_active);
-        if(!h->silu_lrc.cpu||!h->silu_lsc.cpu){ if(h->silu_lrc.cpu)bdestroy(fd,&h->silu_lrc); if(h->silu_lsc.cpu)bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; }
+        if(silu_kind==ORK_OP_SILU_I16){ if(build_act_lut16(c, silu_f, silu_is, silu_os, lut)){ orki_bdestroy(fd,&h->seq_out); free(h); return NULL; } }
+        else { if(silu_calibrate_idx(c)){ orki_bdestroy(fd,&h->seq_out); free(h); return NULL; } silu_build_curve(c, silu_f, silu_is, silu_os, lut); }
+        h->silu_lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,c->dom_active);
+        h->silu_lsc=orki_bcreate(fd,4096,0x403,c->dom_active);
+        if(!h->silu_lrc.cpu||!h->silu_lsc.cpu){ if(h->silu_lrc.cpu)orki_bdestroy(fd,&h->silu_lrc); if(h->silu_lsc.cpu)orki_bdestroy(fd,&h->silu_lsc); orki_bdestroy(fd,&h->seq_out); free(h); return NULL; }
         memcpy(h->silu_lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-        setrn((uint32_t*)h->silu_lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)h->silu_lsc.dma);
+        orki_setrn((uint32_t*)h->silu_lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)h->silu_lsc.dma);
         { uint32_t*lr=(uint32_t*)h->silu_lrc.cpu; int j=0; for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<1030)?(int32_t)lut[j]:0; j++;
             lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-        bsync(fd,&h->silu_lrc,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&h->silu_lrc,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=h->silu_lrc.dma;
-          bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+          orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
           struct rknpu_submit ls;memset(&ls,0,sizeof ls);ls.flags=0x1;ls.task_number=1;ls.task_obj_addr=c->task.obj;ls.core_mask=RKNPU_CORE0_MASK;ls.fence_fd=-1;ls.timeout=ew_timeout_ms();ls.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(rknpu_submit_ioctl(fd,&ls,c->dom_active)){ bdestroy(fd,&h->silu_lrc); bdestroy(fd,&h->silu_lsc); bdestroy(fd,&h->seq_out); free(h); return NULL; } }
+          if(orki_rknpu_submit_ioctl(fd,&ls,c->dom_active)){ orki_bdestroy(fd,&h->silu_lrc); orki_bdestroy(fd,&h->silu_lsc); orki_bdestroy(fd,&h->seq_out); free(h); return NULL; } }
         h->silu_lut=1;
     }
     size_t coff=0;
@@ -12227,21 +12227,21 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
                 last_gi=p; pp++;
             } }
         h->seq_term_c[i]=last_gi;                        /* the core's last program (a matmul) = sentinel */
-        bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         memset(&subs[i],0,sizeof subs[i]);
         subs[i].flags = has_sdp ? (0x1u|0x2u) : (ork_ppflags()|0x2u);
         subs[i].task_number=(uint32_t)Pc[i]; subs[i].task_obj_addr=c->mtk[i].obj; subs[i].core_mask=1u<<i; subs[i].fence_fd=-1;
         subs[i].subcore_task[0]=subs[i].subcore_task[1]=subs[i].subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)Pc[i]};
     }
-    bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: no dirty CPU line evicts over NPU writes */
+    orki_bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: no dirty CPU line evicts over NPU writes */
     /* seed each core's terminal matmul's per-row last-col int32 sentinel */
     for(int i=0;i<nc;i++){ int ti=h->seq_term_c[i]; if(ti<0)continue; int M=h->oM[ti], N=h->nout[ti]/(M?M:1);
         volatile int32_t*o=(volatile int32_t*)((char*)h->seq_out.cpu+h->ooff[ti]);
         for(int m=0;m<M;m++){ volatile int32_t*db=&o[(size_t)m*N+(N-1)]; *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     ork_install_term();
-    for(int i=0;i<nc;i++){ subs[i].timeout=mm_timeout_ms(); if(rknpu_submit_ioctl(fd,&subs[i],c->dom_active)){ /* a core rejected: drain what we can */ } }
+    for(int i=0;i<nc;i++){ subs[i].timeout=mm_timeout_ms(); if(orki_rknpu_submit_ioctl(fd,&subs[i],c->dom_active)){ /* a core rejected: drain what we can */ } }
     return h;
 }
 /* Single-group / single-core convenience wrapper (Stage 2 API): one dependent chain on one core. */
@@ -12262,15 +12262,15 @@ int ork_dyn_seq_end(ork_dyn_chain *h){
         if(done){landed=1;break;} if(g_ork_term||ork_now_us()-t0>3e6) break; }
     g_in_doorbell=0;
     if(!landed) rc=-1;
-    bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&h->seq_out,RKNPU_MEM_SYNC_FROM_DEVICE);
     for(int i=0;i<h->S;i++){ if(!h->dst[i]) continue; int M=h->oM[i], N=h->nout[i]/(M?M:1);
         if(h->oesz8[i]==4){ memcpy(h->dst[i], (char*)h->seq_out.cpu+h->ooff[i], (size_t)M*N*4); }
         else if(h->oesz8[i]==2){ const char*src=(const char*)h->seq_out.cpu+h->ooff[i]; int16_t*dst=(int16_t*)h->dst[i];   /* int16 EWCUBEH (atom-8, 2-byte) -> row-major */
             for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=*(const int16_t*)(src + ((size_t)(nn/8)*(M*16) + (size_t)m*16 + (size_t)(nn%8)*2)); }
         else { const int8_t*src=(const int8_t*)((char*)h->seq_out.cpu+h->ooff[i]); int8_t*dst=(int8_t*)h->dst[i];
             for(int m=0;m<M;m++)for(int nn=0;nn<N;nn++) dst[m*N+nn]=src[ORK_SEQCUBE(m,nn,M)]; } }
-    if(h->silu_lut){ bdestroy(fd,&h->silu_lrc); bdestroy(fd,&h->silu_lsc); }   /* release the resident LUT buffers */
-    bdestroy(fd,&h->seq_out); free(h);
+    if(h->silu_lut){ orki_bdestroy(fd,&h->silu_lrc); orki_bdestroy(fd,&h->silu_lsc); }   /* release the resident LUT buffers */
+    orki_bdestroy(fd,&h->seq_out); free(h);
     if(g_ork_term){ int k=0; sigaction(SIGTERM,&g_prev_sig[k],NULL); raise(SIGTERM); }
     return rc;
 }
@@ -12285,43 +12285,43 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
     if (!c || S < 1 || S > 500 || !tasks) return -1;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1 || w->K % 512 || w->K > 4096) return -1;
-        if (!dma_find(c, (void*)tasks[i].C)) return -1; }
-    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+        if (!orki_dma_find(c, (void*)tasks[i].C)) return -1; }
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     int fd = c->fd, CBUF = c->soc->cbuf_elems, N = tasks[0].w->N; unsigned dom = tasks[0].w->domain;
     int P = S + 1;   /* program 0 = spin; 1..S = real tasks 0..S-1 */
     if ((size_t)P * REGCMD_I8_N * 4 > c->regcmd.size) return -1;
     struct buf ascr[512]; int nascr = 0;
-    struct buf spinC = bcreate(fd, (size_t)N * 4, 0x403, c->dom_active);
-    #define SPIN_CLEAN() do { for (int j=0;j<nascr;j++) bdestroy(fd,&ascr[j]); bdestroy(fd,&spinC); } while (0)
+    struct buf spinC = orki_bcreate(fd, (size_t)N * 4, 0x403, c->dom_active);
+    #define SPIN_CLEAN() do { for (int j=0;j<nascr;j++) orki_bdestroy(fd,&ascr[j]); orki_bdestroy(fd,&spinC); } while (0)
     if (!spinC.cpu) { return -1; }
     uint32_t rc[REGCMD_I8_N + 4];
     /* program 0: spin = task[0]'s matmul writing spinC, self-looping */
     { ork_w *w = tasks[0].w; int K = w->K;
-      struct buf s = bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
-      memcpy(s.cpu,tasks[0].A,(size_t)K); bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
+      struct buf s = orki_bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
+      memcpy(s.cpu,tasks[0].A,(size_t)K); orki_bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
       uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
-      memset(rc,0,sizeof rc); synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,(uint32_t)spinC.dma,1,CBUF,0);
+      memset(rc,0,sizeof rc); orki_synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,(uint32_t)spinC.dma,1,CBUF,0);
       uint64_t self=c->regcmd.dma;   /* self-loop */
       rc[216]=0x0010|((self&0xffff)<<16); rc[217]=(0x0101<<16)|((self>>16)&0xffff);
       rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16);
       memcpy((char*)c->regcmd.cpu,rc,REGCMD_I8_N*4); }
     int32_t *outptr[500];
     for (int i=0;i<S;i++){ int p=i+1; ork_w *w=tasks[i].w; int K=w->K;
-      struct buf s=bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
-      memcpy(s.cpu,tasks[i].A,(size_t)K); bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
-      struct buf *cb=dma_find(c,(void*)tasks[i].C);
+      struct buf s=orki_bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
+      memcpy(s.cpu,tasks[i].A,(size_t)K); orki_bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
+      struct buf *cb=orki_dma_find(c,(void*)tasks[i].C);
       uint32_t cdma=(uint32_t)(cb->dma+((const char*)tasks[i].C-(const char*)cb->cpu));
       uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
-      memset(rc,0,sizeof rc); synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,cdma,1,CBUF,0);
+      memset(rc,0,sizeof rc); orki_synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,cdma,1,CBUF,0);
       if(p<P-1){ uint64_t nx=c->regcmd.dma+(size_t)(p+1)*REGCMD_I8_N*4;
         rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
         rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16); }
       memcpy((char*)c->regcmd.cpu+(size_t)p*REGCMD_I8_N*4,rc,REGCMD_I8_N*4); outptr[i]=(int32_t*)tasks[i].C; }
-    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,(size_t)P*sizeof *t);
     for(int p=0;p<P;p++){ t[p].enable_mask=0xd;t[p].int_mask=0x300;t[p].int_clear=0x1ffff;t[p].regcfg_amount=108;t[p].regcmd_addr=c->regcmd.dma+(size_t)p*REGCMD_I8_N*4; }
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     { volatile int32_t*sd=(volatile int32_t*)((int32_t*)spinC.cpu+(N-1)); *sd=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(sd):"memory"); }
     for(int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
     __asm__ volatile("dsb ish":::"memory");
@@ -12330,7 +12330,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P};
     sub.timeout=mm_timeout_ms();
     c->warmed=1;
-    if(rknpu_submit_ioctl(fd,&sub,dom)){ SPIN_CLEAN(); return -1; }
+    if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ SPIN_CLEAN(); return -1; }
     if(spin_us>0){ struct timespec ts={spin_us/1000000,(long)(spin_us%1000000)*1000}; nanosleep(&ts,0); }
     /* liveness: spin slot written (loop ran) AND no real output touched (loop parked, didn't leak forward) */
     int spinran=0,leaked=0;
@@ -12343,7 +12343,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
       p0[218]=0x0014|(0x0037u<<16); p0[219]=(0x0101<<16);
       __asm__ volatile("dc cvac,%0"::"r"(&p0[216]):"memory"); __asm__ volatile("dc cvac,%0"::"r"(&p0[218]):"memory"); __asm__ volatile("dsb ish":::"memory"); }
     double t0=ork_now_us(); for(;;){ int done=0; for(int i=0;i<S;i++){volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)done++;} if(done>=S||ork_now_us()-t0>2e6)break; }
-    for(int i=0;i<S;i++){ struct buf*cb=dma_find(c,(void*)tasks[i].C); bsync(fd,cb,RKNPU_MEM_SYNC_FROM_DEVICE); }
+    for(int i=0;i<S;i++){ struct buf*cb=orki_dma_find(c,(void*)tasks[i].C); orki_bsync(fd,cb,RKNPU_MEM_SYNC_FROM_DEVICE); }
     int comp=0; for(int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)comp++; }
     SPIN_CLEAN();
     return comp;
@@ -12403,7 +12403,7 @@ int ork_dyn_remaining(ork_dyn_chain *h) { if (!h) return -1; int p = ork_dyn_pro
  * AFTER the sequencer passed the frontier, the job aborts (ret -22, ~10s timeout, NPU soft-reset) — MEASURED.
  * So this can WEDGE the NPU on a lost race. The robust wrap is chunk + resubmit (each chunk a clean job;
  * inter-chunk bubble ~one submit floor, <0.1% at large chunks). Kept for research; gate behind a reserved
- * budget (ORK_DYN_RESERVE) and keep the fill frontier well ahead of ork_dyn_progress. Returns 1 (too late),
+ * orki_budget (ORK_DYN_RESERVE) and keep the fill frontier well ahead of ork_dyn_progress. Returns 1 (too late),
  * 0 (ok), <0 (error). Same v1 op constraints as begin (M=1, DT_I8, K%512==0 && K<=4096, N matches, C resident). */
 #define ORK_DYN_HEADROOM 2
 int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task) {
@@ -12417,16 +12417,16 @@ int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task) {
     int prog = ork_dyn_progress(h);
     if (prog >= h->P - 1 - ORK_DYN_HEADROOM) return 1; /* sequencer too close to the terminator — lost the race */
     int idx = h->P, K = w->K, N = w->N;
-    struct buf *cb = dma_find(c, (void*)task->C); if (!cb) return -1;
+    struct buf *cb = orki_dma_find(c, (void*)task->C); if (!cb) return -1;
     uint32_t adma;                                     /* A -> scratch (zero-copy A miscomputes at M=1) */
-    struct buf *ab = dma_find(c, (void*)task->A);
-    if (ab) { bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)task->A - (const char*)ab->cpu)); }
-    else { if (h->nascr >= 1024) return -2; struct buf s = bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) return -1;
-           memcpy(s.cpu, task->A, (size_t)K); bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s; }
+    struct buf *ab = orki_dma_find(c, (void*)task->A);
+    if (ab) { orki_bsync(fd, ab, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)(ab->dma + ((const char*)task->A - (const char*)ab->cpu)); }
+    else { if (h->nascr >= 1024) return -2; struct buf s = orki_bcreate(fd, (size_t)K, 0x403, c->dom_active); if (!s.cpu) return -1;
+           memcpy(s.cpu, task->A, (size_t)K); orki_bsync(fd, &s, RKNPU_MEM_SYNC_TO_DEVICE); adma = (uint32_t)s.dma; h->ascr[h->nascr++] = s; }
     uint32_t cdma = (uint32_t)(cb->dma + ((const char*)task->C - (const char*)cb->cpu));
     uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
     uint32_t rc[REGCMD_I8_N + 4]; memset(rc, 0, sizeof rc);
-    synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);   /* new program: NO continue descriptor => it is the new terminator */
+    orki_synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);   /* new program: NO continue descriptor => it is the new terminator */
     memcpy((char*)c->regcmd.cpu + (size_t)idx * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
     h->outbuf[idx] = cb; h->outptr[idx] = (int32_t*)task->C;
     { volatile int32_t *db = (volatile int32_t*)(h->outptr[idx] + (N - 1)); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
@@ -12470,7 +12470,7 @@ static void mc_recover_resubmit(ork_dyn_chain *h){
     struct buf *cl[1024]; int ncl = 0;                                    /* re-clean output surfaces to DRAM */
     for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
         for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
-        if (!seen && b) { bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
+        if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
     if (h->esz == 2) {   /* int4: int16 output, full-surface SENT16 (write-order not last-col-last) */
         for (int x = 0; x < h->S; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
             for (int e = 0; e < no; e++){ o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
@@ -12479,14 +12479,14 @@ static void mc_recover_resubmit(ork_dyn_chain *h){
         else for (int m=0;m<Mx;m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+(Nx-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        h->mc_subs[i].timeout = (h->esz==2) ? i4_submit_tmo_ms() : mm_timeout_ms(); rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        h->mc_subs[i].timeout = (h->esz==2) ? i4_submit_tmo_ms() : mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
 }
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     /* SPIN TEARDOWN (safety): a persistent spin tail keeps re-reading the scratch/regcmd after the real outputs
-     * land, so freeing below would race an in-flight re-run (IOMMU fault / wedge). Null-terminate EVERY reserved
+     * land, so freeing below would race an in-flight re-orki_run (IOMMU fault / wedge). Null-terminate EVERY reserved
      * spin slot first: wherever the sequencer currently is, its next slot is now terminal, so it stops within
      * ~1-2 tasks — then the drain + free are safe. Bounded, no race (all slots terminal, not a chased frontier). */
     if (h->spin_end) {
@@ -12560,7 +12560,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     struct buf *done[1024]; int nd = 0;
     for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
         for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
-        if (!seen) { bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+        if (!seen) { orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
     if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
         for (int i = 0; i < h->S; i++)
             bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
@@ -12635,7 +12635,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * h->ostride[i]], &src[(size_t)m * Ne], (size_t)Ne * 4); }
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
-    for (int i = 0; i < h->nascr; i++) bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
+    for (int i = 0; i < h->nascr; i++) orki_bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = last; free(h);
     g_in_doorbell = 0;
     if (g_ork_term) {   /* a SIGTERM/SIGINT arrived mid-poll: we've drained + written back cleanly — now honor it */
@@ -12723,8 +12723,8 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I8 || tasks[i].M != 1 || w->Sn != 1 || w->K % 512 || w->K > 4096) return NULL;
         if (w->Sk != 1 && !w->Bf) return NULL;
-        if (!dma_find(c, (void*)tasks[i].C)) return NULL; }
-    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) dom_activate(c, tasks[0].w->domain);
+        if (!orki_dma_find(c, (void*)tasks[i].C)) return NULL; }
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     int fd = c->fd, CBUF = c->soc->cbuf_elems, N = tasks[0].w->N;
     ork_pc_chain *pc = calloc(1, sizeof *pc); if (!pc) return NULL;
@@ -12734,38 +12734,38 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
      * TRY_ALLOC_SRAM to DRAM when g_sram_total==0 (stock kernel/DTB) and fails an over-budget/contended alloc
      * over to DRAM per-buffer (so large chains spill gracefully). Opt out with ORK_PC_NO_SRAM (benchmarks). */
     unsigned pcsf = getenv("ORK_PC_NO_SRAM") ? 0 : RKNPU_MEM_TRY_ALLOC_SRAM;
-    pc->pool = bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403 | pcsf, c->dom_active);
+    pc->pool = orki_bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403 | pcsf, c->dom_active);
     if (!pc->pool.cpu) { free(pc); return NULL; }
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K;
-        pc->ascr[i] = bcreate(fd, (size_t)K, 0x403 | pcsf, c->dom_active);
-        if (!pc->ascr[i].cpu) { for (int j=0;j<i;j++) bdestroy(fd,&pc->ascr[j]); bdestroy(fd,&pc->pool); free(pc); return NULL; }
-        memcpy(pc->ascr[i].cpu, tasks[i].A, (size_t)K); bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        pc->ascr[i] = orki_bcreate(fd, (size_t)K, 0x403 | pcsf, c->dom_active);
+        if (!pc->ascr[i].cpu) { for (int j=0;j<i;j++) orki_bdestroy(fd,&pc->ascr[j]); orki_bdestroy(fd,&pc->pool); free(pc); return NULL; }
+        memcpy(pc->ascr[i].cpu, tasks[i].A, (size_t)K); orki_bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE);
         pc->asrc[i] = tasks[i].A; pc->Ksz[i] = K;
-        struct buf *cb = dma_find(c, (void*)tasks[i].C);
+        struct buf *cb = orki_dma_find(c, (void*)tasks[i].C);
         uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memset(rc, 0, sizeof rc);
-        synth_i8(rc, 1, K, N, (uint32_t)pc->ascr[i].dma, bdma, cdma, 1, CBUF, 0);   /* A/C addresses BAKED IN */
-        if (validate_regcmd("ork_pc", c, rc, REGCMD_I8_N, w, pc->ascr, i+1)) { for (int j=0;j<=i;j++) bdestroy(fd,&pc->ascr[j]); bdestroy(fd,&pc->pool); free(pc); return NULL; }
+        orki_synth_i8(rc, 1, K, N, (uint32_t)pc->ascr[i].dma, bdma, cdma, 1, CBUF, 0);   /* A/C addresses BAKED IN */
+        if (orki_validate_regcmd("ork_pc", c, rc, REGCMD_I8_N, w, pc->ascr, i+1)) { for (int j=0;j<=i;j++) orki_bdestroy(fd,&pc->ascr[j]); orki_bdestroy(fd,&pc->pool); free(pc); return NULL; }
         if (i < S - 1) { uint64_t nx = pc->pool.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
             rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
             rc[218] = 0x0014 | (0x0037u << 16);        rc[219] = (0x0101 << 16); }
         memcpy((char*)pc->pool.cpu + (size_t)i * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         pc->outbuf[i] = cb; pc->outptr[i] = (int32_t*)tasks[i].C;
     }
-    bsync(fd, &pc->pool, RKNPU_MEM_SYNC_TO_DEVICE);   /* pool is STATIC — synced once, never re-synth'd */
+    orki_bsync(fd, &pc->pool, RKNPU_MEM_SYNC_TO_DEVICE);   /* pool is STATIC — synced once, never re-synth'd */
     return pc;
 }
 /* Re-run the precompiled chain: refresh A contents from the caller's (fixed-address) source, submit NONBLOCK,
  * poll doorbells, writeback. No synth/validate. Returns highest completed op, -1 on submit error. */
 int ork_pc_run(ork_pc_chain *pc) {
     if (!pc) return -1; ork_npu *c = pc->c; int fd = c->fd, S = pc->S, N = pc->N;
-    for (int i = 0; i < S; i++) { memcpy(pc->ascr[i].cpu, pc->asrc[i], (size_t)pc->Ksz[i]); bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE); }
+    for (int i = 0; i < S; i++) { memcpy(pc->ascr[i].cpu, pc->asrc[i], (size_t)pc->Ksz[i]); orki_bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE); }
     struct rknpu_task *t = c->task.cpu; memset(t, 0, (size_t)S * sizeof *t);
     for (int p = 0; p < S; p++) { t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
         t[p].regcfg_amount = 108; t[p].regcmd_addr = pc->pool.dma + (size_t)p * REGCMD_I8_N * 4; }
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
     sub.flags = ork_ppflags() | 0x2u; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
@@ -12773,20 +12773,20 @@ int ork_pc_run(ork_pc_chain *pc) {
     #define ORK_PC_SEED() do { for (int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while(0)
     ORK_PC_SEED();
     if (!pc->warmed) {   /* cold: throwaway NONBLOCK warm pass, poll, reseed (blocking multi-task submit EINVALs) */
-        if (!rknpu_submit_ioctl(fd, &sub, pc->dom)) { double tw=ork_now_us();
+        if (!orki_rknpu_submit_ioctl(fd, &sub, pc->dom)) { double tw=ork_now_us();
             for(;;){ int a=1; for(int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){a=0;break;} } if(a||ork_now_us()-tw>2e6)break; } }
         pc->warmed = 1; ORK_PC_SEED();
     }
-    if (rknpu_submit_ioctl(fd, &sub, pc->dom)) return -1;
+    if (orki_rknpu_submit_ioctl(fd, &sub, pc->dom)) return -1;
     double t0 = ork_now_us(); int last = -1;
     for (;;) { int hi=-1; for (int i=0;i<S;i++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[i]+(N-1)); __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=ORK_DYN_SENT)hi=i; }
         if (hi>=S-1){ last=hi; break; } if (ork_now_us()-t0>2e6){ last=hi; break; } }
     struct buf *done[512]; int nd=0;
-    for (int i=0;i<S;i++){ struct buf*b=pc->outbuf[i]; int seen=0; for(int j=0;j<nd;j++) if(done[j]==b)seen=1; if(!seen){ bsync(fd,b,RKNPU_MEM_SYNC_FROM_DEVICE); if(nd<512)done[nd++]=b; } }
+    for (int i=0;i<S;i++){ struct buf*b=pc->outbuf[i]; int seen=0; for(int j=0;j<nd;j++) if(done[j]==b)seen=1; if(!seen){ orki_bsync(fd,b,RKNPU_MEM_SYNC_FROM_DEVICE); if(nd<512)done[nd++]=b; } }
     return last;
 }
 void ork_pc_free(ork_pc_chain *pc) { if (!pc) return; int fd = pc->c->fd;
-    for (int i=0;i<pc->S;i++) bdestroy(fd,&pc->ascr[i]); bdestroy(fd,&pc->pool); free(pc); }
+    for (int i=0;i<pc->S;i++) orki_bdestroy(fd,&pc->ascr[i]); orki_bdestroy(fd,&pc->pool); free(pc); }
 
 /* CHAIN ASSEMBLER CORE: submit N pre-built HETEROGENEOUS programs as ONE PC-chain (task_number=N, one ioctl).
  * Packs the programs contiguously into c->regcmd (content-driven stride, per AGENTS.md); for each non-last
@@ -12829,11 +12829,11 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
             rc[slot+3]=(0x0101u<<16);
         }
     }
-    bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,(size_t)n*sizeof(struct rknpu_task));
     for(int i=0;i<n;i++){ t[i].enable_mask=progs[i].enable_mask; t[i].int_mask=0x300; t[i].int_clear=0x1ffff;
         t[i].regcfg_amount=progs[i].regcfg_amount; t[i].regcmd_addr=(uint32_t)((uint64_t)c->regcmd.dma + off[i]*4); }
-    bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* ping-pong (ork_ppflags, typically 0x5) is safe ONLY for register-config-only chains (all int8 matmul
      * tasks, like run_chain_i8); ANY SDP/LUT task (enable != 0xd) needs ping-pong OFF (0x1) so a bank swap
      * doesn't race a LUT SRAM commit (AGENTS.md "ping-pong OFF for LUT chains"). */
@@ -12848,7 +12848,7 @@ int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom)
     if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] n=%d dom=%d flags=0x%x warmed(pre)=%d reps=%d regcmd.dma=0x%llx task.obj=0x%llx | "
         "t0{en=0x%x rcfg=%d addr=0x%x} t%d{en=0x%x rcfg=%d addr=0x%x}\n", n,dom,s.flags,reps,reps,(unsigned long long)c->regcmd.dma,(unsigned long long)c->task.obj,
         t[0].enable_mask,t[0].regcfg_amount,t[0].regcmd_addr, n-1,t[n-1].enable_mask,t[n-1].regcfg_amount,t[n-1].regcmd_addr);
-    for(int rep=0; rep<reps; rep++){ int e=rknpu_submit_ioctl(fd,&s,dom); rr = e?-1:0;
+    for(int rep=0; rep<reps; rep++){ int e=orki_rknpu_submit_ioctl(fd,&s,dom); rr = e?-1:0;
         if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] submit rep %d -> %d (errno=%d)\n",rep,e,errno); }
     c->warmed = 1;
     return rr;
@@ -12865,7 +12865,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     if(!c||!ork_ppu_fuse_enabled(c)) return -3;
     int fd=c->fd, M=8, K=512, N=64, mult=0x4000, shift=14, CBUF=c->soc->cbuf_elems;
     #define SEWC(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
-    if(mc_ensure(c,1)) return -1;
+    if(orki_mc_ensure(c,1)) return -1;
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     /* pack an all-ones int8 weight [K,N] -> C = K everywhere */
     int8_t *wb=malloc((size_t)K*N); if(!wb) return -2; for(int i=0;i<K*N;i++) wb[i]=1;
@@ -12882,40 +12882,40 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     memset(AF->cpu,0,offEwB+(size_t)M*N);
     { int8_t*a=(int8_t*)AF->cpu; for(int i=0;i<M*K;i++) a[offA+i]=1;
       for(int m=0;m<M;m++)for(int n=0;n<N;n++){ a[offEwA+SEWC(m,n)]=r1[m*N+n]; a[offEwB+SEWC(m,n)]=s1[m*N+n]; } }
-    bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,AF,RKNPU_MEM_SYNC_TO_DEVICE);
     /* output scratch: matmul0 [M,N]i32 @0, ewmul [M,N]i8 @2048, matmul2 [M,N]i32 @2560 */
     size_t oMM0=0, oEW=(size_t)M*N*4, oMM2=oEW+(size_t)M*N;
-    struct buf OUT=bcreate(fd,8192,0x403,c->dom_active); if(!OUT.cpu) return -2;
+    struct buf OUT=orki_bcreate(fd,8192,0x403,c->dom_active); if(!OUT.cpu) return -2;
     memset(OUT.cpu,0,8192);
     uint32_t o0=(uint32_t)(OUT.dma+oMM0), oe=(uint32_t)(OUT.dma+oEW), o2=(uint32_t)(OUT.dma+oMM2);
     /* build 3 programs at 224-word (64B-aligned) slots in mrc[0] */
     uint32_t *base=(uint32_t*)RC->cpu; memset(base,0,3*(size_t)REGCMD_I8_N*4);
     uint32_t am=(uint32_t)(AF->dma+offA);
     { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
-      synth_i8(rc,M,K,N,am,wdma,o0,1,CBUF,0);                                  /* prog0 matmul -> o0 */
+      orki_synth_i8(rc,M,K,N,am,wdma,o0,1,CBUF,0);                                  /* prog0 matmul -> o0 */
       uint64_t nx=RC->dma + (size_t)1*REGCMD_I8_N*4; int amt=(69+3)/2;         /* -> prog1 (SDP regcfg 69) */
       rc[216]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[217]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
       rc[218]=0x0014|((uint32_t)amt<<16);         rc[219]=(0x0101u<<16);
       memcpy(base+0*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
     { uint32_t rc[REGCMD_MUL_N]; memcpy(rc,REGCMD_MUL,sizeof rc); set_mul_geom(rc,REGCMD_MUL_N,M,N);
-      setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,oe); setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)(AF->dma+offEwA)); setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)(AF->dma+offEwB));
-      setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-      setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
+      orki_setrn(rc,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,oe); orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)(AF->dma+offEwA)); orki_setrn(rc,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)(AF->dma+offEwB));
+      orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+      orki_setrn(rc,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
       uint64_t nx=RC->dma + (size_t)2*REGCMD_I8_N*4; int amt=(108+3)/2;        /* -> prog2 (matmul regcfg 108) */
       rc[138]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[139]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
       rc[140]=0x0014|((uint32_t)amt<<16);         rc[141]=(0x0101u<<16);
       memcpy(base+1*REGCMD_I8_N, rc, REGCMD_MUL_N*4); }
     { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
-      synth_i8(rc,M,K,N,am,wdma,o2,1,CBUF,0);                                  /* prog2 matmul -> o2 (TERMINAL) */
+      orki_synth_i8(rc,M,K,N,am,wdma,o2,1,CBUF,0);                                  /* prog2 matmul -> o2 (TERMINAL) */
       memcpy(base+2*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
-    bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->mtk[0].cpu; memset(tk,0,3*sizeof *tk);
     tk[0].enable_mask=0xd;  tk[0].int_mask=0x300; tk[0].int_clear=0x1ffff; tk[0].regcfg_amount=108; tk[0].regcmd_addr=(uint32_t)(RC->dma+0*REGCMD_I8_N*4);
     tk[1].enable_mask=0x18; tk[1].int_mask=0x300; tk[1].int_clear=0x1ffff; tk[1].regcfg_amount=69;  tk[1].regcmd_addr=(uint32_t)(RC->dma+1*REGCMD_I8_N*4);
     tk[2].enable_mask=0xd;  tk[2].int_mask=0x300; tk[2].int_clear=0x1ffff; tk[2].regcfg_amount=108; tk[2].regcmd_addr=(uint32_t)(RC->dma+2*REGCMD_I8_N*4);
-    bsync(fd,&c->mtk[0],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->mtk[0],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     /* clean-before: whole OUT to DRAM (no dirty CPU line evicts over the NPU writes — begin_mc's cold recipe) */
-    bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_TO_DEVICE);
     /* seed the TERMINAL matmul (prog2 @ o2) last-col-per-row int32 sentinel */
     volatile int32_t *t2=(volatile int32_t*)((char*)OUT.cpu+oMM2);
     for(int m=0;m<M;m++){ volatile int32_t*db=&t2[(size_t)m*N+(N-1)]; *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
@@ -12924,11 +12924,11 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     s.flags=0x1u|0x2u;   /* PC | NONBLOCK; ping-pong OFF (SDP present) */
     s.task_number=3; s.task_obj_addr=c->mtk[0].obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=mm_timeout_ms();
     s.subcore_task[0]=(struct rknpu_subcore_task){0,3};
-    int e=rknpu_submit_ioctl(fd,&s,c->dom_active);
+    int e=orki_rknpu_submit_ioctl(fd,&s,c->dom_active);
     int okall=0;
     if(e==0){ double t0=ork_now_us(); int landed=0;
         for(;;){ int done=1; for(int m=0;m<M;m++){ volatile int32_t*db=&t2[(size_t)m*N+(N-1)]; __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db==ORK_DYN_SENT){done=0;break;} } if(done){landed=1;break;} if(ork_now_us()-t0>3e6)break; }
-        if(landed){ bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE);
+        if(landed){ orki_bsync(fd,&OUT,RKNPU_MEM_SYNC_FROM_DEVICE);
             int32_t*c0=(int32_t*)((char*)OUT.cpu+oMM0), *c2=(int32_t*)((char*)OUT.cpu+oMM2); int8_t*ew=(int8_t*)((char*)OUT.cpu+oEW);
             int n0=0,n2=0,ne=0;
             for(int i=0;i<M*N;i++){ if(c0[i]==K)n0++; if(c2[i]==K)n2++; }
@@ -12936,7 +12936,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
             if(getenv("ORK_SEQ_DBG")) fprintf(stderr,"[seq-hetero] matmul0 #==K=%d/%d  ewmul #match=%d/%d  matmul2 #==K=%d/%d\n",n0,M*N,ne,M*N,n2,M*N);
             okall = (n0==M*N) && (ne==M*N) && (n2==M*N); } }
     if(ok)*ok=okall;
-    bdestroy(fd,&OUT);
+    orki_bdestroy(fd,&OUT);
     #undef SEWC
     return e?-1:0;
 }
@@ -12956,9 +12956,9 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     int fd=c->fd, M=8, N=64, mult=0x4000, shift=14;
     #define EWC(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
-    struct buf A0=bcreate(fd,sz,0x403,-1),B0=bcreate(fd,sz,0x403,-1),O0=bcreate(fd,sz,0x403,-1);
-    struct buf A1=bcreate(fd,sz,0x403,-1),B1=bcreate(fd,sz,0x403,-1),O1=bcreate(fd,sz,0x403,-1);
-    if(!A0.cpu||!B0.cpu||!O0.cpu||!A1.cpu||!B1.cpu||!O1.cpu){ bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1); return -2; }
+    struct buf A0=orki_bcreate(fd,sz,0x403,-1),B0=orki_bcreate(fd,sz,0x403,-1),O0=orki_bcreate(fd,sz,0x403,-1);
+    struct buf A1=orki_bcreate(fd,sz,0x403,-1),B1=orki_bcreate(fd,sz,0x403,-1),O1=orki_bcreate(fd,sz,0x403,-1);
+    if(!A0.cpu||!B0.cpu||!O0.cpu||!A1.cpu||!B1.cpu||!O1.cpu){ orki_bdestroy(fd,&A0);orki_bdestroy(fd,&B0);orki_bdestroy(fd,&O0);orki_bdestroy(fd,&A1);orki_bdestroy(fd,&B1);orki_bdestroy(fd,&O1); return -2; }
     int8_t r0[512],s0[512],r1[512],s1[512],ref0[512],ref1[512]; uint32_t g=12345;
     for(int i=0;i<M*N;i++){ r0[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; s0[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3;
                             r1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; s1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&0x7))-3; }
@@ -12967,18 +12967,18 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     memset(A0.cpu,0,sz);memset(B0.cpu,0,sz);memset(O0.cpu,0,sz);memset(A1.cpu,0,sz);memset(B1.cpu,0,sz);memset(O1.cpu,0,sz);
     int8_t*a0=A0.cpu,*b0=B0.cpu,*a1=A1.cpu,*b1=B1.cpu;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ a0[EWC(m,n)]=r0[m*N+n]; b0[EWC(m,n)]=s0[m*N+n]; a1[EWC(m,n)]=r1[m*N+n]; b1[EWC(m,n)]=s1[m*N+n]; }
-    bsync(fd,&A0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B0,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O0,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&A1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&B1,RKNPU_MEM_SYNC_TO_DEVICE);bsync(fd,&O1,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A0,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B0,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O0,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&A1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O1,RKNPU_MEM_SYNC_TO_DEVICE);
     /* build the two ewmul regcmds exactly like the standalone ork_npu_ewmul_i8 (geom + addrs + scale) */
     uint32_t rc0[REGCMD_MUL_N],rc1[REGCMD_MUL_N];
     memcpy(rc0,REGCMD_MUL,sizeof rc0); set_mul_geom(rc0,REGCMD_MUL_N,M,N);
-    setrn(rc0,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O0.dma); setrn(rc0,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A0.dma); setrn(rc0,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B0.dma);
-    setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc0,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc0,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
+    orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O0.dma); orki_setrn(rc0,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A0.dma); orki_setrn(rc0,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B0.dma);
+    orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
     memcpy(rc1,REGCMD_MUL,sizeof rc1); set_mul_geom(rc1,REGCMD_MUL_N,M,N);
-    setrn(rc1,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O1.dma); setrn(rc1,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A1.dma); setrn(rc1,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B1.dma);
-    setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); setrn(rc1,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); setrn(rc1,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
+    orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O1.dma); orki_setrn(rc1,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A1.dma); orki_setrn(rc1,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B1.dma);
+    orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc1,REGCMD_MUL_N,RK_DPU_EW_CVT_OFFSET,0);
     /* THE PORT: SDP progs through the proven chainer. ewmul0 is a MIDDLE program (desc_slot=138 = the chain-native
      * descriptor slot decoded from SM_TASK0); ewmul1 is the terminal (desc_slot=-1). chain_progs writes ewmul0's
      * forward descriptor at 138, detects enable!=0xd -> ping-pong OFF, and does the reps=2 cold warm-up. */
@@ -12988,26 +12988,26 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
      * MIDDLE SDP task (carries the fwd descriptor at 138 like the FFN chain's silu). ORK_SDP_NOMM=1 = old SDP-first
      * form (control). Matmul: M=8,K=64,N=64, A=c->Af all-ones, W all-ones -> C=K=64 (sanity, not read by ewmul). */
     int nomm=!!getenv("ORK_SDP_NOMM"); int CBUF=c->soc->cbuf_elems, MK=8*64, KN=64*64;
-    struct buf W=bcreate(fd,(size_t)KN,0x403,-1), C=bcreate(fd,(size_t)8*64*4,0x403,-1);
+    struct buf W=orki_bcreate(fd,(size_t)KN,0x403,-1), C=orki_bcreate(fd,(size_t)8*64*4,0x403,-1);
     static uint32_t rmm[REGCMD_I8_N];
     if(!nomm){
-        if(!W.cpu||!C.cpu){ bdestroy(fd,&W);bdestroy(fd,&C);bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1); return -2; }
+        if(!W.cpu||!C.cpu){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&C);orki_bdestroy(fd,&A0);orki_bdestroy(fd,&B0);orki_bdestroy(fd,&O0);orki_bdestroy(fd,&A1);orki_bdestroy(fd,&B1);orki_bdestroy(fd,&O1); return -2; }
         { int8_t*wb=W.cpu; for(int i=0;i<KN;i++)wb[i]=1; int8_t*ad=c->Af.cpu; for(int i=0;i<MK;i++)ad[i]=1; }
         memset(C.cpu,0,(size_t)8*64*4);
-        bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&C,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-        act(fd,RKNPU_ACT_RESET,0);
-        synth_i8(rmm,8,64,64,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)C.dma,1,CBUF,0);
+        orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&C,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_act(fd,RKNPU_ACT_RESET,0);
+        orki_synth_i8(rmm,8,64,64,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)C.dma,1,CBUF,0);
     }
     ork_chain_prog progs[3]={ {rmm,REGCMD_I8_N,0xd,108,216}, {rc0,REGCMD_MUL_N,0x18,69,138}, {rc1,REGCMD_MUL_N,0x18,69,-1} };
-    /* dom=-1 (default domain) to MATCH the bcreate(...,-1) buffers + c->regcmd/c->task (a domain-0 submit
+    /* dom=-1 (default domain) to MATCH the orki_bcreate(...,-1) buffers + c->regcmd/c->task (a domain-0 submit
      * mismatches them, see ork_npu_chain_selftest). nomm control: SDP-first 2-task chain (expected to hang). */
     int rc = nomm ? ork_npu_chain_progs(c,2,progs+1,-1) : ork_npu_chain_progs(c,3,progs,-1);
-    if(rc==0){ bsync(fd,&O0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&O1,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(rc==0){ orki_bsync(fd,&O0,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&O1,RKNPU_MEM_SYNC_FROM_DEVICE);
         int ok0=1,ok1=1;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++){ if(*(int8_t*)((char*)O0.cpu+EWC(m,n))!=ref0[m*N+n])ok0=0; if(*(int8_t*)((char*)O1.cpu+EWC(m,n))!=ref1[m*N+n])ok1=0; }
         if(t0_ok)*t0_ok=ok0; if(t1_ok)*t1_ok=ok1; }
-    bdestroy(fd,&W);bdestroy(fd,&C);
-    bdestroy(fd,&A0);bdestroy(fd,&B0);bdestroy(fd,&O0);bdestroy(fd,&A1);bdestroy(fd,&B1);bdestroy(fd,&O1);
+    orki_bdestroy(fd,&W);orki_bdestroy(fd,&C);
+    orki_bdestroy(fd,&A0);orki_bdestroy(fd,&B0);orki_bdestroy(fd,&O0);orki_bdestroy(fd,&A1);orki_bdestroy(fd,&B1);orki_bdestroy(fd,&O1);
     #undef EWC
     return rc;
 }
@@ -13023,30 +13023,30 @@ int ork_npu_chain_selftest(ork_npu *c, int *t0_cnt, int *t1_cnt){
      * buffers c->Af/c->regcmd/c->task live in the default domain, so a domain-0 submit mismatches them. */
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=-1;
     const int M=8, K=64, N=64;
-    struct buf W0=bcreate(fd,(size_t)K*N,0x403,dom), W1=bcreate(fd,(size_t)K*N,0x403,dom);
-    struct buf C0=bcreate(fd,(size_t)M*N*4,0x403,dom), C1=bcreate(fd,(size_t)M*N*4,0x403,dom);
-    if(!W0.cpu||!W1.cpu||!C0.cpu||!C1.cpu){ bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1); return -2; }
+    struct buf W0=orki_bcreate(fd,(size_t)K*N,0x403,dom), W1=orki_bcreate(fd,(size_t)K*N,0x403,dom);
+    struct buf C0=orki_bcreate(fd,(size_t)M*N*4,0x403,dom), C1=orki_bcreate(fd,(size_t)M*N*4,0x403,dom);
+    if(!W0.cpu||!W1.cpu||!C0.cpu||!C1.cpu){ orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1);orki_bdestroy(fd,&C0);orki_bdestroy(fd,&C1); return -2; }
     { int8_t*b0=W0.cpu,*b1=W1.cpu; for(size_t i=0;i<(size_t)K*N;i++){ b0[i]=1; b1[i]=2; } }   /* uniform -> tile layout irrelevant */
     memset(C0.cpu,0,(size_t)M*N*4); memset(C1.cpu,0,(size_t)M*N*4);
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; }
-    bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&C0,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&C1,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0);
+    orki_bsync(fd,&W0,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&W1,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&C0,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&C1,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0);
     static uint32_t r0[REGCMD_I8_N], r1[REGCMD_I8_N];
-    synth_i8(r0,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)C0.dma,1,CBUF,0);
-    synth_i8(r1,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)C1.dma,1,CBUF,0);
+    orki_synth_i8(r0,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)C0.dma,1,CBUF,0);
+    orki_synth_i8(r1,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)C1.dma,1,CBUF,0);
     ork_chain_prog progs[2]={ {r0,REGCMD_I8_N,0xd,108,216}, {r1,REGCMD_I8_N,0xd,108,-1} };
     int nprog = getenv("ORK_GS_N1") ? 1 : 2;   /* ORK_GS_N1: single-task chain_progs (isolate chaining from the matmul itself) */
     int crc=ork_npu_chain_progs(c,nprog,progs,dom);
-    if(crc){ bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1); return crc==-1?-1:-2; }
-    bsync(fd,&C0,RKNPU_MEM_SYNC_FROM_DEVICE); bsync(fd,&C1,RKNPU_MEM_SYNC_FROM_DEVICE);
+    if(crc){ orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1);orki_bdestroy(fd,&C0);orki_bdestroy(fd,&C1); return crc==-1?-1:-2; }
+    orki_bsync(fd,&C0,RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd,&C1,RKNPU_MEM_SYNC_FROM_DEVICE);
     int n0=0,n1=0; int32_t*c0=C0.cpu,*c1=C1.cpu;
     int32_t mx0=0,mx1=0; for(int i=0;i<M*N;i++){ if(c0[i]==K)n0++; if(c1[i]==2*K)n1++;
         if(c0[i]>mx0)mx0=c0[i]; if(c1[i]>mx1)mx1=c1[i]; }
     fprintf(stderr,"[selftest] K=%d 2K=%d | C0 max=%d first=[%d %d %d %d] | C1 max=%d first=[%d %d %d %d]\n",
             K,2*K,mx0,c0[0],c0[1],c0[2],c0[3],mx1,c1[0],c1[1],c1[2],c1[3]);
     if(t0_cnt)*t0_cnt=n0; if(t1_cnt)*t1_cnt=n1;
-    bdestroy(fd,&W0);bdestroy(fd,&W1);bdestroy(fd,&C0);bdestroy(fd,&C1);
+    orki_bdestroy(fd,&W0);orki_bdestroy(fd,&W1);orki_bdestroy(fd,&C0);orki_bdestroy(fd,&C1);
     return 0;
 }
 
@@ -13093,7 +13093,7 @@ int ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,
             if(a>maxA)maxA=a; if(bb>maxB)maxB=bb; t++;
         }
     }
-    struct buf Ab=bcreate(fd,maxA*esz,0x403,dom), Bb=bcreate(fd,maxB*esz,0x403,dom), Cb=bcreate(fd,totC*4,0x403,dom);
+    struct buf Ab=orki_bcreate(fd,maxA*esz,0x403,dom), Bb=orki_bcreate(fd,maxB*esz,0x403,dom), Cb=orki_bcreate(fd,totC*4,0x403,dom);
     uint32_t *rcs=malloc((size_t)np*REGCMD_I8_N*4);
     ork_chain_prog *progs=malloc(np*sizeof(ork_chain_prog));
     int ret=0;
@@ -13101,22 +13101,22 @@ int ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,
     if(f16){ uint16_t*pa=Ab.cpu,*pb=Bb.cpu; for(size_t i=0;i<maxA;i++)pa[i]=0x3c00; for(size_t i=0;i<maxB;i++)pb[i]=0x3c00; }  /* fp16 1.0 */
     else   { memset(Ab.cpu,1,maxA); memset(Bb.cpu,1,maxB); }
     memset(Cb.cpu,0,totC*4);
-    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
     for(int i=0;i<np;i++){
         uint32_t *rc=rcs+(size_t)i*REGCMD_I8_N;
         uint32_t aC=(uint32_t)(Cb.dma+cOff[i]*4);
-        if(f16) synth   (rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF);      /* fp16, dense [M,Nc] out */
-        else    synth_i8(rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF,0);    /* int8, dense [M,Nc] out */
+        if(f16) orki_synth   (rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF);      /* fp16, dense [M,Nc] out */
+        else    orki_synth_i8(rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF,0);    /* int8, dense [M,Nc] out */
         progs[i]=(ork_chain_prog){rc,REGCMD_I8_N,0xd,108,216};
     }
     /* fp16 needs the NPU in fp16 mode: force a reset on entry (the int8-oriented chain assembler keeps
      * warm across ORK_I8_LIVE markers, so an int8->fp16 switch would otherwise skip the reset). */
-    if(f16){ act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16; }
+    if(f16){ orki_act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16; }
     /* FUSED: one chained submit of all np matmul programs */
     int rc1=ork_npu_chain_progs(c,np,progs,dom);   /* warm + wedge-check */
     if(rc1){ ret=rc1; goto done; }
     { double f0=ork_now_us(); for(int it=0;it<iters;it++) ork_npu_chain_progs(c,np,progs,dom); *fused_us=(ork_now_us()-f0)/iters; }
-    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE);
     { int okc=1; int32_t*Ci=(int32_t*)Cb.cpu; float*Cf=(float*)Cb.cpu;
       for(int i=0;i<np&&okc;i++){ size_t mn=(size_t)tM[i]*tN[i];
         for(size_t e=0;e<mn;e++){ double got = f16 ? (double)Cf[cOff[i]+e] : (double)Ci[cOff[i]+e];
@@ -13125,7 +13125,7 @@ int ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,
     /* PER-SUBMIT: the SAME programs as np separate single-task submits (each pays the floor) */
     { double p0=ork_now_us(); for(int it=0;it<iters;it++) for(int i=0;i<np;i++) ork_npu_chain_progs(c,1,&progs[i],dom); *persub_us=(ork_now_us()-p0)/iters; }
 done:
-    bdestroy(fd,&Ab);bdestroy(fd,&Bb);bdestroy(fd,&Cb);
+    orki_bdestroy(fd,&Ab);orki_bdestroy(fd,&Bb);orki_bdestroy(fd,&Cb);
     free(rcs);free(progs);free(tM);free(tK);free(tN);free(cOff);
     return ret;
 }
@@ -13137,24 +13137,24 @@ done:
 int ork_ssd_probe_rawmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||M<1||K<1||N<1||K%32||N%16) return -2;
     int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=-1,ret=0;
-    struct buf Ab=bcreate(fd,(size_t)M*K*2,0x403,dom),Bb=bcreate(fd,(size_t)K*N*2,0x403,dom),Cb=bcreate(fd,(size_t)M*N*4,0x403,dom);
+    struct buf Ab=orki_bcreate(fd,(size_t)M*K*2,0x403,dom),Bb=orki_bcreate(fd,(size_t)K*N*2,0x403,dom),Cb=orki_bcreate(fd,(size_t)M*N*4,0x403,dom);
     if(!Ab.cpu||!Bb.cpu||!Cb.cpu){ ret=-3; goto done; }
     memcpy(Ab.cpu,A,(size_t)M*K*2); memcpy(Bb.cpu,B,(size_t)K*N*2); memset(Cb.cpu,0,(size_t)M*N*4);
-    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
+    orki_bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
     { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done; }
-      synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)Bb.dma,(uint32_t)Cb.dma,1,CBUF);
+      orki_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)Bb.dma,(uint32_t)Cb.dma,1,CBUF);
       ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
       ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
     if(ret) goto done;
-    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
+    orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
 done:
-    bdestroy(fd,&Ab);bdestroy(fd,&Bb);bdestroy(fd,&Cb);
+    orki_bdestroy(fd,&Ab);orki_bdestroy(fd,&Bb);orki_bdestroy(fd,&Cb);
     return ret;
 }
 
 /* (b) FUSED-MM probe: one fp16 matmul via the fused-chain synth mechanism, but B is PACKED with
- * ork_mm_pack (→ the tiled Bb layout synth actually reads, same as run()) and A is staged ROW-MAJOR,
+ * ork_mm_pack (→ the tiled Bb layout synth actually reads, same as orki_run()) and A is staged ROW-MAJOR,
  * C read DENSE. Determines whether the real-operand fused SSD chain can reuse ork_mm_pack for B + a
  * row-major A (vs needing to hand-tile A). Single-slice only (K<=ks, N<=nmax). C[M,N] fp32. 0/ok,<0. */
 int ork_ssd_probe_fusedmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
@@ -13162,19 +13162,19 @@ int ork_ssd_probe_fusedmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*
     ork_w *w=ork_mm_pack(c,K,N,B); if(!w) return -3;
     if(w->Sk!=1||w->Sn!=1){ ork_mm_free(c,w); return -2; }   /* probe: single tile only */
     int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=w->domain,ret=0;
-    struct buf Ab=bcreate(fd,(size_t)M*K*2,0x403,dom), Cb=bcreate(fd,(size_t)M*N*4,0x403,dom);
+    struct buf Ab=orki_bcreate(fd,(size_t)M*K*2,0x403,dom), Cb=orki_bcreate(fd,(size_t)M*N*4,0x403,dom);
     if(!Ab.cpu||!Cb.cpu){ ret=-3; goto done2; }
     memcpy(Ab.cpu,A,(size_t)M*K*2); memset(Cb.cpu,0,(size_t)M*N*4);
-    bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
-    act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
+    orki_bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
     { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done2; }
-      synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)w->Bb[0].dma,(uint32_t)Cb.dma,1,CBUF);
+      orki_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)w->Bb[0].dma,(uint32_t)Cb.dma,1,CBUF);
       ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
       ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
     if(ret) goto done2;
-    bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
+    orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_FROM_DEVICE); memcpy(C,Cb.cpu,(size_t)M*N*4);
 done2:
-    bdestroy(fd,&Ab);bdestroy(fd,&Cb); ork_mm_free(c,w);
+    orki_bdestroy(fd,&Ab);orki_bdestroy(fd,&Cb); ork_mm_free(c,w);
     return ret;
 }
 
@@ -13218,7 +13218,7 @@ done3:
 struct streamw { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
 static void *stream_worker(void *vp) {
     struct streamw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core, CBUF = c->soc->cbuf_elems;
-    pin_big_core(i);
+    orki_pin_big_core(i);
     int k;
     a->rc = 0;
     uint32_t rc[REGCMD_I8_N + 4];
@@ -13227,12 +13227,12 @@ static void *stream_worker(void *vp) {
         ork_w *w = t->w; int M = t->M, K = w->K, N = w->N, mcap = chain_fullk_mcap_i8(c, K);
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memcpy(c->maf[i].cpu, t->A, (size_t)M * K);
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
         int ntiles = (M + mcap - 1) / mcap, p = 0;
         for (int m0 = 0; m0 < M; m0 += mcap, p++) {
             int mc = (M - m0 < mcap) ? (M - m0) : mcap;
             memset(rc, 0, sizeof rc);
-            synth_i8(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
+            orki_synth_i8(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
                      (uint32_t)(c->mcc[i].dma + (size_t)m0 * N * 4), 1, CBUF, 0);
             if (p < ntiles - 1) {
                 uint64_t nd = c->mrc[i].dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
@@ -13241,13 +13241,13 @@ static void *stream_worker(void *vp) {
             }
             memcpy((char *)c->mrc[i].cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
         }
-        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)ntiles * sizeof *mt);
         for (int q = 0; q < ntiles; q++) {
             mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
             mt[q].regcfg_amount = 108; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I8_N * 4;
         }
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
         sub.flags = ork_ppflags(); sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
@@ -13258,8 +13258,8 @@ static void *stream_worker(void *vp) {
          * dynamic task counter left idle on the warmup pass, yielding a flaky stale (zero) result. */
         int reps = c->mwarm[i] ? 1 : 2;
         for (int rep = 0; rep < reps; rep++) {
-            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (rep == reps - 1) a->rc = -1; continue; }
-            bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (rep == reps - 1) a->rc = -1; continue; }
+            orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         }
         c->mwarm[i] = 1;   /* this core's buffer index is disjoint per worker — no cross-thread race */
         memcpy(t->C, c->mcc[i].cpu, (size_t)M * N * 4);
@@ -13273,14 +13273,14 @@ static void *stream_worker(void *vp) {
 int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
     const int mrc_cap = 65536 / (REGCMD_I8_N * 4);
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I8 || tasks[i].M <= 0) return -2;
         if (w->Sn != 1 || !w->Bf) return -2;
         // The full-K Bf single-submit is only schedule-valid for K%512==0 && K<=4096 (same envelope as
-        // run()'s M>1 Bf path; the 0x1040 K-reduction schedule breaks outside it). Caller must fall back
+        // orki_run()'s M>1 Bf path; the 0x1040 K-reduction schedule breaks outside it). Caller must fall back
         // to per-task run_i8 (which K-splits) for other K. Return -3 so it's distinguishable.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
         if ((tasks[i].M + chain_fullk_mcap_i8(c, w->K) - 1) / chain_fullk_mcap_i8(c, w->K) > mrc_cap) return -2;
@@ -13293,7 +13293,7 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
      * to each tasks[i].C. (Interleave-safe: the colsplit/mc scratch now full-surface seeds+polls — see
      * colsplit's full-surface SENT seed + always-clean bsync — so a doorbell stream group no longer leaves the
      * shared per-core scratch dirty in a way that races an interleaved single run_i8.) */
-    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
+    int nc = orki_budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
     ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);
     if (!h) return -1;
     int d = ork_dyn_end(h);
@@ -13309,25 +13309,25 @@ struct streamw_f16 { ork_npu *c; int core; int S; const ork_mm_task_f16 *tasks; 
 static void *stream_worker_f16(void *vp){
     struct streamw_f16 *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, CBUF=c->soc->cbuf_elems;
     if(CBUF>32768) CBUF=32768;                     /* fp16 M-scheduler validated to the 32768-tile */
-    pin_big_core(i);
+    orki_pin_big_core(i);
     int k; a->rc=0;
     uint32_t rc[REGCMD_I8_N];
     while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->S){
         const ork_mm_task_f16 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
-        memcpy(c->maf[i].cpu, t->A, (size_t)M*K*2); bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->maf[i].cpu, t->A, (size_t)M*K*2); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         memset(rc,0,REGCMD_I8_N*4);
-        synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
-        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
+        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
         mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
-        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
         sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=mm_timeout_ms();
         int reps=c->mwarm[i]?1:2;
-        for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+        for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
         c->mwarm[i]=1;
         memcpy(t->C, c->mcc[i].cpu, (size_t)M*N*4);
     }
@@ -13335,7 +13335,7 @@ static void *stream_worker_f16(void *vp){
 }
 int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
-    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
         if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
         if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
@@ -13348,7 +13348,7 @@ int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(S>1024) return -2;
     ork_mm_task_i8 ti[1024];
     for(int i=0;i<S;i++) ti[i]=(ork_mm_task_i8){ tasks[i].w, tasks[i].M, (const int8_t*)tasks[i].A, (int32_t*)tasks[i].C };
-    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    int nc=orki_budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
     ork_dyn_chain *h=ork_dyn_begin_mc(c,S,ti,nc);
     if(!h) return -1;
     int d=ork_dyn_end(h);
@@ -13361,25 +13361,25 @@ int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
 struct streamw_i8sk { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
 static void *stream_worker_i8sk(void *vp){
     struct streamw_i8sk *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, CBUF=c->soc->cbuf_elems;
-    pin_big_core(i);
+    orki_pin_big_core(i);
     int k; a->rc=0;
     uint32_t rc[REGCMD_I8_N];
     while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->S){
         const ork_mm_task_i8 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
         int sched=(K&(K-1))==0 && K>=256 && K<2048;   /* int8 0x1040 sched zeros output for K<256 -> off at small K */
-        memcpy(c->maf[i].cpu, t->A, (size_t)M*K); bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        memcpy(c->maf[i].cpu, t->A, (size_t)M*K); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         memset(rc,0,REGCMD_I8_N*4);
-        synth_i8(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
-        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_synth_i8(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
+        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
         mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
-        bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub,0,sizeof sub);
         sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
         sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
         sub.timeout=mm_timeout_ms();
         int reps=c->mwarm[i]?1:2;
-        for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+        for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
         c->mwarm[i]=1;
         memcpy(t->C, c->mcc[i].cpu, (size_t)M*N*4);   /* int32 output */
     }
@@ -13387,7 +13387,7 @@ static void *stream_worker_i8sk(void *vp){
 }
 int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if(!c||S<1||!tasks) return -2;
-    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     size_t maxMK=0, maxMN4=0;
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
         if(!w||w->dtype!=DT_I8||tasks[i].M<=0) return -2;
@@ -13398,11 +13398,11 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     int fd=c->fd;
     /* int8-live entry (last_dt=3); keep-warm across int8<->fp16 stage transitions under ORK_SSM_KEEPWARM */
     ork_npu_enter(c,3,XP_STREAM_I8,OCK_SW);  /* small-K int8 stream: same →I8_CHAIN transition as run_stream_i8 (profiles converged 2026-07-14) */
-    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
-    if(mc_ensure(c,nc)) return -1;
+    int nc=orki_budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(orki_mc_ensure(c,nc)) return -1;
     for(int i=0;i<nc;i++){
-        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
-        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+        if(c->maf[i].size<maxMK){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
     int rc=0; npu_pool_ensure(c);
     struct streamw_i8sk sw[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) sw[i]=(struct streamw_i8sk){c,i,S,tasks,&ctr,0};
@@ -13427,7 +13427,7 @@ struct streamw_f16ch { ork_npu *c; int core; int ncore; int S; const ork_mm_task
 static void *stream_worker_f16ch(void *vp){
     struct streamw_f16ch *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, ncore=a->ncore, S=a->S, CBUF=c->soc->cbuf_elems;
     if(CBUF>32768) CBUF=32768;
-    pin_big_core(i);
+    orki_pin_big_core(i);
     a->rc=0;
     int cnt=0; for(int k=i;k<S;k+=ncore) cnt++;
     if(cnt==0) return NULL;
@@ -13439,7 +13439,7 @@ static void *stream_worker_f16ch(void *vp){
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
         memcpy((char*)c->maf[i].cpu + (size_t)p*M*K*2, t->A, (size_t)M*K*2);
         memset(rc,0,REGCMD_I8_N*4);
-        synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
+        orki_synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
               (uint32_t)(c->mcc[i].dma + (size_t)p*M*N*4), sched, CBUF);
         if(p<cnt-1){ uint64_t next=c->mrc[i].dma + (size_t)(p+1)*REGCMD_I8_N*4;   /* PC-chain to next program */
             rc[216]=0x0010|((next&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(next>>16)&0xffff); rc[218]=0x0014|(0x0037u<<16); }
@@ -13447,15 +13447,15 @@ static void *stream_worker_f16ch(void *vp){
         memset(&mt[p],0,sizeof mt[p]); mt[p].enable_mask=0xd; mt[p].int_mask=0x300; mt[p].int_clear=0x1ffff;
         mt[p].regcfg_amount=108; mt[p].regcmd_addr=c->mrc[i].dma + (size_t)p*REGCMD_I8_N*4;
     }
-    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
-    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub,0,sizeof sub);
     sub.flags=ork_ppflags(); sub.task_number=cnt; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)cnt};
     sub.timeout=mm_timeout_ms();
     int reps=c->mwarm[i]?1:2;
-    for(int rep=0;rep<reps;rep++){ if(rknpu_submit_ioctl(fd,&sub,a->tasks[i].w->domain)){ if(rep==reps-1)a->rc=-1; continue; } bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+    for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,a->tasks[i].w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->mwarm[i]=1;
     p=0; for(int k=i;k<S;k+=ncore,p++){ const ork_mm_task_f16 *t=&a->tasks[k]; int M=t->M,N=t->w->N;
         memcpy(t->C, (char*)c->mcc[i].cpu + (size_t)p*M*N*4, (size_t)M*N*4); }
@@ -13463,23 +13463,23 @@ static void *stream_worker_f16ch(void *vp){
 }
 int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
-    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c,tasks[0].w->domain);
+    if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
         if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
         if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;
         if(w->K%32||w->N%16) return -2; }
     int fd=c->fd;
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_SW);
-    int nc=budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
-    if(mc_ensure(c,nc)) return -1;
+    int nc=orki_budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;
+    if(orki_mc_ensure(c,nc)) return -1;
     int per=(S+nc-1)/nc;                                   /* max programs a single core owns */
     size_t needrc=(size_t)per*REGCMD_I8_N*4, needtk=(size_t)per*sizeof(struct rknpu_task);
     size_t maxMK=(size_t)per*tasks[0].M*tasks[0].w->K*2, maxMN4=(size_t)per*tasks[0].M*tasks[0].w->N*4;
     for(int i=0;i<nc;i++){
-        if(c->mrc[i].size<needrc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bcreate(fd,needrc,0x403,c->dom_active); if(!c->mrc[i].cpu)return -1; c->mwarm[i]=0; }
-        if(c->mtk[i].size<needtk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bcreate(fd,needtk,0x40b,c->dom_active); if(!c->mtk[i].cpu)return -1; }
-        if(c->maf[i].size<maxMK){ bdestroy(fd,&c->maf[i]); c->maf[i]=bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
-        if(c->mccsz[i]<maxMN4){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
+        if(c->mrc[i].size<needrc){ orki_bdestroy(fd,&c->mrc[i]); c->mrc[i]=orki_bcreate(fd,needrc,0x403,c->dom_active); if(!c->mrc[i].cpu)return -1; c->mwarm[i]=0; }
+        if(c->mtk[i].size<needtk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bcreate(fd,needtk,0x40b,c->dom_active); if(!c->mtk[i].cpu)return -1; }
+        if(c->maf[i].size<maxMK){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bcreate(fd,maxMK,0x403,c->dom_active); if(!c->maf[i].cpu)return -1; }
+        if(c->mccsz[i]<maxMN4){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bcreate(fd,maxMN4,0x403,c->dom_active); c->mccsz[i]=maxMN4; if(!c->mcc[i].cpu)return -1; c->mwarm[i]=0; } }
     int rc=0; npu_pool_ensure(c);
     struct streamw_f16ch sw[ORK_MAXCORE];
     for(int i=0;i<nc;i++) sw[i]=(struct streamw_f16ch){c,i,nc,S,tasks,0};
@@ -13551,7 +13551,7 @@ static void *ssm_marshal_gi(void *vp){   /* G-independent operand build (aC,bD,b
 }
 /* persistent little-core marshalling helper: spawned once, condvar-signalled per chunk. */
 static void *ssm_helper_worker(void *vp){
-    ork_npu *c=vp; pin_little_core(0);                 /* live on an idle A55 for the whole run */
+    ork_npu *c=vp; orki_pin_little_core(0);                 /* live on an idle A55 for the whole run */
     pthread_mutex_lock(&c->ssm_hmu);
     for(;;){ while(!c->ssm_hgen && !c->ssm_hstop) pthread_cond_wait(&c->ssm_hgo,&c->ssm_hmu);  /* hgen = pending flag */
         if(c->ssm_hstop){ pthread_mutex_unlock(&c->ssm_hmu); return NULL; }
@@ -13837,7 +13837,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (S == 1) return ork_mm_run_i4(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     /* chained weights share one submit => one domain; swap in that domain's scratch */
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
     int fd = c->fd;
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -13854,15 +13854,15 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int i = 0; i < S; i++) {
         if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
         if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
-        struct buf *abuf = dma_find(c, tasks[i].A);
-        if (abuf) bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct buf *abuf = orki_dma_find(c, tasks[i].A);
+        if (abuf) orki_bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
 
-    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
-    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
+    struct buf chain_A = orki_bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
+    struct buf chain_C = orki_bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
     if (!chain_A.cpu || !chain_C.cpu) {
-        if (chain_A.cpu) bdestroy(fd, &chain_A);
-        if (chain_C.cpu) bdestroy(fd, &chain_C);
+        if (chain_A.cpu) orki_bdestroy(fd, &chain_A);
+        if (chain_C.cpu) orki_bdestroy(fd, &chain_C);
         return -1;
     }
 
@@ -13876,7 +13876,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
         out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
     }
-    bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* Clean-before-write the int16 output scratch. chain_C is bcreate'd fresh each call and the kernel can
      * hand back a recycled DMA region carrying dirty CPU cache lines (from a prior occupant). Those lines
@@ -13884,15 +13884,15 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
      * 1+" on warm reuse. Dirty the whole surface then clean it to DRAM (TO_DEVICE) so no stale line survives
      * to evict later -- same full-surface clean-before as ork_dyn_begin_mc_i4's doorbell scratch. */
     memset(chain_C.cpu, 0, (size_t)S * max_N * 2);
-    bsync(fd, &chain_C, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_TO_DEVICE);
 
     struct buf extra[2] = {chain_A, chain_C};
     uint32_t rc[REGCMD_I4_N];
 
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
-        if (validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
+        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        if (orki_validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
 
         if (i < S - 1) {
             uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
@@ -13908,11 +13908,11 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         }
         memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
     }
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
 
     /* Mirror the validated i4_mcworker multi-task path exactly: one rknpu_task per chained regcmd,
      * task_number=S, subcore={0,S}, and the same reps/submit discipline (rknpu_submit_ioctl with a
-     * cold-buffer warmup rep + bsync(C) between reps). The kernel programs first_task+last_task and
+     * cold-buffer warmup rep + orki_bsync(C) between reps). The kernel programs first_task+last_task and
      * the HW PC-chain (rc[216..219]) walks the middle; it waits until the HW task counter reaches S. */
     struct rknpu_task *t = c->task.cpu;
     memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
@@ -13923,7 +13923,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         t[i].regcfg_amount = 116;
         t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4;
     }
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
 
     static int tc = -2;
     if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
@@ -13937,12 +13937,12 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int rep = 0; rep < reps; rep++) {
         int last = (rep == reps - 1);
         sub.timeout = mm_timeout_ms();
-        if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { ok = -1; goto cleanup; } continue; }
-        bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { if (last) { ok = -1; goto cleanup; } continue; }
+        orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
     c->warmed = 1;
 
-    bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     for (int i = 0; i < S; i++) {
         int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
         int32_t *C = tasks[i].C;
@@ -13967,13 +13967,13 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         }
 #endif
 
-        struct buf *cbuf = dma_find(c, tasks[i].C);
-        if (cbuf) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+        struct buf *cbuf = orki_dma_find(c, tasks[i].C);
+        if (cbuf) orki_bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
     }
 
 cleanup:
-    bdestroy(fd, &chain_A);
-    bdestroy(fd, &chain_C);
+    orki_bdestroy(fd, &chain_A);
+    orki_bdestroy(fd, &chain_C);
     return ok;
 }
 
@@ -13990,7 +13990,7 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
     int fd = c->fd;
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -14003,12 +14003,12 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int i = 0; i < S; i++) {
         if (tasks[i].w->K > max_K) max_K = tasks[i].w->K;
         if (tasks[i].w->N > max_N) max_N = tasks[i].w->N;
-        struct buf *abuf = dma_find(c, tasks[i].A);
-        if (abuf) bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct buf *abuf = orki_dma_find(c, tasks[i].A);
+        if (abuf) orki_bsync(fd, abuf, RKNPU_MEM_SYNC_FROM_DEVICE);
     }
-    struct buf chain_A = bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
-    struct buf chain_C = bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
-    if (!chain_A.cpu || !chain_C.cpu) { if (chain_A.cpu) bdestroy(fd,&chain_A); if (chain_C.cpu) bdestroy(fd,&chain_C); return -1; }
+    struct buf chain_A = orki_bcreate(fd, (size_t)S * max_K, 0x403, c->dom_active);
+    struct buf chain_C = orki_bcreate(fd, (size_t)S * max_N * 2, 0x403, c->dom_active);
+    if (!chain_A.cpu || !chain_C.cpu) { if (chain_A.cpu) orki_bdestroy(fd,&chain_A); if (chain_C.cpu) orki_bdestroy(fd,&chain_C); return -1; }
     uint32_t act_dma[1024], out_dma[1024];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
@@ -14016,13 +14016,13 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
         out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
     }
-    bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &chain_A, RKNPU_MEM_SYNC_TO_DEVICE);
     struct buf extra[2] = {chain_A, chain_C};
     uint32_t rc[REGCMD_I4_N];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
-        if (validate_regcmd("ork_dyn_i4_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
+        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        if (orki_validate_regcmd("ork_dyn_i4_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
         if (i < S - 1) { uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
             rc[216] = 0x0010 | ((next_dma & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
             rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
@@ -14030,12 +14030,12 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         memcpy((char*)c->regcmd.cpu + i * REGCMD_I4_N * 4, rc, sizeof(rc));
         if (i == 0 && getenv("ORK_I4PROBE_DUMP")) { fprintf(stderr,"[i4probe] op0 regcmd desc rc[216..219]=%08x %08x %08x %08x  aA=%08x aC=%08x\n",rc[216],rc[217],rc[218],rc[219],act_dma[0],out_dma[0]); }
     }
-    bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t = c->task.cpu;
     memset(t, 0, (size_t)S * sizeof(struct rknpu_task));
     for (int i = 0; i < S; i++) { t[i].enable_mask = 0xd; t[i].int_mask = 0x300; t[i].int_clear = 0x1ffff;
         t[i].regcfg_amount = 116; t[i].regcmd_addr = c->regcmd.dma + (size_t)i * REGCMD_I4_N * 4; }
-    bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     /* seed the FULL int16 output surface with the sentinel (int4's int16 write order over N is NOT
      * guaranteed last-col-last, unlike int8/fp16, so a single last-col sentinel poll races; poll ALL
      * elements written — mirrors the fp16 full-surface seed). */
@@ -14049,7 +14049,7 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
     sub.timeout = mm_timeout_ms();
     c->warmed = 1;
-    if (rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { ok = -1; goto cleanup; }
+    if (orki_rknpu_submit_ioctl(fd, &sub, tasks[0].w->domain)) { ok = -1; goto cleanup; }
     /* DELTA 2: poll the FULL int16 output surface to completion (every element != sentinel) instead of a
      * blocking wait. Op i is "done" only when ALL N of its int16 columns have been overwritten. */
     double t0 = ork_now_us();
@@ -14058,20 +14058,20 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
             for (int col = 0; col < N; col++){ volatile int16_t *db = (volatile int16_t*)&o[col];
                 __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_I4_SENT16){ alld = 0; break; } } }
         if (alld || ork_now_us() - t0 > 3e6) break; }
-    bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_FROM_DEVICE);
     for (int i = 0; i < S; i++) {                            /* int16 -> int32 de-tile into caller C (== run_chain_i4) */
         int16_t *o = (int16_t*)((uint8_t*)chain_C.cpu + (size_t)i * max_N * 2);
         int32_t *C = tasks[i].C; int N = tasks[i].w->N;
         for (int col = 0; col < N; col++) C[col] = o[col];
-        struct buf *cbuf = dma_find(c, tasks[i].C); if (cbuf) bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
+        struct buf *cbuf = orki_dma_find(c, tasks[i].C); if (cbuf) orki_bsync(fd, cbuf, RKNPU_MEM_SYNC_TO_DEVICE);
     }
 cleanup:
-    bdestroy(fd, &chain_A); bdestroy(fd, &chain_C);
+    orki_bdestroy(fd, &chain_A); orki_bdestroy(fd, &chain_C);
     return ok;
 }
 
 /* #52 (B): BCHAIN batch-chain on the NONBLOCK doorbell (self-healing) — the int4 M>1 prefill path.
- * Reuses BCHAIN's proven H-row batch synth (synth_i4 mc=2*Hg) + bank-width Wb=131072/K N-tiling + de-tile
+ * Reuses BCHAIN's proven H-row batch orki_synth (synth_i4 mc=2*Hg) + bank-width Wb=131072/K N-tiling + de-tile
  * (og[(4*j+4*Hg*b)*64+cc] -> C[g*H+j][n0+b*64+cc]) VERBATIM, but submits NONBLOCK (flags|0x2) and detects
  * completion by civac-polling the WRITTEN (strided) int16 cell-set for the SENT16 sentinel — the batch output
  * is a 2D-tiled strided subset (write-order not last-col-last, like the per-row int4 path), so we seed+poll
@@ -14130,18 +14130,18 @@ static void *bch_db_worker(void *vp){
     struct bchdbw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, NT=a->NT;
     int K=a->K,N=a->N,NG=a->NG,M=a->M,H=a->H,Wb=a->Wb,Wmax=a->Wmax; unsigned dom=a->dom;
     a->rc=0; if(NT<1) return NULL;
-    pin_big_core(i);
+    orki_pin_big_core(i);
     uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
     for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
         for(int j=0;j<Hg;j++) tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
-    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
     int tk=0;
     for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
         uint32_t wdma=(uint32_t)(a->w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
             uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-            memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+            memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
             /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
              * weight-stationary (N-tile outer, M-group g inner sharing wdma), so g==0 loads the N-tile weight and
              * g>0 can REUSE the CBUF-resident weight + skip the re-DMA by setting CNA_CBUF_CON0[13]=WEIGHT_REUSE
@@ -14151,18 +14151,18 @@ static void *bch_db_worker(void *vp){
             if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* DEFAULT ON: measured stable ~6% (gate/up ~9%) bit-exact on the MoE expert-triple (test_moe_smoke, M=32). ORK_I4_WREUSE=0 opts out. */
                 if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
                     for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
-                    setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
-            if(g_i4_validate && validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
+                    orki_setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
+            if(g_i4_validate && orki_validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
             if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
                 rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
                 rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
             else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
             memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
     for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
         t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     memset(&a->sub,0,sizeof a->sub);
     a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
     a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
@@ -14184,17 +14184,17 @@ static void *bch_db_worker(void *vp){
      * "555 blocking" is unattainable-while-correct; NONBLOCK is the best CORRECT option. Default = NONBLOCK(1). */
     static int i4mode=-1; if(i4mode<0) i4mode = getenv("ORK_I4_BLOCKVERIFY")?0 : (getenv("ORK_I4_BLOCKING")?2 : 1);
     if(i4mode!=2){   /* BLOCKVERIFY(0) + NONBLOCK(1): seed the SENT16 landing sentinel so ork_dyn_end can drain-verify */
-        bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+        bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
         if(i4mode==1){   /* NONBLOCK doorbell: submit + return; ork_dyn_end (prepolled=0) polls from t=0 */
             a->sub.flags=ork_ppflags()|0x2u; a->sub.timeout=i4_submit_tmo_ms();
-            rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1; a->rc=0; return NULL; }
+            orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1; a->rc=0; return NULL; }
         /* BLOCKVERIFY: fall through to the blocking submit; ork_dyn_end (prepolled=0) does the SHORT post-completion drain-verify */
     }
     a->sub.flags=ork_ppflags();   /* BLOCKING (no |0x2): parallel IRQ kernel-wait across cores (like int8 colsplit); a dropped job aborts -> rknpu_iommu_domain_put (no leak). */
     c->mwarm[i]=1;
     for(int attempt=0; attempt<4; attempt++){
         a->sub.timeout=mm_timeout_ms();
-        int rc=rknpu_submit_ioctl(fd,&a->sub,dom);   /* BLOCKING (0x2 cleared): kernel-waits for job_done or aborts at timeout */
+        int rc=orki_rknpu_submit_ioctl(fd,&a->sub,dom);   /* BLOCKING (0x2 cleared): kernel-waits for job_done or aborts at timeout */
         if(rc==0){ a->rc=0; return NULL; }
         if(g_ork_term){ a->rc=0; return NULL; }
         if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[bch] BLOCKING drop core=%d dom=%u attempt=%d rc=%d -> resubmit (kernel aborted+domain_put, no leak)\n",i,dom,attempt,rc);
@@ -14216,11 +14216,11 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
     if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
         fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
     unsigned dom=w->domain;
-    if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) dom_activate(c,w->domain);
+    if(w->domain!=c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] bchain w=%p submit_dom=%u dom_active=%d | Bb0.dma=0x%llx Bb0.domain=%d Bb0.obj=0x%llx Bb0.heap_fd=%d | K=%d N=%d M=%d Wb=%d NC=%d\n",
         (void*)w, dom, c->dom_active, (unsigned long long)w->Bb[0].dma, w->Bb[0].domain, (unsigned long long)w->Bb[0].obj, w->Bb[0].heap_fd, K, N, M, Wb, NC);
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if(mc_ensure(c,nc)) return -1;
+    if(orki_mc_ensure(c,nc)) return -1;
     if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] scratch dom=%d | W[0x%llx,+0x%llx) mtk_all=0x%llx mrc0=0x%llx maf0=0x%llx mcc0=0x%llx | overlap-check vs W\n",
         c->dom_active, (unsigned long long)w->Bb[0].dma, (unsigned long long)((size_t)K*N/2),
         (unsigned long long)c->mtk_all.dma, (unsigned long long)c->mrc[0].dma, (unsigned long long)c->maf[0].dma, (unsigned long long)c->mcc[0].dma);
@@ -14240,10 +14240,10 @@ static int run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_
         static int msram=-1; if(msram<0) msram=getenv("ORK_MOE_SRAM_SCRATCH")?1:0;   /* SRAM alloc rejects the 0x400 IOMMU-align flag -> drop it + add TRY_ALLOC_SRAM (matches the working ork_dma_alloc_sram path) */
         unsigned f3 = msram ? (0x003u|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;             /* data scratch (mrc/maf/mcc): cacheable+non-contig, SRAM when on */
         unsigned fb = msram ? (0x00bu|RKNPU_MEM_TRY_ALLOC_SRAM) : 0x40bu;             /* task buf (mtk): +KERNEL_MAPPING for the kernel read */
-        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bscratch(c,need_rc,(int)f3,c->dom_active); c->mwarm[i]=0; }
-        if(c->maf[i].size<need_af){ bdestroy(fd,&c->maf[i]); c->maf[i]=bscratch(c,need_af,(int)f3,c->dom_active); }
-        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bscratch(c,need_tk,(int)fb,c->dom_active); }
-        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,need_o,(int)f3,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+        if(c->mrc[i].size<need_rc){ orki_bdestroy(fd,&c->mrc[i]); c->mrc[i]=orki_bscratch(c,need_rc,(int)f3,c->dom_active); c->mwarm[i]=0; }
+        if(c->maf[i].size<need_af){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bscratch(c,need_af,(int)f3,c->dom_active); }
+        if(c->mtk[i].size<need_tk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bscratch(c,need_tk,(int)fb,c->dom_active); }
+        if(c->mccsz[i]<need_o){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,need_o,(int)f3,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
         if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
     }
     c->mc_error=0; g_in_doorbell=1;
@@ -14282,7 +14282,7 @@ struct bchmw { ork_npu *c; int core, e0, e1; const ork_mm_task_i4 *ex; int K,N,H
 static void *bch_mw_worker(void *vp){
     struct bchmw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core;
     int K=a->K,N=a->N,H=a->H,Wb=a->Wb,Wmax=a->Wmax,NC=a->NC; unsigned dom=a->dom;
-    a->rc=0; if(a->e0>=a->e1) return NULL; pin_big_core(i);
+    a->rc=0; if(a->e0>=a->e1) return NULL; orki_pin_big_core(i);
     int NTtot=0; size_t AFtot=0;
     for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H; NTtot+=NC*NG; AFtot+=(size_t)NG*(size_t)(2*H)*(K/2); }
     memset(c->maf[i].cpu,0,AFtot);
@@ -14292,7 +14292,7 @@ static void *bch_mw_worker(void *vp){
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
             for(int j=0;j<Hg;j++) tile_i4_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
         aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
     /* build the chained regcmd across all experts (tk = cumulative program index) */
     aoff=0; int tk=0;
     for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; ork_w *w=t->w; int M=t->M, NG=(M+H-1)/H;
@@ -14301,35 +14301,35 @@ static void *bch_mw_worker(void *vp){
             for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
                 uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
                 uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-                memset(rc,0,sizeof rc); synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+                memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
                 if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
                     if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
                         for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
-                        setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
+                        orki_setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
                 if(tk<NTtot-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
                     rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
                     rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
                 else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
                 memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
         aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tt=c->mtk[i].cpu; memset(tt,0,(size_t)NTtot*sizeof*tt);
     for(int q=0;q<NTtot;q++){ tt[q].enable_mask=0xd; tt[q].int_mask=0x300; tt[q].int_clear=0x1ffff;
         tt[q].regcfg_amount=116; tt[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     memset(&a->sub,0,sizeof a->sub);
     a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NTtot; a->sub.task_obj_addr=c->mtk[i].obj;
     a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
     a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NTtot};
     { int tb=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;   /* seed SENT16 for every expert's cells */
         bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,0,-1,tb); tb+=NC*NG; } }
-    bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
-    a->sub.timeout=i4_submit_tmo_ms(); rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
+    orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+    a->sub.timeout=i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
     int NGl=(a->ex[a->e1-1].M+H-1)/H, NTl=NC*NGl, tbl=NTtot-NTl;   /* last program of the whole chain lands last */
     double t0=ork_now_us();
     for(;;){
         if(bch_db_cells_off(c,i,0,NC,Wb,N,NGl,a->ex[a->e1-1].M,H,Wmax,NULL,1,NTl-1,tbl)){   /* last-program civac gate */
-            bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
             int ok=1, vb=0;
             for(int e=a->e0;e<a->e1 && ok;e++){ int NG=(a->ex[e].M+H-1)/H;
                 if(!bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,3,-1,vb)) ok=0; vb+=NC*NG; }
@@ -14348,10 +14348,10 @@ static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int nt
     int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
     unsigned dom=ex[0].w->domain;
-    if(dom!=(unsigned)c->dom_active || (dom && !c->dom_save)) dom_activate(c,(int)dom);
+    if(dom!=(unsigned)c->dom_active || (dom && !c->dom_save)) orki_dom_activate(c,(int)dom);
     g_last_op="run_i4_experts_bchain_db"; g_last_K=K; g_last_N=N; g_last_wdom=(int)dom;
     ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
-    if(mc_ensure(c,nc)) return -1;
+    if(orki_mc_ensure(c,nc)) return -1;
     struct bchmw args[ORK_MAXCORE];
     int totalNT=0; for(int e=0;e<ntask;e++){ int NG=(ex[e].M+H-1)/H; totalNT+=NC*NG; }
     int e_start=0, priorNT=0;
@@ -14364,10 +14364,10 @@ static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int nt
         int cNT=0; size_t cAF=0; for(int e=args[i].e0;e<args[i].e1;e++){ int NG=(ex[e].M+H-1)/H; cNT+=NC*NG; cAF+=(size_t)NG*(size_t)(2*H)*(K/2); }
         if(cNT<1) continue;
         size_t need_rc=(size_t)cNT*REGCMD_I4_N*4, need_o=(size_t)cNT*(size_t)(4*H*Wmax)*64*2, need_tk=(size_t)cNT*sizeof(struct rknpu_task);
-        if(c->mrc[i].size<need_rc){ bdestroy(fd,&c->mrc[i]); c->mrc[i]=bscratch(c,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
-        if(c->maf[i].size<cAF){ bdestroy(fd,&c->maf[i]); c->maf[i]=bscratch(c,cAF,0x403,c->dom_active); }
-        if(c->mtk[i].size<need_tk){ bdestroy(fd,&c->mtk[i]); c->mtk[i]=bscratch(c,need_tk,0x40b,c->dom_active); }
-        if(c->mccsz[i]<need_o){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=bscratch(c,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
+        if(c->mrc[i].size<need_rc){ orki_bdestroy(fd,&c->mrc[i]); c->mrc[i]=orki_bscratch(c,need_rc,0x403,c->dom_active); c->mwarm[i]=0; }
+        if(c->maf[i].size<cAF){ orki_bdestroy(fd,&c->maf[i]); c->maf[i]=orki_bscratch(c,cAF,0x403,c->dom_active); }
+        if(c->mtk[i].size<need_tk){ orki_bdestroy(fd,&c->mtk[i]); c->mtk[i]=orki_bscratch(c,need_tk,0x40b,c->dom_active); }
+        if(c->mccsz[i]<need_o){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,need_o,0x403,c->dom_active); c->mccsz[i]=need_o; c->mwarm[i]=0; }
         if(!c->mrc[i].cpu||!c->maf[i].cpu||!c->mtk[i].cpu||!c->mcc[i].cpu) return -1;
     }
     c->mc_error=0; g_in_doorbell=1;
@@ -14388,16 +14388,16 @@ static int run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int nt
      * TRANSIENT — its results are already de-tiled to the host C above. Weights stay resident per-domain, but if
      * mcc were left allocated it would be PARKED per-domain by dom_activate and accumulate one ~100 MB copy per
      * domain -> across the auto-sized ~16 domains that's ~1.6 GB of bcreate scratch, exhausting the kernel GEM/CMA
-     * pool so a fresh bcreate (even a tiny mtk_all) EINVALs at ~the 5th domain. Free it here so only the ACTIVE
+     * pool so a fresh orki_bcreate (even a tiny mtk_all) EINVALs at ~the 5th domain. Free it here so only the ACTIVE
      * domain's mcc exists; the next run re-allocs it in its own domain. (int8's per-op scratch is tiny so it never
      * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths. */
-    for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
+    for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
     return 0;
 }
 struct streamw4 { ork_npu *c; int core; int S; const ork_mm_task_i4 *tasks; int *ctr; int rc; };
 static void *stream_worker_i4(void *vp) {
     struct streamw4 *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core;
-    pin_big_core(i);
+    orki_pin_big_core(i);
     int k; a->rc = 0;
     uint32_t rc[REGCMD_I4_N];
     while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
@@ -14415,23 +14415,23 @@ static void *stream_worker_i4(void *vp) {
                 int H = (M - m0 < Hcap) ? (M - m0) : Hcap;
                 for (int j = 0; j < H; j++)                   /* real row j at A-slot 2j (stride-2 input) */
                     tile_i4_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
-                bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+                orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
                 memset(rc, 0, sizeof rc);
-                synth_i4(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
+                orki_synth_i4(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
                 rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;   /* single task */
                 memcpy(c->mrc[i].cpu, rc, REGCMD_I4_N * 4);
-                bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+                orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
                 struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, sizeof *mt);
                 mt[0].enable_mask = 0xd; mt[0].int_mask = 0x300; mt[0].int_clear = 0x1ffff;
                 mt[0].regcfg_amount = 116; mt[0].regcmd_addr = c->mrc[i].dma;
-                bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+                orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
                 struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
                 sub.flags = ork_ppflags(); sub.task_number = 1; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
                 sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, 1};
                 int reps = c->mwarm[i] ? 1 : 2;
                 for (int rep = 0; rep < reps; rep++) { int last = (rep == reps - 1); sub.timeout = mm_timeout_ms();
-                    if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
-                    bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE); }
+                    if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
+                    orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE); }
                 c->mwarm[i] = 1;
                 int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;   /* de-tile: o[(4j+4H*b)*64+cc] -> C[m0+j][b*64+cc] */
                 for (int j = 0; j < H; j++) for (int b = 0; b < NBc; b++) {
@@ -14443,10 +14443,10 @@ static void *stream_worker_i4(void *vp) {
             continue;   /* task done via batch; skip the per-row path below */
         }
         for (int m = 0; m < M; m++) tile_i4_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
-        bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
         for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
             memset(rc, 0, sizeof rc);
-            synth_i4(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
+            orki_synth_i4(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
                      (uint32_t)(c->mcc[i].dma + (size_t)m * N * 2));
             if (m < M - 1) {
                 uint64_t nd = c->mrc[i].dma + (size_t)(m + 1) * REGCMD_I4_N * 4;
@@ -14455,13 +14455,13 @@ static void *stream_worker_i4(void *vp) {
             } else { rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000; }
             memcpy((char *)c->mrc[i].cpu + (size_t)m * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
         }
-        bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)M * sizeof *mt);
         for (int q = 0; q < M; q++) {
             mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
             mt[q].regcfg_amount = 116; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I4_N * 4;
         }
-        bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
         sub.flags = ork_ppflags(); sub.task_number = M; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
         sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)M};
@@ -14474,8 +14474,8 @@ static void *stream_worker_i4(void *vp) {
         for (int rep = 0; rep < reps; rep++) {
             int last = (rep == reps - 1);
             sub.timeout = mm_timeout_ms();
-            if (rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
-            bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (last) a->rc = -1; continue; }
+            orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
         }
         c->mwarm[i] = 1;
         int16_t *o = c->mcc[i].cpu; int32_t *C = t->C;        /* widen int16 NPU output -> int32 caller C */
@@ -14489,7 +14489,7 @@ static void *stream_worker_i4(void *vp) {
 int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
-    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) dom_activate(c, tasks[0].w->domain);
+    if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
     const int mrc_cap = 65536 / (REGCMD_I4_N * 4);
     size_t maxMK = 0, maxMN2 = 0;
     for (int i = 0; i < S; i++) {
@@ -14499,18 +14499,18 @@ int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (tasks[i].M > mrc_cap) return -2;                  /* M single-row regcmds must fit one mrc buffer */
         size_t mk = (size_t)tasks[i].M * w->K, mn = (size_t)tasks[i].M * w->N * 2;
         /* batch (msched) output spans up to 4*HCAP(=16)*N int16 = 128*N bytes; only for tasks that FIT the
-         * weight budget (N*K<=131072, i.e. small N), so the bump is small. */
+         * weight orki_budget (N*K<=131072, i.e. small N), so the bump is small. */
         if(ork_i4_batch() && (size_t)w->N*w->K<=131072){ size_t bn=(size_t)128*w->N; if(bn>mn)mn=bn; }
         if (mk > maxMK) maxMK = mk; if (mn > maxMN2) maxMN2 = mn;
     }
     int fd = c->fd;
     int cold = 0;   /* warmup pass needed on a fresh stream-i4 mode OR freshly-allocated per-core buffer */
     if (ork_npu_enter(c, 5 /* DT_I4_STREAM */, XP_I4_STREAM, OCK_SW)) cold = 1;
-    int nc = budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
-    if (mc_ensure(c, nc)) return -1;
+    int nc = orki_budget(c, 2); if (nc > ORK_MAXCORE) nc = ORK_MAXCORE; if (nc > S) nc = S; if (nc < 1) nc = 1;
+    if (orki_mc_ensure(c, nc)) return -1;
     for (int i = 0; i < nc; i++) {
-        if (c->maf[i].size < maxMK) { bdestroy(fd, &c->maf[i]); c->maf[i] = bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
-        if (c->mccsz[i] < maxMN2) { bdestroy(fd, &c->mcc[i]); c->mcc[i] = bcreate(fd, maxMN2, 0x403, c->dom_active); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
+        if (c->maf[i].size < maxMK) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, maxMK, 0x403, c->dom_active); if (!c->maf[i].cpu) return -1; cold = 1; }
+        if (c->mccsz[i] < maxMN2) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, maxMN2, 0x403, c->dom_active); c->mccsz[i] = maxMN2; if (!c->mcc[i].cpu) return -1; cold = 1; }
     }
     int rc = 0;
     if (cold) for (int i = 0; i < nc; i++) c->mwarm[i] = 0;   /* fresh mode/buffer => each core re-primes (per-core warmup in the worker) */
@@ -14609,7 +14609,7 @@ static ork_async *ork_async_launch(struct ork_async tmpl){
 
 /* Per-path async launchers. Each returns a handle immediately (NULL on bad args -> caller falls back
  * to the matching synchronous run). The returned handle MUST be passed to ork_async_wait exactly once
- * (joins the thread, frees the handle). Numerics are identical to the synchronous run (reused verbatim). */
+ * (joins the thread, frees the handle). Numerics are identical to the synchronous orki_run (reused verbatim). */
 ork_async *ork_mm_run_async    (ork_npu *c, ork_w *w, int M, const ork_f16 *A, float   *C){
     if (!c || !w || M < 1) return NULL;
     return ork_async_launch((struct ork_async){ .kind=OAK_F16, .c=c, .w=w, .M=M, .A=A, .C=C }); }
@@ -14830,7 +14830,7 @@ int ork_submit_seq(ork_npu *c, const ork_seq_op *ops, int n){
         if((int)o->kind<0||(int)o->kind>=ORK_OP_NKIND){ ret=-2; break; }
         /* GROUPED RUN (Stage 4): a maximal contiguous run of group>0 ops rides ork_dyn_begin_seq_i8_mc — a
          * group-id change delimits INDEPENDENT chains (spread across cores). group==0 (default) never enters
-         * here, so the legacy per-op path below is byte-identical for existing callers. Ineligible run (engine
+         * here, so the legacy per-op path below is byte-identical for existing callers. Ineligible orki_run (engine
          * returns NULL: non-int8 / M>64 / kind not yet supported / terminal-not-matmul) => SW-run each op. */
         if(o->group>0){
             SEQ_FLUSH_HW(); if(ret) break;
@@ -15193,11 +15193,11 @@ void ork_fwht_norm(float *v, int n){
  * convert runs one whole expert per core); using the shared pthread pool there would nest/oversubscribe. */
 size_t ork_w_dump_i8_cpu_st(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%32) || (N%32)) return 0;
-    int KS=int8_ks(c), NMAX=c->soc->nmax;
+    int KS=orki_int8_ks(c), NMAX=c->soc->nmax;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t off=0;
     for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
-      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=pgup((size_t)Kp*Nc);
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=orki_pgup((size_t)Kp*Nc);
         if(out){ if(off+tsz>cap) return 0;
             int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);
             struct tile_i8_arg ta={bb,B,KT,k0,n0,N}; tile_i8_range(0,NN,&ta); }   /* inline: no pool */
@@ -15227,11 +15227,11 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
         struct buf cur; cur.cpu=NULL; size_t coff=0, csz=0;
         int ns,ks;
         for(ns=0;ns<Sn && consolidate;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
-          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=pgup((size_t)Kp*Nc);
+          for(ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32; size_t ts=orki_pgup((size_t)Kp*Nc);
             if(!cur.cpu || coff+ts>csz){
                 if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
                 csz = ts>chunk_cap ? ts : chunk_cap;
-                cur = bimport(c->fd,csz,w->domain);
+                cur = orki_bimport(c->fd,csz,w->domain);
                 if(!cur.cpu){ consolidate=0; break; }
                 dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
                 w->own_bufs[w->n_own_bufs++]=cur; coff=0;
@@ -15243,13 +15243,13 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
                 bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)];
             coff+=ts;}}
         if(consolidate){ if(cur.cpu) dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
-        else { for(int i=0;i<w->n_own_bufs;i++) bdestroy(c->fd,&w->own_bufs[i]); free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0; memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1; }
+        else { for(int i=0;i<w->n_own_bufs;i++) orki_bdestroy(c->fd,&w->own_bufs[i]); free(w->own_bufs); w->own_bufs=NULL; w->n_own_bufs=0; memset(w->Bb,0,(size_t)Sk*Sn*sizeof(struct buf)); w->owns=1; }
     }
     if(!consolidate){
         for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
           for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
-            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=bimport(c->fd,(size_t)Kp*Nc,w->domain);
-            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+            struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bimport(c->fd,(size_t)Kp*Nc,w->domain);
+            if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
             dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
             int8_t*bb=b->cpu;
             for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
@@ -15258,7 +15258,7 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
     }
     if(K%512==0 && K<=4096 && !getenv("ORK_NO_BF")){ int KTf=K/32; w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;(void)n0;
-            struct buf*bf=&w->Bf[ns]; *bf=bimport(c->fd,(size_t)K*Nc,w->domain);
+            struct buf*bf=&w->Bf[ns]; *bf=orki_bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
             int8_t*fb=bf->cpu;
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
@@ -15267,7 +15267,7 @@ ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
                 for(int nt=0;nt<NN;nt++)
                     memcpy(fb + ((size_t)nt*KTf + kf0)*32*32, sb + (size_t)nt*KT*32*32, (size_t)KT*32*32);}
             dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);}
-        if(!ok){ for(int ns=0;ns<Sn;ns++) bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
 
