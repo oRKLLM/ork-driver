@@ -25,7 +25,11 @@ GGML="../llama.cpp/ggml/src/ggml-ork/ggml-ork.cpp"
 
 # The real testable artifacts: every tools/ + examples/ source basename. This is the
 # ground truth for "a probe/test that exists". Used by checks 1 and 3.
-arts=$(ls tools examples 2>/dev/null | sed -nE 's/\.(c|sh)$//p' | sort -u)
+# Recursive, and .cpp counts: tools/re/ holds the llama-API harnesses (ork_bench, ork_ppl, the *_diff_probe
+# differential oracles). The old non-recursive .c/.sh-only listing could not see ANY of them, so citations to
+# them silently failed check 1 (or, worse, resolved to a same-basename file elsewhere).
+arts=$(find tools examples -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.sh' \) 2>/dev/null \
+       | sed -E 's|.*/||; s/\.(c|cpp|sh)$//' | sort -u)
 arts_re=$(printf '%s' "$arts" | paste -sd'|' -)
 
 # --- 1) cited probes must resolve to a real artifact -------------------------------------

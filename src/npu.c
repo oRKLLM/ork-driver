@@ -3378,6 +3378,28 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
         for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
             bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
         bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    /* DERIVED-COPY COHERENCE (defect fix). The fp16 MULTI-CORE colsplit does NOT read Bb: it builds a
+     * CONTIGUOUS concatenation of the Sk K-slice tiles ONCE and caches it on the weight (w->Bbc for
+     * Sn==1, w->Bbc_ns[] for Sn>1) behind a *_valid latch that was never cleared. A repack that
+     * refreshed only Bb was therefore INVISIBLE to ork_mm_run()/run_multicore — every multi-core submit
+     * after the first kept computing against the FIRST weight ever packed into this slot, silently.
+     * Single-core run() and ork_mm_run_stream_f16{,_chain} read Bb directly and were always correct,
+     * which is why this only surfaced in a repack-per-batch-slice caller (ggml-ork's ork_bmm_fp16:
+     * batch slice 0 correct, every later slice stale — probe: scratchpad bmm_probe, Hkv=16/rk2=1 gave
+     * NRMSE 1.37 from head 1 on multi-core, PASS with ORK_NPU_MC=1). Refresh the copies in place: K,N
+     * are unchanged so the sizes match, and keeping them valid avoids any bcreate/bdestroy churn. */
+    if(w->Bbc_valid && w->Bbc.cpu){ size_t off=0;
+        for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*N*2;
+            if(off+sz>w->Bbc.size || !w->Bb[ks].cpu) break;
+            memcpy((char*)w->Bbc.cpu+off, w->Bb[ks].cpu, sz); off+=sz;}
+        bsync(c->fd,&w->Bbc,RKNPU_MEM_SYNC_TO_DEVICE);}
+    if(w->Bbc_ns_valid && w->Bbc_ns){
+        for(int ns=0;ns<Sn;ns++){ if(!w->Bbc_ns[ns].cpu) continue;
+            int c0=ns*NMAX, sw=(N-c0<NMAX)?(N-c0):NMAX; size_t off=0;
+            for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*sw*2;
+                if(off+sz>w->Bbc_ns[ns].size || !w->Bb[(size_t)ns*Sk+ks].cpu) break;
+                memcpy((char*)w->Bbc_ns[ns].cpu+off, w->Bb[(size_t)ns*Sk+ks].cpu, sz); off+=sz;}
+            bsync(c->fd,&w->Bbc_ns[ns],RKNPU_MEM_SYNC_TO_DEVICE);}}
     return 0;
 }
 /* ---- Diagnostic only (tools/dmabuf_fill_probe.c): a load_i8 variant whose resident Bb tiles are
