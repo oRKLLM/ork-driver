@@ -93,18 +93,35 @@ fi
 # is a header-local DEFINITION (it satisfies includers), so those count as defined, not declared;
 # typedefs and preprocessor lines are skipped (a struct tag is not a function).
 DVD_PFX='orkd?_[a-z0-9_]*'
-DVD_NAME="s/^[^(]*[^A-Za-z0-9_](${DVD_PFX})[ 	]*\(.*/\1/p"
-DVD_STRIP='s:/\*[^*]*\*/::g; s://.*::; s/[ 	]*$//'
-dvd_decl=$(cat include/*.h src/*.h 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
+DVD_NAME="s/^[^(]*[^A-Za-z0-9_](${DVD_PFX})[ \t]*\\(.*/\\1/p"
+DVD_STRIP='s:/\\*[^*]*\\*/::g; s://.*::; s/[ \t]*$//'
+# Declarations wrap across lines (72 of the 294 public prototypes do, e.g. ork_ssm_scan_f32), and a
+# per-LINE rule is blind to every one of them -- which is how the ssm lift slipped past this gate. Join
+# each logical statement onto one line first: accumulate until a ";" or "{" closes it.
+# Strip block comments ACROSS lines, then join each logical statement onto one line. Both are needed:
+# 72 of the 294 public prototypes wrap (ork_ssm_scan_f32 among them) so a per-line rule is blind to them,
+# and a per-line comment strip leaves multi-line /* */ prose to be joined INTO the statement (which put
+# words like "ork_w" in front of a paren and produced 52 phantom failures when tried without this).
+dvd_clean() { awk '
+  { line=$0; out=""
+    while (length(line)) {
+      if (inc) { i=index(line,"*/"); if(i==0){line=""} else {line=substr(line,i+2); inc=0} }
+      else     { i=index(line,"/*"); if(i==0){out=out line; line=""} else {out=out substr(line,1,i-1); line=substr(line,i+2); inc=1} }
+    }
+    sub(/\/\/.*/,"",out)
+    l = l " " out
+    if (index(out,";") || index(out,"{")) { print l; l="" }
+  } END { if (l!="") print l }'; }
+dvd_decl=$(cat include/*.h src/*.h 2>/dev/null | dvd_clean | sed 's/^/ /' \
   | grep -vE '^ *#' | grep -vE '[^A-Za-z0-9_](static|typedef)[[:space:]]' \
-  | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" | grep -vE '\{' | grep -E ';$' \
+  | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\\(" | grep -vE '\\{' | grep -E ';[[:space:]]*$' \
   | sed -nE "$DVD_NAME" | sort -u)
-dvd_def=$( { cat src/*.c src/soc/*.c 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
-             | grep -E "^ [A-Za-z_][A-Za-z0-9_ *]*[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" \
+dvd_def=$( { cat $LIBSRC 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
+             | grep -E "^ [A-Za-z_][A-Za-z0-9_ *]*[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\\(" \
              | grep -vE '^[^{]*;$' ;
            cat include/*.h src/*.h 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
              | grep -E '[^A-Za-z0-9_]static[[:space:]]' \
-             | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" ; } \
+             | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\\(" ; } \
          | sed -nE "$DVD_NAME" | sort -u)
 for d in $dvd_decl; do
   printf '%s\n' "$dvd_def" | grep -qx "$d" && continue
