@@ -153,4 +153,13 @@ ork_w_sliced *ork_mm_pack_sliced(ork_npu *c, int K, int N, const void *B, int dt
 int           ork_mm_run_sliced (ork_npu *c, ork_w_sliced *w, int M, const void *A, void *C, int nc);
 void          ork_mm_free_sliced(ork_npu *c, ork_w_sliced *w);
 
+/* ---- hot helpers: static inline so the split does not cost the cross-function inlining the monolith had
+ * (ork_now_us alone has ~190 call sites, many on the per-submit path). See MODULARIZE_PLAN.md risk 1. */
+#include <time.h>
+static inline double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec*1e-3; }
+
+/* ---- cross-module internals (extern; defined in npu.c or a src/npu/*.c module) ---- */
+void orki_pin_little_core(int id);          /* npu.c  — pin the caller to an idle A55 */
+void orki_ssm_pool_free(ork_npu *c);        /* npu/ssm.c — release the persistent SSM scan pool (ork_npu_free) */
+
 #endif /* ORK_NPU_INTERNAL_H */

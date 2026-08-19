@@ -11,15 +11,42 @@ stays, siblings `npu/{sdp,f16,i16,i4,ssm}.c` + folder `npu/i8/{regcmd,pack,fold,
 
 | commit | what | status |
 |---|---|---|
-| 0 | this doc + `MODULARIZE_PLAN.md` | ✅ |
-| A | `check_registry.sh` globs all lib sources; `clean:` → `$(COBJ)`; `$(SUDO)` = `sudo -E` | ✅ board-validated |
-| B | rename generic internals to `orki_*` (one TU, no moves) | ⬜ next |
-| C | `src/npu/internal.h` (types, macros, inline helpers, externs) | ⬜ |
-| D–I4 | the lifts (sdp → i16 → ssm → f16 → i4 → i8/{regcmd,pack,fold,run,probe,chain,dyn}) | ⬜ |
+| 0 | this doc + `MODULARIZE_PLAN.md` | ✅ `189553a` |
+| A | `check_registry.sh` globs all lib sources; `clean:` → `$(COBJ)`; `$(SUDO)` = `sudo -E` | ✅ `b83269e` (+ AGENTS fix `1824466`) |
+| B | rename 43 generic internals to `orki_*` (one TU, no moves) | ✅ `c4541c2` |
+| C | `src/npu/internal.h` (types, macros, `ork_now_us` inline, externs) | ✅ `b685614` |
+| **D** | **`src/npu/ssm.c` — first real TU off the monolith (317 lines)** | 🔄 validating |
+| E–I4 | remaining lifts (sdp → i16 → f16 → i4 → i8/{regcmd,pack,fold,run,probe,chain,dyn}) | ⬜ |
 | J | docs (AGENTS §4 tree, README, OPS_REGISTRY, tools/re/README) | ⬜ |
 | K | attest refresh (if CORE moved) + fork CMake file list | ⬜ |
 
-**Working tree:** clean. **Board** (`~/llama.cpp/ggml/src/ggml-ork/ork-driver`) on `main`, clean, governors pinned.
+**Working tree:** on `refactor/modularize-precision`. **Board** synced to the branch, governors pinned.
+**`src/npu.c`: 15,313 → 14,862 lines.**
+
+### Order changed from the plan: D is `ssm.c`, not `sdp.c`
+
+The plan ordered `sdp.c` first as "self-contained math". It is not — the SDP substrate is **scattered
+across 8 sites from line 1542 to 9443** (`sdp_canon`/`ork_npu_sdp_stamp` up in the fold neighbourhood,
+the curve builders down among the i8 activations), and `silu_calibrate_idx` reaches into
+`ork_npu_probe_silu_std`. `ssm` by contrast is **one contiguous block** with a 3-in/3-out boundary, so it
+is the better first proof of the recipe. SDP moves later, when the i8 activations it interleaves with
+have been lifted and the split is obvious. **Lesson for the remaining lifts: pick the block by measured
+contiguity, not by the plan's guess at cohesion.**
+
+### Remaining lifts, ordered by MEASURED contiguity (not the plan's guess)
+
+`src/npu.c` after commit D, functions bucketed by name/dtype, "runs" = clusters separated by >400 lines:
+
+| module | fns | span | runs | largest contiguous runs |
+|---|---:|---:|---:|---|
+| i16 | 21 | 861–14252 | 7 | **8290–9474 (1184)**, 7071–7427, 14222–14252 |
+| f16 | 63 | 74–14700 | 11 | 6505–8115 (1610), 14218–14700, 5669–6071 |
+| i4 | 70 | 92–14829 | 9 | 13378–14829 (1451), 3397–4571, 5175–5593 |
+| i8 | 157 | 869–14762 | 10 | 2584–4529 (1945), 10746–12653 (1907), 5385–7160 (1775) |
+| core (scaffold) | 250 | 62–14730 | 8 | 62–3392 (3330), 3884–5947, 8695–9991 |
+
+So the order stands as **i16 → f16 → i4 → i8/**, but every lift should take the dominant run first and
+sweep the stragglers second, rather than trying to move a module in one pass.
 
 ---
 
