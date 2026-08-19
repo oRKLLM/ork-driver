@@ -12,6 +12,10 @@
 #      evidence — the name of a real probe/test file, a `make test`/`replay`/`gtest`/`ppl`
 #      reference, or an explicit `(no ... probe)` acknowledgment. A hard status backed by
 #      nothing fails. WIP / diagnostic / legend rows are exempt.
+#   5. NO DANGLING DECLARATIONS: every ork_*/orkd_* function PROTOTYPED in a header must have
+#      an implementation. A header can promise a symbol nothing defines — the caller gets a
+#      link error, and if nothing in-tree calls it the gap is invisible. That is exactly how
+#      ork_gptq_i4 shipped declared-but-unimplemented on main for months (fixed 61ccb48).
 #
 # Runs anywhere (pure grep/awk, no NPU, no python). Exit 0 = clean, 1 = registry drift.
 set -eu
@@ -78,5 +82,32 @@ if [ -f src/ork_ops.c ]; then
   done
 fi
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op"
+# --- 5) no dangling declarations: a header prototype with no implementation ---------------
+# A line is a PROTOTYPE iff (after comment-stripping) it carries no "{" and ends in ";". Anything
+# else carrying "name(" is a definition — including K&R-wrapped ones whose "{" lands on a later
+# line, and one-liner bodies. The name is taken from before the FIRST "(" on the line, so a body
+# that calls another ork_* function is not mistaken for its own declaration. `static` in a header
+# is a header-local DEFINITION (it satisfies includers), so those count as defined, not declared;
+# typedefs and preprocessor lines are skipped (a struct tag is not a function).
+DVD_PFX='orkd?_[a-z0-9_]*'
+DVD_NAME="s/^[^(]*[^A-Za-z0-9_](${DVD_PFX})[ 	]*\(.*/\1/p"
+DVD_STRIP='s:/\*[^*]*\*/::g; s://.*::; s/[ 	]*$//'
+dvd_decl=$(cat include/*.h src/*.h 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
+  | grep -vE '^ *#' | grep -vE '[^A-Za-z0-9_](static|typedef)[[:space:]]' \
+  | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" | grep -vE '\{' | grep -E ';$' \
+  | sed -nE "$DVD_NAME" | sort -u)
+dvd_def=$( { cat src/*.c src/soc/*.c 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
+             | grep -E "^ [A-Za-z_][A-Za-z0-9_ *]*[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" \
+             | grep -vE '^[^{]*;$' ;
+           cat include/*.h src/*.h 2>/dev/null | sed 's/^/ /' | sed "$DVD_STRIP" \
+             | grep -E '[^A-Za-z0-9_]static[[:space:]]' \
+             | grep -E "[^A-Za-z0-9_]${DVD_PFX}[[:space:]]*\(" ; } \
+         | sed -nE "$DVD_NAME" | sort -u)
+for d in $dvd_decl; do
+  printf '%s\n' "$dvd_def" | grep -qx "$d" && continue
+  echo "check-registry: FAIL — '$d' is declared in a header but defined nowhere in src/ — dangling declaration (implement it, or stub it like src/ork_gptq.c)"
+  fail=1
+done
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations"
 exit $fail
