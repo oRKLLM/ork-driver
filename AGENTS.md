@@ -72,6 +72,13 @@ Before committing, check whether the change needs doc updates:
 - A non-obvious hardware/RE finding (a new register meaning, a limit, a workaround) → record it
   on the [wiki](https://github.com/oRKLLM/ork-driver/wiki) (ISA Reference / RE Roadmap), not in
   code comments alone.
+- **Made one precision REUSE another's implementation** (an fp16 path that calls an int8 function, an
+  i16 op that rides the int8 chain) → add a row to `tools/precision_overrides.tsv`. This is the ONE
+  doc-drift direction no gate can catch: the capability matrix classifies by the dtype token in a
+  symbol name, so a borrowed implementation is invisible to it and the table silently UNDER-reports
+  the borrowing dtype. Nothing detects it, because there is no ground truth to diff against — the
+  only defence is this line. (The reverse direction IS gated: `make check-registry` check 8 fails if
+  a row cites a symbol that no longer exists.)
 
 This keeps the docs reflecting reality so the next agent doesn't reverse-engineer what changed.
 

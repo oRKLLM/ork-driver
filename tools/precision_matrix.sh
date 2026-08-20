@@ -6,21 +6,17 @@
 #
 # HOW IT CLASSIFIES: a symbol serves a precision if its NAME carries that dtype token (i8/f16/i4/i16),
 # otherwise by the module folder it lives in. That is right where the dtype is in the name, and WRONG for
-# shared implementations serving several dtypes under one name — those are listed in OVERRIDES and render
-# with a dagger. Add an OVERRIDES row when one precision starts reusing another's implementation.
+# shared implementations serving several dtypes under one name — those are listed in tools/precision_overrides.tsv
+# and render with a dagger. Each cites the sharing symbol, which check_registry check 8 verifies still exists.
 #
 # Portable sh + grep/sed only: the board runs mawk and the Mac runs BSD awk, so no gawk extensions and
 # (AGENTS section 2) no Python.
 set -eu
 cd "$(dirname "$0")/.."
 
-# capability<TAB>dtype<TAB>why  — shared implementations the name-based rule cannot see. Each renders as
-# a dagger and a footnote, so a reused implementation reads as "supported, via X" rather than a gap.
-OVERRIDES='run — single core	f16	ork_mm_run / orki_run in npu.c dispatch fp16 (no dtype token in the name)
-run — multicore	f16	ork_dyn_begin_colsplit (i8/colsplit.c) is the ONLY fp16 multicore path (#45)
-run — NONBLOCK doorbell	f16	same colsplit path — fp16 wide-K rides the doorbell
-run — multicore	i16	routed through the int8 chain
-run — HW chain	i16	ork_npu_chain_mm_*_i16 ride the int8 PC-chain'
+# Shared implementations the name-based rule cannot see live in a DATA FILE, not here, so that
+# check_registry.sh check 8 can verify every cited symbol still exists (see that file's header).
+OVERRIDES=$(grep -v "^#" tools/precision_overrides.tsv | sed "/^$/d")
 
 SRC=$(ls src/npu.c src/npu/*.c src/npu/*/*.c 2>/dev/null)
 TMP=${TMPDIR:-/tmp}/orkmatrix.$$; mkdir -p "$TMP"; trap 'rm -rf "$TMP"' EXIT
@@ -83,8 +79,8 @@ probes / RE replay	probe|replay|benchmark
 regcmd fuzz hooks	fuzz
 CAPS
 printf '\n'
-printf '%s\n' "$OVERRIDES" | while IFS='	' read -r c d n; do
-  [ -n "$c" ] && printf '† **%s / %s** — %s\n' "$d" "$c" "$n"
+printf '%s\n' "$OVERRIDES" | while IFS="	" read -r c d sym n; do
+  [ -n "$c" ] && printf '† **%s / %s** — %s (`%s`)\n' "$d" "$c" "$n" "$sym"
 done
 printf '\nfunctions per precision: '
 for d in i8 f16 i4 i16; do printf '%s=%s  ' "$d" "$(wc -l < "$TMP/$d" | tr -d ' ')"; done

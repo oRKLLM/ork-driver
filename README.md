@@ -280,7 +280,9 @@ vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for
 
 Which datapath implements what. Regenerate with `make matrix` (`tools/precision_matrix.sh` derives it
 from the source tree, so it cannot drift from the code). A dagger means the capability is provided by a
-shared implementation rather than that precision's own module — supported, just not its own code.
+shared implementation rather than that precision's own module — supported, just not its own code; those
+are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol doing the work, which
+`make check-registry` verifies still exists.
 
 | capability | i8 | f16 | i4 | i16 |
 |---|:--:|:--:|:--:|:--:|
@@ -292,7 +294,7 @@ shared implementation rather than that precision's own module — supported, jus
 | zero-copy import / adopt | ✅ | — | ✅ | — |
 | quantise from f32 | ✅ | — | ✅ | — |
 | run — single core | ✅ | ✅† | ✅ | — |
-| run — multicore | ✅ | ✅† | ✅ | ✅† |
+| run — multicore | ✅ | ✅† | ✅ | — |
 | run — HW chain | ✅ | — | ✅ | ✅† |
 | run — async stream | ✅ | ✅ | ✅ | — |
 | run — NONBLOCK doorbell | ✅ | ✅† | ✅ | — |
@@ -309,11 +311,10 @@ shared implementation rather than that precision's own module — supported, jus
 | probes / RE replay | ✅ | ✅ | ✅ | ✅ |
 | regcmd fuzz hooks | ✅ | ✅ | ✅ | — |
 
-† **f16 / run — single core** — ork_mm_run / orki_run in npu.c dispatch fp16 (no dtype token in the name)
-† **f16 / run — multicore** — ork_dyn_begin_colsplit (i8/colsplit.c) is the ONLY fp16 multicore path (#45)
-† **f16 / run — NONBLOCK doorbell** — same colsplit path — fp16 wide-K rides the doorbell
-† **i16 / run — multicore** — routed through the int8 chain
-† **i16 / run — HW chain** — ork_npu_chain_mm_*_i16 ride the int8 PC-chain
+† **f16 / run — single core** — ork_mm_run / orki_run in npu.c dispatch fp16 — the dispatcher is dtype-agnostic by design, so there is no token to match (`orki_run`)
+† **f16 / run — multicore** — i8/colsplit.c is the ONLY fp16 multicore path (#45) (`ork_dyn_begin_colsplit`)
+† **f16 / run — NONBLOCK doorbell** — same colsplit path — fp16 wide-K rides the doorbell (`ork_dyn_begin_colsplit`)
+† **i16 / run — HW chain** — the i16 chain rides the general PC-chain core in i8/probe.c rather than a dedicated i16 one (`ork_npu_chain_progs`)
 
 **Most blanks are by design, not a TODO.** int4 has no SDP/activation row because the RK3588 datapath is
 W8A8 *or* W4A4 symmetric — int4 activations are int4, and the SDP LUT op consumes int8/int16, so there is

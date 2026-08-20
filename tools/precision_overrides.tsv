@@ -1,0 +1,24 @@
+# precision_overrides.tsv — shared implementations the matrix's name-based rule cannot see.
+#
+# tools/precision_matrix.sh decides "dtype X has capability C" from the dtype token in a symbol's name
+# (falling back to the module folder it lives in). That is correct wherever the dtype IS in the name, and
+# structurally blind in two cases, both of which live here:
+#   1. one precision REUSES another's implementation — fp16 multicore IS i8/colsplit.c, and no single name
+#      can say "serves i8 and f16" without lying about one of them;
+#   2. the symbol is dtype-tagged but the capability regex does not reach it.
+# Each row renders as a dagger + footnote, so a reused implementation reads "supported, via X" not a gap.
+#
+# THE SYMBOL FIELD IS LOAD-BEARING: check_registry.sh check 8 fails the build if a cited symbol stops
+# being defined, so a dagger can never outlive the code it points at. Cite the function that actually does
+# the work for the borrowing dtype — the shared core, not the caller.
+#
+# This gate earned its keep on its first run: it killed a "run — multicore / i16 / routed through the int8
+# chain" row that had NO symbol behind it, because there is no i16 multicore path at all (the only i16 x
+# multicore thing in the tree is ORK_OP_MATMUL_I16OUT_I8 — an int8 matmul that EMITS int16, which is the
+# int8 row, not an i16 one). Hand-written matrix claims rot in exactly this direction.
+#
+# capability<TAB>dtype<TAB>symbol<TAB>why
+run — single core	f16	orki_run	ork_mm_run / orki_run in npu.c dispatch fp16 — the dispatcher is dtype-agnostic by design, so there is no token to match
+run — multicore	f16	ork_dyn_begin_colsplit	i8/colsplit.c is the ONLY fp16 multicore path (#45)
+run — NONBLOCK doorbell	f16	ork_dyn_begin_colsplit	same colsplit path — fp16 wide-K rides the doorbell
+run — HW chain	i16	ork_npu_chain_progs	the i16 chain rides the general PC-chain core in i8/probe.c rather than a dedicated i16 one

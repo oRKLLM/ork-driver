@@ -194,5 +194,38 @@ if [ -n "$knobbad" ]; then
   fi
 fi
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions"
+
+# --- 8) precision-matrix overrides cite a symbol that still exists --------------------------------
+# The capability x precision matrix (tools/precision_matrix.sh, rendered into README) classifies a
+# function by the dtype token in its NAME. That is blind to shared implementations — fp16's multicore
+# path IS i8/colsplit.c — so those are asserted by hand in tools/precision_overrides.tsv and render as
+# a dagger. A hand-asserted claim rots, so each row must CITE the symbol doing the work, and this check
+# fails the build if the symbol stops being defined, the capability is not one the matrix emits, or the
+# dtype is not a real column. Without it a dagger can outlive its code and the table quietly lies.
+# (It paid for itself immediately: it deleted a "run — multicore / i16" row that had no symbol behind
+# it because no i16 multicore path exists.)
+OVR=tools/precision_overrides.tsv
+if [ -f "$OVR" ]; then
+  TAB=$(printf '\t')
+  ovrdefs=$(for f in src/npu.c src/npu/*.c src/npu/*/*.c; do
+              grep -E '^(static +)?[A-Za-z_][A-Za-z0-9_ *]*\(' "$f" 2>/dev/null | grep -v ';[[:space:]]*$'
+            done | sed -E 's/^.*[ *]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' | sort -u)
+  ovrcaps=$(sed -n '/<<CAPS/,/^CAPS$/p' tools/precision_matrix.sh | sed '1d;$d' | cut -f1)
+  ovrbad=$(grep -v '^#' "$OVR" | sed '/^$/d' | while IFS="$TAB" read -r c d sym why; do
+      [ -n "$sym" ] || { echo "'$c / $d' cites no symbol at all"; continue; }
+      printf '%s\n' "$ovrdefs" | grep -qx "$sym" \
+        || echo "'$c / $d' cites '$sym', which is not defined anywhere under src/npu — stale dagger"
+      printf '%s\n' "$ovrcaps" | grep -qxF "$c" \
+        || echo "'$c / $d' names capability '$c', which the matrix does not emit — the row can never fire"
+      printf "i8 f16 i4 i16" | grep -qw "$d" || echo "'$c / $d' names unknown dtype '$d'"
+    done)
+  if [ -n "$ovrbad" ]; then
+    echo "$ovrbad" | while IFS= read -r l; do
+      echo "check-registry: FAIL — precision-matrix override $l"
+    done
+    fail=1
+  fi
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols"
 exit $fail
