@@ -26,6 +26,7 @@
 #include <dlfcn.h>
 #include <signal.h>
 #include "rknpu_ioctl.h"
+#include "ork_regs.h"
 #include "orkd_client.h"   /* Path B: transparent orkd client routing (gated by ORK_USE_ORKD) */
 #include "orkd_proto.h"    /* ORKD_DT_* wire dtypes for the transparent ring transport */
 #include "spine_kernels.h" /* CPU glue (rmsnorm/rope/attn/silu/quant/civac) for the whole-layer core ork_mm_layer_i8 */
@@ -51,7 +52,6 @@
  * wedge). Decoupling the reset from the marker lets decode interleave run_i8 singletons with run_stream
  * (QKV/gate-up) groups without a ~107ms NPU soft-reset at every matmul boundary. The cold 2-pass warmup
  * (fresh-output-buffer priming) is kept independently — see the reset sites. */
-#define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)
 /* Every int-datapath mode (int8 / int4 / chain=3). ORK_MIXED_NOTHRASH: when set, an int↔int dtype
  * transition (e.g. the per-tensor mixed dispatch alternating W4A4 q4-tensors and W8A8 q6-tensors within a
  * decode token) does NOT ACT_RESET + re-warm + realloc the per-core buffers. MEASURED: mixed W4A4 decode
@@ -59,8 +59,6 @@
  * int4 (no switching) = 6.43 t/s. The reset is cold-entry wedge-protection (fp16→int, or first int); it is
  * NOT needed BETWEEN already-warm int modes — exactly as int8↔chain already interleaves reset-free
  * (ORK_I8_LIVE). Off by default (validate on silicon before promoting). */
-#define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)
-static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
 /* ORK_SSM_KEEPWARM: same lever as ORK_MIXED_NOTHRASH but for the int8-matmul <-> fp16-scan pair (Mamba-2
  * on-NPU SSM). An int8<->fp16 transition per layer otherwise ACT_RESETs + re-warms + reallocs the per-core
  * buffers (measured: matmul run 99% SETUP, 28 soft-resets/prefill). NVDLA/rocket resets only at init and
@@ -69,18 +67,14 @@ static int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK
  * correctness-safe (the program is always rebuilt). Buffers are grow-only so they stabilize to the fp16
  * (2-byte activation) size and are reused by int8. Off by default; validate on silicon (errno=110) before
  * promoting. The families that may interleave reset-free: int8-live (DT_I8/chain) and DT_F16. */
-#define ORK_KW_DT(dt) (ORK_I8_LIVE(dt) || (dt)==DT_F16)
 /* DEFAULT ON (2026-07-13): validated general, coherent, bit-exact-safe win — skips the int8<->fp16 ACT_RESET
  * churn for any fp16-op interleaved with int8 matmuls (SSM scan etc.). ORK_SSM_KEEPWARM=0 to disable. */
-static int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_SDP_NORESET: skip the entry ACT_RESET in the element-wise fp16/int16 SDP ops (ewmul_f16/i16,
  * add_f16/i16). Their int8 twins (ewmul_i8/add_i8) already skip it; the reset was drift, not required.
  * VALIDATED (2026-07-14): coherent (test_ewmul_f16/i16, test_add pass), wedge-free after an int8/fp16
  * matmul (mode_probe SAFE); removes a ~107ms/op reset — test_ewmul_f16 3436→53ms, ewmul_i16 4292→44ms,
  * add 1419→50ms. DEFAULT ON (skip the reset). Set ORK_SDP_NORESET=0 to restore the old reset. */
-static int ork_sdp_noreset(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SDP_NORESET"); v=e?(atoi(e)?1:0):1;} return v; }
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
-static int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
 /* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
  * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
  * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the
@@ -110,8 +104,8 @@ double orki_prof_i8_us = 0,    orki_prof_i4_us = 0;
  * via g_prof_submit_class so we can split within-matmul tiling (K/N/M sub-submits) from chained
  * (one ioctl covering >1 program). Printed on free. Pure diagnostic — no effect when prof off. */
 long   orki_prof_submits = 0;       /* total RKNPU_SUBMIT ioctls */
-static long   g_prof_submit_progs = 0;  /* total PC-chained programs across all submits (>= submits) */
-static long   g_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
+long   orki_prof_submit_progs = 0;  /* total PC-chained programs across all submits (>= submits) */
+long   orki_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
 /* FLOOR-DECOMP instrumentation (always-on, ~40ns/submit): decompose the per-submit floor.
  * orki_fd_ioctl_us = wall time inside the SUBMIT ioctl (kernel job setup + NPU + completion-wait, blocking).
  * orki_fd_hw_us    = SUM of the kernel-reported sub->hw_elapse_time (the HW's own NPU-busy view) — ork never
@@ -262,7 +256,6 @@ int orki_budget(ork_npu*c, int M){
 } /* effective max cores */
 
 
-size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
 /* PER-WEIGHT IOMMU DOMAIN. The rk_iommu v2 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, not per
  * device, so spreading weights over multiple domains keeps >4 GiB resident at once. ORK_IOMMU_DOMAIN
  * is the process-wide DEFAULT domain (env, default 0). Each ork_w then carries its own `domain`:
@@ -273,13 +266,12 @@ size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
  *     is per-call/per-stack, so concurrent multi-core workers each carry their own domain (no global).
  * Activation/output/scratch buffers are allocated under the active domain (dom_activate); resident
  * weights and their submits dominate the IOVA budget, so per-weight placement is what matters. */
-int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_IOMMU_DOMAIN"); v=e?atoi(e):0;} return v; }
 /* THREAD-SAFETY: the IOMMU domain is threaded through call parameters and the per-submit
  * rknpu_submit struct, NOT a process-global — two concurrent submits / packs must not race a
  * shared mutable domain. bcreate/bimport take an explicit `domain`; rknpu_submit_ioctl sets
  * sub->iommu_domain_id from a parameter. The pack-path default for the ggml-ork caller lives on
  * the ork_npu ctx (c->pack_domain), read once per pack to stamp w->domain. dom<0 => default. */
-static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
+int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
 /* ---- IOVA WEDGE GUARD -----------------------------------------------------------------------
  * The rk_iommu v2 IOVA window is 32-bit (~4 GiB) PER iommu_domain_id, and the kernel rknpu driver
  * FAULTS inside MEM_CREATE (rknpu_iommu_dma_map_sg -> rknpu_gem_object_create) when that window is
@@ -291,39 +283,19 @@ static int ork_dom(int dom){ return dom>=0 ? dom : ork_dom_default(); }
  * {0} (cpu==NULL) and its caller falls back (CPU) cleanly. Ceiling default 3900 MiB (headroom under
  * the 4 GiB cap for fragmentation + kernel overhead); tune with ORK_IOVA_CEIL_MB. This guards EVERY
  * DMA-allocating path (weights, scratch, PPU-op buffers, zero-copy imports), not just one op. */
-#define ORK_IOVA_NDOM 64
-static size_t g_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
-static long g_bcreate_n, g_bimport_n, g_bdestroy_n;   /* cumulative alloc/free counts (ORK_PRESUBMIT_TRACE leak diag) */
+size_t orki_iova_bytes[ORK_IOVA_NDOM];   /* MEM_CREATE-mapped bytes currently live, per iommu domain */
+long orki_bcreate_n, orki_bimport_n, orki_bdestroy_n;   /* cumulative alloc/free counts (ORK_PRESUBMIT_TRACE leak diag) */
 /* ORK_IMPORT_TRACE: flushed per-phase trace of every dma-buf IMPORT (bimport) + the weight-level import
  * entrypoints. Each line is fflush'd so if an ioctl HANGS (D-state), the LAST printed line names the exact
  * stuck phase (DMA_HEAP_ALLOC / mmap / PRIME_FD / MEM_CREATE), domain, size, and cumulative counts. Off by
  * default (0 cost). Used to root-cause the weight-import D-state hang without guessing. */
-static int imp_trace(void){ static int t=-1; if(t<0){ const char*e=getenv("ORK_IMPORT_TRACE"); t=e?atoi(e):0; } return t; }
+int orki_imp_trace(void){ static int t=-1; if(t<0){ const char*e=getenv("ORK_IMPORT_TRACE"); t=e?atoi(e):0; } return t; }
 static long g_imp_wn;   /* weight-import call counter (which weight is being imported when a hang hits) */
 /* NPU on-chip SRAM total (bytes), queried once at init. 0 => the kernel/DTB did NOT allocate SRAM to the
  * NPU (stock config, no CONFIG_ROCKCHIP_RKNPU_SRAM / no rkvdec0_sram reassignment). bcreate uses this to
  * fail a TRY_ALLOC_SRAM request over to DRAM so the submit path is portable across kernels/DTBs. */
-static uint64_t g_sram_total = 0;
-size_t ork_iova_ceiling(void){
-    static size_t v=0;
-    if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):3900; if(mb<=0)mb=3900; v=(size_t)mb*1024u*1024u; }
-    return v;
-}
+uint64_t orki_sram_total = 0;
 /* reserve `need` bytes in domain `dom`; 1 = ok (accounted), 0 = would exceed cap (caller must not alloc). */
-int ork_iova_reserve(int dom,size_t need){
-    if(dom<0||dom>=ORK_IOVA_NDOM) return 1;   /* out-of-range domain: untracked, allow (rare) */
-    if(g_iova_bytes[dom]+need > ork_iova_ceiling()){
-        fprintf(stderr,"[ork] IOVA guard: domain %d at %zu MiB + %zu MiB would exceed the %zu MiB cap "
-                "— refusing MEM_CREATE so the caller falls back (raise ORK_IOVA_CEIL_MB or spread domains)\n",
-                dom, g_iova_bytes[dom]>>20, need>>20, ork_iova_ceiling()>>20);
-        return 0;
-    }
-    g_iova_bytes[dom]+=need; return 1;
-}
-void ork_iova_release(int dom,size_t bytes){
-    if(dom<0||dom>=ORK_IOVA_NDOM) return;
-    g_iova_bytes[dom] = g_iova_bytes[dom]>bytes ? g_iova_bytes[dom]-bytes : 0;
-}
 /* ---- graceful-teardown live-buffer registry (SIGTERM/SIGINT) --------------------------------------
  * A killed process (e.g. `timeout`) that skips MEM_DESTROY leaks its IOMMU domain/IOVA mappings — benign
  * for a single domain, but a MULTI-DOMAIN run strands whole 4 GiB domains until reboot (the kernel's
@@ -331,144 +303,60 @@ void ork_iova_release(int dom,size_t bytes){
  * (bcreate + bimport) and, on SIGTERM/SIGINT, MEM_DESTROY them all + ACT_RESET before re-raising the
  * default disposition — the same reclaim a clean exit does. Disable with ORK_NO_SIGCLEAN=1. */
 struct ork_live_ent { uint32_t handle; uint64_t obj; };
-static struct ork_live_ent *g_live=NULL; static int g_live_n=0, g_live_cap=0; static int g_live_fd=-1;
-static pthread_mutex_t g_live_mu=PTHREAD_MUTEX_INITIALIZER;
-static void live_add(int fd, uint32_t h, uint64_t o){ pthread_mutex_lock(&g_live_mu); g_live_fd=fd;
-    if(g_live_n==g_live_cap){ int nc=g_live_cap?g_live_cap*2:256; void*p=realloc(g_live,(size_t)nc*sizeof*g_live); if(p){g_live=p;g_live_cap=nc;} }
-    if(g_live_n<g_live_cap) g_live[g_live_n++]=(struct ork_live_ent){h,o};
-    pthread_mutex_unlock(&g_live_mu); }
-static void live_del(uint32_t h){ pthread_mutex_lock(&g_live_mu);
-    for(int i=0;i<g_live_n;i++) if(g_live[i].handle==h){ g_live[i]=g_live[--g_live_n]; break; }
-    pthread_mutex_unlock(&g_live_mu); }
+struct ork_live_ent *orki_live=NULL; int orki_live_n=0, orki_live_cap=0; int orki_live_fd=-1;
+pthread_mutex_t orki_live_mu=PTHREAD_MUTEX_INITIALIZER;
+void orki_live_add(int fd, uint32_t h, uint64_t o){ pthread_mutex_lock(&orki_live_mu); orki_live_fd=fd;
+    if(orki_live_n==orki_live_cap){ int nc=orki_live_cap?orki_live_cap*2:256; void*p=realloc(orki_live,(size_t)nc*sizeof*orki_live); if(p){orki_live=p;orki_live_cap=nc;} }
+    if(orki_live_n<orki_live_cap) orki_live[orki_live_n++]=(struct ork_live_ent){h,o};
+    pthread_mutex_unlock(&orki_live_mu); }
+void orki_live_del(uint32_t h){ pthread_mutex_lock(&orki_live_mu);
+    for(int i=0;i<orki_live_n;i++) if(orki_live[i].handle==h){ orki_live[i]=orki_live[--orki_live_n]; break; }
+    pthread_mutex_unlock(&orki_live_mu); }
 /* IMPORT REGISTRY (fd-reap recovery, task #47). A parallel registry holding POINTERS to every dma-buf-IMPORTED
  * buf (bimport / bimport_fd) — the ones whose backing pages PERSIST across a DRM-fd close (the client/heap holds
  * the dma-buf fd). ork_ctx_fd_reap() walks this to RE-IMPORT each buffer into the reopened fd and rewrite its
  * handle/IOVA/obj/cpu IN PLACE, so resident weights survive a close+reopen with NO re-orki_pack (only bcreate'd buffers
  * — scratch — are lost, and those lazily re-create). Pointers are stable (Bb[]/own_bufs[] are calloc'd arrays);
- * bdestroy unregisters. Values-registry g_live is for SIGTERM MEM_DESTROY; this one is for reap re-import. */
-static struct buf **g_imp=NULL; static int g_imp_n=0, g_imp_cap=0;
-static void orki_imp_reg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
-    for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ pthread_mutex_unlock(&g_live_mu); return; }   /* dedupe */
-    if(g_imp_n==g_imp_cap){ int nc=g_imp_cap?g_imp_cap*2:128; void*p=realloc(g_imp,(size_t)nc*sizeof*g_imp); if(p){g_imp=p;g_imp_cap=nc;} }
-    if(g_imp_n<g_imp_cap) g_imp[g_imp_n++]=b;
-    pthread_mutex_unlock(&g_live_mu); }
-static void orki_imp_unreg(struct buf*b){ pthread_mutex_lock(&g_live_mu);
-    for(int i=0;i<g_imp_n;i++) if(g_imp[i]==b){ g_imp[i]=g_imp[--g_imp_n]; break; }
-    pthread_mutex_unlock(&g_live_mu); }
-static volatile sig_atomic_t g_sig_busy=0;
-static void ork_sig_teardown(int sig){
-    if(!g_sig_busy){ g_sig_busy=1; int fd=g_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
-        if(fd>=0){ int n=g_live_n;
-            for(int i=0;i<n;i++){ struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=g_live[i].handle; d.obj_addr=g_live[i].obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); }
+ * bdestroy unregisters. Values-registry orki_live is for SIGTERM MEM_DESTROY; this one is for reap re-import. */
+struct buf **orki_imp=NULL; int orki_imp_n=0, orki_imp_cap=0;
+static void orki_imp_reg(struct buf*b){ pthread_mutex_lock(&orki_live_mu);
+    for(int i=0;i<orki_imp_n;i++) if(orki_imp[i]==b){ pthread_mutex_unlock(&orki_live_mu); return; }   /* dedupe */
+    if(orki_imp_n==orki_imp_cap){ int nc=orki_imp_cap?orki_imp_cap*2:128; void*p=realloc(orki_imp,(size_t)nc*sizeof*orki_imp); if(p){orki_imp=p;orki_imp_cap=nc;} }
+    if(orki_imp_n<orki_imp_cap) orki_imp[orki_imp_n++]=b;
+    pthread_mutex_unlock(&orki_live_mu); }
+static void orki_imp_unreg(struct buf*b){ pthread_mutex_lock(&orki_live_mu);
+    for(int i=0;i<orki_imp_n;i++) if(orki_imp[i]==b){ orki_imp[i]=orki_imp[--orki_imp_n]; break; }
+    pthread_mutex_unlock(&orki_live_mu); }
+volatile sig_atomic_t orki_sig_busy=0;
+void ork_sig_teardown(int sig){
+    if(!orki_sig_busy){ orki_sig_busy=1; int fd=orki_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
+        if(fd>=0){ int n=orki_live_n;
+            for(int i=0;i<n;i++){ struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=orki_live[i].handle; d.obj_addr=orki_live[i].obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); }
             struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); } }
     signal(sig,SIG_DFL); raise(sig);
 }
-struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
-    int dom=ork_dom(domain); size_t need=orki_pgup(size);
-    /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (g_sram_total
-     * ==0, stock kernel/DTB), drop to DRAM up front — don't even try. If SRAM exists but the alloc faults
-     * (SRAM full/contended), retry once in DRAM below. Keeps the async submit path portable. */
-    if((flags & RKNPU_MEM_TRY_ALLOC_SRAM) && g_sram_total==0) flags &= ~RKNPU_MEM_TRY_ALLOC_SRAM;
-    if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
-    struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){
-        if(flags & RKNPU_MEM_TRY_ALLOC_SRAM){   /* SRAM path faulted -> DRAM failover (retry once, same IOVA reservation) */
-            memset(&c,0,sizeof c); c.size=need; c.flags=flags & ~RKNPU_MEM_TRY_ALLOC_SRAM; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
-            if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){perror("CREATE");ork_iova_release(dom,need);return (struct buf){0};}
-        } else {
-            fprintf(stderr,"CREATE FAIL: errno=%d(%s) size=%zuKB dom=%d flags=0x%x bcreate#%ld dom_iova=%zuMB ceil=%zuMB\n",
-                    errno, strerror(errno), need>>10, dom, flags, g_bcreate_n,
-                    (dom>=0&&dom<ORK_IOVA_NDOM?g_iova_bytes[dom]:0)>>20, ork_iova_ceiling()>>20);
-            ork_iova_release(dom,need);return (struct buf){0};}
-    }
-    struct rknpu_mem_map m; memset(&m,0,sizeof m); m.handle=c.handle;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");ork_iova_release(dom,need);return (struct buf){0};}
-    void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
-    if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
-    struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
-    live_add(fd,b.handle,b.obj);
-    g_bcreate_n++;
-    return b;
-}
 void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
     struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
-    live_del(b->handle); orki_imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
-    g_bdestroy_n++;
+    orki_live_del(b->handle); orki_imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
+    orki_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
 /* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
  * Reused across every ewmul/add call so the per-op MEM_CREATE/MEM_DESTROY churn (which dominates the
  * standalone-op cost and fragments the IOVA window) is paid ONCE, not per call. 0 on success, -1 on alloc
  * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
-int orki_ppu_scratch3(ork_npu *c,size_t sz){
-    if(sz<4096) sz=4096;
-    if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu && c->ppu_a.domain==c->dom_active) return 0;   /* realloc if the active domain changed (persistent scratch must live in c->dom_active) */
-    orki_bdestroy(c->fd,&c->ppu_a); orki_bdestroy(c->fd,&c->ppu_b); orki_bdestroy(c->fd,&c->ppu_o);
-    c->ppu_a=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_a.cpu){c->ppu_sz=0;return -1;}
-    c->ppu_b=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_b.cpu){orki_bdestroy(c->fd,&c->ppu_a);c->ppu_sz=0;return -1;}
-    c->ppu_o=orki_bcreate(c->fd,sz,0x403,c->dom_active); if(!c->ppu_o.cpu){orki_bdestroy(c->fd,&c->ppu_a);orki_bdestroy(c->fd,&c->ppu_b);c->ppu_sz=0;return -1;}
-    c->ppu_sz=sz; return 0;
-}
 
 /* Zero-copy IMPORT (no page alloc, no copy): allocate a dma-buf from /dev/dma_heap/system, mmap it,
  * import it into the NPU's IOMMU domain via PRIME_FD_TO_HANDLE -> MEM_CREATE(handle, flags=0, size=0).
  * The kernel maps the EXISTING dma-buf pages and returns the IOVA (dma_addr) to put in the regcmd.
  * Caller fills *cpu with the (pre-tiled) bytes, then issues a MEM_SYNC clean (bsync TO_DEVICE) before
  * the first submit. Returns a buf whose heap_fd holds the dma-buf fd (closed by bdestroy). On any
- * failure returns {0} (cpu==NULL). g_dmaheap_fd is the cached /dev/dma_heap/system fd (-1 = unopened,
+ * failure returns {0} (cpu==NULL). orki_dmaheap_fd is the cached /dev/dma_heap/system fd (-1 = unopened,
  * -2 = open failed; import then unavailable and callers fall back to bcreate). */
-static int g_dmaheap_fd = -1;
-int orki_dmaheap_open(void){
-    if(g_dmaheap_fd==-1){
-        const char *h=getenv("ORK_DMA_HEAP"); char path[64];
-        snprintf(path,sizeof path,"/dev/dma_heap/%s", h&&*h?h:"system");
-        g_dmaheap_fd=open(path,O_RDWR|O_CLOEXEC); if(g_dmaheap_fd<0) g_dmaheap_fd=-2;
-    }
-    return g_dmaheap_fd>=0 ? g_dmaheap_fd : -1;
-}
+int orki_dmaheap_fd = -1;
 /* dma-buf CPU-access cache sync on the dma-buf fd (flushes CPU caches for an imported cacheable
  * buffer — the rknpu MEM_SYNC does not cover foreign imports). Bracket the CPU fill: START|WRITE
  * before, END|WRITE after. No-op if the buffer wasn't imported (heap_fd<=0). */
-void orki_dmabuf_sync(int heap_fd,uint64_t flags){
-    if(heap_fd<=0) return; struct dma_buf_sync s={.flags=flags}; ioctl(heap_fd,DMA_BUF_IOCTL_SYNC,&s);
-}
-struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
-    int tr=imp_trace();
-    int hf=orki_dmaheap_open(); if(hf<0) return (struct buf){0};
-    size_t sz=orki_pgup(size);
-    int dtr=ork_dom(domain);   /* domain id for the trace (final `dom` computed post-mmap, same value) */
-    if(tr){ fprintf(stderr,"[IMP] bimport dom=%d sz=%zuKB (imp#%ld, dom_bytes=%zuMB): DMA_HEAP_ALLOC...\n",dtr,sz>>10,g_bimport_n,g_iova_bytes[dtr>=0&&dtr<ORK_IOVA_NDOM?dtr:0]>>20); fflush(stderr); }
-    double _t = orki_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
-    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
-    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC"); return (struct buf){0}; }
-    if(orki_load_prof){ orki_lp_alloc += ork_now_us()-_t; _t=ork_now_us(); }
-    int dbuf=(int)a.fd;
-    if(tr){ fprintf(stderr,"[IMP]   alloc ok (fd=%d) -> mmap...\n",dbuf); fflush(stderr); }
-    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
-    if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
-    if(orki_load_prof){ orki_lp_mmap += ork_now_us()-_t; }
-    int dom=ork_dom(domain);
-    if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
-    if(orki_load_prof) _t=ork_now_us();
-    if(tr){ fprintf(stderr,"[IMP]   mmap ok -> PRIME_FD_TO_HANDLE...\n"); fflush(stderr); }
-    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
-    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    if(orki_load_prof){ orki_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
-    if(tr){ fprintf(stderr,"[IMP]   prime ok (handle=%u) -> MEM_CREATE...\n",ph.handle); fflush(stderr); }
-    /* memflags: normally 0 (weights are NPU-DMA'd, need no kernel vmap). SCRATCH task/descriptor buffers pass
-     * RKNPU_MEM_KERNEL_MAPPING so the kernel can READ the rknpu_task structs — dropping it (the old flags=0)
-     * gave a malformed task and WEDGED the NPU. Only the kernel-read task buffers need it; data buffers pass 0. */
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=memflags; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    if(orki_load_prof){ orki_lp_create += ork_now_us()-_t; orki_lp_nchunk++; orki_lp_bytes+=sz; }
-    struct buf b; memset(&b,0,sizeof b);
-    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
-    live_add(fd,b.handle,b.obj);
-    g_bimport_n++;
-    if(tr){ fprintf(stderr,"[IMP]   MEM_CREATE ok dma=0x%llx -> bimport DONE (imp#%ld dom_bytes=%zuMB)\n",(unsigned long long)b.dma,g_bimport_n,g_iova_bytes[dom>=0&&dom<ORK_IOVA_NDOM?dom:0]>>20); fflush(stderr); }
-    return b;
-}
-struct buf orki_bimport(int fd,size_t size,int domain){ return orki_bimport_f(fd,size,domain,0); }   /* weights: NPU-DMA'd, no kernel vmap */
 /* Run-SCRATCH allocator (task/regcmd/output buffers). int4-RESIDENT runs keep every domain's WEIGHTS bimported
  * (PRIME_FD); a fresh MEM_CREATE (bcreate) then EINVALs in that domain (MEM_CREATE GEM alloc can't coexist with
  * imported memory in the same iommu domain), which starved the run scratch (mc_ensure mtk_all -> decode -3). So
@@ -476,62 +364,9 @@ struct buf orki_bimport(int fd,size_t size,int domain){ return orki_bimport_f(fd
  * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
  * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
  * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
-struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
-    /* int8/fp16 (scratch_import unset): bcreate — the proven path, UNCHANGED. int4 RESIDENT (scratch_import set
-     * once weights are bimported): a fresh bcreate GEM can't be placed amid ~GiB of imported SG mappings in the
-     * same domain (kernel EINVAL once the domain is heavy — mc_ensure mtk_all -> decode -3). Route scratch through
-     * the SAME import path so it coexists. The earlier bimport-scratch WEDGE was because bimport forced MEM_CREATE
-     * flags=0, DROPPING RKNPU_MEM_KERNEL_MAPPING (0x8) that the kernel needs to READ task/descriptor buffers ->
-     * malformed task. Fixed: carry KERNEL_MAPPING for the kernel-read buffers (requested flags & 0x8); NPU-DMA'd
-     * data buffers pass 0. */
-    /* #54 int4 RESIDENT (scratch_import set once native-int4 weights are bimported into their domains): a fresh
-     * bcreate GEM draws from the limited CONTIGUOUS/CMA pool, which FRAGMENTS under the resident dma-heap weights
-     * + the GGUF/orkpack mmap pressure and INTERMITTENTLY EINVALs (mc_ensure mtk_all, at a variable domain 3-8 on
-     * fresh boots — nondeterministic = memory pressure, not a clean limit). Route run scratch through the SAME
-     * dma-heap import path as the weights (system memory, NO contiguous requirement) so it never competes for the
-     * contiguous pool. KERNEL-READ task/descriptor buffers (flags & KERNEL_MAPPING) import WITH that flag so the
-     * kernel still gets a vmap to read the rknpu_task structs (the earlier "bimport scratch wedges" was flags=0
-     * DROPPING KERNEL_MAPPING; carrying it fixes the malformed-task wedge — bimport_f already supports this).
-     * Coherency: bsync auto-routes imported buffers (heap_fd set) to orki_dmabuf_sync (rknpu MEM_SYNC doesn't cover
-     * foreign imports). int8/fp16 (scratch_import UNSET) keep bcreate — the proven path, UNCHANGED. */
-    /* Run scratch is ALWAYS bcreate. Importing scratch is a PROVEN DEAD END: kernel-read task buffers (0x40b)
-     * HARD-WEDGE the board (foreign dma-buf has no kernel vmap -> malformed task; 2026-08-08 + 2026-08-09
-     * unreachable/power-cycle), AND importing even the NPU-DMA'd (0x403) scratch corrupts subsequent MEM_CREATE
-     * (errno 14 EFAULT on the next bcreate; 2026-08-09). The contiguous-pool fragmentation under mmap pressure is
-     * instead addressed by REDUCING the footprint (lean/metadata-only GGUF — run from the int4 orkpack directly),
-     * not by importing scratch. int8/fp16/int4 all bcreate here. */
-    (void)c;
-    /* #54 BIMPORT-ONLY MULTI-DOMAIN (ORK_BIMPORT_DOM, opt-in). On the current board boot, native bcreate
-     * (MEM_CREATE GEM alloc) into a NON-0 iommu domain fails outright with EINVAL (test_i4_domains: bcreate#20
-     * dom=1, dom_iova=2MB — not exhaustion), so non-0 domains can't be established at all and every multi-domain
-     * run wedges downstream. dma-heap bimport into a non-0 domain uses a DIFFERENT MEM_CREATE flavor (imported
-     * handle) that may still work where the fresh GEM alloc EINVALs. Route non-0-domain scratch through bimport,
-     * carrying KERNEL_MAPPING for the kernel-read task/descriptor buffers (flags&0x8 -> 0x40b) — dropping it was
-     * the old import-scratch wedge; bimport_f supports it. Domain 0 + int8/fp16 UNCHANGED (bcreate). */
-    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp && ork_dom(dom)>0){ return orki_bimport_f(c->fd,size,dom,(flags & RKNPU_MEM_KERNEL_MAPPING)); } }
-    return orki_bcreate(c->fd,size,flags,dom);
-}
 /* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
  * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
  * This is the cross-process zero-copy primitive behind ork_dma_import_fd (the orkd daemon's data plane). */
-struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
-    if(dbuf<0) return (struct buf){0};
-    size_t sz=orki_pgup(size);
-    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
-    if(p==MAP_FAILED){ perror("mmap(import_fd)"); return (struct buf){0}; }
-    int dom=ork_dom(domain);
-    if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); return (struct buf){0}; }
-    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
-    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
-    struct buf b; memset(&b,0,sizeof b);
-    b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
-    live_add(fd,b.handle,b.obj);
-    g_bimport_n++;
-    return b;
-}
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
  * it. The kernel rknpu driver lazily sets up a domain's IOVA allocator / page table on its FIRST buffer;
  * if that first buffer is an IMPORTED dma-buf, the import's SG-list pages get wrong/aliased IOVAs and the
@@ -544,50 +379,15 @@ struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
  * here (so it becomes non-NULL exactly when multi-domain is first entered, preserving the single-vs-multi
  * signal the run paths key on). Called from every multi-domain entry: dom_activate, ork_dom_prime,
  * ork_npu_domain_alloc, ork_npu_set_ndomains. Returns 0 ok, -1 on OOM (caller degrades gracefully). */
-int orki_dom_reserve(ork_npu *c, int need){
-    if(need <= c->dom_cap) return 0;
-    int nc = c->dom_cap ? c->dom_cap : 2; while(nc < need) nc *= 2;
-    struct buf *na = realloc(c->dom_anchor, (size_t)nc*sizeof *na);
-    struct ork_dom_scratch *ns = realloc(c->dom_save, (size_t)nc*sizeof *ns);
-    if(na) c->dom_anchor = na;
-    if(ns) c->dom_save = ns;
-    if(!na || !ns) return -1;   /* keep whatever grew; the guarded call sites won't index past dom_cap */
-    memset(c->dom_anchor + c->dom_cap, 0, (size_t)(nc-c->dom_cap)*sizeof *c->dom_anchor);
-    memset(c->dom_save   + c->dom_cap, 0, (size_t)(nc-c->dom_cap)*sizeof *c->dom_save);
-    c->dom_cap = nc;
-    return 0;
-}
 /* Public: pre-size the ctx for `n` IOMMU domains — the backend calls this once with the auto-sizer's
  * n_domains so no per-weight grow happens mid-load. Only meaningful for n>1 (n<=1 = single-domain, leaves
  * dom_save NULL). Safe to call repeatedly; only ever grows. */
-void ork_npu_set_ndomains(ork_npu *c, int n){ if(c && n>1) orki_dom_reserve(c, n); }
-void ork_dom_prime(ork_npu *c, int dom){
-    int d = ork_dom(dom);
-    if(d<=0) return;                                  /* domain 0 never needs an anchor */
-    if(orki_dom_reserve(c, d+1)) return;                   /* grow arrays to cover domain d (OOM -> skip anchoring) */
-    if(c->dom_anchor[d].cpu) return;                  /* already anchored */
-    /* #54 BIMPORT-ONLY (ORK_BIMPORT_DOM): native bcreate EINVALs in non-0 domains on this boot, so the anchor
-     * must be a dma-heap import too. (Quirk 1's native-first requirement can't be honored when bcreate fails;
-     * the weight import that follows is import-first regardless — the probe's bit-exact verify catches any
-     * aliased-IOVA corruption.) */
-    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp){ c->dom_anchor[d] = orki_bimport(c->fd, 65536, d); return; } }
-    c->dom_anchor[d] = orki_bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
-}
 /* #54 FIX: re-establish a domain's IOMMU page-table region before EACH imported dma-buf. The kernel sets up a
  * domain's page table lazily around the buffer that triggers it; the one up-front anchor (ork_dom_prime) covers
  * only the FIRST import — a 2nd+ imported dma-buf then lands on aliased IOVAs and the NPU reads it WRONG (probed
  * bit-exact: 1st import OK, 2nd import maxerr~2835, fixed to 0 by a fresh native bcreate before it). So drop the
  * stale anchor and bcreate a fresh native one immediately before importing each weight. Cheap (64 KiB); the
  * previous import's mapping persists after its anchor is freed (verified: 1st weight re-runs bit-exact after). */
-void ork_dom_reanchor(ork_npu *c, int dom){
-    int d = ork_dom(dom); if(d<=0) return;            /* domain 0 always established */
-    if(orki_dom_reserve(c, d+1)) return;
-    if(c->dom_anchor[d].cpu) orki_bdestroy(c->fd, &c->dom_anchor[d]);
-    { static int bimp=-1; if(bimp<0) bimp=getenv("ORK_BIMPORT_DOM")?1:0;
-      if(bimp){ c->dom_anchor[d] = orki_bimport(c->fd, 65536, d); return; } }   /* #54 bimport-only: bcreate EINVALs in non-0 */
-    c->dom_anchor[d] = orki_bcreate(c->fd, 65536, 0x403, d);
-}
 /* #54 REAP-AT-DOMAIN-BOUNDARY. A genuine int4 doorbell DROP leaves a stuck job in c->dom_active whose completion
  * IRQ never fired, so the kernel's iommu_domain_refcount for that domain stays >0. The reap that clears it —
  * rknpu_job_timeout_clean — only fires at the TOP of the NEXT submit ON THAT CORE, and (crucially) that next
@@ -598,237 +398,6 @@ void ork_dom_reanchor(ork_npu *c, int dom){
  * (ACT_RESET does NOT do this — source-confirmed rknpu_soft_reset is HW-only, leaves the job list; only
  * timeout_clean reaps. That's why the earlier ACT_RESET version failed.) No-op unless a real drop set dom_dirty
  * (rare); clean runs + single-domain pay nothing. Between-ops / pre-teardown only (no live pool workers). */
-void ork_npu_reap_stuck(ork_npu *c, int nc);   /* fwd: per-core timeout_clean reap (defined below) */
-int orki_i4_submit_tmo_ms(void);                    /* fwd: bounded int4 doorbell submit timeout (defined near the int4 workers) */
-void ork_dom_flush_if_dirty(ork_npu *c){
-    if(!c || !c->dom_dirty) return;
-    if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[dom] dirty-REAP on dom=%d (wait-past-timeout + timeout_clean the stuck job before switch)\n", c->dom_active);
-    /* #54 COMBINED BOUNDARY FIX. The switch waits up to 6s for iommu_domain_refcount==0, so a 6s timeout means a
-     * GENUINELY STUCK job (a clean-but-retiring job just delays the switch a few ms). rknpu_job_timeout_clean
-     * (the only thing that reaps a stuck nonblock job — ACT_RESET can't) reaps ONLY a job aged >= its submit
-     * timeout. So: (1) WAIT past the bounded int4 doorbell timeout (i4_submit_tmo_ms) so any dropped job is
-     * reapable + any last in-flight op has time to retire; then (2) per-core reap dummy triggers timeout_clean.
-     * Second reap pass catches a reap-dummy that itself dropped (its own short timeout has elapsed by then).
-     * Only on a dirty (real-drop) boundary — rare — so the ~1.7s is paid only when a switch would otherwise wedge. */
-    { int ms = orki_i4_submit_tmo_ms() + 200; struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
-    ork_npu_reap_stuck(c, c->soc->cores);
-    { struct timespec ts = {0, 400*1000000L}; nanosleep(&ts,NULL); }   /* let a dropped reap-dummy pass its 300ms timeout */
-    ork_npu_reap_stuck(c, c->soc->cores);
-    c->dom_dirty=0;
-}
-/* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
-/* Reserve `need` contiguous bytes of resident weight storage from the arena pool; returns the backing chunk
- * (and sets *base = byte offset within it) or NULL if a fresh chunk can't be allocated (caller then falls
- * back to per-tile bcreate). Chunk size = ORK_WARENA_CHUNK_MB (default 1 GiB), kept under the single-alloc
- * cap; a weight larger than the default chunk gets its own exact-size chunk. */
-struct buf *orki_warena_reserve(ork_npu *c,size_t need,size_t *base){
-    size_t a=(need+4095u)&~(size_t)4095u;
-    if(c->wchunk_n==0 || c->wchunk_off+a > c->wchunk[c->wchunk_n-1].size){
-        if(c->wchunk_n >= (int)(sizeof c->wchunk/sizeof c->wchunk[0])) return NULL;
-        const char *e=getenv("ORK_WARENA_CHUNK_MB"); long mb=e?atol(e):1024; if(mb<=0) return NULL;
-        size_t csz=(size_t)mb*1024u*1024u; if(a>csz) csz=a;
-        struct buf b=orki_bcreate(c->fd,csz,0x403,-1);
-        if(!b.cpu){ fprintf(stderr,"[ork] WARNING: weight arena chunk %zuMB alloc failed — falling back to per-buffer\n",csz/1024u/1024u); return NULL; }
-        c->wchunk[c->wchunk_n++]=b; c->wchunk_off=0;
-    }
-    struct buf *ch=&c->wchunk[c->wchunk_n-1];
-    *base=c->wchunk_off; c->wchunk_off+=a;
-    return ch;
-}
-void orki_act(int fd,uint32_t f,uint32_t v){
-    if(f==RKNPU_ACT_RESET){ static long n=0; if(getenv("ORK_DEBUG_RESET")){ void*ra=__builtin_return_address(0); Dl_info di;
-        if(dladdr(ra,&di)) fprintf(stderr,"[ork] ACT_RESET #%ld off=0x%lx obj=%s\n",++n,(unsigned long)((char*)ra-(char*)di.dli_fbase),di.dli_fname);
-        else fprintf(stderr,"[ork] ACT_RESET #%ld ra=%p\n",++n,ra); } }
-    struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
-
-/* MULTI-DOMAIN SCRATCH SWAP. A submit runs in ONE iommu_domain_id, so the regcmd/task/activation/output
- * scratch a submit references must live in the same domain as the weight. dom_activate parks the current
- * active scratch into dom_save[old] and restores domain `dom`'s parked scratch (zero-initialized on first
- * use, so the run path's lazy bcreate allocates it in `dom` via c->dom_active). No-op when
- * single-domain (dom==dom_active and only domain 0 ever used). */
-void orki_dom_activate(ork_npu *c,int dom){
-    if(dom<0) dom=0;
-    if(dom==c->dom_active) return;
-    /* #54 RETIREMENT BARRIER: a nonblock doorbell op is "done" when its output cell lands, which can be BEFORE
-     * the kernel retires the job (completion IRQ). Switching the IOMMU domain while the PRIOR domain's job is
-     * still in-flight races it -> the first submit in the new domain dispatches nothing (task counter 0x0) ->
-     * kernel watchdog soft reset -> corrupts the switch (the int4 multi-domain wedge; byte-diff ruled out a
-     * malformed descriptor, dom0/dom1 submits are byte-identical + run fine). Let the prior domain's just-landed
-     * job retire before switching. Only on a real switch (per-layer, ~tens of times); tunable/off via env. */
-    { static long su=-1; if(su<0){ const char*e=getenv("ORK_DOM_SETTLE_US"); su=e?atol(e):1000; }
-      if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } }
-    ork_dom_flush_if_dirty(c);   /* #54 THE multi-domain fix: if an int4 doorbell drop left a stuck job in the OUTGOING domain, REAP it now (same-domain timeout_clean, still attached to dom_active) so the switch below finds the domain idle instead of timing out -> cascade. See ork_dom_flush_if_dirty. */
-    double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
-    if(orki_dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
-    struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
-    /* park active -> old */
-    old->used=1; old->regcmd=c->regcmd; old->task=c->task; old->Af=c->Af; old->Cc=c->Cc; old->ccsz=c->ccsz; old->warmed=c->warmed;
-    memcpy(old->mrc,c->mrc,sizeof old->mrc); memcpy(old->mtk,c->mtk,sizeof old->mtk); memcpy(old->maf,c->maf,sizeof old->maf);
-    memcpy(old->mcc,c->mcc,sizeof old->mcc); old->mtk_all=c->mtk_all; memcpy(old->mccsz,c->mccsz,sizeof old->mccsz);
-    memcpy(old->mwarm,c->mwarm,sizeof old->mwarm); old->mc_alloc=c->mc_alloc;
-    /* restore neo -> active (zeroed if first use → lazy alloc in this domain) */
-    c->regcmd=neo->regcmd; c->task=neo->task; c->Af=neo->Af; c->Cc=neo->Cc; c->ccsz=neo->ccsz; c->warmed=neo->warmed;
-    memcpy(c->mrc,neo->mrc,sizeof c->mrc); memcpy(c->mtk,neo->mtk,sizeof c->mtk); memcpy(c->maf,neo->maf,sizeof c->maf);
-    memcpy(c->mcc,neo->mcc,sizeof c->mcc); c->mtk_all=neo->mtk_all; memcpy(c->mccsz,neo->mccsz,sizeof c->mccsz);
-    memcpy(c->mwarm,neo->mwarm,sizeof c->mwarm); c->mc_alloc=neo->mc_alloc;
-    c->dom_active=dom;
-    /* first time we touch domain `dom`: it has none of the init-time scratch yet. Mirror ork_npu_init
-     * EXACTLY — allocate regcmd+task+Af in THIS domain and seed the task descriptor — so a freshly-activated
-     * domain carries every buffer ork_npu_init guarantees, none NULL and none a stale domain-0 IOVA. regcmd
-     * and task have NO lazy size-guard (the chain path writes c->regcmd.cpu / c->task.cpu directly), so they
-     * MUST be created here. Af is created here too so first-use == init: the run path's `c->Af.size<maxaf`
-     * realloc already covers it, but the unguarded RE/probe entrypoints (ork_npu_probe_*) read c->Af.cpu
-     * raw, and a non-NULL in-domain Af is the safe, complete invariant rather than relying on each caller.
-     * Cc and the per-core mc-* scratch are NOT allocated here: their sizes are matmul-dependent, so every
-     * run path lazily (re)allocates them in c->dom_active under their own .size/.cpu guards. */
-    int _first = (!neo->used && !c->regcmd.cpu);
-    if(_first){
-        c->regcmd=orki_bscratch(c,2097152,0x403,dom); c->task=orki_bscratch(c,524288,0x40b,dom); c->Af=orki_bscratch(c,(size_t)4*32768*2,0x403,dom);
-        if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
-            memcpy(c->task.cpu,&t,sizeof t); orki_bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-    }
-    { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
-      c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
-      if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }
-}
-
-static struct ork_npu *g_npu_ctx = NULL;
-
-void orki_dump_submit(struct rknpu_submit *sub) {
-    fprintf(stderr, "[ork-trace] === SUBMIT flags=0x%x timeout=%u task_number=%u core=0x%x domain=%u ===\n",
-            sub->flags, sub->timeout, sub->task_number, sub->core_mask, sub->iommu_domain_id);
-
-    if (!g_npu_ctx) return;
-    
-    void *task_cpu = NULL;
-    if (g_npu_ctx->task.obj == sub->task_obj_addr) {
-        task_cpu = g_npu_ctx->task.cpu;
-    } else if (g_npu_ctx->mtk_all.obj == sub->task_obj_addr) {
-        task_cpu = g_npu_ctx->mtk_all.cpu;
-    } else {
-        for (int i = 0; i < ORK_MAXCORE; i++) {
-            if (g_npu_ctx->mtk[i].obj == sub->task_obj_addr) {
-                task_cpu = g_npu_ctx->mtk[i].cpu;
-                break;
-            }
-        }
-    }
-    
-    if (!task_cpu) {
-        fprintf(stderr, "  (task buffer not found/mapped)\n");
-        return;
-    }
-    
-    struct rknpu_task *tasks = (struct rknpu_task *)task_cpu;
-    for (uint32_t i = 0; i < sub->task_number; i++) {
-        struct rknpu_task *t = &tasks[i];
-        fprintf(stderr, "  task[%u]: flags=0x%x op_idx=%u enable=0x%x int_mask=0x%x regcfg_amount=%u regcmd_addr=0x%llx\n",
-                i, t->flags, t->op_idx, t->enable_mask, t->int_mask, t->regcfg_amount, (unsigned long long)t->regcmd_addr);
-        
-        void *regcmd_cpu = NULL;
-        uint64_t dma_base = 0;
-        if (t->regcmd_addr >= g_npu_ctx->regcmd.dma && t->regcmd_addr < g_npu_ctx->regcmd.dma + g_npu_ctx->regcmd.size) {
-            regcmd_cpu = g_npu_ctx->regcmd.cpu;
-            dma_base = g_npu_ctx->regcmd.dma;
-        } else {
-            for (int j = 0; j < ORK_MAXCORE; j++) {
-                if (t->regcmd_addr >= g_npu_ctx->mrc[j].dma && t->regcmd_addr < g_npu_ctx->mrc[j].dma + g_npu_ctx->mrc[j].size) {
-                    regcmd_cpu = g_npu_ctx->mrc[j].cpu;
-                    dma_base = g_npu_ctx->mrc[j].dma;
-                    break;
-                }
-            }
-        }
-        
-        if (regcmd_cpu) {
-            uint64_t offset = t->regcmd_addr - dma_base;
-            uint32_t *rc = (uint32_t *)((char *)regcmd_cpu + offset);
-            int n_words = (int)t->regcfg_amount * 2 + 16;
-            fprintf(stderr, "  --- regcmd (%d u32 words) ---\n", n_words);
-            for (int k = 0; k < n_words; k += 4) {
-                fprintf(stderr, "  [%03d] %08x %08x %08x %08x\n", k,
-                        rc[k], (k+1 < n_words)?rc[k+1]:0, (k+2 < n_words)?rc[k+2]:0, (k+3 < n_words)?rc[k+3]:0);
-            }
-        } else {
-            fprintf(stderr, "  (regcmd buffer not found for dma=0x%llx)\n", (unsigned long long)t->regcmd_addr);
-        }
-    }
-}
-void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki_dump_submit(sub); }
-
-int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
-    sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
-    if (orki_ork_prof) { orki_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
-    orki_trace_submit(sub);
-    /* PRE-SUBMIT fsync'd trace (ORK_PRESUBMIT_TRACE=<path>): write this submit's full context to disk AND
-     * fsync it BEFORE the ioctl — so if the ioctl HARD-WEDGES the NPU/board (no self-heal, needs power-cycle),
-     * the last line on disk is the exact submit that wedged. Survives the wedge (unlike stderr/page-cache logs
-     * lost on the lockup). One line/submit; the tail after a wedge pins op/weight/domain/tasks/addrs. */
-    if (getenv("ORK_PRESUBMIT_TRACE")) {
-        static FILE *tf=NULL; static long sn=0;
-        if(!tf){ tf=fopen(getenv("ORK_PRESUBMIT_TRACE"),"w"); }
-        if(tf){ size_t iov=0; for(int d=0;d<ORK_IOVA_NDOM;d++) iov+=g_iova_bytes[d];
-            fprintf(tf,"#%ld op=%s K=%d N=%d wdom=%d imported=%d | submit_dom=%u tasks=%u core=0x%x | iova_total=%zuMiB dom[0]=%zu dom[1]=%zu dom[2]=%zu | crt=%ld imp=%ld dst=%ld live=%ld\n",
-                    ++sn, orki_last_op, orki_last_K, orki_last_N, orki_last_wdom, orki_last_import,
-                    sub->iommu_domain_id, sub->task_number, sub->core_mask, iov>>20,
-                    g_iova_bytes[0]>>20, g_iova_bytes[1]>>20, g_iova_bytes[2]>>20,
-                    g_bcreate_n, g_bimport_n, g_bdestroy_n, g_bcreate_n+g_bimport_n-g_bdestroy_n);
-            fflush(tf); fsync(fileno(tf)); }
-    }
-    int _nb = getenv("ORK_JOB_NONBLOCK")!=NULL;   /* TEST: RKNPU_JOB_NONBLOCK (1<<1=0x2) — does SUBMIT return before completion? */
-    if(_nb) sub->flags |= 0x2;
-    double _fd_t0 = ork_now_us();
-    int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
-    { double _fd_dt = ork_now_us() - _fd_t0; orki_fd_ioctl_us += _fd_dt; orki_fd_hw_raw_last = (long long)sub->hw_elapse_time;
-      orki_fd_hw_us += (double)sub->hw_elapse_time; orki_fd_n++;
-      if(_nb){ int async=(rc==0 && _fd_dt<50.0);  /* returned in <50us => before the HW could run => async */
-               fprintf(stderr,"[nonblock] flags=0x%x rc=%d ioctl-return=%.0fus hw_elapse=%lldus%s\n",
-                   sub->flags, rc, _fd_dt, (long long)sub->hw_elapse_time,
-                   async?"  <- ASYNC (RKNPU_JOB_NONBLOCK works: submit returned before HW done)":"  (blocked till done)");
-               { const char*se=getenv("ORK_NONBLOCK_SLEEP_US"); unsigned su=se?(unsigned)strtoul(se,0,0):300000; if(su)usleep(su); } } }
-               /* drain sleep configurable (default 300ms safety). Set SMALL (< compute) to force job OVERLAP and test
-                * whether a 2nd NONBLOCK submit QUEUES (returns ~5us) or SERIALIZES (blocks ~compute) on the busy NPU. */
-    if (rc < 0) {
-        int e = errno;
-        /* TRANSIENT SUBMIT-REJECTION RETRY (before the heavy self-heal reset). The doorbell is per-op NONBLOCK,
-         * so a submit to a core whose PRIOR job has not yet retired (its completion IRQ hasn't fired) is rejected
-         * EINVAL/EBUSY — a GENERAL, pre-existing in-suite race (surfaces on any doorbell user under back-to-back
-         * ops: run_stream, run_i8 colsplit, fp16 bmm). The prior job retires within microseconds, so re-issue the
-         * SAME regcmd/task a few times with a short backoff; a retry that lands needs NO reset (a reset clears
-         * warm -> cold miscompute) and the output still lands. Only fall through to the reset if it stays wedged. */
-        if (e == EINVAL || e == EBUSY) {
-            for (int _r = 0; _r < 20 && rc < 0; _r++) { struct timespec _ts = {0, 50000}; nanosleep(&_ts, NULL);
-                rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub); }
-            if (rc >= 0) return rc;   /* retired + landed */
-            errno = e;
-        }
-        fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
-                rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
-                orki_last_op, orki_last_K, orki_last_N, orki_last_wdom, orki_last_import);
-        /* live per-domain IOVA usage AT THE FAILURE POINT: shows whether the domain overflowed (size/pressure)
-         * vs a non-size DMA-walk stall. g_iova_bytes counts resident tiles + imports + transient scratch. */
-        { size_t tot=0; for(int d=0; d<ORK_IOVA_NDOM; d++) if(g_iova_bytes[d]){ fprintf(stderr,"  [iova@fail] domain %d live=%zu MiB (ceil %zu MiB)\n", d, g_iova_bytes[d]>>20, ork_iova_ceiling()>>20); tot+=g_iova_bytes[d]; }
-          fprintf(stderr,"  [iova@fail] total live=%zu MiB\n", tot>>20); }
-        if (getenv("ORK_DUMP_FAIL")) orki_dump_submit(sub);   /* full failing regcmd on demand */
-        struct rknpu_action a = { .flags = RKNPU_ACT_RESET, .value = 0 };
-        ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
-        errno = e;
-    }
-    return rc;
-}
-/* replace ALL matching regcmd entries — the template repeats some regs (e.g. 0x1040) and
- * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
-#include "ork_regs.h"
-/* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
- * offset) from the rocket-cross-referenced table and validates the value fits the register's defined field
- * bits (a value with bits outside them is a bug — flagged, then written so behavior is preserved). This is
- * the normal path. RE / unbounded writes (specify block+offset+value with NO bounds) use orki_setr() directly —
- * that is the "raw override" the fuzzer hooks (ork_i8_fuzz_add/ork_f16_fuzz_add) already ride. */
-static void orki_setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
-    const ork_reg_desc *d=&ORK_REGS[id];
-    if(v & ~d->mask) fprintf(stderr,"[ork] WARN reg %s (%04x:%04x): value %#x has bits outside field mask %#x\n",d->name,d->blk,d->off,v,d->mask);
-    orki_setr(rc,n,d->blk,d->off,v);
-}
 /* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_synth(). Inert by default. */
 static struct { uint32_t blk, reg, val; } g_f16_fovr[16]; static int g_f16_fovr_n=0;
 void ork_f16_fuzz_clear(void){ g_f16_fovr_n=0; }
@@ -869,7 +438,7 @@ void ork_i8_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(g_i8_fovr_n<16)
 /* int8/w8a8: A,B int8 -> C int32. Differs from fp16: weight amount/stride (no x2), K-passes
  * ceil(K/64), 0x107c=K/16, rows-budget 2x (int8 packs 2x rows/CBUF), and the 0x1040 schedule
  * uses effective K = K/2. cbuf is the fp16 budget; int8 rows = 2*cbuf/K. */
-static void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
+void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
     memcpy(rc,REGCMD_I8,REGCMD_I8_N*4);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE0,K*N);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE1,K);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K+63)/64);orki_setrn(rc,REGCMD_I8_N,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,K/16);
@@ -918,7 +487,7 @@ static void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB
  * A-pack + C de-tile to match rkllm's fold layout (rkllm's stride-60 A is NOT plain contiguous NC1HWC2).
  * The "2160" is capture-specific (K=3584,N=1216) pending a K/N-general derivation. GATED: only synthesized on
  * the explicit m-fold path; the default matmul is untouched. */
-static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
+void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
     orki_synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
     /* --- register-level clone of rkllm's captured M=36 mfold (named via ork_regs.h) --- */
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_GROUP_LINE);            /* GROUP_LINE_OFF feature-read (rkllm SETS this for the big-M fold tasks) */
@@ -951,66 +520,10 @@ static void synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t a
     for(int i=0;i<g_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,g_i8_fovr[i].blk,g_i8_fovr[i].reg,g_i8_fovr[i].val);
 }
 unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
-uint32_t ork_ppflags(void);     /* fwd (defined below) */
-/* #39 WEIGHT-RESIDENT M-FOLD CHAIN (task_number=P). Each of P tasks is a width-`w` mfold tile built by the
- * validated synth_i8_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all
- * P tasks (HW PC-chain), amortizing the weight-DMA over M=P*w rows. Chain descriptor written at words 216-219
- * EXACTLY like the PROVEN run_chain_i8/mcworker_pref_chain; terminal task clears them. subcore_task[0..2] all
- * populated (single-core), matching run_chain_i8. Apacked = P tiles of w-row C2-16 A (w*K bytes each); Bpacked =
- * shared ork_woff weight; Craw = P tiles of raw C2-4 int32 (w*N int32 each). Board only; returns 0/ok, us=avg. */
-int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
-                        const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us){
-    int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||w<1||w>64||(K%32)||(N%16)) return -2;
-    int dom=c->dom_active;
-    size_t tileA=(size_t)w*K, tileC=(size_t)w*N;                 /* per-tile A bytes (C2-16), C int32 elems (C2-4) */
-    /* 8x guard rig (like the replay path): a malformed mfold DMA that over-reads/writes lands in MAPPED memory
-     * (diagnosable) instead of hanging the AXI/IOMMU bus (errno-110). */
-    size_t asz=(size_t)P*tileA*8+(1u<<20), bsz=(size_t)K*N*8+(1u<<20), csz=(size_t)P*tileC*4*8+65536;
-    struct buf A =orki_bcreate(fd,asz,0x403,dom);            if(!A.cpu)  return -2;
-    struct buf B =orki_bcreate(fd,bsz,0x403,dom);            if(!B.cpu) {orki_bdestroy(fd,&A);return -2;}
-    struct buf Cc=orki_bcreate(fd,csz,0x403,dom);            if(!Cc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
-    struct buf RC=orki_bcreate(fd,(size_t)P*REGCMD_I8_N*4,0x403,dom); if(!RC.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);return -2;}
-    memset(A.cpu,0,asz); memset(B.cpu,0,bsz); memset(Cc.cpu,0,csz);
-    memcpy(A.cpu,Apacked,(size_t)P*tileA); memcpy(B.cpu,Bpacked,(size_t)K*N);
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_TO_DEVICE);
-    uint32_t *rcbuf=(uint32_t*)RC.cpu;
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;   /* P-task array (c->task is 512KB / flag 0x40b) */
-    for(int t=0;t<P;t++){
-        uint32_t rc[REGCMD_I8_N];
-        synth_i8_mfold(rc, w, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems);
-        orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A */
-        orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared weight */
-        orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */
-        /* chain-link at fixed words 216-219, PROVEN run_chain_i8/mcworker_pref_chain encoding. Terminal clears. */
-        if(t<P-1){ uint64_t nxt = RC.dma + (uint64_t)(t+1)*REGCMD_I8_N*4;
-            rc[216]=0x0010|((uint32_t)(nxt&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(nxt>>16)&0xffff);
-            rc[218]=0x0014|(0x0037u<<16);                rc[219]=(0x0101u<<16)|0;
-        } else { rc[216]=rc[217]=rc[218]=rc[219]=0; }
-        memcpy(rcbuf + (size_t)t*REGCMD_I8_N, rc, sizeof rc);
-        memset(&tk[t],0,sizeof tk[t]);
-        tk[t].enable_mask=0xd; tk[t].int_mask=0x300; tk[t].int_clear=0x1ffff;
-        tk[t].regcfg_amount=108; tk[t].regcmd_addr=RC.dma + (uint64_t)t*REGCMD_I8_N*4;
-    }
-    orki_bsync(fd,&RC,RKNPU_MEM_SYNC_TO_DEVICE);
-    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    int ret=-1; struct rknpu_submit sub;
-    #define _CSUB() do{ memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=(uint32_t)P; \
-        sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1; sub.timeout=orki_mm_timeout_ms(); \
-        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)P}; }while(0)
-    _CSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; }        /* warm */
-    orki_bsync(fd,&Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
-    if(Craw) memcpy(Craw,Cc.cpu,(size_t)P*tileC*4);
-    { double t0=ork_now_us();
-      for(int i=0;i<iters;i++){ _CSUB(); if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ goto cdone; } }
-      if(us)*us=(ork_now_us()-t0)/(iters>0?iters:1); ret=0; }
-    #undef _CSUB
-cdone:
-    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
-}
 /* #39 WEIGHT-RESIDENT M-FOLD CHAIN using a CAPTURED bit-exact tile regcmd (task #39: "chain the captured m8
  * tile"). Identical machinery to ork_npu_mfold_chain, but each of P tasks is a memcpy of `tile_rc` (rkllm's
  * captured width-`w` mfold regcmd, e.g. mm_regcmd_m8.txt at w=8 — validated 0/9728 bit-exact by validate_layout)
- * with only the 3 address regs re-based per tile. This sidesteps synth_i8_mfold's schedule (which reproduces
+ * with only the 3 address regs re-based per tile. This sidesteps orki_synth_i8_mfold's schedule (which reproduces
  * rkllm only via the per-M recipe); the captured tile carries the real planner schedule verbatim. Words 0..215
  * are the tile (108 regs); trn may be >216 (the capture's next-task bleed) — only the tile words are copied, and
  * the chain descriptor is written fresh at 216-219. 0x40c0 (=0x400 config, NOT an IOVA) is preserved untouched. */
@@ -1413,7 +926,7 @@ static void fold_scratch_free1(ork_npu *c, struct fold_scratch *fs){
     if(fs->TK) for(int s=0;s<fs->nslice;s++) if(fs->TK[s].cpu) orki_bdestroy(c->fd,&fs->TK[s]);
     free(fs->Cc); free(fs->RC); free(fs->TK); free(fs->tmpl); free(fs);
 }
-static void fold_scratch_free(ork_npu *c){   /* free ALL entries + the shared A (teardown) */
+void orki_fold_scratch_free(ork_npu *c){   /* free ALL entries + the shared A (teardown) */
     for(int i=0;i<c->fold_scr_n;i++){ fold_scratch_free1(c,c->fold_scr[i]); c->fold_scr[i]=NULL; }
     c->fold_scr_n=0;
     if(c->fold_A.cpu) orki_bdestroy(c->fd,&c->fold_A);
@@ -1575,7 +1088,7 @@ int ork_npu_sdp_stamp(uint32_t *rc,int rn,int M,int N,uint32_t surfadd){
 }
 int ork_npu_synth_i8_dump(ork_npu *c, int mc, int K, int N, unsigned *out, int outn){
     if(!c || outn < REGCMD_I8_N) return -2;
-    if(getenv("ORK_MFOLD")){ synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }
+    if(getenv("ORK_MFOLD")){ orki_synth_i8_mfold((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems); return REGCMD_I8_N; }
     int sched = (K==1024 || K==512);
     orki_synth_i8((uint32_t*)out, mc, K, N, 0x1000000u, 0x2000000u, 0x3000000u, sched, c->soc->cbuf_elems, 0);
     return REGCMD_I8_N;
@@ -1990,23 +1503,11 @@ void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
 /* Read-only sanity check: the benchmark methodology requires the DDR (dmc) governor at 'performance'
  * — a parked governor ~halves decode. We only WARN (never write; that needs root), so any caller
  * (llama-bench, the examples) notices a misconfigured box. Silence with ORK_NO_GOV_WARN=1. */
-void orki_warn_if_governor_parked(void){
-    if(getenv("ORK_NO_GOV_WARN")) return;
-    FILE*f=fopen("/sys/class/devfreq/dmc/governor","r"); if(!f) return;
-    char g[64]={0};
-    if(fgets(g,sizeof g,f)){ g[strcspn(g,"\n")]=0;
-        if(strcmp(g,"performance")!=0)
-            fprintf(stderr,"[ork] WARNING: DDR (dmc) governor is '%s', not 'performance' — decode may be ~half speed. "
-                           "Pin it: echo performance | sudo tee /sys/class/devfreq/dmc/governor  (ORK_NO_GOV_WARN=1 to silence)\n",g);
-    }
-    fclose(f);
-}
 
 /* Free NPU on-chip SRAM bytes right now (0 if none). Confirms ORK_WEIGHT_SRAM actually placed a tile in SRAM
  * (free drops) for the CPU/NPU partition experiment. */
 size_t ork_npu_sram_free(ork_npu *c){ if(!c) return 0; struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_FREE_SRAM_SIZE;
     return ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&a) ? 0 : a.value; }
-size_t ork_npu_sram_total(ork_npu *c){ (void)c; return (size_t)g_sram_total; }
 /* Cumulative NPU DMA read/write byte counter (RKNPU_GET_TOTAL_RW_AMOUNT). Sample before/after a submit; a
  * ~0 delta means the HW did NO work (job never dispatched); a nonzero delta means it ran (did DMA). The key
  * signal for "did a failed round even reach the NPU?". 0 if unavailable. */
@@ -2020,34 +1521,6 @@ uint64_t ork_npu_dma_rw(ork_npu *c){ if(!c) return 0; struct rknpu_action a; mem
 /* Emit a diagnostic line to /dev/kmsg so it rides netconsole OFF-BOX and survives a hard wedge that stdout/files can't
  * (a fatal wedge loses anything still on the board; kmsg->netconsole->Mac is already gone by then). Rare wedge-path only.
  * <4>=KERN_WARNING passes the default console loglevel. Best-effort: needs root (the tests run as root); silent if not. */
-void ork_kmsg(const char *fmt, ...){
-    char msg[504]; va_list ap; va_start(ap, fmt); vsnprintf(msg, sizeof msg, fmt, ap); va_end(ap);
-    int kfd = open("/dev/kmsg", O_WRONLY|O_CLOEXEC);
-    if(kfd >= 0){ char buf[512]; int n = snprintf(buf, sizeof buf, "<4>ork: %s", msg);
-        if(n>0){ ssize_t w=write(kfd, buf, (size_t)n<sizeof buf?(size_t)n:sizeof buf-1); (void)w; } close(kfd); }
-    /* ORK_F16_TRACE=<path>: ALSO mirror every step to a local, line-flushed file so a `tail -f` shows live progress
-     * even when netconsole is lossy or the run never emits campaign output (e.g. a wedge-spin before the loop). */
-    const char *tp = getenv("ORK_F16_TRACE");
-    if(tp){ static FILE *tf; static int opened; if(!opened){ opened=1; tf=fopen(tp,"a"); }
-        if(tf){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); fprintf(tf, "[%ld.%03ld] %s\n", (long)ts.tv_sec, ts.tv_nsec/1000000L, msg); fflush(tf); } }
-}
-void ork_npu_dump_state(ork_npu *c, const char *label){
-    if(!c) return; int fd=c->fd; struct rknpu_action a;
-    unsigned long long freq=0,volt=0,iommu=0,sram=0,hwv=0;
-    #define ORK_Q(F,V) do{ memset(&a,0,sizeof a); a.flags=(F); if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) V=(unsigned long long)a.value; }while(0)
-    ORK_Q(RKNPU_GET_HW_VERSION,hwv); ORK_Q(RKNPU_GET_FREQ,freq); ORK_Q(RKNPU_GET_VOLT,volt);
-    ORK_Q(RKNPU_GET_IOMMU_EN,iommu); ORK_Q(RKNPU_GET_FREE_SRAM_SIZE,sram);
-    #undef ORK_Q
-    /* The LIVE signals (established by floor_decomp / slice_replay — NOT the RKNPU_GET_*_AMOUNT DMA counters,
-     * which read 0 on this kernel): (1) orki_fd_hw_raw_last = the kernel's per-submit NPU-busy time (hw_elapse),
-     * captured after EVERY submit; 0 => the last job did NO work (faulted/never ran). (2) per-task int_status
-     * from the shared task buffer (read after a FROM_DEVICE sync). */
-    struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;   /* NULL after an fd-reap (task buffer died with the fd, re-created lazily on the next run) — guard the deref */
-    if(t) orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
-    fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=%s0x%x 0x%x 0x%x 0x%x\n",
-            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)orki_fd_hw_raw_last, t?"":"(no task buf) ",
-            t?t[0].int_status:0u, t?t[1].int_status:0u, t?t[2].int_status:0u, t?t[3].int_status:0u);
-}
 /* Soft-reset the NPU (RKNPU_ACT_RESET) and force a re-warm (clear c->warmed). Intended as the recovery step
  * AFTER ork_npu_dump_state when a round goes awry: it clears a stuck/faulted job so the bad state does not
  * accumulate into a hard wedge across repeated submits. Returns the ioctl result (0 ok). */
@@ -2063,58 +1536,7 @@ int ork_npu_soft_reset(ork_npu *c){ if(!c) return -1; struct rknpu_action a; mem
  * bcreate'd scratch (regcmd/task/per-core mcc/maf/mrc/mtk/...) is LOST but lazily re-created (we zero it + its size
  * caches so the next mc_ensure/alloc rebuilds it on the fresh fd; warmed=0 forces the fp16 2-pass re-warm). Returns
  * 0 ok, <0 on reopen/re-import failure (context is then unusable). Caller must have quiesced all submits first. */
-int orki_reimport_inplace(int fd, struct buf *b){   /* re-map a persisted dma-buf into the reopened fd; keep b->cpu/size/heap_fd */
-    if(b->heap_fd<=0 || !b->cpu) return -1;
-    if(!ork_iova_reserve(b->domain, b->size)) return -1;
-    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=b->heap_fd; ph.flags=0;
-    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ ork_iova_release(b->domain,b->size); return -1; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=b->domain;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ ork_iova_release(b->domain,b->size); return -1; }
-    ork_kmsg("  reimport heap_fd=%d oldh=%u -> primeh=%u memh=%u dma=0x%llx obj=0x%llx", b->heap_fd, b->handle, ph.handle, mc.handle, (unsigned long long)mc.dma_addr, (unsigned long long)mc.obj_addr);
-    b->handle=mc.handle; b->dma=mc.dma_addr; b->obj=mc.obj_addr;   /* new IOVA/handle; cpu/size/heap_fd/domain unchanged */
-    live_add(fd,b->handle,b->obj); return 0;
-}
-static int g_reap_n=0;
-int ork_ctx_fd_reap(ork_npu *c){
-    if(!c || c->fd<0) return -1;
-    const char *card=getenv("ORK_NPU_CARD"); if(!card)card=c->soc->card;
-    ork_kmsg("FD-REAP #%d: close(fd=%d) g_imp=%d g_live=%d — drm_release device teardown", ++g_reap_n, c->fd, g_imp_n, g_live_n);
-    /* ABORT any stuck/dropped in-flight job in-kernel BEFORE close. A REAL drop leaves an accepted-but-stuck job still
-     * referencing a GEM object; drm_release then DOUBLE-PUTS that object (job-cleanup put + handle-release put) ->
-     * refcount underflow/use-after-free -> slab corruption (vendor rknpu bug). RKNPU_ACT_RESET removes the job from the
-     * scheduler first, so the subsequent close/drm_release puts each handle exactly once. (Proven necessary only for
-     * REAL drops: 10 FORCE_WEDGE reaps of a CLEAN fd never underflowed; the underflow needs a stuck job at close.) */
-    { struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&ra);
-      struct timespec qs={0,2000000}; nanosleep(&qs,NULL); }   /* 2ms: let the reset settle + the aborted job drain before close */
-    close(c->fd);
-    int nf=open(card,O_RDWR); if(nf<0){ perror("FD-REAP reopen"); c->fd=-1; return -1; }
-    prctl(PR_SET_TIMERSLACK,(unsigned long)1000,0UL,0UL,0UL);
-    orki_act(nf,RKNPU_POWER_ON,0); orki_act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    c->fd=nf;
-    /* all prior IOMMU mappings + live handles are gone with the old fd */
-    pthread_mutex_lock(&g_live_mu); g_live_n=0; g_live_fd=nf; pthread_mutex_unlock(&g_live_mu);
-    for(int d=0; d<ORK_IOVA_NDOM; d++) g_iova_bytes[d]=0;
-    /* re-import every registered dma-buf weight IN PLACE (pages + cpu mmap persisted across the close) */
-    int reimp=0, fail=0; pthread_mutex_lock(&g_live_mu); int nimp=g_imp_n;
-    struct buf **imps=malloc((size_t)(nimp>0?nimp:1)*sizeof*imps); for(int i=0;i<nimp;i++) imps[i]=g_imp[i];
-    pthread_mutex_unlock(&g_live_mu);
-    for(int i=0;i<nimp;i++){ if(orki_reimport_inplace(nf,imps[i])==0) reimp++; else fail++; }
-    free(imps);
-    ork_kmsg("FD-REAP: reopened fd=%d, re-imported %d dma-buf weights (%d failed)", nf, reimp, fail);
-    /* INVALIDATE bcreate'd scratch (lost with the fd) so it lazily re-creates on the fresh fd */
-    #define ZB(b) memset(&(b),0,sizeof(b))
-    ZB(c->regcmd); ZB(c->task); ZB(c->Af); ZB(c->Cc); ZB(c->mtk_all);
-    ZB(c->ppu_a); ZB(c->ppu_b); ZB(c->ppu_o);
-    for(int i=0;i<ORK_MAXCORE;i++){ ZB(c->mrc[i]); ZB(c->mtk[i]); ZB(c->maf[i]); ZB(c->mcc[i]);
-        ZB(c->chain_rc[i]); ZB(c->chain_tk[i]); ZB(c->chain_lrc[i]); ZB(c->chain_lsc[i]);
-        c->mccsz[i]=0; c->mwarm[i]=0; }
-    #undef ZB
-    c->ccsz=0; c->warmed=0; c->mc_alloc=0; c->last_dt=-1; c->last_chain=0;
-    if(c->dom_save){ free(c->dom_save); c->dom_save=NULL; }   /* parked per-domain scratch died with the fd */
-    if(c->dom_anchor){ free(c->dom_anchor); c->dom_anchor=NULL; }
-    c->dom_cap=0; c->dom_active=0;
-    return fail ? -1 : 0;
-}
+int orki_reap_n=0;
 /* Recovery probe (the "dummy op") — NONBLOCK + HOST-BOUNDED, so it can NEVER hang on an already-wedged NPU.
  * A blocking submit on a wedged job enters the kernel's `continue wait` and re-waits PAST its own timeout in an
  * uninterruptible D-state (observed 61s->122s, unkillable) — so the recovery probe MUST NOT block. This issues
@@ -2122,32 +1544,6 @@ int ork_ctx_fd_reap(ork_npu *c){
  * enters the kernel wait), then we poll the output doorbell HOST-side with a hard 300ms cap. Doorbell lands
  * with the right value => NPU is dispatching again (recovered, 1); host-timeout => still wedged (0 => fault).
  * (A comprehensive fp16/SDP/PPU self-test is fine for HEALTHY validation but is the wrong tool here — it blocks.) */
-int ork_dummy_probe(ork_npu *c){
-    int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
-    struct buf A=orki_bcreate(fd,(size_t)K,0x403,dom), B=orki_bcreate(fd,(size_t)K*N,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*4,0x403,dom);
-    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(B.cpu)orki_bdestroy(fd,&B); if(Cc.cpu)orki_bdestroy(fd,&Cc); return 0; }
-    memset(A.cpu,1,K); memset(B.cpu,1,(size_t)K*N);
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
-    __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
-    uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
-    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit s; memset(&s,0,sizeof s);
-    s.flags=0x1|0x2u;   /* PC | NONBLOCK: ioctl returns immediately, cannot enter the kernel continue-wait */
-    s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=300;
-    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    int rr=orki_rknpu_submit_ioctl(fd,&s,dom), ok=0;
-    if(rr==0){ double t0=ork_now_us();   /* host-side bounded poll — no kernel wait, cannot hang */
-        for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory");
-            if(*db!=0x7fffffff){ ok=(*db==K); break; }
-            if(ork_now_us()-t0>300000.0) break;   /* 300ms host cap => doorbell never landed => still wedged */ } }
-    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
-    return ok;
-}
 /* REAP stuck async jobs the CLEAN way (task #47 Bug#2): the vendor driver reaps a stuck/timed-out async job via
  * rknpu_job_timeout_clean, which runs at the TOP of EVERY nonblock submit — if that core's job is past its timeout it
  * soft-resets + schedule_work(cleanup_work) => a CLEAN rknpu_gem_object_put of the job's task_obj. (Contrast close(fd),
@@ -2183,40 +1579,10 @@ void ork_npu_reap_stuck(ork_npu *c, int nc){
  * PASSES (NPU recovered — caller keeps going), 0 if it FAILS (NPU still broken — caller should throw a fault
  * and stop, rather than spiral into a hard wedge). This is the recovery contract the caller runs on an anomaly
  * (a round that fails to land / a submit error). */
-int ork_npu_recover(ork_npu *c, const char *label){
-    if(!c) return 0;
-    ork_npu_dump_state(c,label);
-    ork_npu_soft_reset(c);
-    int ok=ork_dummy_probe(c);
-    fprintf(stderr,"[NPU-RECOVER %s] dump + soft-reset + dummy-op -> %s\n", label?label:"", ok?"PASS (recovered, continue)":"FAIL (still broken, FAULT)");
-    return ok;
-}
 /* Deliberately force a RELIABLE NPU fault (to exercise dump/recover): a tiny int8 matmul whose WEIGHT address
  * is BOGUS (0x1000 — an unmapped low page) so the NPU DMA-reads from unmapped and faults every time. NONBLOCK +
  * a 1s bounded host poll so the caller never blocks. Returns 1 if the output doorbell landed (no fault), 0 if it
  * did NOT land in the window (the expected fault). May soft-reset or IOMMU-fault the NPU — that's the point. */
-int ork_npu_force_fault(ork_npu *c){
-    if(!c) return -1; int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
-    struct buf A=orki_bcreate(fd,(size_t)K,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*4,0x403,dom);
-    if(!A.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(Cc.cpu)orki_bdestroy(fd,&Cc); return -1; }
-    memset(A.cpu,1,K); orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);
-    volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
-    __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
-    uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
-    memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
-    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit s; memset(&s,0,sizeof s);
-    s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=500;
-    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    int rr=orki_rknpu_submit_ioctl(fd,&s,dom), landed=0;
-    if(rr==0){ double t0=ork_now_us(); for(;;){ __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if(*db!=0x7fffffff){landed=1;break;} if(ork_now_us()-t0>1000000.0) break; } }
-    fprintf(stderr,"[FORCE-FAULT] bogus-weight matmul submit rc=%d, doorbell %s (rw counters unreliable; watch dmesg for DMA_READ_ERROR/soft reset)\n", rr, landed?"LANDED (no fault?!)":"did NOT land (faulted as intended)");
-    orki_bdestroy(fd,&A); orki_bdestroy(fd,&Cc);
-    return landed;
-}
 
 /* orkd CLIENT context — the EXPLICIT orkd entry point. Connect (auto-spawn) the orkd daemon and route
  * ork_mm_* through it: the daemon owns the single-stream NPU and serializes every submit, the safe way to
@@ -2224,202 +1590,42 @@ int ork_npu_force_fault(ork_npu *c){
  * Returns NULL if the daemon can't be reached (NO silent fallback to direct — the caller decides). The daemon
  * process itself must not call this (it sets ORKD_IS_DAEMON). Callers pick transport by CHOOSING the entry
  * point: ork_npu_init() = direct (default), ork_npu_init_orkd() = orkd client. */
-ork_npu *ork_npu_init_orkd(void){
-    const struct ork_soc *soc=ork_soc_detect();
-    if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
-    { const char *isd=getenv("ORKD_IS_DAEMON");
-      if(isd && atoi(isd)){ fprintf(stderr,"[ork] ERROR: ork_npu_init_orkd() called inside the daemon — use ork_npu_init() (direct)\n"); return NULL; } }
-    orkd_conn *dc=orkd_connect();
-    if(!dc){ fprintf(stderr,"[ork] ERROR: ork_npu_init_orkd() — orkd_connect failed (daemon not reachable/spawnable)\n"); return NULL; }
-    ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; g_npu_ctx=c;
-    if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
-    if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc));
-    return c;
-}
 
 /* DIRECT (in-process) NPU context — the DEFAULT entry point: opens the DRM card and owns the single-stream
  * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
  * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
  * select the transport by calling the desired entry point rather than relying on the env. */
-int orki_mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
-ork_npu *ork_npu_init(void){
-    const struct ork_soc *soc=ork_soc_detect();
-    if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
-    /* Legacy env override: ORK_USE_ORKD set (and not the daemon itself, which sets ORKD_IS_DAEMON) routes
-     * through orkd. Delegates to the explicit entry point; on connect failure, falls back to the direct NPU. */
-    { const char *ud=getenv("ORK_USE_ORKD"), *isd=getenv("ORKD_IS_DAEMON");
-      if(ud && atoi(ud) && !(isd && atoi(isd))){
-        ork_npu *c=ork_npu_init_orkd();
-        if(c) return c;
-        fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
-    if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
-    orki_warn_if_governor_parked();
-    orki_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
-    orki_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
-    const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
-    int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
-    prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default 50µs): precise short nanosleeps for the doorbell backoffs */
-    orki_act(fd,RKNPU_GET_DRV_VERSION,0);orki_act(fd,RKNPU_POWER_ON,0);orki_act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
-    /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in orki_bcreate (see g_sram_total). */
-    { struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_TOTAL_SRAM_SIZE;
-      if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) g_sram_total=a.value;
-      if(getenv("ORK_TRACE")||getenv("ORK_LOAD_PROF"))
-          fprintf(stderr,"[ork] NPU SRAM: %u KiB %s\n",(unsigned)(g_sram_total>>10),
-                  g_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
-    ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
-    pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
-    c->regcmd=orki_bcreate(fd,2097152,0x403,-1); c->task=orki_bcreate(fd,524288,0x40b,-1); c->Af=orki_bcreate(fd,(size_t)4*32768*2,0x403,-1);
-    struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
-    memcpy(c->task.cpu,&t,sizeof t); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}
-    /* graceful teardown: MEM_DESTROY all live mappings on SIGTERM/SIGINT so a killed orki_run (e.g. `timeout`)
-     * releases its IOMMU domains instead of stranding them until reboot (see the live-buffer registry). */
-    { const char*e=getenv("ORK_NO_SIGCLEAN"); if(!(e&&atoi(e))){
-        struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=ork_sig_teardown; sigemptyset(&sa.sa_mask);
-        sigaction(SIGTERM,&sa,NULL); sigaction(SIGINT,&sa,NULL); } }
-    /* #54: pre-allocate domain-0 run scratch (mtk_all + per-core mrc/mtk/maf) NOW, while domain 0 is empty. It
-     * would otherwise be bcreate'd lazily at the first forward op, AFTER the dense weights import ~GiB into
-     * domain 0 — where a fresh bcreate EINVALs amid the imports (the mc_ensure mtk_all failure). Best-effort. */
-    orki_mc_ensure(c, c->soc->cores);
-    for(int i=0;i<c->soc->cores;i++){ size_t mcc_need=(size_t)2*1024*1024;   /* also pre-size domain-0 mcc (expert BCHAIN need_o) so it never re-bcreates in the import-heavy domain 0 */
-        if(c->mccsz[i]<mcc_need){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=orki_bscratch(c,mcc_need,0x403,c->dom_active); if(c->mcc[i].cpu){ c->mccsz[i]=mcc_need; c->mwarm[i]=0; } } }
-    g_npu_ctx = c;
-    return c;
-}
 /* ORK_LOAD_PROF: print (and reset) the per-phase import breakdown. Called at teardown. No-op unless set. */
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 void ork_npu_xprof_dump(void);
-void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
-    int fd=c->fd; ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before teardown's per-domain MEM_DESTROYs switch domains */
-    ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
-    if(getenv("ORK_DOM_PROFILE") && c->dom_sw_n){   /* domain-swap window telemetry */
-        uint64_t steady_n = c->dom_sw_n - c->dom_sw_first_n; double steady_us = c->dom_sw_us - c->dom_sw_first_us;
-        fprintf(stderr, "[ork DOM-SWAP] %llu real switches (%.1f us total, %.2f us max) | first-touch %llu (%.0f us, one-time bcreate) | steady swaps %llu = %.3f us total, %.4f us/swap avg\n",
-            (unsigned long long)c->dom_sw_n, c->dom_sw_us, c->dom_sw_max_us,
-            (unsigned long long)c->dom_sw_first_n, c->dom_sw_first_us,
-            (unsigned long long)steady_n, steady_us, steady_n ? steady_us/(double)steady_n : 0.0);
-    }
-    if(c->seq_witness){ ork_mm_free(c, c->seq_witness); c->seq_witness=NULL; }   /* B2 terminal-SDP witness weight */
-    ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
-    orki_ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
-    if(orki_ork_prof){
-        if(orki_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
-                                    orki_prof_i8_calls, orki_prof_i8_us/1e3, orki_prof_i8_us/orki_prof_i8_calls);
-        if(orki_prof_i4_calls) fprintf(stderr,"[ork PROFILE] run_i4: %ld calls, %.1f ms total, %.0f us/call\n",
-                                    orki_prof_i4_calls, orki_prof_i4_us/1e3, orki_prof_i4_us/orki_prof_i4_calls);
-        if(orki_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
-                                   orki_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/orki_prof_submits, g_prof_submit_chained,
-                                   orki_prof_i8_calls?(double)orki_prof_submits/orki_prof_i8_calls:0.0);
-        /* HW-vs-poll split (task #19): orki_run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
-         * poll/idle = orki_run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
-        if(orki_fd_n) fprintf(stderr,"[ork FD-SPLIT] orki_run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
-                                   orki_prof_i8_us/1e3, orki_fd_n, orki_fd_ioctl_us/1e3, 100.0*orki_fd_ioctl_us/(orki_prof_i8_us+1e-9),
-                                   orki_fd_hw_us/1e3, 100.0*orki_fd_hw_us/(orki_prof_i8_us+1e-9),
-                                   (orki_prof_i8_us-orki_fd_ioctl_us)/1e3, 100.0*(orki_prof_i8_us-orki_fd_ioctl_us)/(orki_prof_i8_us+1e-9),
-                                   orki_fd_ioctl_us/orki_fd_n, orki_fd_hw_us/orki_fd_n);
-    }
-    if (g_npu_ctx == c) g_npu_ctx = NULL;
-    if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
-        for(int i=1;i<c->pool_n;i++) pthread_join(c->pth[i],NULL); }
-    fold_scratch_free(c);   /* #39 resident mfold scratch */
-    orki_bdestroy(fd,&c->regcmd);orki_bdestroy(fd,&c->task);orki_bdestroy(fd,&c->Af);orki_bdestroy(fd,&c->Cc);orki_bdestroy(fd,&c->mtk_all);
-    orki_bdestroy(fd,&c->ppu_a);orki_bdestroy(fd,&c->ppu_b);orki_bdestroy(fd,&c->ppu_o);   /* persistent SDP-op scratch */
-    for(int i=0;i<ORK_MAXCORE;i++){orki_bdestroy(fd,&c->mrc[i]);orki_bdestroy(fd,&c->mtk[i]);orki_bdestroy(fd,&c->maf[i]);orki_bdestroy(fd,&c->mcc[i]);
-        orki_bdestroy(fd,&c->chain_rc[i]);orki_bdestroy(fd,&c->chain_tk[i]);orki_bdestroy(fd,&c->chain_lrc[i]);orki_bdestroy(fd,&c->chain_lsc[i]);}   /* multi-core matmul + per-core chain scratch, one pass */
-    /* free PARKED per-domain scratch (the active set above is whichever domain was last run) */
-    if(c->dom_save){ for(int d=0;d<c->dom_cap;d++){ if(d==c->dom_active||!c->dom_save[d].used) continue;
-        struct ork_dom_scratch *s=&c->dom_save[d];
-        orki_bdestroy(fd,&s->regcmd);orki_bdestroy(fd,&s->task);orki_bdestroy(fd,&s->Af);orki_bdestroy(fd,&s->Cc);orki_bdestroy(fd,&s->mtk_all);
-        for(int i=0;i<ORK_MAXCORE;i++){orki_bdestroy(fd,&s->mrc[i]);orki_bdestroy(fd,&s->mtk[i]);orki_bdestroy(fd,&s->maf[i]);orki_bdestroy(fd,&s->mcc[i]);} }
-        free(c->dom_save); }
-    for(int i=0;i<c->dma_n;i++) orki_bdestroy(fd,&c->dma_tab[i]);
-    if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) orki_bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
-    if(c->i4arena){ for(int i=0;i<c->i4arena_n;i++) if(c->i4arena[i].cpu) orki_bdestroy(fd,&c->i4arena[i]); free(c->i4arena); }   /* #54 int4 expert import arena (bdestroy closes each chunk's heap_fd) */
-    free(c->cres); if(fd>=0)close(fd); free(c); }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
  * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_mm_run_i8 detects
  * residency automatically (no API change); the caller just allocates A/C here. ---- */
-void *ork_dma_alloc(ork_npu *c, size_t size){
-    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=orki_bcreate(c->fd,size,0x401,c->pack_domain); if(!b.cpu) return NULL;
-    c->dma_tab[c->dma_n++]=b; return b.cpu;
-}
-void ork_dma_free(ork_npu *c, void *ptr){
-    if(!c||!ptr) return;
-    for(int i=0;i<c->dma_n;i++) if(c->dma_tab[i].cpu==ptr){ orki_bdestroy(c->fd,&c->dma_tab[i]); c->dma_tab[i]=c->dma_tab[--c->dma_n]; memset(&c->dma_tab[c->dma_n], 0, sizeof(struct buf)); return; }
-}
 /* Zero-copy IMPORT (no alloc, no copy) — see header. Registered in dma_tab like ork_dma_alloc so
  * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
-void *ork_dma_import(ork_npu *c, size_t size){
-    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    ork_dom_prime(c, c->pack_domain);   /* establish a non-0 domain before importing into it (see ork_dom_prime) */
-    struct buf b=orki_bimport(c->fd,size,c->pack_domain); if(!b.cpu) return NULL;
-    c->dma_tab[c->dma_n++]=b; return b.cpu;
-}
-void ork_dma_import_free(ork_npu *c, void *ptr){ ork_dma_free(c,ptr); }
 /* Import an EXTERNAL dma-buf fd (e.g. received over SCM_RIGHTS from another process) into the NPU's IOMMU
  * domain and register it for zero-copy: the returned CPU pointer maps the shared buffer, and passing a ptr
  * into it as A/C to ork_mm_run* makes the NPU read/write that buffer in place (dma_find resolves the IOVA).
  * Takes ownership of `dmabuf_fd` (closed by ork_dma_free/ork_dma_import_free). NULL on failure. This is the
  * orkd daemon's cross-process zero-copy hook (client shares a buffer; orkd runs against it, no copy). */
-void *ork_dma_import_fd(ork_npu *c, int dmabuf_fd, size_t size){
-    if(!c || dmabuf_fd<0 || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    ork_dom_prime(c, c->pack_domain);
-    struct buf b=orki_bimport_fd(c->fd, dmabuf_fd, size, c->pack_domain); if(!b.cpu) return NULL;
-    c->dma_tab[c->dma_n++]=b; return b.cpu;
-}
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
-struct buf *orki_dma_find(ork_npu *c, const void *p){
-    for(int i=0;i<c->dma_n;i++){ char*base=c->dma_tab[i].cpu;
-        if((const char*)p>=base && (const char*)p<base+c->dma_tab[i].size) return &c->dma_tab[i]; }
-    return NULL;
-}
 /* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
  * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
-void ork_dma_import_sync(ork_npu *c, void *ptr, size_t size){
-    (void)size; struct buf *b=orki_dma_find(c,ptr); if(!b) return;
-    /* For imported dma-bufs the dma-buf's own SYNC ioctl flushes the CPU caches (the rknpu MEM_SYNC
-     * does not cover foreign imports). END|WRITE = "CPU done writing" -> clean to device. */
-    orki_dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
-}
 /* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
  * device after a host write (the bsync the streaming fill would issue). Not in the public header. */
-void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
-    struct buf *b=orki_dma_find(c,ptr); if(!b) return;
-    struct rknpu_mem_sync s; memset(&s,0,sizeof s);
-    s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
-}
 /* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
  * rknpu mem-create flag set, so the probe can A/B the write-combine (0x401) vs cacheable (0x403) fill
  * bandwidth + NPU-read correctness WITHOUT changing the default ork_dma_alloc behavior. Additive; not
  * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
-void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
-    if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
-    struct buf b=orki_bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
-    c->dma_tab[c->dma_n++]=b; return b.cpu;
-}
 /* ork_dma_alloc that requests on-chip SRAM residence (fails over to DRAM if the NPU has no SRAM / it is full).
  * For validating the precompiled/doorbell submit against an SRAM-resident output the CPU polls via dc civac. */
-void *ork_dma_alloc_sram(ork_npu *c, size_t size){ return ork_dma_alloc_flags(c, size, 0x401 | RKNPU_MEM_TRY_ALLOC_SRAM); }
 /* Diagnostic only: clean-only flush (TO_DEVICE) of a sub-range — push dirty CPU cache lines out to DRAM
  * so the NPU reads correct data, WITHOUT the FROM_DEVICE invalidate. This is the bsync a cacheable
  * weight buffer needs before submit (the "clean cost" the probe measures separately). */
-void ork_dma_clean_to_device(ork_npu *c, void *ptr, size_t size){
-    struct buf *b=orki_dma_find(c,ptr); if(!b) return;
-    struct rknpu_mem_sync s; memset(&s,0,sizeof s);
-    s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
-}
-const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}
-int ork_npu_cores(const ork_npu *c){return c->soc->cores;}
-int ork_npu_validated(const ork_npu *c){return c->soc->validated;}
 /* policy: cap the cores the auto-tuner may use for a matmul (n<=0 → all soc cores). The library
  * still picks per-matmul ≤ this (small-N matmuls use fewer). ORK_NPU_MC env overrides if set. */
-void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>0&&n<=c->soc->cores)?n:c->soc->cores; }
 /* Pin the fused chain (run_chain_i8_*) to one NPU core. Default 0 (== prior behavior). Foundation for
  * round-robin: the scheduler places independent prefill chains on different cores, each with its OWN per-core
  * scratch (chain_rc/tk/lrc/lsc[core]) and per-core caches (chain_lut_devloaded[], chain_task_P[]/
@@ -2438,7 +1644,6 @@ void ork_npu_set_chain_core_unsafe(ork_npu *c,int core){ if(!c)return;
     c->chain_core = (core>=0 && core<c->soc->cores) ? core : 0; }
 /* orkd scheduler priority for this client's subsequent submits (higher = dispatched sooner among queued work).
  * Only meaningful in client mode (c->daemon set); a no-op on a direct-NPU context (nothing to schedule against). */
-void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
 
 /* PER-WEIGHT IOMMU DOMAIN PLACEMENT. The rk_iommu 32-bit IOVA cap (~4 GiB) is per iommu_domain_id, so a
  * model larger than 4 GiB stays fully resident (no streaming) by spreading its weights over domains.
@@ -2453,32 +1658,16 @@ void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(!c) return; c->pack_doma
 /* Allocate an IOMMU domain to pack weights into (isolation + a full ~4 GiB IOVA window each). Path B: request
  * one from orkd's coordinated pool (returns id>0, or <0 if exhausted). Direct: hand out a local id (1,2,…).
  * Make it the pack target with ork_npu_set_pack_domain; return it with ork_npu_domain_free. */
-int ork_npu_domain_alloc(ork_npu *c){
-    if(!c) return -1;
-    if(c->daemon) return orkd_domain_alloc(c->daemon);
-    if(c->dom_next < 1) c->dom_next = 1;
-    if(orki_dom_reserve(c, c->dom_next+1)) return -1;   /* grow arrays to cover the new domain (no fixed cap); OOM -> fail */
-    return c->dom_next++;
-}
-int ork_npu_domain_free(ork_npu *c,int domain){
-    if(!c || domain<=0) return -1;
-    if(c->daemon) return orkd_domain_free(c->daemon, domain);
-    return 0;   /* direct mode: domains aren't pooled — a weight's buffers free with the weight */
-}
-int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   /* current pack domain (save/restore around a domain-targeted alloc) */
 /* Currently ACTIVE iommu domain (the one dom_activate last swapped in), i.e. the domain the NEXT submit
  * would run in if its weight already lives there. Pure getter, no state change. The point: a caller that
  * allocates a TRANSIENT/scratch weight (an attention or GDN bmm's dynamic operand) can place it in the
  * domain that is already active, so running it needs NO dom_activate switch — the switch is what a stuck
  * (unreaped, IRQ-never-fired) job turns into a 60 s "switch iommu domain" stall on the NEXT submit. See
  * ork_dom_flush_if_dirty / dom_dirty. Co-domain scratch sidesteps the whole boundary. */
-int  ork_npu_active_domain(const ork_npu *c){ return c ? c->dom_active : 0; }
 /* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
  * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
  * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
-void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) orki_dom_activate(c, domain<0?0:domain); }
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
-int  ork_npu_uses_orkd(const ork_npu *c){ return (c && c->daemon) ? 1 : 0; }   /* 1 = this ctx routes through orkd (serialized); 0 = DIRECT NPU (single-stream — don't run concurrent direct processes) */
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
  * N%16) or DT_I8 (B int8, tile [Nt][Kt][32][32], N%32). K-split (KS) x N-split (NMAX). */
@@ -2489,82 +1678,15 @@ int  ork_npu_uses_orkd(const ork_npu *c){ return (c && c->daemon) ? 1 : 0; }   /
  * core: the calling thread may be pinned to the big cluster (an inference worker often is), but
  * the one-time pack is a CPU-bound batch job with no live inference to protect, so it should use
  * the whole machine. Returns the online-core count, or 0 if it couldn't be determined. */
-int ork_all_cores_mask(cpu_set_t *s){
-    long n=sysconf(_SC_NPROCESSORS_ONLN); if(n<1) return 0;
-    CPU_ZERO(s); for(long i=0;i<n && i<CPU_SETSIZE;i++) CPU_SET((int)i,s);
-    return (int)n;
-}
 /* Un-pin the calling thread: allow it to run on ALL online cores. Public so the ggml-ork dequant/
  * quant workers (std::thread, no attr) can un-pin themselves. */
-void ork_unpin_current_thread(void){
-    cpu_set_t all; if(ork_all_cores_mask(&all)) pthread_setaffinity_np(pthread_self(), sizeof all, &all);
-}
 
 /* PERSISTENT worker pool for ork_parallel_for. Spawn the workers ONCE and reuse them across every
  * call, amortizing the pthread_create/join that dominated fine-grained per-weight tiling — a fresh
  * pool per weight left the cores mostly idle in spawn/join overhead (measured: per-weight CPU tiling
  * capped ~20%). Workers are un-pinned (all cores) and sleep on a condvar between jobs; lazy-init on
  * first use, live for the process. One job at a time (the callers dispatch serially). */
-#define ORK_POOL_MAX 64
-static struct {
-    int inited, n, quit;
-    pthread_t th[ORK_POOL_MAX];
-    pthread_mutex_t mu; pthread_cond_t go, done;
-    void (*fn)(int,int,void*); void *ctx;
-    int lo[ORK_POOL_MAX], hi[ORK_POOL_MAX];
-    int gen, running;
-} g_pool = { .mu = PTHREAD_MUTEX_INITIALIZER, .go = PTHREAD_COND_INITIALIZER, .done = PTHREAD_COND_INITIALIZER };
 
-void *ork_pool_worker(void *a){
-    int id = (int)(intptr_t)a;
-    ork_unpin_current_thread();
-    int seen = 0;
-    pthread_mutex_lock(&g_pool.mu);
-    for(;;){
-        while(g_pool.gen == seen && !g_pool.quit) pthread_cond_wait(&g_pool.go, &g_pool.mu);
-        if(g_pool.quit){ pthread_mutex_unlock(&g_pool.mu); return NULL; }
-        seen = g_pool.gen;
-        void (*fn)(int,int,void*) = g_pool.fn; void *ctx = g_pool.ctx;
-        int lo = g_pool.lo[id], hi = g_pool.hi[id];
-        pthread_mutex_unlock(&g_pool.mu);
-        if(fn && hi > lo) fn(lo, hi, ctx);
-        pthread_mutex_lock(&g_pool.mu);
-        if(--g_pool.running == 0) pthread_cond_signal(&g_pool.done);
-    }
-}
-void ork_pool_init(void){
-    if(g_pool.inited) return;
-    int cores=(int)sysconf(_SC_NPROCESSORS_ONLN); if(cores<1)cores=1;
-    /* ORK_POOL_MULT oversubscribes the cores (e.g. =2 → 2 threads/core) to hide memory-latency stalls
-     * in the tiling/dequant (bandwidth is not saturated, so extra threads can fill the stall bubbles). */
-    int mult = getenv("ORK_POOL_MULT") ? atoi(getenv("ORK_POOL_MULT")) : 1; if(mult<1)mult=1; if(mult>8)mult=8;
-    int n = cores*mult; if(n>ORK_POOL_MAX)n=ORK_POOL_MAX;
-    g_pool.n = n; g_pool.inited = 1;
-    for(int i=1;i<n;i++)   /* worker 0 == the caller; helpers 1..n-1 */
-        if(pthread_create(&g_pool.th[i], NULL, ork_pool_worker, (void*)(intptr_t)i)!=0){ g_pool.n = i; break; }
-}
-void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
-    if(n<=0) return;
-    if(n==1){ fn(0,1,ctx); return; }
-    static pthread_mutex_t dispatch = PTHREAD_MUTEX_INITIALIZER;   /* pool is a shared singleton — one job at a time */
-    pthread_mutex_lock(&dispatch);
-    ork_pool_init();
-    int nthr = g_pool.n; if(nthr>n) nthr=n; if(nthr<1) nthr=1;   /* use the whole pool (incl. oversubscription) */
-    if(nthr<=1){ pthread_mutex_unlock(&dispatch); fn(0,n,ctx); return; }
-    int chunk = (n + nthr - 1) / nthr;
-    pthread_mutex_lock(&g_pool.mu);
-    g_pool.fn = fn; g_pool.ctx = ctx;
-    for(int t=0;t<g_pool.n;t++){ int a=t*chunk; if(a>n)a=n; int b=a+chunk; if(b>n)b=n; g_pool.lo[t]=a; g_pool.hi[t]=b; }
-    g_pool.running = g_pool.n - 1;   /* every helper wakes + decrements (idle ones just have empty ranges) */
-    g_pool.gen++;
-    pthread_cond_broadcast(&g_pool.go);
-    pthread_mutex_unlock(&g_pool.mu);
-    if(g_pool.hi[0] > g_pool.lo[0]) fn(g_pool.lo[0], g_pool.hi[0], ctx);   /* caller runs chunk 0 */
-    pthread_mutex_lock(&g_pool.mu);
-    while(g_pool.running > 0) pthread_cond_wait(&g_pool.done, &g_pool.mu);
-    pthread_mutex_unlock(&g_pool.mu);
-    pthread_mutex_unlock(&dispatch);
-}
 /* Tile a contiguous [nt] range of int8 weight columns into the NPU 32x32 block layout. Shared by the Bb
  * K-slice tiles and the full-K Bf rebuild (same structure; differ only in KT and the k0 offset). Each nt
  * range is disjoint in bb, so this is bit-identical to the serial loop. */
@@ -2895,19 +2017,6 @@ size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *o
  * pagecache into DRAM, zero-copy import) handles everything while the NPU serves. Best-effort: on any
  * read failure it returns 0 (assume idle) so the caller keeps the NPU option. Cheap enough to poll per
  * weight. Threshold >5% treats warm-up/idle noise as free but any real submit stream as busy. */
-int ork_npu_busy(ork_npu *ctx){
-    (void)ctx;
-    FILE *f=fopen("/sys/kernel/debug/rknpu/load","r");
-    if(!f) return 0;
-    char buf[256]; size_t n=fread(buf,1,sizeof buf-1,f); fclose(f);
-    if(!n) return 0; buf[n]=0;
-    /* format: "NPU load:  Core0:  0%, Core1:  0%, Core2:  0%," — busy if any core % exceeds threshold */
-    for(const char *p=buf; (p=strchr(p,'%')); p++){
-        const char *q=p; while(q>buf && (q[-1]==' ' || (q[-1]>='0'&&q[-1]<='9'))) q--;
-        if(atoi(q)>5) return 1;
-    }
-    return 0;
-}
 /* Reload pre-tiled int8 weight bytes (from ork_w_dump / a .orkpack) straight into NPU DMA — bcreate +
  * memcpy + bsync, with NO dequant / quant / tiling. The fast path for streaming persisted weights: a
  * re-pack becomes a plain DMA copy. `blob`/`n` must be this exact (K,N) int8 weight's Bb dump, in pack
@@ -3006,9 +2115,9 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(n!=need) return NULL;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain);
     g_imp_wn++;
-    if(imp_trace()){ fprintf(stderr,"[IMP] ===== weight #%ld load_i8_import K=%d N=%d Sk=%d Sn=%d tiles=%d need=%zuMB dom=%d =====\n",g_imp_wn,K,N,Sk,Sn,Sk*Sn,need>>20,w->domain); fflush(stderr); }
+    if(orki_imp_trace()){ fprintf(stderr,"[IMP] ===== weight #%ld load_i8_import K=%d N=%d Sk=%d Sn=%d tiles=%d need=%zuMB dom=%d =====\n",g_imp_wn,K,N,Sk,Sn,Sk*Sn,need>>20,w->domain); fflush(stderr); }
     ork_dom_prime(c, w->domain);   /* establish a non-0 domain with a native anchor BEFORE importing into it */
-    if(imp_trace()){ fprintf(stderr,"[IMP]   dom_prime done, entering %s import\n", getenv("ORK_NO_CONSOLIDATE_IMPORT")?"PER-TILE":"CONSOLIDATED-CHUNK"); fflush(stderr); }
+    if(orki_imp_trace()){ fprintf(stderr,"[IMP]   dom_prime done, entering %s import\n", getenv("ORK_NO_CONSOLIDATE_IMPORT")?"PER-TILE":"CONSOLIDATED-CHUNK"); fflush(stderr); }
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     /* SIZE-BOUNDED CONSOLIDATED IMPORT (default on; ORK_NO_CONSOLIDATE_IMPORT disables): pack this weight's
      * tiles into a HANDFUL of moderate (~ORK_IMPORT_CHUNK_MB, default 16MB) imported dma-buf CHUNKS; each tile
@@ -3869,31 +2978,8 @@ struct ork_stage {
     int mapped;
 };
 /* bare DMA-heap dma-buf: alloc + mmap, NO PRIME/MEM_CREATE (no IOVA yet). heap_fd = dma-buf fd. */
-struct buf orki_bstage_alloc(size_t size){
-    int hf=orki_dmaheap_open(); if(hf<0) return (struct buf){0};
-    size_t sz=orki_pgup(size);
-    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
-    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(stage)"); return (struct buf){0}; }
-    int dbuf=(int)a.fd;
-    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
-    if(p==MAP_FAILED){ perror("mmap(stage)"); close(dbuf); return (struct buf){0}; }
-    struct buf b; memset(&b,0,sizeof b); b.cpu=p; b.size=sz; b.heap_fd=dbuf; return b;
-}
 /* IOMMU-map an already-allocated bare dma-buf (sets dma/obj/handle). 0 ok / -1 fail. */
-int orki_bstage_map(int fd, struct buf*b){
-    struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=b->heap_fd; ph.flags=0;
-    if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME(stage)"); return -1; }
-    struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK;
-    if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(stage)"); return -1; }
-    b->handle=mc.handle; b->dma=mc.dma_addr; b->obj=mc.obj_addr; return 0;
-}
 /* MEM_DESTROY the map (keep the dma-buf + mmap alive for recycle): clears dma/obj/handle only. */
-void orki_bstage_unmap(int fd, struct buf*b){
-    if(!b->obj && !b->handle) return;
-    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
-    b->dma=0; b->obj=0; b->handle=0;
-}
-void orki_bstage_free(struct buf*b){ if(!b->cpu) return; munmap(b->cpu,b->size); if(b->heap_fd>0) close(b->heap_fd); memset(b,0,sizeof *b); }
 
 /* tile shape mirrors ork_mm_load_i4a8: KS=1024 K-split, NMAX N-split; Bf full-K when K%512==0 && K<=4096
  * (same envelope as load_i8_import). Returns NULL if dma-heap absent / alloc fails. */
@@ -4611,20 +3697,6 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
  * SRAM/side-effect commit and STALL (errno 110), esp. in mixed/chained programs. RE knob to test whether a
  * chain stall is the ping-pong race (vs IOVA). Default unchanged (0x5). */
 uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO_PINGPONG"); v=(e&&atoi(e))?1:5;} return (uint32_t)v; }
-int orki_submit1(ork_npu *c){
-    int fd=c->fd;
-    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
-    sub.core_mask=1u<<tc;
-    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
-     * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
-    int reps=c->warmed?1:2;
-    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
-        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
-        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
-    c->warmed=1; return 0;
-}
 /* P3 #7: doorbell variant of submit1 for the single-core matmul path (orki_run()'s run_fullk_dec / run_loop) —
  * NONBLOCK submit + host-bounded poll on c->Cc instead of the kernel-blocking submit. The plain matmul output
  * is int32 (int8 A·B) or fp32 (fp16), so 0x7fffffff is a safe sentinel (a real int32 accumulator, or a finite
@@ -4632,22 +3704,6 @@ int orki_submit1(ork_npu *c){
  * word gate then a full-surface verify (matmul writeback is last-col-last, so the gate is sound; the verify
  * covers any residual lag). The int8-OUTPUT submit1 callers (fused SiLU/out8) have no safe sentinel and keep
  * the blocking submit1; the ZC-OUT (cbuf) case writes the user buffer, not c->Cc, and also keeps submit1. */
-int orki_submit1_db(ork_npu *c, size_t nout){
-    int fd=c->fd;
-    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags()|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
-    sub.core_mask=1u<<tc;
-    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
-    volatile int32_t *o=(volatile int32_t*)c->Cc.cpu; size_t li=nout-1;
-    int reps=c->warmed?1:2;
-    for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
-        o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
-        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
-        double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0;
-        for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
-        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
-    c->warmed=1; return 0;
-}
 /* ---- multi-core (ORK_NPU_MC=<n>): use n cores (capped at soc->cores). Split each N-slice's
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
@@ -4694,53 +3750,10 @@ int orki_mc_ensure(ork_npu *c,int nc){
 double orki_mc_copy[MCPROF_MAX], orki_mc_sub[MCPROF_MAX], orki_mc_acc[MCPROF_MAX]; long orki_mc_n[MCPROF_MAX];
 double orki_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of orki_mc_sub (the OVERLAPPABLE part; ioctl/NPU = sub-synth) */
 
-void orki_pin_big_core(int id){
-    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
-    if(off) return;
-#if defined(__linux__)
-    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return;
-    int cpu=(int)ncpu-1-id; if(cpu<0) cpu=0;
-    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
-    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
-#endif
-    /* NOTE: this pins only the dedicated NPU-driver threads to their own big core. We deliberately do
-     * NOT restrict the whole process / CPU threadpool to the big cluster: doing so at init was measured
-     * to oversubscribe and CRATER decode at -t 8 (9.3 -> 2.3 tok/s) while not helping -t 4. The big-core
-     * win for the CPU side comes from running with -t = big-core-count (e.g. -t 4 on RK3588), which is a
-     * user/serving choice, not something to force here. See the Thread-Count wiki experiment. */
-}
 /* Pin the calling thread to a LITTLE core (low-numbered: A55 0-3 on RK3588). For off-critical-path /
  * IO-bound / memory-bound work (e.g. the SSM double-buffer marshalling helper) that should run on the
  * idle little cluster WHILE the big cores are saturated by ggml's threadpool + the NPU pool. The A55 is
  * ~2x slower but it's free time overlapped with the NPU submit. Honors ORK_NO_AFFINITY. */
-void orki_pin_little_core(int id){
-    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
-    if(off) return;
-#if defined(__linux__)
-    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return;
-    int cpu=id; if(cpu>=ncpu) cpu=0;           /* low index = little cluster */
-    cpu_set_t s; CPU_ZERO(&s); CPU_SET(cpu,&s);
-    pthread_setaffinity_np(pthread_self(), sizeof s, &s);
-#endif
-}
-void *orki_npu_pool_worker(void *vp){
-    struct ork_pw *pw=vp; ork_npu *c=pw->c; int id=pw->id, mygen=0;
-    orki_pin_big_core(id);                          /* keep this worker off the little cores */
-    for(;;){
-        pthread_mutex_lock(&c->pmu);
-        while(c->pgen==mygen && !c->pstop) pthread_cond_wait(&c->pgo,&c->pmu);
-        if(c->pstop){ pthread_mutex_unlock(&c->pmu); return NULL; }
-        mygen=c->pgen; int nc=c->pjob_nc; void *args=c->pjob; void *(*fn)(void*)=c->pjob_fn; size_t st=c->pjob_stride; pthread_mutex_unlock(&c->pmu);
-        if(id<nc){ fn((char*)args + (size_t)id*st);   /* chain_core_worker / colsplit per-core worker */
-            pthread_mutex_lock(&c->pmu); if(++c->pdone==nc-1) pthread_cond_signal(&c->pdn); pthread_mutex_unlock(&c->pmu); }
-    }
-}
-void orki_npu_pool_ensure(ork_npu *c){
-    if(c->pool_n) return;
-    orki_pin_big_core(0);                           /* calling thread drives NPU core 0 — keep it big too */
-    c->pool_n=c->soc->cores>ORK_MAXCORE?ORK_MAXCORE:c->soc->cores;
-    for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,orki_npu_pool_worker,&c->pwa[i]); }
-}
 /* run_multicore phase timing (ORK_RT): setup (checks+mc_ensure+cres memset), submit (pool dispatch
  * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
 double orki_rt_setup=0, orki_rt_submit=0, orki_rt_copy=0; long orki_rt_n=0;
@@ -4755,8 +3768,6 @@ double orki_rt_setup=0, orki_rt_submit=0, orki_rt_copy=0; long orki_rt_n=0;
  *                matmul then takes its own reset/re-warm path (fp16 entry = warmed=0 re-warm, int8 entry =
  *                ACT_RESET). No explicit HW reset here. Tests whether re-warm alone clears the wedge.
  *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
-void ork_npu_mode_invalidate(ork_npu *c){ if(!c) return; c->last_dt=-1; c->warmed=0; for(int i=0;i<ORK_MAXCORE;i++) c->mwarm[i]=0; }
-void ork_npu_mode_reset(ork_npu *c){ if(!c) return; orki_act(c->fd,RKNPU_ACT_RESET,0); ork_npu_mode_invalidate(c); }
 
 /* ============================ MODE-TRANSITION LAYER (ork_npu_enter) ============================
  * SINGLE owner of "what does moving the NPU's stateful regcmd datapath from mode X to mode Y
@@ -4809,28 +3820,10 @@ void ork_npu_mode_reset(ork_npu *c){ if(!c) return; orki_act(c->fd,RKNPU_ACT_RES
  * PC-chain (one submit, task_number>1); OCK_FUSED = run_chain_i8_ffn static regcmd graph (carries
  * in-chain SDP/LUT ops — ping-pong/LUT-commit rules differ; that specialness lives in the chain body). */
 /* keep-warm predicate selector (from = c->last_dt, to = target marker) */
-enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
 /* reset condition selector */
-enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS, RC_SDPKW };
 /* warm/size-clear condition selector (shared enum for both the warm and the size clear) */
-enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
 /* clear target: bit0 = scalar (warmed / ccsz), bit1 = per-core (mwarm[] / mccsz[]) */
-enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
-struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
 /* transition profiles — one row per distinct historical site (line refs = pre-refactor src/npu.c) */
-static const struct ork_xspec XSPEC[XP_NPROFILE] = {
-  /* XP_MC_MM      3596  run_multicore   */ { KWP_MC,  RC_I8ENTRY,       TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT_NOTKW, 1 },
-  /* XP_SC_MM      4211  run single-core */ { KWP_SC,  RC_I8ENTRY,       TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NT_NOTKW, 1 },
-  /* XP_CHAIN_NT   7194/7477 chain       */ { KWP_MC,  RC_NOTLIVE_NOTKW, TG_SCALAR,  WC_NOTKW,         TG_SCALAR,  WC_NOTKW,    1 },
-  /* XP_STREAM_I8  7821  run_stream_i8   */ { KWP_MC,  RC_NOTLIVE_NOTKW, TG_BOTH,    WC_NOTLIVE_NOTKW, TG_NONE,    WC_NONE,     1 },
-  /* XP_STREAM_F16 7892/8026 stream f16  */ { KWP_F16, RC_NOTKW,         TG_BOTH,    WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
-  /* XP_I4_MC      4000/4161 int4 mc     */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT,       1 },
-  /* XP_I4_MWARM   8692/8783/8816 int4   */ { KWP_NTI, RC_NOTKW,         TG_PERCORE, WC_NOTKW,         TG_NONE,    WC_NONE,     1 },
-  /* XP_I4_INCR    8552  int4 incr       */ { KWP_NTI, RC_NOTKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },
-  /* XP_I4CHAIN    8497  run_chain_i4 (4)*/ { KWP_NONE,RC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,        TG_SCALAR,  WC_ALWAYS,   1 },
-  /* XP_I4_STREAM  9014  stream i4 (5)   */ { KWP_NONE,RC_ALWAYS,        TG_BOTH,    WC_ALWAYS,        TG_NONE,    WC_NONE,     1 },
-  /* XP_SDP        activation/ewmul (4)  */ { KWP_NONE,RC_SDPKW,         TG_NONE,    WC_NONE,          TG_NONE,    WC_NONE,     1 },  /* setdt=1: record SDP mode so a following matmul (int4-grouped/fp16/int8) re-transitions -> resets, fixing the mm-after-SDP wedge */
-};
 /* Enter mode `to` via `profile`. Returns 1 if a real transition fired (last_dt changed, or an SDP
  * entry reset was issued), 0 if this was a no-op (from==to). The return lets the two sites that gate a
  * caller-LOCAL warmup flag off the transition (XP_I4_INCR's `warm`, XP_I4_STREAM's `cold`) stay
@@ -4842,58 +3835,6 @@ long orki_xcount[XP_NPROFILE][8]; int orki_xprof=-1;
 const char *orki_XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
     "I4_MC","I4_MWARM","I4_INCR","I4CHAIN","I4_STREAM","SDP"};
 const char *orki_XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
-int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
-    const struct ork_xspec *x=&XSPEC[profile];
-    int from=c->last_dt, fd=c->fd;
-    /* Record the chaining mechanism as transition state. For the common case it has NO bearing on the
-     * precision-mode reset, so the XSPEC row below is mechanism-agnostic. When a transition is found to
-     * need mechanism-specific handling (e.g. OCK_FUSED's in-chain LUT), branch on `chain` here — the
-     * hook is intentionally explicit even though no entry-transition currently requires it (validated:
-     * mode_probe + test_ssd_chunk_npu). See AGENTS.md §"Mode-transition layer". */
-    c->last_chain = chain;
-    if(orki_xprof<0){ const char*e=getenv("ORK_XPROF"); orki_xprof=(e&&atoi(e))?1:0; }
-    if(orki_xprof){ int fi=from+1; if(fi<0)fi=0; if(fi>7)fi=7; orki_xcount[profile][fi]++; }
-    if(x->setdt && from==to) return 0;                 /* mirrors the old `if(dt!=c->last_dt)` guard */
-    int kw=0;
-    switch(x->kwp){
-      case KWP_MC:  kw=(ork_nothrash()&&ORK_INT_DT(from)&&ORK_INT_DT(to)) || (ork_f16warm()&&ORK_KW_DT(from)&&ORK_KW_DT(to)); break;
-      case KWP_SC:  kw= ork_f16warm()&&ORK_KW_DT(from)&&ORK_KW_DT(to); break;
-      case KWP_NTI: kw= ork_nothrash()&&ORK_INT_DT(from); break;
-      case KWP_NTL: kw= ork_nothrash()&&ORK_I8_LIVE(from); break;
-      case KWP_F16: kw= ork_f16warm()&&ORK_KW_DT(from); break;
-      default:      kw=0;
-    }
-    int rst=0;
-    switch(x->rst){
-      case RC_NOTKW:         rst=!kw; break;
-      case RC_I8ENTRY:       rst=(to==DT_I8 && !ORK_I8_LIVE(from) && !kw); break;
-      case RC_NOTLIVE:       rst=!ORK_I8_LIVE(from); break;
-      case RC_NOTLIVE_NOTKW: rst=(!ORK_I8_LIVE(from) && !kw); break;
-      case RC_ALWAYS:        rst=1; break;
-      case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
-      default:               rst=0;
-    }
-    if(rst){ orki_act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
-    int wclr=0;
-    switch(x->wc){
-      case WC_NOTKW:         wclr=!kw; break;
-      case WC_NOTLIVE_NOTKW: wclr=(!ORK_I8_LIVE(from) && !kw); break;
-      case WC_ALWAYS:        wclr=1; break;
-      default:               wclr=0;
-    }
-    if(wclr){ if(x->wtg&TG_SCALAR)c->warmed=0; if(x->wtg&TG_PERCORE)for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; }
-    int sclr=0;
-    switch(x->sc){
-      case WC_NOTKW:    sclr=!kw; break;
-      case WC_NT:       sclr=!ork_nothrash(); break;
-      case WC_NT_NOTKW: sclr=(!ork_nothrash() && !kw); break;
-      case WC_ALWAYS:   sclr=1; break;
-      default:          sclr=0;
-    }
-    if(sclr){ if(x->stg&TG_SCALAR)c->ccsz=0; if(x->stg&TG_PERCORE)for(int i=0;i<ORK_MAXCORE;i++)c->mccsz[i]=0; }
-    if(x->setdt) c->last_dt=to;
-    return 1;
-}
 /* fp16 multicore matmul (Sn==1) doorbell colsplit — DEFAULT ON (2026-08-05). Bit-exact and 1.04-1.23x faster than
  * mcworker (A/B, governors-verified). The K-split (Sk>1) drop that used to WEDGE was root-caused as a concurrent
  * CROSS-BUFFER weight-fetch wild (HW prefetches Bb[ks+1] while Bb[ks] drains) and is now PREVENTED by CONTIG (one
@@ -9856,17 +8797,9 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     orki_bdestroy(fd, &task_chain); orki_bdestroy(fd, &task_sep);
     return 0;
 }
-const char *ork_npu_version(void){
-#ifdef ORK_GIT_HASH
-    static char v[64]; snprintf(v, sizeof v, "%s+g%s", ORK_NPU_VERSION, ORK_GIT_HASH); return v;
-#else
-    return ORK_NPU_VERSION;   /* no git at build time (e.g. native board build) → semver only */
-#endif
-}
 
 /* .orkpack compat token = library MAJOR version (atoi stops at the first '.'): a format-breaking change
  * requires a major bump, while minor/patch stay backward-compatible. See ork_npu.h. */
-uint32_t ork_pack_format_version(void){ return ORK_PACK_FORMAT_VERSION; }   /* decoupled from the library MAJOR — bump only on a real on-disk format change (see ork_npu.h) */
 
 /* Max M rows a single full-K int8 submit handles at this K (mirrors orki_run()'s M>1 Bf tiling, npu.c
  * "Tier 1c-ii"). Each chain link is ONE full-K submit, so a task's M must not exceed this — else the
@@ -12503,7 +11436,7 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     pc->c = c; pc->S = S; pc->N = N; pc->dom = tasks[0].w->domain;
     /* Park the static regcmd pool + per-op A-scratch in on-chip NPU SRAM when present — it is otherwise-unused
      * memory, so residing there frees DRAM/IOVA for the rest of the pipeline. Detection-gated: bcreate drops
-     * TRY_ALLOC_SRAM to DRAM when g_sram_total==0 (stock kernel/DTB) and fails an over-budget/contended alloc
+     * TRY_ALLOC_SRAM to DRAM when orki_sram_total==0 (stock kernel/DTB) and fails an over-budget/contended alloc
      * over to DRAM per-buffer (so large chains spill gracefully). Opt out with ORK_PC_NO_SRAM (benchmarks). */
     unsigned pcsf = getenv("ORK_PC_NO_SRAM") ? 0 : RKNPU_MEM_TRY_ALLOC_SRAM;
     pc->pool = orki_bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403 | pcsf, c->dom_active);
@@ -13309,17 +12242,6 @@ struct ork_async { pthread_t th; int started; int rc; enum ork_async_kind kind;
  * migrate); a set lets the scheduler place it on any FREE big core -> real CPU‖NPU overlap, never an
  * A55. (The run_multicore pool deliberately pins DISTINCT single cores instead — that's a simultaneous
  * barrier where distinct cores avoid contention; the async worker is a single overlapping thread.) */
-int ork_big_core_set(cpu_set_t *s){
-#if defined(__linux__)
-    static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
-    if(off) return 0;
-    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return 0;
-    CPU_ZERO(s); for(int k=(int)(ncpu/2);k<ncpu;k++) CPU_SET(k,s);  /* top half = big cluster on RK35xx */
-    return 1;
-#else
-    (void)s; return 0;
-#endif
-}
 static void *ork_async_worker(void *p){
     struct ork_async *h = (struct ork_async *)p;
 #if defined(__linux__)
@@ -13803,7 +12725,6 @@ int ork_bmm_fp16(ork_npu *c, int nbatch, int M, int K, int N,
  * is off by default — but it puts the reduction on the NPU as requested. The reduce-matmul + rsqrt-LUT +
  * scale can be CHAINED into ONE submit (run_chain) or fused into an adjacent matmul's output stage; that
  * amortization is the follow-up. On any NPU-path failure it falls back to the CPU result. */
-static int ork_norm_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_NORM_NPU")?1:0; return v; }
 /* cached ones[n,16] fp16 reduce-weight (single-slot; norm calls are single-threaded in the graph) */
 static ork_w *g_ones_w=NULL; static int g_ones_n=0; static ork_npu *g_ones_ctx=NULL;
 static ork_w *norm_reduce_w(ork_npu *c,int n){
@@ -13899,7 +12820,6 @@ int ork_npu_l2norm_f16(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
  * -> exp(x-max)), Σ via the reduction-as-matmul (e·ones[n,16], reusing the norm reduce weight). Like the
  * norm this is submit-floor-bound standalone (gated off; the win is fusing into the attention chain). Any
  * NPU-path failure (PPU-fuse off, n%32!=0, exp/reduce error) falls back to the full CPU softmax. 0/ok,-2. */
-static int ork_softmax_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_SOFTMAX_NPU")?1:0; return v; }
 int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
     if(!c||!x||!out||M<1||n<1) return -2;
     float *mx=malloc((size_t)M*sizeof(float)), *e=malloc((size_t)M*n*sizeof(float)), *s=malloc((size_t)M*sizeof(float));

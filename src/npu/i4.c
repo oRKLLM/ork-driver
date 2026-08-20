@@ -8,6 +8,7 @@
  * Lifted verbatim out of npu.c by the precision split (MODULARIZE_PLAN.md round 1). The int4 PACK/quant
  * side (quant_chan_i4, the NF4 codebook, i4a8 persist, tile_i4_*) is still in the scaffold: it interleaves
  * with the int8 pack code, which is layer-organized, and comes out in a later sweep. */
+#define _GNU_SOURCE   /* CPU_SET/pthread_setaffinity_np, as npu.c does */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

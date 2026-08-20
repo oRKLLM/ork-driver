@@ -8,6 +8,7 @@
  * first real translation unit off the monolith: a single contiguous block with a 3-in / 3-out boundary.
  * Context: the scan LOSES at 130M but WINS ~2x byte-coherent at 2.7B-Q8_0 — the crossover is real (the CPU
  * recurrence is cache-bound and degrades 33x while the NPU path degrades 11x). See the wiki SSM pages. */
+#define _GNU_SOURCE   /* CPU_SET/pthread_setaffinity_np, as npu.c does */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -1,8 +1,13 @@
 /* npu/core/prof.c — profiling and timing accessors: the per-run / per-core / submit-floor counters and
  * the dump helpers. No dtype in any contract; see npu/core.h. Lifted verbatim from npu.c. */
+#define _GNU_SOURCE   /* CPU_SET/pthread_setaffinity_np, as npu.c does */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
+#include <sys/prctl.h>
+#include "ork_regs.h"
+#include "regcmd_i8.h"
 #include "npu/internal.h"
 #include "npu/core.h"
 

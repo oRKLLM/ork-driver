@@ -69,7 +69,7 @@ void orki_act(int fd,uint32_t f,uint32_t v);
 void orki_dump_submit(struct rknpu_submit *sub);
 void orki_trace_submit(struct rknpu_submit *sub);
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain);
-uint32_t ork_ppflags(void); /* fwd (defined below) */ /* #39 WEIGHT-RESIDENT M-FOLD CHAIN (task_number=P). Each of P tasks is a width-`w` mfold tile built by the * validated synth_i8_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all * P tasks (HW PC-chain), amortizing the weight-DMA over M=P*w rows. Chain descriptor written at words 216-219 * EXACTLY like the PROVEN run_chain_i8/mcworker_pref_chain; terminal task clears them. subcore_task[0..2] all * populated (single-core), matching run_chain_i8. Apacked = P tiles of w-row C2-16 A (w*K bytes each); Bpacked = * shared ork_woff weight; Craw = P tiles of raw C2-4 int32 (w*N int32 each). Board only; returns 0/ok, us=avg. */ int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N, const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us);
+uint32_t ork_ppflags(void);
 int orki_submit1(ork_npu *c);
 int orki_submit1_db(ork_npu *c, size_t nout);
 
@@ -145,5 +145,36 @@ extern long orki_xcount[XP_NPROFILE][8];
 extern long long orki_fd_hw_raw_last;
 extern size_t orki_lp_bytes;
 extern long orki_rt_n;
+
+/* ---- state + helpers shared with the scaffold (de-static'd at the core move) ---- */
+#define ORK_IOVA_NDOM 64
+extern int orki_dmaheap_fd;
+extern int orki_imp_n, orki_imp_cap;
+extern int orki_live_fd;
+extern int orki_live_n, orki_live_cap;
+extern int orki_reap_n;
+extern long orki_bcreate_n, orki_bimport_n, orki_bdestroy_n;
+extern long orki_prof_submit_chained;
+extern long orki_prof_submit_progs;
+extern pthread_mutex_t orki_live_mu;
+extern size_t orki_iova_bytes[ORK_IOVA_NDOM];
+extern uint64_t orki_sram_total;
+extern volatile sig_atomic_t orki_sig_busy;
+int orki_imp_trace(void);
+int ork_dom(int dom);
+void orki_fold_scratch_free(ork_npu *c);
+void orki_live_add(int fd, uint32_t h, uint64_t o);
+void orki_live_del(uint32_t h);
+void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride);
+
+extern struct buf **orki_imp;
+extern int orki_imp_n, orki_imp_cap;
+
+void ork_sig_teardown(int sig);
+extern struct ork_npu *orki_npu_ctx;
+
+void orki_setrn(uint32_t *rc, int n, enum ork_reg_id id, uint32_t v);
+
+void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
 
 #endif /* ORK_NPU_CORE_H */

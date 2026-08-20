@@ -260,4 +260,26 @@ int  orki_i4_submit_tmo_ms(void);
 int  orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
 int  orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);
 
+struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
+
+/* mode-transition policy selectors (XSPEC rows live in core/mode.c) */
+enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
+enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS, RC_SDPKW };
+enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
+enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
+
+/* ---- dtype predicates ---- */
+#define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)
+#define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)
+#define ORK_KW_DT(dt) (ORK_I8_LIVE(dt) || (dt)==DT_F16)
+
+/* ---- env-knob accessors: one-line cached getenv, static inline so every module can read them
+ * without a cross-TU call (each TU keeps its own idempotent cache) ---- */
+static inline int ork_nothrash(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_MIXED_NOTHRASH"); v=(e&&atoi(e))?1:0;} return v; }
+static inline int ork_f16warm(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SSM_KEEPWARM"); v=e?(atoi(e)?1:0):1;} return v; }
+static inline int ork_sdp_noreset(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_SDP_NORESET"); v=e?(atoi(e)?1:0):1;} return v; }
+static inline int ork_precomp(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_PRECOMP_RC"); v=(e&&atoi(e))?1:0;} return v; }
+static inline int ork_norm_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_NORM_NPU")?1:0; return v; }
+static inline int ork_softmax_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_SOFTMAX_NPU")?1:0; return v; }
+
 #endif /* ORK_NPU_INTERNAL_H */
