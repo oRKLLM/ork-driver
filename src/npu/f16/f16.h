@@ -47,7 +47,6 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov, const uin
 int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us);
 int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint16_t *reshape_raw,int reshape_words,double *us);
 int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us);
-int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_t *out_raw,int out_words,double *us);
 int ork_npu_rmsnorm_f16(ork_npu *c,int M,int n,const f16 *x,const f16 *w,float eps,f16 *out);
 int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out);
 int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out);

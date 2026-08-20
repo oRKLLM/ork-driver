@@ -32,10 +32,6 @@ int          ork_npu_probe_single_i8(ork_npu *ctx, int K, int N, const int8_t *A
  * (raw device layout). The RE crux for the on-NPU matmul->int16-silu handoff. 0/ok, -1 wedged, -2 dims. */
 int          ork_npu_probe_i16_out(ork_npu *ctx, int M, int K, int N, const int8_t *A, const int8_t *B,
                                    int mult, int shift, short *C, double *us);
-/* Fused EXP LUT for the coalesced chain (softmax): HW-chains exp onto the score matmul via run_chain_i8_gsilu.
- * Scores must be <=0 (post-max domain). Same signature/calibration as the silu LUT. 0/ok, -1 fail. */
-int          ork_mm_chain_build_exp_lut(ork_npu *ctx, double in_scale, double out_scale,
-                                        int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut);
 
 /* PPU FUSED SiLU (step 2): full-K int8 matmul with SiLU applied on-chip via the LUT output stage. Two
  * sequential submits (LUT-load into PPU SRAM, then matmul reading it). A[M*K],B[K*N] int8; C[M*N] int8.
@@ -72,9 +68,6 @@ int          ork_npu_probe_sdp_chain_fwd(ork_npu *ctx, int *t0_ok, int *t1_ok);
 /* STAGE-1 PROBE: [matmul->ewmul(SDP middle)->matmul] NONBLOCK chain on the begin_mc recipe (warmed scratch +
  * clean-before), completion via the terminal matmul sentinel. *ok = all three outputs bit-exact. 0/ok,-1/-2/-3. */
 int          ork_npu_probe_seq_hetero(ork_npu *ctx, int *ok);
-/* Self-test: chain 2 plain int8 matmuls (all-ones) and verify BOTH tasks execute. *t0_cnt / *t1_cnt = count
- * of M*N int32 slots == K or 2K (near M*N => that task ran). Validates chain_progs w/ a real task0. */
-int          ork_npu_chain_selftest(ork_npu *ctx, int *t0_cnt, int *t1_cnt);
 
 /* Faithful fp16 replay: run RKNN's fp16 LUT-load program (`loader`/`ln`) + the fp16 compute op verbatim,
  * patching only I/O + M/N. Uses the fp16 (LE-table) loader, not the int8 LO loader. in/out fp16 [M*N], N%8==0. */
@@ -92,22 +85,8 @@ int          ork_npu_replay_lut_i16(ork_npu *ctx, const unsigned *regcmd, int rn
  * wedge-safe). Avar = nvar A-images each `astride` bytes; Couts = nvar contiguous M*N int32 results. 0/ok. */
 int          ork_npu_replay_i8_sweep(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
                                const signed char *Avar, int nvar, int astride, const signed char *Bdata, int Bbytes, int *Couts);
-/* #39 A-layout mapper: for nk0 weight one-hot positions Bpos (ork_woff byte for (n0,k0)), recover per output
- * slot the A byte offset the fold read. Fills rpos[nk0*M] (raw C int32 index), aoff[nk0*M] (A byte offset),
- * cnt[nk0] (slots found). One buffer set, wedge-safe. 0/ok. */
-int          ork_npu_replay_i8_amap(ork_npu *ctx, const unsigned *regcmd, int rn, int M, int K, int N,
-                               const unsigned *Bpos, int nk0, int n0, int *rpos, int *aoff, int *cnt);
 /* #39 PORT (RE): dump ork's synth_i8 regcmd for (mc,K,N) to diff vs rkllm's captured regcmd. Returns word count. */
 int          ork_npu_synth_i8_dump(ork_npu *ctx, int mc, int K, int N, unsigned *out, int outn);
-/* #39 same, but each task is a CAPTURED bit-exact tile regcmd (tile_rc/trn) with only addresses re-based. */
-int          ork_npu_mfold_chain_cap(ork_npu *ctx, int P, int w, int K, int N,
-                                     const unsigned *tile_rc, int trn,
-                                     const signed char *Apacked, const signed char *Bpacked,
-                                     int *Craw, int iters, double *us);
-/* #39 TIMING probe: replay P DIFFERENT captured tiles (tiles=P*rn words) in one chain, shared weight, zeroed
- * operands. The timing slope vs P reveals weight re-DMA (linear) vs resident reuse (sublinear). */
-int          ork_npu_mfold_chain_multi(ork_npu *ctx, int P, int w, int K, int N,
-                                       const unsigned *tiles, int rn, int iters, double *us);
 /* #39 Path-1 TOKEN-TILER executor: run P fold sub-tiles of one M_total-token batch as ONE multi-task submit over a
  * SHARED batch cube (M_total x K nc16 in, M_total x N c4 out, shared woff weight). Tile t handles rows
  * [row_off[t], row_off[t]+m) at byte offset row_off[t]*16. Caller prepares each tile's regcmd (per-size skeleton +
@@ -140,9 +119,6 @@ int          ork_npu_overlap_prof(ork_npu *ctx, int M, int K, int N, int cpu_rep
 /* RE (WIP): full-chain replay of vendor gemm+reshape (task0-10); returns gemm output (contiguous) + reshape
  * output (atom-8) so caller verifies reshape_out==atom8(gemm_out). Loads gemm_mul_image.bin. See RESHAPE_WIP.md. */
 int          ork_npu_replay_reshape_f16(ork_npu *ctx, unsigned short *gemm_raw, int gemm_words, unsigned short *reshape_raw, int reshape_words, double *us);
-/* RE (WIP): vendor fp16 contiguous->atom-8 RESHAPE base op (task4) with a constructed permutation weight.
- * Reads the output RAW for layout inspection. N=64/M<=8 only (captured geometry). See RESHAPE_WIP.md. */
-int          ork_npu_reshape_probe_f16(ork_npu *ctx, int M, int N, const unsigned short *src, unsigned short *out_raw, int out_words, double *us);
 /* LOOPBACK Pass-2: standalone SDP reads INT32 accumulator from DRAM, per-channel scale + requant -> int16.
  * out[m][n]=clamp_i16(a_i32[m][n]*b[n]*mult>>shift). Routes around the broken CNA->DPU requant-WDMA. */
 int          ork_npu_requant_perchan_i32(ork_npu *ctx, const int *a, const short *b, int M, int N, int mult, int shift, short *out, double *us);
@@ -216,10 +192,5 @@ int          ork_npu_mm_perchan_f16(ork_npu *ctx, int M, int K, int N, const uns
 int          ork_npu_mm_perchan_f16_diag(ork_npu *ctx, int M, int K, int N, const unsigned short *A,
                                  const unsigned short *B, const unsigned short *scale, unsigned short *out, double *us);
 
-/* RE/calibration only: run S chained M=1 full-K int8 matmuls using PC-chaining in a single submit */
-int          ork_npu_probe_chain_i8(ork_npu *ctx, int S, int K, int N, const int8_t *A,
-                                    const int8_t *B, int32_t *C);
 
-/* RE/calibration only: benchmark S chained matmuls vs S separate submits using pre-allocated memory */
-int          ork_npu_benchmark_chain(ork_npu *ctx, int S, int K, int N, int iters);
 #endif /* ORK_PROBE_H */

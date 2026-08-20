@@ -144,41 +144,6 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
     return ok;
 }
 
-int ork_npu_reshape_probe_f16(ork_npu *c,int M,int N,const uint16_t *src,uint16_t *out_raw,int out_words,double *us){
-    int fd=c->fd;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(N!=64||M<1||M>8) return -2;   /* WIP: captured pattern/geometry is M=8,N=64 */
-    static const int WPOS[64]={0,65,136,201,272,337,408,473,544,609,680,745,816,881,952,1017,1026,1091,1162,
-        1227,1298,1363,1434,1499,1570,1635,1706,1771,1842,1907,1978,2043,2052,2117,2188,2253,2324,2389,2460,
-        2525,2596,2661,2732,2797,2868,2933,3004,3069,3078,3143,3214,3279,3350,3415,3486,3551,3622,3687,3758,
-        3823,3894,3959,4030,4095};
-    size_t isz=(size_t)M*N*2; if(isz<4096)isz=4096;
-    size_t osz=(size_t)M*N*2*2; if(osz<8192)osz=8192;   /* generous output room */
-    struct buf In=orki_bcreate(fd,isz,0x403,-1), W=orki_bcreate(fd,8192,0x403,-1), O=orki_bcreate(fd,osz,0x403,-1);
-    if(!In.cpu||!W.cpu||!O.cpu){ orki_bdestroy(fd,&In);orki_bdestroy(fd,&W);orki_bdestroy(fd,&O); return -2; }
-    memset(In.cpu,0,isz); memset(W.cpu,0,8192); memset(O.cpu,0,osz);
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++) ((uint16_t*)In.cpu)[(size_t)m*N+n]=src[(size_t)m*N+n];
-    for(int i=0;i<64;i++) ((uint16_t*)W.cpu)[WPOS[i]]=0x3c00;   /* fp16 1.0 permutation (channel reorder) */
-    orki_bsync(fd,&In,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
-    uint32_t rc[REGCMD_RESHAPE_F16_N]; memcpy(rc,REGCMD_RESHAPE_F16,sizeof rc);
-    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)In.dma);    /* input base (CNA activation) */
-    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)W.dma);     /* weight base (permutation) */
-    orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);    /* output base (DPU) */
-    { const char*e;   /* RE: reconcile the reshape read geometry to OUR contiguous [M][N] input pitch */
-      if((e=getenv("ORK_RSH_107C"))) orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON1,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_RSH_1080"))) orki_setrn(rc,REGCMD_RESHAPE_F16_N,RK_CNA_DMA_CON2,(uint32_t)strtoul(e,0,0)); }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
-      t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};sub.timeout=orki_ew_timeout_ms();
-    int ok=-1; double t0=ork_now_us();
-    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    else { orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }   /* coherent buffer: read partial write on fail too */
-    if(out_raw){ int w=(int)(osz/2); if(w>out_words)w=out_words; for(int i=0;i<w;i++) out_raw[i]=((uint16_t*)O.cpu)[i]; }
-    orki_bdestroy(fd,&In);orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
-    return ok;
-}
 
 int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
                                uint32_t idx_off,uint32_t cfg4064,uint32_t cfg4068,

@@ -2040,13 +2040,6 @@ int orki_fused_mtile(int K,int M){
  * const-LUT calibration harness; lut==NULL keeps the captured fixed silu curve. */
 
 
-/* Fused EXP LUT for the coalesced chain output stage (softmax): lut[idx(acc)] = clamp(exp(acc*in_scale)/out_scale/R).
- * Same 2-pass calibration as silu; scores must be <=0 (post-max softmax domain) so exp in (0,1] fits int8 (acc>0
- * entries clamp). Lets run_chain_i8_gsilu HW-chain exp onto the score matmul in ONE submit. 0/ok,-1 fail. */
-int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
-                               int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
-    return orki_chain_build_lut_fn(c, orki_exp_f, in_scale, out_scale, r_mult, r_shift, cfg4068, lut);
-}
 
 /* Constant SDP index params for the standalone activation-LUT op (from the RKNN SiLU capture). The op's
  * index math idx(in) depends ONLY on these (not on in/out scale), so one calibration serves every scale. */
@@ -2887,5 +2880,3 @@ int orki_bmm_c_dense(const ork_bmm_strides *s,int N){ return s->cs_n==1 && s->cs
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
 
 /* ==== CPU-side pack/dump helpers linked by the ggml-ork backend (no internal callers) ==== */
-
-

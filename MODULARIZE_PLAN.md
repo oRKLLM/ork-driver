@@ -761,3 +761,43 @@ AGENTS §4's layout map still described the pre-round-6 tree — no `dyn_seq`/`d
 `probe_*` files, no `include/ork/` (rounds 3-4), and none of the four orkd files (rounds 8-9). A map that
 describes a tree that no longer exists is worse than no map, because it is the first thing a new agent
 reads. Fixed, along with which half of the public header is supported API versus RE surface.
+
+## Retiring the dead exports (2026-08-20)
+
+Eight exported declarations had no reference anywhere — not `src/`, `examples/`, `tools/`, `include/`, nor
+any of 12 fork branches. Retired on the user's decision. **Recovery point: commit `291412b`**; each is
+recoverable with `git show 291412b:<path>`.
+
+| symbol | was in |
+|---|---|
+| `ork_mm_chain_build_exp_lut` | `src/npu.c` |
+| `ork_npu_benchmark_chain` | `src/npu/i8/probe_chain.c` |
+| `ork_npu_chain_selftest` | `src/npu/i8/probe_chain.c` |
+| `ork_npu_mfold_chain_cap` | `src/npu/i8/fold.c` |
+| `ork_npu_mfold_chain_multi` | `src/npu/i8/fold.c` |
+| `ork_npu_probe_chain_i8` | `src/npu/i8/chain.c` |
+| `ork_npu_replay_i8_amap` | `src/npu/i8/probe_replay.c` |
+| `ork_npu_reshape_probe_f16` | `src/npu/f16/replay.c` |
+
+Public declaration count 296 → 288, and the diff names exactly those eight — not a count that happens to
+drop by eight.
+
+**Re-verified before deleting, and that mattered.** The dead-list was measured back in round 4 and the tree
+moved a great deal since. Two things had changed:
+
+- `ork_npu_chain_selftest` appeared to have a caller in `i8/chain.c`. It did not — that was a **comment I
+  myself wrote in round 8** while moving `ork_npu_chain_progs`. Comment-stripped, 0 real uses. Had I trusted
+  the raw grep I would have wrongly spared it; had I trusted round 4 blindly I would have deleted without
+  noticing the reference at all.
+- `ork_mm_chain_build_exp_lut` is **named in a PROVEN OPS_REGISTRY row**. That looked like a blocker, but
+  `chainexp_probe` calls only `ork_mm_run_chain_i8_ffn_exp`, and that builds its curve internally via
+  `orki_silu_build_curve_biased(orki_exp_f,…)`. The registry row simply over-claimed. Citation corrected in
+  the same commit per AGENTS; **status untouched** — still PROVEN, same probe, same evidence.
+
+Two mechanical traps on the way out, both caught by verification rather than by reading:
+
+- The header sweep removed 7 of 8 declarations from `include/ork/probe.h`. The missed one spanned four
+  lines and my match window was three. A count that does not equal the expected number is a finding.
+- The correcting note I added to the registry **re-cited the retired symbol**, and check 2 greps the whole
+  file for `ork_*` tokens regardless of backticks — so documenting the removal re-broke the gate. The note
+  now describes the wrapper without naming it and points here for the name.

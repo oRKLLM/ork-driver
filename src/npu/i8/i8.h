@@ -61,12 +61,9 @@ int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_
 int ork_npu_fold_run_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int ncore,int iters,double*us);
 int ork_npu_fold_run_w(ork_npu*c, ork_w*w, int M, const int8_t*Araw, int32_t*Cout, int iters, double*us);
 int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us);
-int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32_t *tile_rc, int trn, const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us);
-int ork_npu_mfold_chain_multi(ork_npu *c, int P, int w, int K, int N, const uint32_t *tiles, int rn, int iters, double *us);
 int ork_npu_mfold_chain_v(ork_npu *c, int P, const int *ws, int K, int N, const uint32_t *tiles, int rn, const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int wreuse, int iters, double *us);
 int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,int mult,int shift,int8_t *out,double *us);
 int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N, int mult,int shift,uint32_t bscale,int za,int zb,int zo,int8_t *out,double *us);
-int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,const int8_t *G, int mult,int shift,int8_t *C,double *us);
 int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const int8_t *G,int8_t *C,double *us);
 int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,int Wsz, const void*gl,int Gsz,void*out,int Osz,double *us);
@@ -80,7 +77,6 @@ int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N, int r_mult,i
 int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N, int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off, uint32_t cfg4064,uint32_t cfg4068,const int16_t *lut,int nlut, int16_t *out,double *us);
 int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C);
 int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N, const int8_t *Adata, int Abytes, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us);
-int ork_npu_replay_i8_amap(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N, const uint32_t *Bpos, int nk0, int n0, int32_t *rpos, int32_t *aoff, int32_t *cnt);
 int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N, const int8_t *Avar, int nvar, int astride, const int8_t *Bdata, int Bbytes, int32_t *Couts);
 int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us);
 int ork_npu_rsqrt_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us);

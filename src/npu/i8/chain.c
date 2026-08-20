@@ -43,85 +43,6 @@ static void *chainrr_worker(void *vp){
 
 
 
-int ork_npu_probe_chain_i8(ork_npu *c, int S, int K, int N, const int8_t *A, const int8_t *B, int32_t *C) {
-    int fd = c->fd, CBUF = c->soc->cbuf_elems;
-    if (K % 32 || N % 32 || N > c->soc->nmax || S < 1 || S > 32) return -2;
-    struct buf W = orki_bcreate(fd, (size_t)K * N, 0x403,-1); if (!W.cpu) return -2;
-    int NN = N / 32, KT = K / 32; int8_t *bb = W.cpu;
-    for (int nt = 0; nt < NN; nt++) for (int kt = 0; kt < KT; kt++) for (int nl = 0; nl < 32; nl++) for (int kk = 0; kk < 32; kk++)
-        bb[(size_t)nt * KT * 32 * 32 + (size_t)kt * 32 * 32 + nl * 32 + kk] = B[(size_t)(kt * 32 + kk) * N + (nt * 32 + nl)];
-    orki_bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(fd, &W, RKNPU_MEM_SYNC_TO_DEVICE);
-    
-    struct buf O = orki_bcreate(fd, (size_t)S * 4096, 0x403,-1); if (!O.cpu) { orki_bdestroy(fd, &W); return -2; }
-    
-    int8_t *ad = c->Af.cpu;
-    for (int i = 0; i < S; i++) {
-        for (int j = 0; j < K; j++) ad[i * K + j] = A[i * K + j];
-    }
-    orki_bsync(fd, &c->Af, RKNPU_MEM_SYNC_TO_DEVICE);
-    
-    orki_act(fd, RKNPU_ACT_RESET, 0);
-    
-    uint32_t rc[REGCMD_I8_N];
-    for (int i = 0; i < S; i++) {
-        uint32_t act_dma = (uint32_t)(c->Af.dma + i * K);
-        uint32_t out_dma = (uint32_t)(O.dma + i * 4096);
-        orki_synth_i8(rc, 1, K, N, act_dma, (uint32_t)W.dma, out_dma, 1, CBUF, 0);
-        orki_setrn(rc, REGCMD_I8_N,RK_CNA_CBUF_CON0, 0xb1);
-        struct buf extra[2] = {W, O};
-        if (orki_validate_regcmd("probe_chain_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
-        
-        if (i < S - 1) {
-            uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I8_N * 4;
-            rc[216] = 0x0010 | ((next_dma & 0xffff) << 16);
-            rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
-            rc[218] = 0x0014 | (0x0037 << 16);
-            rc[219] = (0x0101 << 16) | (0);
-        } else {
-            rc[216] = 0;
-            rc[217] = 0;
-            rc[218] = 0x00000014;
-            rc[219] = 0x01010000;
-        }
-        memcpy((char*)c->regcmd.cpu + i * sizeof(rc), rc, sizeof(rc));
-    }
-    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
-    
-    struct rknpu_task *t = c->task.cpu;
-    memset(t, 0, S * sizeof(struct rknpu_task));
-    for (int i = 0; i < S; i++) {
-        t[i].enable_mask = 0xd;
-        t[i].int_mask = 0x300;
-        t[i].int_clear = 0x1ffff;
-        t[i].regcfg_amount = 108;
-        t[i].regcmd_addr = c->regcmd.dma + i * REGCMD_I8_N * 4;
-    }
-    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-    
-    struct rknpu_submit sub; memset(&sub, 0, sizeof(sub));
-    sub.task_start = 0;
-    sub.task_number = 1; // HIDE the chained tasks from the kernel! The kernel rejects task_number > 1.
-    sub.task_counter = 0;
-    sub.priority = 0;
-    sub.task_obj_addr = c->task.obj;
-    sub.core_mask = RKNPU_CORE_AUTO_MASK;
-    sub.subcore_task[0].task_start = 0;
-    sub.subcore_task[0].task_number = 1; // Hide from subcore logic too!
-    
-    int ok = -1;
-    for (int rep = 0; rep < 2; rep++) {
-        sub.timeout = orki_mm_timeout_ms();
-        if (orki_rknpu_submit_ioctl(fd, &sub, -1)) { ok = -1; continue; }
-        orki_bsync(fd, &O, RKNPU_MEM_SYNC_FROM_DEVICE);
-        for (int i = 0; i < S; i++) {
-            memcpy(C + i * N, (char*)O.cpu + i * 4096, (size_t)N * 4);
-        }
-        ok = 0;
-    }
-    
-    orki_bdestroy(fd, &W); orki_bdestroy(fd, &O);
-    return ok;
-}
 
 int orki_chain_fullk_mcap_i8(ork_npu *c, int K) {
     int RB = 2 * c->soc->cbuf_elems, R = RB / K; if (R < 1) R = 1;
@@ -831,7 +752,8 @@ int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *c
  * It lived in i8/probe.c until MODULARIZE_PLAN.md round 7, because that is where it was written
  * during the chain RE. It is NOT a probe: it has six callers inside the library and is what the
  * heterogeneous chain paths are built on (round 4 classified it production on caller evidence). The
- * comment that used to sit above it there belonged to ork_npu_chain_selftest and has been returned. */
+ * comment that used to sit above it there documented a different function entirely and was returned
+ * to it; that function has since been retired as unreferenced. */
 int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom){
     if(!c||!progs||n<1||n>1024) return -2;
     int fd=c->fd;
