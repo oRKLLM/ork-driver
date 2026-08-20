@@ -282,4 +282,25 @@ static inline int ork_precomp(void){ static int v=-1; if(v<0){const char*e=geten
 static inline int ork_norm_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_NORM_NPU")?1:0; return v; }
 static inline int ork_softmax_npu_enabled(void){ static int v=-1; if(v<0) v=getenv("ORK_SOFTMAX_NPU")?1:0; return v; }
 
+#define REGCMD_I8_EW_N (REGCMD_I8_N + REGCMD_EW_LANE_N)   /* 224 + 36 = 260 words = 126 reg entries + trailer */
+
+/* ---- scaffold <-> f16 module ---- */
+double orki_silu_f(double x);
+int ork_f16_colsplit(void);
+int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out);
+int ork_norm_reduce_npu(ork_npu *c,int M,int n,const f16 *x,float *ss_out);
+int ork_norm_rsqrt_npu(ork_npu *c,int M,int nf,double eps,const float *ss,float *scale);
+int orki_bmm_c_dense(const ork_bmm_strides *s,int N);
+ork_bmm_strides orki_bmm_natural(int M,int K,int N);
+unsigned orki_ew_timeout_ms(void);
+void orki_bmm_scatter_i32(int32_t *dst, const int32_t *src, int rows, int cols, long sr, long sc);
+void orki_set_f16_out(uint32_t*rc,int N,int stride);
+void orki_set_f16_out_fp16in(uint32_t*rc,int M,int N);
+void orki_set_mul_geom(uint32_t *rc,int n,int M,int N);
+void orki_splice_ew_lane(uint32_t*rc,const uint32_t*base);
+void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf);
+
+void orki_bmm_gather_i8(int8_t *dst, const int8_t *src, int rows, int cols, long sr, long sc);
+void orki_bmm_gather_f16(f16 *dst, const f16 *src, int rows, int cols, long sr, long sc);
+
 #endif /* ORK_NPU_INTERNAL_H */
