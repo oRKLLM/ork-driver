@@ -428,10 +428,26 @@ TEST_TIMEOUT ?= 360
 # line (`ORK_SSM_KEEPWARM=0 make test`) silently never reached the binaries and the run looked like a pass
 # of a config it never exercised. `sudo -E` preserves it. Override if a sudoers policy forbids -E.
 SUDO ?= sudo -E
-test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe orkd orkd_probe
+# The `test:` recipe is ONE backslash-continued logical line: make runs each recipe LINE in its own
+# shell, so $$fail and the exported ORKD_BIN only survive while the continuation is unbroken. Do not
+# put a `#` comment inside it — a comment cannot carry a trailing backslash (the shell would swallow
+# the next line into it), so adding one splits the recipe and silently loses all shell state. That
+# exact mistake made the suite report TESTS FAILED with every test passing, and made the orkd gate
+# run without ORKD_BIN so the daemon never spawned. Explanations go HERE, above the target.
+#
+# The orkd daemon gate runs LAST (the daemon owns the NPU) and is grouped rather than folded into the
+# loop, because orkd_seq_probe needs ORK_USE_ORKD=1 and the loop has one shared environment.
+test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
 	@fail=0; ORKD_BIN=$$PWD/orkd; export ORKD_BIN; \
-	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe" "orkd_probe mm"; do \
+	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
+	for t in "orkd_probe mm" "orkd_ring_probe" "orkd_dom_api"; do \
+	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
+	echo "== orkd_seq_probe (Path B)"; \
+	$(SUDO) env ORK_USE_ORKD=1 timeout -k 15 $(TEST_TIMEOUT) ./orkd_seq_probe >/tmp/ork_seq.log 2>&1 || fail=1; \
+	cat /tmp/ork_seq.log; \
+	if grep -q "orkd_connect failed" /tmp/ork_seq.log; then \
+	 echo "FAIL - orkd_seq_probe fell back to the LOCAL NPU: it printed PASS without exercising the daemon at all"; fail=1; fi; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./llama2 "$(MODEL)" 6 || fail=1; \
 	 else echo "== llama2 SKIP (no $(MODEL))"; fi; \
 	if pgrep -x orkd >/dev/null 2>&1; then echo "== reaping orkd (SIGTERM; never -9 — an abrupt kill mid-submit wedges the IOMMU)"; \

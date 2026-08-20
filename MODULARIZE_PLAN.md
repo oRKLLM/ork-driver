@@ -694,3 +694,70 @@ Cut thematically, since nothing constrained where:
 Verified by the tree-wide code-multiset invariant: **zero removals**, and all 50 additions are replicated
 `#include`/`#define` preamble (2 new files × 25 lines). `CORE` gained both new TUs — that is checked, not
 assumed, because omitting it does not fail the build; the objects simply never compile.
+
+## Round 11 — widening the daemon gate to match what rounds 8-10 moved (2026-08-20)
+
+Round 7 gave `orkd` its first behavioural test, and rounds 8-9 then restructured the daemon and its client
+substantially. But `orkd_probe mm` only exercises **pack → run → free**. Everything else rounds 8-9 touched
+— the A-ring transport, the heterogeneous seq path, the domain calls — was being validated by "it links".
+
+Three sibling probes already existed as board tools and already self-validate with a nonzero exit; they were
+simply never wired in:
+
+| probe | covers what `orkd_probe mm` does not |
+|---|---|
+| `orkd_ring_probe` | `orkd_ring_setup/submit/collect` + `handle_ring_setup` + `ring_service` + `g_ring_c` — bit-exact socket-vs-ring, sync **and** pipelined |
+| `orkd_seq_probe` | `handle_seq` + `orkd_submit_seq` — six attention SDP ops checked against a CPU reference, via Path B |
+| `orkd_dom_api` | `handle_dom_req`/`handle_dom_rel` + `orkd_domain_alloc/free` — bit-exact per domain |
+
+That is close to exactly the code rounds 8, 9 and 10 relocated, which is the point: the gate should cover
+what the refactor moved, not just what was easy to test first.
+
+**The four daemon tests are now a grouped block rather than entries in the generic loop.** `orkd_seq_probe`
+needs `ORK_USE_ORKD=1` to take Path B, and the loop has one shared environment — so it gets its own line
+with `$(SUDO) env VAR=..`, never `VAR=.. sudo`, which strips it (the trap already documented in AGENTS §3).
+Grouping also keeps the "daemon owns the NPU" tests together, immediately before the SIGTERM reaper.
+
+Each was validated STANDALONE before being trusted in the suite. A probe that has never been a gate test is
+not known-good just because it exists — wiring in a flaky one would poison every future run, and the cost of
+finding out later is far higher than the cost of checking now.
+
+
+## Round 12 — the NPU guard, and what a bad contention check cost (2026-08-20)
+
+Round 11's board validation **collided with a parallel session's `make test`**. Result: three
+`RKNPU: switch iommu domain time out` faults with `rknpu_gem_object_create error`, and — the part that
+actually hurt the other run — an orphaned `orkd` left holding an IOMMU domain, which blocked *their* domain
+switches until it was SIGTERMed. It exited in 1 s and the fault count froze; damage was bounded, but caused.
+
+**The cause was my detection, not my timing.** I polled `pgrep -x make`. Their suite runs its recipe as
+`/bin/sh -c fail=0; for t in ...`, so `make` never matched and the board read as free.
+
+The parallel session had already written a better check as `/tmp/npu_guard.sh`, and its own comment names
+the exact bug: *"name-based pgrep misses renamed binaries."* It asks who holds the **render node** via
+`/proc/*/fd` → `renderD12[89]`, which sees the device rather than a process name, plus NPU utilisation and
+whether a fault storm is in progress (a wedge in flight looks idle by utilisation alone).
+
+Landed at `tools/util/npu_guard.sh`, attributed in the header, detection logic unchanged — `/tmp` does not
+survive a reboot, and two sessions gating on two different mechanisms is how this happened.
+
+**Added on top: an flock.** Checking and then launching is a race; the window between "guard says free" and
+"my submit starts" is precisely where the incident landed. With `--` the lock is held for the lifetime of
+the command. Verified all four paths, not assumed:
+
+| case | result |
+|---|---|
+| free board, check only | `GUARD OK`, exit 0 |
+| `-- <cmd>` on a free board | runs, lock released |
+| second session while held | `GUARD BLOCKED`, **exit 1**, command did not run |
+| `ORK_NPU_LOCK_WAIT=15` | queued, then ran |
+
+The blocked case initially reported `exit=0` — that was `tail`'s status through a pipe, not the guard's.
+Re-tested without the pipe: exit 1. A guard that prints BLOCKED and exits 0 is worse than no guard, and
+that one is easy to accept by eye.
+
+### Also in round 12: the docs had gone stale under the refactor
+AGENTS §4's layout map still described the pre-round-6 tree — no `dyn_seq`/`dyn_ctl`, none of the four
+`probe_*` files, no `include/ork/` (rounds 3-4), and none of the four orkd files (rounds 8-9). A map that
+describes a tree that no longer exists is worse than no map, because it is the first thing a new agent
+reads. Fixed, along with which half of the public header is supported API versus RE surface.

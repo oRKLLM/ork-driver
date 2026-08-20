@@ -29,3 +29,20 @@ with the "no macOS binary transfers" rule).
 ```sh
 tools/util/sync_daemon.sh &     # edit REPO/OUTBOX_LOCAL paths at the top for your checkout
 ```
+
+## `npu_guard.sh` — run this before anything that touches the NPU
+
+    sudo tools/util/npu_guard.sh                 # check only: exit 0 = free, non-zero = DO NOT START
+    sudo tools/util/npu_guard.sh -- make test    # take the lock, re-check, then run
+    ORK_NPU_LOCK_WAIT=300 sudo -E tools/util/npu_guard.sh -- make test   # queue instead of failing
+
+The RK3588 NPU is single-stream: two concurrent direct-NPU processes wedge the IOMMU, and recovering costs
+a reboot or a power-cycle. The guard checks three things — who holds the render node (via `/proc/*/fd`, so
+it sees the device rather than a process name), whether NPU utilisation is idle, and whether a fault storm
+is already in progress (a wedge in progress looks idle by utilisation alone).
+
+`--` additionally holds an `flock` for the lifetime of the command, which closes the check-then-launch race.
+Without it two sessions can both pass the check and then collide.
+
+Origin: written by a parallel session as `/tmp/npu_guard.sh`; landed here so it survives a reboot and every
+session gates on the same check. The lock wrapper was added on top; the detection logic is unchanged.

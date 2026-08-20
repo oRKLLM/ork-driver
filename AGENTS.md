@@ -129,6 +129,18 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 ```
 
 - The validated board is RK3588 (SBC IP: `10.3.0.236`).
+- **RUN `sudo tools/util/npu_guard.sh -- <cmd>` FOR ANYTHING THAT TOUCHES THE NPU.** More than one agent
+  may share this board. The guard checks who holds the render node (`/proc/*/fd` → `renderD12[89]`), that
+  NPU utilisation is idle, and that no fault storm is in progress; with `--` it holds an flock for the
+  lifetime of the command so check-and-launch is not a race. `ORK_NPU_LOCK_WAIT=<seconds>` waits instead
+  of failing.
+  - **A name-based `pgrep` is NOT sufficient**, and this is not hypothetical: a session polling
+    `pgrep -x make` missed a concurrent suite because its recipe runs as `/bin/sh -c fail=0; for t in ...`,
+    read the board as free, and overlapped — three `RKNPU: switch iommu domain time out` faults, plus an
+    orphaned `orkd` holding an IOMMU domain that blocked the other run until it was SIGTERMed. Check the
+    device, not the process name.
+  - The guard is read-only (it reads `/proc`, sysfs and `dmesg`), so it is always safe to run, including
+    while someone else's job is in flight.
 - The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can stall the next — keep that in mind when adding tests.
   - **SBC Hard Wedge**: If the board becomes completely/hard wedged (unresponsive over SSH), use the Home Assistant MCP tools to power cycle the **"Rock 5B Plug"** smart plug. Specifically, call the `mcp_context-forge_home-assistant-hassturnoff(name="Rock 5B Plug")` tool to turn off the smart plug, followed by `mcp_context-forge_home-assistant-hassturnon(name="Rock 5B Plug")` to turn it back on.
     - **If a plug power-cycle does NOT bring it back** (plug reports `on`, but no ping/SSH after several minutes): the SPI bootloader has likely been corrupted (a hard power-cut mid-NPU-submit, or the abrupt loss, can corrupt SPI — the board then won't boot even with power restored). Recovery requires PHYSICAL access: **reflash the SPI image, then reboot from the Belkin power supply.** This was sufficient on `10.3.0.236` — **the SSD did NOT need reseating** (rootfs was intact; only the SPI bootloader was gone). A remote plug cycle cannot fix this — hand off to a physically-present operator.
@@ -181,20 +193,29 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 ## 4. Architecture & repo layout
 
 ```
-include/ork_npu.h      public API (init / pack / run / soc introspection)
+include/ork_npu.h      public API — a 49-line UMBRELLA (guard, base typedefs, version) that includes:
+include/ork/           context dma weights run sdp probe dynamic seq chain bmm
+                         sdp.h = the supported SDP surface; probe.h = RE probes with no production
+                         caller (53% of the old header). Consumers include <ork_npu.h>, never a part.
 src/npu.c              SCAFFOLD: the dtype-dispatching layer only — run()/run_multicore, the
                        heterogeneous op-sequence scheduler, bmm dispatch, async wrappers,
                        slice/stage/stream-pool glue, ork_npu_init
 src/npu/internal.h     private ABI: ork_npu/ork_w/buf types, dtype predicates, env knobs, hot inlines
 src/npu/core.h         the SUBSTRATE interface (see the header-placement rule below)
 src/npu/core/          dtype-agnostic substrate: device buf submit sched domain mode prof (+ core.h)
-src/npu/i8/            int8 — regcmd pack fold run chain colsplit dyn queue probe   (+ i8.h)
+src/npu/i8/            int8 — regcmd pack fold run chain colsplit queue         (+ i8.h)
+                         dyn dyn_seq dyn_ctl        — NONBLOCK doorbell: begin paths / seq chain / control
+                         probe probe_sdp probe_replay probe_prof probe_chain — RE probes by family
 src/npu/f16/           fp16 — regcmd run perchan stream probe replay                (+ f16.h)
 src/npu/i4/            int4 — quant pack run chain stream                           (+ i4.h)
 src/npu/i16/           int16 — regcmd act chain probe                               (+ i16.h)
 src/npu/sdp.c          shared activation curves + LUT machinery (i8/i16/f16 all use it)
 src/npu/norm.c         RMSNorm / L2 / softmax / RoPE / FWHT — an op family, not a precision
 src/npu/ssm.c          Mamba-2 / SSD scan
+src/orkd.c             orkd DAEMON: dispatch loop, socket accept, ring service, main
+src/orkd_handlers.c    its 19 per-opcode request handlers  (interface: src/orkd_internal.h)
+src/orkd_client.c      client transport: connect/spawn, A-ring, domain calls
+src/orkd_client_ops.c  client RPC op wrappers              (shared helpers: src/orkd_client_internal.h)
 src/soc.{h,c}          runtime device-tree SoC detection + caps registry
 src/soc/<chip>.c       one file per SoC: core count, CBUF budget, output-width cap, K-slice
 src/ork_regs.h         named regcmd registers (setrn); src/rknpu_ioctl.h open DRM uABI
