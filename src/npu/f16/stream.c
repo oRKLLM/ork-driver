@@ -106,13 +106,49 @@ static void *stream_worker_f16(void *vp){
  * copied via per-core staging. Each worker pulls the next task and runs a SINGLE-CORE submit on its own
  * core (core_mask=1<<i) — so nbatch independent matmuls spread across all cores. Single M-tile (the SSD
  * scan is M<=64 <= one tile); K<96 uses sched=0 (the small-K 0x1040 fix). */
+/* ---- shared entry check + the MEASURED fp16 M envelope, for BOTH stream entrypoints ----
+ * Both had an identical validation loop and NEITHER bounded M, so an out-of-envelope M was
+ * silently miscomputed (Tier 14 A). One helper now owns the check, so they cannot drift again.
+ * `hard` clamps to an additional per-program limit (the doorbell rejects fp16 M>64); 0 = none.
+ * Writes the min cap across tasks, the max M, and whether every task's M is the same. */
+static int f16_stream_check(int S,const ork_mm_task_f16 *tasks,int hard,int *cap,int *maxM,int *uniform){
+    int c0=1<<30,mx=0,m0=tasks[0].M,uni=1;
+    for(int i=0;i<S;i++){ const ork_w *w=tasks[i].w;
+        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
+        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
+        if(w->K%32||w->N%16) return -2;
+        int cp=orki_f16_mcap(w->K,orki_f16_sched(w->K));
+        if(hard&&cp>hard) cp=hard;
+        if(cp<c0) c0=cp;
+        if(tasks[i].M>mx) mx=tasks[i].M;
+        if(tasks[i].M!=m0) uni=0; }
+    *cap=c0; *maxM=mx; *uniform=uni; return 0;
+}
+
+/* M-TILE an over-envelope batch by re-entering `fn` on row-slices of <= cap rows. Each sub-batch
+ * is uniform-M, which is what the per-core staging and buffer sizing below already assume — so
+ * this reuses the whole existing path unchanged instead of teaching the worker per-program M.
+ * Heterogeneous M above the envelope cannot be expressed this way and is REFUSED (-2) rather
+ * than miscomputed: that refusal is the point of the Tier 14 item. */
+static int f16_stream_mtile(ork_npu *c,int S,const ork_mm_task_f16 *tasks,int cap,int maxM,int uniform,
+                            int (*fn)(ork_npu*,int,const ork_mm_task_f16*)){
+    if(!uniform) return -2;
+    ork_mm_task_f16 *sub=malloc((size_t)S*sizeof *sub); if(!sub) return -3;
+    int ret=0;
+    for(int m0=0;m0<maxM && !ret;m0+=cap){
+        int mc=(maxM-m0<cap)?(maxM-m0):cap;
+        for(int i=0;i<S;i++) sub[i]=(ork_mm_task_f16){ tasks[i].w, mc,
+            tasks[i].A+(size_t)m0*tasks[i].w->K, tasks[i].C+(size_t)m0*tasks[i].w->N };
+        ret=fn(c,S,sub); }
+    free(sub); return ret;
+}
+
 int ork_f16_mm_run_stream(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
-    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
-        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
-        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
-        if(w->K%32||w->N%16) return -2; }
+    { int cap,maxM,uni,vrc=f16_stream_check(S,tasks,64,&cap,&maxM,&uni);   /* 64 = the doorbell's fp16 per-program limit */
+      if(vrc) return vrc;
+      if(maxM>cap) return f16_stream_mtile(c,S,tasks,cap,maxM,uni,ork_f16_mm_run_stream); }
     /* P3 SPINE MIGRATION: fp16 stream onto the NONBLOCK doorbell (ork_dyn_begin_mc), like run_stream_i8. The
      * doorbell fp16 path accepts single-slice small-K (K%32) shapes (uses Bb + the K-dependent sched); A stays
      * host (the fp16 doorbell stages A into maf). Build the neutral ork_mm_task_i8 view — w carries dtype=DT_F16,
@@ -176,10 +212,9 @@ static void *stream_worker_f16ch(void *vp){
 int ork_f16_mm_run_stream_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
-    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
-        if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
-        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;
-        if(w->K%32||w->N%16) return -2; }
+    { int cap,maxM,uni,vrc=f16_stream_check(S,tasks,0,&cap,&maxM,&uni);   /* no extra per-program limit: the chain synths M itself */
+      if(vrc) return vrc;
+      if(maxM>cap) return f16_stream_mtile(c,S,tasks,cap,maxM,uni,ork_f16_mm_run_stream_chain); }
     int fd=c->fd;
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_SW);
     int nc=orki_budget(c,2); if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>S)nc=S; if(nc<1)nc=1;

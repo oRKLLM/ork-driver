@@ -269,7 +269,11 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
         int ksplit = (dt == DT_I8 && w->K > 4096);
         if (w->K > 4096 && !ksplit) return NULL;
         if (ksplit && w->Sn != 1) return NULL;
-        if (dt == DT_F16 && (size_t)tasks[i].M * w->K > 32768) return NULL;   /* fp16 M-tile validated <=32768; larger miscomputes (latent fp16 scheduler bug) */
+        /* fp16 M envelope. WAS `M*K > 32768` — that constant is the int8 one (32768 BYTES at
+         * 1 B/elem) and is 2x TOO LOOSE for fp16's 2 B/elem, so this path MISCOMPUTED at
+         * non-pow2 K (measured: K=384 real ceiling 42, this permitted 85; K=640 -> 25 vs 51).
+         * orki_f16_mcap is the measured envelope (1 CBUF bank sched=0, 11 banks sched=1). */
+        if (dt == DT_F16 && tasks[i].M > orki_f16_mcap(w->K, orki_f16_sched(w->K))) return NULL;
         if (w->Sk != 1 && !w->Bf && !ksplit) return NULL;   /* non-ksplit Sk>1 needs the full-K Bf; ksplit uses the Bb K-slices */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);

@@ -114,6 +114,23 @@ chain_marginal_probe: tools/re/chain_marginal_probe.c $(COBJ)
 fold_resident_probe: tools/re/fold_resident_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: map the TRUE fp16 M-tile envelope per K per entrypoint — mg_max*64 (0x1040 K-reduction
+# schedule) vs M*K<=32768 (the doorbell's R/0x1010 "perf hint" cap). Settles which bound to guard at.
+f16_mcap_probe: tools/re/f16_mcap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# RE tool: root-cause the K=128 fp16 anomaly (ceiling 256 vs the schedule's ~1499, and a
+# first-bad-row-0 signature). Tests whether the envelope is NON-MONOTONIC in M, which would
+# implicate 0x1040's DATA_BANK/WEIGHT_BANK split rather than a row/area count.
+f16_k128_probe: tools/re/f16_k128_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# RE tool: does the INT8 M-tile cap under-report like fp16's did? Drives ORK_MCAP to force a
+# single M-row program and compares BIT-EXACTLY vs a CPU int32 reference. One (K,M) per process
+# (ORK_MCAP's getenv is cached); sweep from a shell loop, upward only.
+i8_mcap_probe: tools/re/i8_mcap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)

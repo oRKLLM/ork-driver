@@ -58,7 +58,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
          * (safe). The build terminated the regcmd chain at each slice boundary (kb[]); the oSk f32 accumulate below
          * then sums the Sk partials. Tiling recomputed identically to the build (deterministic). */
         ork_w *w = a->w; int M = a->h->oM[i], Sk = a->h->oSk[i], K = w->K;
-        int KS = c->soc->ks, CBUFf = (c->soc->cbuf_elems > 32768) ? 32768 : c->soc->cbuf_elems, RBf = CBUFf, kstart = 0;
+        int KS = c->soc->ks, kstart = 0;
         const char *sge = getenv("ORK_F16_STAGGER"); int stag_us = sge ? atoi(sge) : 0;   /* variant A: per-core-index fetch stagger (µs) */
         /* fp16 SELF-HEAL — OPT-IN (ORK_F16_RECOV), default OFF. NAIVE retry-same-slice is HARMFUL and DISPROVEN:
          * resubmitting the identical 3-core concurrent fp16 slice re-triggers the SAME concurrent-fetch CDMA wild,
@@ -83,9 +83,9 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
         const char *spte = getenv("ORK_F16_SENTINEL_TMO_US"); double f16_poll_ovr = spte ? atof(spte) : 0.0;   /* explicit detect-timeout override (us); 0 => AUTO = 1.5x the measured slice-completion time (orki_f16_slice_us) */
         for (int ks = 0; ks < Sk; ks++) {
             int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-            int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048), R = RBf/Kp; if (R<1) R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-            double scale=(double)Kp/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg=base>=0x1b?(base-0x1b)/slope+1:0;
-            int kcap=mg*64; if(!sched)kcap=(RBf/2)/Kp; if(kcap<4*R)kcap=sched?4*R:((RBf/2)/Kp); if(kcap<1)kcap=1;
+            /* kcap MUST match the tiling below (it derives np_ks, the program count) — both now
+             * come from the one measured envelope so they cannot disagree. */
+            int kcap = orki_f16_mcap(Kp, orki_f16_sched(Kp));
             int np_ks = (M + kcap - 1) / kcap;
             struct rknpu_submit s; memset(&s, 0, sizeof s);
             s.flags = ork_ppflags() | (f16_sentinel ? 0x2u : 0u);   /* SENTINEL: NONBLOCK (0x2) — CPU polls, never blocks in-kernel. Else BLOCKING (ping-pong safe within one buffer). */
@@ -246,7 +246,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             * int8 WIDE-K branch with orki_f16_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
             * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_f16_synth()+Bb+dtype differ). */
             int CBUFf = (CBUF > 32768) ? 32768 : CBUF;   /* fp16 M-scheduler is validated only to the 32768-tile; a larger cbuf miscomputes mc>~cap (mcworker applies the same cap) */
-            int KS = c->soc->ks, RBf = CBUFf;   /* fp16: RB = cbuf (int8 doubles it) */
+            int KS = c->soc->ks;
             struct rknpu_task *tkf = (struct rknpu_task*)c->mtk[i].cpu;
             size_t ksz = (size_t)w->Sk * M * Ncore * 4;   /* Sk f32 partials [ks][M][Ncore] */
             if (c->mccsz[i] < ksz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, ksz, 0x403, c->dom_active);
@@ -301,10 +301,13 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             int np2 = 0; size_t goff = 0, sloff = 0; char kb[512] = {0}; unsigned char pcp[600] = {0};   /* pcp[p]=1 => program p is a perchan drain-gap (not a matmul) */
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
-                int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);   /* fp16 sched window (NO HISCHED here) */
-                int R = RBf/Kp; if (R<1) R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-                double scale=(double)Kp/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-                int kcap = mg_max*64; if(!sched) kcap=(RBf/2)/Kp; if(kcap<4*R) kcap=sched?4*R:((RBf/2)/Kp); if(kcap<1) kcap=1;   /* fp16 M-tile cap — NEVER raise: >cap miscomputes (npu.c ~4770) */
+                int sched = orki_f16_sched(Kp);
+                /* fp16 M-tile cap = the MEASURED envelope (orki_f16_mcap). The old
+                 * mg_max*64 / (RBf/2)/Kp / 4*R expression was wrong in BOTH directions: too small
+                 * at K=512/1024 (320/128 vs a real 352/176) and far too LARGE at K=128 (4*R=1024
+                 * vs a real 256), which is how ork_f16_mm_run silently miscomputed at K=128 for
+                 * any M in [257,1472] — this multicore/colsplit path is the one it takes. */
+                int kcap = orki_f16_mcap(Kp, sched);
                 uint32_t wbase = (uint32_t)((contig ? (w->Bbc.dma + sloff) : w->Bb[ks].dma) + (uint64_t)t0 * Kp * 32);   /* CONTIG: slice base = Bbc + cumulative slice offset (one buffer); else per-slice Bb[ks]. N-tile stride Kp*32 (== mcworker) */
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
                     if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }

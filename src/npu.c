@@ -1614,7 +1614,13 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048)), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
+        int sched=dt?(Kp==1024||Kp==512):orki_f16_sched(Kp), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
+        /* fp16: the M-tile is the MEASURED envelope, not 4*R / (RB/2)/Kp. Those were derived from
+         * int8 (32768 ELEMENTS) and are 2x too loose for fp16 (2 B/elem => 16384 elems = 1 CBUF
+         * bank), and the sched=1 form overshot badly (4*R = 1024 @K=128 vs a real ceiling of 256,
+         * which is why ork_f16_mm_run silently miscomputed there for any M in [257,1472]).
+         * int8 keeps its own path untouched — it is measured-correct at mg_max*64. */
+        if(!dt) chunk=orki_f16_mcap(Kp,sched);
         /* sched=0 uses the DEFAULT 0x1040 template, which computes correctly only while the activation tile
          * fits its budget: mc*Kp <= 32768 elements. (RB/2)/Kp overshoots (e.g. int8 K=256 -> chunk=224, but
          * rows past 32768/256=128 in one submit are GARBAGE — isolated via shape_probe). The sched=1 path

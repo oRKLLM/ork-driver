@@ -107,11 +107,50 @@ void orki_f16_set_out_fp16in(uint32_t*rc,int M,int N){
     }
 }
 
+/* fp16 0x1040 SCHEDULE PREDICATE — the validated window, in ONE place. The run, chain and doorbell
+ * paths each had their own copy and they had DRIFTED (chain `K<2048`, doorbell no upper bound at
+ * all), so the same shape took different schedules on different entrypoints. */
+int orki_f16_sched(int K){ return (K&(K-1))==0 && K>=128 && K<2048; }
+
+/* fp16 M-TILE CEILING — the largest row count ONE program computes correctly. MEASURED on RK3588
+ * (tools/re/f16_mcap_probe.c + f16_k128_probe.c, 2026-08-20); every value below was found by an
+ * UPWARD scan with ceiling+1 confirmed wrong, never by bisection (the predicate is not monotonic
+ * at K=128, so bisection lands on an arbitrary valid point).
+ *
+ * MECHANISM. 0x1040 (RK_CNA_CBUF_CON0) is the CBUF BANK SPLIT — DATA_BANK[3:0]/WEIGHT_BANK[7:4],
+ * 12 banks total, 32 KB each (NVDLA: 512-bit entries, 512 entries/bank). orki_f16_synth walks the
+ * split one bank toward data-heavy per 64-row group as M grows; the ceiling is where WEIGHT_BANK
+ * would hit 0 (v is floored at 0x1b = DBNK 11 / WBNK 1 — forcing v below that HANGS the submit,
+ * measured). So the envelope is just banks x 32 KB / row bytes:
+ *   sched=0: 0x1040 keeps its template default 0xb1 = 1 DATA bank -> M <= 32768/(2K) = 16384/K
+ *   sched=1: the split reaches 11 DATA banks -> 360448 B         -> M <= 180224/K
+ * Measured: 704@K=256, 352@K=512, 176@K=1024 (sched=1, all exactly 11 banks); and 256@64, 42@384,
+ * 25@640, 21@768, 10@1536, 8@2048 (sched=0, all exactly 16384/K).
+ *
+ * K=128 IS CAPPED BY MEASUREMENT, NOT BY THE FORMULA. It needs HALF-bank steps — slope is
+ * (int)(15*128/256) = (int)7.5 = 7 — which the encoding cannot express, so base already yields
+ * DBNK=8/WBNK=11 (sum 19, invalid) and each step wraps DBNK mod 16 instead of moving one bank.
+ * The envelope there is NON-MONOTONIC (256 ok, 320 bad, 384 ok, 448 bad, 512 ok, ...), so only the
+ * contiguous prefix is usable.
+ *
+ * fp16 ONLY. int8 is measured-correct at its truncated mg_max*64 (704@512, 320@1024, 128@2048,
+ * 64@4096) and must NOT be moved onto this rule: at identical base/slope fp16 reaches the 11-bank
+ * capacity and int8 does not (unexplained; see the wiki entry). Do not "unify" them.
+ */
+int orki_f16_mcap(int K,int sched){
+    int cap;
+    if(K<1)                            cap = 1;
+    else if(!sched)                    cap = 16384/K;   /* 1 CBUF bank of activations */
+    else if(K==128)                    cap = 256;       /* broken encoding — measured prefix */
+    else if(K==256||K==512||K==1024)   cap = 180224/K;  /* 11 banks — measured exact */
+    else                               cap = 16384/K;   /* unmeasured sched=1 K: stay on the 1-bank bound */
+    const char*e=getenv("ORK_F16_MTILE"); if(e){ int v=atoi(e); if(v>0)cap=v; }   /* RE override (probe above the cap) */
+    return cap<1?1:cap;
+}
+
 inline int orki_f16_mtile(int K,int M){
-    double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale);
-    int mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0; int chunk = mg_max*64;
-    const char*e=getenv("ORK_F16_MTILE"); if(e){ int v=atoi(e); if(v>0)chunk=v; }
-    if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
+    int chunk=orki_f16_mcap(K,orki_f16_sched(K));
+    if(chunk>M)chunk=M; if(chunk<1)chunk=1; return chunk;
 }
 
 /* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_f16_synth(). Inert by default. */

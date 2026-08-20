@@ -325,6 +325,12 @@ int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t
 int ork_dyn_grouped_end(ork_dyn_chain *h);
 int orki_int8_ks(ork_npu *c);
 int orki_mtile_cap(int Kred);
+/* fp16 M-tile envelope (src/npu/f16/regcmd.c). Tree-wide because the scaffold (npu.c) and the
+ * doorbell (i8/dyn.c) both need it and f16/f16.h is folder-private. orki_f16_mcap is the LARGEST
+ * M one fp16 program computes correctly — MEASURED, see the big comment at its definition. Use it
+ * to M-TILE where the caller can, and to REFUSE where it cannot. Do NOT apply it to int8. */
+int orki_f16_mcap(int K, int sched);
+int orki_f16_sched(int K);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);

@@ -88,6 +88,11 @@ int          ork_bmm_fp16_fused(ork_npu *c,int nb,int M,int K,int N,const ork_f1
  * and runs a single-core submit on itself (no barrier; CPU-prep of op N+1 overlaps NPU of op N). For the
  * SSD scan's per-stage H independent matmuls: ~3-5x the single-core chain. Packed-B + row-major-A + dense-C,
  * numerically identical to ork_bmm_fp16. Single-slice, nb>=1. 0/ok,<0. */
+/* M ENVELOPE (both stream entrypoints): one fp16 program is only correct up to a measured row
+ * ceiling set by the CBUF bank split (see orki_f16_mcap in src/npu/f16/regcmd.c) — e.g. 352 @K=512,
+ * 176 @K=1024, 256 @K=128, 16384/K for non-pow2 K. A larger M is M-TILED internally, so any M is
+ * valid when every task carries the SAME M. Tasks with DIFFERING M above the ceiling cannot be
+ * tiled as a batch and are REFUSED (-2) rather than miscomputed. */
 typedef struct { ork_w *w; int M; const ork_f16 *A; float *C; } ork_mm_task_f16;
 int          ork_f16_mm_run_stream(ork_npu *c, int S, const ork_mm_task_f16 *tasks);
 /* CHAINED-MULTICORE fp16 stream: PC-chains each core's round-robin-assigned matmuls into ONE task_number>1

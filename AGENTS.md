@@ -294,10 +294,26 @@ not be CBUF-resident), reg `0x1010` is only a perf hint (correctness is identica
 at every K (704@K512, 320@K1024, 128@K2048, 64@K3584/4096). Raising the cap from `R-1` (~31) to
 `mg_max*64` gave **~2.1× single-core / ~1.6× three-core at K=2048, ~1.5× at K=3584, bit-exact** (2026-06-30).
 
-Consequences: `cbuf_elems` no longer sets the int8 M-tile size (it only feeds the neutral `0x1010` hint);
-it still governs the fp16 path. This fix is int8 full-K only — the wide-K (`K>4096`) K-slice path and fp16
-keep their own caps (fp16 has a separate latent large-tile M-scheduler bug). When touching any M-tile cap,
-the bound is `mg_max*64`; never reintroduce an `R-1`/`pow2_floor` ceiling.
+Consequences: `cbuf_elems` no longer sets the int8 M-tile size (it only feeds the neutral `0x1010` hint).
+This fix is int8 full-K only — the wide-K (`K>4096`) K-slice path keeps its own cap. **For int8, when
+touching any M-tile cap the bound is `mg_max*64`; never reintroduce an `R-1`/`pow2_floor` ceiling.**
+
+**fp16 does NOT use `mg_max*64` — it has its own measured envelope, `orki_f16_mcap(K, sched)`
+(`src/npu/f16/regcmd.c`), and the "latent large-tile M-scheduler bug" is now characterised (2026-08-20,
+`tools/re/f16_mcap_probe.c`).** `0x1040` is a CBUF **bank split** (`DATA_BANK[3:0]`/`WEIGHT_BANK[7:4]`,
+12 banks × 32 KB), walked one bank data-ward per 64-row group; the ceiling is where `WEIGHT_BANK` would
+hit 0. So the fp16 envelope is banks × 32 KB / row-bytes: **`sched=0` → 1 bank → `M ≤ 16384/K`;
+`sched=1` → 11 banks → `M ≤ 180224/K`** (measured 704@K256, 352@K512, 176@K1024, and 8@K2048 … 256@K64
+for sched=0 — `ceiling+1` miscomputes at every one). **K=128 is capped at a measured 256**: it needs
+half-bank steps (`slope = (int)7.5 = 7`), which the encoding cannot express, so its envelope is
+*non-monotonic* (256 ok, 320 bad, 384 ok, …) and only the contiguous prefix is usable.
+
+Two traps this cost us, both now fixed: the old fp16 caps used **32768 ELEMENTS** (the int8 byte budget),
+which is **2× too loose** at 2 B/elem and silently miscomputed at non-pow2 K; and `4*R` overshot at K=128
+(1024 vs 256), so `ork_f16_mm_run` miscomputed for any `M ∈ [257,1472]`. **Never derive an fp16 M-tile
+from an int8 constant, and never bisect for an fp16 ceiling — the predicate is not monotonic. Scan
+upward.** int8 and fp16 must NOT be unified on one rule: at identical `base`/`slope` fp16 reaches the
+11-bank capacity and int8 stops at the truncated `mg_max*64` (unexplained; see the wiki entry).
 
 ### Multi-SoC: data, not branches
 
