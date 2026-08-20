@@ -95,6 +95,11 @@ static void *stream_worker_f16(void *vp){
     return NULL;
 }
 
+/* ---- fp16 ROUND-ROBIN STREAM (ork_mm_run_stream_f16) — fp16 twin of the int8 stream above ----
+ * Dynamic·dynamic (both operands activations): weight is pre-packed per task (ork_w, fp16 Bb tiled), A/C
+ * copied via per-core staging. Each worker pulls the next task and runs a SINGLE-CORE submit on its own
+ * core (core_mask=1<<i) — so nbatch independent matmuls spread across all cores. Single M-tile (the SSD
+ * scan is M<=64 <= one tile); K<96 uses sched=0 (the small-K 0x1040 fix). */
 int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
@@ -155,6 +160,13 @@ static void *stream_worker_f16ch(void *vp){
     return NULL;
 }
 
+/* ---- CHAINED-MULTICORE fp16 stream (ork_mm_run_stream_f16_chain) ----
+ * Combines the two half-wins: PC-chaining (task_number>1, one submit amortizes the ~48us submit floor over
+ * many programs — like run_chain_i8) AND 3-core parallelism (like run_stream_f16). Static strided partition:
+ * core i owns tasks {i, i+nc, ...}; it synths all of them into ITS mrc[i] (each program's PC next-descriptor
+ * at word 216 -> 0x0010/0x0014 links to the next), builds a cnt-entry task-descriptor array in mtk[i], and
+ * issues ONE task_number=cnt submit on core i. This is the fused graph the scan wanted: N submits -> nc.
+ * Matmul-only chain (register-config, no LUT) -> ping-pong safe. Escapes the per-matmul submit floor. */
 int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);

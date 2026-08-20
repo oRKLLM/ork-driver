@@ -86,6 +86,8 @@ ork_w *ork_mm_pack_i4a8_im(ork_npu *c, int K, int N, const float *f32, const flo
     return w;
 }
 
+/* int4-stored: fill = inflate nibbles -> int8 + tile (the .orkpack i4a8 blob, ork_w_dump_i4a8). The fill
+ * happens ONCE here (the expensive op, cached in RAM). NULL on import-unavailable / malformed blob. */
 size_t ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap){
     if(!w || !w->Bi4 || !w->bscale) return 0;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)w->N*sizeof(float), nib=(size_t)w->K*w->N/2;
@@ -100,6 +102,12 @@ size_t ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap){
     return need;
 }
 
+/* Zero-copy IMPORT variant of ork_mm_load_i4a8: resident tiles are dma-bufs the NPU reads in place (PRIME
+ * import), and the int4 nibbles inflate -> int8 directly into them (no f32 round-trip). Bit-identical to
+ * ork_mm_load_i4a8 (same blob, same tiled bytes). Falls through to NULL (caller uses ork_mm_load_i4a8) if
+ * import is unavailable. Retains Bi4 + bscale so the loaded weight re-dumps byte-identically. */
+/* tile shape mirrors ork_mm_load_i4a8: KS=1024 K-split, NMAX N-split; Bf full-K when K%512==0 && K<=4096
+ * (same envelope as load_i8_import). Returns NULL if dma-heap absent / alloc fails. */
 ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     if(K%32 || N%32) return NULL;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
@@ -450,6 +458,12 @@ ork_w *ork_mm_pack_i4_to_i8(ork_npu *c, int K, int N, const int8_t *B) {
     return ork_mm_pack_i8(c, K, N, B);
 }
 
+/* int4 (W4A4) sub-weight packer (#33): twin of orki_slice_pack_i8, but the tile envelope is BCHAIN's
+ * (run_i4_bchain_db, the per-tile executor): each sub-tile must be Sk==1, Sn==1, N%64==0, and K<=8192 so
+ * BCHAIN's H=16384/K>=2. So K-slice at ks=8192 (K padded to 32 — pack_i4 needs K%32; pad rows are zeroed ->
+ * contribute 0), N-tile at ns=8192 (Sn==1; BCHAIN N-tiles further by bank-width internally). B is the int8
+ * nibble-container [-8,7] (pack_i4's input); a native pack_i4 weight keeps no raw nibbles, so sub-tiles are
+ * re-packed from the caller's B here (as orki_slice_pack_i8 does with ork_mm_pack_i8). */
 ork_w_sliced *orki_slice_pack_i4(ork_npu *c, int K, int N, const int8_t *B) {
     if (N % 64) return NULL;                                             /* pack_i4 requires N%64 (a real int4 weight satisfies it); N is not padded */
     int Kpad = ((K + 31) / 32) * 32;                                    /* pad K to 32 (pack_i4 K%32); zero rows contribute 0 -> bit-exact */

@@ -180,6 +180,12 @@ void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uin
     { const char*e=getenv("ORK_EW_BIAS"); if(e) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(e,0,0)); }
 }
 
+/* orki_set_i8_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
+ * synth_i8's default int32 output format (does NOT apply set_i8_out8's int8 override) and enables the SiLU
+ * LUT with the int32-output bit (0x8000) set in 0x4010. out_i32 = R*V16[idx(acc)] + out_bias, unclamped —
+ * with a fine-scale LUT that maps silu across ~±8000 (int16 V16 * R), that's ~13-14 bit silu instead of int8.
+ * The ablation (ORK_GATE_ABLATE — historical) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
+ * = baseline PPL); this recovers it while keeping silu free on-NPU. Same LUT/config regs as set_i8_silu. */
 void orki_set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     /* SWEEP knobs: output-format registers env-configurable to find the matmul+LUT non-int8 output encoding.
      * PREC = bits[1:0] of 0x4010 (int8=0, int16=1, fp16=2; bit31=int32-bypass-CVT). int8+silu = 0x44e0. */

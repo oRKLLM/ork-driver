@@ -249,6 +249,11 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     return ok;
 }
 
+/* ork_npu_mul_perchan_f16_contig — per-channel fp16 MUL that reads a CONTIGUOUS [M][N] fp16 input (the native
+ * fp16 matmul output layout), via the vendor task13 config (FLYING_MODE + NOTCH addressing, EW_CFG=0x20800384,
+ * ERDMA=0x8000000a). This is the SDP that matches the fp16 matmul's contiguous output — closing the chain / a
+ * pure-NPU 2-submit without the CPU atom-8 repack. a=[M][N] contiguous fp16, b=[N] scale, out=[M][N]. Captured
+ * at M=8,N=64; notch is verbatim for N=64. ORK_MULC_* env for on-board geometry RE. 0/ok,-1,-2,-3. */
 int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;

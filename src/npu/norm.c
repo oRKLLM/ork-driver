@@ -30,6 +30,12 @@ static ork_w *norm_reduce_w(ork_npu *c,int n){
     return orki_ones_w;
 }
 
+/* rmsnorm/l2norm: reduction sum(x^2) on the NPU (ork_norm_reduce_npu, any n via K-split) when ORK_NORM_NPU
+ * is set; rsqrt + scale on CPU. Validated 0.0005 vs the CPU ref. (The fully-fused single-submit reduce+rsqrt
+ * — ork_mm_build_f16_rsqrt_lut, validated 0.0012 standalone for n<=2048 in test_bmm's rsqrt test — is the
+ * building block for a one-submit on-NPU norm; wiring it into the general path needs LUT pre-calibration, so
+ * the shipped norm keeps rsqrt on CPU for robustness across all n.) The ork_norm_rsqrt_npu helper above is
+ * the decoupled K=32 rsqrt op, kept for that follow-up. */
 int ork_norm_reduce_npu(ork_npu *c,int M,int n,const f16 *x,float *ss_out){
     if(!ork_norm_npu_enabled() || n%32) return -1;      /* K%32 for the matmul */
     ork_w *ow=norm_reduce_w(c,n); if(!ow) return -1;

@@ -118,6 +118,11 @@ void ork_pool_init(void){
         if(pthread_create(&orki_pool.th[i], NULL, ork_pool_worker, (void*)(intptr_t)i)!=0){ orki_pool.n = i; break; }
 }
 
+/* PERSISTENT worker pool for ork_parallel_for. Spawn the workers ONCE and reuse them across every
+ * call, amortizing the pthread_create/join that dominated fine-grained per-weight tiling — a fresh
+ * pool per weight left the cores mostly idle in spawn/join overhead (measured: per-weight CPU tiling
+ * capped ~20%). Workers are un-pinned (all cores) and sleep on a condvar between jobs; lazy-init on
+ * first use, live for the process. One job at a time (the callers dispatch serially). */
 void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx){
     if(n<=0) return;
     if(n==1){ fn(0,1,ctx); return; }

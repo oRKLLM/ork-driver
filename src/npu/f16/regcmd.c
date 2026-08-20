@@ -109,6 +109,15 @@ inline int orki_f16_mtile(int K,int M){
     if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
 }
 
+/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_synth(). Inert by default. */
+/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (orki_synth() uses scale=K/256, vs int8's K/512
+ * since int8 packs 2 rows per CBUF slot) gives the SAME bit-exact M-tile ceiling mg_max*64. The old
+ * ork_mm_run_f16_silu chunk=16 was a stale over-conservative cap far below this (64 @K2048, 320 @K512) —
+ * bit-exact validated (tools/silu_f16_check: M-tile 16==32==64 @K2048, 16==320 @K512, 384>ceil DIFFERS).
+ * ORK_F16_MTILE overrides (validation / probing above the ceiling). */
+/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via orki_synth(). Weight tile [NT][KT][16][32]
+ * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
+ * bit patterns (uint16). ork_f16_fuzz overrides apply inside orki_synth(). 0/ok -1 wedged -2 dims. */
 void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     memcpy(rc,REGCMD,REGCMD_N*4);
     orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE0,K*N*2);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE1,K*2);

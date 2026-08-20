@@ -315,3 +315,27 @@ all 60 of its commits have upstream equivalents. Nothing pending to land.)*
 - [ ] Use `tools/util/sync_daemon.sh` for the duration (sync all of `src/`, never a single file).
 - [ ] `AGENTS.md` §4 layout, `README.md`, `OPS_REGISTRY.md`, `tools/re/README.md` updated.
 - [ ] `MODULARIZE_WIP.md` deleted (or folded into the wiki).
+
+## Round 2 — reuniting stranded doc-comments (2026-08-20)
+
+Round 1 moved code out of `npu.c` and left its **doc-comments behind**. Nothing was duplicated at the
+destination: of the stranded blocks, 100% had no counterpart in the module that received the code. So
+`npu.c` documented functions it no longer contained, and 36 functions across 17 modules had no doc at all.
+
+Moved: 36 blocks / 205 lines, each one where the comment's FIRST LINE names the symbol it documents —
+verified by a comment-stripping fingerprint (`gcc -fpreprocessed -dD -E` over every source, hashed before
+and after) so the change is provably comment-only, zero behaviour delta.
+
+**Deliberately left in `npu.c`: 70 blocks / 378 lines.** These are the ambiguous ones — a block whose first
+line names no symbol (a section banner like `===== SUBMIT QUEUE =====`), or one that cites several
+modules' symbols without naming its own subject. Automated placement by "first symbol mentioned" was tried
+and scored **31/88 correct**, which is far too low for RE narrative that AGENTS treats as load-bearing, so
+it was reverted rather than shipped. Placing the remaining 378 lines needs a human read of each block; it
+is worth doing, but not worth guessing.
+
+Two tooling bugs surfaced here and are fixed:
+- the symbol extractor was greedy (`s/^.*[ *]\(name\)(.*/\1/`), so a one-liner that CALLS another function
+  recorded the callee as defined locally — 32 phantom definitions, which is what made the first placement
+  pass look plausible while being wrong;
+- knob accessors (`int ork_f16_colsplit(void){ ...getenv... }`) counted as implementations, which briefly
+  turned a correct dagger in the capability matrix into a false claim of native fp16 multicore.

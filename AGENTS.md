@@ -285,7 +285,7 @@ The NPU's regcmd datapath is **stateful**: a "mode" (precision/schedule) is trac
 `c->last_dt` plus warm flags (`warmed`, `mwarm[]`) and buffer-size caches (`ccsz`, `mccsz[]`). Moving
 between modes may need an `RKNPU_ACT_RESET`, a cold 2-pass re-warm, and/or a buffer realloc. That
 policy used to be **copy-pasted inline into ~16 run/stream/chain/int4 entrypoints**, each drifted.
-It is now owned by **one function**, `ork_npu_enter(c, to_marker, profile, chain)` in `src/npu.c`, driven by
+It is now owned by **one function**, `ork_npu_enter(c, to_marker, profile, chain)` in `src/npu/core/mode.c`, driven by
 the **`XSPEC[]` policy table** (one row per historical transition site). Every run path calls it first;
 the drift is now visible **as data** (e.g. the nothrash-keyed chain profile ignores `ORK_SSM_KEEPWARM`
 where the matmul/stream profiles honor it). See the big comment above `XSPEC[]` for the exhaustive

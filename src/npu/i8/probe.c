@@ -1001,6 +1001,12 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     return 0;
 }
 
+/* CHAIN ASSEMBLER self-test: chain TWO plain int8 matmuls via ork_npu_chain_progs and verify BOTH tasks
+ * EXECUTE + produce output -- the exact thing Phase-0 could not (an early task0 that actually runs). Uses
+ * WORKING primitives only (synth_i8 native int32 output; no set_i16_out). Layout-agnostic: A=all-1, W0=all-1,
+ * W1=all-2 -> every C0 element == K, every C1 element == 2K, regardless of output tiling. Fills *t0_cnt/
+ * *t1_cnt = count of the M*N int32 slots matching K / 2K (near M*N => that task ran; 0 => it didn't).
+ * 0/ok, -1 wedge, -2 dims/alloc. rk3588. */
 int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom){
     if(!c||!progs||n<1||n>1024) return -2;
     int fd=c->fd;

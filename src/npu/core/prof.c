@@ -30,6 +30,8 @@ void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
 
 double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?orki_mc_synth[core]:0; }
 
+/* run_multicore phase timing (read via ork_npu_run_timing; the ORK_RT env gate is removed): setup (checks+mc_ensure+cres memset), submit (pool dispatch
+ * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
 void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n){ if(setup)*setup=orki_rt_setup; if(submit)*submit=orki_rt_submit; if(copy)*copy=orki_rt_copy; if(n)*n=orki_rt_n; }
 
 void ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n){

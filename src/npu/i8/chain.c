@@ -737,6 +737,22 @@ int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t
     if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
     return -1; }
 
+/* ============ CONCURRENT ROUND-ROBIN CHAIN DISPATCH (ork_mm_run_chains_rr) — increment 2 ============
+ * Prefill throughput: N independent fused exp-softmax-numerator chains dispatched across ALL NPU cores at once
+ * (chain -> core via atomic work-stealing), each on its OWN per-core scratch (chain_rc/tk/lrc/lsc[core]) so there
+ * is NO cross-core DRAM sharing. Targets ~3x over single-core for a deep prefill queue. Shared mode state
+ * (ork_npu_enter) + the domain are established ONCE here single-threaded; workers pass force_core>=0 so
+ * orki_run_chain_i8_impl skips the re-enter (racing the mode reset would wedge a sibling core). Chains are homogeneous:
+ * same op graph (ops[]) + scales + domain; each carries its own S-task array (chains[i]). */
+/* BIASED round-robin: same concurrent dispatch as ork_mm_run_chains_rr, but the fused exp bakes in a scalar
+ * max-subtract (e=exp((score-max_bias)*in_scale)/out_scale) so the chains are correct on REAL (positive) scores
+ * without a live per-query max (registry: scalar global-max-biased exp; bias cancels in av/Sigma). This lets N
+ * independent attention cores' [QK^T->exp->reduce,e.V] chains fan across the NPU cores from a single dispatch.
+ * The exp LUT contents change IN PLACE at one static address, so orki_run_chain_i8_impl's POINTER-keyed per-core
+ * device-LUT cache (chain_lut_p[cc]) would go stale. We invalidate all cores ONCE here, single-threaded, BEFORE
+ * the workers start — each worker's orki_run_chain_i8_impl then rebuilds+reuploads THIS core's per-core SDP-SRAM LUT
+ * on its first chain (the "LUT-cache-update op at the front of the chain, injected per core"). Per-core buffers
+ * make that reload concurrency-safe. Returns 0/ok, <0 err. Local NPU only (the daemon calls it on its own ctx). */
 int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
                          const ork_chain_op *ops, double in_scale, double out_scale){
     if(!c || nchains<1 || !chains || !S || !ops) return -2;

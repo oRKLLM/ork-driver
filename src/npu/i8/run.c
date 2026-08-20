@@ -30,6 +30,7 @@
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
+/* RUN the slot's matmul (must be mapped). Same as ork_mm_run_i8 on the slot's view. */
 int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op so the daemon zero-copy-swaps to it */
@@ -182,6 +183,9 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     return rc_ret;
 }
 
+/* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
+ * Same path as ork_mm_run_i8_silu but the silu value is emitted at int32 precision (dequant with the fine
+ * out_scale the LUT was built for). K%512, K<=4096, N%32. 0/ok, -1 wedge, -2 shape, -3 SoC. */
 int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
                          int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                          const int16_t *lut,int nlut){
@@ -527,6 +531,15 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     return ork_npu_probe_add_i8(c,a,b,M,N,(int)ma,S+14,(uint32_t)mb,0,0,0,out,us);
 }
 
+/* ork_mm_silu_build_lut — generate ork's OWN silu LUT for the fused-output path (ork-NATIVE: no RKNN
+ * dependence, works on ork's 108-reg matmul program). Since ork controls both the LUT and the output-stage
+ * registers, correct fused SiLU is a 2-step construction (see tools/silu_native.c, validated ~1 int8):
+ *   (1) MEASURE ork's index(acc) for (r_mult,r_shift,cfg4068) via one ramp-LUT calibration submit;
+ *   (2) BUILD lut[idx(acc)] = clamp_int16( silu(acc*in_scale)/out_scale / R ), R=r_mult/2^r_shift; interp gaps.
+ * The caller then runs the matmul via ork_npu_probe_i8_silu_cfg(..,r_mult,r_shift,0,0xffffc000,cfg4068,lut,1030,..)
+ * — do the build ONCE per (registers) and reuse the lut across matmuls of the same scale. Pick r_mult/r_shift
+ * so R ~= 660*in_scale (the matmul's acc range then spans silu's transition band). out_bias MUST be 0 (the
+ * validated config; the ramp readback assumes it). Fills lut[1030]. 0/ok, -1 fail. */
 int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
                           int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut){
     return orki_chain_build_lut_fn(c, orki_silu_f, in_scale, out_scale, r_mult, r_shift, cfg4068, lut);
@@ -573,6 +586,13 @@ int ork_npu_exp_i8_biased(ork_npu *c,const int8_t *in,int M,int N,double in_scal
 
 
 
+/* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
+ * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
+ * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool
+ * of per-core workers that PULL the next task dynamically (atomic counter) and run it as a single-core
+ * submit on their own core — no barrier, no static partition. A core that finishes early grabs the next
+ * task immediately, so the cores pipeline and never idle on a sync point. Each worker owns its per-core
+ * buffers (mrc/mtk/maf/mcc); tasks' weights are read-only-shared, outputs are disjoint. */
 int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
@@ -603,6 +623,10 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     return (d == S - 1) ? 0 : -1;
 }
 
+/* ---- SMALL-K int8 ROUND-ROBIN STREAM (ork_mm_run_stream_i8_sk) — int8 twin of run_stream_f16 ----
+ * run_stream_i8 is full-K only (K%512, 0x1040 schedule); this handles the scan's small single-slice int8
+ * matmuls (K%32,N%16) with the SAME 3-core round-robin batching the fp16 scan uses. Per-core: memcpy int8
+ * A -> maf, synth_i8, submit on core i, copy int32 C out. Caller quantizes A + dequants int32. */
 int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);

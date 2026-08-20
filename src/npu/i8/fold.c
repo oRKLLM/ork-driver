@@ -504,6 +504,11 @@ int ork_npu_fold_batch_w(ork_npu*c, int nw, ork_w**ws, int M, const int8_t*Araw,
     return 0;
 }
 
+/* #39 mfold: load the fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") into a resident
+ * ork_w carrying only w->Bfold (nslice bufs). Run via ork_npu_fold_run_w. Shape/size-checked; NULL on mismatch. */
+/* #39 attach a fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") to an EXISTING loaded/packed
+ * ork_w so ork_mm_run_i8 auto-routes small-M through the fold. Bfold bufs land in w->domain. 0 ok, <0 error.
+ * No-op (0) if already attached. Caller stores the fold blob only for the winning shapes (K=3584, wide q/o N). */
 size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     (void)c;
     if(!B || K!=FOLD_REF_K || N<1 || (N%32)) return 0;

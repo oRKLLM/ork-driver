@@ -555,6 +555,16 @@ int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int n
         if(w->domain!=ex[0].w->domain || w->K!=ex[0].w->K || w->N!=ex[0].w->N) return -2; }  /* one submit => one domain + one shape */
     return orki_run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
 }
+/* int4 (W4A4) multi-core NONBLOCK doorbell — the DT_I4 sibling of ork_dyn_begin_mc. int4 is structurally
+ * different from int8/fp16 at the hardware level: the datapath writes an int16 (2-byte) accumulator (widened
+ * to int32 on the host, esz=2) and its HW chain is M=1 only — so it CANNOT share the 4-byte-C body. This keeps
+ * that body byte-identical and specialises the int4 divergences: tile_i4_Aslice host-A staging (0.5 B/elem),
+ * synth_i4 / REGCMD_I4_N stride / regcfg_amount=116, an int16 per-core output scratch (ALWAYS copy-back — the
+ * NPU never writes the caller's int32 C in place), and a FULL-SURFACE int16 sentinel seed that doubles as the
+ * clean-before-write the fresh/reused scratch needs (int4's int16 write-order over N is not last-col-last, so
+ * both the seed and the completion poll cover the whole row). Proven bit-exact single-core by ork_dyn_i4_probe;
+ * this is the productionised multi-core form the scheduler dispatches. Host (malloc) A only, as for int8/fp16.
+ * end() drains via the esz-aware ork_dyn_done_i and widens int16->int32 into the caller's C. */
 ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
 int orki_i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */

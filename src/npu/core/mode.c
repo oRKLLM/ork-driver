@@ -36,6 +36,64 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
 };
 
 
+/* MODE-TRANSITION RE hooks (mode_probe.c). The standalone SDP ops (ork_npu_ewmul_*, orki_act_lut_i16 →
+ * exp/silu/…) reprogram the pipeline (their own ACT_RESET + SDP regcmd) but leave c->last_dt / c->warmed
+ * untouched, so a following SAME-dtype matmul sees dt==last_dt and SKIPS its reset/re-warm — running a
+ * matmul regcmd on an SDP-configured pipeline. These expose the two candidate fixes so the probe can
+ * measure which is sufficient:
+ *   _invalidate: clear the cached mode state ONLY (last_dt=-1, warmed=0, per-core mwarm=0) — the next
+ *                matmul then takes its own reset/re-warm path (fp16 entry = warmed=0 re-warm, int8 entry =
+ *                ACT_RESET). No explicit HW reset here. Tests whether re-warm alone clears the wedge.
+ *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
+/* ============================ MODE-TRANSITION LAYER (ork_npu_enter) ============================
+ * SINGLE owner of "what does moving the NPU's stateful regcmd datapath from mode X to mode Y
+ * require" — the ACT_RESET / re-warm (warmed, mwarm[]) / buffer-realloc (ccsz, mccsz[]) policy that
+ * was previously copy-pasted (and quietly drifted) inline into every run/stream/chain/int4 entry.
+ *
+ * Each run path calls ork_npu_enter(c, target_marker, profile, chain) FIRST; the per-profile row of XSPEC
+ * below IS the policy for that path. A profile is a faithful, byte-for-byte transcription of the site
+ * it replaced (verified `make test` byte-identical across all dtypes and both keep-warm knobs), so
+ * Phase-1 behavior was UNCHANGED — the consolidation was behavior-preserving. The drift is visible AS
+ * DATA, and a policy change is a one-row edit — e.g. PHASE 2 (2026-07-14) converged the →I8_CHAIN
+ * profiles: XP_CHAIN_NT used to ignore ORK_SSM_KEEPWARM (KWP_NTL + RC_NOTLIVE), so a chain entered
+ * from an fp16 op ate a full ~105ms ACT_RESET where the stream profiles kept warm; switching it to
+ * KWP_MC + RC_NOTLIVE_NOTKW eliminated that (chain_xition_probe: reset-cost 53538us→~0, coherent), and
+ * the two stream-int8 profiles collapsed into one (XP_STREAM_I8). See the wiki "Exp-2026-07-14 Mode-
+ * Transition Layer" for the full Phase-2 record and AGENTS.md §"Mode-transition layer" for how to add/change.
+ *
+ * EXHAUSTIVE (from -> to) permutation space — modes = { COLD(-1), F16(0), I8(1), I4(2), I8_CHAIN(3),
+ * I4_CHAIN(4), I4_STREAM(5) }, plus SDP = a TRANSIENT activation/ewmul reset with NO stored marker.
+ * `from` (= c->last_dt) enters ONLY through the
+ * ORK_I8_LIVE / ORK_INT_DT / ORK_KW_DT predicates, so a row is keyed by (target, caller-scope), not by
+ * an enumerated `from` — that collapses the NxN matrix to one row per historical site:
+ *   ->F16/I8 matmul : reset only ENTERING int8 from a non-int8-live mode (first-int8-submit wedge);
+ *                     fp16 never resets. Keep-warm across int8<->fp16 (ORK_SSM_KEEPWARM, default on).
+ *   ->I4           : reset entering int4 from a non-int mode; keep-warm int<->int (ORK_MIXED_NOTHRASH).
+ *   ->I8_CHAIN(3)  : DT_I8<->DT_I8_CHAIN is NOT a hw mode change (ORK_I8_LIVE) -> no reset.
+ *   ->I4_CHAIN(4)  : unconditional reset on entry (single-core int4 M=1 chain).
+ *   ->I4_STREAM(5) : unconditional reset on entry.
+ *   ->SDP          : activation/ewmul reprogram the pipeline but correctly LEAVE last_dt untouched
+ *                    (setdt=0), so the NEXT matmul keeps warm (no ~105us re-warm). The historical
+ *                    "SDP->matmul wedge" was NOT a last_dt issue — it was the c->task LUT-descriptor
+ *                    poisoning (nuance #1), fixed independently in 98c00b1 (Exp-2026-07-12). Board
+ *                    mode_probe (2026-07-14) confirms EVERY SDP->matmul is SAFE with NO reset, and
+ *                    that FORCING one costs ~105us/transition for zero correctness gain. XP_SDP is
+ *                    therefore KEEP-WARM-AWARE: rst=RC_SDPKW (reset iff !ork_sdp_noreset(), i.e. only
+ *                    when the ORK_SDP_NORESET skip is OFF), setdt=0 (no marker, leaves last_dt). This is
+ *                    the op-local SDP reset expressed AS DATA — byte-identical to the historical inline
+ *                    `if(!ork_sdp_noreset()) orki_act(RESET)`, default-SKIP so it does NOT re-introduce the
+ *                    churn ORK_SSM_KEEPWARM removes. NEVER set XP_SDP to RC_ALWAYS (that forces the reset).
+ *                    Wired via ork_npu_enter(c, c->last_dt, XP_SDP, OCK_NONE); SDP ops still not yet
+ *                    converted keep the inline form (identical behavior) pending a Phase-2 sweep.
+ * NUANCE #1 (kept SEPARATE, per Exp-2026-07-12): the c->task LUT-descriptor poisoning is a DISTINCT
+ * axis from precision-mode and ACT_RESET does NOT fix it — the layer owns only the precision reset;
+ * the c->task save/restore stays an op responsibility (no clr_task cell is wired in Phase 1). */
+/* CHAINING MECHANISM in effect for a transition — passed as explicit state to ork_npu_enter so the
+ * policy can branch on it for the few handoffs where the mechanism genuinely matters, and ignore it
+ * (the common case) otherwise. OCK_NONE = plain per-matmul run / run_multicore / int4 batch;
+ * OCK_SW = run_stream_* round-robin (multi-submit, per-core); OCK_HW = run_chain_i8 / chain_progs
+ * PC-chain (one submit, task_number>1); OCK_FUSED = run_chain_i8_ffn static regcmd graph (carries
+ * in-chain SDP/LUT ops — ping-pong/LUT-commit rules differ; that specialness lives in the chain body). */
 int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     const struct ork_xspec *x=&XSPEC[profile];
     int from=c->last_dt, fd=c->fd;

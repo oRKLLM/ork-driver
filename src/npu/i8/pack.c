@@ -103,6 +103,9 @@ void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv){ if(!kv)return;
     if(c && c->daemon){ free(kv->wkt); free(kv->wv); free(kv); return; }   /* orkd: mirrors are id-holders; daemon-side reclaimed on disconnect (TODO ORKD_KV_FREE for mid-session release) */
     if(kv->wkt)ork_w_free(kv->wkt); if(kv->wv)ork_w_free(kv->wv); free(kv); }
 
+/* SINGLE-THREADED int8 CPU dump — identical bytes to ork_w_dump_i8_cpu, but tiles inline on the calling
+ * thread (NO internal pool). For callers that ALREADY parallelize at a coarser grain (the .orkpack expert
+ * convert runs one whole expert per core); using the shared pthread pool there would nest/oversubscribe. */
 size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%32) || (N%32)) return 0;
     int KS=orki_int8_ks(c), NMAX=c->soc->nmax;
@@ -130,6 +133,11 @@ size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
     return off;
 }
 
+/* Zero-copy IMPORT variant of ork_mm_load_i8: each resident tile is a dma-buf the NPU reads in place
+ * (PRIME import) instead of a MEM_CREATE-alloc'd buffer the blob is memcpy'd into. The bytes still get
+ * written once (into the imported mmap) + synced once; the saving is the kernel page allocation, not
+ * the host fill (load is from a disk/RAM blob either way). Same blob format / round-trip as load_i8.
+ * Falls through to NULL (caller uses ork_mm_load_i8) if import is unavailable. */
 ork_w *ork_mm_load_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K%32 || N%32) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;

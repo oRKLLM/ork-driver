@@ -183,6 +183,12 @@ struct buf *orki_warena_reserve(ork_npu *c,size_t need,size_t *base){
     return ch;
 }
 
+/* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
+ * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
+/* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
+ * device after a host write (the bsync the streaming fill would issue). Not in the public header. */
+/* ork_dma_alloc that requests on-chip SRAM residence (fails over to DRAM if the NPU has no SRAM / it is full).
+ * For validating the precompiled/doorbell submit against an SRAM-resident output the CPU polls via dc civac. */
 void *ork_dma_alloc(ork_npu *c, size_t size){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
     struct buf b=orki_bcreate(c->fd,size,0x401,c->pack_domain); if(!b.cpu) return NULL;
@@ -223,6 +229,7 @@ void ork_dma_import_sync(ork_npu *c, void *ptr, size_t size){
     orki_dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE);
 }
 
+/* the full TO|FROM then TO orki_bsync (the current ork_dma_bsync_to_device pattern), per tile. */
 void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
     struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     struct rknpu_mem_sync s; memset(&s,0,sizeof s);
