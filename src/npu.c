@@ -2644,7 +2644,7 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
  * regcfg*2 convention). The gap is a pure time-filler on a DUMMY fp16 scratch (identity scale) — its only job is
  * to idle the weight-CDMA so W0's fetch drains before W1's base latches. Both matmuls use the fp16-out stage
  * (orki_set_f16_out_fp16in — the config with the PROVEN mm->perchan HW edge). Returns the submit rc (nonzero=wedge);
- * *nz0/*nz1 = count of nonzero output words per matmul (coarse "did it compute" sanity). rk3588-gated. */
+ * *nz0 / *nz1 = count of nonzero output words per matmul (coarse "did it compute" sanity). rk3588-gated. */
 
 /* PER-CORE-FD concurrency probe. Runs a 3-core fp16 N-column-split matmul where EACH core submits on its OWN
  * fresh DRM fd (a separate open of the card), not the shared c->fd — to test whether per-core-fd isolation
@@ -3135,7 +3135,7 @@ ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const in
  * the terminal + does per-op copy-back (matmul int32 dense; SDP int8 EWCUBE de-marshalled). Returns NULL if
  * ineligible (caller then runs the ops via the SW break). Stage 2: MM_I8 + EWMUL_I8; ADD/SILU/GELU follow.
  * SINGLE group / single core here; the scheduler slices a sequence into groups and (Stage 3) spreads them. */
-/* per-op eligibility (Stage 2/3 envelope); records dom of the first matmul weight into *dom/*have_dom */
+/* per-op eligibility (Stage 2/3 envelope); records dom of the first matmul weight into *dom / *have_dom */
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom){
     if(o->kind==ORK_OP_MM_I8){ ork_w *w=o->w;
         if(!w||w->dtype!=DT_I8||w->Sn!=1||w->Sk!=1||w->K%512||w->K>4096) return 0;
@@ -3362,7 +3362,7 @@ void orki_mc_recover_resubmit(ork_dyn_chain *h){
  *   scores  [CS, Nst]x[Nst, CS]      cstate  [HG*P, CS]x[CS, Nst]
  *   Ydiag_g [CS, CS]x[CS, HG*P]      Y_off   [HG*P, Nst]x[Nst, CS]
  * each x (G*NC) batches. M<=HG*P fits ONE M-tile at these K (mcap(K=64)=10496). Returns 0/ok, <0 on
- * error; fills *fused_us/*persub_us (per-iter wall) and *ok_out (1 = fused chain bit-correct). Board only. */
+ * error; fills *fused_us / *persub_us (per-iter wall) and *ok_out (1 = fused chain bit-correct). Board only. */
 
 /* (b) LAYOUT PROBE: run ONE fp16 matmul through the exact fused-chain mechanism (raw synth + a single
  * ork_npu_chain_progs task) with ROW-MAJOR resident operands A[M,K],B[K,N] → C[M,N] fp32. Decides

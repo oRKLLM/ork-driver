@@ -498,7 +498,16 @@ bench-llama:
 	@echo "== Running two-turn conversation integration benchmark via llama-server =="
 	@LLAMA_SERVER_BIN=$(HOME)/llama.cpp/build/bin/llama-server tools/bench_two_turn.sh
 
+# API documentation (doxygen). Generated into docs/api/html, gitignored. The Doxyfile is scoped to
+# include/ + src/ and excludes the captured regcmd data headers (megabytes of hex, not API).
+.PHONY: docs
+docs:
+	@command -v doxygen >/dev/null || { echo "doxygen not installed"; exit 1; }
+	@doxygen Doxyfile >/dev/null && echo "docs/api/html/index.html written ($$(find docs/api/html -name '*.html' | wc -l | tr -d ' ') pages)"
+	@n=$$(wc -l < /tmp/doxywarn.txt 2>/dev/null || echo 0); echo "doxygen warnings: $$n"
+
 clean:
+	rm -rf docs/api
 	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so $(COBJ)
 
 .PHONY: all lib install test clean check-attest check-registry

@@ -1,7 +1,7 @@
-/* npu/internal.h — the PRIVATE ABI shared by src/npu.c and the src/npu/*.c precision modules.
+/* npu/internal.h — the PRIVATE ABI shared by src/npu.c and the src/npu/<mod>.c precision modules.
  *
  * Round 1 of the modularization (MODULARIZE_PLAN.md) splits the npu.c monolith along the precision axis
- * into src/npu/{sdp,f16,i16,i4,ssm}.c + src/npu/i8/*.c. Everything those translation units need in common
+ * into src/npu/{sdp,f16,i16,i4,ssm}.c + src/npu/i8/<mod>.c. Everything those translation units need in common
  * — the context/weight/buffer types, the dtype markers, and the hot helpers that must stay inlinable
  * across the split — lives here. NOT a public header: include/ork_npu.h is the API; this is internals,
  * and nothing outside src/ may include it.
@@ -166,7 +166,7 @@ static inline void orki_setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v)
 static inline void orki_bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 static inline void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 
-/* ---- cross-module internals (extern; defined in npu.c or a src/npu/*.c module) ---- */
+/* ---- cross-module internals (extern; defined in npu.c or a src/npu/<mod>.c module) ---- */
 void orki_pin_little_core(int id);          /* npu.c  — pin the caller to an idle A55 */
 void orki_ssm_pool_free(ork_npu *c);        /* npu/ssm.c — release the persistent SSM scan pool (ork_npu_free) */
 

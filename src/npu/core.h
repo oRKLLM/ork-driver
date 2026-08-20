@@ -1,7 +1,7 @@
 /* npu/core.h — the SUBSTRATE interface: everything in the driver whose contract has no dtype in it.
  *
  * Buffers, IOMMU domains, the DRM submit path, device lifecycle, the worker pool, the mode-transition
- * layer, profiling. Implemented in src/npu/core/*.c; used by npu.c and by every precision module.
+ * layer, profiling. Implemented in src/npu/core/<mod>.c; used by npu.c and by every precision module.
  *
  * WHY THIS EXISTS, declared up front instead of grown: measured on the pre-split tree, ~90% of each
  * precision module's inbound boundary is this substrate (i4: 35 of 40 symbols, f16: 36 of 38, i16: 17 of
@@ -16,7 +16,7 @@
  * HEADER PLACEMENT RULE (src/npu/):
  *   npu/<name>.h        — tree-wide. Included from outside its own subsystem. internal.h (types the
  *                         whole driver shares) and core.h (the substrate's outward interface).
- *   npu/<mod>/<mod>.h   — PRIVATE to that folder. Only npu/<mod>/*.c may include it; if the scaffold
+ *   npu/<mod>/<mod>.h   — PRIVATE to that folder. Only npu/<mod>/ sources may include it; if the scaffold
  *                         needs one of a module's symbols, the declaration goes in internal.h instead.
  * So core.h sits BESIDE core/ rather than inside it because it is consumed by npu.c and by every
  * precision module — putting it in core/ would make the most widely included header in the tree look

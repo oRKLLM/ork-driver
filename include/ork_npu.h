@@ -661,12 +661,12 @@ typedef struct { const uint32_t *rc; int nwords; unsigned enable_mask; int regcf
 int          ork_npu_chain_progs(ork_npu *ctx, int n, const ork_chain_prog *progs, int dom);
 /* PROBE: chain two int8 SDP ewmuls (ewmul0 middle @desc_slot=138 -> ewmul1) via ork_npu_chain_progs and verify
  * both vs CPU ref. *t0_ok = middle SDP op correct carrying a forward descriptor; *t1_ok = chain walked forward
- * through the SDP slot. 0/ok (see *t0_ok/*t1_ok), -3 no-PPU, -2 alloc, -1 wedge. Proves int8 SDP HW-chains. */
+ * through the SDP slot. 0/ok (see *t0_ok / *t1_ok), -3 no-PPU, -2 alloc, -1 wedge. Proves int8 SDP HW-chains. */
 int          ork_npu_probe_sdp_chain_fwd(ork_npu *ctx, int *t0_ok, int *t1_ok);
 /* STAGE-1 PROBE: [matmul->ewmul(SDP middle)->matmul] NONBLOCK chain on the begin_mc recipe (warmed scratch +
  * clean-before), completion via the terminal matmul sentinel. *ok = all three outputs bit-exact. 0/ok,-1/-2/-3. */
 int          ork_npu_probe_seq_hetero(ork_npu *ctx, int *ok);
-/* Self-test: chain 2 plain int8 matmuls (all-ones) and verify BOTH tasks execute. *t0_cnt/*t1_cnt = count
+/* Self-test: chain 2 plain int8 matmuls (all-ones) and verify BOTH tasks execute. *t0_cnt / *t1_cnt = count
  * of M*N int32 slots == K or 2K (near M*N => that task ran). Validates chain_progs w/ a real task0. */
 int          ork_npu_chain_selftest(ork_npu *ctx, int *t0_cnt, int *t1_cnt);
 
