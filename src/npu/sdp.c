@@ -17,6 +17,17 @@
 #include "npu/internal.h"
 #include "npu/core.h"
 
+/* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
+ * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
+ * spread across TWO blocks: the DPU/SDP block 0x1001 AND the PDP/aux output-dims mirror block 0x801. In both,
+ * every functional register holds a single value across ALL tiles; only the geometry registers vary with (M,N).
+ * sdp_canon() returns that first-principles value for any 0x1001/0x801 register — no captured blob.
+ * ork_npu_sdp_stamp() rewrites the value of EVERY 0x1001/0x801 register present in a REGCMD_I8_N regcmd to its
+ * canonical value (leaving DST_BASE_ADDR 0x4020 for the caller's C IOVA — the only output-stage address), so a
+ * proven-runnable fold skeleton whose 0x1001+0x801 blocks are zeroed gets its ENTIRE output stage rebuilt from
+ * understood values. This is the "state-setter" a delta-encoded, register-inheriting big-M tile depends on (NVDLA
+ * register-file persistence). surfadd = 0x40c0 SURFACE_ADD (128*M for matched small-M tiles; the burst-regime
+ * value for big-M, e.g. 0x3000 at M=36 — see full_sdp.py's 0x40c0-by-M histogram). */
 static uint32_t sdp_canon(unsigned reg,int M,int N,uint32_t surfadd){
     switch(reg){
         /* ── DPU/SDP output stage (block 0x1001) ── */

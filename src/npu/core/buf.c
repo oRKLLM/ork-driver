@@ -51,6 +51,10 @@ struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     return b;
 }
 
+/* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
+ * Reused across every ewmul/add call so the per-op MEM_CREATE/MEM_DESTROY churn (which dominates the
+ * standalone-op cost and fragments the IOVA window) is paid ONCE, not per call. 0 on success, -1 on alloc
+ * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
 int orki_ppu_scratch3(ork_npu *c,size_t sz){
     if(sz<4096) sz=4096;
     if(c->ppu_sz>=sz && c->ppu_a.cpu && c->ppu_b.cpu && c->ppu_o.cpu && c->ppu_a.domain==c->dom_active) return 0;   /* realloc if the active domain changed (persistent scratch must live in c->dom_active) */
@@ -113,6 +117,13 @@ struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
 
 struct buf orki_bimport(int fd,size_t size,int domain){ return orki_bimport_f(fd,size,domain,0); }   /* weights: NPU-DMA'd, no kernel vmap */
 
+/* Run-SCRATCH allocator (task/regcmd/output buffers). int4-RESIDENT runs keep every domain's WEIGHTS bimported
+ * (PRIME_FD); a fresh MEM_CREATE (bcreate) then EINVALs in that domain (MEM_CREATE GEM alloc can't coexist with
+ * imported memory in the same iommu domain), which starved the run scratch (mc_ensure mtk_all -> decode -3). So
+ * for int4 (c->last_dt==DT_I4) route the small scratch through the SAME import path (bimport) as the weights, so
+ * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
+ * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
+ * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
 struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
     /* int8/fp16 (scratch_import unset): bcreate — the proven path, UNCHANGED. int4 RESIDENT (scratch_import set
      * once weights are bimported): a fresh bcreate GEM can't be placed amid ~GiB of imported SG mappings in the
@@ -150,6 +161,9 @@ struct buf orki_bscratch(ork_npu *c,size_t size,int flags,int dom){
     return orki_bcreate(c->fd,size,flags,dom);
 }
 
+/* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
+ * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
+ * This is the cross-process zero-copy primitive behind ork_dma_import_fd (the orkd daemon's data plane). */
 struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
     if(dbuf<0) return (struct buf){0};
     size_t sz=orki_pgup(size);
@@ -183,6 +197,9 @@ struct buf *orki_warena_reserve(ork_npu *c,size_t need,size_t *base){
     return ch;
 }
 
+/* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
+ * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_mm_run_i8 detects
+ * residency automatically (no API change); the caller just allocates A/C here. ---- */
 /* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
  * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
 /* Diagnostic only (tools/disk_stream_bench.c): flush `size` bytes of an ork_dma_alloc buffer to the
@@ -238,6 +255,10 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
     s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
 }
 
+/* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
+ * rknpu mem-create flag set, so the probe can A/B the write-combine (0x401) vs cacheable (0x403) fill
+ * bandwidth + NPU-read correctness WITHOUT changing the default ork_dma_alloc behavior. Additive; not
+ * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
 void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
     struct buf b=orki_bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;
@@ -321,6 +342,9 @@ int orki_is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const stru
     return 0;
 }
 
+/* CLIENT: allocate a dma-heap buffer of `size` bytes, mmap it R/W, and (via DMA_BUF_SYNC_START) ready it for
+ * CPU fill. Returns the dma-buf fd (>=0) and sets *ptr to the mapping; -1 on failure. No NPU touched. The
+ * caller fills *ptr then calls ork_dmabuf_seal(fd) to flush before passing the fd to the daemon. */
 int ork_dmabuf_alloc(size_t size, void **ptr){
     int hf=orki_dmaheap_open(); if(hf<0) return -1;
     size_t sz=orki_pgup(size);

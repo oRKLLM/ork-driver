@@ -29,6 +29,12 @@
 #include "npu/core.h"
 #include "npu/f16/f16.h"
 
+/* fp16 multicore matmul (Sn==1) doorbell colsplit — DEFAULT ON (2026-08-05). Bit-exact and 1.04-1.23x faster than
+ * mcworker (A/B, governors-verified). The K-split (Sk>1) drop that used to WEDGE was root-caused as a concurrent
+ * CROSS-BUFFER weight-fetch wild (HW prefetches Bb[ks+1] while Bb[ks] drains) and is now PREVENTED by CONTIG (one
+ * contiguous weight buffer -> no dma-buf boundary -> no wild -> no drop; validated 1000-iter 0-drop + make test).
+ * CONTIG is default-on for Sn==1 inside ork_dyn_begin_colsplit; it is the ONLY fp16 multicore path (#45) — the
+ * legacy mcworker fallback has been removed. See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
 int ork_f16_colsplit(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_F16_COLSPLIT"); v=e?atoi(e):1; } return v; }   /* colsplit is the ONLY fp16 multicore path (#45); ORK_F16_COLSPLIT=0 -> single-core fp16 reference (never mcworker) */
 
 void *ork_pcfd_thread(void *vp){

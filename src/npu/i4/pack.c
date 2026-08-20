@@ -502,6 +502,13 @@ void orki_tile_i4_B(uint8_t*dst,const int8_t*B,int K,int N,int nib){
     }
 }
 
+/* CPU-ONLY int4 pack straight to the compact .orkpack blob (header + bscale[N] + Bi4[K*N/2]) — byte-
+ * identical to ork_mm_pack_i4a8_im() + ork_w_dump_i4a8(), but with NO bcreate/IOMMU/tiling. The per-tile
+ * bcreate in the NPU int4 packer is the serial single-stream consumer that bottlenecks .orkpack conversion;
+ * a WRITE only needs the compact nibbles + scales on disk (ork_mm_load_i4a8 re-tiles at load). This
+ * replicates the EXACT per-channel quant of ork_mm_pack_i4a8_im (absmax/7 uniform or NF4 codebook, optional
+ * imatrix clip-grid, SR with a per-call seed) so the bytes match. Single-threaded (caller parallelizes over
+ * experts). out=NULL → required size. K%32,N%32. */
 size_t ork_pack_i4a8_cpu_blob(ork_npu *c, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap){
     (void)c;
     if(K%32 || N%32 || !f32) return 0;

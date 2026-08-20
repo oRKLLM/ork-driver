@@ -48,6 +48,17 @@ ork_w *ork_mm_pack_i8(ork_npu *c,int K,int N,const int8_t *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: pack resident in the daemon (remember the domain so runs carry it) */
     return orki_pack(c,K,N,B,DT_I8);  }
 
+/* ---- Tier 12f: RESIDENT K/V with per-key APPEND (decode attention) -----------------------------------------
+ * A decode step appends ONE key to the KV cache, then attends over all keys. Repacking K^T/V from scratch each
+ * step is packing-bound (measured ~15x slower than CPU); instead keep the two packed int8 weights RESIDENT and
+ * write only the new key's tile bytes each step (+ a per-tile bsync). ork_mm_pack_i8's tile layout is
+ *   bb[nt*KT*1024 + kt*1024 + nl*32 + kk]   (nt=n/32, kt=k/32, nl=n%32, kk=k%32; KT = this tile's K/32)
+ * K^T weight is [Kp=512, Lmax]: K=Kp fixed so KT=16 and a new key is a new N-COLUMN (n=key) — a clean append
+ * into the single N-tile (Lmax<=nmax). V weight is [Lmax, HD]: the key is the K (contraction) index, so it lands
+ * in K-tile ks_idx=key/KS at local kt=(key%KS)/32 — multi-tile when Lmax>KS. Both weights are alloc'd zeroed for
+ * the full Lmax, so keys beyond the current length contribute 0 (Q·0=0 score, 0 weight) and the caller just runs
+ * the matmuls at K=Lmax / N=Lmax with a host softmax over the first `len` keys. Quant scales are the caller's
+ * (per-key ks for K via host dequant; a single vs for V). Local NPU only. */
 ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax){
     if(!c || HD%32 || Lmax%32 || Lmax<32 || Lmax>c->soc->nmax) return NULL;  /* v1: K^T single N-tile */
     int Kp=512;
@@ -120,6 +131,11 @@ size_t ork_w_dump_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
     return off;
 }
 
+/* Produce the Bf (full-K re-tiled) blob for weight B[K,N] straight from raw row-major int8, PURE-CPU — the
+ * on-disk companion to ork_w_dump_i8_cpu so a .orkpack can carry Bf and the loader skips the runtime rebuild.
+ * Layout: Sn page-padded tiles; tile ns = orki_pgup(K*Nc), holding [nt][ktf][32][32] over the FULL K (KTf=K/32).
+ * Byte-identical to the load-time Bf rebuild / ork_mm_repack_i8's Bf tiling. Only the Bf run envelope
+ * (K%512==0 && K<=4096) has a Bf; returns 0 otherwise. Pass out=NULL to size. */
 size_t ork_w_dump_bf_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%512) || K>4096 || (N%32)) return 0;
     int NMAX=c->soc->nmax, Sn=(N+NMAX-1)/NMAX, KTf=K/32;
@@ -673,6 +689,12 @@ size_t ork_w_dump_i8_cpu_st(ork_npu *c, int K, int N, const int8_t *B, void *out
     return off;
 }
 
+/* Pack int8 B[K,N] (row-major [k*N+n]) DIRECTLY into IMPORTED dma-buf chunks, tiled into the NPU layout —
+ * ork_mm_pack_i8's tiling into ork_mm_load_i8_import's chunked-import storage, with NO native bcreate, NO
+ * blob round-trip, NO free/churn. Purpose: a fused per-tensor weight (fc.wg) allocates as uniform ~16MB
+ * import chunks like every other weight, instead of a native-bcreate outlier that fragments the 32-bit
+ * domain's IOVA (the PRIME-ENOMEM-at-low-fill that blocked per-domain fusion). Mirrors load_i8_import
+ * (anchor + chunked own_bufs + full-K Bf rebuild); returns NULL if import is unavailable/fails. */
 ork_w *ork_mm_pack_i8_import(ork_npu *c,int K,int N,const int8_t *B){
     if(K%32 || N%32) return NULL;
     if(orki_dmaheap_open()<0) return NULL;

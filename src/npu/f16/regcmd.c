@@ -59,6 +59,11 @@ void orki_set_f16_out(uint32_t*rc,int N,int stride){
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_R40C4,0);
 }
 
+/* fp16-IN fp16-OUT DPU output stage, reconstructed from the VENDOR conv task[0] (conv_mul.rknn, decoded against
+ * rocket_registers.h) — the config that actually emits fp16 to memory AND hands off cleanly to a chained fp16 SDP.
+ * orki_set_f16_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
+ * writes 0x4084=1 WITHOUT DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16), so the fp16 CVT is never enabled. Here we take
+ * the vendor's mode/bypass/CVT registers verbatim and keep only the matmul-shaped output GEOMETRY (N channels). */
 void orki_set_f16_out_fp16in(uint32_t*rc,int M,int N){
     /* fp16-in fp16-out DPU output stage. Precision/bypass/CVT regs from a captured VENDOR fp16->fp16 MATMUL
      * (~/rknn_sdk/cap_fp16f16.dec): 0x4040=0x53 (BS FULLY bypassed — a MATMUL, not the conv's BS-active 0x20150

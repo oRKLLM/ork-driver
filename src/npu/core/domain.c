@@ -45,6 +45,11 @@ void ork_iova_release(int dom,size_t bytes){
     orki_iova_bytes[dom] = orki_iova_bytes[dom]>bytes ? orki_iova_bytes[dom]-bytes : 0;
 }
 
+/* Grow the per-domain arrays (native anchor + parked scratch) to hold at least `need` domains. No fixed
+ * cap — the domain count is whatever the auto-sizer / ork_npu_domain_alloc drives. dom_save is allocated
+ * here (so it becomes non-NULL exactly when multi-domain is first entered, preserving the single-vs-multi
+ * signal the run paths key on). Called from every multi-domain entry: dom_activate, ork_dom_prime,
+ * ork_npu_domain_alloc, ork_npu_set_ndomains. Returns 0 ok, -1 on OOM (caller degrades gracefully). */
 int orki_dom_reserve(ork_npu *c, int need){
     if(need <= c->dom_cap) return 0;
     int nc = c->dom_cap ? c->dom_cap : 2; while(nc < need) nc *= 2;
@@ -73,6 +78,12 @@ void ork_dom_prime(ork_npu *c, int dom){
     c->dom_anchor[d] = orki_bcreate(c->fd, 65536, 0x403, d);   /* native bcreate == establishes the domain */
 }
 
+/* #54 FIX: re-establish a domain's IOMMU page-table region before EACH imported dma-buf. The kernel sets up a
+ * domain's page table lazily around the buffer that triggers it; the one up-front anchor (ork_dom_prime) covers
+ * only the FIRST import — a 2nd+ imported dma-buf then lands on aliased IOVAs and the NPU reads it WRONG (probed
+ * bit-exact: 1st import OK, 2nd import maxerr~2835, fixed to 0 by a fresh native bcreate before it). So drop the
+ * stale anchor and bcreate a fresh native one immediately before importing each weight. Cheap (64 KiB); the
+ * previous import's mapping persists after its anchor is freed (verified: 1st weight re-runs bit-exact after). */
 void ork_dom_reanchor(ork_npu *c, int dom){
     int d = ork_dom(dom); if(d<=0) return;            /* domain 0 always established */
     if(orki_dom_reserve(c, d+1)) return;

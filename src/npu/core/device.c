@@ -21,6 +21,16 @@ void ork_ssm_helper_stop(ork_npu *c);
 
 void ork_npu_set_ndomains(ork_npu *c, int n){ if(c && n>1) orki_dom_reserve(c, n); }
 
+/* #54 REAP-AT-DOMAIN-BOUNDARY. A genuine int4 doorbell DROP leaves a stuck job in c->dom_active whose completion
+ * IRQ never fired, so the kernel's iommu_domain_refcount for that domain stays >0. The reap that clears it —
+ * rknpu_job_timeout_clean — only fires at the TOP of the NEXT submit ON THAT CORE, and (crucially) that next
+ * submit is normally in the NEXT domain, AFTER the switch: so get_and_switch(D+1) waits on D's refcount>0 and
+ * TIMES OUT ("switch iommu domain time out, id: N") — the reap can never happen across the boundary. FIX: before
+ * switching away from a dirty domain, issue a SAME-DOMAIN per-core dummy (ork_npu_reap_stuck) whose submit runs
+ * timeout_clean(core i) -> clean gem_object_put of the stuck job -> refcount returns to 0, so the switch lands.
+ * (ACT_RESET does NOT do this — source-confirmed rknpu_soft_reset is HW-only, leaves the job list; only
+ * timeout_clean reaps. That's why the earlier ACT_RESET version failed.) No-op unless a real drop set dom_dirty
+ * (rare); clean runs + single-domain pay nothing. Between-ops / pre-teardown only (no live pool workers). */
 void ork_npu_reap_stuck(ork_npu *c, int nc);   /* fwd: per-core timeout_clean reap (defined below) */
 int orki_i4_submit_tmo_ms(void);                    /* fwd: bounded int4 doorbell submit timeout (defined near the int4 workers) */
 /* sync a sub-range of a buffer object (for arena views, which share one obj at varying offsets) */
@@ -207,6 +217,12 @@ int ork_npu_force_fault(ork_npu *c){
     return landed;
 }
 
+/* orkd CLIENT context — the EXPLICIT orkd entry point. Connect (auto-spawn) the orkd daemon and route
+ * ork_mm_* through it: the daemon owns the single-stream NPU and serializes every submit, the safe way to
+ * share it across concurrent processes. NO local NPU open (the daemon owns it); the ops check c->daemon.
+ * Returns NULL if the daemon can't be reached (NO silent fallback to direct — the caller decides). The daemon
+ * process itself must not call this (it sets ORKD_IS_DAEMON). Callers pick transport by CHOOSING the entry
+ * point: ork_npu_init() = direct (default), ork_npu_init_orkd() = orkd client. */
 ork_npu *ork_npu_init_orkd(void){
     const struct ork_soc *soc=ork_soc_detect();
     if(!soc){fprintf(stderr,"[ork] ERROR: unknown SoC (no device-tree match) — cannot select NPU params\n");return NULL;}
@@ -278,6 +294,9 @@ void ork_npu_set_core_budget(ork_npu *c,int n){ if(!c)return; c->core_budget=(n>
 
 void ork_npu_set_priority(ork_npu *c,unsigned prio){ if(c && c->daemon) orkd_set_priority(c->daemon, prio); }
 
+/* Allocate an IOMMU domain to pack weights into (isolation + a full ~4 GiB IOVA window each). Path B: request
+ * one from orkd's coordinated pool (returns id>0, or <0 if exhausted). Direct: hand out a local id (1,2,…).
+ * Make it the pack target with ork_npu_set_pack_domain; return it with ork_npu_domain_free. */
 int ork_npu_domain_alloc(ork_npu *c){
     if(!c) return -1;
     if(c->daemon) return orkd_domain_alloc(c->daemon);
@@ -294,8 +313,17 @@ int ork_npu_domain_free(ork_npu *c,int domain){
 
 int  ork_npu_pack_domain(const ork_npu *c){ return c ? c->pack_domain : -1; }   /* current pack domain (save/restore around a domain-targeted alloc) */
 
+/* Currently ACTIVE iommu domain (the one dom_activate last swapped in), i.e. the domain the NEXT submit
+ * would run in if its weight already lives there. Pure getter, no state change. The point: a caller that
+ * allocates a TRANSIENT/scratch weight (an attention or GDN bmm's dynamic operand) can place it in the
+ * domain that is already active, so running it needs NO dom_activate switch — the switch is what a stuck
+ * (unreaped, IRQ-never-fired) job turns into a 60 s "switch iommu domain" stall on the NEXT submit. See
+ * ork_dom_flush_if_dirty / dom_dirty. Co-domain scratch sidesteps the whole boundary. */
 int  ork_npu_active_domain(const ork_npu *c){ return c ? c->dom_active : 0; }
 
+/* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
+ * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
+ * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
 void ork_npu_activate_domain(ork_npu *c, int domain){ if(c) orki_dom_activate(c, domain<0?0:domain); }
 
 int  ork_npu_uses_orkd(const ork_npu *c){ return (c && c->daemon) ? 1 : 0; }   /* 1 = this ctx routes through orkd (serialized); 0 = DIRECT NPU (single-stream — don't run concurrent direct processes) */

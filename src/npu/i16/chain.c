@@ -20,6 +20,11 @@
 #include "npu/core.h"
 #include "npu/i16/i16.h"
 
+/* CHAIN (M4 building block): int8-matmul(int16-out) -> PER-CHANNEL-scale(int16) in ONE PC-chain via
+ * chain_progs — the A·V->normalize pattern. The matmul's int16 output G IS the per-channel op's input
+ * (0x5018), validating the intermediate-buffer bridge (like ork_npu_chain_gatesilu_i16 but SDP=per-channel
+ * scale instead of silu). out = clamp_i16( requant_i16(A[M,K]xB[K,N], m1,s1) * scale[n] * m2 >> s2 ).
+ * A int8[M*K], B int8[K*N] row-major, scale int16[N] per-channel. K%32,N%32,N<=nmax,M<=64. 0/ok,<0. */
 int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                                  const int16_t *scale,int m1,int s1,int m2,int s2,int16_t *out,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
@@ -198,6 +203,15 @@ fail:
     return -1;
 }
 
+/* CHAIN ASSEMBLER increment-1: DATA-CONNECTED int8-matmul(int16-out) -> int16-silu in ONE PC-chain via the
+ * general ork_npu_chain_progs core. Unlike ork_npu_chain_mm_silu_i16 (which only proves the chain WALKS --
+ * its matmul output and silu input are SEPARATE buffers), here the gate matmul's int16 output buffer G IS
+ * the silu's input, so it validates the INTERMEDIATE-BUFFER BRIDGE (the crux of the FFN chain): does the
+ * matmul set_i16_out layout match the silu's 0x5018 EWCUBEH cube input layout. Computes
+ *   out = clamp_i16( silu( gate_i16 * in_scale ) / out_scale ),  gate_i16 = requant_i16(A[M,K] x B[K,N]).
+ * A int8 [M*K] row-major, B int8 [K*N] row-major (de-tiled here); mult/shift = the int32->int16 requant.
+ * gate_out (nullable) returns G read back via EWCUBEH so a caller can localize a mismatch to the matmul
+ * stage vs the silu stage. Small-shape validated regime (probe_i16_out N range). 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                                int mult,int shift,double in_scale,double out_scale,
                                int16_t *gate_out,int16_t *out,double *us){

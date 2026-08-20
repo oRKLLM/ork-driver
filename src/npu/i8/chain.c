@@ -205,6 +205,9 @@ int ork_mm_layer_i8(ork_npu *c, const struct ork_layer_dims *d,
     return rc;
 }
 
+/* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
+ * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
+ * (build via ork_mm_silu_build_lut). Single M-tile per task for now (M<=chain mcap). 0/ok,-1 wedge,-2 dims. */
 int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int gate_task,
                               int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off, uint32_t cfg4068,
                               const int16_t *lut, int nlut) {
@@ -213,6 +216,11 @@ int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, in
     return orki_run_chain_i8_impl(c, S, tasks, &ss, -1);
 }
 
+/* OPTION B: chain [... -> gate matmul(int8-out) -> silu-SDP -> ...] where task[sdp_task] is a STANDALONE int8
+ * silu-SDP op reading task[sdp_task-1]'s (gate) output via aliased buffers (the vendor's matmul->SDP pattern),
+ * NOT a fused matmul output stage. The gate task (sdp_task-1) gets orki_set_i8_out8 (int8 output, requant
+ * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_npu_silu_i8).
+ * tasks[sdp_task].C receives int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
 int ork_mm_run_chain_i8_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int sdp_task,
                                 int gate_mult, int gate_shift, double in_scale, double out_scale) {
     if (sdp_task < 1 || sdp_task >= S) return -2;
@@ -706,6 +714,9 @@ int ork_mm_attn_orkd(ork_npu *c, ork_w *wkt, ork_w *wones, ork_w *wv,
                         r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av);
 }
 
+/* RR variant: nchains fused-attn chains (per-chain wkt/wv, shared wones) fanned across the daemon's cores in ONE
+ * round-trip (ORKD_ATTN_RR / ork_mm_run_chains_rr_biased). Q = nchains*Nq*Kp int8 (chain-major); Sigma =
+ * nchains*Nq*32, av = nchains*Nq*dv int32 (attn_c = av_c/Sigma_c). All weights must be daemon-resident. -3 if not. */
 int ork_mm_attn_rr_orkd(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
                         int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
                         double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){

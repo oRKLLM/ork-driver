@@ -126,6 +126,12 @@ int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const 
     return rc;
 }
 
+/* On-NPU composed softmax over each row of [M][n]: y = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU.
+ * The per-row max and the final normalize (÷Σ) are CPU (cheap per-row scalars); the heavy parts run on the
+ * NPU: exp via ork_npu_exp_i16 (int16 SDP LUT; x-max quantized to a shared in_scale so exp maps in*in_scale
+ * -> exp(x-max)), Σ via the reduction-as-matmul (e·ones[n,16], reusing the norm reduce weight). Like the
+ * norm this is submit-floor-bound standalone (gated off; the win is fusing into the attention chain). Any
+ * NPU-path failure (PPU-fuse off, n%32!=0, exp/reduce error) falls back to the full CPU softmax. 0/ok,-2. */
 int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
     if(!c||!x||!out||M<1||n<1) return -2;
     float *mx=malloc((size_t)M*sizeof(float)), *e=malloc((size_t)M*n*sizeof(float)), *s=malloc((size_t)M*sizeof(float));

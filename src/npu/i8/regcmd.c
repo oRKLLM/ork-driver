@@ -242,6 +242,9 @@ void orki_apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
     int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,n,RK_CNA_CBUF_CON0,v);
 }
 
+/* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
+ * already filled by orki_synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
+ * [108 reg entries] [REGCMD_EW_LANE 18 entries] [8-word trailer]. */
 void orki_splice_ew_lane(uint32_t*rc,const uint32_t*base){
     memcpy(rc,               base,             216*4);                 /* 108 register entries (0x10xx/0x30xx/0x40xx) */
     memcpy(rc+216,           REGCMD_EW_LANE,   REGCMD_EW_LANE_N*4);    /* 18 second-lane entries (0x50xx) */

@@ -126,6 +126,12 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     return ok;
 }
 
+/* PUBLIC per-channel-scaled fp16 matmul, on NPU: out[m][n] = (Σ_k A[m][k]B[k][n]) * scale[n]. Composes the two
+ * bit-exact primitives — the fp16 matmul with fp16 CONTIGUOUS output (ork_npu_probe_f16_mm_f16out, 512/512) and
+ * the atom-8 per-channel EW-mul SDP (ork_npu_mul_perchan_f16, which takes a CONTIGUOUS input and repacks to
+ * atom-8 internally). This is the vendor's own structure (plain fp16 matmul → separate fp16 per-channel SDP);
+ * the contiguous↔atom-8 reshape is the SDP's internal O(M·N) repack (on CPU; the vendor does it as small on-NPU
+ * CNA copies — a follow-on optimization, see ATTN_REDERIVE_WIP.md). A/B/scale/out fp16 bit patterns. 0/ok, <0. */
 int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                            const uint16_t *scale,uint16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;

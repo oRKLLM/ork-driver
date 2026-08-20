@@ -123,6 +123,13 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
     return 0;
 }
 
+/* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
+ * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)
+ * so the silu value is emitted at fp16→fp32 precision, NOT quantized to int8. Same flying-mode LUT-stage regs
+ * as orki_set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
+ * set_i8_silu's set_i8_out8 override to int8). This is the "end-goal" higher-precision fused gate — currently
+ * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
+ * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     { const char*e=getenv("ORK_F16_C4004"); uint32_t v=e?(uint32_t)strtoul(e,0,0):0x0030;
       orki_setrn(rc,REGCMD_N,RK_DPU_S_POINTER,v); orki_setrn(rc,REGCMD_N,RK_SDP_5004,v); } /* activation mode on */

@@ -32,6 +32,10 @@ struct {
 } orki_pool = { .mu = PTHREAD_MUTEX_INITIALIZER, .go = PTHREAD_COND_INITIALIZER, .done = PTHREAD_COND_INITIALIZER };
 
 
+/* DIRECT (in-process) NPU context — the DEFAULT entry point: opens the DRM card and owns the single-stream
+ * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
+ * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
+ * select the transport by calling the desired entry point rather than relying on the env. */
 int orki_mc_ensure(ork_npu *c,int nc);   /* fwd: #54 pre-alloc domain-0 run scratch at init (while empty) */
 ork_npu *ork_npu_init(void){
     const struct ork_soc *soc=ork_soc_detect();

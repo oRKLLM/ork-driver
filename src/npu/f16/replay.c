@@ -245,6 +245,10 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
     return ok;
 }
 
+/* Faithful fp16 replay: run RKNN's fp16 LUT-LOAD program (loader/ln, the LE-table exponential-mode loader with
+ * RKNN's curve baked in) verbatim + the fp16 compute op (REGCMD_SILU_STD_F16) verbatim — patching only the I/O
+ * addresses + M/N. Unlike ork_npu_probe_silu_std_f16, this uses the fp16 loader (NOT the int8 LO-table loader)
+ * and keeps the compute's baked index params. in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;

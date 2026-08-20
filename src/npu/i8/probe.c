@@ -127,6 +127,11 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     return ok;
 }
 
+/* RE (int8 batch-mode A/B): run one int8 matmul via synth_i8 and return the RAW int32 output (no
+ * requantize, no de-tile). Mirrors probe_i8_out8 (weight [NT][KT][32][32], A raw-copied to Af). Any
+ * ork_i8_fuzz_add overrides apply inside synth_i8, so a caller can flip int8 stream->batch (0x405c=0 etc.)
+ * and observe the resulting output layout. Output buffer is 2*M*N int32 (room for a stride-2 batch layout).
+ * 0/ok, -1 wedged, -2 dims. Submit timeout honors ORK_I4_PROBE_TO_MS (fast-fail for wedgy fuzz values). */
 int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *raw){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
@@ -531,6 +536,11 @@ done:
     orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc); orki_bdestroy(fd,&RCb); return ret;
 }
 
+/* #39 A-layout solver: submit a FIXED (captured) regcmd for `nvar` A-variants, reusing ONE buffer set so the
+ * IOVA is stable across submits. The fresh-alloc-per-call path (ork_npu_replay_i8 called N times) intermittently
+ * wedges on the fold; buffer reuse is the safe pattern (cf. replay_mm_i8's iters loop, which never wedged).
+ * Avar = nvar A-images, each `astride` bytes; Bdata = shared weight; Couts = nvar contiguous M*N int32 results.
+ * A warm submit (variant 0) precedes the measured loop. Returns 0/ok, -2 bad shape, <0 on submit error. */
 int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
         const int8_t *Avar, int nvar, int astride, const int8_t *Bdata, int Bbytes, int32_t *Couts){
     int fd=c->fd; if(fd<0) return -3; if(rn<8||rn>2048||M<1||(K%32)||(N%16)||nvar<1) return -2;
@@ -1143,6 +1153,15 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     return e?-1:0;
 }
 
+/* PROBE (int8 SDP on the HW-chain): can a standalone SDP op (ewmul, enable=0x18, regcfg=69) be a MIDDLE program
+ * in a PC-chain, walking FORWARD through its next-descriptor? Decode of the vendor's working SDP chain
+ * (regcmd_softmax_f16.h SM_TASK0) proved REGCMD_MUL is ALREADY chain-native: its tail (words 138..145) is
+ * byte-identical in STRUCTURE to SM_TASK0 — a terminal descriptor at word 138 (=2*regcfg; next-addr 0 / amt 0)
+ * followed by the 0x0041/0x0018/0x0081 op-enable trailer. So the port is NOT a template change; it is feeding
+ * SDP progs (desc_slot=138) through the PROVEN ork_npu_chain_progs (which already handles SDP: per-prog
+ * desc_slot + has_sdp ping-pong-off + reps=2 cold warm-up). Chains [ewmul0(desc_slot=138) -> ewmul1(last)] and
+ * verifies BOTH outputs vs the CPU ref: *t0_ok = the middle SDP op computed correctly carrying a forward
+ * descriptor; *t1_ok = the chain WALKED forward through the SDP op's slot. Both ok => int8 SDP HW-chains. */
 int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     if(t0_ok)*t0_ok=0; if(t1_ok)*t1_ok=0;
     if(!c||!ork_ppu_fuse_enabled(c)) return -3;

@@ -53,6 +53,14 @@ int ork_dyn_queue_flush(ork_dyn_queue *q) {
 
 int ork_dyn_queue_pending(ork_dyn_queue *q) { return q ? q->n - q->submitted : -1; }   /* not-yet-submitted count */
 
+/* Idle-transition halt (the linger wiring): once the producer has drained the queue AND the linger window has
+ * elapsed since the last push, null-terminate the flying chain just ahead of the sequencer (0x0014=0 via the
+ * validated ork_dyn_halt) so a chain with unspent reserve/spin ahead of the frontier stops early and the NPU
+ * goes idle instead of running out its reserved budget. linger_us is the grace window before giving up on more
+ * work arriving. No-op (returns 0) if nothing is flying, work is still pending, we are within the linger window,
+ * the chain is multi-core (halt is single-buffer only — mc self-terminates per-core), or the frontier is already
+ * at the terminator. Returns 1 iff it halted. (Visible effect only for a reserved/persistent chain: a plain
+ * self-terminating chunk already stops at its own frontier; this is a no-op for it, by design.) */
 int ork_dyn_queue_idle(ork_dyn_queue *q) {
     if (!q || !q->h || q->submitted < q->n) return 0;                       /* nothing flying, or work still pending */
     if (ork_now_us() - q->last_push_us < (double)q->linger_us) return 0;    /* still inside the linger grace window */

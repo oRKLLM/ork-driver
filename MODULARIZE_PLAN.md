@@ -421,3 +421,47 @@ These are NOT deleted. Several are `#39`/`#54` RE apparatus whose probe driver m
 have been folded into a tool since, and AGENTS is explicit that experimental code is not discarded on an
 agent's own judgement. They are listed here so the decision can be made deliberately, per symbol, by someone
 who knows whether the experiment is finished.
+
+## Round 5 — finishing the stranded docs, using git history as the anchor (2026-08-20)
+
+Round 2 left 69 doc blocks in `npu.c` because rule-based placement scored 31/88 and I would not ship
+that. This round places 40 of them (215 lines) on **exact provenance instead of inference**.
+
+The insight is that the evidence was in the repository all along. Round 1 moved functions out of `npu.c`
+and left their docs behind — which means in the **pre-split tree, each stranded doc sat immediately above
+the function it documents**. So: find the block's verbatim text in the 15,185-line pre-split `npu.c`, read
+the definition on the next line, and look up where that function lives now. No naming heuristic, no vote.
+
+The difference is not marginal. Where the earlier heuristics said:
+
+| block | heuristic said | history proves |
+|---|---|---|
+| `set_f16_silu — graft the SiLU LUT output stage…` | `i8/regcmd.c` | **`f16/run.c`** |
+| `SINGLE-SUBMIT fp16 matmul, per-channel scale fused` | `i8/regcmd.c` | **`f16/perchan.c`** |
+| `Run-SCRATCH allocator … bimport` | `core/sched.c` | **`core/buf.c`** |
+| `fp16 multicore doorbell colsplit` | `i8/colsplit.c` | **`f16/stream.c`** |
+
+Adjacency is required, not just "the text appears somewhere": a block whose next pre-split line is another
+comment belonged to a multi-block run and is NOT placed by this rule.
+
+`npu.c` 3172 → 2953. Provably comment-only by the stripped-source fingerprint — and this time the stripper
+was checked to emit real content (17,552 lines), after the round-2 version turned out to be hashing nothing
+but filenames.
+
+Three blocks the round-2 detector had called stranded are **not** stranded: their subject
+(`orki_budget`, `ork_w_dump`, `ork_stage_fill`) is still in `npu.c`. They stay, and the count of genuinely
+stranded blocks was 66, not 69.
+
+Two more were not deletions but round 1's `orki_` prefixing (`set_f16_out_fp16in`, `splice_ew_lane`), and
+one subject became a `static inline` in `internal.h` (`ork_softmax_npu_enabled`) while the op it gates
+(`ork_npu_softmax_f16`, undocumented) lives in `norm.c` — that is where its doc went.
+
+### Still in `npu.c`: 26 blocks / ~130 lines
+
+- **17 blocks** whose text is absent from the pre-split image, i.e. written or edited after it. A later
+  pre-image would anchor them; the same history method applies, it just needs the right tree.
+- **8 blocks** that were part of a multi-block run even before the split — section banners like
+  `===== SUBMIT QUEUE =====` that head a group rather than document one function.
+- **1 block**, the `effective w4a8` banner, whose pre-split neighbour is semantically unrelated
+  (`ork_xs32`, a PRNG) — proof that adjacency alone is not sufficient for banners, which is why the
+  banners are excluded rather than placed.

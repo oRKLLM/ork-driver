@@ -249,10 +249,6 @@ void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->siz
     orki_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
     if(b->heap_fd>0){ close(b->heap_fd); b->heap_fd=0; } b->cpu=0; }
-/* Ensure the persistent SDP-op scratch (a/b/out) is each >= sz bytes; (re)allocate only when it must grow.
- * Reused across every ewmul/add call so the per-op MEM_CREATE/MEM_DESTROY churn (which dominates the
- * standalone-op cost and fragments the IOVA window) is paid ONCE, not per call. 0 on success, -1 on alloc
- * failure (caller returns an error -> its caller falls back to CPU). Freed in ork_npu_free. */
 
 /* Zero-copy IMPORT (no page alloc, no copy): allocate a dma-buf from /dev/dma_heap/system, mmap it,
  * import it into the NPU's IOMMU domain via PRIME_FD_TO_HANDLE -> MEM_CREATE(handle, flags=0, size=0).
@@ -265,16 +261,6 @@ int orki_dmaheap_fd = -1;
 /* dma-buf CPU-access cache sync on the dma-buf fd (flushes CPU caches for an imported cacheable
  * buffer — the rknpu MEM_SYNC does not cover foreign imports). Bracket the CPU fill: START|WRITE
  * before, END|WRITE after. No-op if the buffer wasn't imported (heap_fd<=0). */
-/* Run-SCRATCH allocator (task/regcmd/output buffers). int4-RESIDENT runs keep every domain's WEIGHTS bimported
- * (PRIME_FD); a fresh MEM_CREATE (bcreate) then EINVALs in that domain (MEM_CREATE GEM alloc can't coexist with
- * imported memory in the same iommu domain), which starved the run scratch (mc_ensure mtk_all -> decode -3). So
- * for int4 (c->last_dt==DT_I4) route the small scratch through the SAME import path (bimport) as the weights, so
- * it coexists in-domain. int8/fp16 are UNCHANGED (bcreate). `flags` is subsumed under import (bimport's MEM_CREATE
- * uses flags=0). NOTE: at ork_npu_init/first domain-0 touch last_dt is COLD (not DT_I4) so domain 0's init scratch
- * still bcreate's into the empty domain (fine); the int4 switch only applies once an int4 run is active. */
-/* Like bimport but imports an ALREADY-EXISTING dma-buf fd (e.g. one received over SCM_RIGHTS from another
- * process) instead of allocating from the heap. Takes ownership of `dbuf` (bdestroy closes it via heap_fd).
- * This is the cross-process zero-copy primitive behind ork_dma_import_fd (the orkd daemon's data plane). */
 /* ESTABLISH a non-0 IOMMU domain with a small NATIVE allocation before any dma-buf import is mapped into
  * it. The kernel rknpu driver lazily sets up a domain's IOVA allocator / page table on its FIRST buffer;
  * if that first buffer is an IMPORTED dma-buf, the import's SG-list pages get wrong/aliased IOVAs and the
@@ -282,30 +268,9 @@ int orki_dmaheap_fd = -1;
  * tools/mc_import_probe.c: import-first FAULTS, native-alloc-first is bit-exact; single- AND multi-core).
  * One tiny native anchor per domain, kept resident for the ctx lifetime (freed at teardown). No-op for
  * domain 0 (always established) and when already anchored. Call BEFORE the first bimport into `dom`. */
-/* Grow the per-domain arrays (native anchor + parked scratch) to hold at least `need` domains. No fixed
- * cap — the domain count is whatever the auto-sizer / ork_npu_domain_alloc drives. dom_save is allocated
- * here (so it becomes non-NULL exactly when multi-domain is first entered, preserving the single-vs-multi
- * signal the run paths key on). Called from every multi-domain entry: dom_activate, ork_dom_prime,
- * ork_npu_domain_alloc, ork_npu_set_ndomains. Returns 0 ok, -1 on OOM (caller degrades gracefully). */
 /* Public: pre-size the ctx for `n` IOMMU domains — the backend calls this once with the auto-sizer's
  * n_domains so no per-weight grow happens mid-load. Only meaningful for n>1 (n<=1 = single-domain, leaves
  * dom_save NULL). Safe to call repeatedly; only ever grows. */
-/* #54 FIX: re-establish a domain's IOMMU page-table region before EACH imported dma-buf. The kernel sets up a
- * domain's page table lazily around the buffer that triggers it; the one up-front anchor (ork_dom_prime) covers
- * only the FIRST import — a 2nd+ imported dma-buf then lands on aliased IOVAs and the NPU reads it WRONG (probed
- * bit-exact: 1st import OK, 2nd import maxerr~2835, fixed to 0 by a fresh native bcreate before it). So drop the
- * stale anchor and bcreate a fresh native one immediately before importing each weight. Cheap (64 KiB); the
- * previous import's mapping persists after its anchor is freed (verified: 1st weight re-runs bit-exact after). */
-/* #54 REAP-AT-DOMAIN-BOUNDARY. A genuine int4 doorbell DROP leaves a stuck job in c->dom_active whose completion
- * IRQ never fired, so the kernel's iommu_domain_refcount for that domain stays >0. The reap that clears it —
- * rknpu_job_timeout_clean — only fires at the TOP of the NEXT submit ON THAT CORE, and (crucially) that next
- * submit is normally in the NEXT domain, AFTER the switch: so get_and_switch(D+1) waits on D's refcount>0 and
- * TIMES OUT ("switch iommu domain time out, id: N") — the reap can never happen across the boundary. FIX: before
- * switching away from a dirty domain, issue a SAME-DOMAIN per-core dummy (ork_npu_reap_stuck) whose submit runs
- * timeout_clean(core i) -> clean gem_object_put of the stuck job -> refcount returns to 0, so the switch lands.
- * (ACT_RESET does NOT do this — source-confirmed rknpu_soft_reset is HW-only, leaves the job list; only
- * timeout_clean reaps. That's why the earlier ACT_RESET version failed.) No-op unless a real drop set dom_dirty
- * (rare); clean runs + single-domain pay nothing. Between-ops / pre-teardown only (no live pool workers). */
 /* sched=1: single-submit internal M-scheduler (clean power-of-2 Kp); sched=0: one M-tile. */
 /* synth_i16 — int16 matmul regcmd (emulated W16A16 coherence layer). Same 2-BYTE geometry as the fp16 synth
  * (int16 tiles are byte-identical layout to fp16), but the CNA precision (REG_CNA_CONV_CON1 @ 0x100c) is
@@ -393,17 +358,6 @@ unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
 /* #39 SHARED-INPUT fold BATCH: nw weights (all K=FOLD_REF_K, resident Bfold, same domain) that consume the SAME
  * input A[M,K] — QKV, or gate+up. The nc16 input marshal is done ONCE and reused across all nw folds (that marshal
  * was ~half the per-op tax; amortizing it is the point). Couts[i] row-major (NULL entries skipped). 0 ok, -1/-2/-3. */
-/* #39 Path-1 CANONICAL OUTPUT-STAGE STATE-SETTER. The full-prefill sweep (tools/re full_sdp.py + full_regmap.py
- * over pf.dump, 120,923+ tiles) proved the output stage is ONE invariant config for every int8 fold matmul,
- * spread across TWO blocks: the DPU/SDP block 0x1001 AND the PDP/aux output-dims mirror block 0x801. In both,
- * every functional register holds a single value across ALL tiles; only the geometry registers vary with (M,N).
- * sdp_canon() returns that first-principles value for any 0x1001/0x801 register — no captured blob.
- * ork_npu_sdp_stamp() rewrites the value of EVERY 0x1001/0x801 register present in a REGCMD_I8_N regcmd to its
- * canonical value (leaving DST_BASE_ADDR 0x4020 for the caller's C IOVA — the only output-stage address), so a
- * proven-runnable fold skeleton whose 0x1001+0x801 blocks are zeroed gets its ENTIRE output stage rebuilt from
- * understood values. This is the "state-setter" a delta-encoded, register-inheriting big-M tile depends on (NVDLA
- * register-file persistence). surfadd = 0x40c0 SURFACE_ADD (128*M for matched small-M tiles; the burst-regime
- * value for big-M, e.g. 0x3000 at M=36 — see full_sdp.py's 0x40c0-by-M histogram). */
 
 /* ── On-NPU (PPU) fused output stage — additive, GATED, CPU/NEON path stays the default ──────────
  *
@@ -449,11 +403,6 @@ unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
  * per-tensor requant floor) for the fp16 silu. WEDGE-PRONE (proc-precision mismatch, per set_f16_silu
  * warning); env-overridable for the sweep. N-derived geometry, constants from regcmd_array_4x32x16.h. */
 
-/* fp16-IN fp16-OUT DPU output stage, reconstructed from the VENDOR conv task[0] (conv_mul.rknn, decoded against
- * rocket_registers.h) — the config that actually emits fp16 to memory AND hands off cleanly to a chained fp16 SDP.
- * orki_set_f16_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
- * writes 0x4084=1 WITHOUT DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16), so the fp16 CVT is never enabled. Here we take
- * the vendor's mode/bypass/CVT registers verbatim and keep only the matmul-shaped output GEOMETRY (N channels). */
 
 /* Runtime gate for the PPU fused-output path. Gated on the DETECTED SoC: the fused output stage (int8
  * requantize, SiLU LUT, dual-input EW-mul) is reverse-engineered and validated against the RK3588 PPU
@@ -523,9 +472,6 @@ unsigned orki_mm_timeout_ms(void){ static int t=-1; if(t<0){const char*e=getenv(
  * RKNN's register ORDER + EW output-stage/lane (so it executes) while making the conv engine read ork's own
  * [Nt][Kt][32][32] A/B tile layout (so acc is correct). Addresses (0x1070/0x1110/0x4020) patched by caller. */
 
-/* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
- * already filled by orki_synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
- * [108 reg entries] [REGCMD_EW_LANE 18 entries] [8-word trailer]. */
 
 /* set_i8_ewmul — NVDLA SDP element-wise MULTIPLY grafted onto ork's WORKING conv+int8-out program.
  * Recipe from the mesa "rocket" driver source (NVDLA-derived): ork's synth_i8+set_i8_out8 does the conv ->
@@ -609,25 +555,12 @@ int orki_reap_n=0;
  * a 1s bounded host poll so the caller never blocks. Returns 1 if the output doorbell landed (no fault), 0 if it
  * did NOT land in the window (the expected fault). May soft-reset or IOMMU-fault the NPU — that's the point. */
 
-/* orkd CLIENT context — the EXPLICIT orkd entry point. Connect (auto-spawn) the orkd daemon and route
- * ork_mm_* through it: the daemon owns the single-stream NPU and serializes every submit, the safe way to
- * share it across concurrent processes. NO local NPU open (the daemon owns it); the ops check c->daemon.
- * Returns NULL if the daemon can't be reached (NO silent fallback to direct — the caller decides). The daemon
- * process itself must not call this (it sets ORKD_IS_DAEMON). Callers pick transport by CHOOSING the entry
- * point: ork_npu_init() = direct (default), ork_npu_init_orkd() = orkd client. */
 
-/* DIRECT (in-process) NPU context — the DEFAULT entry point: opens the DRM card and owns the single-stream
- * NPU directly (do not run concurrent direct-NPU processes; they wedge the IOMMU). For back-compat, the legacy
- * ORK_USE_ORKD=1 env still redirects this to the orkd client (ork_npu_init_orkd) — but new callers should
- * select the transport by calling the desired entry point rather than relying on the env. */
 /* ORK_LOAD_PROF: print (and reset) the per-phase import breakdown. Called at teardown. No-op unless set. */
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 void ork_npu_xprof_dump(void);
 
-/* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
- * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_mm_run_i8 detects
- * residency automatically (no API change); the caller just allocates A/C here. ---- */
 /* Zero-copy IMPORT (no alloc, no copy) — see header. Registered in dma_tab like ork_dma_alloc so
  * ork_mm_run zero-copy detection + dma_find work; freed by ork_dma_import_free (or ork_dma_free). */
 /* Import an EXTERNAL dma-buf fd (e.g. received over SCM_RIGHTS from another process) into the NPU's IOMMU
@@ -636,10 +569,6 @@ void ork_npu_xprof_dump(void);
  * Takes ownership of `dmabuf_fd` (closed by ork_dma_free/ork_dma_import_free). NULL on failure. This is the
  * orkd daemon's cross-process zero-copy hook (client shares a buffer; orkd runs against it, no copy). */
 /* the registered DMA buffer containing host ptr p, or NULL if p isn't zero-copy-resident */
-/* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
- * rknpu mem-create flag set, so the probe can A/B the write-combine (0x401) vs cacheable (0x403) fill
- * bandwidth + NPU-read correctness WITHOUT changing the default ork_dma_alloc behavior. Additive; not
- * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
 /* Diagnostic only: clean-only flush (TO_DEVICE) of a sub-range — push dirty CPU cache lines out to DRAM
  * so the NPU reads correct data, WITHOUT the FROM_DEVICE invalidate. This is the bsync a cacheable
  * weight buffer needs before submit (the "clean cost" the probe measures separately). */
@@ -674,18 +603,6 @@ void ork_npu_set_chain_core_unsafe(ork_npu *c,int core){ if(!c)return;
 void ork_npu_set_pack_domain(ork_npu *c,int domain){ if(!c) return; c->pack_domain = domain<0 ? -1 : domain;
     if(c->daemon) orkd_set_pack_domain(c->daemon, domain<0 ? 0u : (uint32_t)domain); }   /* Path B: route the domain to the daemon so orkd_pack lands the weight there */
 
-/* Allocate an IOMMU domain to pack weights into (isolation + a full ~4 GiB IOVA window each). Path B: request
- * one from orkd's coordinated pool (returns id>0, or <0 if exhausted). Direct: hand out a local id (1,2,…).
- * Make it the pack target with ork_npu_set_pack_domain; return it with ork_npu_domain_free. */
-/* Currently ACTIVE iommu domain (the one dom_activate last swapped in), i.e. the domain the NEXT submit
- * would run in if its weight already lives there. Pure getter, no state change. The point: a caller that
- * allocates a TRANSIENT/scratch weight (an attention or GDN bmm's dynamic operand) can place it in the
- * domain that is already active, so running it needs NO dom_activate switch — the switch is what a stuck
- * (unreaped, IRQ-never-fired) job turns into a 60 s "switch iommu domain" stall on the NEXT submit. See
- * ork_dom_flush_if_dirty / dom_dirty. Co-domain scratch sidesteps the whole boundary. */
-/* Make `domain` the ACTIVE iommu domain (parks/restores per-domain scratch, establishes it if fresh). A
- * DMA buffer created for a non-0 domain must be allocated while that domain is active, else it maps in the
- * currently-active domain and a submit against `domain` can't see it. Call before ork_dma_alloc-in-domain. */
 int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
 
 /* pack B[K,N] (row-major) into resident NPU tiles. dt: DT_F16 (B fp16, tile [Nt][Kt][16][32],
@@ -809,17 +726,6 @@ ork_w *ork_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
     if(c && c->daemon){ uint64_t id=orkd_pack_f16(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_F16; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: fp16 pack in the daemon (remember the domain so runs carry it) */
     return orki_pack(c,K,N,B,DT_F16); }
 
-/* ---- Tier 12f: RESIDENT K/V with per-key APPEND (decode attention) -----------------------------------------
- * A decode step appends ONE key to the KV cache, then attends over all keys. Repacking K^T/V from scratch each
- * step is packing-bound (measured ~15x slower than CPU); instead keep the two packed int8 weights RESIDENT and
- * write only the new key's tile bytes each step (+ a per-tile bsync). ork_mm_pack_i8's tile layout is
- *   bb[nt*KT*1024 + kt*1024 + nl*32 + kk]   (nt=n/32, kt=k/32, nl=n%32, kk=k%32; KT = this tile's K/32)
- * K^T weight is [Kp=512, Lmax]: K=Kp fixed so KT=16 and a new key is a new N-COLUMN (n=key) — a clean append
- * into the single N-tile (Lmax<=nmax). V weight is [Lmax, HD]: the key is the K (contraction) index, so it lands
- * in K-tile ks_idx=key/KS at local kt=(key%KS)/32 — multi-tile when Lmax>KS. Both weights are alloc'd zeroed for
- * the full Lmax, so keys beyond the current length contribute 0 (Q·0=0 score, 0 weight) and the caller just runs
- * the matmuls at K=Lmax / N=Lmax with a host softmax over the first `len` keys. Quant scales are the caller's
- * (per-key ks for K via host dequant; a single vs for V). Local NPU only. */
 /* Append key `key` (0..Lmax-1): kcol[HD] = this key's K vector (int8), vrow[HD] = its V vector (int8). Writes the
  * tile bytes for the new K^T column and V row, then bsyncs the touched tile(s). Returns 0/ok, <0 bad-arg. */
 
@@ -859,16 +765,6 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
  * tiling (same orki_tile_i8_range, page-padded per tile, same Sk×Sn order as ork_w_dump) runs pure-CPU and
  * parallel across all cores; the NPU is touched only at LOAD time (ork_mm_load_i8_import). Pass out=NULL
  * to size. K%32, N%32. Byte-identical to the pack+dump path (fresh DMA bufs are zeroed; we zero-pad). */
-/* Produce the Bf (full-K re-tiled) blob for weight B[K,N] straight from raw row-major int8, PURE-CPU — the
- * on-disk companion to ork_w_dump_i8_cpu so a .orkpack can carry Bf and the loader skips the runtime rebuild.
- * Layout: Sn page-padded tiles; tile ns = orki_pgup(K*Nc), holding [nt][ktf][32][32] over the FULL K (KTf=K/32).
- * Byte-identical to the load-time Bf rebuild / ork_mm_repack_i8's Bf tiling. Only the Bf run envelope
- * (K%512==0 && K<=4096) has a Bf; returns 0 otherwise. Pass out=NULL to size. */
-/* #39 mfold: fold-layout (rkllm M-fold, fold_woff) weight blob for B[K,N] straight from raw row-major int8,
- * PURE-CPU — the on-disk companion (orkpack v5 "Bfold") so the run path skips the per-call fold_woff repack
- * that otherwise kills mfold. Layout: nslice tiles (NS=FOLD_REF_N wide); tile s = orki_pgup(K*sliceW) holding
- * fold_woff(n,k,K) for that slice's columns. Only K==FOLD_REF_K && N<=3*FOLD_REF_N (the baked-ref fold
- * envelope); returns 0 otherwise. Byte-identical to ork_npu_fold_op_i8's per-slice W pack. out=NULL to size. */
 /* NPU-availability gate for the hybrid pack scheduler: return 1 if the NPU appears IN USE (any core
  * loaded above a small threshold), 0 if idle. Reads the kernel's rolling per-core load counter. A
  * hybrid conversion routes a weight to the NPU tile/pack path ONLY when this is 0, so a background
@@ -892,9 +788,6 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
  * lays the resident tiles as base+offset VIEWS. This keeps ALL weight residency client-side (client manages
  * its IOVA domains) — the daemon never tiles, never allocs a weight buffer, never owns the bytes. */
 
-/* CLIENT: allocate a dma-heap buffer of `size` bytes, mmap it R/W, and (via DMA_BUF_SYNC_START) ready it for
- * CPU fill. Returns the dma-buf fd (>=0) and sets *ptr to the mapping; -1 on failure. No NPU touched. The
- * caller fills *ptr then calls ork_dmabuf_seal(fd) to flush before passing the fd to the daemon. */
 /* CLIENT: flush the CPU-written bytes so the NPU (via the daemon's IOMMU import) sees them. */
 
 /* DAEMON: adopt client-passed pre-tiled int8 weight dma-buf(s) as a resident weight WITHOUT tiling or
@@ -1046,9 +939,6 @@ const float ORKI_NF4_LEVELS[16] = {
  * cost is data-independent, so it's a valid per-path microbench either way). */
 /* tile inflated codes qf32[N*K] into w's existing resident DMA buffers (inv=1; codes are exact). Reuses
  * the production orki_tile_f32_i8 — same memcpy/quant + orki_bsync(TO_DEVICE) the steady-state stream would issue. */
-/* DIRECT path microbench: inflate w's nibbles STRAIGHT to int8-tiled (no f32, no re-quant) into the
- * resident DMA tiles. i8scratch is caller-provided (size N*K); kind forces UNIFORM/NF4. Bit-identical
- * to ork_slice_inflate_i4a8_kind + ork_slice_tile_i8, but in one pass with no float round-trip. */
 /* DIRECT inflate ONLY (nibble -> linear int8 i8[N*K]); the rearrange/bsync is the separate tile step.
  * Lets the bench split direct inflate cost from the tile+bsync cost. */
 
@@ -1373,12 +1263,6 @@ long orki_xcount[XP_NPROFILE][8]; int orki_xprof=-1;
 const char *orki_XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
     "I4_MC","I4_MWARM","I4_INCR","I4CHAIN","I4_STREAM","SDP"};
 const char *orki_XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
-/* fp16 multicore matmul (Sn==1) doorbell colsplit — DEFAULT ON (2026-08-05). Bit-exact and 1.04-1.23x faster than
- * mcworker (A/B, governors-verified). The K-split (Sk>1) drop that used to WEDGE was root-caused as a concurrent
- * CROSS-BUFFER weight-fetch wild (HW prefetches Bb[ks+1] while Bb[ks] drains) and is now PREVENTED by CONTIG (one
- * contiguous weight buffer -> no dma-buf boundary -> no wild -> no drop; validated 1000-iter 0-drop + make test).
- * CONTIG is default-on for Sn==1 inside ork_dyn_begin_colsplit; it is the ONLY fp16 multicore path (#45) — the
- * legacy mcworker fallback has been removed. See NPU-Quirks "fp16 3-core colsplit drop" + Exp-2026-08-05-fp16-Colsplit-CONTIG. */
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */
@@ -1896,13 +1780,6 @@ int orki_fused_mtile(int K,int M){
  * Below is the sweep harness (env-configurable format regs), kept for the record; NOT called by the chain. ── */
 
 
-/* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
- * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)
- * so the silu value is emitted at fp16→fp32 precision, NOT quantized to int8. Same flying-mode LUT-stage regs
- * as orki_set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
- * set_i8_silu's set_i8_out8 override to int8). This is the "end-goal" higher-precision fused gate — currently
- * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
- * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
 
 /* ork_mm_run_f16_silu — fp16 gate matmul + fused SiLU with fp16→fp32 output (no int8 activation quant). The
  * "end-goal" precise on-NPU gate: recovers the full PPL gap the int8 silu output loses (ablation), at the cost
@@ -1925,11 +1802,6 @@ int orki_fused_mtile(int K,int M){
  * mult/2^shift)) as int8 [M*N]. For keeping int8 intermediates on the NPU across a chained FFN inner
  * (the "up" projection feeding the EW-mul). Same resident full-K path + submit1 as the fused runs. */
 
-/* int8 matmul with INT16 requant output (set_i16_out): C = clamp_i16(round((A·W)*mult/2^shift)) [M*N] int16,
- * COMPACT-LINEAR (m*N+n) — which is exactly the CONTIGUOUS host layout the int16 SDP seq adapters read, so a
- * seq [MM_I8_OUT16 -> exp_i16/silu_i16] carries int16 forward RESIDENT (A2) with NO hardware PC-chain and NO
- * layout bridge (sidesteps the set_i16_out chaining fragility). K%512 (int8 requant small-K limit). Twin of
- * ork_mm_run_i8_out8. 0/ok, -1 wedged, -2 dims, -3 SoC. */
 
 /* RE/calibration: run ONE M=1 full-K int8 submit (no K-split) at (K,N) to probe this SoC's
  * single-submit K-tile ceiling (`0x1044`). Allocates its own buffers — does not touch resident
@@ -1957,11 +1829,6 @@ int orki_fused_mtile(int K,int M){
  * CPU model. C is written as raw M*N*2 bytes (layout TBD — a varying-value pass follows to map it).
  * 0/ok, -1 wedged, -2 dims. */
 
-/* RE (int8 batch-mode A/B): run one int8 matmul via synth_i8 and return the RAW int32 output (no
- * requantize, no de-tile). Mirrors probe_i8_out8 (weight [NT][KT][32][32], A raw-copied to Af). Any
- * ork_i8_fuzz_add overrides apply inside synth_i8, so a caller can flip int8 stream->batch (0x405c=0 etc.)
- * and observe the resulting output layout. Output buffer is 2*M*N int32 (room for a stride-2 batch layout).
- * 0/ok, -1 wedged, -2 dims. Submit timeout honors ORK_I4_PROBE_TO_MS (fast-fail for wedgy fuzz values). */
 
 /* DOORBELL PIPELINE PROFILER (Tier 11): measure the wall of `iters` SERIAL int8 matmuls, BLOCKING vs
  * NONBLOCK + DRAM-doorbell busy-poll. Blocking = submit waits (~130µs floor + compute)/op. Nonblock = submit
@@ -2063,12 +1930,6 @@ int orki_fused_mtile(int K,int M){
  * N->16 on-NPU (log2(N/16) submits, ping-pong buffers), then a 16-wide CPU tail. Reusable: softmax
  * stability, max-pool, top-k, clamp. 0/ok, <0 err. */
 
-/* PUBLIC per-channel-scaled fp16 matmul, on NPU: out[m][n] = (Σ_k A[m][k]B[k][n]) * scale[n]. Composes the two
- * bit-exact primitives — the fp16 matmul with fp16 CONTIGUOUS output (ork_npu_probe_f16_mm_f16out, 512/512) and
- * the atom-8 per-channel EW-mul SDP (ork_npu_mul_perchan_f16, which takes a CONTIGUOUS input and repacks to
- * atom-8 internally). This is the vendor's own structure (plain fp16 matmul → separate fp16 per-channel SDP);
- * the contiguous↔atom-8 reshape is the SDP's internal O(M·N) repack (on CPU; the vendor does it as small on-NPU
- * CNA copies — a follow-on optimization, see ATTN_REDERIVE_WIP.md). A/B/scale/out fp16 bit patterns. 0/ok, <0. */
 
 /* PURE-NPU per-channel-scaled fp16 matmul via a DIAGONAL second matmul (no SDP, no reshape, no CPU repack).
  * out = (A·B) · diag(scale): matmul1 A[M,K]·B[K,N] -> G[M,N] (contiguous fp16), then matmul2 G[M,N]·D[N,N] where
@@ -2168,10 +2029,6 @@ int orki_fused_mtile(int K,int M){
  * The LUT data words are streamed via 0x4104 verbatim (encoding TBD by calibration — pass lut as the raw 16-bit
  * words the op consumes). in/out fp16 [M*N], N%8==0; rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
 
-/* Faithful fp16 replay: run RKNN's fp16 LUT-LOAD program (loader/ln, the LE-table exponential-mode loader with
- * RKNN's curve baked in) verbatim + the fp16 compute op (REGCMD_SILU_STD_F16) verbatim — patching only the I/O
- * addresses + M/N. Unlike ork_npu_probe_silu_std_f16, this uses the fp16 loader (NOT the int8 LO-table loader)
- * and keeps the compute's baked index params. in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 
 /* ---- FORWARD-SOFTMAX REPLAY (RE) --------------------------------------------------------------------
  * Replay the captured vendor forward-softmax 9-task PC-chained graph VERBATIM at its capture geometry
@@ -2199,11 +2056,6 @@ int orki_fused_mtile(int K,int M){
  * submits single-core task_number=1 (chain-links ignored at n=1), warms once, times `iters`. rkllm's task
  * descriptor is identical to ork's (enable=0xd,int_mask=0x300,regcfg_amount=108 — verified from capture).
  * SAFETY: orki_mm_timeout_ms() so a bad regcmd self-terminates (soft, reboot-recoverable) rather than hanging. */
-/* #39 A-layout solver: submit a FIXED (captured) regcmd for `nvar` A-variants, reusing ONE buffer set so the
- * IOVA is stable across submits. The fresh-alloc-per-call path (ork_npu_replay_i8 called N times) intermittently
- * wedges on the fold; buffer reuse is the safe pattern (cf. replay_mm_i8's iters loop, which never wedged).
- * Avar = nvar A-images, each `astride` bytes; Bdata = shared weight; Couts = nvar contiguous M*N int32 results.
- * A warm submit (variant 0) precedes the measured loop. Returns 0/ok, -2 bad shape, <0 on submit error. */
 /* #39 A-layout MAPPER (Route A): recover the fold's A-read map — for each weight one-hot position Bpos[i]
  * (= ork_woff byte for logical (n0, k0_i)), which A-buffer BYTE OFFSET does the fold pull for each output
  * position? With a one-hot weight at (k0,n0), C[*][n0] = A_read(*,k0). We run 4 submits/k0 on ONE buffer set
@@ -2287,21 +2139,7 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
  * no inter-task reset). Mirrors chain_mm_silu_i16 but task0 is fp16 (all-1s 32x32 -> C=32.0) instead of int8.
  * Sets *mm_ok (fp16 matmul C≈32 in-chain), *silu_ok (int16 silu vs CPU). 0/ok,-1 fail,-2 bad,-3 SoC. */
 
-/* CHAIN ASSEMBLER increment-1: DATA-CONNECTED int8-matmul(int16-out) -> int16-silu in ONE PC-chain via the
- * general ork_npu_chain_progs core. Unlike ork_npu_chain_mm_silu_i16 (which only proves the chain WALKS --
- * its matmul output and silu input are SEPARATE buffers), here the gate matmul's int16 output buffer G IS
- * the silu's input, so it validates the INTERMEDIATE-BUFFER BRIDGE (the crux of the FFN chain): does the
- * matmul set_i16_out layout match the silu's 0x5018 EWCUBEH cube input layout. Computes
- *   out = clamp_i16( silu( gate_i16 * in_scale ) / out_scale ),  gate_i16 = requant_i16(A[M,K] x B[K,N]).
- * A int8 [M*K] row-major, B int8 [K*N] row-major (de-tiled here); mult/shift = the int32->int16 requant.
- * gate_out (nullable) returns G read back via EWCUBEH so a caller can localize a mismatch to the matmul
- * stage vs the silu stage. Small-shape validated regime (probe_i16_out N range). 0/ok,-1 wedge,-2 dims,-3 SoC. */
 
-/* CHAIN (M4 building block): int8-matmul(int16-out) -> PER-CHANNEL-scale(int16) in ONE PC-chain via
- * chain_progs — the A·V->normalize pattern. The matmul's int16 output G IS the per-channel op's input
- * (0x5018), validating the intermediate-buffer bridge (like ork_npu_chain_gatesilu_i16 but SDP=per-channel
- * scale instead of silu). out = clamp_i16( requant_i16(A[M,K]xB[K,N], m1,s1) * scale[n] * m2 >> s2 ).
- * A int8[M*K], B int8[K*N] row-major, scale int16[N] per-channel. K%32,N%32,N<=nmax,M<=64. 0/ok,<0. */
 
 /* fp16-IN chained matmul -> per-channel SDP (the attention A·V normalize path, all-fp16 like the vendor conv->mul).
  * Closes the single-submit chain with CORRECT values: fp16 matmul (synth, weight tile [N/16][K/32][16][32], fp16
@@ -2406,9 +2244,6 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
 /* ORKD fused attention core against 3 resident (is_orkd) weights (K^T[Kp,Nk], ones[Nk,32], V[Nk,dv]) — one
  * ORKD_ATTN round-trip, one on-NPU chain (QK^T->exp->reduce,e.V), e never leaves the NPU. Sigma[Nq*32] +
  * av[Nq*dv] returned; caller normalizes attn=av/Sigma. Thin wrapper over the orkd_attn_i8 client. */
-/* RR variant: nchains fused-attn chains (per-chain wkt/wv, shared wones) fanned across the daemon's cores in ONE
- * round-trip (ORKD_ATTN_RR / ork_mm_run_chains_rr_biased). Q = nchains*Nq*Kp int8 (chain-major); Sigma =
- * nchains*Nq*32, av = nchains*Nq*dv int32 (attn_c = av_c/Sigma_c). All weights must be daemon-resident. -3 if not. */
 
 /* --- ORKD whole-decode-layer core: the SINGLE home for the layer compute (lib<->orkd parity) ----------------
  * orki_layer_mm: one M=1 matmul against a resident weight — doorbell if K fits its envelope (K%512==0 && K<=4096),
@@ -2416,15 +2251,7 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
 /* Transport-transparent whole-layer op. c->daemon set => forward as one ORKD_LAYER round-trip; else run locally
  * (the orkd daemon's handle_layer lands here on its own direct ctx). See the header for the compute contract. */
 
-/* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
- * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
- * (build via ork_mm_silu_build_lut). Single M-tile per task for now (M<=chain mcap). 0/ok,-1 wedge,-2 dims. */
 
-/* OPTION B: chain [... -> gate matmul(int8-out) -> silu-SDP -> ...] where task[sdp_task] is a STANDALONE int8
- * silu-SDP op reading task[sdp_task-1]'s (gate) output via aliased buffers (the vendor's matmul->SDP pattern),
- * NOT a fused matmul output stage. The gate task (sdp_task-1) gets orki_set_i8_out8 (int8 output, requant
- * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_npu_silu_i8).
- * tasks[sdp_task].C receives int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
 
 /* GENERAL heterogeneous FFN chain: per-task ops[] (OP_MM32/OP_MM8/OP_SILU/OP_EWMUL); SDP tasks read prior
  * outputs by index (ops[i].in0/in1), aliased. The silu LUT for (in_scale,out_scale) is built internally.
@@ -2494,11 +2321,6 @@ int orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,i
  * staged into the per-core AF (zero-copy A is M=1-wrong). All S tasks must share one domain (a MoE node's
  * experts do: layer-based residence); begin_mc submits + allocs its scratch in tasks[0]'s domain. */
 
-/* ============ B: GROUPED int4 (W4A4 per-K-group scales) on the NONBLOCK doorbell ============
- * ork_mm_run_i4_grouped's doorbell path. Row-decomposed (M=1 tasks across cores); each row emits Sn*Sk programs
- * (K-slice = gsize G, Sk = K/G groups). Output = Sk int16 partial blocks of [N] per row. Unlike A2's int-sum,
- * the drain (ork_dyn_grouped_end) FLOAT scale-accumulates: C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]
- * (matches the grouped drain). NULL if ineligible (chain/scratch too big) -> caller refuses (ORK_RC_WEDGE_PRONE; the blocking i4_mcworker_g path is removed #45). */
 /* Drain the grouped-int4 doorbell: poll all rows' Sk*N int16 partials, then FLOAT scale-accumulate into C[M,N]. */
 
 /* per-op eligibility (Stage 2/3 envelope); records dom of the first matmul weight into *dom / *have_dom */
@@ -2592,12 +2414,6 @@ void orki_seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct buf
  * terminator frontier). Returns #real outputs completed (0..S); *spin_alive = spin ran but real outputs
  * stayed untouched during the spin window (the loop parked as intended). */
 /* Highest op index whose output has landed in DRAM (doorbell), or -1 if none yet. Non-blocking. */
-/* Chain-aware anomaly dump. Uses the doorbell DETECTOR (ork_dyn_progress) to name the STUCK descriptor — the
- * first op that did NOT land = progress+1 — and extracts THAT op's context: its regcmd slot DMA address, baked
- * output C address + current doorbell value, and the in-regcmd next-descriptor words 216..219 (feed to
- * tools/re/decode_reg for a register post-mortem). Plus the per-op doorbell map and the context-level
- * ork_npu_dump_state (freq/volt/hw_elapse/int_status). Fire on an anomaly BEFORE a wedge/reboot loses it.
- * Single-core chains (mc uses per-core regcmd buffers — only the map + context are shown there). */
 /* ---- Budget accounting: a submit runs a FIXED step count and the NPU STOPS at the end (program P-1's
  * terminator). Work longer than one chain must be split into successive begin() calls; these let the caller
  * size chunks (max_steps) and know how close the running chain is to its end (remaining) so it can plan the
@@ -2636,14 +2452,6 @@ int orki_i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit
  *   ork_dyn_queue_destroy(q); */
 /* ncore<=1 => single-core chain (begin); ncore>1 => multi-core (the ORK_DYN_MC override is removed) NONBLOCK stream (begin_mc). */
 /* submit the next pending chunk NONBLOCK (NPU runs while the caller works); no-op if one is already flying */
-/* Idle-transition halt (the linger wiring): once the producer has drained the queue AND the linger window has
- * elapsed since the last push, null-terminate the flying chain just ahead of the sequencer (0x0014=0 via the
- * validated ork_dyn_halt) so a chain with unspent reserve/spin ahead of the frontier stops early and the NPU
- * goes idle instead of running out its reserved budget. linger_us is the grace window before giving up on more
- * work arriving. No-op (returns 0) if nothing is flying, work is still pending, we are within the linger window,
- * the chain is multi-core (halt is single-buffer only — mc self-terminates per-core), or the frontier is already
- * at the terminator. Returns 1 iff it halted. (Visible effect only for a reserved/persistent chain: a plain
- * self-terminating chunk already stops at its own frontier; this is a no-op for it, by design.) */
 /* drain: finish the flying chunk + submit/finish any remaining chunks, writeback; returns total ops completed */
 
 /* ========= PRECOMPILED-PROGRAM CACHE (regime A: fixed chain, pinned buffers) =====================
@@ -2677,15 +2485,6 @@ int orki_i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit
  * Proves the SDP-doorbell mechanism produces bit-exact matmul AND ewmul output (the thing the chain_progs-based
  * nb probe could not — its matmuls were empty on the superseded fresh-buffer path). *ok = all three bit-exact. */
 
-/* PROBE (int8 SDP on the HW-chain): can a standalone SDP op (ewmul, enable=0x18, regcfg=69) be a MIDDLE program
- * in a PC-chain, walking FORWARD through its next-descriptor? Decode of the vendor's working SDP chain
- * (regcmd_softmax_f16.h SM_TASK0) proved REGCMD_MUL is ALREADY chain-native: its tail (words 138..145) is
- * byte-identical in STRUCTURE to SM_TASK0 — a terminal descriptor at word 138 (=2*regcfg; next-addr 0 / amt 0)
- * followed by the 0x0041/0x0018/0x0081 op-enable trailer. So the port is NOT a template change; it is feeding
- * SDP progs (desc_slot=138) through the PROVEN ork_npu_chain_progs (which already handles SDP: per-prog
- * desc_slot + has_sdp ping-pong-off + reps=2 cold warm-up). Chains [ewmul0(desc_slot=138) -> ewmul1(last)] and
- * verifies BOTH outputs vs the CPU ref: *t0_ok = the middle SDP op computed correctly carrying a forward
- * descriptor; *t1_ok = the chain WALKED forward through the SDP op's slot. Both ok => int8 SDP HW-chains. */
 
 
 /* FUSED SSD-SCAN MATMUL BENCH: chain ALL grouped-scan matmuls of ONE Mamba-2/SSD layer into a SINGLE
@@ -3145,28 +2944,9 @@ int orki_bmm_c_dense(const ork_bmm_strides *s,int N){ return s->cs_n==1 && s->cs
  * Single-slot cache (rebuilds when ctx/nf/eps change or ss drifts outside [lo,hi]); norm calls single-threaded. */
 /* scale[m] = 1/sqrt(ss[m]/nf + eps) on the NPU (K=512 fused rsqrt). 0/ok, <0 -> caller uses CPU rsqrt. */
 
-/* On-NPU composed softmax over each row of [M][n]: y = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU.
- * The per-row max and the final normalize (÷Σ) are CPU (cheap per-row scalars); the heavy parts run on the
- * NPU: exp via ork_npu_exp_i16 (int16 SDP LUT; x-max quantized to a shared in_scale so exp maps in*in_scale
- * -> exp(x-max)), Σ via the reduction-as-matmul (e·ones[n,16], reusing the norm reduce weight). Like the
- * norm this is submit-floor-bound standalone (gated off; the win is fusing into the attention chain). Any
- * NPU-path failure (PPU-fuse off, n%32!=0, exp/reduce error) falls back to the full CPU softmax. 0/ok,-2. */
 
 /* Fast Walsh-Hadamard Transform (FWHT) - Exposed utility function for caller-driven quantization */
 
 /* ==== CPU-side pack/dump helpers linked by the ggml-ork backend (no internal callers) ==== */
 
-/* Pack int8 B[K,N] (row-major [k*N+n]) DIRECTLY into IMPORTED dma-buf chunks, tiled into the NPU layout —
- * ork_mm_pack_i8's tiling into ork_mm_load_i8_import's chunked-import storage, with NO native bcreate, NO
- * blob round-trip, NO free/churn. Purpose: a fused per-tensor weight (fc.wg) allocates as uniform ~16MB
- * import chunks like every other weight, instead of a native-bcreate outlier that fragments the 32-bit
- * domain's IOVA (the PRIME-ENOMEM-at-low-fill that blocked per-domain fusion). Mirrors load_i8_import
- * (anchor + chunked own_bufs + full-K Bf rebuild); returns NULL if import is unavailable/fails. */
 
-/* CPU-ONLY int4 pack straight to the compact .orkpack blob (header + bscale[N] + Bi4[K*N/2]) — byte-
- * identical to ork_mm_pack_i4a8_im() + ork_w_dump_i4a8(), but with NO bcreate/IOMMU/tiling. The per-tile
- * bcreate in the NPU int4 packer is the serial single-stream consumer that bottlenecks .orkpack conversion;
- * a WRITE only needs the compact nibbles + scales on disk (ork_mm_load_i4a8 re-tiles at load). This
- * replicates the EXACT per-channel quant of ork_mm_pack_i4a8_im (absmax/7 uniform or NF4 codebook, optional
- * imatrix clip-grid, SR with a per-call seed) so the bytes match. Single-threaded (caller parallelizes over
- * experts). out=NULL → required size. K%32,N%32. */

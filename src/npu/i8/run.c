@@ -364,6 +364,11 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
     return rc_ret;
 }
 
+/* int8 matmul with INT16 requant output (set_i16_out): C = clamp_i16(round((A·W)*mult/2^shift)) [M*N] int16,
+ * COMPACT-LINEAR (m*N+n) — which is exactly the CONTIGUOUS host layout the int16 SDP seq adapters read, so a
+ * seq [MM_I8_OUT16 -> exp_i16/silu_i16] carries int16 forward RESIDENT (A2) with NO hardware PC-chain and NO
+ * layout bridge (sidesteps the set_i16_out chaining fragility). K%512 (int8 requant small-K limit). Twin of
+ * ork_mm_run_i8_out8. 0/ok, -1 wedged, -2 dims, -3 SoC. */
 int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int mult,int shift){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(w->dtype!=DT_I8 || !w->Bf) return -2;

@@ -689,6 +689,12 @@ int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
     for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) hi = i;   /* per-row: task done = ALL its rows' last cols written */
     return hi; }
 
+/* Chain-aware anomaly dump. Uses the doorbell DETECTOR (ork_dyn_progress) to name the STUCK descriptor — the
+ * first op that did NOT land = progress+1 — and extracts THAT op's context: its regcmd slot DMA address, baked
+ * output C address + current doorbell value, and the in-regcmd next-descriptor words 216..219 (feed to
+ * tools/re/decode_reg for a register post-mortem). Plus the per-op doorbell map and the context-level
+ * ork_npu_dump_state (freq/volt/hw_elapse/int_status). Fire on an anomaly BEFORE a wedge/reboot loses it.
+ * Single-core chains (mc uses per-core regcmd buffers — only the map + context are shown there). */
 void ork_dyn_dump(ork_dyn_chain *h, const char *label){
     if(!h) return; ork_npu *c=h->c; int N=h->N;
     ork_npu_dump_state(c,label);

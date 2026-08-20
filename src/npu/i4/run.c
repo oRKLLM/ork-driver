@@ -131,6 +131,9 @@ void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind) {
 
 void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a8_kind(w, qf32, w ? w->quant_kind : 0); }
 
+/* DIRECT path microbench: inflate w's nibbles STRAIGHT to int8-tiled (no f32, no re-quant) into the
+ * resident DMA tiles. i8scratch is caller-provided (size N*K); kind forces UNIFORM/NF4. Bit-identical
+ * to ork_slice_inflate_i4a8_kind + ork_slice_tile_i8, but in one pass with no float round-trip. */
 void ork_slice_direct_i4a8_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
     if (!w || !w->Bi4) return;
     orki_tile_direct_i4_i8(c, w, w->K, w->N, kind, i8scratch);
