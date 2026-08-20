@@ -275,6 +275,57 @@ weight from DRAM — so the kernel picks the **largest M-tile the `0x1040` sched
 (`mg_max*64`) to amortize that weight stream over as many activation rows as possible (~2× single-core
 vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for the full account.
 
+
+## Capability × precision matrix
+
+Which datapath implements what. Regenerate with `make matrix` (`tools/precision_matrix.sh` derives it
+from the source tree, so it cannot drift from the code). A dagger means the capability is provided by a
+shared implementation rather than that precision's own module — supported, just not its own code.
+
+| capability | i8 | f16 | i4 | i16 |
+|---|:--:|:--:|:--:|:--:|
+| regcmd synth | ✅ | ✅ | ✅ | ✅ |
+| output stage (requant) | ✅ | ✅ | — | ✅ |
+| fused-act output stage | ✅ | — | — | — |
+| pack weights | ✅ | ✅ | ✅ | — |
+| load / .orkpack persist | ✅ | — | ✅ | — |
+| zero-copy import / adopt | ✅ | — | ✅ | — |
+| quantise from f32 | ✅ | — | ✅ | — |
+| run — single core | ✅ | ✅† | ✅ | — |
+| run — multicore | ✅ | ✅† | ✅ | ✅† |
+| run — HW chain | ✅ | — | ✅ | ✅† |
+| run — async stream | ✅ | ✅ | ✅ | — |
+| run — NONBLOCK doorbell | ✅ | ✅† | ✅ | — |
+| batched GEMM (bmm) | ✅ | ✅ | ✅ | — |
+| fused matmul+activation | ✅ | ✅ | — | — |
+| SDP activations | ✅ | — | — | ✅ |
+| elementwise mul | ✅ | ✅ | — | ✅ |
+| elementwise add | ✅ | ✅ | — | ✅ |
+| per-channel multiply | ✅ | ✅ | — | ✅ |
+| slice-and-dice tiles | ✅ | — | ✅ | — |
+| M-fold chain | ✅ | — | — | — |
+| MoE expert coalescing | — | — | ✅ | — |
+| resident KV | ✅ | — | — | — |
+| probes / RE replay | ✅ | ✅ | ✅ | ✅ |
+| regcmd fuzz hooks | ✅ | ✅ | ✅ | — |
+
+† **f16 / run — single core** — ork_mm_run / orki_run in npu.c dispatch fp16 (no dtype token in the name)
+† **f16 / run — multicore** — ork_dyn_begin_colsplit (i8/colsplit.c) is the ONLY fp16 multicore path (#45)
+† **f16 / run — NONBLOCK doorbell** — same colsplit path — fp16 wide-K rides the doorbell
+† **i16 / run — multicore** — routed through the int8 chain
+† **i16 / run — HW chain** — ork_npu_chain_mm_*_i16 ride the int8 PC-chain
+
+**Most blanks are by design, not a TODO.** int4 has no SDP/activation row because the RK3588 datapath is
+W8A8 *or* W4A4 symmetric — int4 activations are int4, and the SDP LUT op consumes int8/int16, so there is
+no int4 activation path to implement. int16 is the *activation* precision (the accuracy tier between int8
+and fp16 for SDP ops), not a weight-storage tier, which is why it has no pack/load/import/quantise row and
+only 18 functions to int8's 167. fp16 weights are not persisted to `.orkpack` — the pack format is
+int8/int4 — so fp16 has no persist or zero-copy-import row. MoE expert coalescing is int4-only because the
+auto-profile packs experts as NF4.
+
+The genuinely open gaps, and whether they are worth closing, are tracked on the wiki
+([Precision Capability Matrix](https://github.com/oRKLLM/ork-driver/wiki)).
+
 ## Environment variables (gates & knobs)
 
 The default path uses **no environment variables** — `ork_npu_init` → `pack` → `run` just works, and

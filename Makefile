@@ -500,6 +500,11 @@ bench-llama:
 
 # API documentation (doxygen). Generated into docs/api/html, gitignored. The Doxyfile is scoped to
 # include/ + src/ and excludes the captured regcmd data headers (megabytes of hex, not API).
+# Regenerate the capability x precision matrix in README.md (see tools/precision_matrix.sh).
+.PHONY: matrix
+matrix:
+	@sh tools/precision_matrix.sh
+
 .PHONY: docs
 docs:
 	@command -v doxygen >/dev/null || { echo "doxygen not installed"; exit 1; }
