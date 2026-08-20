@@ -29,6 +29,13 @@
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
+/* #39 WEIGHT-RESIDENT M-FOLD CHAIN using a CAPTURED bit-exact tile regcmd (task #39: "chain the captured m8
+ * tile"). Identical machinery to ork_npu_mfold_chain, but each of P tasks is a memcpy of `tile_rc` (rkllm's
+ * captured width-`w` mfold regcmd, e.g. mm_regcmd_m8.txt at w=8 — validated 0/9728 bit-exact by validate_layout)
+ * with only the 3 address regs re-based per tile. This sidesteps orki_synth_i8_mfold's schedule (which reproduces
+ * rkllm only via the per-M recipe); the captured tile carries the real planner schedule verbatim. Words 0..215
+ * are the tile (108 regs); trn may be >216 (the capture's next-task bleed) — only the tile words are copied, and
+ * the chain descriptor is written fresh at 216-219. 0x40c0 (=0x400 config, NOT an IOVA) is preserved untouched. */
 int ork_npu_mfold_chain_cap(ork_npu *c, int P, int w, int K, int N, const uint32_t *tile_rc, int trn,
                             const int8_t *Apacked, const int8_t *Bpacked, int32_t *Craw, int iters, double *us){
     int fd=c->fd; if(fd<0) return -3; if(P<1||P>64||w<1||w>64||(K%32)||(N%16)||!tile_rc||trn<108) return -2;
@@ -207,6 +214,14 @@ static int ork_fold_submit_all(int fd,int dom,struct buf *TK,const int *gsz,int 
     return e?-1:0;
 }
 
+/* #39 Path-1 TOKEN-TILER executor: run P fold sub-tiles of one M_total-token batch as ONE multi-task submit over a
+ * SHARED batch cube. Unlike ork_npu_mfold_chain_v (concatenated per-tile buffers), all tiles read/write the SAME
+ * M_total x K input and M_total x N output; tile t handles rows [row_off[t], row_off[t]+m) at feature/output byte
+ * offset row_off[t]*16 (nc16 in / c4 out both stride rows by 16 bytes). The caller prepares each tile's regcmd
+ * (per-size skeleton with the 4 M_total regs patched — 0x4024=16*M_total, 0x107c=M_total, 0x1080=M_total-m,
+ * 0x40c0=128*M_total — plus the output-stage regs + doorbell). Shared weight (0x1110). This is rkllm's real fold:
+ * a batch amortized over few big-M tiles, one weight stream per tile. Apacked = M_total x K nc16 (width M_total);
+ * Bpacked = K x N woff; Craw = M_total x N c4 (width M_total). Returns 0/ok, us=avg submit. */
 int ork_npu_fold_batch(ork_npu *c, int Mtot, int K, int N, int P, const int *row_off,
                        const uint32_t *tiles, int rn, const int8_t *Apacked, const int8_t *Bpacked,
                        int32_t *Craw, int ncore, int iters, double *us){

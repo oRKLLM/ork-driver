@@ -102,6 +102,10 @@ size_t ork_w_dump_i4a8(const ork_w *w, void *out, size_t cap){
     return need;
 }
 
+/* Reload the compact int4 form straight into NPU DMA: parse+validate header, read bscale + Bi4, inflate
+ * each channel's nibbles -> int8 (UNIFORM sign-extend / NF4 LUT per quant_kind) and orki_tile_f32_i8 into a
+ * fresh DMA buffer — the tail of the pack path, from stored nibbles instead of re-quantized f32. Retains
+ * a copy of Bi4 + bscale so the loaded weight can be re-dumped byte-identically. NULL on malformed blob. */
 /* Zero-copy IMPORT variant of ork_mm_load_i4a8: resident tiles are dma-bufs the NPU reads in place (PRIME
  * import), and the int4 nibbles inflate -> int8 directly into them (no f32 round-trip). Bit-identical to
  * ork_mm_load_i4a8 (same blob, same tiled bytes). Falls through to NULL (caller uses ork_mm_load_i4a8) if

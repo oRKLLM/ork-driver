@@ -302,13 +302,6 @@ int orki_dmaheap_fd = -1;
  * The "2160" is capture-specific (K=3584,N=1216) pending a K/N-general derivation. GATED: only synthesized on
  * the explicit m-fold path; the default matmul is untouched. */
 unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
-/* #39 WEIGHT-RESIDENT M-FOLD CHAIN using a CAPTURED bit-exact tile regcmd (task #39: "chain the captured m8
- * tile"). Identical machinery to ork_npu_mfold_chain, but each of P tasks is a memcpy of `tile_rc` (rkllm's
- * captured width-`w` mfold regcmd, e.g. mm_regcmd_m8.txt at w=8 — validated 0/9728 bit-exact by validate_layout)
- * with only the 3 address regs re-based per tile. This sidesteps orki_synth_i8_mfold's schedule (which reproduces
- * rkllm only via the per-M recipe); the captured tile carries the real planner schedule verbatim. Words 0..215
- * are the tile (108 regs); trn may be >216 (the capture's next-task bleed) — only the tile words are copied, and
- * the chain descriptor is written fresh at 216-219. 0x40c0 (=0x400 config, NOT an IOVA) is preserved untouched. */
 /* #39 TIMING PROBE: replay P DIFFERENT captured tiles (tiles = P*rn words, e.g. rkllm's real chain tasks IN
  * ORDER) as one task_number=P weight-resident chain, rebasing each tile's A/W/C onto shared buffers (uniform
  * max-M stride; ZEROED operands — this measures re-DMA vs reuse, not correctness). Shared weight buffer. Returns
@@ -319,14 +312,6 @@ unsigned orki_mm_timeout_ms(void);   /* fwd (defined below) */
  * concatenated per-tile nc16 (tile t = ws[t] rows, offset = sum of prior ws*K bytes); shared woff weight Bpacked;
  * Craw = concatenated per-tile c4 (ws[t]*N int32 each). wreuse: OR WEIGHT_REUSE(0x1040 bit13) into tiles t>0.
  * Rebases A/W/C per tile onto shared guard buffers preserving the concat layout. Returns 0/ok, us=avg submit. */
-/* #39 Path-1 TOKEN-TILER executor: run P fold sub-tiles of one M_total-token batch as ONE multi-task submit over a
- * SHARED batch cube. Unlike ork_npu_mfold_chain_v (concatenated per-tile buffers), all tiles read/write the SAME
- * M_total x K input and M_total x N output; tile t handles rows [row_off[t], row_off[t]+m) at feature/output byte
- * offset row_off[t]*16 (nc16 in / c4 out both stride rows by 16 bytes). The caller prepares each tile's regcmd
- * (per-size skeleton with the 4 M_total regs patched — 0x4024=16*M_total, 0x107c=M_total, 0x1080=M_total-m,
- * 0x40c0=128*M_total — plus the output-stage regs + doorbell). Shared weight (0x1110). This is rkllm's real fold:
- * a batch amortized over few big-M tiles, one weight stream per tile. Apacked = M_total x K nc16 (width M_total);
- * Bpacked = K x N woff; Craw = M_total x N c4 (width M_total). Returns 0/ok, us=avg submit. */
 /* #39 per-core fold submit: one core's task-group, core_mask=1u<<core, own task buffer (tasks from index 0),
  * subcore_task[*]={0,P} — EXACTLY the proven mcworker per-core pattern. Run one per thread => concurrent 3-core. */
 
@@ -923,10 +908,6 @@ const float ORKI_NF4_LEVELS[16] = {
 
 /* Serialize the compact int4 form: header + bscale[N] (f32) + Bi4 (K*N/2 bytes). out=NULL -> required
  * size. Returns 0 if `w` is not an int4-packed weight (no Bi4/bscale) or on cap overflow. */
-/* Reload the compact int4 form straight into NPU DMA: parse+validate header, read bscale + Bi4, inflate
- * each channel's nibbles -> int8 (UNIFORM sign-extend / NF4 LUT per quant_kind) and orki_tile_f32_i8 into a
- * fresh DMA buffer — the tail of the pack path, from stored nibbles instead of re-quantized f32. Retains
- * a copy of Bi4 + bscale so the loaded weight can be re-dumped byte-identically. NULL on malformed blob. */
 /* Rearrange linear int8 codes i8[N][K] into IMPORTED (dma-buf) tiles, using the dma-buf's OWN cache sync
  * (the rknpu MEM_SYNC does NOT cover foreign imports). Same byte math as orki_tile_i8_to_tiles. */
 /* ---- DIAGNOSTIC ONLY (tools/prefetch_headroom.c): isolate the STEADY-STATE per-slice streaming prep.
@@ -1896,11 +1877,6 @@ int orki_fused_mtile(int K,int M){
  * regcfg=69. This is the CLEAN on-NPU element-wise path (NVDLA standalone SDP layer, both operands from memory)
  * — sidesteps the conv-geometry coupling that blocked the fused-into-matmul approach. 0/ok,-1 wedged. */
 
-/* Public EW-mul: out[m*N+n] = clamp_i8(round(up[m][n]*silu[m][n] * mult/2^shift)) computed ON THE NPU via the
- * standalone SDP element-wise op. Marshals up/silu (logical [M][N]) into the NVDLA feature cube (atom-16),
- * submits REGCMD_MUL with symmetric zero-points (za=zb=zo=0), de-marshals. GENERALIZED to arbitrary M,N via
- * orki_set_mul_geom (M,N reprogrammed from the captured M=8/N=64 op). N must be a multiple of 16 (channel atom).
- * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 
 /* fp16 element-wise MULTIPLY: out[m][n] = up[m][n] * silu[m][n] in fp16 on the NPU (standalone SDP fp16 op,
  * no requant). Marshals into the NVDLA fp16 feature cube (atom=8, 2-byte channels) internally. GENERALIZED to
@@ -1918,10 +1894,6 @@ int orki_fused_mtile(int K,int M){
  * NVDLA cube atom=8 (same layout as fp16). Symmetric zero-points. mult in 0..0x7fff. GENERALIZED to arbitrary
  * M,N (N a multiple of 8); rk3588-gated. 0/ok,-1 wedged,-2 shape,-3 SoC. */
 
-/* Standalone int8 element-wise ADD — RE probe (settable scale regs to decode the add structure). out[m][n] from
- * the 2-input SDP op with ALU=add (REGCMD_ADD), reprogrammed to (M,N) by orki_set_mul_geom. Caller sets za(0x4044),
- * zb(0x4074), zo(0x4080), out scale mult(0x4084)/shift(0x4088), and the b-operand scale bscale(0x4078); the
- * ALU-mode regs (0x4040/0x4048/0x4070) stay from the template. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
 
 /* On-NPU per-row MAX-REDUCE (int8): out[m] = max_n a[m*N+n], N%16, N<=8192. Batched pairwise-max TREE
  * using the SDP EW ALU in MAX mode (EW_ALU_ALGO=0 @ reg 0x4070, rocket_registers.h; NVDLA map_alu_op
@@ -2014,15 +1986,6 @@ int orki_fused_mtile(int K,int M){
  * ALU=add op (REGCMD_ADD_I16). Same requant structure as int8. Residual (equal scales) => clamp_i16(a+b), exact;
  * arbitrary unequal scales approximate. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
 
-/* ── Standalone on-NPU SiLU (activation-LUT SDP op) — RE probe ─────────────────────────────────────
- * Applies the PPU activation LUT to a SINGLE int8 memory input [M][N] via the standalone 69-reg/enable=0x18
- * SDP op (REGCMD_SILU_STD), reprogrammed to (M,N) by orki_set_mul_geom. Two submits on the single-stream NPU:
- * (1) LUT-load (REGCMD_SILU_LUT, streams the int16 curve into PPU SRAM); (2) the standalone op reads it.
- * SDP math: idx=(in*R)>>6 + C0(idx_off); out=clamp_i8(R*LUT-interp(idx) + out_bias); R=r_mult/2^r_shift.
- * The caller supplies the scale regs (r_mult,r_shift,out_bias,idx_off,cfg4064,cfg4068) and the LUT; lut==NULL
- * keeps the captured curve. This is the RE/calibration entry (measure idx(in) with a ramp LUT, then build the
- * silu curve at those indices — same 2-pass scheme as ork_mm_silu_build_lut but through THIS op, not a matmul).
- * in/out int8 [M*N] row-major; N%16==0. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 
 /* fp16 standalone activation-LUT op — RE probe. Applies the PPU LUT to a SINGLE fp16 memory input [M][N] via
  * REGCMD_SILU_STD_F16 (single-input, fp16 gain 0x00010001). Two submits: REGCMD_SILU_LUT (load) + this op.
@@ -2172,9 +2135,6 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
  * does — for each integer LUT index k it finds the q_in whose idx==k (from the dense R=1 calibration transitions)
  * and samples silu there, so the op's interpolation lands on silu at the exact grid. RKNN-class accuracy.
  * in/out int16 [M*N], N%8==0. rk3588-gated. 0/ok,-1 wedged,-2 bad shape,-3 SoC. */
-/* Build the int16 activation LUT curve for `f` at (in_scale,out_scale) into lut[1030]. Calibrates the idx map
- * once per ctx (a STANDALONE probe — must run outside any chain). 0/ok. Shared by orki_act_lut_i16 (standalone) and
- * the HW-chained silu prologue in ork_dyn_begin_seq_i8_mc. */
 /* On-NPU GELU (int16 / w16a16i): same activation-LUT op, GELU curve. RKNN-class accuracy like SiLU int16. */
 /* On-NPU rsqrt (int16) — RMSNorm building block. RKNN-class accuracy. */
 /* On-NPU exp (int16) — softmax building block. RKNN-class accuracy. */
@@ -2245,9 +2205,6 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
  * ORKD_ATTN round-trip, one on-NPU chain (QK^T->exp->reduce,e.V), e never leaves the NPU. Sigma[Nq*32] +
  * av[Nq*dv] returned; caller normalizes attn=av/Sigma. Thin wrapper over the orkd_attn_i8 client. */
 
-/* --- ORKD whole-decode-layer core: the SINGLE home for the layer compute (lib<->orkd parity) ----------------
- * orki_layer_mm: one M=1 matmul against a resident weight — doorbell if K fits its envelope (K%512==0 && K<=4096),
- * else wide-K run_i8; warm-retry. (Moved here from orkd.c handle_layer so direct and daemon share one impl.) */
 /* Transport-transparent whole-layer op. c->daemon set => forward as one ORKD_LAYER round-trip; else run locally
  * (the orkd daemon's handle_layer lands here on its own direct ctx). See the header for the compute contract. */
 
@@ -2274,13 +2231,6 @@ int ork_mm_chain_build_exp_lut(ork_npu*c, double in_scale, double out_scale,
  * failing chain's code). PRECONDITION: cores must be WARM (a prior matmul on each) — a cold core's first submit
  * wedges; a chain-only caller should warm via a multi-core matmul first (see chainrr_conc_probe). Local NPU only. */
 
-/* ================= DYNAMIC STEERED SUBMISSION API (validated by tools/steer_probe + doorbell_id_probe) =====
- * A run_chain_i8 chain, but submitted NONBLOCK so the host can (a) watch per-op progress via each op's output
- * doorbell (dc civac poll), (b) HALT it mid-flight to free the NPU early (write 0x0014=0 into a future op's
- * live regcmd descriptor — the sequencer reads it from DRAM at exec-time), (c) later, redirect the next-pointer
- * for runtime routing. v1 constraints: M=1 per task, single-slice conforming K (K%512==0, K<=4096), and A/C
- * resident in ork_dma_alloc buffers (so we hold DMA addrs + poll outputs coherently). One program per task
- * (P==S). Steering must lead the sequencer by ~1-2 ops (time it off ork_dyn_progress). */
 /* Graceful SIGTERM/SIGINT for the doorbell. The async poll (ork_dyn_end) would otherwise spin uninterruptibly:
  * a `kill -TERM` during an NPU submit-wait was IGNORED -> orphaned process, forced board reboot (and a kill -9
  * mid-submit risks an IOMMU/NPU wedge). A chained handler sets a flag; the poll breaks on it and DRAINS
@@ -2439,17 +2389,6 @@ void orki_seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct buf
 int orki_i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
 /* Drain (until complete or a stall => halted), write outputs back from DMA, free. Returns highest op done. */
 
-/* ============ SUBMIT QUEUE: chunk-pipeline over the dynamic API (the robust wrap) ==================
- * Accumulate matmul tasks, submit them as clean task_number-bounded chunks, and let the NPU run a chunk
- * NONBLOCK while the caller does other work (CPU int4 bulk in the decode split). This is the production
- * wrap: each chunk is a complete job (no in-flight extension), work > chunk_max splits into successive
- * chunks (inter-chunk bubble ~one submit floor, <0.1% at big chunks). Usage:
- *   q = ork_dyn_queue_create(c, chunk_max);
- *   for (...) ork_dyn_queue_push(q, &task);   // accumulate the NPU's share
- *   ork_dyn_queue_flush(q);                    // NPU starts (NONBLOCK)
- *   ... CPU does its bulk in parallel ...
- *   n = ork_dyn_queue_drain(q);                // rendezvous + writeback
- *   ork_dyn_queue_destroy(q); */
 /* ncore<=1 => single-core chain (begin); ncore>1 => multi-core (the ORK_DYN_MC override is removed) NONBLOCK stream (begin_mc). */
 /* submit the next pending chunk NONBLOCK (NPU runs while the caller works); no-op if one is already flying */
 /* drain: finish the flying chunk + submit/finish any remaining chunks, writeback; returns total ops completed */

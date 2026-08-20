@@ -465,3 +465,49 @@ one subject became a `static inline` in `internal.h` (`ork_softmax_npu_enabled`)
 - **1 block**, the `effective w4a8` banner, whose pre-split neighbour is semantically unrelated
   (`ork_xs32`, a PRNG) — proof that adjacency alone is not sufficient for banners, which is why the
   banners are excluded rather than placed.
+
+## Round 6 — generalized history anchoring, then splitting `i8/probe.c` (2026-08-20)
+
+**Part 1: the doc residue.** Round 5 anchored blocks against ONE pre-split image, which only worked for
+docs written before it. Generalizing: walk all 511 historical `npu.c` versions newest-first and, per block,
+stop at the first tree where that block's verbatim text is immediately followed by a definition. Different
+blocks resolve against different commits — 6, 9, 11, 62 commits back — which is exactly why a single
+pre-image missed them.
+
+That placed 8 more blocks (43 lines), and identified 4 more that must **stay** because their subject
+(`orki_budget`, `ork_w_dump`, `ork_stage_fill`, `ork_w_free`) is still defined in `npu.c`. Running total of
+false "stranded" classifications from round 2's detector: 7.
+
+For section banners (which head a group rather than document one function) adjacency is the wrong test —
+the `effective w4a8` banner's pre-split neighbour is `ork_xs32`, a PRNG. Instead: find the banner's section
+in the pre-split tree and see which module received its functions. Only 2 banners had unambiguous evidence
+(≥2 definitions, 100% agreement) and moved — DYNAMIC STEERED SUBMISSION → `i8/dyn.c` (2/2), SUBMIT QUEUE →
+`i8/queue.c` (9/9). The rest scored 25–57% and stayed. `npu.c` 2952 → 2892.
+
+**Part 2: `i8/probe.c` 1,270 → five files.** It was the largest module after the scaffold and pure RE
+surface. Split as CONTIGUOUS line ranges by probe family:
+
+| file | body lines | holds |
+|---|--:|---|
+| `i8/probe.c` | 131 | fuzz-override hooks + matmul probes (mtile, single, out8, mm) |
+| `i8/probe_sdp.c` | 332 | ewmul (three template variants), mul, add, standalone SiLU |
+| `i8/probe_replay.c` | 216 | verbatim regcmd replay, A-variant sweep, A-layout mapper, fused-SiLU cfg |
+| `i8/probe_prof.c` | 167 | submit-floor + overlap profiling, batch / b-scale acceptance |
+| `i8/probe_chain.c` | 395 | chain benchmark, `ork_npu_chain_progs`, hetero / SDP-fwd / self-test |
+
+Safe to split because `probe.c` has **no file-scope statics**; the one file-scope definition
+(`orki_i8_fovr[]`, externed via `internal.h`) and the one macro (`CPU_ROUTER`, lines 775–799) each fall
+entirely inside a single group.
+
+Verified by a tree-wide **code-multiset** invariant — strip comments from every source, drop filenames,
+sort, compare. Result: **zero removals**, and all 104 additions are replicated `#include`/`#define`
+preamble (4 files × 26 lines). No code line was added or lost by the move. Plus `make clean && make` on the
+board and an exported-symbol diff over `libork_npu.so`.
+
+`CORE` in the Makefile gained the four new TUs. Forgetting that would not fail the build — the objects
+simply would never be compiled and the symbols would go missing at link, so it is checked, not assumed.
+
+### Follow-up this exposed
+`ork_npu_chain_progs` has **six library callers** (round 4 classified it production) yet lives in
+`probe_chain.c`. The contiguous split preserves that misplacement rather than fixing it, because moving one
+function out is a separate, non-contiguous change. It belongs in `i8/chain.c`.

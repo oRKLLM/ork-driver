@@ -400,6 +400,11 @@ int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int m
     return rc_ret;
 }
 
+/* Public EW-mul: out[m*N+n] = clamp_i8(round(up[m][n]*silu[m][n] * mult/2^shift)) computed ON THE NPU via the
+ * standalone SDP element-wise op. Marshals up/silu (logical [M][N]) into the NVDLA feature cube (atom-16),
+ * submits REGCMD_MUL with symmetric zero-points (za=zb=zo=0), de-marshals. GENERALIZED to arbitrary M,N via
+ * orki_set_mul_geom (M,N reprogrammed from the captured M=8/N=64 op). N must be a multiple of 16 (channel atom).
+ * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
 int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i8(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;

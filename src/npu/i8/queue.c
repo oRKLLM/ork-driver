@@ -28,6 +28,17 @@
 #include "npu/core.h"
 #include "npu/i8/i8.h"
 
+/* ============ SUBMIT QUEUE: chunk-pipeline over the dynamic API (the robust wrap) ==================
+ * Accumulate matmul tasks, submit them as clean task_number-bounded chunks, and let the NPU run a chunk
+ * NONBLOCK while the caller does other work (CPU int4 bulk in the decode split). This is the production
+ * wrap: each chunk is a complete job (no in-flight extension), work > chunk_max splits into successive
+ * chunks (inter-chunk bubble ~one submit floor, <0.1% at big chunks). Usage:
+ *   q = ork_dyn_queue_create(c, chunk_max);
+ *   for (...) ork_dyn_queue_push(q, &task);   // accumulate the NPU's share
+ *   ork_dyn_queue_flush(q);                    // NPU starts (NONBLOCK)
+ *   ... CPU does its bulk in parallel ...
+ *   n = ork_dyn_queue_drain(q);                // rendezvous + writeback
+ *   ork_dyn_queue_destroy(q); */
 ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore) {
     if (!c) return NULL; int mx = ork_dyn_max_steps(); if (chunk_max <= 0 || chunk_max > mx) chunk_max = mx;
     if (ncore <= 0) ncore = 1; if (ncore > c->soc->cores) ncore = c->soc->cores;

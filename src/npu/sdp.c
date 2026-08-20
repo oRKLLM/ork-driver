@@ -105,6 +105,9 @@ int orki_chain_build_lut_fn(ork_npu*c, double(*fn)(double), double in_scale, dou
     return 0;
 }
 
+/* Build the int16 activation LUT curve for `f` at (in_scale,out_scale) into lut[1030]. Calibrates the idx map
+ * once per ctx (a STANDALONE probe — must run outside any chain). 0/ok. Shared by orki_act_lut_i16 (standalone) and
+ * the HW-chained silu prologue in ork_dyn_begin_seq_i8_mc. */
 int orki_build_act_lut16(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
     if(orki_silu_calibrate_idx16(c)) return -1;
     static double qsum[1030]; static int qn[1030];

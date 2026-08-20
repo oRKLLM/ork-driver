@@ -76,6 +76,13 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
     return 1; }
 
+/* ================= DYNAMIC STEERED SUBMISSION API (validated by tools/steer_probe + doorbell_id_probe) =====
+ * A run_chain_i8 chain, but submitted NONBLOCK so the host can (a) watch per-op progress via each op's output
+ * doorbell (dc civac poll), (b) HALT it mid-flight to free the NPU early (write 0x0014=0 into a future op's
+ * live regcmd descriptor — the sequencer reads it from DRAM at exec-time), (c) later, redirect the next-pointer
+ * for runtime routing. v1 constraints: M=1 per task, single-slice conforming K (K%512==0, K<=4096), and A/C
+ * resident in ork_dma_alloc buffers (so we hold DMA addrs + poll outputs coherently). One program per task
+ * (P==S). Steering must lead the sequencer by ~1-2 ops (time it off ork_dyn_progress). */
 ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     ork_install_term();   /* graceful SIGTERM: make the async poll interruptible */
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;   /* S==1 is valid: a 1-program chain (task_number=1 runs it) */
