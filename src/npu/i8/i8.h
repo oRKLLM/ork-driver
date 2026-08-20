@@ -129,4 +129,6 @@ void orki_fold_scratch_free(ork_npu *c);
 void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride);
 void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
 
+struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
+
 #endif /* ORK_NPU_I8_H */

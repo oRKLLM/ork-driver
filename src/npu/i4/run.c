@@ -265,3 +265,12 @@ int ork_bmm_i4(ork_npu *c, int nbatch, int M, int K, int N,
                const int8_t *A, const int8_t *B, int32_t *C){
     ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_bmm_i4_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
+int orki_run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+    ork_mm_task_i8 *tk = malloc((size_t)M * sizeof *tk); if(!tk) return -4;
+    for(int m=0;m<M;m++) tk[m]=(ork_mm_task_i8){ w, 1, A + (size_t)m*w->K, C + (size_t)m*w->N };
+    ork_dyn_chain *h = ork_dyn_begin_mc_i4(c, M, tk, nc);
+    free(tk);
+    if(!h) return -4;   /* shape/buffer limit -> caller refuses (ORK_RC_WEDGE_PRONE) */
+    int d = ork_dyn_end(h);
+    return (d == M-1) ? 0 : -1;
+}

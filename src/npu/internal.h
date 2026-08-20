@@ -446,4 +446,6 @@ struct ork_i4a8_hdr { uint32_t magic, version; int32_t K, N; uint32_t quant_kind
 
 void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src);
 
+extern double orki_f16_slice_us;
+
 #endif /* ORK_NPU_INTERNAL_H */
