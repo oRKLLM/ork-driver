@@ -339,3 +339,40 @@ Two tooling bugs surfaced here and are fixed:
   pass look plausible while being wrong;
 - knob accessors (`int ork_f16_colsplit(void){ ...getenv... }`) counted as implementations, which briefly
   turned a correct dagger in the capability matrix into a false claim of native fp16 multicore.
+
+## Round 3 — splitting the public header (2026-08-20)
+
+`include/ork_npu.h` was 1519 lines and 56% comment. It is included by **445 files in this repo plus the
+fork's `ggml-ork.cpp`**, so it stays exactly where it is and keeps its name: it is now a 49-line umbrella
+holding the include guard, the base typedefs and the version macros, then including nine parts from
+`include/ork/`. No consumer changes.
+
+The split is **contiguous** — every part is a verbatim line range of the original, included in the original
+order. Two invariants were checked mechanically, and they are the reason this round needed no `make test`:
+- concatenating the parts reproduces the original body **byte for byte** (1484 lines both sides);
+- the declaration set is **identical** (295 both sides).
+Headers are not in `ATTEST_SRCS` (it hashes `.c` only), so a header-only change cannot alter the attest;
+correctness here is "does it still compile", which is a board build with no NPU execution.
+
+| part | lines | holds |
+|---|--:|---|
+| `ork/context.h`  | 134 | lifecycle, SoC introspection, core budget, IOMMU domains |
+| `ork/dma.h`      |  46 | zero-copy buffers, dma-buf import |
+| `ork/weights.h`  | 238 | pack / load / dump / free, resident KV, streaming pool |
+| `ork/run.h`      | 127 | matmul entrypoints, fused matmul+activation, sliced rescue |
+| `ork/ops.h`      | 451 | SDP ops and norms — **interleaved with their RE probes** |
+| `ork/dynamic.h`  |  86 | MoE/chained matmuls, NONBLOCK doorbell, queue, precompiled chains |
+| `ork/seq.h`      | 265 | op vocabulary, the op→op chaining lookup, `ork_submit_seq` |
+| `ork/chain.h`    | 139 | static chains, round-robin dispatch, streams, async |
+| `ork/bmm.h`      | 111 | batched GEMM (attention), floor-decomp, mode hooks, SSM |
+
+**What the split exposed, and did not fix.** `ork/ops.h` is 451 lines because the production SDP surface
+(ewmul/add/silu/gelu/exp/rsqrt, per-channel multiply, RMSNorm, RoPE, softmax) and the probe/replay/fuzz
+surface alternate every 20–60 lines through that whole region — they were written together while the ops
+were being reverse-engineered. A contiguous split cannot separate them, and separating them means moving
+declarations one at a time. That is deliberately NOT done here: round 2 measured exactly that kind of
+heuristic placement at 31/88 correct. Splitting `ops.h` into `sdp.h` + `probe.h` is the round-4 candidate,
+and it wants a human read, not a rule.
+
+Worth noting for whoever does it: roughly a third of the "public" header is RE probe surface that no
+production consumer calls. Separating it would make the actual supported API legible for the first time.
