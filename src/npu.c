@@ -75,15 +75,6 @@
  * matmul (mode_probe SAFE); removes a ~107ms/op reset — test_ewmul_f16 3436→53ms, ewmul_i16 4292→44ms,
  * add 1419→50ms. DEFAULT ON (skip the reset). Set ORK_SDP_NORESET=0 to restore the old reset. */
 /* ORK_PRECOMP_RC: reuse a weight's precompiled M=1 decode regcmd (skip per-submit synth+validate). Opt-in. */
-/* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
- * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
- * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the
- * weight every row (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default ON (bit-exact
- * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + orki_run_i4_mc_db (per-row doorbell)
- * + stream_worker_i4; NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy.
- *   PRESERVED as a distinct, named strategy — the multi-task-submit batch (many 1-row tasks per submit, the
- *   vendor's int4 approach; task_number=rows) is a SEPARATE path and must NOT overwrite/conflate with this.
- *   Env var kept as ORK_I4_MSCHED for back-compat (0=off, 1=on). */
 /* ORK_I4_NSUB: N-subslice the batch path so wide-N (Ncore*K > 131072 weight budget) still batches — split N
  * into ≤131072/K-column chunks, one batch submit each, instead of falling back to per-row. Default OFF until
  * board-validated; when off, msched keeps the weight-fit guard (whole-Ncore batch or per-row). */
