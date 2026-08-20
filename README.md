@@ -166,8 +166,10 @@ make install      # → $(PREFIX)/lib/{libork_npu.a,libork_npu.so} + $(PREFIX)/i
 ```
 
 - **C / C++ (e.g. the llama.cpp-rockchip backend):** statically link `libork_npu.a` (no runtime
-  `.so` dependency) — `cc your.c -lork_npu` after `make install`, or drop the `src/*.c` straight
-  into your build. The header is the entire contract: `ork_npu_init` / `ork_mm_pack[_i8]` /
+  `.so` dependency) — `cc your.c -lork_npu` after `make install`, or drop the library sources straight
+  into your build (`src/*.c src/npu/*.c src/npu/*/*.c src/soc/*.c`, with `-Iinclude -Isrc`; the
+  Makefile's CORE variable is the authoritative list).
+  The header is the entire contract: `ork_npu_init` / `ork_mm_pack[_i8]` /
   `ork_mm_run[_i8]`.
 - **Other languages (Python / Node / Rust):** link `libork_npu.so` and FFI against the same C
   ABI (`dlopen` / `ctypes` / `node-ffi` / `bindgen`).

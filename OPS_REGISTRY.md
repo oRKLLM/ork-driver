@@ -61,7 +61,7 @@ driver fix, not a dead end.
 
 ---
 
-## matmul output stages (`set_*` regcmd rewriters, `src/npu.c`)
+## matmul output stages (`orki_set_*` regcmd rewriters, `src/npu/<prec>/regcmd.c`)
 
 | name | purpose | status | probe → verdict | gotchas / layout | use / notes |
 |---|---|---|---|---|---|
@@ -209,5 +209,7 @@ driver fix, not a dead end.
    int16-silu path (blocked, #35). Don't assume gmax policy affects the shipped path.
 
 ---
-*Extracted 2026-07-21 from `src/npu.c`, `tools/*.c`, `ggml-ork.cpp`, and root `*_WIP.md`.
+*Extracted 2026-07-21 from `src/npu.c`, `tools/*.c`, `ggml-ork.cpp`, and root `*_WIP.md`. Paths updated
+2026-08-19: npu.c was split by precision into `src/npu/` — an op now lives in its precision folder
+(`src/npu/i8/`, `/f16/`, `/i4/`, `/i16/`), the substrate in `src/npu/core/`. See AGENTS.md §4.
 Line numbers drift — grep the symbol. To change a status, re-run the named probe first.*

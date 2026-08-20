@@ -1,7 +1,8 @@
 # tools/re — NPU reverse-engineering toolkit
 
 The workflow used to reverse-engineer a **regcmd** (register-command program) for a new op or a new
-Rockchip/NVDLA-derived NPU, so it can be templatized into `src/regcmd_*.h` and driven by `src/npu.c`.
+Rockchip/NVDLA-derived NPU, so it can be templatized into `src/regcmd_*.h` and driven by the matching precision module under
+`src/npu/` (`i8/regcmd.c`, `f16/regcmd.c`, …; see AGENTS.md §4).
 These are **RE / calibration tools only** — they are NOT part of the `ork-driver` library, `make`, or
 `make test`. Some depend on the proprietary `librknnrt.so` / `rknn-toolkit2`, which are used only to
 *capture* reference programs (never to build or run the library). Keep that boundary.
@@ -43,7 +44,8 @@ As more NPUs are added to the platform, everything needed to onboard one lives h
    ```
 
 4. **Templatize** the decoded words into `src/regcmd_<op>.h` as a `static const uint32_t REGCMD_<OP>[]`,
-   and add a marshaling function in `src/npu.c` that patches the addresses + geometry (`set_mul_geom`)
+   and add a marshaling function in the op's precision module under `src/npu/` that patches the
+   addresses + geometry (`orki_set_mul_geom`)
    + any per-scale fields, submits it, and de-marshals. Validate bit-exact vs a CPU reference in an
    example under `examples/` so `make test` covers it.
 

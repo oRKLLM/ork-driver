@@ -167,17 +167,46 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 
 ```
 include/ork_npu.h      public API (init / pack / run / soc introspection)
-src/npu.c              core: raw DRM submit, regcmd synthesis, K-split + N-tiling + M-scheduler
+src/npu.c              SCAFFOLD: the dtype-dispatching layer only — run()/run_multicore, the
+                       heterogeneous op-sequence scheduler, bmm dispatch, async wrappers,
+                       slice/stage/stream-pool glue, ork_npu_init
+src/npu/internal.h     private ABI: ork_npu/ork_w/buf types, dtype predicates, env knobs, hot inlines
+src/npu/core.h         the SUBSTRATE interface (see the header-placement rule below)
+src/npu/core/          dtype-agnostic substrate: device buf submit sched domain mode prof (+ core.h)
+src/npu/i8/            int8 — regcmd pack fold run chain colsplit dyn queue probe   (+ i8.h)
+src/npu/f16/           fp16 — regcmd run perchan stream probe replay                (+ f16.h)
+src/npu/i4/            int4 — quant pack run chain stream                           (+ i4.h)
+src/npu/i16/           int16 — regcmd act chain probe                               (+ i16.h)
+src/npu/sdp.c          shared activation curves + LUT machinery (i8/i16/f16 all use it)
+src/npu/norm.c         RMSNorm / L2 / softmax / RoPE / FWHT — an op family, not a precision
+src/npu/ssm.c          Mamba-2 / SSD scan
 src/soc.{h,c}          runtime device-tree SoC detection + caps registry
 src/soc/<chip>.c       one file per SoC: core count, CBUF budget, output-width cap, K-slice
-src/rknpu_ioctl.h      open DRM uABI of the upstream rknpu kernel driver
+src/ork_regs.h         named regcmd registers (setrn); src/rknpu_ioctl.h open DRM uABI
 src/regcmd_*.h         captured regcmd templates (our RE; no proprietary content)
 examples/              test_matmul · layer · decode · model · llama2 — the test suite (each
                        self-validates vs CPU; MHA/GQA/arbitrary-head_dim covered). `make test` runs them.
 tools/re/               NPU reverse-engineering toolkit (capture→decode→templatize new ops/NPUs; README there)
 tools/re/regcmd_capture.c LD_PRELOAD calibration-capture shim (for adding SoCs / new ops)
 docs/ADDING_AN_SOC.md   how to add/validate a SoC (RE narrative + scratch live on the wiki)
+Doxyfile / `make docs`  scoped API docs -> docs/api/html (gitignored); excludes the regcmd data headers
 ```
+
+**npu.c was 15,313 lines; it is now the scaffold.** The split is by PRECISION (2026-08-19,
+`refactor/modularize-precision`). Two rules keep it from re-merging:
+
+- **Where does my code go?** If a symbol's name, its regcmd template, or its dtype argument is
+  precision-tagged, it belongs in that precision's folder. If its contract has no dtype in it, it is
+  substrate — `npu/core/`. If it is an op family used by several precisions (activations, norms, the
+  SSM scan), it is a peer module at `npu/<family>.c`. Only dtype DISPATCH stays in npu.c.
+- **HEADER PLACEMENT.** `npu/<name>.h` is tree-wide (internal.h, core.h). `npu/<mod>/<mod>.h` is
+  PRIVATE to that folder — only `npu/<mod>/` sources may include it, and if the scaffold needs one of
+  a module's symbols the declaration goes in internal.h instead. Enforced: `make check-registry`
+  check 6 fails the build on any cross-folder include of a private header.
+
+Every internal symbol that crosses a translation unit carries an `ork_`/`orki_` prefix (`orki_` for
+what would otherwise be a generic name in `libork_npu.so` — `run`, `pack`, `act`, `g_last_op`). Adding
+an unprefixed one is visible in `nm -g` over `$(COBJ)`.
 
 ### Weight-DMA amortization (the single-core M-tile lever)
 
