@@ -801,3 +801,28 @@ Two mechanical traps on the way out, both caught by verification rather than by 
 - The correcting note I added to the registry **re-cited the retired symbol**, and check 2 greps the whole
   file for `ork_*` tokens regardless of backticks — so documenting the removal re-broke the gate. The note
   now describes the wrapper without naming it and points here for the name.
+
+## Round 13 — the build partition must be total (2026-08-20)
+
+The hazard: a `.c` that is in neither `CORE` nor the deliberate exclusions **never compiles**, and the
+attest quietly stops covering it. Nothing fails; the file just isn't there. Rounds 6 and 10 each added TUs
+that had to be hand-added to `CORE`, and both times the only thing that caught it was remembering.
+
+`NOT_CORE` now names the five deliberate exclusions with reasons — the daemon binary (`orkd.c`,
+`orkd_handlers.c`), the RPC transport (`orkd_client*.c`, in COBJ but computing nothing) and the gated-off
+pure-CPU quantizer (`ork_gptq.c`). None determine NPU output, which is what the attest hash is for.
+
+check_registry check 10 asserts the partition is **total**: every `src/**/*.c` is in one list or the other,
+and every `CORE` entry exists on disk. Adding a source file is now a build error until you say which side it
+belongs on. Verified in both directions and on both platforms — clean tree OK; a new `.c` in neither list
+FAILs with exit 1; a renamed `CORE` entry FAILs twice (orphaned new name, missing old one); and the same
+results under GNU sed 4.9 on the board, not just BSD sed locally.
+
+Three shell traps on the way, all previously seen this session and all caught by running rather than reading:
+
+- **`make -p` runs the default goal.** Using it to read `CORE` rebuilt the tree and hung the check. Parse
+  the Makefile text instead — a checker must never be able to trigger a build.
+- **`case` inside `$( )`** — bash 3.2 (macOS `/bin/sh`) mis-parses it. Exactly the check-8 trap; a `grep`
+  test replaces it.
+- **A trailing `#` comment** on the `CORE :=` line was read as filenames, producing "Compile is in CORE but
+  does not exist". Strip comments before splitting.

@@ -22,6 +22,19 @@ CORE := src/npu.c src/npu/core/buf.c src/npu/core/device.c src/npu/core/domain.c
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
+# Every src/**/*.c must be in CORE (NPU-output-determining, hashed into the attest) or in NOT_CORE
+# below. check_registry check 10 enforces that the partition is TOTAL: a new .c that is in neither
+# is a build error, not a file that silently never compiles. That failure mode is real — rounds 6
+# and 10 of MODULARIZE_PLAN.md each added TUs that had to be hand-added to CORE, and forgetting is
+# invisible: the objects simply never build and the attest quietly stops covering them.
+NOT_CORE := src/orkd.c src/orkd_handlers.c \
+            src/orkd_client.c src/orkd_client_ops.c \
+            src/ork_gptq.c
+# orkd.c/orkd_handlers.c   — the DAEMON binary, not linked into the library at all
+# orkd_client*.c           — RPC transport (in COBJ, not CORE): moves bytes, computes nothing
+# ork_gptq.c               — pure-CPU pack-time quantizer, gated off, nothing routed through it
+# None of these determine NPU output, which is what the attest hash is for.
+
 ORKD_CLIENT_SRC := src/orkd_client.c src/orkd_client_ops.c  # transport + RPC op wrappers; nine targets compile these, so keep them in ONE variable — adding a file to the split must not mean editing nine recipes
 ORKD_CLIENT_HDR := src/orkd_client.h src/orkd_client_internal.h src/orkd_proto.h
 COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.

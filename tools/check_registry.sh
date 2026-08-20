@@ -256,5 +256,28 @@ if [ -f "$BUDGET" ]; then
   fi
 fi
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols; no file over its size budget"
+
+# --- 10) CORE + NOT_CORE must cover every source file --------------------------------------------
+# A .c in neither list silently never compiles, and the attest quietly stops covering it. Rounds 6 and 10
+# both added TUs that needed hand-adding to CORE; nothing caught that but a human remembering. Now it does.
+# (grep, not `case`: bash 3.2 — /bin/sh on macOS — mis-parses a case pattern inside $( ). Same trap as check 8.)
+# Parse the Makefile TEXT, never `make -p` — that runs the default goal (it rebuilt the whole tree here
+# and hung the check). sed joins backslash continuations so multi-line lists are read whole.
+mkvar() { sed -n "/^$1 *:=/,/[^\\\\]$/p" Makefile \
+          | sed 's/#.*//; s/^[A-Z_]* *:= *//; s/\\\\$//' | tr '\n' ' '; }   # strip the trailing # comment too
+cm=$(mkvar CORE)
+nm=$(mkvar NOT_CORE)
+if [ -n "$cm" ]; then
+  partbad=$(for f in $(ls src/*.c src/npu/*.c src/npu/*/*.c src/soc/*.c 2>/dev/null); do
+              printf '%s' " $cm $nm " | grep -qF " $f " || echo "$f is in neither CORE nor NOT_CORE"
+            done
+            for f in $cm; do [ -e "$f" ] || echo "$f is in CORE but does not exist"; done) || true
+  if [ -n "$partbad" ]; then
+    echo "$partbad" | while IFS= read -r l; do echo "check-registry: FAIL — build partition: $l"; done
+    echo "  => add it to CORE (it determines NPU output, and belongs in the attest) or to NOT_CORE WITH a reason."
+    fail=1
+  fi
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols; no file over its size budget; CORE+NOT_CORE cover every source"
 exit $fail
