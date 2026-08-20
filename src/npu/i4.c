@@ -273,7 +273,7 @@ cleanup:
  * completion by civac-polling the WRITTEN (strided) int16 cell-set for the SENT16 sentinel — the batch output
  * is a 2D-tiled strided subset (write-order not last-col-last, like the per-row int4 path), so we seed+poll
  * exactly the written cells and never the padding. A dropped round self-heals via RESET+re-seed+resubmit
- * (mc_recover_resubmit model), so a miss never hard-wedges (unlike the removed blocking BCHAIN). Single host
+ * (orki_mc_recover_resubmit model), so a miss never hard-wedges (unlike the removed blocking BCHAIN). Single host
  * thread submits all cores nonblock then polls them. -4 = ineligible (caller falls back); -1 = unrecovered. */
 /* mode 0=seed SENT16 (values only; caller bsyncs TO_DEVICE), 1=civac gate (invalidate per 64B line then check),
  * 3=plain full-verify (after bsync FROM_DEVICE, no per-cell DC), 2=de-tile int16->int32 into C. Cache ops are
