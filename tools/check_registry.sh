@@ -209,7 +209,7 @@ if [ -f "$OVR" ]; then
   TAB=$(printf '\t')
   ovrdefs=$(for f in src/npu.c src/npu/*.c src/npu/*/*.c; do
               grep -E '^(static +)?[A-Za-z_][A-Za-z0-9_ *]*\(' "$f" 2>/dev/null | grep -v ';[[:space:]]*$'
-            done | sed -E 's/^.*[ *]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' | sort -u)
+            done | sed -E "s/^[^(]*[ *]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/" | sort -u)
   ovrcaps=$(sed -n '/<<CAPS/,/^CAPS$/p' tools/precision_matrix.sh | sed '1d;$d' | cut -f1)
   ovrbad=$(grep -v '^#' "$OVR" | sed '/^$/d' | while IFS="$TAB" read -r c d sym why; do
       [ -n "$sym" ] || { echo "'$c / $d' cites no symbol at all"; continue; }

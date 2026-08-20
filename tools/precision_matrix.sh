@@ -22,10 +22,18 @@ SRC=$(ls src/npu.c src/npu/*.c src/npu/*/*.c 2>/dev/null)
 TMP=${TMPDIR:-/tmp}/orkmatrix.$$; mkdir -p "$TMP"; trap 'rm -rf "$TMP"' EXIT
 
 # every top-level definition: "name<TAB>file"
+# One definition per line as "name<TAB>file". Two traps, both hit in practice:
+#   - the name must be the FIRST identifier before a "(", not the last: a one-line function that CALLS
+#     another (seq_disp_ewmul_i8 -> ork_npu_ewmul_i8) otherwise records the CALLEE as defined here, which
+#     put 32 phantom symbols in the map and mis-filed capabilities into npu.c;
+#   - a knob accessor (`int ork_f16_colsplit(void){ ...getenv... }`) is a PREDICATE, not an implementation.
+#     Counting it made fp16 claim its own multicore path when the real one is i8/colsplit.c, silently
+#     replacing a correct dagger with a wrong plain tick. Drop any definition line that reads getenv.
 for f in $SRC; do
   grep -E '^(static +)?[A-Za-z_][A-Za-z0-9_ *]*\(' "$f" 2>/dev/null \
     | grep -v ';[[:space:]]*$' \
-    | sed -E 's/^.*[ *]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' \
+    | grep -v 'getenv' \
+    | sed -E "s/^[^(]*[ *]([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/" \
     | sed "s|\$|	$f|"
 done | sort -u > "$TMP/syms"
 
