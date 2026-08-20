@@ -140,7 +140,7 @@ void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uin
         orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,0x00000000);          /* EW_CVT_OFFSET_VALUE = 0 (silu zero-point 0) */
         orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_SCALE,0x00000001);          /* EW_CVT_SCALE=1, SHIFT=0 (unity operand cvt) */
         /* output-stage EW-active bits (required so the DPU expects the element-wise/RDMA stage; mode bits,
-         * geometry-independent). ORK_EW_NO50=skip individual ones during bisection. */
+         * geometry-independent). ORK_EW_NO50 (removed) skipped individual ones during bisection. */
         orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,0x00000125);          /* out row cfg + EW-enable bit0 (out8=0x124) */
         orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x000000e0);          /* DATA_FORMAT EW bits (out8=0) */
         { const char*eo=getenv("ORK_EW_COFF"); if(eo) orki_setrn(rc,REGCMD_I8_N,RK_DPU_EW_CVT_OFFSET,(uint32_t)strtoul(eo,0,0)); }

@@ -195,7 +195,7 @@ int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
      * self-heal limps it through (correct output, ~1 reset/layer). And the FUSED int16 output is CLOSED
      * (int8-only, ⚠ note below), so the standalone op is the only int16 path. => int16 silu NOT viable
      * in-chain with current NPU understanding — needs kernel-level reset or a deeper pipeline fix. Left as
-     * the RE artifact (ORK_FFN_SILU_I16). Shipped coherent path is all-CPU-silu. ping-pong OFF (LUT-op). */
+     * the RE artifact (its ORK_FFN_SILU_I16 gate is removed). Shipped coherent path is all-CPU-silu. ping-pong OFF (LUT-op). */
     /* #35 RESOLVED: the per-call ACT_RESET was pure OVERHEAD, not a wedge guard. The in-chain "wedge" was a
      * MISREAD — dmesg "RKNPU: soft reset" counts the DELIBERATE ACT_RESET (ORK_DEBUG_RESET: 23 act calls ->
      * 27 dmesg entries), not hardware wedges (errno=110 count = 0 in a full chain run). Removing it: int16

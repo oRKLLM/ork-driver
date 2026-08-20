@@ -143,7 +143,7 @@ int orki_int8_ks(ork_npu *c){ (void)c;
         if(kt && (kt<32 || kt%32)) kt=0; }   /* must be a multiple of 32; else ignore */
     return kt>0?kt:1024;
 }
-/* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (ORK_FULLK_DEC,
+/* Bb[ns*Sk+ks] = K-split x N-split (always). Bf[ns] = optional full-K per N-slice (the ORK_FULLK_DEC gate is removed; now unconditional,
  * int8 K<=10752): lets the multi-core DECODE path do ONE submit/core instead of ~K/1024 K-slices.
  * ~2x weight memory (dual layout) — fits IOVA for int8 ~1.7B; can overflow for larger/fp16. */
 /* Auto-tuner policy. Multi-core + full-K decode are now the library's DEFAULT per-matmul choice
@@ -154,7 +154,7 @@ int orki_budget(ork_npu*c, int M){
     /* M=1 is single-core by default here; the int8 DECODE path in orki_run() overrides to the multi-core budget
      * (it calls orki_budget(c,2)) — splitting N across cores parallelizes the cold per-token weight-DMA, measured
      * +40% end-to-end decode (Qwen3-1.7B) and MONOTONIC in the in-model N-sweep: every int8 shape benefits,
-     * so there is no per-shape threshold and no env knob (the old ORK_DECODE_MC gate is gone). mc_prof's warm
+     * so there is no per-shape threshold and no env knob (the old ORK_DECODE_MC gate is removed). mc_prof's warm
      * loop had mis-measured a crossover that doesn't exist in real cold decode. fp16/int4 M==1 stay single-core
      * (fp16 large-tile M-scheduler unvalidated; int4 not the decode path). The NN<nc*2 shrink at the call site
      * still keeps truly tiny int8 N single-core. */
@@ -1383,7 +1383,7 @@ uint32_t ork_ppflags(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_NO
  * output tiles across the cores, run concurrently on per-core buffers, accumulate into disjoint
  * columns of cres (no lock). n is a *request* — the engine can pass any count up to soc->cores,
  * so this is dynamic, not hardwired to a chip's core total. ---- */
-/* ORK_MCPROF diagnostic: per-core phase timing (copy / submit / acc). Populated by the single-core
+/* Per-core phase timing (copy / submit / acc), read via ork_npu_mc_timing; the ORK_MCPROF env gate is removed (copy / submit / acc). Populated by the single-core
  * orki_run() path (the multi-core matmul now runs on the doorbell colsplit, which reports via its own
  * poll/backoff timers, not g_mc_*). Read via ork_npu_mc_timing. */
 double orki_mc_copy[MCPROF_MAX], orki_mc_sub[MCPROF_MAX], orki_mc_acc[MCPROF_MAX]; long orki_mc_n[MCPROF_MAX];
@@ -1505,7 +1505,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
      * outside the envelope returns an ERROR — we never silently fall to the blocking path. */
     { int i8 = (dt==DT_I8 && (w->N/32)>=2 && nc>1);
       /* COLSPLIT IS THE DEFAULT (any M) for base, wide-N and wide-K. The old M==1 gate on wide-N/wide-K (behind
-       * ORK_COLSPLIT_MGT1) existed because 23af039's first M>1 colsplit regressed prefill ~15x (per-K-slice
+       * ORK_COLSPLIT_MGT1 — removed) existed because 23af039's first M>1 colsplit regressed prefill ~15x (per-K-slice
        * partials + a SERIAL host accumulate). That is FIXED: balanced boundary-split (no notch, no load-
        * imbalance) + PER-CORE PARALLEL ks-outer accumulate + gather-A-once now make colsplit BEAT the mcworker
        * chain on the 7B (75 vs 73 t/s, bit-exact) AND it is self-healing (a blocking mcworker miss hard-wedges
@@ -2003,14 +2003,14 @@ int orki_fused_mtile(int K,int M){
  * output; int16/fp16 output exists only in the STANDALONE silu program (0x50xx lane: int16=0x24004401,
  * fp16=0xa8000002 — different regcfg). No RKNN capture possible (RKNN never fuses activation into non-int8
  * matmul). CONCLUSION: higher-precision fused silu is not achievable in the matmul program. The ablation
- * (ORK_GATE_ABLATE) proved int8 silu OUTPUT is the whole FFN-chain PPL gap, so the remaining route to parity
+ * (ORK_GATE_ABLATE — historical) proved int8 silu OUTPUT is the whole FFN-chain PPL gap, so the remaining route to parity
  * is UN-FUSED: int32 matmul -> standalone int16/fp16 silu op (loses the silu-free-on-NPU fusion, adds a submit).
  * Below is the sweep harness (env-configurable format regs), kept for the record; NOT called by the chain. ── */
 /* orki_set_i8_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
  * synth_i8's default int32 output format (does NOT apply set_i8_out8's int8 override) and enables the SiLU
  * LUT with the int32-output bit (0x8000) set in 0x4010. out_i32 = R*V16[idx(acc)] + out_bias, unclamped —
  * with a fine-scale LUT that maps silu across ~±8000 (int16 V16 * R), that's ~13-14 bit silu instead of int8.
- * The ablation (ORK_GATE_ABLATE) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
+ * The ablation (ORK_GATE_ABLATE — historical) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
  * = baseline PPL); this recovers it while keeping silu free on-NPU. Same LUT/config regs as set_i8_silu. */
 
 /* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
@@ -2265,7 +2265,7 @@ int orki_fused_mtile(int K,int M){
  * Regs (rocket_registers.h — RK3588 offsets, NOT vanilla NVDLA): 0x501c RDMA_BRDMA_CFG (BRDMA_DATA_USE
  * bits[4:1]), 0x5020 RDMA_BS_BASE_ADDR (scale vector src); 0x4040 BS_CFG (BS_BYPASS b0 / BS_ALU_BYPASS b1
  * / BS_MUL_BYPASS b4 / BS_RELU_BYPASS b6), 0x4048 BS_MUL_CFG (BS_MUL_SRC b0 =MEM, BS_MUL_SHIFT_VALUE b[13:8]).
- * Config regs env-overridable (ORK_BS_R40/R48/BRDMA) to pin the DATA_USE/enable values on-board. int8. 0/ok. */
+ * Config regs were env-overridable (ORK_BS_R40/R48/BRDMA — removed) to pin DATA_USE/enable on-board. int8. 0/ok. */
 
 /* Public on-NPU element-wise ADD (int8): out[m*N+n] = clamp_i8(round( (a*a_scale + b*b_scale)/out_scale ))
  * via the 2-input SDP op with ALU=add. Decoded structure: out = clamp((a*mult_a + b*mult_b) >> (0x4088-14) + zo),
@@ -2806,7 +2806,7 @@ int orki_i4_submit_tmo_ms(void);   /* #54 fwd decl: bounded int4 doorbell submit
  *   ... CPU does its bulk in parallel ...
  *   n = ork_dyn_queue_drain(q);                // rendezvous + writeback
  *   ork_dyn_queue_destroy(q); */
-/* ncore<=1 => single-core chain (begin); ncore>1 (or ORK_DYN_MC) => multi-core NONBLOCK stream (begin_mc). */
+/* ncore<=1 => single-core chain (begin); ncore>1 => multi-core (the ORK_DYN_MC override is removed) NONBLOCK stream (begin_mc). */
 /* submit the next pending chunk NONBLOCK (NPU runs while the caller works); no-op if one is already flying */
 /* Idle-transition halt (the linger wiring): once the producer has drained the queue AND the linger window has
  * elapsed since the last push, null-terminate the flying chain just ahead of the sequencer (0x0014=0 via the

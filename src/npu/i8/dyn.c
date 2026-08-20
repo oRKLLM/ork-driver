@@ -235,7 +235,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
      * convention the int8 doorbell already requires — the DEFAULT fp16 path (seed-all clean-before +
      * poll-to-done + civac) is bit-exact: 28/28 over 2 shapes (K512N256M2, K1024N512M4), multi-core.
      * A must be host memory (as for int8 A/D); a zero-copy DMA-A source is unsupported here. Legacy
-     * opt-in env ORK_DYN_F16 is now a no-op. */
+     * opt-in env ORK_DYN_F16 is removed (it was already a no-op). */
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         /* M>1 supported up to 64 rows/op: one regcmd/task holds the whole M-tile only within the 0x1040
          * mg_max*64 K-reduction cap (64 @ K<=4096, larger @ smaller K), so 64 is universally safe here;

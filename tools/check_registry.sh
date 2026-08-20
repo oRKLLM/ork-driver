@@ -12,6 +12,8 @@
 #      evidence — the name of a real probe/test file, a `make test`/`replay`/`gtest`/`ppl`
 #      reference, or an explicit `(no ... probe)` acknowledgment. A hard status backed by
 #      nothing fails. WIP / diagnostic / legend rows are exempt.
+#   7. NO STALE ENV-KNOB MENTIONS: a comment naming ORK_FOO must be a knob the code reads, or be
+#      marked removed/historical. A documented lever that does not exist is worse than no comment.
 #   6. HEADER PLACEMENT: npu/<mod>/<mod>.h is private to its folder; only npu/<mod>/*.c may include
 #      it. Keeps the "inside the folder = private, beside it = interface" rule from eroding.
 #   5. NO DANGLING DECLARATIONS: every ork_*/orkd_* function PROTOTYPED in a header must have
@@ -149,5 +151,41 @@ for h in src/npu/*/*.h; do
   fi
 done
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private"
+
+# --- 7) no stale env-knob mentions: a comment naming ORK_FOO must mean something ------------------
+# The RE narrative in this tree is load-bearing, but a comment that documents a knob the code no
+# longer reads is worse than no comment: it tells the next reader a lever exists. So every ORK_*
+# named in a comment must EITHER be read by the code (getenv / a real identifier) OR be explicitly
+# marked as history — "removed", "historical", "retired", "deprecated", "not wired yet". Prefix
+# references (ORK_SSM_*, or a name that is a prefix of a real identifier) are exempt.
+py=$(command -v python3 || true)
+if [ -n "$py" ] && [ -z "${ORK_SKIP_KNOB_CHECK:-}" ]; then
+  knobbad=$("$py" - <<'PYEOF'
+import re,glob
+files=sorted(set(glob.glob('src/*.c')+glob.glob('src/*/*.c')+glob.glob('src/*/*/*.c')
+                +glob.glob('src/*.h')+glob.glob('src/*/*.h')+glob.glob('src/*/*/*.h')+glob.glob('include/*.h')))
+code=re.sub(r'/\*.*?\*/|//[^\n]*','',''.join(open(f,errors='ignore').read() for f in files),flags=re.S)
+live=set(re.findall(r'getenv\("(ORK_[A-Z0-9_]+)"\)',code)); ident=set(re.findall(r'\bORK_[A-Z0-9_]+\b',code))
+MARK=re.compile(r'\b(removed|historical|retired|deprecated|not wired yet)\b',re.I)
+for f in files:
+    t=open(f,errors='ignore').read()
+    for m in re.finditer(r'/\*.*?\*/',t,re.S):
+        blk=m.group(0)
+        for k in sorted(set(re.findall(r'\bORK_[A-Z0-9_]{3,}\b',blk))):
+            if k in live or k in ident or k.endswith('_'): continue
+            if any(i.startswith(k) and i!=k for i in ident): continue
+            i=blk.find(k)
+            if not MARK.search(blk[max(0,i-140):i+140]):
+                print(f"{f}:{t[:m.start()].count(chr(10))+1}: {k}")
+PYEOF
+)
+  if [ -n "$knobbad" ]; then
+    echo "$knobbad" | while IFS= read -r l; do
+      echo "check-registry: FAIL — comment names env knob the code never reads (mark it removed/historical): $l"
+    done
+    fail=1
+  fi
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions"
 exit $fail

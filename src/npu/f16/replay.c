@@ -329,7 +329,7 @@ int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us
          * nextdma==0 (last/no-chain) -> zero both to terminate. cf. run_chain_i8 (0x0014=0x0037 for its 108s). */ \
         if(_d==0x0101&&_a==0x0010){ if(nextdma){ uint32_t _nx=(uint32_t)(nextdma); (rc)[k]=0x0010|((_nx&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_nx>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } \
         if(_d==0x0101&&_a==0x0014){ if(nextdma){ uint32_t _na=(uint32_t)(((nextamt)+3)/2); (rc)[k]=0x0014|((_na&0xffff)<<16); (rc)[k+1]=(0x0101u<<16)|((_na>>16)&0xffff); } else { (rc)[k]=0; (rc)[k+1]=0; } } } }while(0)
-    /* ORK_SM_FULLIMG: FAITHFUL single-delta full-image hardware-chain replay. The vendor's 5 buffers are ONE
+    /* ORK_SM_FULLIMG (gate removed; always on): FAITHFUL single-delta full-image hardware-chain replay. The vendor's 5 buffers are ONE
      * contiguous IOVA image (0xfffae000 out, 0xfffb6000 in, 0xfffbe000 scratch, 0xffff8000 regcmd+weights),
      * and task4's LUT-write (0x4020=0xffffab00) points INTO the regcmd region — a relationship my split
      * IN/OUT/SCR/LUT/regcmd buffers destroy. Here: ONE big buffer covering the image, every task's regcmd at

@@ -331,7 +331,7 @@ static void *bch_db_worker(void *vp){
      *     is coherent by job-done; int4's DPU writeback LAGS completion (why bare blocking miscomputes), so it
      *     still needs the one verify. Best of both: int8's blocking efficiency + int4's needed drain-verify.
      *     Measured: the nonblock host-poll (mode 1) cost 22-36% over blocking on the MoE expert shapes.
-     *   1 NONBLOCK (ORK_I4_NB): seed + nonblock doorbell + ork_dyn_end polls from t=0 (pipelined; the expensive
+     *   1 NONBLOCK (ORK_I4_NB — historical): seed + nonblock doorbell + ork_dyn_end polls from t=0 (pipelined; the expensive
      *     int4 SENT16 scan spins the whole HW-exec window -> the 22-36%). Kept for A/B.
      *   2 BLOCKING (ORK_I4_BLOCKING): bare blocking, prepolled=1, NO drain-verify -> MISCOMPUTES. A/B only. */
     /* MEASURED (test_moe_prog, 2026-08): BLOCKVERIFY(0) 768us > NONBLOCK(1) 712us > BLOCKING(2, miscomputes) 555us.
