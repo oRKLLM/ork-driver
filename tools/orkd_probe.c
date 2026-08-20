@@ -1,10 +1,13 @@
-/* orkd_probe — validate the orkd daemon end-to-end (board tool, NOT in `make test`).
+/* orkd_probe — validate the orkd daemon end-to-end. `orkd_probe mm` IS in `make test` (last), the
+ * daemon's only behavioural gate: it packs and runs a matmul THROUGH orkd and compares against an
+ * exact integer CPU reference, so a daemon regression fails the suite instead of going unnoticed.
  *
  * Auto-spawns orkd if none is running (the daemon opens the NPU), connects, prints the daemon-reported core
  * count. Modes:
  *   orkd_probe            — PING/PONG liveness, then disconnect.
  *   orkd_probe <seconds>  — hold the connection <seconds> (run two to watch them SHARE one daemon + idle-reap).
  *   orkd_probe mm         — pack a small int8 weight + run A x weight THROUGH the daemon, verify vs a CPU ref.
+ *                           Exact integer compare (A=ones, so C[m,n]=sum_k B[k,n]); exit 3 on mismatch.
  *
  * Run under sudo so the auto-spawned daemon can open /dev/dri/cardN:
  *   make orkd orkd_probe && sudo env ORKD_BIN=$PWD/orkd ./orkd_probe mm

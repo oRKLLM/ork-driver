@@ -136,6 +136,14 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   - **NPU Wedge**: If only the NPU is wedged (submission hang/timeout, but the SBC is still responsive via SSH), execute a graceful reboot command over SSH to restart the board: `ssh board 'sudo reboot'`.
 - A `.bin` test model (e.g. `stories15M`) is needed only for the `llama2` example; it is
   git-ignored and `make test` skips that test gracefully when `MODEL` is absent.
+- **`orkd` has a behavioural gate now.** `make test` ends with `orkd_probe mm`, which auto-spawns the
+  daemon, packs and runs a matmul THROUGH it, and compares against an exact integer CPU reference. Before
+  this the daemon had NO test at all, so any `orkd.c` change was verified only by "it compiles" — which is
+  why refactoring it was deferred (see MODULARIZE_PLAN.md round 7). It runs LAST, because the daemon takes
+  ownership of the NPU, and the suite SIGTERMs any surviving `orkd` afterwards (never `-9` — an abrupt kill
+  mid-submit wedges the IOMMU and costs a power-cycle). That reap is NOT optional: `orkd` self-reaps ~6 s
+  after its last client disconnects, but the suite reaches the reap step sooner, so every run would
+  otherwise finish with a daemon still holding the NPU — which matters when the board is shared.
 - **The examples ARE the tests** — each self-validates against a CPU reference (NPU output must
   match within fp16 tolerance; NaN/inf or dead output must fail). When you fix a hardware-behavior
   bug, add a shape/config case to the relevant example so `make test` would have caught it.

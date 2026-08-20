@@ -520,3 +520,44 @@ the move both relocated the function and returned the doc to the function it des
 Verified by the code-multiset invariant being **exactly neutral** (17,656 lines both sides — a pure
 relocation adds and loses nothing, unlike the probe split which legitimately added replicated preamble),
 literal-aware brace balance 0 in both files, and a board build + `make test`.
+
+## Round 7 — the prerequisite, not the split (2026-08-20)
+
+Round 7 was going to split `orkd.c` (1,003 lines). It didn't, and the reason is worth recording because it
+is the first time in seven rounds that measurement said *don't*.
+
+**Why not.** Splitting `orkd.c` means de-staticing daemon internals, because the file is densely connected:
+every one of the 19 `handle_*` functions calls `readn`/`writen`/`send_msg`. Measured cost at five candidate
+cut points:
+
+| cut | de-statics |
+|---|--:|
+| before the handlers (topic cut) | **22** |
+| before `ring_service` | 40 |
+| handlers + `dispatch_one` together | 40 |
+| before `daemonize` | 36 |
+| before `orkd_warmup` | 37 |
+
+The intuition that moving `dispatch_one` in with the handlers would let all 19 stay `static` is **wrong** —
+it just moves the cost to `main`/`daemonize`, which then need the helpers, `wk_*`, `dom_*` and the globals.
+There is no cheap seam. 22 is the floor, of which ~6 (the small I/O wrappers) could stay internal as
+`static inline` in a private header.
+
+22 de-statics is a defensible price for splitting a 1,003-line file. Doing it with **no behavioural test**
+is not: `make test` never started the daemon, so the only gate was "it compiles". Every other round had a
+behavioural gate.
+
+**So round 7 built the gate instead.** `make test` now ends with `orkd_probe mm`, which auto-spawns `orkd`,
+packs a weight and runs a matmul THROUGH the daemon, and compares against an EXACT integer CPU reference
+(A is all-ones, so `C[m,n] = sum_k B[k,n]`) — exit 3 on mismatch. Validated standalone first: 128/128
+correct. It runs LAST because the daemon takes ownership of the NPU, and the suite SIGTERMs any surviving
+`orkd` afterwards (never `-9`; an abrupt kill mid-submit wedges the IOMMU and costs a power-cycle).
+
+Measured daemon lifecycle: `orkd` idle-reaps on its own ~6 s after the last client disconnects, cleanly and
+with no IOMMU error. That made the Makefile reaper look like belt-and-braces — but in the real suite it
+FIRES, every run: the suite reaches the reap step within the 6 s linger, so without it `make test` would
+exit while a daemon still owned the NPU. On a shared board that is not cosmetic. Keep it.
+
+**Round 8 can now split `orkd.c`** with the same safety as rounds 1-6: cut before the handlers, 22
+de-statics with `orkd_` prefixes (AGENTS requires a prefix once a symbol crosses a TU), ~6 of them as
+`static inline` in a private `src/orkd_internal.h`.
