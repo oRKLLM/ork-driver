@@ -227,5 +227,34 @@ if [ -f "$OVR" ]; then
   fi
 fi
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols"
+
+# --- 9) per-file size budget: keep the modularization from decaying --------------------------------
+# src/npu.c reached 15,313 lines because nothing ever said stop. Twelve refactor rounds got every
+# module under 900; this makes that an invariant rather than a moment in time. Budgets and their
+# justifications live in tools/size_budget.txt — exceeding one means editing that file and saying why,
+# which is deliberate and reviewable, unlike drift.
+BUDGET=tools/size_budget.txt
+if [ -f "$BUDGET" ]; then
+  defmax=$(awk '$1=="*"{print $2; exit}' "$BUDGET")
+  : "${defmax:=900}"
+  szbad=$(for f in $(ls src/*.c src/*.h src/npu/*.c src/npu/*.h src/npu/*/*.c src/npu/*/*.h 2>/dev/null); do
+            n=$(wc -l < "$f" | tr -d ' ')
+            m=$(awk -v p="$f" '$1==p{print $2; exit}' "$BUDGET")
+            [ -n "$m" ] || m=$defmax
+            [ "$n" -gt "$m" ] && echo "$f: $n lines > budget $m"
+          done) || true
+  # `|| true`: the loop's LAST command is the [ -gt ] test, which is FALSE for a passing file, so
+  # under `set -e` (line 25) the whole script would exit 1 having printed nothing — a check that
+  # silently aborts the ones after it. Found by tracing, not by reading.
+  if [ -n "$szbad" ]; then
+    echo "$szbad" | while IFS= read -r l; do
+      echo "check-registry: FAIL — over size budget: $l"
+    done
+    echo "  => split it (measure the seam first — it is often cheaper than it looks), or raise the"
+    echo "     budget in $BUDGET WITH a reason."
+    fail=1
+  fi
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols; no file over its size budget"
 exit $fail

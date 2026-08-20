@@ -235,6 +235,12 @@ Doxyfile / `make docs`  scoped API docs -> docs/api/html (gitignored); excludes 
   precision-tagged, it belongs in that precision's folder. If its contract has no dtype in it, it is
   substrate — `npu/core/`. If it is an op family used by several precisions (activations, norms, the
   SSM scan), it is a peer module at `npu/<family>.c`. Only dtype DISPATCH stays in npu.c.
+- **SIZE BUDGET (enforced).** `tools/size_budget.txt` caps every `src/**` file at 900 lines by
+  default, checked by `make check-registry` (check 9). `src/npu.c` has a ratcheted exception set
+  just above its current size so the scaffold can only shrink. Exceeding a budget means editing
+  that file and stating a reason — deliberate and reviewable, unlike drift. Prefer splitting:
+  measure the seam first, because the cost is a property of the call graph, not of the line count
+  (`i8/dyn.c` split three ways for ZERO crossing symbols; `orkd.c`, nearly the same size, cost 28).
 - **HEADER PLACEMENT.** `npu/<name>.h` is tree-wide (internal.h, core.h). `npu/<mod>/<mod>.h` is
   PRIVATE to that folder — only `npu/<mod>/` sources may include it, and if the scaffold needs one of
   a module's symbols the declaration goes in internal.h instead. Enforced: `make check-registry`

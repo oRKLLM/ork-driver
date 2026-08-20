@@ -1,0 +1,22 @@
+# size_budget.txt — per-file line budgets, enforced by `make check-registry` (check 9).
+#
+# WHY: src/npu.c reached 15,313 lines because nothing ever said stop. Twelve refactor rounds
+# (MODULARIZE_PLAN.md) brought every module under 900. Without a gate that is a one-off cleanup
+# that decays; with one it is an invariant, and growing a file past its budget becomes a
+# deliberate, reviewable act rather than an accident nobody notices for a year.
+#
+# Format:  <path-or-*>  <max-lines>  <reason>
+# The default (*) applies to any src/**/*.c and src/**/*.h without an explicit entry.
+#
+# To exceed a budget you must edit THIS file and say why. That is the point — the friction is
+# the feature. Prefer splitting: the seam cost is usually far lower than it looks (i8/dyn.c split
+# three ways for ZERO crossing symbols), and it is worth measuring before assuming otherwise.
+
+*                       900   default: no single module should need more than this
+
+# --- justified exceptions -------------------------------------------------------------------
+# npu.c is the dtype-dispatch SCAFFOLD, not a module: run/run_multicore, the op-sequence
+# scheduler, bmm dispatch, async wrappers and ork_npu_init. It is ~55% comment (1,092 code lines
+# of 2,891). This budget should RATCHET DOWN as the remaining stranded doc-comments are placed;
+# it is set just above the current size so the file cannot grow, only shrink.
+src/npu.c              2950   dtype-dispatch scaffold, 55% comment; ratchet down as docs are placed
