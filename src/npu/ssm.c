@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include "npu/internal.h"
+#include "npu/core.h"
 
 static inline double ork_softplus(double v){ return v>20.0 ? v : log1p(exp(v)); }
 /* SSM_SCAN (Mamba-2) via the chunked mode-5 scan: matmul spine on the NPU (persistent weight pool +

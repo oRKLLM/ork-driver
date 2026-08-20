@@ -20,6 +20,7 @@
 #include <arm_neon.h>
 #endif
 #include "npu/internal.h"
+#include "npu/core.h"
 #include "regcmd_i4.h"
 
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {

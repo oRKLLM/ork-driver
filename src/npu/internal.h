@@ -245,20 +245,9 @@ struct ork_dyn_chain {
 /* ---- scaffold internals the precision modules call (de-static'd at the lift that needed them) ---- */
 int      orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end);
 unsigned orki_mm_timeout_ms(void);
-void     orki_npu_pool_ensure(ork_npu *c);
-uint32_t ork_ppflags(void);
 int      ork_i4_batch(void);
-void     ork_dom_flush_if_dirty(ork_npu *c);
-int      ork_npu_enter(ork_npu *c, int to, int profile, int chain);
-struct buf orki_bcreate(int fd, size_t size, uint32_t flags, int domain);
 void     orki_bdestroy(int fd, struct buf *b);
-struct buf orki_bscratch(ork_npu *c, size_t size, int flags, int dom);
 int      orki_budget(ork_npu *c, int M);
-struct buf *orki_dma_find(ork_npu *c, const void *p);
-void     orki_dom_activate(ork_npu *c, int dom);
-int      orki_mc_ensure(ork_npu *c, int nc);
-void     orki_pin_big_core(int id);
-int      orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain);
 void     orki_synth_i4(uint32_t *rc, int mc, int K, int N, uint32_t aA, uint32_t aB, uint32_t aC);
 int      orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n);
 void     orki_tile_i4_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
