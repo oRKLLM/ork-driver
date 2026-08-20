@@ -431,44 +431,6 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     return ok;
 }
 
-int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i16(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
-    int fd=c->fd, dom=c->dom_active;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
-    if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
-    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* 2-byte atom=8 cube (fp16/int16), surf_stride=M*16 */
-    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* int16 cube = M*N*2 bytes */
-    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
-    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
-    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
-        *(int16_t*)((char*)A.cpu+p)=up[m*N+n]; *(int16_t*)((char*)B.cpu+p)=silu[m*N+n]; }
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
-    uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
-    orki_set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult);     /* OUT_CVT_SCALE (gain mantissa) */
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);    /* OUT_CVT_SHIFT */
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0);                  /* zo=0 */
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0);                  /* za=0 */
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);                  /* zb=0 */
-    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    int ok=-1; double t1=0; sub.timeout=orki_ew_timeout_ms(); double t0=ork_now_us();
-    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
-    #undef EWCUBEH
-    return ok;
-}
 
 int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us){
     int fd=c->fd;
@@ -647,10 +609,6 @@ int orki_silu_calibrate_idx16(ork_npu *c){
     c->silu_idx16_ok=1; return 0;
 }
 
-int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_silu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
-}
 
 int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || !tasks) return -2;

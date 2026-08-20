@@ -406,11 +406,6 @@ int orki_dmaheap_fd = -1;
  * 2-byte geometry (hangs on int8's 1-byte). Integer datapath => NOTHRASH-stable with int8 layers, rides the
  * fp16 matmul scaffolding. Output stage: start with the fp16 template's (empirical), refine to integer if the
  * accumulate/convert needs it. ORK_I16_CON1 overrides 0x100c for on-board RE of the exact int16 encoding. */
-static void orki_synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
-    orki_synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
-    uint32_t con1=0x20000090u; const char*e=getenv("ORK_I16_CON1"); if(e) con1=(uint32_t)strtoul(e,NULL,0);
-    orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON1,con1);             /* FP16(2)->INT16(1) precision */
-}
 /* RE fuzzer hook for int8 (tools; batch-mode RE): (block,reg,val) overrides applied at the END of synth_i8.
  * Inert by default (n=0) — production unaffected. Mirrors the int4 g_i4_fovr hooks. */
 /* int8/w8a8: A,B int8 -> C int32. Differs from fp16: weight amount/stride (no x2), K-passes
@@ -585,29 +580,6 @@ int ork_npu_sdp_stamp(uint32_t *rc,int rn,int M,int N,uint32_t surfadd){
  * the 2x-denser-than-int32 midpoint. THESE ARE BEST-GUESS and env-overridable (ORK_I16OUT_*) so the encoding
  * can be SWEPT on-board (like i16_matmul_test did for the fp16/int16 output regs). This is the RE crux: the
  * on-NPU int32->int16 requant that lets the matmul feed the int16 silu inside one chain. */
-void orki_set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
-    int s=stride>0?stride:N;
-    /* SOLVED (wedge + layout) 2026-07-21 via i16out_fix_probe layout sweep: the int16 output stage now writes
-     * COMPACT CONTIGUOUS int16 (row-major m*N+n, M*N*2 bytes, 128/128 correct, no stall, no buffer overflow).
-     *  - 0x4010=0x20000000: OUT_PRECISION=int16 (bits[31:29]=1). The old 0x0000 (=int8 precision) while emitting
-     *    2-byte elements was the WDMA terminal-count/precision MISMATCH that STALLED the op (the standalone wedge).
-     *  - 0x4038=(s/8-1)|(N/8-1): the ORIGINAL comment's INTENDED "N/8 (2x denser than int32)" — the old code had
-     *    a typo N/16 in the low half (-> wrong width -> stall). (N/4 = the fp16 value = a wasteful 2N-wide surface
-     *    that overflows M*N*2 buffers; N/8 is the compact one.)
-     *  - 0x4050=0x36e, 0x40c0=0x40: the 2-byte surface (0x248 was wrong/int8-ish -> partial/stall).
-     * NOTE: output is LINEAR (m*N+n), NOT the EWCUBEH cube the standalone int16 SiLU stages its host input into;
-     * feeding it to the SiLU in a chain needs the SiLU input geom set to read linear (or the int8-bridge template). */
-    unsigned r10=getenv("ORK_I16OUT_4010")?strtoul(getenv("ORK_I16OUT_4010"),0,0):0x20000000;
-    unsigned r50=getenv("ORK_I16OUT_4050")?strtoul(getenv("ORK_I16OUT_4050"),0,0):0x0000036e;
-    unsigned rc0=getenv("ORK_I16OUT_40c0")?strtoul(getenv("ORK_I16OUT_40c0"),0,0):0x0040;
-    unsigned r38=getenv("ORK_I16OUT_4038")?strtoul(getenv("ORK_I16OUT_4038"),0,0):(unsigned)((((s/8)-1)<<16)|((N/8)-1));
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,r10);
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,r38);
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,r50);
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,rc0);
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,mult);
-    orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);
-}
 
 /* PHASE 1 (#35 chained FFN) — the SHIM the user asked for: instead of the CLOSED int16-matmul-output,
  * graft the fp16 REGCMD template's fp16 OUT_CVT (0x4010=0xa8000002, 0x40c0=0x40=2-byte, 0x4050=0x36e,
@@ -3123,63 +3095,6 @@ int orki_fused_mtile(int K,int M){
  * correct VALUES (out_i16 = clamp_i16(round(acc_i32 * mult / 2^shift))); the caller compares vs the
  * CPU model. C is written as raw M*N*2 bytes (layout TBD — a varying-value pass follows to map it).
  * 0/ok, -1 wedged, -2 dims. */
-int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
-                          int mult,int shift,int16_t *C,double *us){
-    int fd=c->fd, CBUF=c->soc->cbuf_elems;
-    if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
-    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
-    int NN=N/32,KT=K/32; int8_t*bb=W.cpu;     /* int8 tile layout [Ntile][Ktile][32][32], full K */
-    for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
-        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)];
-    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
-    size_t obytes=getenv("ORK_I16_OBYTES")?strtoul(getenv("ORK_I16_OBYTES"),0,0):(size_t)M*N*2;  /* enlarge to capture a strided layout */
-    if(obytes<(size_t)M*N*2) obytes=(size_t)M*N*2;
-    struct buf O=orki_bcreate(fd,obytes,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* int16 output */
-    memset(O.cpu,0,obytes); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    orki_act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    if(getenv("ORK_MM_F16OUT")) orki_set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
-    else if(getenv("ORK_MM_I32OUT")) { /* CONTROL: skip set_i16_out -> synth_i8's default int32 output (works standalone) */ }
-    else                        orki_set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
-    /* TOGGLE SWEEP: restore individual output-stage regs to their int32 (completing) values to isolate the
-     * WDMA terminal-count stall. Each ORK_MM_R<reg>=<hex> overrides one reg AFTER set_i16_out. */
-    { const char*e;
-      if((e=getenv("ORK_MM_R4010"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4038"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4050"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_BS_OW_CFG,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4084"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R4088"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)strtoul(e,0,0));
-      if((e=getenv("ORK_MM_R40c0"))) orki_setrn(rc,REGCMD_I8_N,RK_DPU_SURFACE_ADD,(uint32_t)strtoul(e,0,0)); }
-    if(getenv("ORK_MM_DUMPRC")){ const char*tag=getenv("ORK_MM_I32OUT")?"I32":"I16"; /* dump the assembled 0x40xx output stage for diffing */
-        for(int k=0;k+1<REGCMD_I8_N;k+=2){ uint32_t r=rc[k]&0xffff, v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
-            if(r>=0x4000 && r<0x4100) fprintf(stderr,"[%s] 0x%04x = 0x%08x\n",tag,r,v); } }
-    struct buf extra[2] = {W, O};
-    if (orki_validate_regcmd("probe_i16_out", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
-    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    int ok=-1; double t1=0;
-    for(int rep=0;rep<3;rep++){ sub.timeout=orki_mm_timeout_ms();
-        double t0=ork_now_us();
-        if(orki_rknpu_submit_ioctl(fd,&sub,-1)){ ok=-1; break; }
-        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    if(ok==0){ memcpy(C,O.cpu,(size_t)M*N*2); if(us)*us=t1;
-        if(getenv("ORK_MM_DUMPOUT")){ /* LAYOUT MAP: caller made values distinct; print int16-slot -> value for every nonzero slot in the (enlarged) O */
-            const int16_t*oc=O.cpu; long ns=(long)(obytes/2); int shown=0; long firstrow_end=-1, secondrow_start=-1; int prev=-1;
-            fprintf(stderr,"[i16map] obytes=%zu (%ld slots), M=%d N=%d — nonzero slots:\n",obytes,ns,M,N);
-            for(long i=0;i<ns;i++){ int v=oc[i]; if(v!=0){ if(shown<64) fprintf(stderr,"  [%ld]=%d",i,v);
-                if(prev>=0 && v<prev && secondrow_start<0){ firstrow_end=i-1; secondrow_start=i; } prev=v; shown++; if(shown%8==0&&shown<=64)fprintf(stderr,"\n"); } }
-            fprintf(stderr,"\n[i16map] total nonzero=%d  (row-wrap at slot ~%ld => row byte-stride ~%ld)\n",shown,secondrow_start,secondrow_start*2); } }
-    else if(getenv("ORK_MM_DUMPOUT")){ /* partial-write signature: how far did the WDMA get before the stall? */
-        orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); int16_t*oc=O.cpu; long last=-1; int tot=0,rows=0;
-        for(long i=0;i<(long)M*N;i++) if(oc[i]){ tot++; if(i>last)last=i; }
-        for(int m=0;m<M;m++){ int rnz=0; for(int n=0;n<N;n++) if(oc[(size_t)m*N+n])rnz++; if(rnz)rows++; }
-        fprintf(stderr,"[dumpout] M=%d N=%d: nonzero=%d/%d  rows-with-data=%d/%d  last-nz-elem=%ld (row %ld/%d)\n",
-                M,N,tot,M*N,rows,M,last,last<0?-1:last/N,M); }
-    orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);
-    return ok;
-}
 
 /* RE (int8 batch-mode A/B): run one int8 matmul via synth_i8 and return the RAW int32 output (no
  * requantize, no de-tile). Mirrors probe_i8_out8 (weight [NT][KT][32][32], A raw-copied to Af). Any
@@ -3409,42 +3324,6 @@ int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
  * pure-NPU 2-submit without the CPU atom-8 repack. a=[M][N] contiguous fp16, b=[N] scale, out=[M][N]. Captured
  * at M=8,N=64; notch is verbatim for N=64. ORK_MULC_* env for on-board geometry RE. 0/ok,-1,-2,-3. */
 
-int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
-    int fd=c->fd;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
-    if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
-    #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* 2-byte atom=8 cube */
-    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,sz,0x403,-1);
-    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
-    memset(A.cpu,0,sz); memset(O.cpu,0,sz); memset(B.cpu,0,sz);
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+PC16(m,n))=a[(size_t)m*N+n];
-    for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
-    uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
-    orki_set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,0x00000008);            /* ERDMA_DATA_MODE=0 (per-channel) + DATA_SIZE=TWO_BYTE */
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
-    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
-    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
-    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=orki_ew_timeout_ms();
-    int ok=-1; double t0=ork_now_us();
-    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
-    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
-    #undef PC16
-    return ok;
-}
 
 /* Wall-#2 probe: a background thread that, mid-submit, hot-patches ONE descriptor far ahead in the treadmill
  * ring (outside the NPU's prefetch horizon) to a MARKER task, then flushes. If the NPU honors the live patch
@@ -3603,59 +3482,6 @@ int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,
 /* On-NPU int16 element-wise ADD: out = clamp_i16(round((a*a_scale + b*b_scale)/out_scale)) via the 2-input SDP
  * ALU=add op (REGCMD_ADD_I16). Same requant structure as int8. Residual (equal scales) => clamp_i16(a+b), exact;
  * arbitrary unequal scales approximate. in/out int16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
-int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
-                    double a_scale,double b_scale,double out_scale,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_add_i16(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    int fd=c->fd, dom=c->dom_active;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)||out_scale<=0) return -2;
-    double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
-    int S=14; while(S>0 && cmax*(double)(1u<<S) > 0x4000) S--;
-    while(S<30 && cmax*(double)(1u<<(S+1)) <= 0x4000) S++;
-    long ma=lround(ca*(double)(1u<<S)), mb=lround(cb*(double)(1u<<S));
-    if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
-    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf B=orki_bcreate(fd,sz,0x403,dom); if(!B.cpu){orki_bdestroy(fd,&A);return -2;}
-    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);return -2;}
-    memset(A.cpu,0,sz);memset(B.cpu,0,sz);memset(O.cpu,0,sz);
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int p=EWCUBEH(m,n);
-        *(int16_t*)((char*)A.cpu+p)=a[m*N+n]; *(int16_t*)((char*)B.cpu+p)=b[m*N+n]; }
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (XP_SDP=RC_SDPKW, keep-warm-aware; == the old inline reset) */
-    uint32_t rc[REGCMD_ADD_I16_N]; memcpy(rc,REGCMD_ADD_I16,sizeof rc);
-    orki_set_mul_geom(rc,REGCMD_ADD_I16_N,M,N);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5018,(uint32_t)A.dma);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_SDP_5038,(uint32_t)B.dma);
-    /* EXPERIMENTAL: int16 add is NOT bit-exact over the signed range. Isolated: the ERDMA/X2 operand (0x5038, via
-     * 0x4078) is exact for BOTH signs; the SRDMA/X1 operand (0x5018, via 0x4084) is exact for POSITIVE but HALVES
-     * NEGATIVES (int8's X1 didn't — a int16-specific X1 sign/shift behavior). 0x4048 and the shift couple into it,
-     * and configs that fix negatives double-count or scale x2. A clean signed fix needs a full X1/X2 sub-module
-     * scale decode (multi-reg, sign-dependent) — not yet cracked. Env overrides (ORK_ADD16_R48/84/88/78) for RE. */
-    uint32_t r48=0x40000000,r84=(uint32_t)ma,r88=(uint32_t)(S+14),r78=(uint32_t)mb; const char*e;
-    if((e=getenv("ORK_ADD16_R48")))r48=(uint32_t)strtoul(e,0,16);
-    if((e=getenv("ORK_ADD16_R84")))r84=(uint32_t)strtoul(e,0,16);
-    if((e=getenv("ORK_ADD16_R88")))r88=(uint32_t)strtoul(e,0,16);
-    if((e=getenv("ORK_ADD16_R78")))r78=(uint32_t)strtoul(e,0,16);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_MUL_CFG,r48);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SCALE,r84);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_SHIFT,r88);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_SCALE,r78);
-    orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_EW_CVT_OFFSET,0); orki_setrn(rc,REGCMD_ADD_I16_N,RK_DPU_OUT_CVT_OFFSET,0);
-    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
-    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    int ok=-1; double t1=0; sub.timeout=orki_ew_timeout_ms(); double t0=ork_now_us();
-    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&O);
-    #undef EWCUBEH
-    return ok;
-}
 
 /* ── Standalone on-NPU SiLU (activation-LUT SDP op) — RE probe ─────────────────────────────────────
  * Applies the PPU activation LUT to a SINGLE int8 memory input [M][N] via the standalone 69-reg/enable=0x18
@@ -3715,69 +3541,6 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
  * (0,1,2) A[j]=(j>>7p)&0x7f base-128 digits -> offset = d0 | d1<<7 | d2<<14 at each slot. Fills, per k0 i:
  * rpos[i*M+t] = raw int32 index of the t-th output slot, aoff[i*M+t] = the A byte offset it read (t<cnt[i]).
  * Returns 0/ok. Offsets up to 2MB (fits the oversized A buffer). */
-int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
-                           const int16_t *in,int M,int N,int16_t *out,double *us){
-    int fd=c->fd;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)||rn>REGCMD_SILU_STD_I16_N) return -2;
-    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
-     * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
-     * (multi-domain FFN chain); if the buffers live in dom0 and it submits iommu_domain_id=0 while
-     * c->dom_active is that other domain, the submit WEDGES (errno 110) — REPRODUCED in isolation by
-     * i16_shape_probe [G] (dom0 matmul->silu clean; dom1 matmul->silu wedges). Match the active domain. */
-    int dom = getenv("ORK_I16_DOM0") ? 0 : c->dom_active;   /* ORK_I16_DOM0: A/B — force dom0 (disable the domain fix) */
-    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
-    struct buf O=orki_bcreate(fd,sz,0x403,dom); if(!O.cpu){orki_bdestroy(fd,&A);return -2;}
-    struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
-    struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
-    memset(A.cpu,0,sz);memset(O.cpu,0,sz);
-    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int16_t*)((char*)A.cpu+EWCUBEH(m,n))=in[m*N+n];
-    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    orki_act(fd,RKNPU_ACT_RESET,0);
-    memcpy(Lrc.cpu,REGCMD_SILU_LUT,REGCMD_SILU_LUT_N*4);
-    orki_setrn((uint32_t*)Lrc.cpu,REGCMD_SILU_LUT_N,RK_DPU_DST_BASE_ADDR,(uint32_t)Lsc.dma);
-    { uint32_t*lr=(uint32_t*)Lrc.cpu; int j=0;
-      for(int k=0;k+1<REGCMD_SILU_LUT_N;k+=2){ if((lr[k]&0xffff)==0x4104){ int32_t v=(j<nlut)?(int32_t)lut[j]:0; j++;
-          lr[k]=0x4104|((uint32_t)(v&0xffff)<<16); lr[k+1]=(0x1001u<<16)|(((uint32_t)v>>16)&0xffff); } } }
-    orki_bsync(fd,&Lrc,RKNPU_MEM_SYNC_TO_DEVICE);
-    { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
-      t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
-      orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-      /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
-       * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
-       * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
-       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
-      struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
-    }
-    uint32_t rc[REGCMD_SILU_STD_I16_N]; memset(rc,0,sizeof rc); memcpy(rc,regcmd,(size_t)rn*4);
-    orki_set_mul_geom(rc,rn,M,N);
-    orki_setrn(rc,rn,RK_SDP_5040,0); orki_setrn(rc,rn,RK_SDP_5038,0);
-    orki_setrn(rc,rn,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-    orki_setrn(rc,rn,RK_SDP_5018,(uint32_t)A.dma);
-    memcpy(c->regcmd.cpu,rc,(size_t)rn*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; memset(tk,0,sizeof *tk);
-    tk->enable_mask=0x18; tk->int_mask=0x300; tk->int_clear=0x1ffff; tk->regcfg_amount=(uint32_t)(rn/2-4); tk->regcmd_addr=c->regcmd.dma;
-    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-    int ok=-1; double t1=0; sub.timeout=orki_ew_timeout_ms(); double t0=ork_now_us();
-    /* ORK_I16_DUMP: dump the exact submit context so the WEDGING chain submit can be diffed byte-for-byte
-     * against the CLEAN probe submit of the same shape (in-model instrumentation, #35). */
-    if(getenv("ORK_I16_DUMP")){ static long n=0;
-        fprintf(stderr,"[i16dump #%ld] M=%d N=%d dom=%d dom_active=%d core=0x%x | A.dma=0x%llx A.dom=%d O.dma=0x%llx O.dom=%d Lrc.dma=0x%llx(d%d) Lsc.dma=0x%llx(d%d) | regcmd.dma=0x%llx regcfg=%u task.obj=0x%llx last_dt=%d warmed=%d\n",
-            ++n,M,N,dom,c->dom_active,sub.core_mask,
-            (unsigned long long)A.dma,A.domain,(unsigned long long)O.dma,O.domain,
-            (unsigned long long)Lrc.dma,Lrc.domain,(unsigned long long)Lsc.dma,Lsc.domain,
-            (unsigned long long)c->regcmd.dma,tk->regcfg_amount,(unsigned long long)c->task.obj,c->last_dt,c->warmed);
-        fflush(stderr); }
-    if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
-    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); if(us)*us=t1; }
-    orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
-    #undef EWCUBEH
-    return ok;
-}
 
 /* RE/validation for the FUSED SiLU output stage (step 2): run a full-K int8 matmul with SiLU applied
  * on-chip, returning C[M*N] as int8. TWO submits on the single-stream NPU: (1) the LUT-load program
@@ -3979,100 +3742,6 @@ mfail:
  * (0x5018), validating the intermediate-buffer bridge (like ork_npu_chain_gatesilu_i16 but SDP=per-channel
  * scale instead of silu). out = clamp_i16( requant_i16(A[M,K]xB[K,N], m1,s1) * scale[n] * m2 >> s2 ).
  * A int8[M*K], B int8[K*N] row-major, scale int16[N] per-channel. K%32,N%32,N<=nmax,M<=64. 0/ok,<0. */
-int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
-                                 const int16_t *scale,int m1,int s1,int m2,int s2,int16_t *out,double *us){
-    int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
-    #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
-    struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,dom), G=orki_bcreate(fd,sz,0x403,dom), O=orki_bcreate(fd,sz,0x403,dom), SB=orki_bcreate(fd,4096,0x403,dom);
-    if(!W.cpu||!G.cpu||!O.cpu||!SB.cpu){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB); return -1; }
-    { int NN=N/32,KT=K/32; int8_t*bb=W.cpu;
-      for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
-        bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
-    memset(G.cpu,0,sz); memset(O.cpu,0,sz); memset(SB.cpu,0,4096);
-    { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
-    /* ALL-INT16 dtype-matched chain (the fp16-out matmul writeout is a HW dead end — see orki_set_f16_out_fp16in NOTE).
-     * int8 matmul -> INT16 G (set_i16_out, PROVEN by the gate->silu chain) -> INT16 2-input per-channel SDP
-     * (REGCMD_MUL_I16, PROC_PRECISION=1, DATA_FORMAT 0x24000001). Both int16 => dtype-path matched (the same fix
-     * that unhung the fp16 pair), and the matmul CAN emit int16 (unlike fp16). PC16/EWCUBEH atom-8 layout is shared
-     * between set_i16_out output and the int16 SDP input (the gatesilu bridge).
-     * RESULT (2026-07-14): HANGS (errno=110) — the int16 2-input SDP (REGCMD_MUL_I16) is NOT chain-safe: it keeps
-     * the BS-ALU ACTIVE (0x4040=0x20050) + relies on reset-provided state, unlike the vendor fp16 chain SDP
-     * (REGCMD_MUL_F16_CHAIN, BS fully bypassed 0x53). Dtype-match is necessary but NOT sufficient; the SDP must
-     * also be the chain-safe (BS/BN bypassed) variant, which we only have for fp16. So neither end lines up:
-     * fp16 has the chain-safe SDP but no matmul writeout; int16 has the matmul writeout but no chain-safe SDP.
-     * Next lever = capture a vendor GEMM with fp16-out (how the vendor emits fp16 from a matmul-class op). */
-    uint32_t r34=0x00000008u;                                                 /* ERDMA per-channel + 2-byte (int16 SDP) */
-    { int16_t*sb=(int16_t*)SB.cpu; for(int n=0;n<N;n++) sb[n]=scale[n]; }      /* int16 per-channel scale CONTIGUOUS [N] */
-    orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&G,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
-    orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-    if(getenv("ORK_I16_ENTER")) ork_npu_enter(c,DT_I8,XP_SC_MM,OCK_NONE);   /* layer entry */
-    else orki_act(fd,RKNPU_ACT_RESET,0);                                         /* gatesilu-style bare reset (proven for this chained int16-out matmul) */
-    static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
-    orki_synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
-    orki_set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
-    { const char*e=getenv("ORK_I16_MM4010"); if(e) orki_setrn(mm,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
-    /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
-     * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
-     * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
-    if(getenv("ORK_I16_MULTMPL")){   /* OLD: standalone-captured REGCMD_MUL_I16 (hangs chained — no chained-ERDMA arming) */
-        memcpy(pc,REGCMD_MUL_I16,sizeof pc);
-        orki_set_mul_geom(pc,REGCMD_MUL_I16_N,M,N);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)G.dma);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)SB.dma);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_SDP_5034,r34);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
-        orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BS_CFG,0x00000053); orki_setrn(pc,REGCMD_MUL_I16_N,RK_DPU_BN_CFG,0x00000053);
-    } else {   /* CHAIN-SAFE int16 SDP = the PROVEN chained fp16 template (REGCMD_MUL_F16_CHAIN, vendor conv->mul
-                * chained-ERDMA arming), patched precision fp16->int16: 0x4010 int16 DATA_FORMAT, int16 requant
-                * (m2/s2), ERDMA per-channel 2-byte. The chain-safe arming (0x5004/0x5008/0x5044/BS-bypass) is
-                * inherited verbatim — that's what REGCMD_MUL_I16 lacked. */
-        memcpy(pc,REGCMD_MUL_F16_CHAIN,REGCMD_MUL_F16_CHAIN_N*4);
-        orki_set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)G.dma);
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5038,(uint32_t)SB.dma);
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5034,0x00000008);                     /* ERDMA per-channel + 2-byte */
-        uint32_t r10=getenv("ORK_I16_R4010")?strtoul(getenv("ORK_I16_R4010"),0,0):0x24000001; /* int16 DATA_FORMAT (was fp16 0x48000002) */
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_PRECISION,r10);
-        orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)m2); orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)s2); /* int16 requant (was FP32TOFP16_EN) */
-    }
-    double t0=ork_now_us();
-    int crc;
-    if(getenv("ORK_I16_SEQ")){
-        /* O(M·N) PURE-NPU per-channel scale via SEQUENCED submits (the 2-input SDP isn't chain-safe, but as a
-         * SEPARATE submit it reads the matmul's atom-8 G in place — SAME layout, NO repack, NO reshape). The SDP
-         * is element-wise per-channel = O(M·N), vs the fp16 diagonal-matmul's O(M·N²). int16 matmul writes atom-8
-         * natively (set_i16_out) so — unlike fp16 — no contiguous↔atom-8 bridge is needed. G device-resident. */
-        /* mirror the WORKING standalone (mul_perchan_i16): the task already points at c->regcmd from init — only
-         * flip regcfg_amount + enable_mask (NO memset / regcmd_addr, which would clobber init's task config). */
-        struct rknpu_task*tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask; crc=0;
-        memcpy(c->regcmd.cpu,mm,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-        { tk->regcfg_amount=108; tk->enable_mask=0xd; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=orki_ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(orki_rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] MATMUL submit failed errno=%d dom=%d\n",errno,dom);} else orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE|RKNPU_MEM_SYNC_TO_DEVICE); }   /* matmul -> atom-8 int16 G (device-resident) */
-        if(!crc){ ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer */
-          memcpy(c->regcmd.cpu,pc,REGCMD_MUL_I16_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-          tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-          struct rknpu_submit s;memset(&s,0,sizeof s);s.flags=ork_ppflags();s.task_number=1;s.task_obj_addr=c->task.obj;s.core_mask=RKNPU_CORE0_MASK;s.fence_fd=-1;s.timeout=orki_ew_timeout_ms();s.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-          if(orki_rknpu_submit_ioctl(fd,&s,dom)){crc=-1;fprintf(stderr,"[i16seq] SDP submit failed errno=%d dom=%d\n",errno,dom);} else orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); }              /* SDP per-channel scale (reads G atom-8 in place) -> O */
-        tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);   /* restore shared task */
-    } else {
-        ork_chain_prog progs[2]={ {mm,REGCMD_I8_N,0xd,108,216}, {pc,REGCMD_MUL_I16_N,0x18,69,-1} };
-        crc=ork_npu_chain_progs(c,2,progs,dom);
-        if(crc){ orki_bsync(fd,&G,RKNPU_MEM_SYNC_FROM_DEVICE); int gnz=0; int16_t*g=(int16_t*)G.cpu; for(int i=0;i<M*N;i++) if(g[i])gnz++;
-            fprintf(stderr,"[i16chain] chain_progs crc=%d errno=%d — G nonzero=%d/%d (task0 matmul %s)\n",crc,errno,gnz,M*N,gnz?"COMPLETED":"did NOT complete"); }
-    }
-    if(!crc){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
-        for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+EWCUBEH(m,n)); }  /* int16 O */
-    orki_bdestroy(fd,&W);orki_bdestroy(fd,&G);orki_bdestroy(fd,&O);orki_bdestroy(fd,&SB);
-    #undef EWCUBEH
-    return crc;
-}
 
 /* fp16-IN chained matmul -> per-channel SDP (the attention A·V normalize path, all-fp16 like the vendor conv->mul).
  * Closes the single-submit chain with CORRECT values: fp16 matmul (synth, weight tile [N/16][K/32][16][32], fp16
@@ -4123,28 +3792,9 @@ int orki_build_act_lut16(ork_npu *c,double(*f)(double),double in_scale,double ou
         lut[k]=(int16_t)(lut[a]+(lut[b]-lut[a])*(k-a)/(b-a)); }
     return 0;
 }
-int orki_act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
-    int16_t lut[1030];
-    if(orki_build_act_lut16(c,f,in_scale,out_scale,lut)) return -1;
-    return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
-}
 /* On-NPU GELU (int16 / w16a16i): same activation-LUT op, GELU curve. RKNN-class accuracy like SiLU int16. */
-int ork_npu_gelu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_gelu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_gelu_f,in,M,N,in_scale,out_scale,out,us);
-}
 /* On-NPU rsqrt (int16) — RMSNorm building block. RKNN-class accuracy. */
-int ork_npu_rsqrt_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_rsqrt_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_rsqrt_f,in,M,N,in_scale,out_scale,out,us);
-}
 /* On-NPU exp (int16) — softmax building block. RKNN-class accuracy. */
-int ork_npu_exp_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
-    if(c && c->daemon){ if(us)*us=0; return orkd_exp_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_exp_f,in,M,N,in_scale,out_scale,out,us);
-}
 
 /* RE: does batching tasks per ioctl amortize the RKNPU_SUBMIT round-trip floor? Runs `ntask`
  * identical small int8 matmuls (single core) as (a) ntask separate task_number=1 ioctls vs (b) ONE

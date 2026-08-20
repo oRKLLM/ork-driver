@@ -52,7 +52,10 @@ for p in $probes; do
 done
 
 # --- 2) named op symbols must exist (exclude probe/test tokens caught above) --------------
-ops=$(grep -oE 'ork_(npu|mm|dyn|submit|ppu)_[a-z0-9_]+|set_[a-z0-9]+_(out8?|silu32?|fp16in)|run_chain_i8_impl' "$REG" \
+# NOTE: the precision split prefixed internal symbols orki_*, so the internal-op patterns must allow it —
+# otherwise `orki_set_i8_silu32` in the registry still matches the bare `set_i8_silu32` here and the
+# source lookup then fails on the word boundary.
+ops=$(grep -oE '(orki_)?ork_(npu|mm|dyn|submit|ppu)_[a-z0-9_]+|(orki_)?set_[a-z0-9]+_(out8?|silu32?|fp16in)|(orki_)?run_chain_i8_impl' "$REG" \
       | grep -vE '_(probe|test|check|stress|bench)$' | sort -u)
 for o in $ops; do
   hit=0
