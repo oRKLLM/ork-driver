@@ -20,8 +20,8 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int8_t)((i%5)-2);
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)((i%7)-3);
     int32_t*C=malloc((size_t)M*N*4);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
-    ork_mm_run_i8(c,w,M,A,C);                      /* ORK_TRACE prints regcmd here */
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    ork_i8_mm_run(c,w,M,A,C);                      /* ORK_TRACE prints regcmd here */
     int rc=0;
     if(!getenv("ORK_TRACE") && (long)M*N<=4000000){  /* CPU int8 reference check */
         int mism=0; long maxe=0;
@@ -32,7 +32,7 @@ int main(int argc,char**argv){
         printf("CPU-ref check M=%d K=%d N=%d: mism=%d maxerr=%ld %s\n",M,K,N,mism,maxe,mism?"FAIL":"OK");
         rc = mism?1:0;
     }
-    for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,C);
+    for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,C);
     if(iters) printf("ork ran M=%d K=%d N=%d single-core (%d iters)\n",M,K,N,iters);
     ork_w_free(w); ork_npu_free(c); free(A);free(B);free(C); return rc;
 }

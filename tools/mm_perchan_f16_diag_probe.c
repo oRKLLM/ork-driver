@@ -14,7 +14,7 @@ int main(void){
         for(int i=0;i<M*K;i++){st=st*1103515245+12345;A[i]=(ork_f16)((st>>16)&1);}
         for(int i=0;i<K*N;i++){st=st*1103515245+12345;B[i]=(ork_f16)((st>>16)&1);}
         for(int n=0;n<N;n++) sc[n]=(ork_f16)(n%3);
-        double us=0; int rc=ork_npu_mm_perchan_f16_diag(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)out,&us);
+        double us=0; int rc=ork_f16_npu_mm_perchan_diag(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)out,&us);
         int bad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];
             float ref=acc*(float)sc[n]; if((float)out[(size_t)m*N+n]!=ref) bad++; }
         printf("  MKN=%d,%d,%d: rc=%d %d/%d exact %s\n",M,K,N,rc,M*N-bad,M*N,(rc==0&&!bad)?"OK":"CHECK"); if(rc||bad)fail=1;

@@ -1,4 +1,4 @@
-/* Validate ork_npu_rope_neox_f16 vs a CPU NEOX-RoPE reference at attention shapes. */
+/* Validate ork_f16_npu_rope_neox vs a CPU NEOX-RoPE reference at attention shapes. */
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +13,7 @@ int main(void){
         int *pos=malloc(nrow*sizeof(int));
         unsigned s=99+t;
         for(int r=0;r<nrow;r++){ pos[r]=(r/nh); for(int i=0;i<hd;i++){ s=s*1103515245+12345; x[(size_t)r*hd+i]=(ork_f16)(((int)((s>>16)&0xff)-128)/64.0f); } }
-        int rc=ork_npu_rope_neox_f16(c,x,hd,nrow,pos,fb,o);
+        int rc=ork_f16_npu_rope_neox(c,x,hd,nrow,pos,fb,o);
         double maxerr=0;
         for(int r=0;r<nrow;r++){ double p=pos[r];
             for(int i=0;i<hd2;i++){ double th=p*pow(fb,-2.0*i/hd); double cc=cos(th),ss=sin(th);

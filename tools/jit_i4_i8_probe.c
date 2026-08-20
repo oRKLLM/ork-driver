@@ -1,5 +1,5 @@
 /* jit_i4_i8_probe — Slice 1 of the tiered int4-park/JIT-int8 residence: validate the JIT int4->int8
- * materialization. Park a weight as int4 values, JIT-inflate to an int8 ork_w (ork_mm_pack_i4_to_i8, the
+ * materialization. Park a weight as int4 values, JIT-inflate to an int8 ork_w (ork_i4_mm_pack_to_i8, the
  * free CPU unpack + tile), run int8 on the NPU, verify correct + time the inflate vs a direct int8 pack.
  * All-ones int4 (value 1) -> int8 matmul == K everywhere (bit-exact gate).
  *   make jit_i4_i8_probe && sudo env ORK_MM_TIMEOUT=4000 ./jit_i4_i8_probe [iters]
@@ -24,19 +24,19 @@ int main(int argc,char**argv){
     printf("jit_i4_i8_probe: K=%d N=%d M=%d (parked int4 -> JIT int8)\n",K,N,M);
 
     /* ---- direct int8 (baseline: pre-inflated) ---- */
-    ork_npu_set_pack_domain(c,0); ork_w*w8=ork_mm_pack_i8(c,K,N,Bi8); if(!w8){printf("pack_i8 fail\n");return 1;}
-    ork_mm_run_i8(c,w8,M,A,C);
-    double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w8,M,A,C); double run8=(now_us()-t0)/iters;
+    ork_npu_set_pack_domain(c,0); ork_w*w8=ork_i8_mm_pack(c,K,N,Bi8); if(!w8){printf("pack_i8 fail\n");return 1;}
+    ork_i8_mm_run(c,w8,M,A,C);
+    double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w8,M,A,C); double run8=(now_us()-t0)/iters;
     int ok8=1; for(int i=0;i<M*N;i++)if(C[i]!=K){ok8=0;break;}
     printf("  int8 direct: run %8.1f us  bit-exact=%s\n", run8, ok8?"YES":"NO");
 
     /* ---- JIT: inflate parked int4 -> int8 ork_w, then run ---- */
     ork_npu_set_pack_domain(c,0);
-    t0=now_us(); ork_w*wj=0; for(int i=0;i<iters;i++){ if(wj)ork_w_free(wj); wj=ork_mm_pack_i4_to_i8(c,K,N,Bi4); }
+    t0=now_us(); ork_w*wj=0; for(int i=0;i<iters;i++){ if(wj)ork_w_free(wj); wj=ork_i4_mm_pack_to_i8(c,K,N,Bi4); }
     double inflate=(now_us()-t0)/iters;
     if(!wj){printf("pack_i4_to_i8 fail\n");return 1;}
-    memset(C,0,(size_t)M*N*4); ork_mm_run_i8(c,wj,M,A,C);
-    t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,wj,M,A,C); double runj=(now_us()-t0)/iters;
+    memset(C,0,(size_t)M*N*4); ork_i8_mm_run(c,wj,M,A,C);
+    t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,wj,M,A,C); double runj=(now_us()-t0)/iters;
     int okj=1; for(int i=0;i<M*N;i++)if(C[i]!=K){okj=0;break;}
     printf("  JIT int4->int8: inflate %8.1f us + run %8.1f us  bit-exact=%s\n", inflate, runj, okj?"YES":"NO");
     printf("  ★ parked=int4 (half RAM); run matches int8 (%s); inflate/run ratio %.2f\n",

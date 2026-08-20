@@ -23,13 +23,13 @@ int main(void){
     for(size_t j=0;j<sizeof Ks/sizeof*Ks;j++){
         int K=Ks[j];
         int8_t *B = malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-        ork_w *w = ork_mm_pack_i8(c,K,N,B); free(B);
+        ork_w *w = ork_i8_mm_pack(c,K,N,B); free(B);
         if(!w){ printf("  %5d  FAIL  (pack rejected)\n", K); continue; }
         int8_t *A = malloc((size_t)M*K); memset(A,1,(size_t)M*K);
         int32_t *Cs[8];
         ork_mm_task_i8 tk[8];
         for(int i=0;i<S;i++){ Cs[i]=calloc((size_t)M*N,4); tk[i]=(ork_mm_task_i8){w,M,A,Cs[i]}; }
-        int rc = ork_mm_run_chain_i8(c,S,tk);
+        int rc = ork_i8_mm_run_chain(c,S,tk);
         int bad=0;
         if(rc==0){ for(int i=0;i<S;i++){ for(size_t e=0;e<(size_t)M*N;e++){ if(Cs[i][e]!=K){bad++;break;} } } }
         const char *v;

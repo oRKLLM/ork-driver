@@ -1,7 +1,7 @@
 /* kv_append_probe — validate Tier 12f resident-KV APPEND. Append K/V key-by-key into resident packed weights
  * (ork_kv_resident_alloc/ork_kv_append), run decode attention, and check it EQUALS the full-repack path
- * (ork_mm_pack_i8 of the whole K^T/V — same int8 bytes, so bit-for-bit) AND a CPU fp reference. Proves the tiled
- * write in ork_kv_append matches ork_mm_pack_i8's layout (incl. multi-tile V for L>1024).
+ * (ork_i8_mm_pack of the whole K^T/V — same int8 bytes, so bit-for-bit) AND a CPU fp reference. Proves the tiled
+ * write in ork_kv_append matches ork_i8_mm_pack's layout (incl. multi-tile V for L>1024).
  *   sudo env ORK_MM_TIMEOUT=3000 ./kv_append_probe [L] [HD]
  */
 #define _GNU_SOURCE
@@ -14,12 +14,12 @@
 static int run_attn(ork_npu*c,ork_w*wkt,ork_w*wv,int8_t*Q8,int L,int HD,float scale,float qs,float ks,float vs,float*att){
     int32_t *scores=malloc((size_t)L*4),*attv=malloc((size_t)HD*4); double*sc=malloc((size_t)L*sizeof(double)); int8_t*w8=malloc((size_t)L);
     int rc=-1;
-    ork_mm_task_i8 t1={wkt,1,Q8,scores}; if(ork_mm_run_chain_i8(c,1,&t1)) goto out;
+    ork_mm_task_i8 t1={wkt,1,Q8,scores}; if(ork_i8_mm_run_chain(c,1,&t1)) goto out;
     { double mx=-1e300; for(int j=0;j<L;j++){ sc[j]=(double)scores[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
       double Z=0; for(int j=0;j<L;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
       double wmax=0; for(int j=0;j<L;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0);
       for(int j=0;j<L;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
-      ork_mm_task_i8 t2={wv,1,w8,attv}; if(ork_mm_run_chain_i8(c,1,&t2)) goto out;
+      ork_mm_task_i8 t2={wv,1,w8,attv}; if(ork_i8_mm_run_chain(c,1,&t2)) goto out;
       for(int e=0;e<HD;e++) att[e]=(float)((double)attv[e]/(ws*vs)); rc=0; }
 out: free(scores);free(attv);free(sc);free(w8); return rc;
 }
@@ -44,7 +44,7 @@ int main(int argc,char**argv){
     int8_t *KTp=calloc((size_t)Kp*L,1),*Vp=malloc((size_t)L*HD);
     for(int e=0;e<HD;e++)for(int j=0;j<L;j++) KTp[(size_t)e*L+j]=(int8_t)lrintf(K[(size_t)j*HD+e]*ks);
     for(size_t i=0;i<(size_t)L*HD;i++) Vp[i]=(int8_t)lrintf(V[i]*vs);
-    ork_w *rkt=ork_mm_pack_i8(c,Kp,L,KTp), *rv=ork_mm_pack_i8(c,L,HD,Vp);
+    ork_w *rkt=ork_i8_mm_pack(c,Kp,L,KTp), *rv=ork_i8_mm_pack(c,L,HD,Vp);
     if(!rkt||!rv){ printf("repack pack fail\n"); return 2; }
     float *att_ref=malloc((size_t)HD*4); if(run_attn(c,rkt,rv,Q8,L,HD,scale,qs,ks,vs,att_ref)){ printf("repack run fail\n"); return 1; }
 

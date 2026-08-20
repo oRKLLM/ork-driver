@@ -1,6 +1,6 @@
 /* tools/i16_matmul_test.c — first real int16 matmul via the fp16 run path + 0x100c=INT16 fuzz-override.
  *
- * int16 tiles are byte-identical layout to fp16, so ork_mm_pack tiles int16 weights correctly. Flipping
+ * int16 tiles are byte-identical layout to fp16, so ork_f16_mm_pack tiles int16 weights correctly. Flipping
  * 0x100c FP16(2)->INT16(1) via ork_f16_fuzz_add makes the CNA MAC integer. We feed small int16 A/B and
  * compare the NPU output to the CPU int16 reference C[m,n]=sum_k A[m,k]*B[k,n] (int32). This tells us
  * whether proc=1 gives a correct integer matmul with the fp16 output stage, or whether the output stage
@@ -25,7 +25,7 @@ int main(int argc,char**argv){
     int32_t*ref=malloc((size_t)M*N*4);
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int32_t s=0; for(int k=0;k<K;k++) s+=(int32_t)Ai[(size_t)m*K+k]*(int32_t)Bi[(size_t)k*N+n]; ref[(size_t)m*N+n]=s; }
 
-    ork_w*w=ork_mm_pack(c,K,N,(const f16*)Bi); if(!w){printf("pack fail\n");return 2;}
+    ork_w*w=ork_f16_mm_pack(c,K,N,(const f16*)Bi); if(!w){printf("pack fail\n");return 2;}
     float*C=malloc((size_t)M*N*4); for(int i=0;i<M*N;i++)C[i]=-1e30f;
     /* int16 = fp16 2-byte INPUT geometry + INT16 precision + INT8 INTEGER OUTPUT stage (fp16's output stage
      * gave all-zeros — it reads an fp accumulator). Output-format regs from the int8 template (0x4010/0x4050/
@@ -35,10 +35,10 @@ int main(int argc,char**argv){
     ork_f16_fuzz_add(0x1001,0x4010,  getenv("ORK_I16_4010")?strtoul(getenv("ORK_I16_4010"),0,0):0x80000000u);
     ork_f16_fuzz_add(0x1001,0x4050,  getenv("ORK_I16_4050")?strtoul(getenv("ORK_I16_4050"),0,0):0x000007fcu);
     ork_f16_fuzz_add(0x1001,0x40c0,  getenv("ORK_I16_40c0")?strtoul(getenv("ORK_I16_40c0"),0,0):0x00000080u);
-    int rc=ork_mm_run(c,w,M,(const f16*)Ai,C);
+    int rc=ork_f16_mm_run(c,w,M,(const f16*)Ai,C);
     ork_f16_fuzz_clear();
     printf("i16 matmul M=%d K=%d N=%d rc=%d\n",M,K,N,rc);
-    /* output stage is INTEGER: the device buffer holds int32, but ork_mm_run's C is float* — reinterpret bits */
+    /* output stage is INTEGER: the device buffer holds int32, but ork_f16_mm_run's C is float* — reinterpret bits */
     int32_t*Ci=(int32_t*)C;
     int nbad=0;
     for(int i=0;i<M*N;i++){ if(Ci[i]!=ref[i]) nbad++; }

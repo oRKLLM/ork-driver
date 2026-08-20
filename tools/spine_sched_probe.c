@@ -70,7 +70,7 @@ int main(void){
 
     int8_t*A=malloc((size_t)M*K); int8_t*Wb=malloc((size_t)K*N);
     for(int i=0;i<M*K;i++) A[i]=(int8_t)s3(); for(size_t i=0;i<(size_t)K*N;i++) Wb[i]=(int8_t)s3();
-    ork_w*W=ork_mm_pack_i8(c,K,N,Wb); if(!W){ printf("pack fail\n"); return 2; }
+    ork_w*W=ork_i8_mm_pack(c,K,N,Wb); if(!W){ printf("pack fail\n"); return 2; }
     int32_t *C0=ork_dma_alloc(c,(size_t)S*N*4), *C3=ork_dma_alloc(c,(size_t)S*N*4);
     if(!C0||!C3){ printf("dma fail\n"); return 2; }
     ork_mm_task_i8 *tk0=malloc((size_t)S*sizeof *tk0), *tk3=malloc((size_t)S*sizeof *tk3);

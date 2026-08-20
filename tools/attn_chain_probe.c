@@ -85,9 +85,9 @@ int main(int argc,char**argv){
     }
 
     /* ===================== NPU SEQ PIPELINE ===================== */
-    ork_w *w_q=ork_mm_pack(c,d,d,Wq), *w_k=ork_mm_pack(c,d,d,Wk), *w_v=ork_mm_pack(c,d,d,Wv), *w_o=ork_mm_pack(c,d,d,Wo);
+    ork_w *w_q=ork_f16_mm_pack(c,d,d,Wq), *w_k=ork_f16_mm_pack(c,d,d,Wk), *w_v=ork_f16_mm_pack(c,d,d,Wv), *w_o=ork_f16_mm_pack(c,d,d,Wo);
     ork_f16 *ones=malloc((size_t)N*16*2); for(size_t i=0;i<(size_t)N*16;i++) ones[i]=(ork_f16)1.0f;
-    ork_w *w_ones=ork_mm_pack(c,N,16,ones);
+    ork_w *w_ones=ork_f16_mm_pack(c,N,16,ones);
     if(!w_q||!w_k||!w_v||!w_o||!w_ones){ printf("pack fail\n"); return 2; }
     int rc[16]; int ri=0;
     ork_f16 *xn=malloc((size_t)N*d*2), *Q=malloc((size_t)N*d*2), *K=malloc((size_t)N*d*2), *Vv=malloc((size_t)N*d*2);
@@ -107,8 +107,8 @@ int main(int argc,char**argv){
 
     /* [CPU] transpose+pack K^T[d,N] and V[N,d] as runtime weights */
     ork_f16 *KrT=malloc((size_t)d*N*2); for(int j=0;j<N;j++) for(int k=0;k<d;k++) KrT[(size_t)k*N+j]=Kr[(size_t)j*d+k];
-    ork_w *w_kt=ork_mm_pack(c,d,N,KrT);
-    ork_w *w_vv=ork_mm_pack(c,N,d,Vv);
+    ork_w *w_kt=ork_f16_mm_pack(c,d,N,KrT);
+    ork_w *w_vv=ork_f16_mm_pack(c,N,d,Vv);
     if(!w_kt||!w_vv){ printf("runtime pack fail\n"); return 2; }
 
     /* 7: scores = Qr . K^T */

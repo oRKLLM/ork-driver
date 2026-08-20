@@ -30,7 +30,7 @@ static void cpu_run(int w0,int w1){ int W=w1-w0, nt=gCPUthreads; pthread_t th[8]
     for(int t=0;t<nt;t++){ jb[t]=(cjob){w0+t*per,(w0+(t+1)*per<w1?w0+(t+1)*per:w1),4+t}; pthread_create(&th[t],0,cpu_worker,&jb[t]); }
     for(int t=0;t<nt;t++) pthread_join(th[t],0); }
 static void* npu_tramp(void*p){ (void)p; cpu_set_t s;CPU_ZERO(&s);CPU_SET(7,&s);pthread_setaffinity_np(pthread_self(),sizeof s,&s);
-    double t0=now_us(); gNpuRc=ork_mm_run_chain_i8(gNPU,gTKn,gTK); gNpuDt=now_us()-t0; return NULL; }
+    double t0=now_us(); gNpuRc=ork_i8_mm_run_chain(gNPU,gTKn,gTK); gNpuDt=now_us()-t0; return NULL; }
 
 int main(int argc,char**argv){
     int W=argc>1?atoi(argv[1]):96, Nnpu=argc>2?atoi(argv[2]):12, K=argc>3?atoi(argv[3]):2048, N=argc>4?atoi(argv[4]):512;
@@ -50,13 +50,13 @@ int main(int argc,char**argv){
     int32_t*NC=malloc((size_t)Nnpu*N*4);
     int8_t*Bi8=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++) Bi8[i]=(int8_t)((i%15)-7);
     ork_mm_task_i8 *tk=malloc(sizeof(ork_mm_task_i8)*Nnpu);
-    for(int i=0;i<Nnpu;i++){ ork_npu_set_pack_domain(c,0); ork_w*w8=ork_mm_pack_i8(c,K,N,Bi8); if(!w8){printf("pack_i8 fail\n");return 1;}
+    for(int i=0;i<Nnpu;i++){ ork_npu_set_pack_domain(c,0); ork_w*w8=ork_i8_mm_pack(c,K,N,Bi8); if(!w8){printf("pack_i8 fail\n");return 1;}
         tk[i].w=w8; tk[i].M=1; tk[i].A=Ai8; tk[i].C=NC+(size_t)i*N; }
     gTK=tk; gTKn=Nnpu;
 
-    cpu_run(0,W); ork_mm_run_chain_i8(c,Nnpu,tk);   /* warm */
+    cpu_run(0,W); ork_i8_mm_run_chain(c,Nnpu,tk);   /* warm */
     double t0=now_us(); for(int r=0;r<20;r++) cpu_run(0,W); double t_cpu_all=(now_us()-t0)/20;
-    t0=now_us(); for(int r=0;r<20;r++) ork_mm_run_chain_i8(c,Nnpu,tk); double t_npu=(now_us()-t0)/20;
+    t0=now_us(); for(int r=0;r<20;r++) ork_i8_mm_run_chain(c,Nnpu,tk); double t_npu=(now_us()-t0)/20;
     t0=now_us(); for(int r=0;r<20;r++) cpu_run(0,gNcpu); double t_cpu_bulk=(now_us()-t0)/20;
     double t_hy=0; for(int r=0;r<20;r++){ double h0=now_us(); pthread_t nth;
         pthread_create(&nth,0,npu_tramp,0); cpu_run(0,gNcpu); pthread_join(nth,0); t_hy+=now_us()-h0; }

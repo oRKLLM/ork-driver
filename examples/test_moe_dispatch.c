@@ -4,10 +4,10 @@
  * whole "dense-ify the MoE" direction hinges on ONE question: does that per-program tax AMORTIZE when many
  * experts are submitted as a chain / a grouped call / one big program — or is it paid N times no matter what?
  *
- *   DECODE regime  (M=1, NE=8 = top-8):  N separate ork_mm_run_i4  vs  ork_mm_run_chain_i4 (HW PC-chain)
- *                                        vs  ork_dyn_i4_probe (nonblock doorbell chain).
- *   PREFILL regime (M=16, NE=32):        N separate  vs  ork_mm_run_i4_experts nc=1 / nc=3 (grouped/coalesce).
- *   CEILING:                             ONE ork_mm_run_i4 of M=NE*Me rows vs a single weight — the
+ *   DECODE regime  (M=1, NE=8 = top-8):  N separate ork_i4_mm_run  vs  ork_i4_mm_run_chain (HW PC-chain)
+ *                                        vs  ork_i4_dyn_probe (nonblock doorbell chain).
+ *   PREFILL regime (M=16, NE=32):        N separate  vs  ork_i4_mm_run_experts nc=1 / nc=3 (grouped/coalesce).
+ *   CEILING:                             ONE ork_i4_mm_run of M=NE*Me rows vs a single weight — the
  *                                        amortization lower-bound (1 dispatch, all the rows).
  *
  * READING IT: if a chained/grouped call ~= N * (separate per-op), the tax is paid per program and does NOT
@@ -45,7 +45,7 @@ int main(void){
     ork_w   **W = calloc(NEMAX,sizeof*W);
     int8_t  **B = calloc(NEMAX,sizeof*B);
     for(int e=0;e<NEMAX;e++){ B[e]=malloc((size_t)K*N); fill_i4(B[e],(size_t)K*N,23+e);
-        W[e]=ork_mm_pack_i4(c,K,N,B[e]); if(!W[e]){ printf("pack %d fail\n",e); return 1; } }
+        W[e]=ork_i4_mm_pack(c,K,N,B[e]); if(!W[e]){ printf("pack %d fail\n",e); return 1; } }
 
     /* ================= DECODE regime: M=1, NE=8 (top-8) ================= */
     {
@@ -56,13 +56,13 @@ int main(void){
             fill_i4(A[e],(size_t)M*K,7+e); tk[e]=(ork_mm_task_i4){W[e],M,A[e],C[e]}; }
 
         double sep=0, chain=0, dyn=0;
-        for(int e=0;e<NE;e++) ork_mm_run_i4(c,W[e],M,A[e],C[e]);                 /* warm */
-        BEST(sep,   8, { for(int e=0;e<NE;e++) ork_mm_run_i4(c,W[e],M,A[e],C[e]); });
+        for(int e=0;e<NE;e++) ork_i4_mm_run(c,W[e],M,A[e],C[e]);                 /* warm */
+        BEST(sep,   8, { for(int e=0;e<NE;e++) ork_i4_mm_run(c,W[e],M,A[e],C[e]); });
         long e_sep = verify(A[0],B[0],C[0],M,K,N);
-        int rc_chain = ork_mm_run_chain_i4(c,NE,tk);
-        if(rc_chain==0){ BEST(chain, 8, { ork_mm_run_chain_i4(c,NE,tk); }); }
-        int rc_dyn = ork_dyn_i4_probe(c,NE,tk);
-        if(rc_dyn==0){ BEST(dyn, 8, { ork_dyn_i4_probe(c,NE,tk); }); }
+        int rc_chain = ork_i4_mm_run_chain(c,NE,tk);
+        if(rc_chain==0){ BEST(chain, 8, { ork_i4_mm_run_chain(c,NE,tk); }); }
+        int rc_dyn = ork_i4_dyn_probe(c,NE,tk);
+        if(rc_dyn==0){ BEST(dyn, 8, { ork_i4_dyn_probe(c,NE,tk); }); }
 
         printf("\n[DECODE  M=1  NE=8  K=%d N=%d]\n",K,N);
         printf("  separate   : %8.1f us  (%.1f us/expert)   %s\n", sep, sep/NE, e_sep==0?"bit-exact":"MISCOMPUTE");
@@ -83,11 +83,11 @@ int main(void){
             fill_i4(A[e],(size_t)M*K,7+e); ex[e]=(ork_mm_task_i4){W[e],M,A[e],C[e]}; }
 
         double sep=0, g1=0, g3=0;
-        for(int e=0;e<NE;e++) ork_mm_run_i4(c,W[e],M,A[e],C[e]);                 /* warm */
-        BEST(sep, 4, { for(int e=0;e<NE;e++) ork_mm_run_i4(c,W[e],M,A[e],C[e]); });
+        for(int e=0;e<NE;e++) ork_i4_mm_run(c,W[e],M,A[e],C[e]);                 /* warm */
+        BEST(sep, 4, { for(int e=0;e<NE;e++) ork_i4_mm_run(c,W[e],M,A[e],C[e]); });
         long e_sep = verify(A[0],B[0],C[0],M,K,N);
-        int r1 = ork_mm_run_i4_experts(c,ex,NE,1); if(r1==0) BEST(g1,4,{ ork_mm_run_i4_experts(c,ex,NE,1); });
-        int r3 = ork_mm_run_i4_experts(c,ex,NE,3); if(r3==0) BEST(g3,4,{ ork_mm_run_i4_experts(c,ex,NE,3); });
+        int r1 = ork_i4_mm_run_experts(c,ex,NE,1); if(r1==0) BEST(g1,4,{ ork_i4_mm_run_experts(c,ex,NE,1); });
+        int r3 = ork_i4_mm_run_experts(c,ex,NE,3); if(r3==0) BEST(g3,4,{ ork_i4_mm_run_experts(c,ex,NE,3); });
         long e_grp = verify(A[0],B[0],ex[0].C,M,K,N);
 
         printf("\n[PREFILL M=16 NE=32 K=%d N=%d]\n",K,N);
@@ -100,8 +100,8 @@ int main(void){
         /* CEILING: one program, M=NE*M rows, single weight — the amortization lower-bound */
         int Mbig=NE*M; int8_t *Ab=malloc((size_t)Mbig*K); int32_t *Cb=malloc((size_t)Mbig*N*4);
         fill_i4(Ab,(size_t)Mbig*K,99);
-        ork_mm_run_i4(c,W[0],Mbig,Ab,Cb);                                        /* warm */
-        double big=0; BEST(big, 4, { ork_mm_run_i4(c,W[0],Mbig,Ab,Cb); });
+        ork_i4_mm_run(c,W[0],Mbig,Ab,Cb);                                        /* warm */
+        double big=0; BEST(big, 4, { ork_i4_mm_run(c,W[0],Mbig,Ab,Cb); });
         printf("  CEILING 1x(M=%d): %8.1f us  (one dispatch, all %d rows) — floor if the tax fully amortized\n",
             Mbig, big, Mbig);
         printf("  => per-PROGRAM tax ~= (separate - ceiling*NE-scaled); if grouped -> ceiling, build it; if grouped ~ separate, need block-diagonal.\n");

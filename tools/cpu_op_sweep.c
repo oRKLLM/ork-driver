@@ -46,11 +46,11 @@ int main(void){
             printf("%-8s %-12s %10.1f %10.1f   %-6s\n", NAME, tag, npu, cpu, cpu<npu?"CPU":"NPU"); \
         }while(0)
         char shp[16]; snprintf(shp,sizeof shp,"M%dxN%d",M,N); (void)shp;
-        SWEEP1("silu",  ork_npu_silu_i8 (c,in,M,N,is,os,o,&us),        cpu_silu (in,n,is,os,o));
-        SWEEP1("gelu",  ork_npu_gelu_i8 (c,in,M,N,is,os,o,&us),        cpu_gelu (in,n,is,os,o));
-        SWEEP1("rsqrt", ork_npu_rsqrt_i8(c,in,M,N,is,os,o,&us),        cpu_rsqrt(in,n,is,os,o));
-        SWEEP1("exp",   ork_npu_exp_i8  (c,in,M,N,is,os,o,&us),        cpu_exp  (in,n,is,os,o));
-        SWEEP1("add",   ork_npu_add_i8  (c,in,b,M,N,is,is,os,o,&us),   cpu_add  (in,b,n,is,is,os,o));
+        SWEEP1("silu",  ork_i8_npu_silu (c,in,M,N,is,os,o,&us),        cpu_silu (in,n,is,os,o));
+        SWEEP1("gelu",  ork_i8_npu_gelu (c,in,M,N,is,os,o,&us),        cpu_gelu (in,n,is,os,o));
+        SWEEP1("rsqrt", ork_i8_npu_rsqrt(c,in,M,N,is,os,o,&us),        cpu_rsqrt(in,n,is,os,o));
+        SWEEP1("exp",   ork_i8_npu_exp  (c,in,M,N,is,os,o,&us),        cpu_exp  (in,n,is,os,o));
+        SWEEP1("add",   ork_i8_npu_add  (c,in,b,M,N,is,is,os,o,&us),   cpu_add  (in,b,n,is,is,os,o));
         free(in);free(b);free(o);
         #undef SWEEP1
     }

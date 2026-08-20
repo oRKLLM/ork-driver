@@ -1,4 +1,4 @@
-/* tools/silu32_check.c — validate the INT32-output fused SiLU (ork_mm_run_i8_silu32): the silu value is
+/* tools/silu32_check.c — validate the INT32-output fused SiLU (ork_i8_mm_run_silu32): the silu value is
  * emitted at int32 precision instead of int8, so it should match true silu far better than the int8 path
  * (ablation: int8 silu output = the whole FFN-chain PPL gap). Build a fine-scale LUT, run, compare to CPU silu.
  *   make silu32_check && sudo ./silu32_check [M] [in_scale]      (board only)
@@ -21,7 +21,7 @@ int main(int argc,char**argv){
     int bcol[64];
     for(int n=0;n<N;n++){ int b=(n-32); if(b>127)b=127; if(b<-128)b=-128; bcol[n]=b;  /* x = acc*in in ~[-8,8] */
         for(int k=0;k<K;k++)B[(size_t)k*N+n]=(int8_t)b; }
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
 
     double xmax=(double)K*32*in; double smax=silu(xmax); double out=smax/30000.0;   /* fine out_scale: ~15-bit (int16 range) */
     const int RM=0x4000,RS=0x10; const unsigned OB=0,IO=0xffffc000u,C4=0x56391300u;
@@ -29,11 +29,11 @@ int main(int argc,char**argv){
     if(ork_mm_silu_build_lut(c,in,out,RM,RS,C4,lut)){ printf("lut build fail\n"); return 1; }
 
     int32_t*C32=malloc((size_t)M*N*4);
-    if(ork_mm_run_i8_silu32(c,w,M,A,C32,RM,RS,OB,IO,C4,lut,1030)){ printf("silu32 run fail\n"); return 1; }
+    if(ork_i8_mm_run_silu32(c,w,M,A,C32,RM,RS,OB,IO,C4,lut,1030)){ printf("silu32 run fail\n"); return 1; }
     /* also run the int8 path for comparison (same LUT is fine — resolution differs at the OUTPUT) */
     int8_t*C8=malloc((size_t)M*N); double out8=smax/127.0; int16_t lut8[1030];
     ork_mm_silu_build_lut(c,in,out8,RM,RS,C4,lut8);
-    ork_mm_run_i8_silu(c,w,M,A,C8,RM,RS,OB,IO,C4,lut8,1030);
+    ork_i8_mm_run_silu(c,w,M,A,C8,RM,RS,OB,IO,C4,lut8,1030);
 
     double se32=0,mx32=0,se8=0,mx8=0; int cnt=0;
     for(int n=0;n<N;n++){ double acc=(double)K*bcol[n]; double ref=silu(acc*in);

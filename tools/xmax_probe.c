@@ -34,7 +34,7 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)32*N;i++) negones[i]=(ork_f16)(-1.f);
     for(size_t i=0;i<(size_t)M*N;i++){ nmb[i]=(ork_f16)-12345.f; out[i]=(ork_f16)-12345.f; }
 
-    ork_w *w=ork_mm_pack(c,32,N,negones); if(!w){ printf("pack fail\n"); return 2; }
+    ork_w *w=ork_f16_mm_pack(c,32,N,negones); if(!w){ printf("pack fail\n"); return 2; }
     int rc1,rc2;
     if(seqmode){
         ork_seq_op ops[2]={ { .kind=ORK_OP_MM_F16_F16OUT, .w=w, .M=M, .A=maxp, .C=nmb },

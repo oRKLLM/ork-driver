@@ -57,7 +57,7 @@ int main(void){
     int8_t *Wb=malloc((size_t)K*N);
     for(int i=0;i<M*K;i++) A[i]=(int8_t)s3();
     for(size_t i=0;i<(size_t)K*N;i++) Wb[i]=(int8_t)s3();
-    ork_w *W=ork_mm_pack_i8(c,K,N,Wb); if(!W){ printf("pack failed\n"); return 2; }
+    ork_w *W=ork_i8_mm_pack(c,K,N,Wb); if(!W){ printf("pack failed\n"); return 2; }
     ork_mm_task_i8 *tk=malloc((size_t)S*sizeof *tk);
     for(int s=0;s<S;s++) tk[s]=(ork_mm_task_i8){W,M,A,C+(size_t)s*N};
     int32_t *Cr=malloc((size_t)N*4);

@@ -56,7 +56,7 @@ int main(int argc,char**argv){
           rKr[(size_t)r*d+i]=ka*cc-kb*ss; rKr[(size_t)r*d+i+hd2]=kb*cc+ka*ss; } }
       free(xn);free(Q);free(K); }
 
-    ork_w *wq=ork_mm_pack(c,d,d,Wq), *wk=ork_mm_pack(c,d,d,Wk), *wv=ork_mm_pack(c,d,d,Wv);
+    ork_w *wq=ork_f16_mm_pack(c,d,d,Wq), *wk=ork_f16_mm_pack(c,d,d,Wk), *wv=ork_f16_mm_pack(c,d,d,Wv);
     if(!wq||!wk||!wv){ printf("pack fail\n"); return 2; }
     ork_f16 *xn=malloc((size_t)N*d*sizeof(ork_f16)), *Q=malloc((size_t)N*d*sizeof(ork_f16)), *K=malloc((size_t)N*d*sizeof(ork_f16));
     ork_f16 *V=malloc((size_t)N*d*sizeof(ork_f16)), *Qr=malloc((size_t)N*d*sizeof(ork_f16)), *Kr=malloc((size_t)N*d*sizeof(ork_f16));

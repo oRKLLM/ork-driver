@@ -28,17 +28,17 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++){ g=g*1664525u+1013904223u; B[i]=(int8_t)(-(int)((g>>26)%4)); }   /* -3..0 */
     short *scores=malloc((size_t)M*N*2), *e=malloc((size_t)M*N*2);
     for(size_t i=0;i<(size_t)M*N;i++){ scores[i]=-1; e[i]=-1; }
-    ork_w *w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
+    ork_w *w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
     int fail=0;
     /* pre-calibrate the int16 LUT in a CLEAN context (before any matmul) — the documented fix for the
      * "int16-LUT calibration wedges as first op after a multi-core matmul" trap (orkd does this at startup). */
-    { short wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(short)(100+i); ork_npu_exp_i16(c,wi,1,32,in_scale,out_scale,wo,NULL); }
+    { short wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(short)(100+i); ork_i16_npu_exp(c,wi,1,32,in_scale,out_scale,wo,NULL); }
 
     /* S0: exp_i16 STANDALONE on CPU-computed int16 scores (isolates exp-on-these-values from the chain handoff) */
     { short *cs=malloc((size_t)M*N*2), *ce=malloc((size_t)M*N*2);
       for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long acc=0; for(int k=0;k<K;k++)acc+=(long)A[(size_t)m*K+k]*B[(size_t)k*N+n];
           long q=(acc*mult)>>shift; if(q>32767)q=32767; if(q<-32768)q=-32768; cs[(size_t)m*N+n]=(short)q; }
-      int rc=ork_npu_exp_i16(c,cs,M,N,in_scale,out_scale,ce,NULL); int bad=0; double me=0;
+      int rc=ork_i16_npu_exp(c,cs,M,N,in_scale,out_scale,ce,NULL); int bad=0; double me=0;
       if(!rc) for(int i=0;i<M*N;i++){ double want=exp((double)cs[i]*in_scale)/out_scale; if(want>32767)want=32767;
           double er=fabs((double)ce[i]-want); if(er>me)me=er; if(er>200+0.05*want)bad++; }
       printf("  [S0] exp_i16 standalone on int16 scores: rc=%d max|err|=%.0f LSB %s (%d/%d)\n",rc,me,bad?"MISMATCH":"OK",bad,M*N);

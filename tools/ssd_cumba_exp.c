@@ -1,6 +1,6 @@
 /* tools/ssd_cumba_exp.c — validate the SSD scan's core elementwise primitive ON SILICON:
  * exp(cumsum) fused as ONE NPU submit. cumsum(v)[l] = (tril_ones · v)[l] (CumBA), and exp rides the
- * matmul's SDP output stage (ork_mm_run_f16_act) => C[l,h] = exp( Σ_{s<=l} Abar[s,h] ) in one op, no
+ * matmul's SDP output stage (ork_f16_mm_run_act) => C[l,h] = exp( Σ_{s<=l} Abar[s,h] ) in one op, no
  * CPU crossing. ssd_coherence.c proved the PWL-LUT exp is numerically negligible (rel-L2 unchanged);
  * this confirms the hardware matches. Compares on-NPU exp(cumsum) to the CPU reference.
  *
@@ -35,7 +35,7 @@ int main(void){
            rcm, Craw[0],Craw[NH],Craw[NH*2], Ad[0], Ad[0]+Ad[NH], Ad[0]+Ad[NH]+Ad[NH*2]);
     free(Craw);
 
-    /* fp16 fused-LUT exp is mis-calibrated on silicon (WIP) — skip. Try INT16 exp (ork_npu_exp_i16), the
+    /* fp16 fused-LUT exp is mis-calibrated on silicon (WIP) — skip. Try INT16 exp (ork_i16_npu_exp), the
      * sibling of the validated int16-silu. Compute cumsum on CPU (CumBA already works on-NPU above),
      * quantize to int16, apply on-NPU int16 exp, dequant, compare to CPU exp. */
     (void)efn; (void)C;
@@ -44,7 +44,7 @@ int main(void){
       double *acs=malloc((size_t)CS*NH*sizeof(double));
       for(int hh=0;hh<NH;hh++){ double run=0; for(int l=0;l<CS;l++){ run+=Ad[(size_t)l*NH+hh]; acs[(size_t)l*NH+hh]=run;
           long q=lround(run/in_scale); if(q>32767)q=32767; if(q<-32768)q=-32768; in[(size_t)l*NH+hh]=(short)q; } }
-      double us=0; int rce=ork_npu_exp_i16(c, in, CS, NH, in_scale, out_scale, out, &us);
+      double us=0; int rce=ork_i16_npu_exp(c, in, CS, NH, in_scale, out_scale, out, &us);
       double l2n=0,l2d=0,maxrel=0; int nbad=0;
       for(size_t i=0;i<(size_t)CS*NH;i++){ double ref=exp(acs[i]), got=(double)out[i]*out_scale;
           double e=fabs(got-ref)/(fabs(ref)+1e-9); if(e>maxrel)maxrel=e; l2n+=(got-ref)*(got-ref); l2d+=ref*ref;

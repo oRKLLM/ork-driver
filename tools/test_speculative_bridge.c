@@ -4,7 +4,7 @@
  * draft tokens in ONE batched M=N target forward. This harness measures the two things that decide
  * whether the pivot pays off on THIS hardware:
  *
- *   (1) M-batch amortization curve: ork_mm_run at M = 1,2,4,8,16 on a target-shaped matmul. The
+ *   (1) M-batch amortization curve: ork_f16_mm_run at M = 1,2,4,8,16 on a target-shaped matmul. The
  *       correct primitive is a single M=N matmul (the M-scheduler / prefill path) — NOT a multi-task
  *       submit (task_number>1 is broken on the rknpu kernel: EINVAL/timeout). If M=N collapses the
  *       per-token cost, the floor is amortized.
@@ -58,7 +58,7 @@ int main(void){
     /* resident target weight (one projection, reused across all M) */
     ork_f16 *B = malloc((size_t)K*NOUT*sizeof(ork_f16));
     for(size_t i=0;i<(size_t)K*NOUT;i++) B[i]=(ork_f16)(((int)(i%17)-8)*0.02f);
-    ork_w *w = ork_mm_pack(c,K,NOUT,B); if(!w){ fprintf(stderr,"pack failed\n"); return 1; }
+    ork_w *w = ork_f16_mm_pack(c,K,NOUT,B); if(!w){ fprintf(stderr,"pack failed\n"); return 1; }
 
     int Mset[5]={1,2,4,8,16}; int MMAX=16;
     ork_f16 *A = malloc((size_t)MMAX*K*sizeof(ork_f16));
@@ -70,8 +70,8 @@ int main(void){
     double t_m1_per_tok=0;
     for(int mi=0; mi<5; mi++){
         int M=Mset[mi];
-        for(int it=0; it<5; it++) ork_mm_run(c,w,M,A,C);           /* warm */
-        double t0=us(); for(int it=0; it<ITERS; it++) ork_mm_run(c,w,M,A,C); double per=(us()-t0)/ITERS;
+        for(int it=0; it<5; it++) ork_f16_mm_run(c,w,M,A,C);           /* warm */
+        double t0=us(); for(int it=0; it<ITERS; it++) ork_f16_mm_run(c,w,M,A,C); double per=(us()-t0)/ITERS;
         double per_tok=per/M;
         if(M==1) t_m1_per_tok=per_tok;
         printf("  %-4d %-14.1f %-16.1f %.2fx\n", M, per, per_tok, t_m1_per_tok/per_tok);
@@ -98,8 +98,8 @@ int main(void){
     /* (3) structural verdict */
     printf("\n=== (3) structural verdict ===\n");
     double verify_fwd_proxy = 0; /* one M=NDRAFT forward, single projection as a proxy */
-    for(int it=0; it<5; it++) ork_mm_run(c,w,NDRAFT,A,C);
-    { double t=us(); for(int it=0; it<ITERS; it++) ork_mm_run(c,w,NDRAFT,A,C); verify_fwd_proxy=(us()-t)/ITERS; }
+    for(int it=0; it<5; it++) ork_f16_mm_run(c,w,NDRAFT,A,C);
+    { double t=us(); for(int it=0; it<ITERS; it++) ork_f16_mm_run(c,w,NDRAFT,A,C); verify_fwd_proxy=(us()-t)/ITERS; }
     printf("  M=%d verify matmul (proxy)   : %8.1f us\n", NDRAFT, verify_fwd_proxy);
     printf("  accept-gate / verify        : %.2f%%  %s\n", 100.0*gate_us/verify_fwd_proxy,
            gate_us < 0.05*verify_fwd_proxy ? "(under 5% budget — OK)" : "(EXCEEDS 5% budget — investigate)");

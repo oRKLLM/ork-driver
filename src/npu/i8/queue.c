@@ -119,7 +119,7 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memset(rc, 0, sizeof rc);
-        orki_synth_i8(rc, 1, K, N, (uint32_t)pc->ascr[i].dma, bdma, cdma, 1, CBUF, 0);   /* A/C addresses BAKED IN */
+        orki_i8_synth(rc, 1, K, N, (uint32_t)pc->ascr[i].dma, bdma, cdma, 1, CBUF, 0);   /* A/C addresses BAKED IN */
         if (orki_validate_regcmd("ork_pc", c, rc, REGCMD_I8_N, w, pc->ascr, i+1)) { for (int j=0;j<=i;j++) orki_bdestroy(fd,&pc->ascr[j]); orki_bdestroy(fd,&pc->pool); free(pc); return NULL; }
         if (i < S - 1) { uint64_t nx = pc->pool.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
             rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);

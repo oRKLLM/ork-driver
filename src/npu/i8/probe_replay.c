@@ -29,7 +29,7 @@
 #include "npu/core.h"
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
-int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
+int ork_i8_npu_replay(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
                       const int8_t *Adata, int Abytes, const int8_t *Bdata, int Bbytes, int32_t *Cout, int iters, double *us){
     int fd=c->fd; if(fd<0) return -3; if(rn<8 || rn>2048 || M<1 || (K%32) || (N%16)) return -2;
     int dom=c->dom_active;
@@ -55,7 +55,7 @@ int ork_npu_replay_i8(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, 
      * here — but if left intact it points at the CAPTURING process's next-task IOVA, which is UNMAPPED in
      * ork's address space; the NPU walks the chain to it and IOMMU HARD-WEDGES the board. Zero the value
      * halves (keep offset/block) so next-addr=0 (end of chain) and next-amount=0. (validate_mfold's rfile
-     * path already did this; doing it here makes every ork_npu_replay_i8 caller — incl. replay_mm_i8 — safe.) */
+     * path already did this; doing it here makes every ork_i8_npu_replay caller — incl. replay_mm_i8 — safe.) */
     for(int k=0;k+1<rn;k+=2){ unsigned o=rc[k]&0xffff, b=(rc[k+1]>>16)&0xffff;
         if(b==0x101 && (o==0x0010||o==0x0014)){ rc[k]&=0xffff; rc[k+1]&=0xffff0000u; } }
     orki_setrn(rc,rn,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)A.dma);            /* A (activations) */
@@ -88,11 +88,11 @@ done:
 }
 
 /* #39 A-layout solver: submit a FIXED (captured) regcmd for `nvar` A-variants, reusing ONE buffer set so the
- * IOVA is stable across submits. The fresh-alloc-per-call path (ork_npu_replay_i8 called N times) intermittently
+ * IOVA is stable across submits. The fresh-alloc-per-call path (ork_i8_npu_replay called N times) intermittently
  * wedges on the fold; buffer reuse is the safe pattern (cf. replay_mm_i8's iters loop, which never wedged).
  * Avar = nvar A-images, each `astride` bytes; Bdata = shared weight; Couts = nvar contiguous M*N int32 results.
  * A warm submit (variant 0) precedes the measured loop. Returns 0/ok, -2 bad shape, <0 on submit error. */
-int ork_npu_replay_i8_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
+int ork_i8_npu_replay_sweep(ork_npu *c, const uint32_t *regcmd, int rn, int M, int K, int N,
         const int8_t *Avar, int nvar, int astride, const int8_t *Bdata, int Bbytes, int32_t *Couts){
     int fd=c->fd; if(fd<0) return -3; if(rn<8||rn>2048||M<1||(K%32)||(N%16)||nvar<1) return -2;
     int dom=c->dom_active;
@@ -133,12 +133,12 @@ sdone:
 }
 
 
-int ork_npu_probe_i8_silu(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int8_t *C,double *us){
+int ork_i8_npu_probe_silu(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int8_t *C,double *us){
     /* g2 captured register set (a known-good replay): R=0x51aa/2^0x14, bias=-97, idx_off, 0x4068 field. */
-    return ork_npu_probe_i8_silu_cfg(c,M,K,N,A,B,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0,C,us);
+    return ork_i8_npu_probe_silu_cfg(c,M,K,N,A,B,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0,C,us);
 }
 
-int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+int ork_i8_npu_probe_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                               int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                               const int16_t *lut,int nlut,int8_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
@@ -146,7 +146,7 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
     /* MULTI-DOMAIN: the FFN chain calls this per-layer fused-SiLU LUT-calibration probe with c->dom_active set
      * to the layer's (non-0) domain; the probe's buffers + submits must MATCH it, else submitting
      * iommu_domain_id=0 while c->dom_active!=0 WEDGES (errno 110) — the same hazard already fixed for the i16
-     * SiLU probes (ork_npu_probe_silu_std_i16). dom==0 for every single-domain caller => behavior-preserving.
+     * SiLU probes (ork_i16_npu_probe_silu_std). dom==0 for every single-domain caller => behavior-preserving.
      * ORK_SILU_DOM0=1 forces dom0 (A/B / disable the fix). */
     int dom = getenv("ORK_SILU_DOM0") ? 0 : c->dom_active;
     struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,dom); if(!W.cpu) return -2;
@@ -181,8 +181,8 @@ int ork_npu_probe_i8_silu_cfg(ork_npu *c,int M,int K,int N,const int8_t *A,const
 
     /* ---- submit 2: matmul compute (enable=0x1d, regcfg=108) reading the resident LUT ---- */
     uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    orki_set_i8_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+    orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_i8_set_silu(rc,N,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
     if(getenv("ORK_FUSED_DUMP")){ for(int k=0;k+1<REGCMD_I8_N;k+=2) fprintf(stderr,"PROBE %04x=%08x l=%04x\n",rc[k]&0xffff,((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16),rc[k+1]>>16); }
     struct buf extra[2]={W,O};
     if(orki_validate_regcmd("probe_i8_silu",c,rc,REGCMD_I8_N,NULL,extra,2)){ orki_bdestroy(fd,&W);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }

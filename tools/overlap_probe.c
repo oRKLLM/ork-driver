@@ -39,7 +39,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     ork_npu_set_core_budget(c, ork_npu_cores(c));
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
     float*Af=malloc((size_t)M*K*4); for(size_t i=0;i<(size_t)M*K;i++)Af[i]=((i*1103515245u)%255)/255.0f-0.5f;
     int8_t*Ai0=malloc((size_t)M*K),*Ai1=malloc((size_t)M*K);
     int32_t*Ci=malloc((size_t)M*N*4); float*Cf=malloc((size_t)M*N*4);
@@ -47,15 +47,15 @@ int main(int argc,char**argv){
 
     printf("overlap_probe int8 %dx%dx%d, %d iters, %d cores\n",M,K,N,iters,ork_npu_cores(c));
     /* phase timings (isolated) */
-    quant(Af,Ai0,M,K); ork_mm_run_i8(c,w,M,Ai0,Ci);  /* warm */
+    quant(Af,Ai0,M,K); ork_i8_mm_run(c,w,M,Ai0,Ci);  /* warm */
     double t0=now_us(); for(int i=0;i<iters;i++) quant(Af,Ai0,M,K);  double tq=(now_us()-t0)/iters;
-    t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,Ai0,Ci); double tr=(now_us()-t0)/iters;
+    t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,Ai0,Ci); double tr=(now_us()-t0)/iters;
     t0=now_us(); for(int i=0;i<iters;i++) dequant(Ci,Cf,as,bs,M,N);   double td=(now_us()-t0)/iters;
     printf("  phases (us/iter):  quant=%.0f  run_i8(NPU)=%.0f  dequant=%.0f   quant+deq=%.0f (%.1f%% of run)\n",
            tq,tr,td,tq+td,100.0*(tq+td)/tr);
 
     /* SERIAL: quant -> run -> deq */
-    t0=now_us(); for(int i=0;i<iters;i++){ quant(Af,Ai0,M,K); ork_mm_run_i8(c,w,M,Ai0,Ci); dequant(Ci,Cf,as,bs,M,N); }
+    t0=now_us(); for(int i=0;i<iters;i++){ quant(Af,Ai0,M,K); ork_i8_mm_run(c,w,M,Ai0,Ci); dequant(Ci,Cf,as,bs,M,N); }
     double tser=(now_us()-t0)/iters;
     /* PIPELINED: bg quants next A + deqs prev C while NPU runs current */
     quant(Af,Ai0,M,K);
@@ -63,7 +63,7 @@ int main(int argc,char**argv){
     for(int i=0;i<iters;i++){ int cur=i&1; int8_t*Acur=cur?Ai1:Ai0, *Anext=cur?Ai0:Ai1;
         struct bgargs a={Af,Anext,Ci,Cf,as,bs,M,K,N,i>0};
         pthread_t th; pthread_create(&th,NULL,bg,&a);
-        ork_mm_run_i8(c,w,M,Acur,Ci);
+        ork_i8_mm_run(c,w,M,Acur,Ci);
         pthread_join(th,NULL);
     }
     double tpipe=(now_us()-t0)/iters;

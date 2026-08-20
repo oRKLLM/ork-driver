@@ -59,7 +59,11 @@ done
 # NOTE: the precision split prefixed internal symbols orki_*, so the internal-op patterns must allow it —
 # otherwise `orki_set_i8_silu32` in the registry still matches the bare `set_i8_silu32` here and the
 # source lookup then fails on the word boundary.
-ops=$(grep -oE '(orki_)?ork_(npu|mm|dyn|submit|ppu)_[a-z0-9_]+|(orki_)?set_[a-z0-9]+_(out8?|silu32?|fp16in)|(orki_)?run_chain_i8_impl' "$REG" \
+# Naming is dtype-FIRST (ork_<dtype>_<family>_<verb>...; see AGENTS "Naming convention"), so the dtype
+# alternative must come FIRST here — otherwise this regex silently matches almost nothing and check 2
+# degrades to a no-op instead of failing. It did exactly that during the migration: 17 ops extracted
+# where the old naming yielded far more. A gate that stops looking is worse than one that breaks.
+ops=$(grep -oE '(ork|orki)_(i8|i4a8|i4|nf4|f16|i16)_[a-z0-9_]+|(ork|orki)_(npu|mm|dyn|submit|ppu|bmm|w)_[a-z0-9_]+' "$REG" \
       | grep -vE '_(probe|test|check|stress|bench)$' | sort -u)
 for o in $ops; do
   hit=0
@@ -279,5 +283,27 @@ if [ -n "$cm" ]; then
   fi
 fi
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols; no file over its size budget; CORE+NOT_CORE cover every source"
+
+# --- 11) naming convention: dtype-first ------------------------------------------------------------
+# ork_<dtype>_<family>_<verb>[_<mechanism>][_<modifier>] — see AGENTS "Naming convention" and
+# docs/NAMING_MIGRATION.md. A symbol that names a dtype anywhere OTHER than immediately after the
+# ork_/orki_ prefix is drift. Exemptions (CONVERSION / AGNOSTIC / MULTI) live in tools/naming_exempt.txt;
+# include/ork/compat.h is skipped wholesale since it exists to hold the deprecated pre-rename spellings.
+NEX=tools/naming_exempt.txt
+namesyms=$(cat include/ork_npu.h $(ls include/ork/*.h | grep -v compat.h) 2>/dev/null \
+           | perl -0777 -pe 's{/\*.*?\*/}{}gs' | sed 's://.*::' | tr '\n' ' ' | tr ';' '\n' \
+           | grep -oE '\b(ork|orki)_[A-Za-z0-9_]+[[:space:]]*\(' | tr -d ' (' | sort -u)
+namebad=$(for sym in $namesyms; do
+            grep -qE "^$sym( |\t)" "$NEX" 2>/dev/null && continue
+            printf '%s\n' "$sym" | grep -qE '(^|_)(i8|i4a8|i4|nf4|f16|i16)($|_)' || continue
+            printf '%s\n' "$sym" | grep -qE '^(ork|orki)_(i8|i4a8|i4|nf4|f16|i16)_' && continue
+            echo "$sym names a dtype but not directly after the ork_/orki_ prefix"
+          done) || true
+if [ -n "$namebad" ]; then
+  echo "$namebad" | while IFS= read -r l; do echo "check-registry: FAIL — naming: $l"; done
+  echo "  => move the dtype to the front (ork_<dtype>_<family>_<verb>...), or add it to $NEX with a kind and reason."
+  fail=1
+fi
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private; no stale knob mentions; matrix overrides cite live symbols; no file over its size budget; CORE+NOT_CORE cover every source; naming is dtype-first"
 exit $fail

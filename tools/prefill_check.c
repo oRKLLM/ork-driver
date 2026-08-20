@@ -18,8 +18,8 @@ static long check(ork_npu*ctx,int M,int K,int N,int nc,long*maxerr){
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=r8();
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=r8();
-    ork_w*w=ork_mm_pack_i8(ctx,K,N,B); if(!w){printf("pack fail K=%d N=%d\n",K,N);exit(1);}
-    if(ork_mm_run_i8(ctx,w,M,A,C)){printf("run fail\n");exit(1);}
+    ork_w*w=ork_i8_mm_pack(ctx,K,N,B); if(!w){printf("pack fail K=%d N=%d\n",K,N);exit(1);}
+    if(ork_i8_mm_run(ctx,w,M,A,C)){printf("run fail\n");exit(1);}
     long bad=0,me=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){
         long ref=0; for(int k=0;k<K;k++) ref+=(long)A[(size_t)m*K+k]*B[(size_t)k*N+n];

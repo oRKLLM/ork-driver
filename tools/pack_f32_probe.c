@@ -1,4 +1,4 @@
-/* Isolate ork_mm_pack_i8_f32: pack the SAME logical weights via pack_i8 (reference, int8 input) and
+/* Isolate ork_i8_mm_pack_f32: pack the SAME logical weights via pack_i8 (reference, int8 input) and
  * pack_i8_f32 (f32 input + NEON quant), run_i8 both, compare. Progress prints pinpoint pack-vs-run and
  * which K wedges.  make pack_f32_probe && sudo ./pack_f32_probe [K] [N] [M] */
 #include <stdio.h>
@@ -10,7 +10,7 @@
 
 static unsigned sd = 99; static int r8(void){ sd = sd*1103515245+12345; return (int)((sd>>16)&0xff)-128; }
 
-/* dequant callback for ork_mm_pack_i8_dequant: here it just copies channel n from the reference
+/* dequant callback for ork_i8_mm_pack_dequant: here it just copies channel n from the reference
  * f32[N][K] (n-major) — in ggml-ork this would call to_float to dequant Q4_K. */
 struct deqctx { const float *Bf; };
 static void deq_cb(void *ctx, int n, float *dst, int K) {
@@ -35,22 +35,22 @@ int main(int argc, char **argv) {
     int32_t *C1 = malloc((size_t)M*N*4), *C2 = malloc((size_t)M*N*4), *C3 = malloc((size_t)M*N*4);
 
     printf("[1] pack_i8 (reference)...\n"); fflush(stdout);
-    ork_w *w1 = ork_mm_pack_i8(c, K, N, Bi);
+    ork_w *w1 = ork_i8_mm_pack(c, K, N, Bi);
     printf("[1] packed=%p; run_i8...\n", (void*)w1); fflush(stdout);
-    int rc1 = ork_mm_run_i8(c, w1, M, Ai, C1);
+    int rc1 = ork_i8_mm_run(c, w1, M, Ai, C1);
     printf("[1] pack_i8 rc=%d C[0..2]=%d,%d,%d\n", rc1, C1[0], C1[1], C1[2]); fflush(stdout);
 
     printf("[2] pack_i8_f32 (NEON)...\n"); fflush(stdout);
-    ork_w *w2 = ork_mm_pack_i8_f32(c, K, N, Bf, bsc);
+    ork_w *w2 = ork_i8_mm_pack_f32(c, K, N, Bf, bsc);
     printf("[2] packed=%p; run_i8...\n", (void*)w2); fflush(stdout);
-    int rc2 = ork_mm_run_i8(c, w2, M, Ai, C2);
+    int rc2 = ork_i8_mm_run(c, w2, M, Ai, C2);
     printf("[2] pack_i8_f32 rc=%d C[0..2]=%d,%d,%d\n", rc2, C2[0], C2[1], C2[2]); fflush(stdout);
 
     printf("[3] pack_i8_dequant (fused callback, no full f32 buffer)...\n"); fflush(stdout);
     struct deqctx dc = { Bf };
-    ork_w *w3 = ork_mm_pack_i8_dequant(c, K, N, deq_cb, &dc, bsc);
+    ork_w *w3 = ork_i8_mm_pack_dequant(c, K, N, deq_cb, &dc, bsc);
     printf("[3] packed=%p; run_i8...\n", (void*)w3); fflush(stdout);
-    int rc3 = w3 ? ork_mm_run_i8(c, w3, M, Ai, C3) : -99;
+    int rc3 = w3 ? ork_i8_mm_run(c, w3, M, Ai, C3) : -99;
     printf("[3] pack_i8_dequant rc=%d C[0..2]=%d,%d,%d\n", rc3, C3[0], C3[1], C3[2]); fflush(stdout);
 
     int mism = 0; if (!rc1 && !rc2) for (int i=0;i<M*N;i++) if (C1[i]!=C2[i]) mism++;

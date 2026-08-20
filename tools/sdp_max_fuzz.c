@@ -1,7 +1,7 @@
 /* sdp_max_fuzz — realize an on-NPU element-wise ALU op by retargeting the SDP EW_ALU_ALGO field
  * (rocket_registers.h: 0x4070 EW_CFG, bits[19:16] = EW_ALU_ALGO; NVDLA firmware map_alu_op[] order
  * = MAX=0,MIN=1,SUM=2,EQL=3; our ADD template has algo=2=SUM, confirming the enum). Drives
- * ork_npu_probe_i8_mul with the ALU-active (ADD-routing) config + algo overridden. With operand a=0,
+ * ork_i8_npu_probe_mul with the ALU-active (ADD-routing) config + algo overridden. With operand a=0,
  * the three ops have DISTINCT signatures: MAX->max(0,b)=ReLU(b); MIN->min(0,b)=-ReLU(-b); SUM->b.
  * Confirms MAX=0 works on-NPU (no fuzzing of unknowns — codes are from the driver). BOARD: sudo ./sdp_max_fuzz */
 #include "ork_npu.h"
@@ -21,7 +21,7 @@ int main(void){
         char r70[16]; snprintf(r70,sizeof r70,"0x%08x",0x904002c0u|((unsigned)cs[k].algo<<16));
         setenv("ORK_EW_R70",r70,1);
         memset(o,0,sizeof o); double us=0;
-        int r=ork_npu_probe_i8_mul(c,a,b,n,o,&us);
+        int r=ork_i8_npu_probe_mul(c,a,b,n,o,&us);
         /* sample at b=-20 (idx12), b=-4 (idx28), b=+4 (idx36), b=+20 (idx52) */
         printf("algo=%d %-3s R70=%s rc=%d : out[b=-20]=%d out[b=-4]=%d out[b=+4]=%d out[b=+20]=%d\n",
                cs[k].algo,cs[k].nm,r70,r, o[12],o[28],o[36],o[52]);

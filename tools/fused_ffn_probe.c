@@ -2,10 +2,10 @@
  * (no fp32 round-trip / CPU op between the matmuls), vs the round-trip style.
  *
  *   CHAINED (on-NPU, int8 throughout):
- *     gate matmul + fused SiLU  (ork_mm_run_i8_silu)   -> silu_gate int8
- *     up   matmul + int8-out    (ork_mm_run_i8_out8)   -> up        int8
- *     silu_gate (x) up          (ork_npu_ewmul_i8)     -> glu       int8
- *     down matmul (int8-in)     (ork_mm_run_i8)        -> out       int32
+ *     gate matmul + fused SiLU  (ork_i8_mm_run_silu)   -> silu_gate int8
+ *     up   matmul + int8-out    (ork_i8_mm_run_out8)   -> up        int8
+ *     silu_gate (x) up          (ork_i8_npu_ewmul)     -> glu       int8
+ *     down matmul (int8-in)     (ork_i8_mm_run)        -> out       int32
  *
  * Times the chain warm + the per-op split, and (for the monitor harness) loops so NPU/CPU/RAM-BW can be
  * sampled. Dims default to a small FFN (K=2048, D_ff=2048) so down's K stays <=4096 (the full-K envelope).
@@ -40,10 +40,10 @@ struct npu_arg { ork_npu*c; ork_w*wg,*wu,*wd; int M,Dff; const int8_t*x; int8_t*
 static void* npu_thread(void*a){
     struct npu_arg*p=a; double us=0; pin(4,4);   /* NPU-driver thread on its own big core */
     for(int it=0; it<p->iters; it++){
-        ork_mm_run_i8_silu(p->c,p->wg,p->M,p->x,p->silu_gate,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
-        ork_mm_run_i8_out8(p->c,p->wu,p->M,p->x,p->up,0x4000,14);
-        ork_npu_ewmul_i8(p->c,p->up,p->silu_gate,p->M,p->Dff,0x4000,14,p->glu,&us);
-        ork_mm_run_i8(p->c,p->wd,p->M,p->glu,p->out);
+        ork_i8_mm_run_silu(p->c,p->wg,p->M,p->x,p->silu_gate,0x51aa,0x14,0xffffff9fu,0xffffc000u,0x56391100u,NULL,0);
+        ork_i8_mm_run_out8(p->c,p->wu,p->M,p->x,p->up,0x4000,14);
+        ork_i8_npu_ewmul(p->c,p->up,p->silu_gate,p->M,p->Dff,0x4000,14,p->glu,&us);
+        ork_i8_mm_run(p->c,p->wd,p->M,p->glu,p->out);
     }
     return NULL;
 }
@@ -63,7 +63,7 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)Dff*Kh;i++) Bd[i]=(int8_t)((i*3)%9-4);
     for(size_t i=0;i<(size_t)M*Kh;i++) x[i]=(int8_t)((i*11)%17-8);
 
-    ork_w *wg=ork_mm_pack_i8(c,Kh,Dff,Bg), *wu=ork_mm_pack_i8(c,Kh,Dff,Bu), *wd=ork_mm_pack_i8(c,Dff,Kh,Bd);
+    ork_w *wg=ork_i8_mm_pack(c,Kh,Dff,Bg), *wu=ork_i8_mm_pack(c,Kh,Dff,Bu), *wd=ork_i8_mm_pack(c,Dff,Kh,Bd);
     if(!wg||!wu||!wd){ fprintf(stderr,"pack failed\n"); return 2; }
 
     int8_t  *silu_gate=malloc((size_t)M*Dff), *up=malloc((size_t)M*Dff), *glu=malloc((size_t)M*Dff);
@@ -77,10 +77,10 @@ int main(int argc,char**argv){
     #define STEP(fn) do{ int r=(fn); if(r){fprintf(stderr,"step rc=%d\n",r); rc=1;} }while(0)
     /* warmup */
     for(int w=0;w<3 && !rc;w++){
-        STEP(ork_mm_run_i8_silu(c,wg,M,x,silu_gate,RM,RS,OB,IO,C4,NULL,0));
-        STEP(ork_mm_run_i8_out8(c,wu,M,x,up,EM,ES));
-        STEP(ork_npu_ewmul_i8(c,up,silu_gate,M,Dff,EM,ES,glu,&us));
-        STEP(ork_mm_run_i8(c,wd,M,glu,out));
+        STEP(ork_i8_mm_run_silu(c,wg,M,x,silu_gate,RM,RS,OB,IO,C4,NULL,0));
+        STEP(ork_i8_mm_run_out8(c,wu,M,x,up,EM,ES));
+        STEP(ork_i8_npu_ewmul(c,up,silu_gate,M,Dff,EM,ES,glu,&us));
+        STEP(ork_i8_mm_run(c,wd,M,glu,out));
     }
     if(rc){ fprintf(stderr,"warmup failed\n"); return 1; }
 
@@ -88,10 +88,10 @@ int main(int argc,char**argv){
     double t_g=0,t_u=0,t_e=0,t_d=0,t0;
     double tot0=now_us();
     for(int it=0; it<iters && !rc; it++){
-        t0=now_us(); STEP(ork_mm_run_i8_silu(c,wg,M,x,silu_gate,RM,RS,OB,IO,C4,NULL,0)); t_g+=now_us()-t0;
-        t0=now_us(); STEP(ork_mm_run_i8_out8(c,wu,M,x,up,EM,ES));                          t_u+=now_us()-t0;
-        t0=now_us(); STEP(ork_npu_ewmul_i8(c,up,silu_gate,M,Dff,EM,ES,glu,&us));           t_e+=now_us()-t0;
-        t0=now_us(); STEP(ork_mm_run_i8(c,wd,M,glu,out));                                  t_d+=now_us()-t0;
+        t0=now_us(); STEP(ork_i8_mm_run_silu(c,wg,M,x,silu_gate,RM,RS,OB,IO,C4,NULL,0)); t_g+=now_us()-t0;
+        t0=now_us(); STEP(ork_i8_mm_run_out8(c,wu,M,x,up,EM,ES));                          t_u+=now_us()-t0;
+        t0=now_us(); STEP(ork_i8_npu_ewmul(c,up,silu_gate,M,Dff,EM,ES,glu,&us));           t_e+=now_us()-t0;
+        t0=now_us(); STEP(ork_i8_mm_run(c,wd,M,glu,out));                                  t_d+=now_us()-t0;
     }
     double tot=now_us()-tot0;
     if(rc){ fprintf(stderr,"timed loop failed\n"); return 1; }

@@ -1,5 +1,5 @@
 /* tools/i4_multim_probe.c — Tier 4b RE: can the int4 regcmd do MULTI-M in one submit, and what is the
- * multi-M output layout? Sets the M-count regs to M (ork_npu_probe_i4_mm -> synth_i4 mc=M), one submit,
+ * multi-M output layout? Sets the M-count regs to M (ork_i4_npu_probe_mm -> synth_i4 mc=M), one submit,
  * and brute-forces candidate de-tile layouts against an EXACT CPU reference (int4*int4 is exact; with
  * small K the int16 sum never overflows, so a correct layout matches bit-for-bit).
  *
@@ -40,7 +40,7 @@ static void test(ork_npu*ctx,int M,int K,int N){
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=r4();
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A[(size_t)m*K+k]*B[(size_t)k*N+n];ref[(size_t)m*N+n]=s;}
     int16_t*raw=calloc((size_t)2*M*N,2);   /* 2x: stride-2 multi-M writes physical rows 0..2(M-1) */
-    int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+    int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
     printf("M=%d K=%d N=%d  submit rc=%d\n",M,K,N,rc);
     if(rc==0){
         for(unsigned l=0;l<sizeof LAYS/sizeof*LAYS;l++){

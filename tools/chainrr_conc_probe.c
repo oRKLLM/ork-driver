@@ -27,7 +27,7 @@ int main(int argc,char**argv){
     ork_chain_op ops[4] = { {1,-1,0,r_mult,r_shift}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
 
     /* shared ones-weight (Sigma reduce); per-chain K^T and V weights + IO buffers (distinct inputs per chain) */
-    ork_w *w_ones; { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,ones); free(ones); }
+    ork_w *w_ones; { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,ones); free(ones); }
     if(!w_ones){ printf("pack ones fail\n"); return 2; }
     ork_w **w_kt=calloc(NCH,sizeof*w_kt), **w_v=calloc(NCH,sizeof*w_v);
     int8_t **Qp=calloc(NCH,sizeof*Qp), **Kd=calloc(NCH,sizeof*Kd), **Vd=calloc(NCH,sizeof*Vd);
@@ -54,7 +54,7 @@ int main(int argc,char**argv){
             int ei=(int)lround(e); ce[(size_t)i*Nk+j]=(int8_t)ei; Ssum+=ei; } cS[(size_t)ch*Nq+i]=Ssum;
           for(int x=0;x<dv;x++){ double av=0; for(int j=0;j<Nk;j++) av+=(double)ce[(size_t)i*Nk+j]*Vd[ch][(size_t)j*dv+x]; cav[ch][(size_t)i*dv+x]=av; } }
         free(ce); free(Q);
-        w_kt[ch]=ork_mm_pack_i8(c,Kp,Nk,KTp); w_v[ch]=ork_mm_pack_i8(c,Nk,dv,Vd[ch]); free(KTp);
+        w_kt[ch]=ork_i8_mm_pack(c,Kp,Nk,KTp); w_v[ch]=ork_i8_mm_pack(c,Nk,dv,Vd[ch]); free(KTp);
         if(!w_kt[ch]||!w_v[ch]){ printf("pack chain %d fail\n",ch); return 2; }
         scb[ch]=calloc((size_t)Nq*Nk,4); eb[ch]=calloc((size_t)Nq*Nk,4); ssum[ch]=calloc((size_t)Nq*32,4); avb[ch]=calloc((size_t)Nq*dv,4);
         chains[ch]=malloc(4*sizeof(ork_mm_task_i8)); S[ch]=4;
@@ -68,7 +68,7 @@ int main(int argc,char**argv){
 
     /* WARM all cores (multi-core matmul) — the chains' precondition (a cold core's first submit wedges) */
     { int32_t *wc=calloc((size_t)Nq*Nk,4); ork_mm_task_i8 wt={ w_kt[0], Nq, Qp[0], wc };
-      int wrc=ork_mm_run_chain_i8(c,1,&wt); free(wc);
+      int wrc=ork_i8_mm_run_chain(c,1,&wt); free(wc);
       printf("  [warm] multi-core matmul rc=%d\n", wrc); }
 
     /* CONCURRENT round-robin dispatch */

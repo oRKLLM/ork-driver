@@ -18,7 +18,7 @@
 static ork_npu*c; static ork_w*w; static const int M=8;
 static ork_f16 *A,*B; static float *C; static double acc[N];
 static unsigned g_io,g_c4;
-static int run(const int16_t*lut){ return ork_mm_run_f16_silu(c,w,M,A,C,0,g_io,g_c4,lut,1030); }
+static int run(const int16_t*lut){ return ork_f16_mm_run_silu(c,w,M,A,C,0,g_io,g_c4,lut,1030); }
 
 int main(int argc,char**argv){
     g_io = argc>1?(unsigned)strtoul(argv[1],0,0):0xffffc000u;
@@ -28,7 +28,7 @@ int main(int argc,char**argv){
     for(int i=0;i<M*K;i++)A[i]=(ork_f16)1.0f;
     /* acc[n] spans [-390,+390] symmetric: B[k,n]=acc/K so K*A*B = acc (A=1). Positive AND negative. */
     for(int n=0;n<N;n++){ acc[n]=12.2*(n-31.5); double b=acc[n]/(double)K; for(int k=0;k<K;k++)B[(size_t)k*N+n]=(ork_f16)b; }
-    w=ork_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
+    w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
     int16_t lut[1030];
     for(int i=0;i<1030;i++)lut[i]=1000; if(run(lut)){printf("run fail\n");return 1;} double o1=C[32];
     for(int i=0;i<1030;i++)lut[i]=3000; run(lut); double o2=C[32];

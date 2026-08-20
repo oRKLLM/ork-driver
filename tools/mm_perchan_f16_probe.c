@@ -18,7 +18,7 @@ int main(void){
         for(int i=0;i<K*N;i++){ st=st*1103515245+12345; B[i]=(ork_f16)((st>>16)&1); }
         for(int n=0;n<N;n++) scale[n]=(ork_f16)(n%3);
         double us=0;
-        int rc=ork_npu_mm_perchan_f16(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)scale,(unsigned short*)out,&us);
+        int rc=ork_f16_npu_mm_perchan(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)scale,(unsigned short*)out,&us);
         int bad=0;
         for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];
             float ref=acc*(float)scale[n]; if((float)out[(size_t)m*N+n]!=ref) bad++; }

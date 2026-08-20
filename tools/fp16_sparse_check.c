@@ -15,8 +15,8 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=(ork_f16)(0.02f*((i%11)+1));
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=(ork_f16)(0.02f*((i%7)+1));
     float*C=malloc((size_t)M*N*4);
-    ork_w*w=ork_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
-    if(ork_mm_run(c,w,M,A,C)){printf("run failed\n");return 1;}
+    ork_w*w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    if(ork_f16_mm_run(c,w,M,A,C)){printf("run failed\n");return 1;}
     int rows[]={0,1,7,8,9,15,16,63,64,65,127,200,255,M-1}; int nr=sizeof(rows)/sizeof(rows[0]);
     int cols[]={0,1,63,N/2,N-1}; int ncl=sizeof(cols)/sizeof(cols[0]);
     double maxrel=0; int bad=0, nan=0, ns=0;

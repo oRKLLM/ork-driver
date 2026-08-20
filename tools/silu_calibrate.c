@@ -42,7 +42,7 @@ static long eval(ork_npu*c, const int8_t*A, const int8_t*B, const int *acc,
                  int r_mult,int r_shift,uint32_t out_bias,uint32_t cfg4068,
                  const int8_t*ref, int *maxerr){
     static int8_t C[N];
-    if(ork_npu_probe_i8_silu_cfg(c,1,K,N,A,B,r_mult,r_shift,out_bias,0xffffc000u,cfg4068,NULL,0,C,0))
+    if(ork_i8_npu_probe_silu_cfg(c,1,K,N,A,B,r_mult,r_shift,out_bias,0xffffc000u,cfg4068,NULL,0,C,0))
         return -1;
     long s=0; int mx=0;
     for(int n=0;n<N;n++){ int e=abs((int)C[n]-(int)ref[n]); s+=e; if(e>mx)mx=e; }

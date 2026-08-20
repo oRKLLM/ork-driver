@@ -9,7 +9,7 @@
  *   C[M,N] (fp32) = A[M,K] (fp16, row-major) x B[K,N] (fp16, row-major)
  *
  * Typical use (transformer): pack each weight matrix once (resident on the NPU), then
- * stream activations through ork_mm_run. Arbitrary M/K/N (K-split + N-tiling internally).
+ * stream activations through ork_f16_mm_run. Arbitrary M/K/N (K-split + N-tiling internally).
  */
 #ifndef ORK_NPU_H
 #define ORK_NPU_H
@@ -46,5 +46,6 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 #include "ork/seq.h"
 #include "ork/chain.h"
 #include "ork/bmm.h"
+#include "ork/compat.h"   /* DEPRECATED pre-rename spellings for the fork; see docs/NAMING_MIGRATION.md */
 
 #endif

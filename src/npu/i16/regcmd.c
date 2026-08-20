@@ -21,12 +21,12 @@
 #include "npu/i16/i16.h"
 
 static void orki_synth_i16(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
-    orki_synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
+    orki_f16_synth(rc,mc,K,N,aA,aB,aC,sched,cbuf);                 /* fp16 2-byte geometry base */
     uint32_t con1=0x20000090u; const char*e=getenv("ORK_I16_CON1"); if(e) con1=(uint32_t)strtoul(e,NULL,0);
     orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON1,con1);             /* FP16(2)->INT16(1) precision */
 }
 
-void orki_set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift){
+void orki_i16_set_out(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
     /* SOLVED (wedge + layout) 2026-07-21 via i16out_fix_probe layout sweep: the int16 output stage now writes
      * COMPACT CONTIGUOUS int16 (row-major m*N+n, M*N*2 bytes, 128/128 correct, no stall, no buffer overflow).

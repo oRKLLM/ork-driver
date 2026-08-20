@@ -12,7 +12,7 @@ open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a rea
 > Status: **RK3588 validated on hardware** (Radxa ROCK 5B). On Qwen3-1.7B w8a8 it does **decode
 > ~11 tok/s (~96% of the closed `librkllmrt`)** and prefill ~94 tok/s — multi-core and the full-K
 > int8 decode layout are chosen automatically (no tuning flags); per-channel int8 quant is
-> validated (~0.5% error). **int4 (W4A4) matmul is validated too** (`ork_mm_pack_i4`/`ork_mm_run_i4`,
+> validated (~0.5% error). **int4 (W4A4) matmul is validated too** (`ork_i4_mm_pack`/`ork_i4_mm_run`,
 > the first open *regcmd*-based int4 on RK3588 — maxerr=0 vs CPU, with K-split/N-tiling/M-tiling);
 > `w4a16` (fp16 activations) is next. RK3576 shares the driver/ISA — the path works but its tuning
 > params are inherited and need on-device validation (the library warns until then). See
@@ -24,8 +24,8 @@ open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a rea
 #include "ork_npu.h"
 
 ork_npu *ctx = ork_npu_init();              // detects the SoC, opens the NPU DIRECTLY (in-process, default)
-ork_w   *w   = ork_mm_pack(ctx, K, N, B);   // pack B[K,N] fp16 once, resident on the NPU
-ork_mm_run(ctx, w, M, A, C);                // C[M,N] fp32 = A[M,K] fp16 x B[K,N]  (many times)
+ork_w   *w   = ork_f16_mm_pack(ctx, K, N, B);   // pack B[K,N] fp16 once, resident on the NPU
+ork_f16_mm_run(ctx, w, M, A, C);                // C[M,N] fp32 = A[M,K] fp16 x B[K,N]  (many times)
 ork_npu_free(ctx);
 ```
 
@@ -51,19 +51,19 @@ tiled DMA.
 
 ```c
 // w8a8: int8 weights, int8 activations -> int32 accumulate (A int8[M,K], C int32[M,N])
-ork_w *w = ork_mm_pack_i8_f32(ctx, K, N, Bf32, bscale);  ork_mm_run_i8(ctx, w, M, A, C);
+ork_w *w = ork_i8_mm_pack_f32(ctx, K, N, Bf32, bscale);  ork_i8_mm_run(ctx, w, M, A, C);
 
 // w4a8: 4-bit weight STORAGE, int8 compute. Uniform grid by default;
 //   ORK_NF4=1 -> NF4 (normal-float-4) codebook (better for Gaussian-ish weights);
 //   ORK_SR=1  -> stochastic rounding.
-ork_w *w4 = ork_mm_pack_i4a8(ctx, K, N, Bf32, bscale);
+ork_w *w4 = ork_i4a8_mm_pack(ctx, K, N, Bf32, bscale);
 
 // w4a8 + importance matrix: per-input-channel weights pick a clip-optimal per-channel scale.
-ork_w *wi = ork_mm_pack_i4a8_im(ctx, K, N, Bf32, imatrix /*len K, NULL=uniform*/, bscale);
+ork_w *wi = ork_i4a8_mm_pack_im(ctx, K, N, Bf32, imatrix /*len K, NULL=uniform*/, bscale);
 ```
 
-- **Compact int4 persist** — `ork_w_dump_i4a8` serializes the nibble store + per-channel scales
-  (`'O4N1'` blob, ~½ the tiled-int8 dump); `ork_mm_load_i4a8` reloads it straight into NPU DMA
+- **Compact int4 persist** — `ork_i4a8_w_dump` serializes the nibble store + per-channel scales
+  (`'O4N1'` blob, ~½ the tiled-int8 dump); `ork_i4a8_mm_load` reloads it straight into NPU DMA
   (inflate → tile). `ork_w_bscale` / `ork_w_quant_kind` expose the stored scales / codebook.
 - **Mixed-precision allocation** — `tools/gguf_tier_map.c` reads any GGUF's per-tensor quant
   types and maps them onto `{int8, int4}` tiers by an effective-bits threshold (the
@@ -83,12 +83,12 @@ host→device copy):
 void *p = ork_dma_import(ctx, bytes);      // dma-heap buffer, mmap'd + IOMMU-mapped
 memcpy(p, tiled_bytes, bytes);             // fill once (pre-tiled weights, or an activation A)
 ork_dma_import_sync(ctx, p, bytes);        // flush CPU writes -> device (dma-buf cache clean)
-// ... pass p as A/C to ork_mm_run, exactly like an ork_dma_alloc buffer ...
+// ... pass p as A/C to ork_f16_mm_run, exactly like an ork_dma_alloc buffer ...
 ork_dma_import_free(ctx, p);
 ```
 
-`ork_mm_load_i8_import` / `ork_mm_load_i4a8_import` are the import-backed loaders: same blob and
-byte-identical result as `ork_mm_load_i8` / `ork_mm_load_i4a8`, but each resident tile is an
+`ork_i8_mm_load_import` / `ork_i4a8_mm_load_import` are the import-backed loaders: same blob and
+byte-identical result as `ork_i8_mm_load` / `ork_i4a8_mm_load`, but each resident tile is an
 imported dma-buf (saves the kernel page alloc). All four return `NULL` if the dma-heap is absent so
 the caller falls back. Import eliminates the *copy*, not the 4 GiB *cap*.
 
@@ -100,7 +100,7 @@ expensive `MEM_DESTROY` (paid only on **evict**):
 
 ```c
 ork_stream_pool  *pool = ork_stream_pool_create(ctx);
-ork_stream_entry *e = ork_stream_pool_add_i4a8(pool, K, N, blob, n); // fill = inflate, ONCE
+ork_stream_entry *e = ork_i4a8_stream_pool_add(pool, K, N, blob, n); // fill = inflate, ONCE
 // per use (cache hit): cheap map -> run -> unmap; entry stays filled in RAM after unmap
 ork_stream_pool_map(pool, e); ork_stream_pool_run(pool, e, M, A, C); ork_stream_pool_unmap(pool, e);
 ork_stream_pool_remove(pool, e);   // the caller's eviction frees the RAM buffer
@@ -110,7 +110,7 @@ The pool provides the **lifecycle only** (hold-in-RAM, cheap map/unmap, free); t
 **policy and RAM budget live in the caller**. Both stores are covered: `add_i8` (fill = copy the
 stored tile bytes) and `add_i4a8` (fill = inflate the nibbles). A transient prefetch double-buffer is
 just a small pool the caller fills ahead on a background thread. `ork_stream_pool_create` returns
-`NULL` if the dma-heap is unavailable (fall back to `ork_mm_load_i8` + `ork_mm_run_i8`).
+`NULL` if the dma-heap is unavailable (fall back to `ork_i8_mm_load` + `ork_i8_mm_run`).
 
 > Note: a *transient* ring that maps **and unmaps every swap** does not reach resident speed — the
 > per-swap `MEM_DESTROY` (~0.5–2 ms) is irreducible overhead on top of the submit, and the inflate
@@ -169,8 +169,8 @@ make install      # → $(PREFIX)/lib/{libork_npu.a,libork_npu.so} + $(PREFIX)/i
   `.so` dependency) — `cc your.c -lork_npu` after `make install`, or drop the library sources straight
   into your build (`src/*.c src/npu/*.c src/npu/*/*.c src/soc/*.c`, with `-Iinclude -Isrc`; the
   Makefile's CORE variable is the authoritative list).
-  The header is the entire contract: `ork_npu_init` / `ork_mm_pack[_i8]` /
-  `ork_mm_run[_i8]`.
+  The header is the entire contract: `ork_npu_init` / `ork_f16_mm_pack[_i8]` /
+  `ork_f16_mm_run[_i8]`.
 - **Other languages (Python / Node / Rust):** link `libork_npu.so` and FFI against the same C
   ABI (`dlopen` / `ctypes` / `node-ffi` / `bindgen`).
 
@@ -278,6 +278,10 @@ vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for
 
 ## Capability × precision matrix
 
+> Symbol names are **dtype-first** (`ork_i8_mm_run`). If you are updating from an older revision, see
+> [`docs/NAMING_MIGRATION.md`](docs/NAMING_MIGRATION.md) for the full old→new table; `include/ork/compat.h`
+> keeps the previous spellings working for the ggml-ork fork in the meantime.
+
 Which datapath implements what. Regenerate with `make matrix` (`tools/precision_matrix.sh` derives it
 from the source tree, so it cannot drift from the code). A dagger means the capability is provided by a
 shared implementation rather than that precision's own module — supported, just not its own code; those
@@ -293,7 +297,7 @@ are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol d
 | load / .orkpack persist | ✅ | — | ✅ | — |
 | zero-copy import / adopt | ✅ | — | ✅ | — |
 | quantise from f32 | ✅ | — | ✅ | — |
-| run — single core | ✅ | ✅† | ✅ | — |
+| run — single core | ✅ | ✅ | ✅ | — |
 | run — multicore | ✅ | ✅† | ✅ | — |
 | run — HW chain | ✅ | — | ✅ | ✅† |
 | run — async stream | ✅ | ✅ | ✅ | — |
@@ -311,10 +315,10 @@ are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol d
 | probes / RE replay | ✅ | ✅ | ✅ | ✅ |
 | regcmd fuzz hooks | ✅ | ✅ | ✅ | — |
 
-† **f16 / run — single core** — ork_mm_run / orki_run in npu.c dispatch fp16 — the dispatcher is dtype-agnostic by design, so there is no token to match (`orki_run`)
 † **f16 / run — multicore** — i8/colsplit.c is the ONLY fp16 multicore path (#45) (`ork_dyn_begin_colsplit`)
 † **f16 / run — NONBLOCK doorbell** — same colsplit path — fp16 wide-K rides the doorbell (`ork_dyn_begin_colsplit`)
 † **i16 / run — HW chain** — the i16 chain rides the general PC-chain core in i8/probe.c rather than a dedicated i16 one (`ork_npu_chain_progs`)
+
 
 **Most blanks are by design, not a TODO.** int4 has no SDP/activation row because the RK3588 datapath is
 W8A8 *or* W4A4 symmetric — int4 activations are int4, and the SDP LUT op consumes int8/int16, so there is

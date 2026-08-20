@@ -2,7 +2,7 @@
  * streaming pool built on it. Board only (needs /dev/dri + /dev/dma_heap). NOT in `make test`.
  *
  * Piece 1: ork_dma_import as a matmul B (zero-copy, NPU reads user dma-buf pages directly) — vs CPU.
- *          ork_mm_load_i8_import round-trip vs ork_mm_load_i8 vs CPU; load-time import vs alloc+copy.
+ *          ork_i8_mm_load_import round-trip vs ork_i8_mm_load vs CPU; load-time import vs alloc+copy.
  * Piece 2: fixed-size-slot streaming pool: cycle a working set LARGER than the IOVA window through a
  *          small set of uniform slots via import + MEM_DESTROY, asserting no fragmentation crash and
  *          correct output; per-swap cost vs MEM_CREATE+copy+DESTROY.
@@ -25,7 +25,7 @@ static void ref_i8(int M,int K,int N,const int8_t*A,const int8_t*B,int32_t*C){
 }
 
 /* ---- Piece 1a: imported matmul B via ork_dma_import (raw, no ork_w) is out of scope here because the
- * weight path tiles B internally; instead we validate import end-to-end through ork_mm_load_i8_import,
+ * weight path tiles B internally; instead we validate import end-to-end through ork_i8_mm_load_import,
  * which packs+imports the resident weight. That exercises the same primitive on the weight path. ---- */
 
 static int test_load_import(ork_npu*ctx,int K,int N,int M){
@@ -37,21 +37,21 @@ static int test_load_import(ork_npu*ctx,int K,int N,int M){
     ref_i8(M,K,N,A,B,Cref);
 
     /* pack normally to produce the canonical tile blob (ork_w_dump) */
-    ork_w*wp=ork_mm_pack_i8(ctx,K,N,B);
+    ork_w*wp=ork_i8_mm_pack(ctx,K,N,B);
     if(!wp){ printf("  pack_i8 failed\n"); return 1; }
     size_t blobsz=ork_w_dump(wp,NULL,0); void*blob=malloc(blobsz); ork_w_dump(wp,blob,blobsz);
     ork_mm_free(ctx,wp);
 
     /* standard alloc+copy load (baseline), timed */
-    double t0=now_us(); ork_w*ws=ork_mm_load_i8(ctx,K,N,blob,blobsz); double t_std=now_us()-t0;
+    double t0=now_us(); ork_w*ws=ork_i8_mm_load(ctx,K,N,blob,blobsz); double t_std=now_us()-t0;
     if(!ws){ printf("  load_i8 failed\n"); return 1; }
-    if(ork_mm_run_i8(ctx,ws,M,A,Cstd)){ printf("  run std failed\n"); return 1; }
+    if(ork_i8_mm_run(ctx,ws,M,A,Cstd)){ printf("  run std failed\n"); return 1; }
     ork_mm_free(ctx,ws);
 
     /* zero-copy import load, timed */
-    t0=now_us(); ork_w*wi=ork_mm_load_i8_import(ctx,K,N,blob,blobsz); double t_imp=now_us()-t0;
+    t0=now_us(); ork_w*wi=ork_i8_mm_load_import(ctx,K,N,blob,blobsz); double t_imp=now_us()-t0;
     if(!wi){ printf("  load_i8_import returned NULL (import unavailable?)\n"); free(blob); return 2; }
-    if(ork_mm_run_i8(ctx,wi,M,A,Cimp)){ printf("  run import failed\n"); return 1; }
+    if(ork_i8_mm_run(ctx,wi,M,A,Cimp)){ printf("  run import failed\n"); return 1; }
     ork_mm_free(ctx,wi);
 
     int bad_ref=0,bad_std=0;
@@ -80,7 +80,7 @@ static int test_fixed_slot_stream(ork_npu*ctx,int K,int N,int NEXP,int ITERS,int
     int32_t**Cref=malloc(NEXP*sizeof*Cref);
     for(int e=0;e<NEXP;e++){
         B[e]=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++)B[e][i]=(int8_t)(r4()-1);
-        ork_w*wp=ork_mm_pack_i8(ctx,K,N,B[e]);
+        ork_w*wp=ork_i8_mm_pack(ctx,K,N,B[e]);
         if(!wp){ printf("  pack expert %d failed\n",e); return 1; }
         if(!blobsz) blobsz=ork_w_dump(wp,NULL,0);
         blob[e]=malloc(blobsz); ork_w_dump(wp,blob[e],blobsz);
@@ -93,11 +93,11 @@ static int test_fixed_slot_stream(ork_npu*ctx,int K,int N,int NEXP,int ITERS,int
     for(int it=0;it<ITERS;it++){
         for(int e=0;e<NEXP;e++){
             double t0=now_us();
-            ork_w*w = use_import ? ork_mm_load_i8_import(ctx,K,N,blob[e],blobsz)
-                                 : ork_mm_load_i8(ctx,K,N,blob[e],blobsz);
+            ork_w*w = use_import ? ork_i8_mm_load_import(ctx,K,N,blob[e],blobsz)
+                                 : ork_i8_mm_load(ctx,K,N,blob[e],blobsz);
             t_load+=now_us()-t0;
             if(!w){ fail++; printf("  !! load failed it=%d e=%d (FRAGMENTATION/OOM)\n",it,e); continue; }
-            if(ork_mm_run_i8(ctx,w,M,A,C)){ printf("  run failed it=%d e=%d\n",it,e); fail++; }
+            if(ork_i8_mm_run(ctx,w,M,A,C)){ printf("  run failed it=%d e=%d\n",it,e); fail++; }
             else { for(int n=0;n<N;n++) if(C[n]!=Cref[e][n]){bad++;break;} }
             t0=now_us(); ork_mm_free(ctx,w); t_free+=now_us()-t0;
             swaps++;

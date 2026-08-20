@@ -1,5 +1,5 @@
 /* dom_chain_stress.c — drive the ACTUAL doorbell-chain API (ork_submit_seq with a grouped run, which rides
- * ork_dyn_begin_seq_i8_mc — the NONBLOCK multi-task HW PC-chain the application is built on) across two IOMMU
+ * ork_i8_dyn_begin_seq_mc — the NONBLOCK multi-task HW PC-chain the application is built on) across two IOMMU
  * domains, for a large op count. This is NOT a proxy: it submits real doorbell chains, alternating the domain
  * every submit, so a cross-domain switch follows every chain. If the doorbell-chain mechanism is what wedges
  * multi-domain, this reproduces "switch iommu domain time out". settle via ORK_DOM_SETTLE_US (0 to hunt).
@@ -29,8 +29,8 @@ int main(int argc,char**argv){
     int32_t *C1=malloc((size_t)M*N*4), *C2=malloc((size_t)M*N*4);
     g_s=0x1234u; for(int i=0;i<K*N;i++) B[i]=rnd8();
     g_s=0x5678u; for(int i=0;i<M*K;i++) A[i]=rnd8();
-    ork_npu_set_pack_domain(c,d1); ork_w *w1=ork_mm_pack_i8(c,K,N,B);
-    ork_npu_set_pack_domain(c,d2); ork_w *w2=ork_mm_pack_i8(c,K,N,B);
+    ork_npu_set_pack_domain(c,d1); ork_w *w1=ork_i8_mm_pack(c,K,N,B);
+    ork_npu_set_pack_domain(c,d2); ork_w *w2=ork_i8_mm_pack(c,K,N,B);
     if(!w1||!w2){ fprintf(stderr,"pack failed (w1=%p w2=%p) — already wedged?\n",(void*)w1,(void*)w2); return 1; }
 
     printf("dom_chain_stress: d1=%d d2=%d, %d grouped doorbell chains [mm->mm] alternating domains (M=%d K=%d N=%d)\n",
@@ -38,7 +38,7 @@ int main(int argc,char**argv){
     for(int i=0;i<iters;i++){
         ork_w *w = (i&1) ? w2 : w1;
         int32_t *C = (i&1) ? C2 : C1;
-        ork_seq_op ops[2]; memset(ops,0,sizeof ops);   /* a 2-task grouped chain (group>0 => ork_dyn_begin_seq_i8_mc doorbell) */
+        ork_seq_op ops[2]; memset(ops,0,sizeof ops);   /* a 2-task grouped chain (group>0 => ork_i8_dyn_begin_seq_mc doorbell) */
         ops[0].kind=ORK_OP_MM_I8; ops[0].w=w; ops[0].M=M; ops[0].A=A; ops[0].C=C; ops[0].group=1;
         ops[1].kind=ORK_OP_MM_I8; ops[1].w=w; ops[1].M=M; ops[1].A=A; ops[1].C=C; ops[1].group=1;
         int rc = ork_submit_seq(c, ops, 2);

@@ -1,7 +1,7 @@
 /* test_mode_transition — regression for the NPU shared-task-descriptor fix (wiki NPU-Quirks
  * "LUT-activation op poisons the shared task descriptor", branch feat/ssm-npu, 2026-07-12).
  *
- * THE BUG: a standalone LUT activation (ork_npu_exp_i16 / silu_i16 / gelu / rsqrt) memset the shared
+ * THE BUG: a standalone LUT activation (ork_i16_npu_exp / silu_i16 / gelu / rsqrt) memset the shared
  * ctx task descriptor (c->task) to its own SDP program (regcfg_amount=69, enable_mask=0x18) and did not
  * restore it. A following SINGLE-CORE matmul reuses the init c->task (regcfg=108, 0xd) without rebuilding
  * it, so it submitted a matmul regcmd under the stale SDP descriptor -> task counter 0x0 -> errno=110
@@ -37,7 +37,7 @@ static double mm_check(ork_npu *c, int M, int K, int N, int *rcout){
 static int lut_exp(ork_npu *c, int M, int N){
     short *in=malloc((size_t)M*N*2), *out=malloc((size_t)M*N*2); double us=0;
     for(size_t i=0;i<(size_t)M*N;i++) in[i]=(short)(-((int)(i%20000)));   /* negative -> exp in (0,1] */
-    int rc=ork_npu_exp_i16(c,in,M,N,30.0/30000.0,1.0/30000.0,out,&us);
+    int rc=ork_i16_npu_exp(c,in,M,N,30.0/30000.0,1.0/30000.0,out,&us);
     free(in);free(out); return rc;
 }
 

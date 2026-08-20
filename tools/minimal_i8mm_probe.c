@@ -15,7 +15,7 @@ static uint32_t g=0x13579u; static int r8(void){ g=g*1664525u+1013904223u; retur
 static int test_K(ork_npu*c,int M,int K,int N){
     int8_t *A=malloc((size_t)M*K), *W=malloc((size_t)K*N); memset(W,1,(size_t)K*N);   /* ones weight */
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)r8();
-    ork_w *w=ork_mm_pack_i8(c,K,N,W); if(!w){ printf("  K=%-4d pack FAIL\n",K); free(A);free(W); return 1; }
+    ork_w *w=ork_i8_mm_pack(c,K,N,W); if(!w){ printf("  K=%-4d pack FAIL\n",K); free(A);free(W); return 1; }
     int32_t *C=malloc((size_t)M*N*4); for(size_t i=0;i<(size_t)M*N;i++)C[i]=0x7f7f7f7f;
     ork_seq_op op={ .kind=ORK_OP_MM_I8, .w=w, .M=M, .A=A, .C=C };
     int rc=ork_submit_seq(c,&op,1);

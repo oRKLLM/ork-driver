@@ -22,20 +22,20 @@ static int one(ork_npu*c,int M,int K,int N,int iters,double*us,double*maxerr){
     unsigned s=12345;
     for(size_t i=0;i<(size_t)M*K;i++){ s=s*1103515245u+12345u; A[i]=(f16)(((int)(s>>16&0xff)-128)/256.0f); }
     for(size_t i=0;i<(size_t)K*N;i++){ s=s*1103515245u+12345u; B[i]=(f16)(((int)(s>>16&0xff)-128)/256.0f); }
-    ork_w*w=ork_mm_pack(c,K,N,B); if(!w){ free(A);free(B);free(C);free(R); *us=-1; return -1; }
-    ork_npu_set_core_budget(c,1); ork_mm_run(c,w,M,A,R);                 /* nc=1 reference */
+    ork_w*w=ork_f16_mm_pack(c,K,N,B); if(!w){ free(A);free(B);free(C);free(R); *us=-1; return -1; }
+    ork_npu_set_core_budget(c,1); ork_f16_mm_run(c,w,M,A,R);                 /* nc=1 reference */
     double b1=1e18; int nc1iters = getenv("ORK_CAMPAIGN") ? 1 : iters;   /* CAMPAIGN: skip the 1000 nc=1 TIMING runs (waste + where campaign3 silently wedged); 1 ref run is enough for R */
-    for(int it=0;it<nc1iters;it++){ double t0=now_us(); ork_mm_run(c,w,M,A,R); double d=now_us()-t0; if(d<b1)b1=d; } g_us1=b1;
-    ork_npu_set_core_budget(c,3); ork_mm_run(c,w,M,A,C);                 /* nc=3 warm */
+    for(int it=0;it<nc1iters;it++){ double t0=now_us(); ork_f16_mm_run(c,w,M,A,R); double d=now_us()-t0; if(d<b1)b1=d; } g_us1=b1;
+    ork_npu_set_core_budget(c,3); ork_f16_mm_run(c,w,M,A,C);                 /* nc=3 warm */
     if(getenv("ORK_F16_REAP_TEST")){   /* task #47: close+reopen the DRM fd (drm_release reap) mid-flight, re-import the
         * dma-buf weight in place, then re-run nc=3 — the final C-vs-R diff below validates the POST-REAP output is
         * still bit-exact (proves reopened-fd + re-import + run-path re-warm works). Needs ORK_F16_IMPORT_W. */
         int rr=ork_ctx_fd_reap(c);
         fprintf(stderr,"[REAP-TEST] ork_ctx_fd_reap rc=%d — re-running nc=3 post-reap\n",rr);
         for(size_t i=0;i<(size_t)M*N;i++) C[i]=0;                        /* clear so a non-run shows as diff, not stale-correct */
-        ork_mm_run(c,w,M,A,C);
+        ork_f16_mm_run(c,w,M,A,C);
     }
-    double best=1e18; for(int it=0;it<iters;it++){ double t0=now_us(); ork_mm_run(c,w,M,A,C); double d=now_us()-t0; if(d<best)best=d;
+    double best=1e18; for(int it=0;it<iters;it++){ double t0=now_us(); ork_f16_mm_run(c,w,M,A,C); double d=now_us()-t0; if(d<best)best=d;
         if(getenv("ORK_CAMPAIGN")){ g_camp_total++; int bad=0; for(size_t i=0;i<(size_t)M*N;i++) if(C[i]!=R[i]){ bad=1; break; } if(bad) g_camp_wrong++;
             if((it%50)==0){ fprintf(stderr,"[CAMPAIGN] iter %d/%d total=%ld wrong=%ld\n",it,iters,g_camp_total,g_camp_wrong); fflush(stderr); } } }
     double me=0; int nbit=0; for(size_t i=0;i<(size_t)M*N;i++){ double e=fabs((double)C[i]-(double)R[i]); if(e>me)me=e; if(C[i]!=R[i])nbit++; }

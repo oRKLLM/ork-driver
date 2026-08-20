@@ -1,4 +1,4 @@
-/* tools/i16_silu_acc.c — is the on-NPU int16 SiLU (ork_npu_silu_i16) accurate enough to fix the gmax-gate
+/* tools/i16_silu_acc.c — is the on-NPU int16 SiLU (ork_i16_npu_silu) accurate enough to fix the gmax-gate
  * coherence? Compares its silu(gate) error vs CPU fp32 silu over the gate range [-gmax,gmax], in silu units
  * — directly comparable to f16_gate_acc's numbers (int8 fused LUT err = 92 @gmax132; fp16+CPU-silu = 0.03).
  * If int16-silu err is small at high gmax, the UN-FUSED int8-matmul -> int16-silu gate is coherent (and
@@ -19,7 +19,7 @@ static void run_gmax(ork_npu*c,double gmax){
     double gate[64];
     for(int n=0;n<N;n++){ gate[n]=-gmax + 2.0*gmax*n/(double)(N-1);
         for(int m=0;m<M;m++){ long q=lround(gate[n]/is); if(q>32767)q=32767; if(q<-32768)q=-32768; in[m*N+n]=(short)q; } }
-    double us=0; int r=ork_npu_silu_i16(c,in,M,N,is,os,out,&us);
+    double us=0; int r=ork_i16_npu_silu(c,in,M,N,is,os,out,&us);
     if(r){ printf("  gmax=%6.1f: rc=%d\n",gmax,r); return; }
     double emax=0,esum=0;
     for(int n=0;n<N;n++){ double got=(double)out[n]*os, ref=siluf(gate[n]); double d=fabs(got-ref);

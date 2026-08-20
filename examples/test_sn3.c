@@ -20,10 +20,10 @@ static int one(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     if(!A||!B||!C){printf("  OOM\n");return 1;}
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
-    ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
+    ork_w*w=ork_i8_mm_pack(ctx,K,N,B);
     if(!w){printf("  pack_i8 FAILED (Sn=%d alloc?)\n",(N+8191)/8192);free(A);free(B);free(C);return 1;}
     errno=0;
-    int rc=ork_mm_run_i8(ctx,w,M,A,C);
+    int rc=ork_i8_mm_run(ctx,w,M,A,C);
     if(rc){printf("  run_i8 FAILED rc=%d errno=%d (%s)\n",rc,errno,strerror(errno));ork_w_free(w);free(A);free(B);free(C);return 1;}
     uint64_t got=fnv64(C,(size_t)M*N*4);
     int regen=getenv("ORK_REGEN")!=NULL, ret;

@@ -2,7 +2,7 @@
  * normalize on the NPU as a native per-channel scale). Reference: out[m][d] = (Σ_j e[m][j] V[j][d]) / Σ[m],
  * Σ[m]=Σ_j e[m][j]. NPU path (queries m become the output channel):
  *   Ô[d][m] = Σ_j V[j][d] e[m][j]  = matmul( A=V^T[DV][K],  W=e^T[K][N] )   (ork_mm, fp16)
- *   out[m][d] = Ô[d][m] * (1/Σ)[m]  via ork_npu_mul_perchan_f16 (1/Σ per-query = per-channel)
+ *   out[m][d] = Ô[d][m] * (1/Σ)[m]  via ork_f16_npu_mul_perchan (1/Σ per-query = per-channel)
  * Compares to the CPU reference. BOARD: sudo ./tnorm_probe */
 #include "ork_npu.h"
 #include <stdio.h>
@@ -24,14 +24,14 @@ int main(void){
     ork_f16 *eT=malloc((size_t)K*N*2), *VT=malloc((size_t)DV*K*2);
     for(int j=0;j<K;j++)for(int m=0;m<N;m++) eT[(size_t)j*N+m]=(ork_f16)e[(size_t)m*K+j];
     for(int d=0;d<DV;d++)for(int j=0;j<K;j++) VT[(size_t)d*K+j]=(ork_f16)V[(size_t)j*DV+d];
-    ork_w *w=ork_mm_pack(c,K,N,eT); if(!w){printf("pack failed\n");return 2;}
+    ork_w *w=ork_f16_mm_pack(c,K,N,eT); if(!w){printf("pack failed\n");return 2;}
     float *Ohat=malloc((size_t)DV*N*4);
-    if(ork_mm_run(c,w,DV,VT,Ohat)){printf("mm_run failed\n");return 2;}
+    if(ork_f16_mm_run(c,w,DV,VT,Ohat)){printf("mm_run failed\n");return 2;}
     /* per-channel 1/Σ over Ô[DV][N] (N=queries=channels) */
     ork_f16 *Oh16=malloc((size_t)DV*N*2), *inv=malloc(N*2), *Onorm=malloc((size_t)DV*N*2);
     for(int i=0;i<DV*N;i++) Oh16[i]=(ork_f16)Ohat[i];
     for(int m=0;m<N;m++) inv[m]=(ork_f16)(1.0/Sig[m]);
-    int rc=ork_npu_mul_perchan_f16(c,Oh16,inv,DV,N,Onorm,NULL);
+    int rc=ork_f16_npu_mul_perchan(c,Oh16,inv,DV,N,Onorm,NULL);
     double maxerr=0; int bad=0;
     for(int m=0;m<N;m++)for(int d=0;d<DV;d++){ float g=(float)Onorm[(size_t)d*N+m]; float r=ref[(size_t)m*DV+d]; double er=fabs(g-r); if(er>maxerr)maxerr=er; if(er>0.02)bad++; }
     printf("transposed-normalize: rc=%d  max|err|=%.4f  bad=%d/%d  %s\n",rc,maxerr,bad,N*DV,(rc==0&&bad==0)?"OK":"CHECK");

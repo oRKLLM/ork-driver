@@ -87,7 +87,7 @@ int main(int argc, char ** argv) {
     coord(wi,"WORST   ");
     // ---- MECHANISM ORACLE ----
     // Hypothesis: bmm_fp16 fills B with  B[j] = src0(j%K, j/K)  (i.e. [N,K] order) while
-    // ork_mm_repack_f16 reads B as [K,N] row-major (B[k*N+n]).  Emulate exactly that mis-index
+    // ork_f16_mm_repack reads B as [K,N] row-major (B[k*N+n]).  Emulate exactly that mis-index
     // for head 0 and see whether `got` matches it bit-for-bit-ish.  If yes, the bug is named.
     {
         std::vector<ggml_fp16_t> a16((size_t)K*N);
@@ -97,7 +97,7 @@ int main(int argc, char ** argv) {
         double se2=0, sr2=0; float w2=0; size_t wi2=0;
         // ggml stores element (i0,i1) of a [K,N] tensor at a16[i1*K + i0] (ne[0]-contiguous), i.e. the
         // raw buffer IS B^T in [N,K] row-major order. bmm_fp16 fills B[j] = src0(j%K, j/K) = a16[j],
-        // i.e. it hands that raw [N,K] buffer to ork_mm_repack_f16, which reads it as B[k*N+n].
+        // i.e. it hands that raw [N,K] buffer to ork_f16_mm_repack, which reads it as B[k*N+n].
         std::vector<float> Bdrv((size_t)K*N);
         for (size_t idx=0; idx<(size_t)K*N; idx++) Bdrv[idx] = ggml_fp16_to_fp32(a16[idx]);   // Bdrv[k*N+n]
         for (int m=0;m<M;m++) for (int n=0;n<N;n++) {

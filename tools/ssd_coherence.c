@@ -42,7 +42,7 @@ static void seq(const dims*d,const double*x,const double*dt,const double*A,const
 /* round a double to the nearest IEEE-754 half (fp16) value and back — mirrors NPU fp16 storage. */
 static double hf(double x){ return (double)(_Float16)x; }
 
-/* exp via a PWL LUT — mirrors the NPU SDP output-stage exp (ork_mm_build_f16_lut, ~1024 fp16 segments over
+/* exp via a PWL LUT — mirrors the NPU SDP output-stage exp (ork_f16_mm_build_lut, ~1024 fp16 segments over
  * a band). All scan exp args are <=0 (decay), so band [-30,0]; nodes + interp result rounded to fp16. */
 static double pwl_exp(double x){
     const double lo=-30.0, hi=0.0; const int NS=1024;

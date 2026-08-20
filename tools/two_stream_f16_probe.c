@@ -28,7 +28,7 @@ int main(void){
     for(size_t i=0;i<(size_t)M*L2;i++)  P[i]=(ork_f16)1.0f;
     /* QK^T weights: pack K^T as [HD, L2] (K=HD, N=L2); A.V weights: pack V as [L2, HD] (K=L2, N=HD) */
     ork_w *wK[S], *wV[S];
-    for(int i=0;i<S;i++){ wK[i]=ork_mm_pack(c,HD,L2,KT); wV[i]=ork_mm_pack(c,L2,HD,V);
+    for(int i=0;i<S;i++){ wK[i]=ork_f16_mm_pack(c,HD,L2,KT); wV[i]=ork_f16_mm_pack(c,L2,HD,V);
         if(!wK[i]||!wV[i]){printf("pack failed\n");return 2;} }
     float *Sc[S], *Ov[S];
     for(int i=0;i<S;i++){ Sc[i]=malloc((size_t)M*L2*4); Ov[i]=malloc((size_t)M*HD*4); }
@@ -38,8 +38,8 @@ int main(void){
         ork_mm_task_f16 qk[S], av[S];
         for(int i=0;i<S;i++){ memset(Sc[i],0,(size_t)M*L2*4); memset(Ov[i],0,(size_t)M*HD*4);
             qk[i]=(ork_mm_task_f16){wK[i],M,Q,Sc[i]}; av[i]=(ork_mm_task_f16){wV[i],M,P,Ov[i]}; }
-        int r1=ork_mm_run_stream_f16_chain(c,S,qk);   /* QK^T : N=L2 */
-        int r2=ork_mm_run_stream_f16_chain(c,S,av);   /* A.V  : N=HD (back-to-back, N changed) */
+        int r1=ork_f16_mm_run_stream_chain(c,S,qk);   /* QK^T : N=L2 */
+        int r2=ork_f16_mm_run_stream_chain(c,S,av);   /* A.V  : N=HD (back-to-back, N changed) */
         printf("iter %d (rc %d,%d):\n",iter,r1,r2);
         bad += check("QK^T",Sc[0],M,L2,HD);   /* sum over HD ones = HD */
         bad += check("A.V", Ov[0],M,HD,L2);   /* sum over L2 ones = L2 */

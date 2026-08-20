@@ -1,7 +1,7 @@
 /* sdp_chain_probe — int8 SDP on the HW chain.
  *  [fwd]        : ewmul as a MIDDLE task walks forward (ork_npu_chain_progs, desc_slot=138).
  *  [seq-hetero] : Stage 1 mechanism — [matmul->ewmul->matmul] NONBLOCK, terminal-matmul sentinel (hand-built).
- *  [seq-api]    : Stage 2 — the SAME chain via the reusable ork_dyn_begin_seq_i8 / ork_dyn_seq_end API
+ *  [seq-api]    : Stage 2 — the SAME chain via the reusable ork_i8_dyn_begin_seq / ork_dyn_seq_end API
  *                 (ork_seq_op[], packed weight, per-op copy-back). Board only. */
 #include "ork_npu.h"
 #include <stdio.h>
@@ -12,7 +12,7 @@
 static int seq_api_test(ork_npu *c){
     const int M=8, K=512, N=64, mult=0x4000, shift=14;
     int8_t *W=malloc((size_t)K*N); for(int i=0;i<K*N;i++) W[i]=1;               /* all-ones -> matmul C=K */
-    ork_w *w=ork_mm_pack_i8(c,K,N,W); free(W); if(!w){ printf("[seq-api] pack failed\n"); return 1; }
+    ork_w *w=ork_i8_mm_pack(c,K,N,W); free(W); if(!w){ printf("[seq-api] pack failed\n"); return 1; }
     int8_t *A0=malloc((size_t)M*K); for(int i=0;i<M*K;i++) A0[i]=1;              /* matmul A all-ones */
     int8_t A1[512],B1[512],ref[512]; unsigned g=333;
     for(int i=0;i<M*N;i++){ A1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&7))-3; B1[i]=(int8_t)(((g=g*1103515245u+12345u)>>20&7))-3; }
@@ -24,7 +24,7 @@ static int seq_api_test(ork_npu *c){
     ops[0]=(ork_seq_op){.kind=ORK_OP_MM_I8,   .w=w, .M=M, .N=N, .A=A0, .C=C0};
     ops[1]=(ork_seq_op){.kind=ORK_OP_EWMUL_I8,.w=NULL,.M=M,.N=N, .A=A1, .B=B1, .C=O1, .mult=mult, .shift=shift};
     ops[2]=(ork_seq_op){.kind=ORK_OP_MM_I8,   .w=w, .M=M, .N=N, .A=A0, .C=C2};
-    ork_dyn_chain *h=ork_dyn_begin_seq_i8(c,3,ops);
+    ork_dyn_chain *h=ork_i8_dyn_begin_seq(c,3,ops);
     if(!h){ printf("[seq-api] begin_seq_i8 returned NULL (ineligible)\n"); free(A0);free(C0);free(C2); return 1; }
     int rc=ork_dyn_seq_end(h);
     int n0=0,n2=0,ne=0;
@@ -41,7 +41,7 @@ static int seq_api_test(ork_npu *c){
 static int seq_mc_test(ork_npu *c, int G, int nc){
     const int M=8, K=512, N=64, mult=0x4000, shift=14;
     int8_t *W=malloc((size_t)K*N); for(int i=0;i<K*N;i++) W[i]=1;
-    ork_w *w=ork_mm_pack_i8(c,K,N,W); free(W); if(!w){ printf("[seq-mc] pack failed\n"); return 1; }
+    ork_w *w=ork_i8_mm_pack(c,K,N,W); free(W); if(!w){ printf("[seq-mc] pack failed\n"); return 1; }
     int8_t *A0=malloc((size_t)M*K); for(int i=0;i<M*K;i++) A0[i]=1;
     int nops=3*G;
     ork_seq_op *ops=calloc(nops,sizeof *ops);
@@ -57,7 +57,7 @@ static int seq_mc_test(ork_npu *c, int G, int nc){
         ops[3*g+2]=(ork_seq_op){.kind=ORK_OP_MM_I8,   .w=w, .M=M, .N=N, .A=A0, .C=C2[g]};
     }
     gstart[G]=nops;
-    ork_dyn_chain *h=ork_dyn_begin_seq_i8_mc(c,nops,ops,G,gstart,nc);
+    ork_dyn_chain *h=ork_i8_dyn_begin_seq_mc(c,nops,ops,G,gstart,nc);
     int ok=0, rc=-1;
     if(!h){ printf("[seq-mc] begin_seq_i8_mc NULL (ineligible)\n"); }
     else { rc=ork_dyn_seq_end(h); ok=(rc==0);
@@ -70,11 +70,11 @@ static int seq_mc_test(ork_npu *c, int G, int nc){
 }
 
 /* Stage 4: drive ork_submit_seq with GROUPED ops — 2 independent [mm->ewmul->mm] chains (group 1, group 2) —
- * so the scheduler routes the contiguous group>0 run to ork_dyn_begin_seq_i8_mc (no blocking SW break). */
+ * so the scheduler routes the contiguous group>0 run to ork_i8_dyn_begin_seq_mc (no blocking SW break). */
 static int submit_seq_grouped_test(ork_npu *c){
     const int M=8, K=512, N=64, mult=0x4000, shift=14, G=2;
     int8_t *W=malloc((size_t)K*N); for(int i=0;i<K*N;i++) W[i]=1;
-    ork_w *w=ork_mm_pack_i8(c,K,N,W); free(W); if(!w){ printf("[submit-grp] pack failed\n"); return 1; }
+    ork_w *w=ork_i8_mm_pack(c,K,N,W); free(W); if(!w){ printf("[submit-grp] pack failed\n"); return 1; }
     int8_t *A0=malloc((size_t)M*K); for(int i=0;i<M*K;i++) A0[i]=1;
     int8_t (*A1)[512]=malloc((size_t)G*512), (*B1)[512]=malloc((size_t)G*512), (*ref)[512]=malloc((size_t)G*512);
     int32_t (*C0)[512]=malloc((size_t)G*512*4), (*C2)[512]=malloc((size_t)G*512*4); int8_t (*O)[512]=malloc((size_t)G*512);

@@ -1,7 +1,7 @@
 /* regcmd_fold_refs.h — captured per-size fold sub-tile regcmd templates (our RE; no proprietary content).
  * One reference regcmd per fold tile size M, extracted from a real rkllm prefill capture (tools/re
  * extract_refs.py over pf.dump). Each is a full 232-word (108-reg) int8 fold matmul tile at K=3584,
- * N=1216 with all output-stage + M_total registers present. ork_npu_fold_run_i8 selects the template
+ * N=1216 with all output-stage + M_total registers present. ork_i8_npu_fold_run selects the template
  * for each sub-tile size and patches the 4 M_total-dependent regs (0x4024=16*M_total, 0x107c=M_total,
  * 0x1080=M_total-M, 0x40c0=128*M_total) + feature/weight/output IOVAs + row offset at runtime.
  * K/N are baked (the RE domain: FFN/attn projections at K=3584 N=1216); other shapes fall back to the

@@ -29,7 +29,7 @@ static inline void dsb  (void){ __asm__ volatile("dsb ish":::"memory"); }
 #define SENT 0x7fffffff
 
 static ork_npu *gC; static int gS; static ork_mm_task_i8 *gTK; static volatile int gRc, gDone;
-static void* chain_thr(void*p){ (void)p; gRc = ork_mm_run_chain_i8(gC, gS, gTK); gDone = 1; return NULL; }
+static void* chain_thr(void*p){ (void)p; gRc = ork_i8_mm_run_chain(gC, gS, gTK); gDone = 1; return NULL; }
 
 int main(int argc,char**argv){
     int S=argc>1?atoi(argv[1]):8, K=argc>2?atoi(argv[2]):512, N=argc>3?atoi(argv[3]):512;
@@ -39,7 +39,7 @@ int main(int argc,char**argv){
 
     int8_t*A=malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     /* one coherent DMA output buffer, S slots of N int32 each */
     int32_t*Obuf=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t));
     if(!Obuf){printf("dma_alloc fail (need zero-copy out)\n");return 1;}
@@ -48,7 +48,7 @@ int main(int argc,char**argv){
     gTK=tk; gS=S;
 
     /* warm (blocking) + correctness */
-    if(ork_mm_run_chain_i8(c,S,tk)){printf("chain warm rc!=0\n");return 1;}
+    if(ork_i8_mm_run_chain(c,S,tk)){printf("chain warm rc!=0\n");return 1;}
     int ok=1; for(int i=0;i<S;i++) if(Obuf[(size_t)i*N + (N-1)]!=K){ok=0;break;}
     printf("  chain correctness (all outputs==%d): %s\n",K,ok?"PASS":"FAIL");
 

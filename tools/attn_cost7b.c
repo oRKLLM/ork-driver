@@ -37,25 +37,25 @@ int main(int argc,char**argv){
     int32_t*S=malloc((size_t)M*L2*4),*O=malloc((size_t)M*HD*4);
     /* pack K^T (HD x L2) and V (L2 x HD) per kv-head */
     ork_w*wK[NKV],*wV[NKV];
-    for(int kv=0;kv<NKV;kv++){ wK[kv]=ork_mm_pack_i8(c,HD,L2,Kt); wV[kv]=ork_mm_pack_i8(c,L2,HD,V);
+    for(int kv=0;kv<NKV;kv++){ wK[kv]=ork_i8_mm_pack(c,HD,L2,Kt); wV[kv]=ork_i8_mm_pack(c,L2,HD,V);
         if(!wK[kv]||!wV[kv]){printf("pack failed (M=%d L2=%d: HD%%32=%d L2%%32=%d)\n",M,L2,HD%32,L2%32);return 1;} }
-    ork_mm_run_i8(c,wK[0],M,Q,S); ork_mm_run_i8(c,wV[0],M,P,O); /* warm */
+    ork_i8_mm_run(c,wK[0],M,Q,S); ork_i8_mm_run(c,wV[0],M,P,O); /* warm */
 
     /* (A) idealized floor: submit cost only, K/V already packed */
     double t0=now();
     for(int l=0;l<NL;l++) for(int h=0;h<NH;h++){int kv=h/grp;
-        ork_mm_run_i8(c,wK[kv],M,Q,S);
-        ork_mm_run_i8(c,wV[kv],M,P,O); }
+        ork_i8_mm_run(c,wK[kv],M,Q,S);
+        ork_i8_mm_run(c,wV[kv],M,P,O); }
     double dtA=now()-t0;
 
     /* (B) realistic: repack K and V (per-token activations) each layer before its heads run.
      * GQA: NKV distinct K/V per layer. repack_i8 reuses the DMA (no alloc churn). */
     t0=now();
     for(int l=0;l<NL;l++){
-        for(int kv=0;kv<NKV;kv++){ ork_mm_repack_i8(c,wK[kv],HD,L2,Kt); ork_mm_repack_i8(c,wV[kv],L2,HD,V); }
+        for(int kv=0;kv<NKV;kv++){ ork_i8_mm_repack(c,wK[kv],HD,L2,Kt); ork_i8_mm_repack(c,wV[kv],L2,HD,V); }
         for(int h=0;h<NH;h++){int kv=h/grp;
-            ork_mm_run_i8(c,wK[kv],M,Q,S);
-            ork_mm_run_i8(c,wV[kv],M,P,O); }
+            ork_i8_mm_run(c,wK[kv],M,Q,S);
+            ork_i8_mm_run(c,wV[kv],M,P,O); }
     }
     double dtB=now()-t0;
 

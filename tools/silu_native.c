@@ -43,7 +43,7 @@ static int tgt(int a, double in_s, double out_s){
     double v = silu(a*in_s)/out_s; long r = lround(v);
     if(r>127)r=127; if(r<-128)r=-128; return (int)r;
 }
-static int run(void){ return ork_npu_probe_i8_silu_cfg(c,M,K,N,A,B,R_MULT,R_SHIFT,OUT_BIAS,IDX_OFF,CFG4068,lut,1030,C,0); }
+static int run(void){ return ork_i8_npu_probe_silu_cfg(c,M,K,N,A,B,R_MULT,R_SHIFT,OUT_BIAS,IDX_OFF,CFG4068,lut,1030,C,0); }
 
 /* build ork's LUT for (in_scale,out_scale) from the measured idx(acc), run, return mean/max err */
 static void build_and_run(double in_s, double out_s){

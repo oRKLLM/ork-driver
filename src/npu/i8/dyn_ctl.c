@@ -49,7 +49,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
       struct buf s = orki_bcreate(fd,(size_t)K,0x403,c->dom_active); if(!s.cpu){SPIN_CLEAN();return -1;}
       memcpy(s.cpu,tasks[0].A,(size_t)K); orki_bsync(fd,&s,RKNPU_MEM_SYNC_TO_DEVICE); ascr[nascr++]=s;
       uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
-      memset(rc,0,sizeof rc); orki_synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,(uint32_t)spinC.dma,1,CBUF,0);
+      memset(rc,0,sizeof rc); orki_i8_synth(rc,1,K,N,(uint32_t)s.dma,bdma,(uint32_t)spinC.dma,1,CBUF,0);
       uint64_t self=c->regcmd.dma;   /* self-loop */
       rc[216]=0x0010|((self&0xffff)<<16); rc[217]=(0x0101<<16)|((self>>16)&0xffff);
       rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16);
@@ -61,7 +61,7 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
       struct buf *cb=orki_dma_find(c,(void*)tasks[i].C);
       uint32_t cdma=(uint32_t)(cb->dma+((const char*)tasks[i].C-(const char*)cb->cpu));
       uint32_t bdma=w->Bf?(uint32_t)w->Bf[0].dma:(uint32_t)w->Bb[0].dma;
-      memset(rc,0,sizeof rc); orki_synth_i8(rc,1,K,N,(uint32_t)s.dma,bdma,cdma,1,CBUF,0);
+      memset(rc,0,sizeof rc); orki_i8_synth(rc,1,K,N,(uint32_t)s.dma,bdma,cdma,1,CBUF,0);
       if(p<P-1){ uint64_t nx=c->regcmd.dma+(size_t)(p+1)*REGCMD_I8_N*4;
         rc[216]=0x0010|((nx&0xffff)<<16); rc[217]=(0x0101<<16)|((nx>>16)&0xffff);
         rc[218]=0x0014|(0x0037u<<16); rc[219]=(0x0101<<16); }
@@ -164,7 +164,7 @@ int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task) {
     uint32_t cdma = (uint32_t)(cb->dma + ((const char*)task->C - (const char*)cb->cpu));
     uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
     uint32_t rc[REGCMD_I8_N + 4]; memset(rc, 0, sizeof rc);
-    orki_synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);   /* new program: NO continue descriptor => it is the new terminator */
+    orki_i8_synth(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);   /* new program: NO continue descriptor => it is the new terminator */
     memcpy((char*)c->regcmd.cpu + (size_t)idx * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
     h->outbuf[idx] = cb; h->outptr[idx] = (int32_t*)task->C;
     { volatile int32_t *db = (volatile int32_t*)(h->outptr[idx] + (N - 1)); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }

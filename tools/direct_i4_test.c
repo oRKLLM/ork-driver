@@ -3,10 +3,10 @@
  *
  *   Correctness: pack a weight (UNIFORM or NF4) -> dump i4a8 blob -> load twice (f32 path / direct path)
  *   -> memcmp the tiled DMA bytes (Bb + Bf) of both ork_w. Must be byte-identical (memcmp==0). Then run
- *   ork_mm_run_i8 on each and on a CPU int4 reference; the int32 outputs must match exactly.
+ *   ork_i8_mm_run on each and on a CPU int4 reference; the int32 outputs must match exactly.
  *
  *   Bench: time inflate+tile only (into the already-resident DMA tiles) — old f32 path
- *   (ork_slice_inflate_i4a8_kind + ork_slice_tile_i8) vs new direct (ork_slice_direct_i4a8_kind),
+ *   (ork_i4a8_slice_inflate_kind + ork_i8_slice_tile) vs new direct (ork_i4a8_slice_direct_kind),
  *   for UNIFORM and NF4, over a set of FFN shapes. median of >=20 reps.
  *
  *   build:  make direct_i4_test     run:  sudo taskset -c 4-7 ./direct_i4_test
@@ -25,10 +25,10 @@ struct ork_w_pub { int K, N, Sk, Sn, dtype, gsize; struct buf *Bb; struct buf *B
                    uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; };
 
 /* internal diagnostics exported from src/npu.c */
-void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind);
-void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
-void ork_slice_direct_i4a8_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind);
-void ork_slice_direct_inflate_i8(const ork_w *w, int8_t *i8, int kind);
+void ork_i4a8_slice_inflate_kind(const ork_w *w, float *qf32, int kind);
+void ork_i8_slice_tile(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
+void ork_i4a8_slice_direct_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind);
+void ork_i8_slice_direct_inflate(const ork_w *w, int8_t *i8, int kind);
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6 + t.tv_nsec/1e3; }
 static int cmp_d(const void*a,const void*b){ double x=*(const double*)a,y=*(const double*)b; return x<y?-1:x>y?1:0; }
@@ -71,7 +71,7 @@ static void cpu_ref_i4(struct ork_w_pub *w, int M, const int8_t *A, int32_t *C){
 
 static ork_w *load_path(ork_npu *c,int K,int N,const void*blob,size_t bn,int direct){
     if(direct) setenv("ORK_DIRECT_I4","1",1); else unsetenv("ORK_DIRECT_I4");
-    ork_w *w = ork_mm_load_i4a8(c,K,N,blob,bn);
+    ork_w *w = ork_i4a8_mm_load(c,K,N,blob,bn);
     unsetenv("ORK_DIRECT_I4");
     return w;
 }
@@ -81,11 +81,11 @@ static int verify(ork_npu *c,int K,int N,int nf4){
     float *f32=malloc((size_t)N*K*sizeof(float));
     uint32_t s=0x12345u; for(size_t i=0;i<(size_t)N*K;i++){ s^=s<<13;s^=s>>17;s^=s<<5; f32[i]=((int)(s&0xffff)-32768)/9000.0f; }
     if(nf4) setenv("ORK_NF4","1",1); else unsetenv("ORK_NF4");
-    ork_w *wp = ork_mm_pack_i4a8(c,K,N,f32,NULL);
+    ork_w *wp = ork_i4a8_mm_pack(c,K,N,f32,NULL);
     unsetenv("ORK_NF4");
     if(!wp){ printf("  [%s K%d N%d] pack FAIL\n",kn,K,N); free(f32); return 1; }
-    size_t bn = ork_w_dump_i4a8(wp,NULL,0); void*blob=malloc(bn);
-    if(ork_w_dump_i4a8(wp,blob,bn)!=bn){ printf("  [%s] dump FAIL\n",kn); rc=1; goto out; }
+    size_t bn = ork_i4a8_w_dump(wp,NULL,0); void*blob=malloc(bn);
+    if(ork_i4a8_w_dump(wp,blob,bn)!=bn){ printf("  [%s] dump FAIL\n",kn); rc=1; goto out; }
 
     ork_w *wf = load_path(c,K,N,blob,bn,0);
     ork_w *wd = load_path(c,K,N,blob,bn,1);
@@ -99,7 +99,7 @@ static int verify(ork_npu *c,int K,int N,int nf4){
     int M=8; int8_t *A=malloc((size_t)M*K);
     for(size_t i=0;i<(size_t)M*K;i++){ s^=s<<13;s^=s>>17;s^=s<<5; A[i]=(int8_t)((int)(s&0xff)-128); }
     int32_t *Cf=malloc((size_t)M*N*4), *Cd=malloc((size_t)M*N*4), *Cr=malloc((size_t)M*N*4);
-    if(ork_mm_run_i8(c,wf,M,A,Cf)||ork_mm_run_i8(c,wd,M,A,Cd)){ printf("  [%s] run FAIL\n",kn); rc=1; }
+    if(ork_i8_mm_run(c,wf,M,A,Cf)||ork_i8_mm_run(c,wd,M,A,Cd)){ printf("  [%s] run FAIL\n",kn); rc=1; }
     else {
         cpu_ref_i4((struct ork_w_pub*)wd,M,A,Cr);
         int dfd=memcmp(Cf,Cd,(size_t)M*N*4); int dfr=memcmp(Cd,Cr,(size_t)M*N*4);
@@ -119,7 +119,7 @@ static void bench(ork_npu *c,int K,int N){
     /* a packed weight gives resident DMA tiles + a nibble store to inflate from repeatedly */
     float *f32=malloc((size_t)N*K*sizeof(float));
     uint32_t s=0x9a3u; for(size_t i=0;i<(size_t)N*K;i++){ s^=s<<13;s^=s>>17;s^=s<<5; f32[i]=((int)(s&0xffff)-32768)/9000.0f; }
-    ork_w *w = ork_mm_pack_i4a8(c,K,N,f32,NULL); free(f32);
+    ork_w *w = ork_i4a8_mm_pack(c,K,N,f32,NULL); free(f32);
     if(!w){ printf("  K%d N%d pack FAIL\n",K,N); return; }
     float *qf32=malloc((size_t)N*K*sizeof(float)); float *inv1=malloc((size_t)N*sizeof(float));
     for(int i=0;i<N;i++) inv1[i]=1.0f;
@@ -127,16 +127,16 @@ static void bench(ork_npu *c,int K,int N){
     double sm[REPS]; double GB=(double)N*K/1e9;  /* effective: int8 bytes written into the tile */
     for(int kind=0;kind<2;kind++){ const char*kn=kind?"NF4":"UNIFORM";
         /* OLD: inflate(f32) + tile_f32_i8 */
-        for(int i=0;i<WARM;i++){ ork_slice_inflate_i4a8_kind(w,qf32,kind); ork_slice_tile_i8(c,w,qf32,inv1); }
-        for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_inflate_i4a8_kind(w,qf32,kind); ork_slice_tile_i8(c,w,qf32,inv1); sm[i]=now_us()-t; }
+        for(int i=0;i<WARM;i++){ ork_i4a8_slice_inflate_kind(w,qf32,kind); ork_i8_slice_tile(c,w,qf32,inv1); }
+        for(int i=0;i<REPS;i++){ double t=now_us(); ork_i4a8_slice_inflate_kind(w,qf32,kind); ork_i8_slice_tile(c,w,qf32,inv1); sm[i]=now_us()-t; }
         double oldm=median(sm,REPS);
         /* NEW: direct inflate->int8-tiled (full) + the inflate-only split */
-        for(int i=0;i<WARM;i++) ork_slice_direct_i4a8_kind(c,w,i8,kind);
-        for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_direct_i4a8_kind(c,w,i8,kind); sm[i]=now_us()-t; }
+        for(int i=0;i<WARM;i++) ork_i4a8_slice_direct_kind(c,w,i8,kind);
+        for(int i=0;i<REPS;i++){ double t=now_us(); ork_i4a8_slice_direct_kind(c,w,i8,kind); sm[i]=now_us()-t; }
         double newm=median(sm,REPS);
         double inf[REPS];
-        for(int i=0;i<WARM;i++) ork_slice_direct_inflate_i8(w,i8,kind);
-        for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_direct_inflate_i8(w,i8,kind); inf[i]=now_us()-t; }
+        for(int i=0;i<WARM;i++) ork_i8_slice_direct_inflate(w,i8,kind);
+        for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_slice_direct_inflate(w,i8,kind); inf[i]=now_us()-t; }
         double infm=median(inf,REPS);
         printf("  K%-5d N%-5d %-7s  old %8.1f us (%5.2f GB/s)   direct %8.1f us (%5.2f GB/s)   %.2fx   [direct inflate %.1f / tile+bsync %.1f]\n",
             K,N,kn, oldm, GB/(oldm*1e-6), newm, GB/(newm*1e-6), oldm/newm, infm, newm-infm);

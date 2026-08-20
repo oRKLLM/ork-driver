@@ -29,7 +29,7 @@ int main(int argc, char**argv){
     ork_npu *c = ork_npu_init(); if(!c){ printf("init failed\n"); return 2; }
     int K=512, N=64;   /* tiny weight (32KB, ~3us DMA) so the slope is chain overhead, not bandwidth */
     int8_t *B = malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w *w = ork_mm_pack_i8(c,K,N,B); free(B);
+    ork_w *w = ork_i8_mm_pack(c,K,N,B); free(B);
     if(!w){ printf("pack fail\n"); return 2; }
     printf("chain_marginal_probe: K=%d N=%d iters=%d  (M=128 forces the single-ioctl HW-chain path)\n",K,N,iters);
 
@@ -47,14 +47,14 @@ int main(int argc, char**argv){
     for(int j=0;j<nN;j++){
         int Nj=Ns[j];
         int8_t *Bj=malloc((size_t)K*Nj); memset(Bj,1,(size_t)K*Nj);
-        ork_w *wj=ork_mm_pack_i8(c,K,Nj,Bj); free(Bj);
+        ork_w *wj=ork_i8_mm_pack(c,K,Nj,Bj); free(Bj);
         if(!wj){ printf("  %4d  pack fail\n",Nj); continue; }
         int8_t *A=malloc((size_t)M*K); memset(A,1,(size_t)M*K);
         int32_t *Cs[64]; ork_mm_task_i8 tk[64];
         for(int i=0;i<S;i++){ Cs[i]=calloc((size_t)M*Nj,4); tk[i]=(ork_mm_task_i8){wj,M,A,Cs[i]}; }
-        int rc=ork_mm_run_chain_i8(c,S,tk);
+        int rc=ork_i8_mm_run_chain(c,S,tk);
         if(rc){ printf("  %4d  rc=%d\n",Nj,rc); for(int i=0;i<S;i++){ free(Cs[i]); } free(A); continue; }
-        double t0=now_us(); for(int i=0;i<iters;i++){ ork_mm_run_chain_i8(c,S,tk); } double per=(now_us()-t0)/iters/S;
+        double t0=now_us(); for(int i=0;i<iters;i++){ ork_i8_mm_run_chain(c,S,tk); } double per=(now_us()-t0)/iters/S;
         int bad=0; for(int i=0;i<S;i++){ for(size_t e=0;e<(size_t)M*Nj;e++){ if(Cs[i][e]!=K){bad++;break;} } }
         printf("  %4d  %4d   %7.2f     (%d)%s\n", Nj, K*Nj/1024, per, K*Nj, bad?"  C!=K":"");
         xs[np]=(double)K*Nj; ys[np]=per; np++;

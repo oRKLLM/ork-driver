@@ -1,6 +1,6 @@
 /* fused_resident_probe — task #20 (a): the fused activation, PACKED ONCE and RUN MANY resident. Proves the
- * calibration (LUT build + S-pack) is factored out of the per-call path (ork_mm_pack_f16_fused_act), so a
- * fused C=fn(A·B) matmul can live resident and replay with NO re-pack (ork_mm_run_f16_fused_act) — the
+ * calibration (LUT build + S-pack) is factored out of the per-call path (ork_f16_mm_pack_fused_act), so a
+ * fused C=fn(A·B) matmul can live resident and replay with NO re-pack (ork_f16_mm_run_fused_act) — the
  * enabler for composing fused exp/rsqrt/silu inside a resident seq (per-call re-pack would defeat residency).
  *   R1/R2: exp(Q·K^T) on TWO different Q against the SAME resident weight -> validate both vs CPU exp.
  *   sudo env ORK_MM_TIMEOUT=3000 timeout 60 ./fused_resident_probe [M] [d] [n]
@@ -35,12 +35,12 @@ int main(int argc,char**argv){
         for(int m=0;m<M;m++)for(int j=0;j<n;j++){ double s=0; for(int k=0;k<d;k++) s+=(double)(float)Q[(size_t)m*d+k]*(float)KT[(size_t)k*n+j]; if(s<lo)lo=(float)s; } }
     printf("  score band [%.3f, 0]\n", lo);
     /* PACK ONCE: bake exp LUT + S-weight into the resident weight */
-    ork_w *w=ork_mm_pack_f16_fused_act(c,d,n,KT,myexp,NULL,(double)lo-0.01,0.0);
+    ork_w *w=ork_f16_mm_pack_fused_act(c,d,n,KT,myexp,NULL,(double)lo-0.01,0.0);
     if(!w){ printf("FAIL pack_f16_fused_act -> NULL (PPU off / shape / mixed-sign)\n"); ork_npu_free(c); return 1; }
     /* RUN MANY: two different Q against the same resident weight, no re-pack */
     float *C1=malloc((size_t)M*n*4), *C2=malloc((size_t)M*n*4);
-    int r1=ork_mm_run_f16_fused_act(c,w,M,Q1,C1);
-    int r2=ork_mm_run_f16_fused_act(c,w,M,Q2,C2);
+    int r1=ork_f16_mm_run_fused_act(c,w,M,Q1,C1);
+    int r2=ork_f16_mm_run_fused_act(c,w,M,Q2,C2);
     printf("  run R1 rc=%d  R2 rc=%d (same resident weight, no re-pack)\n",r1,r2);
     int fail=(r1||r2)?1:0;
     if(!r1) fail|=check("R1",C1,Q1,KT,M,d,n);

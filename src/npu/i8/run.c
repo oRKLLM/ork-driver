@@ -30,8 +30,8 @@
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
-/* RUN the slot's matmul (must be mapped). Same as ork_mm_run_i8 on the slot's view. */
-int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+/* RUN the slot's matmul (must be mapped). Same as ork_i8_mm_run on the slot's view. */
+int ork_i8_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op so the daemon zero-copy-swaps to it */
         /* ZERO-COPY transport (ORK_ORKD_ZC): A+C ride SCM_RIGHTS dma-buf fds; the daemon reads A / writes C IN
@@ -42,7 +42,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I8,A,C); if(r!=-2) return r; }
         return orkd_run_i8(c->daemon, w->orkd_id, M, w->K, w->N, A, C); }
     if(w->dtype!=DT_I8) return -1;
-    if(orki_check_overlap("ork_mm_run_i8", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_i8_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* ORK_RUN_TRACE=N: dump A(int8 input) + C(int32 output) stats for the first N int8 matmuls of the real
      * orki_run (NOT a synthetic tool). A garbage => backend act-quant (stage 2); C garbage w/ sane A => weight
      * bytes/tiling (stage 1); both sane => the garbage is dequant/scales (stage 4). Flushed per line. */
@@ -73,7 +73,7 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     return r;
 }
 
-int orki_slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
+int orki_i8_slice_run(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
     int ks = w->ks, ns = w->ns;   /* balanced tile step baked at orki_pack (equal-width N-tiles >= cores) */
     int nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N, Kpad = w->Kpad;
@@ -120,7 +120,7 @@ int orki_slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32
     free(Aslc); free(part); free(tasks); return rc;
 }
 
-int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
+int ork_i8_mm_run_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
                        int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                        const int16_t *lut,int nlut){
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -168,8 +168,8 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             /* matmul + fused-SiLU output stage -> int8 in c->Cc (via submit1: warmup + domain) */
             uint32_t rc[REGCMD_I8_N];
-            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            orki_set_i8_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            orki_i8_synth(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_i8_set_silu(rc,Nc,0,r_mult,r_shift,out_bias,idx_off,cfg4068);
             if(orki_validate_regcmd("i8_silu",c,rc,REGCMD_I8_N,w,NULL,0)){ rc_ret=-1; break; }   /* stamp real op/weight so a submit-failure dump isn't a STALE probe label (mis-diagnosis) + sanity-check addrs */
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
@@ -183,10 +183,10 @@ int ork_mm_run_i8_silu(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,
     return rc_ret;
 }
 
-/* ork_mm_run_i8_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
- * Same path as ork_mm_run_i8_silu but the silu value is emitted at int32 precision (dequant with the fine
+/* ork_i8_mm_run_silu32 — resident full-K int8 matmul + fused SiLU with INT32 output (C is int32 [M*N]).
+ * Same path as ork_i8_mm_run_silu but the silu value is emitted at int32 precision (dequant with the fine
  * out_scale the LUT was built for). K%512, K<=4096, N%32. 0/ok, -1 wedge, -2 shape, -3 SoC. */
-int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
+int ork_i8_mm_run_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
                          int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,
                          const int16_t *lut,int nlut){
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -225,8 +225,8 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
-            orki_set_i8_silu32(rc,Nc,r_mult,r_shift,out_bias,idx_off,cfg4068);
+            orki_i8_synth(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);  /* default = int32 out */
+            orki_i8_set_silu32(rc,Nc,r_mult,r_shift,out_bias,idx_off,cfg4068);
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
@@ -243,22 +243,22 @@ int ork_mm_run_i8_silu32(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C,
 }
 
 double orki_silu_f(double x);   /* fwd decl (defined below near the other activation refs) */
-/* ork_mm_build_f16_lut — GENERIC fp16 fused-output PWL LUT builder (the fp16 twin of the int8/int16
- * orki_act_lut_i8/i16(fn,...) path). Bakes an arbitrary scalar fn(x) into the SDP output-stage LUT for inputs
+/* ork_f16_mm_build_lut — GENERIC fp16 fused-output PWL LUT builder (the fp16 twin of the int8/int16
+ * orki_i8_act_lut/i16(fn,...) path). Bakes an arbitrary scalar fn(x) into the SDP output-stage LUT for inputs
  * x in [in_lo,in_hi]. The fp16 SDP index only spreads for NEGATIVE acc, so a reduce/gate matmul packed as
  * -S*W (S returned) drives acc=-S*x into the spread band; runtime C_out = R*LUT[idx(acc)] and the caller
  * recovers fn(x) = C_out*out_scale. 2-pass self-contained probe: measure R/bias, then idx(acc), then fill
  * LUT[idx] with fn at the sample points + interpolate. S = ATGT/max|in| (ORK_F16_ATGT); out_scale =
  * max_n|fn(sample_n)|/8000. fn(x,ctx) carries params via ctx (e.g. {n_feat,eps} for rsqrt; NULL for silu).
- * 0/ok, -2 fail. Consolidates the former ork_mm_build_f16_silu_lut + _rsqrt_lut (now thin wrappers). */
-/* fn adapters for ork_mm_build_f16_lut (silu takes no params; rsqrt carries n_feat/eps in ctx) */
+ * 0/ok, -2 fail. Consolidates the former ork_f16_mm_build_silu_lut + _rsqrt_lut (now thin wrappers). */
+/* fn adapters for ork_f16_mm_build_lut (silu takes no params; rsqrt carries n_feat/eps in ctx) */
 
 /* ---- FUSED matmul + output-stage activation: C = fn(A·B) in ONE submit (the "no-crossing chain") --------
  * The activation rides the matmul's DPU output stage — no separate activation submit, no CPU<->NPU crossing,
  * no mode-switch re-warm. This is the ONLY regime where an on-NPU non-matmul op beats CPU/NEON (a standalone
  * op is submit-floor-bound; see RE-roadmap M4.6). Mechanism: build the fn PWL LUT over the matmul-output range
- * [in_lo,in_hi] (ork_mm_build_f16_lut), pack the weight as -S*B so acc=-S*(A·B) lands in the fp16 index-spread
- * band, run the fused-LUT matmul (ork_mm_run_f16_silu is fn-agnostic — it applies whatever LUT it's given),
+ * [in_lo,in_hi] (ork_f16_mm_build_lut), pack the weight as -S*B so acc=-S*(A·B) lands in the fp16 index-spread
+ * band, run the fused-LUT matmul (ork_f16_mm_run_silu is fn-agnostic — it applies whatever LUT it's given),
  * then recover fn(x)=C*out_scale. This is what realizes on-NPU softmax(exp)/RMSNorm(rsqrt)/SwiGLU(silu) as a
  * fused output stage rather than a losing standalone op. The matmul output MUST fall in [in_lo,in_hi] (the
  * LUT's calibrated band; values outside clamp to the edge). Single tile: K%32<=2048, N%16<=nmax. rk3588
@@ -268,14 +268,14 @@ double orki_silu_f(double x);   /* fwd decl (defined below near the other activa
 
 /* PACK-ONCE fused-activation weight: calibrate the fn PWL LUT over [in_lo,in_hi] and pack the S-scaled weight,
  * baking BOTH into the resident ork_w (w->fa_lut / w->fa_osc). This factors the calibration OUT of the per-call
- * path so a fused-activation matmul can be RESIDENT — packed once, run many times via ork_mm_run_f16_fused_act
+ * path so a fused-activation matmul can be RESIDENT — packed once, run many times via ork_f16_mm_run_fused_act
  * (no per-call LUT rebuild / re-pack), which is what lets fused exp/rsqrt/silu compose in a resident seq (a
- * standalone re-pack every call defeats residency). Same single-signed constraint as ork_mm_run_f16_act:
+ * standalone re-pack every call defeats residency). Same single-signed constraint as ork_f16_mm_run_act:
  * in_lo>=0 (positive-input, pack -S*B) or in_hi<=0 (negative-input via neg-trampoline, pack +S*B); mixed -> NULL.
  * The returned weight carries fn baked in — the run path needs NO fn pointer (so it crosses a socket/seq op). */
 
 /* RUN a pre-packed fused-activation weight: C = fn(A·B) in ONE submit, reusing the resident LUT/scale. The
- * fused-activation twin of ork_mm_run_stream_f16 — no calibration, no re-pack. -2 if w has no baked LUT. */
+ * fused-activation twin of ork_f16_mm_run_stream — no calibration, no re-pack. -2 if w has no baked LUT. */
 
 
 /* Thin wrapper: fused SiLU LUT for a gate spanning [-Gmax,Gmax]. Caps Gmax (ORK_F16_GCAP, default 40) so S
@@ -284,16 +284,16 @@ double orki_silu_f(double x);   /* fwd decl (defined below near the other activa
 /* Thin wrapper: fused rsqrt LUT baking 1/sqrt(ss/n_feat+eps) over ss in [ss_min,ss_max] — for on-NPU
  * rmsnorm (n_feat=n) / l2norm (n_feat=1). A reduce-matmul packed as -S*W emits the norm SCALE directly.
  * PRECISION VARIANTS: this is the fp16, fused-into-the-reduce rsqrt. The int8/int16 STANDALONE rsqrt of a
- * tensor is ork_npu_rsqrt_i8/i16 (built via orki_act_lut_i8/i16 with the same orki_rsqrt_f). Same op, different
+ * tensor is ork_i8_npu_rsqrt/i16 (built via orki_i8_act_lut/i16 with the same orki_rsqrt_f). Same op, different
  * precision + fusion regime — keep both. Build once per (layer,range) + cache (it runs probe submits). */
 
 /* Resident-weight fused UP matmul + element-wise MULTIPLY by G (=silu(gate)) in the SDP output stage:
  * C = clamp_i8( round( (A·W_up) * G * gain ) ), gain = mult/2^shift = s_up*s_silu/s_out. Completes the
- * fused SwiGLU (gate via ork_mm_run_i8_silu -> G; up here). The 2nd operand G is fetched by the SDP
+ * fused SwiGLU (gate via ork_i8_mm_run_silu -> G; up here). The 2nd operand G is fetched by the SDP
  * DPU_RDMA (0x5038) — set_i8_ewmul + orki_splice_ew_lane graft it onto ork's conv+int8-out program (regcfg
  * 108->126, enable 0x1d). Resident full-K int8 weight (K%512==0, K<=4096), N-tiled, single-core,
  * M-tile<=64/submit. G is dense int8 [M*N] (same layout as the output). rk3588 only. 0/ok,-1,-2,-3. */
-int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *G,int8_t *C,int mult,int shift){
+int ork_i8_mm_run_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *G,int8_t *C,int mult,int shift){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
@@ -317,9 +317,9 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
             orki_bsync(fd,&Gb,RKNPU_MEM_SYNC_TO_DEVICE);
             orki_act(fd,RKNPU_ACT_RESET,0);
             uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
-            orki_synth_i8(base,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_i8_synth(base,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
             orki_splice_ew_lane(rc,base);
-            orki_set_i8_ewmul(rc,mc,Nc,0,mult,shift,(uint32_t)Gb.dma);
+            orki_i8_set_ewmul(rc,mc,Nc,0,mult,shift,(uint32_t)Gb.dma);
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0x1d; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=REGCMD_I8_EW_N/2; t->regcmd_addr=c->regcmd.dma;
@@ -332,7 +332,7 @@ int ork_mm_run_i8_ewmul(ork_npu *c,ork_w *w,int M,const int8_t *A,const int8_t *
     return rc_ret;
 }
 
-int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int mult,int shift){
+int ork_i8_mm_run_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int mult,int shift){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
@@ -341,7 +341,7 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
     if(DT_I8!=c->last_dt){ c->warmed=0; c->ccsz=0; c->last_dt=DT_I8; }
     int chunk=orki_fused_mtile(K,M);                          /* mg_max*64 M-tile per submit (was 64) */
     size_t maxaf=(size_t)chunk*K, maxout=(size_t)chunk*NMAX;
-    /* realloc on size OR domain change (see ork_mm_run_i8_silu: cross-domain reuse faults the NPU) */
+    /* realloc on size OR domain change (see ork_i8_mm_run_silu: cross-domain reuse faults the NPU) */
     if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
     if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }
     int rc_ret=0;
@@ -351,8 +351,8 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            orki_set_i8_out8(rc,Nc,0,mult,shift);
+            orki_i8_synth(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_i8_set_out8(rc,Nc,0,mult,shift);
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
@@ -368,8 +368,8 @@ int ork_mm_run_i8_out8(ork_npu *c,ork_w *w,int M,const int8_t *A,int8_t *C,int m
  * COMPACT-LINEAR (m*N+n) — which is exactly the CONTIGUOUS host layout the int16 SDP seq adapters read, so a
  * seq [MM_I8_OUT16 -> exp_i16/silu_i16] carries int16 forward RESIDENT (A2) with NO hardware PC-chain and NO
  * layout bridge (sidesteps the set_i16_out chaining fragility). K%512 (int8 requant small-K limit). Twin of
- * ork_mm_run_i8_out8. 0/ok, -1 wedged, -2 dims, -3 SoC. */
-int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int mult,int shift){
+ * ork_i8_mm_run_out8. 0/ok, -1 wedged, -2 dims, -3 SoC. */
+int ork_i8_mm_run_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int mult,int shift){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(w->dtype!=DT_I8 || !w->Bf) return -2;
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
@@ -387,8 +387,8 @@ int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int m
             int8_t*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             uint32_t rc[REGCMD_I8_N];
-            orki_synth_i8(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
-            orki_set_i16_out(rc,Nc,0,mult,shift);                                  /* int32 acc -> int16 LINEAR out */
+            orki_i8_synth(rc,mc,K,Nc,(uint32_t)c->Af.dma,(uint32_t)wbase,(uint32_t)c->Cc.dma,1,CBUF,0);
+            orki_i16_set_out(rc,Nc,0,mult,shift);                                  /* int32 acc -> int16 LINEAR out */
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
               t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=108; t->regcmd_addr=c->regcmd.dma;
@@ -405,7 +405,7 @@ int ork_mm_run_i8_out16(ork_npu *c,ork_w *w,int M,const int8_t *A,short *C,int m
  * submits REGCMD_MUL with symmetric zero-points (za=zb=zo=0), de-marshals. GENERALIZED to arbitrary M,N via
  * orki_set_mul_geom (M,N reprogrammed from the captured M=8/N=64 op). N must be a multiple of 16 (channel atom).
  * mult must be 0..0x7fff (OUT_CVT_SCALE is SIGNED 16-bit). 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
-int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
+int ork_i8_npu_ewmul(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,int mult,int shift,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i8(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -446,7 +446,7 @@ int ork_npu_ewmul_i8(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
 }
 
 
-int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us){
+int ork_i8_npu_row_max(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
@@ -491,7 +491,7 @@ int ork_npu_row_max_i8(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
     return ok;
 }
 
-int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,int mult,int shift,int8_t *out,double *us){
+int ork_i8_npu_mul_perchan(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,int mult,int shift,int8_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
@@ -527,7 +527,7 @@ int ork_npu_mul_perchan_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int 
     return ok;
 }
 
-int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
+int ork_i8_npu_add(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                    double a_scale,double b_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_add_i8(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -538,7 +538,7 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
     while(S<30 && cmax*(double)(1u<<(S+1)) <= 0x4000) S++;
     long ma=lround(ca*(double)(1u<<S)), mb=lround(cb*(double)(1u<<S));
     if(ma>0x4000)ma=0x4000; if(mb>0x4000)mb=0x4000;
-    return ork_npu_probe_add_i8(c,a,b,M,N,(int)ma,S+14,(uint32_t)mb,0,0,0,out,us);
+    return ork_i8_npu_probe_add(c,a,b,M,N,(int)ma,S+14,(uint32_t)mb,0,0,0,out,us);
 }
 
 /* ork_mm_silu_build_lut — generate ork's OWN silu LUT for the fused-output path (ork-NATIVE: no RKNN
@@ -546,7 +546,7 @@ int ork_npu_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
  * registers, correct fused SiLU is a 2-step construction (see tools/silu_native.c, validated ~1 int8):
  *   (1) MEASURE ork's index(acc) for (r_mult,r_shift,cfg4068) via one ramp-LUT calibration submit;
  *   (2) BUILD lut[idx(acc)] = clamp_int16( silu(acc*in_scale)/out_scale / R ), R=r_mult/2^r_shift; interp gaps.
- * The caller then runs the matmul via ork_npu_probe_i8_silu_cfg(..,r_mult,r_shift,0,0xffffc000,cfg4068,lut,1030,..)
+ * The caller then runs the matmul via ork_i8_npu_probe_silu_cfg(..,r_mult,r_shift,0,0xffffc000,cfg4068,lut,1030,..)
  * — do the build ONCE per (registers) and reuse the lut across matmuls of the same scale. Pick r_mult/r_shift
  * so R ~= 660*in_scale (the matmul's acc range then spans silu's transition band). out_bias MUST be 0 (the
  * validated config; the ramp readback assumes it). Fills lut[1030]. 0/ok, -1 fail. */
@@ -563,47 +563,47 @@ static int act_lut_i8_biased(ork_npu *c,double(*f)(double),double bias,const int
     if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
     if(orki_silu_calibrate_idx(c)) return -1;
     int16_t lut[1030]; orki_silu_build_curve_biased(c,f,in_scale,out_scale,bias,lut);
-    return ork_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
+    return ork_i8_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
 }
 
-int orki_act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+int orki_i8_act_lut(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     return act_lut_i8_biased(c,f,0.0,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_silu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+int ork_i8_npu_silu(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_silu_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i8(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i8_act_lut(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_gelu_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+int ork_i8_npu_gelu(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_gelu_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i8(c,orki_gelu_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i8_act_lut(c,orki_gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_rsqrt_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+int ork_i8_npu_rsqrt(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_rsqrt_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i8(c,orki_rsqrt_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i8_act_lut(c,orki_rsqrt_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_exp_i8(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
+int ork_i8_npu_exp(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_exp_i8(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i8(c,orki_exp_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i8_act_lut(c,orki_exp_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_exp_i8_biased(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,double max,int8_t *out,double *us){
+int ork_i8_npu_exp_biased(ork_npu *c,const int8_t *in,int M,int N,double in_scale,double out_scale,double max,int8_t *out,double *us){
     return act_lut_i8_biased(c,orki_exp_f,max,in,M,N,in_scale,out_scale,out,us);
 }
 
 
 
-/* ---- ASYNC ROUND-ROBIN STREAM (ork_mm_run_stream_i8) ----
+/* ---- ASYNC ROUND-ROBIN STREAM (ork_i8_mm_run_stream) ----
  * Mirrors how the closed runtime keeps the 3 cores busy (see wiki Exp-2026-06-24-RKLLM-Multicore-Capture):
  * instead of barrier-splitting ONE chain across cores, dispatch a STREAM of independent matmuls to a pool
  * of per-core workers that PULL the next task dynamically (atomic counter) and run it as a single-core
  * submit on their own core — no barrier, no static partition. A core that finishes early grabs the next
  * task immediately, so the cores pipeline and never idle on a sync point. Each worker owns its per-core
  * buffers (mrc/mtk/maf/mcc); tasks' weights are read-only-shared, outputs are disjoint. */
-int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+int ork_i8_mm_run_stream(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
     if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
@@ -616,7 +616,7 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         // orki_run()'s M>1 Bf path; the 0x1040 K-reduction schedule breaks outside it). Caller must fall back
         // to per-task run_i8 (which K-splits) for other K. Return -3 so it's distinguishable.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
-        if ((tasks[i].M + orki_chain_fullk_mcap_i8(c, w->K) - 1) / orki_chain_fullk_mcap_i8(c, w->K) > mrc_cap) return -2;
+        if ((tasks[i].M + orki_i8_chain_fullk_mcap(c, w->K) - 1) / orki_i8_chain_fullk_mcap(c, w->K) > mrc_cap) return -2;
     }
     /* P3 SPINE MIGRATION (submit consolidation). The accepted shapes (Sn==1, K%512==0, K<=4096, Bf) are
      * exactly the doorbell's multi-core int8 envelope, so route the S independent tasks onto ONE NONBLOCK
@@ -633,11 +633,11 @@ int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     return (d == S - 1) ? 0 : -1;
 }
 
-/* ---- SMALL-K int8 ROUND-ROBIN STREAM (ork_mm_run_stream_i8_sk) — int8 twin of run_stream_f16 ----
+/* ---- SMALL-K int8 ROUND-ROBIN STREAM (ork_i8_mm_run_stream_sk) — int8 twin of run_stream_f16 ----
  * run_stream_i8 is full-K only (K%512, 0x1040 schedule); this handles the scan's small single-slice int8
  * matmuls (K%32,N%16) with the SAME 3-core round-robin batching the fp16 scan uses. Per-core: memcpy int8
  * A -> maf, synth_i8, submit on core i, copy int32 C out. Caller quantizes A + dequants int32. */
-int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+int ork_i8_mm_run_stream_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     size_t maxMK=0, maxMN4=0;
@@ -669,15 +669,15 @@ int ork_mm_run_stream_i8_sk(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     return rc;
 }
 
-ork_async *ork_mm_run_i8_async (ork_npu *c, ork_w *w, int M, const int8_t  *A, int32_t *C){
+ork_async *ork_i8_mm_run_async (ork_npu *c, ork_w *w, int M, const int8_t  *A, int32_t *C){
     if (!c || !w || w->dtype != DT_I8 || M < 1) return NULL;
     return ork_async_launch((struct ork_async){ .kind=OAK_I8, .c=c, .w=w, .M=M, .A=A, .C=C }); }
 
-ork_async *ork_mm_run_stream_i8_async(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+ork_async *ork_i8_mm_run_stream_async(ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if (!c || S < 1 || !tasks) return NULL;
     return ork_async_launch((struct ork_async){ .kind=OAK_STREAM_I8, .c=c, .S=S, .tasks=tasks }); }
 
-int ork_bmm_i8_strided(ork_npu *c, int nbatch, int M, int K, int N,
+int ork_i8_bmm_strided(ork_npu *c, int nbatch, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C, const ork_bmm_strides *s){
     if(!c||!A||!B||!C||!s) return -1;
     if(nbatch<1||M<1||K<1||N<1) return -2;
@@ -685,16 +685,16 @@ int ork_bmm_i8_strided(ork_npu *c, int nbatch, int M, int K, int N,
     int8_t *Ac=malloc((size_t)M*K), *Bc=malloc((size_t)K*N);
     int cdense=orki_bmm_c_dense(s,N); int32_t *Cc = cdense?NULL:malloc((size_t)M*N*sizeof(int32_t));
     if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
-    orki_bmm_gather_i8(Bc,B+s->abs*0+s->bbs*0,K,N,s->bs_k,s->bs_n); /* batch-0 B for the pack */
-    ork_w *w = ork_mm_pack_i8(c, K, N, Bc);
+    orki_i8_bmm_gather(Bc,B+s->abs*0+s->bbs*0,K,N,s->bs_k,s->bs_n); /* batch-0 B for the pack */
+    ork_w *w = ork_i8_mm_pack(c, K, N, Bc);
     int rc=0;
     if(!w) rc=-3;
     for(int b=0;!rc&&b<nbatch;b++){
-        if(b>0){ orki_bmm_gather_i8(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
-                 if(ork_mm_repack_i8(c,w,K,N,Bc)){ rc=-4; break; } }
-        orki_bmm_gather_i8(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        if(b>0){ orki_i8_bmm_gather(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+                 if(ork_i8_mm_repack(c,w,K,N,Bc)){ rc=-4; break; } }
+        orki_i8_bmm_gather(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
         int32_t *Cout = cdense ? C+(long)b*s->cbs : Cc;
-        if(ork_mm_run_i8(c,w,M,Ac,Cout)){ rc=-5; break; }
+        if(ork_i8_mm_run(c,w,M,Ac,Cout)){ rc=-5; break; }
         if(!cdense) orki_bmm_scatter_i32(C+(long)b*s->cbs,Cc,M,N,s->cs_m,s->cs_n);
     }
     if(w) ork_mm_free(c,w);
@@ -702,9 +702,9 @@ int ork_bmm_i8_strided(ork_npu *c, int nbatch, int M, int K, int N,
     return rc;
 }
 
-int ork_bmm_i8(ork_npu *c, int nbatch, int M, int K, int N,
+int ork_i8_bmm(ork_npu *c, int nbatch, int M, int K, int N,
                const int8_t *A, const int8_t *B, int32_t *C){
-    ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_bmm_i8_strided(c,nbatch,M,K,N,A,B,C,&s);
+    ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_i8_bmm_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
 static void *stream_worker(void *vp) {
     struct streamw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core, CBUF = c->soc->cbuf_elems;
@@ -714,7 +714,7 @@ static void *stream_worker(void *vp) {
     uint32_t rc[REGCMD_I8_N + 4];
     while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
         const ork_mm_task_i8 *t = &a->tasks[k];
-        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N, mcap = orki_chain_fullk_mcap_i8(c, K);
+        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N, mcap = orki_i8_chain_fullk_mcap(c, K);
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memcpy(c->maf[i].cpu, t->A, (size_t)M * K);
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -722,7 +722,7 @@ static void *stream_worker(void *vp) {
         for (int m0 = 0; m0 < M; m0 += mcap, p++) {
             int mc = (M - m0 < mcap) ? (M - m0) : mcap;
             memset(rc, 0, sizeof rc);
-            orki_synth_i8(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
+            orki_i8_synth(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
                      (uint32_t)(c->mcc[i].dma + (size_t)m0 * N * 4), 1, CBUF, 0);
             if (p < ntiles - 1) {
                 uint64_t nd = c->mrc[i].dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
@@ -767,7 +767,7 @@ void *orki_stream_worker_i8sk(void *vp){
         int sched=(K&(K-1))==0 && K>=256 && K<2048;   /* int8 0x1040 sched zeros output for K<256 -> off at small K */
         memcpy(c->maf[i].cpu, t->A, (size_t)M*K); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         memset(rc,0,REGCMD_I8_N*4);
-        orki_synth_i8(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
+        orki_i8_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
         memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
         mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;

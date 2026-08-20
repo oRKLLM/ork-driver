@@ -20,7 +20,7 @@ int main(int argc, char **argv) {
     int32_t *C = calloc((size_t)M*N,4);
 
     ork_npu_set_pack_domain(c, 0);
-    ork_w *wt = ork_mm_pack_i8(c, K, N, B);
+    ork_w *wt = ork_i8_mm_pack(c, K, N, B);
     size_t need = ork_w_dump(wt, NULL, 0);
     void *blob = malloc(need); ork_w_dump(wt, blob, need); ork_mm_free(c, wt);
 
@@ -29,11 +29,11 @@ int main(int argc, char **argv) {
         int got = 0;
         for (int i = 0; i < W; i++) {
             ork_npu_set_pack_domain(c, dom);
-            ork_w *wi = ork_mm_load_i8_import(c, K, N, blob, need);
+            ork_w *wi = ork_i8_mm_load_import(c, K, N, blob, need);
             if (!wi) break;
             if (dom == 0 && !first0) first0 = wi;
             if (dom == 1 && !first1) first1 = wi;
-            if (ork_mm_run_i8(c, wi, M, A, C)) { printf("run fail during fill dom%d #%d\n", dom, i); break; }
+            if (ork_i8_mm_run(c, wi, M, A, C)) { printf("run fail during fill dom%d #%d\n", dom, i); break; }
             got++;
         }
         printf("filled domain %d with %d imports (~%dMB)\n", dom, got, got*16);
@@ -43,10 +43,10 @@ int main(int argc, char **argv) {
     printf("=== now ALTERNATING submits across two import-heavy domains (switch each time) ===\n");
     for (int j = 0; j < 50; j++) {
         memset(C, 0, (size_t)M*N*4);
-        int r0 = ork_mm_run_i8(c, first0, M, A, C);            /* switch -> dom0 (full) */
+        int r0 = ork_i8_mm_run(c, first0, M, A, C);            /* switch -> dom0 (full) */
         int c0 = C[0];
         memset(C, 0, (size_t)M*N*4);
-        int r1 = ork_mm_run_i8(c, first1, M, A, C);            /* switch -> dom1 (full) */
+        int r1 = ork_i8_mm_run(c, first1, M, A, C);            /* switch -> dom1 (full) */
         int c1 = C[0];
         if (r0 || r1 || c0 != K || c1 != K) {
             printf("*** FAULT at alternation #%d: dom0 rc=%d C=%d | dom1 rc=%d C=%d (expect %d)\n",

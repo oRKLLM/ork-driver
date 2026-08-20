@@ -13,7 +13,7 @@ int main(void){
     const int M=8,N=64; static ork_f16 in[512],out[512];
     for(int i=0;i<M*N;i++){ double x=-8.0+16.0*i/(M*N-1); in[i]=(ork_f16)x; }
     double us=0;
-    int r=ork_npu_probe_silu_std_f16(c,in,M,N,0xffffc000u,0x80000000u,0x69840000u,LUT_SIG_F16,LUT_SIG_F16_N,out,&us);
+    int r=ork_f16_npu_probe_silu_std(c,in,M,N,0xffffc000u,0x80000000u,0x69840000u,LUT_SIG_F16,LUT_SIG_F16_N,out,&us);
     printf("replay fp16 rc=%d (%.1f us)\n",r,us);
     if(!r) for(int i=0;i<M*N;i+=8){ double x=(float)in[i],o=(float)out[i];
         printf("  x=%7.3f out=%9.4f sig=%.4f silu=%.4f x*sig=%.4f\n",x,o,sigf(x),siluf(x),x*sigf(x)); }

@@ -207,7 +207,7 @@ static size_t fold_woff(int n,int k,int K){ int KT=(K+31)/32; return ((size_t)(n
 
 static size_t fold_c4(int m,int n,int w){ return (size_t)(n/4)*((size_t)w*4)+(size_t)m*4+(n%4); }
 
-int ork_npu_fold_run_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int ncore,int iters,double*us){
+int ork_i8_npu_fold_run(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int ncore,int iters,double*us){
     if(!c||c->fd<0) return -3;
     if(K!=FOLD_REF_K||N!=FOLD_REF_N||M<1||M>128) return -1;
     static const int SZ[]={36,32,28,24,20,16,14,12,10,8,6,4,2,1};
@@ -224,7 +224,7 @@ int ork_npu_fold_run_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8
     free(tiles);free(Ap);free(Wp);free(Craw); return r?-2:0;
 }
 
-int ork_npu_fold_op_i8(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int iters,double*us){
+int ork_i8_npu_fold_op(ork_npu*c,int K,int N,const int8_t*Wraw,int M,const int8_t*Araw,int32_t*Cout,int iters,double*us){
     int fd=c->fd; if(fd<0) return -3;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS;
     if(K!=FOLD_REF_K||M<1||M>128||nslice<1||nslice>3) return -1;
@@ -400,13 +400,13 @@ int ork_npu_fold_batch_w(ork_npu*c, int nw, ork_w**ws, int M, const int8_t*Araw,
  * PURE-CPU — the on-disk companion (orkpack v5 "Bfold") so the run path skips the per-call fold_woff repack
  * that otherwise kills mfold. Layout: nslice tiles (NS=FOLD_REF_N wide); tile s = orki_pgup(K*sliceW) holding
  * fold_woff(n,k,K) for that slice's columns. Only K==FOLD_REF_K && N<=3*FOLD_REF_N (the baked-ref fold
- * envelope); returns 0 otherwise. Byte-identical to ork_npu_fold_op_i8's per-slice W pack. out=NULL to size. */
-/* #39 mfold: load the fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") into a resident
+ * envelope); returns 0 otherwise. Byte-identical to ork_i8_npu_fold_op's per-slice W pack. out=NULL to size. */
+/* #39 mfold: load the fold-layout weight blob (ork_i8_w_dump_fold_cpu / orkpack v5 "Bfold") into a resident
  * ork_w carrying only w->Bfold (nslice bufs). Run via ork_npu_fold_run_w. Shape/size-checked; NULL on mismatch. */
-/* #39 attach a fold-layout weight blob (ork_w_dump_fold_i8_cpu / orkpack v5 "Bfold") to an EXISTING loaded/packed
- * ork_w so ork_mm_run_i8 auto-routes small-M through the fold. Bfold bufs land in w->domain. 0 ok, <0 error.
+/* #39 attach a fold-layout weight blob (ork_i8_w_dump_fold_cpu / orkpack v5 "Bfold") to an EXISTING loaded/packed
+ * ork_w so ork_i8_mm_run auto-routes small-M through the fold. Bfold bufs land in w->domain. 0 ok, <0 error.
  * No-op (0) if already attached. Caller stores the fold blob only for the winning shapes (K=3584, wide q/o N). */
-size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+size_t ork_i8_w_dump_fold_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     (void)c;
     if(!B || K!=FOLD_REF_K || N<1 || (N%32)) return 0;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return 0;   /* N up to 64*1216 (covers gate/up N=18944) */
@@ -419,7 +419,7 @@ size_t ork_w_dump_fold_i8_cpu(ork_npu *c, int K, int N, const int8_t *B, void *o
     return off;
 }
 
-ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
+ork_w *ork_i8_mm_load_fold(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K!=FOLD_REF_K || N<1 || (N%32)) return NULL;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return NULL;
     size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=orki_pgup((size_t)K*sw);}
@@ -436,7 +436,7 @@ ork_w *ork_mm_load_fold_i8(ork_npu *c,int K,int N,const void *blob,size_t n){
     return w;
 }
 
-int ork_w_attach_fold_i8(ork_npu *c, ork_w *w, const void *blob, size_t n){
+int ork_i8_w_attach_fold(ork_npu *c, ork_w *w, const void *blob, size_t n){
     if(!c||!w||w->K!=FOLD_REF_K||w->N<1||(w->N%32)) return -1;
     if(w->Bfold) return 0;
     const int NS=FOLD_REF_N; int nslice=(w->N+NS-1)/NS; if(nslice<1||nslice>64) return -1;

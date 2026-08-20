@@ -24,7 +24,7 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)M*N;i++) C[i]=0.0f;
 
     double us=0;
-    int rc=ork_npu_f16_percore_probe(c,M,K,N,A,B,C,&us,mode);
+    int rc=ork_f16_npu_percore_probe(c,M,K,N,A,B,C,&us,mode);
     if(rc<0){ printf("PCFD M=%d K=%d N=%d mode=%d : rc=%d (setup error)\n",M,K,N,mode,rc); ork_npu_free(c); return 1; }
 
     double maxerr=0, maxrel=0;                                    /* CPU fp16 reference: accumulate in float */

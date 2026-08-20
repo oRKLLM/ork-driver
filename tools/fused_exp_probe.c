@@ -1,5 +1,5 @@
 /* fused_exp_probe — task #20: the HW-CHAINABLE softmax exp — exp fused onto the score matmul's DPU output
- * stage (ork_mm_run_f16_act, fn=exp) in ONE submit (no separate exp op, no matmul->SDP crossing). This is
+ * stage (ork_f16_mm_run_act, fn=exp) in ONE submit (no separate exp op, no matmul->SDP crossing). This is
  * the M4.8 "no-crossing chain" applied to softmax: C = exp(Q·K^T) fused. Scores constructed <=0 (the
  * post-max-subtract softmax domain; fp16 SDP index spreads for a single sign). Validates vs CPU exp.
  *   sudo env ORK_MM_TIMEOUT=3000 timeout 40 ./fused_exp_probe [M] [d] [N]
@@ -27,8 +27,8 @@ int main(int argc,char**argv){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double s=0; for(int k=0;k<d;k++) s+=(double)(float)Q[(size_t)m*d+k]*(float)KT[(size_t)k*N+n];
         sc[(size_t)m*N+n]=(float)s; if(s<lo)lo=(float)s; }
     printf("  score range [%.3f, 0]\n", lo);
-    double us_est=0; int rc=ork_mm_run_f16_act(c,d,N,KT,M,Q,C,myexp,NULL,(double)lo-0.01,0.0);
-    printf("  ork_mm_run_f16_act(fn=exp) rc=%d C[0]=%.4f (want exp(%.3f)=%.4f)\n",rc,C[0],sc[0],exp(sc[0]));
+    double us_est=0; int rc=ork_f16_mm_run_act(c,d,N,KT,M,Q,C,myexp,NULL,(double)lo-0.01,0.0);
+    printf("  ork_f16_mm_run_act(fn=exp) rc=%d C[0]=%.4f (want exp(%.3f)=%.4f)\n",rc,C[0],sc[0],exp(sc[0]));
     if(rc){ printf("FAIL rc=%d\n",rc); ork_npu_free(c); return 1; }
     int bad=0; double me=0,mre=0;
     for(int i=0;i<M*N;i++){ double want=exp((double)sc[i]); double e=fabs(C[i]-want); double re=e/(want+1e-3); if(e>me)me=e; if(re>mre)mre=re; if(re>0.03&&e>4e-3)bad++; }

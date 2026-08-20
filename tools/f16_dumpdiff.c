@@ -1,5 +1,5 @@
 /* f16_dumpdiff — dump the regcmd/task/submit/buffer/bsync state of the WORKING fp16 chain
- * (ork_mm_run_stream_f16_chain) vs the FAILING fp16 doorbell (ork_dyn_begin_mc + ORK_DYN_F16)
+ * (ork_f16_mm_run_stream_chain) vs the FAILING fp16 doorbell (ork_dyn_begin_mc + ORK_DYN_F16)
  * for the SAME fp16 op (K=512,N=256,M=2), so the two [F16_DUMP] blocks can be diffed word-by-word.
  *   make f16_dumpdiff && sudo env ORK_DYN_F16=1 ORK_F16_DUMP=1 ORK_MM_TIMEOUT=3000 ./f16_dumpdiff [S]
  * Prints the doorbell dump then the chain dump on stderr; a pass/fail on each to stdout. */
@@ -17,7 +17,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     ork_f16 one=(ork_f16)1.0f;
     ork_f16*B=(ork_f16*)malloc((size_t)K*N*sizeof(ork_f16)); for(size_t i=0;i<(size_t)K*N;i++) B[i]=one;
-    ork_w*w=ork_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     ork_f16*Am=(ork_f16*)malloc((size_t)M*K*sizeof(ork_f16)); for(int i=0;i<M*K;i++) Am[i]=one;   /* references: malloc A (zero-copy DMA-A miscomputes) */
     ork_f16*A=(ork_f16*)ork_dma_alloc(c,(size_t)M*K*sizeof(ork_f16)); for(int i=0;i<M*K;i++) A[i]=one;   /* doorbell A (DMA, matches ork_dyn_test E) */
     float*Cd=(float*)ork_dma_alloc(c,(size_t)S*M*N*sizeof(float));   /* doorbell (direct) output */
@@ -32,26 +32,26 @@ int main(int argc,char**argv){
     for(int i=0;i<S;i++){ ti[i].w=w; ti[i].M=M; ti[i].A=(const int8_t*)doorA; ti[i].C=(int32_t*)(Cd+(size_t)i*M*N); }
 
     for(int it=0; it<iters; it++){
-    /* ---- REFERENCE A: ork_mm_run (submit1/run_multicore) — the canonical bit-exact fp16 path ---- */
+    /* ---- REFERENCE A: ork_f16_mm_run (submit1/run_multicore) — the canonical bit-exact fp16 path ---- */
     if(only && !strcmp(only,"run")){
         for(int i=0;i<M*N;i++) Cc[i]=-1.0f;
-        int rc=ork_mm_run(c,w,M,Am,Cc);
+        int rc=ork_f16_mm_run(c,w,M,Am,Cc);
         int okr = (Cc[N-1]>=(float)K-2 && Cc[N-1]<=(float)K+2 && Cc[M*N-1]>=(float)K-2 && Cc[M*N-1]<=(float)K+2);
         printf("[it%d] RUN     : rc=%d %s  C[0][last]=%.1f C[1][last]=%.1f C[0][0]=%.1f\n", it, rc, okr?"OK":"FAIL", Cc[N-1], Cc[M*N-1], Cc[0]);
     }
-    /* ---- REFERENCE B: ork_mm_run_stream_f16 (non-chain round-robin; the path the passing SSD test uses) ---- */
+    /* ---- REFERENCE B: ork_f16_mm_run_stream (non-chain round-robin; the path the passing SSD test uses) ---- */
     if(only && !strcmp(only,"stream")){
         for(int i=0;i<S*M*N;i++) Cc[i]=-1.0f;
-        int rc=ork_mm_run_stream_f16(c,S,tf);
+        int rc=ork_f16_mm_run_stream(c,S,tf);
         int okc=0;
         for(int i=0;i<S;i++){ int allk=1; for(int m=0;m<M;m++){ float v=Cc[(size_t)i*M*N+(size_t)m*N+(N-1)]; if(v<(float)K-2||v>(float)K+2){allk=0;break;} } if(allk)okc++; }
         printf("[it%d] STREAM  : rc=%d %d/%d ok  C[0..2][last]=%.1f %.1f %.1f  C[0][0]=%.1f\n",
                it, rc, okc, S, Cc[N-1], Cc[M*N+N-1], Cc[2*M*N+N-1], Cc[0]);
     }
-    /* ---- fp16 chain (ork_mm_run_stream_f16_chain) ---- */
+    /* ---- fp16 chain (ork_f16_mm_run_stream_chain) ---- */
     if(!only || !strcmp(only,"chain")){
         for(int i=0;i<S*M*N;i++) Cc[i]=-1.0f;
-        int rc=ork_mm_run_stream_f16_chain(c,S,tf);
+        int rc=ork_f16_mm_run_stream_chain(c,S,tf);
         int okc=0;
         for(int i=0;i<S;i++){ int allk=1; for(int m=0;m<M;m++){ float v=Cc[(size_t)i*M*N+(size_t)m*N+(N-1)]; if(v<(float)K-2||v>(float)K+2){allk=0;break;} } if(allk)okc++; }
         printf("[it%d] CHAIN   : rc=%d %d/%d ok  C[0..2][last]=%.1f %.1f %.1f  C[0][0]=%.1f\n",

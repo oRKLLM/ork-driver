@@ -161,7 +161,7 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
 
 uint32_t ork_ppflags(void);     /* fwd (defined below) */
 /* #39 WEIGHT-RESIDENT M-FOLD CHAIN (task_number=P). Each of P tasks is a width-`w` mfold tile built by the
- * validated orki_synth_i8_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all
+ * validated orki_i8_synth_mfold (bit-exact standalone at w=36); the K*N weight is loaded ONCE and shared across all
  * P tasks (HW PC-chain), amortizing the weight-DMA over M=P*w rows. Chain descriptor written at words 216-219
  * EXACTLY like the PROVEN run_chain_i8/mcworker_pref_chain; terminal task clears them. subcore_task[0..2] all
  * populated (single-core), matching run_chain_i8. Apacked = P tiles of w-row C2-16 A (w*K bytes each); Bpacked =
@@ -185,7 +185,7 @@ int ork_npu_mfold_chain(ork_npu *c, int P, int w, int K, int N,
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu;   /* P-task array (c->task is 512KB / flag 0x40b) */
     for(int t=0;t<P;t++){
         uint32_t rc[REGCMD_I8_N];
-        orki_synth_i8_mfold(rc, w, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems);
+        orki_i8_synth_mfold(rc, w, K, N, 0x1000000u, 0x2000000u, 0x3000000u, c->soc->cbuf_elems);
         orki_setrn(rc,REGCMD_I8_N,RK_CNA_FEATURE_DATA_ADDR,(uint32_t)(A.dma + (uint64_t)t*tileA));   /* this tile's A */
         orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_DATA_ADDR,(uint32_t)B.dma);                          /* shared weight */
         orki_setrn(rc,REGCMD_I8_N,RK_DPU_DST_BASE_ADDR,(uint32_t)(Cc.dma + (uint64_t)t*tileC*4));     /* this tile's C */

@@ -52,14 +52,14 @@ static int one(ork_npu *c, int K, int N, int M, int slice_all, const char *tag){
     cpuref(A,B,M,K,N,Ccpu);
 
     if(slice_all) setenv("ORK_SLICE_ALL","1",1); else unsetenv("ORK_SLICE_ALL");
-    ork_w *w = ork_mm_pack_i8(c,K,N,B);                 /* pack builds w->sliced (natural gate or ORK_SLICE_ALL) */
+    ork_w *w = ork_i8_mm_pack(c,K,N,B);                 /* pack builds w->sliced (natural gate or ORK_SLICE_ALL) */
     unsetenv("ORK_SLICE_ALL");
     if(!w){ printf("    pack FAIL\n"); return 1; }
 
     unsetenv("ORK_FORCE_SLICE_RESCUE");                 /* NATIVE path */
-    int rn = ork_mm_run_i8(c,w,M,A,Cnat);
+    int rn = ork_i8_mm_run(c,w,M,A,Cnat);
     setenv("ORK_FORCE_SLICE_RESCUE","1",1);             /* FORCE the rescue */
-    int rr = ork_mm_run_i8(c,w,M,A,Cres);
+    int rr = ork_i8_mm_run(c,w,M,A,Cres);
     unsetenv("ORK_FORCE_SLICE_RESCUE");
     ork_mm_free(c,w);
 
@@ -87,9 +87,9 @@ static int one_pad(ork_npu *c, int K, int N, int M, int slice_all, const char *t
     int32_t *Ccpu=malloc((size_t)M*N*4), *Cres=malloc((size_t)M*N*4);
     cpuref(A,B,M,K,N,Ccpu);
     if(slice_all) setenv("ORK_SLICE_ALL","1",1); else unsetenv("ORK_SLICE_ALL");
-    ork_w *w=ork_mm_pack_i8(c,K,N,B); unsetenv("ORK_SLICE_ALL");
+    ork_w *w=ork_i8_mm_pack(c,K,N,B); unsetenv("ORK_SLICE_ALL");
     if(!w){ printf("    pack FAIL\n"); free(A);free(B);free(Ccpu);free(Cres); return 1; }
-    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rr=ork_mm_run_i8(c,w,M,A,Cres); unsetenv("ORK_FORCE_SLICE_RESCUE");
+    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rr=ork_i8_mm_run(c,w,M,A,Cres); unsetenv("ORK_FORCE_SLICE_RESCUE");
     ork_mm_free(c,w);
     int fail=0; long f;
     if(rr==ORK_RC_WEDGE_PRONE){ printf("    rescue REFUSED (-501): padded tiles not built -> FAIL\n"); fail=1; }
@@ -114,9 +114,9 @@ static int one_i4(ork_npu *c, int K, int N, int M, int slice_all, const char *ta
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
     int32_t *Cres=malloc((size_t)M*N*4);
     if(slice_all) setenv("ORK_SLICE_ALL","1",1); else unsetenv("ORK_SLICE_ALL");
-    ork_w *w=ork_mm_pack_i4(c,K,N,B); unsetenv("ORK_SLICE_ALL");
+    ork_w *w=ork_i4_mm_pack(c,K,N,B); unsetenv("ORK_SLICE_ALL");
     if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(Cres); return 1; }
-    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rr=ork_mm_run_i4(c,w,M,A,Cres); unsetenv("ORK_FORCE_SLICE_RESCUE");
+    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rr=ork_i4_mm_run(c,w,M,A,Cres); unsetenv("ORK_FORCE_SLICE_RESCUE");
     int fail=0;
     if(rr==ORK_RC_WEDGE_PRONE){ printf("    rescue REFUSED (-501): int4 tiles not built -> FAIL\n"); fail=1; }
     else if(rr){ printf("    int4 rescue rc=%d FAIL\n", rr); fail=1; }
@@ -128,8 +128,8 @@ static int one_i4(ork_npu *c, int K, int N, int M, int slice_all, const char *ta
         if(!fail && !getenv("ORK_REGEN")) printf("    OK (int4 rescue golden 0x%016llx)\n",(unsigned long long)GI4[idx]); }
     if(getenv("REPS")){ int reps=atoi(getenv("REPS")); if(reps<1)reps=1;
         setenv("ORK_FORCE_SLICE_RESCUE","1",1);
-        for(int q=0;q<2;q++) ork_mm_run_i4(c,w,M,A,Cres);
-        double t0=now_us(); for(int r=0;r<reps;r++) ork_mm_run_i4(c,w,M,A,Cres); double us=(now_us()-t0)/reps;
+        for(int q=0;q<2;q++) ork_i4_mm_run(c,w,M,A,Cres);
+        double t0=now_us(); for(int r=0;r<reps;r++) ork_i4_mm_run(c,w,M,A,Cres); double us=(now_us()-t0)/reps;
         unsetenv("ORK_FORCE_SLICE_RESCUE");
         printf("    PERF: int4 rescue = %.1f us/call (%d K-slice x %d N-tile)\n", us, (((K+31)/32*32)+8191)/8192, (N+8191)/8192); }
     ork_mm_free(c,w); free(A);free(B);free(Cres);
@@ -146,10 +146,10 @@ static int one_i4_natural(ork_npu *c, int K, int N, int M, const char *tag){
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4();
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
     int32_t *Cnat=malloc((size_t)M*N*4), *Cfor=malloc((size_t)M*N*4);
-    ork_w *w=ork_mm_pack_i4(c,K,N,B);   /* natural gate builds w->sliced (Sn>1) */
+    ork_w *w=ork_i4_mm_pack(c,K,N,B);   /* natural gate builds w->sliced (Sn>1) */
     if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(Cnat);free(Cfor); return 1; }
-    unsetenv("ORK_FORCE_SLICE_RESCUE"); int rn=ork_mm_run_i4(c,w,M,A,Cnat);   /* run_i4_mc_db -4 -> rescue */
-    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rf=ork_mm_run_i4(c,w,M,A,Cfor); unsetenv("ORK_FORCE_SLICE_RESCUE");
+    unsetenv("ORK_FORCE_SLICE_RESCUE"); int rn=ork_i4_mm_run(c,w,M,A,Cnat);   /* run_i4_mc_db -4 -> rescue */
+    setenv("ORK_FORCE_SLICE_RESCUE","1",1); int rf=ork_i4_mm_run(c,w,M,A,Cfor); unsetenv("ORK_FORCE_SLICE_RESCUE");
     int fail=0; long f;
     if(rn==ORK_RC_WEDGE_PRONE){ printf("    NATURAL refuse did NOT route to rescue (-501) -> wiring FAIL\n"); fail=1; }
     else if(rn||rf){ printf("    rc natural=%d forced=%d FAIL\n",rn,rf); fail=1; }
@@ -161,11 +161,11 @@ static int one_i4_natural(ork_npu *c, int K, int N, int M, const char *tag){
             printf(b2?"    vs CPU: %ld mism\n":"    vs CPU: bit-exact\n",b2); free(Ccpu); } }
     if(!fail && !getenv("ORK_REGEN")) printf("    OK (natural refuse->rescue, rc=0, ==forced, golden 0x%016llx)\n",(unsigned long long)GI4[idx]);
     if(getenv("REPS")){ int reps=atoi(getenv("REPS")); if(reps<1)reps=1;
-        for(int q=0;q<2;q++) ork_mm_run_i4(c,w,M,A,Cnat);   /* natural path (run_i4_mc_db -4 attempt -> rescue) */
-        double t0=now_us(); for(int r=0;r<reps;r++) ork_mm_run_i4(c,w,M,A,Cnat); double usn=(now_us()-t0)/reps;
+        for(int q=0;q<2;q++) ork_i4_mm_run(c,w,M,A,Cnat);   /* natural path (run_i4_mc_db -4 attempt -> rescue) */
+        double t0=now_us(); for(int r=0;r<reps;r++) ork_i4_mm_run(c,w,M,A,Cnat); double usn=(now_us()-t0)/reps;
         setenv("ORK_FORCE_SLICE_RESCUE","1",1);             /* forced: rescue ONLY (skips the -4 attempt) */
-        for(int q=0;q<2;q++) ork_mm_run_i4(c,w,M,A,Cfor);
-        double t1=now_us(); for(int r=0;r<reps;r++) ork_mm_run_i4(c,w,M,A,Cfor); double usf=(now_us()-t1)/reps;
+        for(int q=0;q<2;q++) ork_i4_mm_run(c,w,M,A,Cfor);
+        double t1=now_us(); for(int r=0;r<reps;r++) ork_i4_mm_run(c,w,M,A,Cfor); double usf=(now_us()-t1)/reps;
         unsetenv("ORK_FORCE_SLICE_RESCUE");
         printf("    PERF: natural(with -4 attempt)=%.1f us  forced(rescue only)=%.1f us  attempt-tax=%.1f us\n", usn, usf, usn-usf); }
     ork_mm_free(c,w); free(A);free(B);free(Cnat);free(Cfor);
@@ -187,9 +187,9 @@ static int one_i4g(ork_npu *c, int M, int K, int N, int G, const char *tag){
         aS[m*Sk+g]=mx/7; for(int j=0;j<G;j++){ int q=(int)(Af[m*K+g*G+j]/aS[m*Sk+g]+(Af[m*K+g*G+j]>=0?.5f:-.5f)); if(q>7)q=7; if(q<-8)q=-8; Ai[m*K+g*G+j]=(signed char)q; } }
     for(int g=0;g<Sk;g++)for(int n=0;n<N;n++){ float mx=1e-9f; for(int j=0;j<G;j++){ float b=Bf[(g*G+j)*N+n]; if(b<0)b=-b; if(b>mx)mx=b; }
         bS[g*N+n]=mx/7; for(int j=0;j<G;j++){ int q=(int)(Bf[(g*G+j)*N+n]/bS[g*N+n]+(Bf[(g*G+j)*N+n]>=0?.5f:-.5f)); if(q>7)q=7; if(q<-8)q=-8; Bi[(g*G+j)*N+n]=(signed char)q; } }
-    ork_w *w=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
+    ork_w *w=ork_i4_mm_pack_grouped(c,K,N,Bi,G);
     if(!w){ printf("    pack_i4_grouped FAIL\n"); free(Af);free(Bf);free(aS);free(bS);free(C);free(Ai);free(Bi); return 1; }
-    int rc=ork_mm_run_i4_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
+    int rc=ork_i4_mm_run_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
     int fail=0;
     if(rc==ORK_RC_WEDGE_PRONE){ printf("    grouped rescue REFUSED (-501) -> FAIL\n"); fail=1; }
     else if(rc){ printf("    grouped run rc=%d FAIL\n", rc); fail=1; }
@@ -199,9 +199,9 @@ static int one_i4g(ork_npu *c, int M, int K, int N, int G, const char *tag){
         if(maxe>=0.05){ printf("    grouped rescue maxerr=%.4f >= 0.05 FAIL\n", maxe); fail=1; }
         else printf("    OK (grouped rescue rc=0, dequant maxerr=%.4f EXACT)\n", maxe); }
     if(getenv("REPS")){ int reps=atoi(getenv("REPS")); if(reps<1)reps=1;
-        ork_w *w2=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
-        for(int q=0;q<2;q++) ork_mm_run_i4_grouped(c,w2,M,Ai,aS,bS,C);
-        double t0=now_us(); for(int r=0;r<reps;r++) ork_mm_run_i4_grouped(c,w2,M,Ai,aS,bS,C); double us=(now_us()-t0)/reps;
+        ork_w *w2=ork_i4_mm_pack_grouped(c,K,N,Bi,G);
+        for(int q=0;q<2;q++) ork_i4_mm_run_grouped(c,w2,M,Ai,aS,bS,C);
+        double t0=now_us(); for(int r=0;r<reps;r++) ork_i4_mm_run_grouped(c,w2,M,Ai,aS,bS,C); double us=(now_us()-t0)/reps;
         ork_w_free(w2);
         int nc=3, per_row=Sk, rpc=64/per_row; if(rpc<1)rpc=1; int Msub=rpc*nc; int chunks=(M+Msub-1)/Msub;
         printf("    PERF: grouped rescue (M=%d Sk=%d) = %.1f us/call (~%d M-chunks of %d rows)\n", M, Sk, us, chunks, Msub); }
@@ -216,9 +216,9 @@ static int one_i4_bch(ork_npu *c, int K, int N, int M, const char *tag){
     printf("  [%-12s] K=%d N=%d M=%d int4 NATURAL BCHAIN (Sn=%d Sk-wide=%d N%%64=%d)\n", tag, K, N, M, (N+8191)/8192, K>8192, N%64);
     int8_t *A=malloc((size_t)M*K), *B=malloc((size_t)K*N); int32_t *C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4(); for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
-    ork_w *w=ork_mm_pack_i4(c,K,N,B); if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(C); return 1; }
+    ork_w *w=ork_i4_mm_pack(c,K,N,B); if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(C); return 1; }
     printf("    submitting..."); fflush(stdout);
-    int rc=ork_mm_run_i4(c,w,M,A,C);
+    int rc=ork_i4_mm_run(c,w,M,A,C);
     printf(" done rc=%d %s\n", rc, rc==0?"(completed, no wedge)":"(nonzero)");
     ork_mm_free(c,w); free(A);free(B);free(C);
     return rc==0?0:1;

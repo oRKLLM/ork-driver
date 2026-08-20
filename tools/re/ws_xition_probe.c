@@ -26,7 +26,7 @@ static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t)
 /* build S tasks all sharing weight w (K,N), each M rows of all-ones A, own C. returns 0 ok */
 static int build_tasks(ork_npu *c, int K, int N, int M, int S, ork_w **wo, ork_mm_task_i8 *tasks, int8_t **Ao, int32_t **Cs){
     int8_t *B = malloc((size_t)K*N); memset(B, 1, (size_t)K*N);
-    ork_w *w = ork_mm_pack_i8(c, K, N, B); free(B);
+    ork_w *w = ork_i8_mm_pack(c, K, N, B); free(B);
     if(!w) return -1;
     int8_t *A = malloc((size_t)M*K); memset(A, 1, (size_t)M*K);
     *wo = w; *Ao = A;
@@ -44,12 +44,12 @@ int main(int argc, char**argv){
     ork_npu *c = ork_npu_init(); if(!c){ printf("init failed\n"); return 2; }
     printf("ws_xition_probe: iters=%d  BW/overhead separation via tiny (K512 N64 M1) tasks\n", iters);
 
-    /* ---- (1) single-submit floor: tiny task, one ork_mm_run_i8 ---- */
+    /* ---- (1) single-submit floor: tiny task, one ork_i8_mm_run ---- */
     { int K=512,N=64,M=1,S=1; ork_w*w; int8_t*A; int32_t*Cs[1]; ork_mm_task_i8 tk[1];
       if(build_tasks(c,K,N,M,S,&w,tk,&A,Cs)){ printf("pack fail (tiny)\n"); return 2; }
-      ork_mm_run_i8(c,w,M,A,Cs[0]);                                     /* warm */
+      ork_i8_mm_run(c,w,M,A,Cs[0]);                                     /* warm */
       uint64_t d0=ork_npu_dma_rw(c);
-      double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,Cs[0]); double t=(now_us()-t0)/iters;
+      double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,Cs[0]); double t=(now_us()-t0)/iters;
       uint64_t dma=(ork_npu_dma_rw(c)-d0)/iters;
       printf("\n[single submit ] tiny K512N64M1: %.2f us/submit   dma=%llu B/submit  C==K:%s\n",
              t,(unsigned long long)dma, verify(Cs,S,M,N,K)?"NO":"yes");
@@ -60,10 +60,10 @@ int main(int argc, char**argv){
     int Ss[]={1,2,4,8,16,32}; double tS[8]={0}; int nS=sizeof Ss/sizeof*Ss;
     for(int j=0;j<nS;j++){ int K=512,N=64,M=1,S=Ss[j]; ork_w*w; int8_t*A; int32_t*Cs[64]; ork_mm_task_i8 tk[64];
       if(build_tasks(c,K,N,M,S,&w,tk,&A,Cs)){ printf("  S=%d pack fail\n",S); continue; }
-      int rc=ork_mm_run_chain_i8(c,S,tk);                              /* warm */
+      int rc=ork_i8_mm_run_chain(c,S,tk);                              /* warm */
       if(rc){ printf("  S=%-2d chain rc=%d (rejected — max task_number?)\n",S,rc); for(int i=0;i<S;i++)free(Cs[i]); free(A); continue; }
       uint64_t d0=ork_npu_dma_rw(c);
-      double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_chain_i8(c,S,tk); double t=(now_us()-t0)/iters;
+      double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run_chain(c,S,tk); double t=(now_us()-t0)/iters;
       uint64_t dma=(ork_npu_dma_rw(c)-d0)/iters; tS[j]=t;
       printf("  S=%-2d  %8.2f us/chain  = %6.2f us/task   dma=%7llu B/chain   C==K:%s\n",
              S, t, t/S, (unsigned long long)dma, verify(Cs,S,M,N,K)?"NO":"yes");
@@ -79,15 +79,15 @@ int main(int argc, char**argv){
     printf("\n[realistic tile] K256 N192 M36 (ws_model best chip config):\n");
     { int K=256,N=192,M=36; ork_w*w; int8_t*A; int32_t*Cs[64]; ork_mm_task_i8 tk[64];
       if(!build_tasks(c,K,N,M,1,&w,tk,&A,Cs)){
-        ork_mm_run_i8(c,w,M,A,Cs[0]);
-        uint64_t d0=ork_npu_dma_rw(c); double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,Cs[0]);
+        ork_i8_mm_run(c,w,M,A,Cs[0]);
+        uint64_t d0=ork_npu_dma_rw(c); double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,Cs[0]);
         double ts=(now_us()-t0)/iters; uint64_t dma=(ork_npu_dma_rw(c)-d0)/iters;
         printf("  single: %.2f us  dma=%llu B  (weight=%dKB, DMA-floor=%.2fus @11GB/s)\n",
                ts,(unsigned long long)dma, K*N/1024, (K*N)/11000.0);
         free(Cs[0]);
         int S=16; for(int i=0;i<S;i++){ Cs[i]=calloc((size_t)M*N,4); tk[i].w=w; tk[i].M=M; tk[i].A=A; tk[i].C=Cs[i]; }
-        int rc=ork_mm_run_chain_i8(c,S,tk);
-        if(!rc){ uint64_t e0=ork_npu_dma_rw(c); double u0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_chain_i8(c,S,tk);
+        int rc=ork_i8_mm_run_chain(c,S,tk);
+        if(!rc){ uint64_t e0=ork_npu_dma_rw(c); double u0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run_chain(c,S,tk);
           double tc=(now_us()-u0)/iters; uint64_t dma2=(ork_npu_dma_rw(c)-e0)/iters;
           printf("  chain S=16: %.2f us = %.2f us/task  dma=%llu B  C==K:%s\n",
                  tc, tc/S, (unsigned long long)dma2, verify(Cs,S,M,N,K)?"NO":"yes");

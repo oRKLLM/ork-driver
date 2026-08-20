@@ -52,7 +52,7 @@ void *ork_pcfd_thread(void *vp){
 int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||nb<1||nb>64||M<1||K<1||N<1||K%32||N%16) return -2;
     /* B3 (chain_progs retirement): the batch of nb independent fp16 matmuls now rides the NONBLOCK-doorbell
-     * fp16 PC-chain (ork_mm_run_stream_f16_chain) instead of the legacy ork_npu_chain_progs. The stream primitive
+     * fp16 PC-chain (ork_f16_mm_run_stream_chain) instead of the legacy ork_npu_chain_progs. The stream primitive
      * owns staging + warm/reset (enters DT_F16/XP_STREAM_F16 — fp16 content tracked AS fp16, unifying this with
      * the other fp16 scan stages; the old path entered DT_I8_CHAIN, whose "genuine int8->fp16 switch needs a
      * reset" caveat this removes). Spreads the batch across cores rather than one core-0 chain. Bit-exact
@@ -62,11 +62,11 @@ int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*
     if(!w||!tk){ free(w); free(tk); return -3; }
     int ret=0;
     for(int b=0;b<nb;b++){
-        w[b]=ork_mm_pack(c,K,N,B+(size_t)b*K*N);
+        w[b]=ork_f16_mm_pack(c,K,N,B+(size_t)b*K*N);
         if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done3; }
         tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N};
     }
-    ret=ork_mm_run_stream_f16_chain(c,nb,tk);
+    ret=ork_f16_mm_run_stream_chain(c,nb,tk);
 done3:
     for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
     free(w); free(tk);
@@ -84,7 +84,7 @@ static void *stream_worker_f16(void *vp){
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
         memcpy(c->maf[i].cpu, t->A, (size_t)M*K*2); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         memset(rc,0,REGCMD_I8_N*4);
-        orki_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
+        orki_f16_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
         memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
         mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
@@ -101,12 +101,12 @@ static void *stream_worker_f16(void *vp){
     return NULL;
 }
 
-/* ---- fp16 ROUND-ROBIN STREAM (ork_mm_run_stream_f16) — fp16 twin of the int8 stream above ----
+/* ---- fp16 ROUND-ROBIN STREAM (ork_f16_mm_run_stream) — fp16 twin of the int8 stream above ----
  * Dynamic·dynamic (both operands activations): weight is pre-packed per task (ork_w, fp16 Bb tiled), A/C
  * copied via per-core staging. Each worker pulls the next task and runs a SINGLE-CORE submit on its own
  * core (core_mask=1<<i) — so nbatch independent matmuls spread across all cores. Single M-tile (the SSD
  * scan is M<=64 <= one tile); K<96 uses sched=0 (the small-K 0x1040 fix). */
-int ork_mm_run_stream_f16(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
+int ork_f16_mm_run_stream(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
@@ -143,7 +143,7 @@ static void *stream_worker_f16ch(void *vp){
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
         memcpy((char*)c->maf[i].cpu + (size_t)p*M*K*2, t->A, (size_t)M*K*2);
         memset(rc,0,REGCMD_I8_N*4);
-        orki_synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
+        orki_f16_synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
               (uint32_t)(c->mcc[i].dma + (size_t)p*M*N*4), sched, CBUF);
         if(p<cnt-1){ uint64_t next=c->mrc[i].dma + (size_t)(p+1)*REGCMD_I8_N*4;   /* PC-chain to next program */
             rc[216]=0x0010|((next&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(next>>16)&0xffff); rc[218]=0x0014|(0x0037u<<16); }
@@ -166,14 +166,14 @@ static void *stream_worker_f16ch(void *vp){
     return NULL;
 }
 
-/* ---- CHAINED-MULTICORE fp16 stream (ork_mm_run_stream_f16_chain) ----
+/* ---- CHAINED-MULTICORE fp16 stream (ork_f16_mm_run_stream_chain) ----
  * Combines the two half-wins: PC-chaining (task_number>1, one submit amortizes the ~48us submit floor over
  * many programs — like run_chain_i8) AND 3-core parallelism (like run_stream_f16). Static strided partition:
  * core i owns tasks {i, i+nc, ...}; it synths all of them into ITS mrc[i] (each program's PC next-descriptor
  * at word 216 -> 0x0010/0x0014 links to the next), builds a cnt-entry task-descriptor array in mtk[i], and
  * issues ONE task_number=cnt submit on core i. This is the fused graph the scan wanted: N submits -> nc.
  * Matmul-only chain (register-config, no LUT) -> ping-pong safe. Escapes the per-matmul submit floor. */
-int ork_mm_run_stream_f16_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
+int ork_f16_mm_run_stream_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
@@ -211,10 +211,10 @@ int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16
     ork_w **w=calloc(nb,sizeof(ork_w*)); ork_mm_task_f16 *tk=malloc((size_t)nb*sizeof(ork_mm_task_f16));
     if(!w||!tk){ free(w);free(tk); return -3; }
     int ret=0;
-    for(int b=0;b<nb;b++){ w[b]=ork_mm_pack(c,K,N,B+(size_t)b*K*N);
+    for(int b=0;b<nb;b++){ w[b]=ork_f16_mm_pack(c,K,N,B+(size_t)b*K*N);
         if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done; }
         tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N}; }
-    ret=ork_mm_run_stream_f16(c,nb,tk);
+    ret=ork_f16_mm_run_stream(c,nb,tk);
 done:
     for(int b=0;b<nb;b++) if(w[b]) ork_mm_free(c,w[b]);
     free(w);free(tk);
@@ -231,11 +231,11 @@ int ork_bmm_fp16_strided(ork_npu *c, int nbatch, int M, int K, int N,
     if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
     int rc=0;
     for(int b=0;b<nbatch;b++){
-        orki_bmm_gather_f16(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
-        orki_bmm_gather_f16(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
-        ork_w *w=ork_mm_pack(c,K,N,Bc); if(!w){ rc=-3; break; }
+        orki_f16_bmm_gather(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+        orki_f16_bmm_gather(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        ork_w *w=ork_f16_mm_pack(c,K,N,Bc); if(!w){ rc=-3; break; }
         float *Cout = cdense ? C+(long)b*s->cbs : Cc;
-        int r=ork_mm_run(c,w,M,Ac,Cout);
+        int r=ork_f16_mm_run(c,w,M,Ac,Cout);
         ork_mm_free(c,w);
         if(r){ rc=-5; break; }
         if(!cdense) orki_bmm_scatter_i32((int32_t*)(C+(long)b*s->cbs),(const int32_t*)Cc,M,N,s->cs_m,s->cs_n);

@@ -22,18 +22,18 @@ static int check(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     f16*A=malloc((size_t)M*K*2),*B=malloc((size_t)K*N*2); float*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)rnd();
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(f16)rnd();
-    ork_w*w=ork_mm_pack(ctx,K,N,B);
+    ork_w*w=ork_f16_mm_pack(ctx,K,N,B);
     if(!w){printf("pack failed %d,%d\n",K,N);free(A);free(B);free(C);return 1;}
     /* run the SAME resident weights for several M (decode then prefill); hash each run's output */
     int Ms[]={1,1,4,M}; uint64_t got=1469598103934665603ULL;
     for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
-        if(ork_mm_run(ctx,w,m,A,C)){printf("run failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        if(ork_f16_mm_run(ctx,w,m,A,C)){printf("run failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
         got=fnv64u(got,C,(size_t)m*N*4); }
     int bad=0,ret,regen=getenv("ORK_REGEN")!=NULL;
     if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){
         printf("  ok   MKN=%d,%d,%d fp16 (golden 0x%016llx)\n",M,K,N,(unsigned long long)got); ret=0;   /* fast: no O(M*N*K) ref */
     } else {   /* preserved fp32 reference (re-run the M-tiles — NPU cheap; the CPU ref is the cost) */
-        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_mm_run(ctx,w,m,A,C);
+        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_f16_mm_run(ctx,w,m,A,C);
             for(int i=0;i<m;i++)for(int n=0;n<N;n++){float ref=0;for(int k=0;k<K;k++)ref+=(float)A[(size_t)i*K+k]*(float)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;} }
         if(regen||!gold) printf("  REGEN check GOLD {%d,%d,%d} = 0x%016llxULL (mism=%d)\n",M,K,N,(unsigned long long)got,bad);
         else if(got!=gold) printf("  GOLDEN MISMATCH fp16 {%d,%d,%d} (mism=%d) — regen if intended\n",M,K,N,bad);
@@ -48,17 +48,17 @@ static int check_i8(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
-    ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
+    ork_w*w=ork_i8_mm_pack(ctx,K,N,B);
     if(!w){printf("pack_i8 failed %d,%d\n",K,N);free(A);free(B);free(C);return 1;}
     int Ms[]={1,1,4,M}; uint64_t got=1469598103934665603ULL;
     for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M;
-        if(ork_mm_run_i8(ctx,w,m,A,C)){printf("run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        if(ork_i8_mm_run(ctx,w,m,A,C)){printf("run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
         got=fnv64u(got,C,(size_t)m*N*4); }
     int bad=0,ret,regen=getenv("ORK_REGEN")!=NULL;
     if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){
         printf("  ok   MKN=%d,%d,%d int8 (golden 0x%016llx)\n",M,K,N,(unsigned long long)got); ret=0;   /* fast: no O(M*N*K) ref */
     } else {   /* preserved exact int32 reference */
-        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_mm_run_i8(ctx,w,m,A,C);
+        for(int t=0;t<4;t++){int m=Ms[t]; if(m>M)m=M; ork_i8_mm_run(ctx,w,m,A,C);
             for(int i=0;i<m;i++)for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[(size_t)i*K+k]*(int)B[(size_t)k*N+n]; if(C[(size_t)i*N+n]!=ref)bad++;} }
         if(regen||!gold) printf("  REGEN check_i8 GOLD {%d,%d,%d} = 0x%016llxULL (mism=%d)\n",M,K,N,(unsigned long long)got,bad);
         else if(got!=gold) printf("  GOLDEN MISMATCH int8 {%d,%d,%d} (mism=%d) — regen if intended\n",M,K,N,bad);
@@ -92,9 +92,9 @@ static int check_chain_prefill(ork_npu*ctx){
         int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
         for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-1);
         for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-1);
-        ork_w*w=ork_mm_pack_i8(ctx,K,N,B);
+        ork_w*w=ork_i8_mm_pack(ctx,K,N,B);
         if(!w){printf("  pack_i8 failed\n");free(A);free(B);free(C);return 1;}
-        if(ork_mm_run_i8(ctx,w,M,A,C)){printf("  run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
+        if(ork_i8_mm_run(ctx,w,M,A,C)){printf("  run_i8 failed\n");ork_w_free(w);free(A);free(B);free(C);return 1;}
         uint64_t got=fnv64(C,(size_t)M*N*4);
         uint64_t gold = s<(int)(sizeof GOLD/sizeof*GOLD) ? GOLD[s] : 0;
         int regen=getenv("ORK_REGEN")!=NULL;
@@ -136,7 +136,7 @@ static int check_chain_i8(ork_npu*ctx) {
         for (size_t j = 0; j < (size_t)Ms[i] * K; j++) A[i][j] = (int8_t)(rnd() - 1);
         for (size_t j = 0; j < (size_t)K * N; j++) B[i][j] = (int8_t)(rnd() - 1);
         
-        w[i] = ork_mm_pack_i8(ctx, K, N, B[i]);
+        w[i] = ork_i8_mm_pack(ctx, K, N, B[i]);
         if (!w[i]) { printf("pack_chain_i8 failed %d\n", i); return 1; }
         
         tasks[i].w = w[i];
@@ -146,8 +146,8 @@ static int check_chain_i8(ork_npu*ctx) {
     }
     
     int bad = 0;
-    printf("Running ork_mm_run_chain_i8...\n");
-    if (ork_mm_run_chain_i8(ctx, S, tasks)) {
+    printf("Running ork_i8_mm_run_chain...\n");
+    if (ork_i8_mm_run_chain(ctx, S, tasks)) {
         printf("run_chain_i8 failed\n");
         bad = 1;
     } else {
@@ -194,11 +194,11 @@ static int check_chain_i8_bf(ork_npu *ctx) {
         A[i] = malloc((size_t)Ms[i] * K); B[i] = malloc((size_t)K * N); C[i] = malloc((size_t)Ms[i] * N * 4);
         for (size_t j = 0; j < (size_t)Ms[i] * K; j++) A[i][j] = (int8_t)(rnd() - 1);
         for (size_t j = 0; j < (size_t)K * N; j++) B[i][j] = (int8_t)(rnd() - 1);
-        w[i] = ork_mm_pack_i8(ctx, K, N, B[i]);
+        w[i] = ork_i8_mm_pack(ctx, K, N, B[i]);
         if (!w[i]) { printf("pack_chain_i8_bf failed %d\n", i); return 1; }
         tasks[i].w = w[i]; tasks[i].M = Ms[i]; tasks[i].A = A[i]; tasks[i].C = C[i];
     }
-    int bad = 0, rc = ork_mm_run_chain_i8(ctx, S, tasks);
+    int bad = 0, rc = ork_i8_mm_run_chain(ctx, S, tasks);
     if (rc) { printf("run_chain_i8 (Bf) failed rc=%d\n", rc); bad = 1; }
     else for (int i = 0; i < S; i++) for (int r = 0; r < Ms[i]; r++) for (int n = 0; n < N; n++) {
         int32_t ref = 0; for (int k = 0; k < K; k++) ref += (int)A[i][(size_t)r*K+k] * (int)B[i][(size_t)k*N+n];
@@ -223,10 +223,10 @@ static int check_stream_i8(ork_npu *ctx) {
         A[i]=malloc((size_t)M*K); B[i]=malloc((size_t)K*N); C[i]=malloc((size_t)M*N*4);
         for (size_t j=0;j<(size_t)M*K;j++) A[i][j]=(int8_t)(rnd()-1);
         for (size_t j=0;j<(size_t)K*N;j++) B[i][j]=(int8_t)(rnd()-1);
-        w[i]=ork_mm_pack_i8(ctx,K,N,B[i]); if(!w[i]){printf("pack_stream failed %d\n",i);return 1;}
+        w[i]=ork_i8_mm_pack(ctx,K,N,B[i]); if(!w[i]){printf("pack_stream failed %d\n",i);return 1;}
         tasks[i].w=w[i]; tasks[i].M=M; tasks[i].A=A[i]; tasks[i].C=C[i];
     }
-    int bad=0, rc=ork_mm_run_stream_i8(ctx,S,tasks);
+    int bad=0, rc=ork_i8_mm_run_stream(ctx,S,tasks);
     if(rc){printf("run_stream_i8 failed rc=%d\n",rc); bad=1;}
     else for(int i=0;i<S;i++) for(int r=0;r<Ms[i];r++) for(int n=0;n<Ns[i];n++){
         int32_t ref=0; for(int k=0;k<Ks[i];k++) ref+=(int)A[i][(size_t)r*Ks[i]+k]*(int)B[i][(size_t)k*Ns[i]+n];
@@ -248,12 +248,12 @@ static int check_chain_envelope(ork_npu *ctx) {
       int8_t *B = malloc((size_t)K*N), *A = malloc((size_t)M*K); int32_t *C = malloc((size_t)M*N*4);
       for (size_t j=0;j<(size_t)K*N;j++) B[j]=(int8_t)(rnd()-1);
       for (size_t j=0;j<(size_t)M*K;j++) A[j]=(int8_t)(rnd()-1);
-      ork_w *w = ork_mm_pack_i8(ctx,K,N,B);
+      ork_w *w = ork_i8_mm_pack(ctx,K,N,B);
       ork_mm_task_i8 t = { w, M, A, C };
-      int rc_chain = w ? ork_mm_run_chain_i8(ctx, 1, &t) : 0;   /* S=1 still goes through validation... */
+      int rc_chain = w ? ork_i8_mm_run_chain(ctx, 1, &t) : 0;   /* S=1 still goes through validation... */
       ork_mm_task_i8 ts[2] = { {w,M,A,C}, {w,M,A,C} };          /* S=2 to exercise the chain path proper */
-      int rc_chain2 = w ? ork_mm_run_chain_i8(ctx, 2, ts) : 0;
-      int rc_stream = w ? ork_mm_run_stream_i8(ctx, 2, ts) : 0;
+      int rc_chain2 = w ? ork_i8_mm_run_chain(ctx, 2, ts) : 0;
+      int rc_stream = w ? ork_i8_mm_run_stream(ctx, 2, ts) : 0;
       /* chain S=1 delegates to run_i8 (handles K-split) so it may succeed; the chain proper (S>=2) and
        * the stream must reject K=768 M>1 with -3. */
       if (rc_chain2 != -3) { printf("  ENVELOPE: run_chain_i8 K=768 M=8 expected -3, got %d\n", rc_chain2); bad++; }
@@ -265,9 +265,9 @@ static int check_chain_envelope(ork_npu *ctx) {
       int8_t *B = malloc((size_t)K*N), *A = malloc((size_t)M*K); int32_t *C = malloc((size_t)M*N*4);
       for (size_t j=0;j<(size_t)K*N;j++) B[j]=(int8_t)(rnd()-1);
       for (size_t j=0;j<(size_t)M*K;j++) A[j]=(int8_t)(rnd()-1);
-      ork_w *w = ork_mm_pack_i8(ctx,K,N,B);
+      ork_w *w = ork_i8_mm_pack(ctx,K,N,B);
       ork_mm_task_i8 ts[2] = { {w,M,A,C}, {w,M,A,C} };
-      int rc = w ? ork_mm_run_chain_i8(ctx, 2, ts) : -1;
+      int rc = w ? ork_i8_mm_run_chain(ctx, 2, ts) : -1;
       if (rc) { printf("  ENVELOPE: in-envelope K=1536 chain failed rc=%d\n", rc); bad++; }
       else for (int r=0;r<M && bad<6;r++) for (int n=0;n<N;n++) {
           int32_t ref=0; for(int k=0;k<K;k++) ref+=(int)A[(size_t)r*K+k]*(int)B[(size_t)k*N+n];
@@ -277,19 +277,19 @@ static int check_chain_envelope(ork_npu *ctx) {
     return bad ? 1 : 0;
 }
 
-/* Validate the NEON f32->int8 pack (ork_mm_pack_i8_f32): pack f32 weights, run_i8, dequant with the
+/* Validate the NEON f32->int8 pack (ork_i8_mm_pack_f32): pack f32 weights, run_i8, dequant with the
  * returned per-channel bscale, compare to the f32 CPU reference (within int8 W8A8 tolerance). */
 static int check_pack_i8_f32(ork_npu *ctx) {
     int M = 8, K = 2048, N = 512;   /* K=2048 -> Sk=2 + Bf, exercises the full-K tile path too */
     float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
     for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = ((int)rnd()-128)/64.0f;     /* [N][K] n-major */
     for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
-    ork_w *w = ork_mm_pack_i8_f32(ctx, K, N, Bf, bsc);
+    ork_w *w = ork_i8_mm_pack_f32(ctx, K, N, Bf, bsc);
     if (!w) { printf("  pack_i8_f32 failed\n"); free(Bf);free(Af);free(bsc); return 1; }
     int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
     for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
         asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
-    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    int rc = ork_i8_mm_run(ctx, w, M, Ai, Ci);
     double se=0, sref=0;
     if (!rc) for (int m=0;m<M;m++) for (int n=0;n<N;n++){
         double ref=0; for(int k=0;k<K;k++) ref += (double)Af[(size_t)m*K+k]*Bf[(size_t)n*K+k];
@@ -302,7 +302,7 @@ static int check_pack_i8_f32(ork_npu *ctx) {
     return ok?0:1;
 }
 
-/* Validate the "effective w4a8" pack (ork_mm_pack_i4a8): int4-precision weights, int8 compute, int4
+/* Validate the "effective w4a8" pack (ork_i4a8_mm_pack): int4-precision weights, int8 compute, int4
  * storage. Packs f32 weights to int4 (round-to-nearest, ORK_SR unset for determinism), runs run_i8,
  * dequants with the returned per-channel bscale, and compares to a CPU reference that computes the SAME
  * int4-quantized weights (dequantized by bscale) x the int8 activations. This isolates COMPUTE
@@ -312,13 +312,13 @@ static int check_pack_i4a8(ork_npu *ctx) {
     float *Bf = malloc((size_t)N*K*sizeof(float)), *Af = malloc((size_t)M*K*sizeof(float)), *bsc = malloc((size_t)N*sizeof(float));
     for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = ((int)rnd()-128)/64.0f;     /* [N][K] n-major */
     for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
-    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    ork_w *w = ork_i4a8_mm_pack(ctx, K, N, Bf, bsc);
     if (!w) { printf("  pack_i4a8 failed\n"); free(Bf);free(Af);free(bsc); return 1; }
     /* int8-quantize A (per-row symmetric, same as the W8A8 path) */
     int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
     for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
         asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
-    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    int rc = ork_i8_mm_run(ctx, w, M, Ai, Ci);
     /* CPU reference: re-quantize the weights to int4 the SAME way (scale=max/7, RN, clamp [-7,7]),
      * dequant by bsc[n], and dot against the dequantized int8 activations. */
     double se=0, sref=0;
@@ -367,14 +367,14 @@ static int check_pack_nf4_correct(ork_npu *ctx) {
     for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = gauss();                    /* Gaussian weights: NF4's design point */
     for (size_t j=0;j<(size_t)M*K;j++) Af[j] = gauss();
     setenv("ORK_NF4", "1", 1);
-    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    ork_w *w = ork_i4a8_mm_pack(ctx, K, N, Bf, bsc);
     unsetenv("ORK_NF4");
     if (!w) { printf("  pack_i4a8(NF4) failed\n"); free(Bf);free(Af);free(bsc); return 1; }
     int qk = ork_w_quant_kind(w); int qk_ok = (qk == ORK_QK_CODEBOOK_NF4);
     int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
     for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
         asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
-    int rc = ork_mm_run_i8(ctx, w, M, Ai, Ci);
+    int rc = ork_i8_mm_run(ctx, w, M, Ai, Ci);
     /* CPU reference: per channel n, absmax=max|w|, bscale=absmax/127; each weight -> nearest NF4 level,
      * dequant = level*absmax = level*127*bscale. Compare against asc[m]*bsc[n]*Ci. */
     double se=0, sref=0;
@@ -426,7 +426,7 @@ static int check_nf4_accuracy_gate(void) {
     return ok?0:1;
 }
 
-/* (3) IMATRIX weighted scale selection (ork_mm_pack_i4a8_im, Phase 1.3): build channels where a few
+/* (3) IMATRIX weighted scale selection (ork_i4a8_mm_pack_im, Phase 1.3): build channels where a few
  * INPUT columns are "important" (large imatrix[k]) and hold mid-range, non-outlier values, while a few
  * UNIMPORTANT columns hold large outliers. Plain absmax then wastes the int4 grid resolving outliers
  * that don't matter; imatrix-weighted clip selection picks a tighter scale that resolves the important
@@ -460,8 +460,8 @@ static int check_pack_i4a8_imatrix(ork_npu *ctx) {
     }
     for (size_t j=0;j<(size_t)M*K;j++) Af[j] = ((int)rnd()-128)/64.0f;
     /* absmax pack (imatrix=NULL) and imatrix pack */
-    ork_w *w0 = ork_mm_pack_i4a8_im(ctx, K, N, Bf, NULL, bsc0);
-    ork_w *w1 = ork_mm_pack_i4a8_im(ctx, K, N, Bf, im,   bsc1);
+    ork_w *w0 = ork_i4a8_mm_pack_im(ctx, K, N, Bf, NULL, bsc0);
+    ork_w *w1 = ork_i4a8_mm_pack_im(ctx, K, N, Bf, im,   bsc1);
     if (!w0 || !w1) { printf("  pack_i4a8_im failed\n"); free(Bf);free(Af);free(bsc0);free(bsc1);free(im);
         if(w0)ork_w_free(w0); if(w1)ork_w_free(w1); return 1; }
     /* (a) NULL path byte-identical: bsc0[n] must equal absmax_n/7 exactly (the prior absmax behavior). */
@@ -478,7 +478,7 @@ static int check_pack_i4a8_imatrix(ork_npu *ctx) {
     int8_t *Ai = malloc((size_t)M*K); float *asc = malloc((size_t)M*sizeof(float)); int32_t *Ci = malloc((size_t)M*N*4);
     for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
         asc[m]=mx/127.0f; float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
-    int rc = ork_mm_run_i8(ctx, w1, M, Ai, Ci);
+    int rc = ork_i8_mm_run(ctx, w1, M, Ai, Ci);
     double se=0, sref=0; int finite=1;
     if (!rc) for (int n=0;n<N;n++){
         const float *wr = Bf + (size_t)n*K; float bs = bsc1[n], biv = bs>0?1.0f/bs:0.0f;
@@ -499,8 +499,8 @@ static int check_pack_i4a8_imatrix(ork_npu *ctx) {
 }
 
 /* COMPACT int4 persist/load round-trip (Phase 2.1): pack random f32 with int4 (NF4 or UNIFORM) via
- * ork_mm_pack_i4a8 and run it (C_resident). Dump the COMPACT int4 form (ork_w_dump_i4a8, size-query then
- * fill), reload it (ork_mm_load_i4a8) and run again (C_streamed). Asserts the Phase-2 streaming gate:
+ * ork_i4a8_mm_pack and run it (C_resident). Dump the COMPACT int4 form (ork_i4a8_w_dump, size-query then
+ * fill), reload it (ork_i4a8_mm_load) and run again (C_streamed). Asserts the Phase-2 streaming gate:
  *   (a) C_streamed == C_resident EXACTLY (same nibbles/scales/LUT => bit-identical NPU output),
  *   (b) re-dumping the loaded weight yields byte-identical bytes (full self-contained round-trip),
  *   (c) the per-channel bscale survives the round-trip. */
@@ -511,7 +511,7 @@ static int check_dump_load_i4a8(ork_npu *ctx, int nf4) {
     for (size_t j=0;j<(size_t)N*K;j++) Bf[j] = gauss();
     for (size_t j=0;j<(size_t)M*K;j++) Af[j] = gauss();
     if (nf4) setenv("ORK_NF4", "1", 1);
-    ork_w *w = ork_mm_pack_i4a8(ctx, K, N, Bf, bsc);
+    ork_w *w = ork_i4a8_mm_pack(ctx, K, N, Bf, bsc);
     if (nf4) unsetenv("ORK_NF4");
     if (!w) { printf("  dump_load_i4a8(%s): pack failed\n", tag); free(Bf);free(Af);free(bsc); return 1; }
 
@@ -519,28 +519,28 @@ static int check_dump_load_i4a8(ork_npu *ctx, int nf4) {
     int8_t *Ai = malloc((size_t)M*K); int32_t *C_res = malloc((size_t)M*N*4), *C_str = malloc((size_t)M*N*4);
     for (int m=0;m<M;m++){ float mx=1e-9f; for(int k=0;k<K;k++){float v=fabsf(Af[(size_t)m*K+k]); if(v>mx)mx=v;}
         float iv=127.0f/mx; for(int k=0;k<K;k++){int q=(int)lrintf(Af[(size_t)m*K+k]*iv); Ai[(size_t)m*K+k]=(int8_t)(q>127?127:q<-127?-127:q);} }
-    int rc1 = ork_mm_run_i8(ctx, w, M, Ai, C_res);
+    int rc1 = ork_i8_mm_run(ctx, w, M, Ai, C_res);
 
     /* dump compact int4 form: size-query then fill */
-    size_t need = ork_w_dump_i4a8(w, NULL, 0);
+    size_t need = ork_i4a8_w_dump(w, NULL, 0);
     int bad = 0;
     if (need == 0) { printf("  dump_load_i4a8(%s): size-query returned 0\n", tag); bad = 1; }
     size_t expect = 5*4 /*hdr: 2 u32 + 2 i32 + 1 u32*/ + (size_t)N*sizeof(float) + (size_t)K*N/2;
     if (!bad && need != expect) { printf("  dump_load_i4a8(%s): size %zu != expected %zu\n", tag, need, expect); bad = 1; }
     void *blob = malloc(need);
-    size_t got = ork_w_dump_i4a8(w, blob, need);
+    size_t got = ork_i4a8_w_dump(w, blob, need);
     if (!bad && got != need) { printf("  dump_load_i4a8(%s): fill returned %zu != %zu\n", tag, got, need); bad = 1; }
 
     /* reload + run */
-    ork_w *wl = bad ? NULL : ork_mm_load_i4a8(ctx, K, N, blob, need);
+    ork_w *wl = bad ? NULL : ork_i4a8_mm_load(ctx, K, N, blob, need);
     if (!bad && !wl) { printf("  dump_load_i4a8(%s): load failed\n", tag); bad = 1; }
-    int rc2 = wl ? ork_mm_run_i8(ctx, wl, M, Ai, C_str) : -1;
+    int rc2 = wl ? ork_i8_mm_run(ctx, wl, M, Ai, C_str) : -1;
 
     /* (a) bit-identical output */
     int out_exact = (!bad && rc1==0 && rc2==0) ? (memcmp(C_res, C_str, (size_t)M*N*4)==0) : 0;
     /* (b) byte-identical re-dump */
     int rt_exact = 0;
-    if (wl) { void *blob2 = malloc(need); size_t got2 = ork_w_dump_i4a8(wl, blob2, need);
+    if (wl) { void *blob2 = malloc(need); size_t got2 = ork_i4a8_w_dump(wl, blob2, need);
               rt_exact = (got2==need && memcmp(blob, blob2, need)==0); free(blob2); }
     /* (c) bscale carried + quant_kind */
     int bsc_ok = 0;
@@ -561,7 +561,7 @@ static int test_overlap_guards(ork_npu *ctx) {
     int M = 1, K = 32, N = 32;
     int8_t *B = malloc((size_t)K * N);
     for (int i = 0; i < K * N; i++) B[i] = 1;
-    ork_w *w = ork_mm_pack_i8(ctx, K, N, B);
+    ork_w *w = ork_i8_mm_pack(ctx, K, N, B);
     if (!w) {
         printf("  test_overlap_guards failed: pack_i8 failed\n");
         free(B);
@@ -573,7 +573,7 @@ static int test_overlap_guards(ork_npu *ctx) {
     int8_t *A = shared;
     int32_t *C = (int32_t *)(shared + 16); // 16 bytes offset, overlapping under K=32
 
-    int ret = ork_mm_run_i8(ctx, w, M, A, C);
+    int ret = ork_i8_mm_run(ctx, w, M, A, C);
     int bad = 0;
     if (ret != -1) {
         printf("  test_overlap_guards failed: run_i8 did not reject overlapping buffers! (ret=%d)\n", ret);
@@ -593,7 +593,7 @@ int main(void){
     /* fp16 and int8 in SEPARATE contexts: a model is one precision, and switching regcmd mode
      * (fp16<->int8) on a live context wedges the first submit in the new mode for ~6s (the NPU
      * mode is stateful — see the wiki). Each precision gets a fresh context here, which also
-     * mirrors real usage. (ork_mm_run_i8 on fp16 weights still safely returns an error.) */
+     * mirrors real usage. (ork_i8_mm_run on fp16 weights still safely returns an error.) */
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}
     ork_npu_set_core_budget(ctx, 3);
     //

@@ -1,5 +1,5 @@
 /* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
- * Duplicate of the pre-session probe i16out_probe (both drive ork_npu_probe_i16_out). Its result depends on
+ * Duplicate of the pre-session probe i16out_probe (both drive ork_i16_npu_probe_out). Its result depends on
  * the UNMERGED set_i16_out change (6fb8b9f), so it is NOT independent validation and is NOT a source for the
  * SDK supported-op derivation (origin/main examples only). Delete once the int16 output stage is validated
  * against a merged baseline. Builds as a no-op stub unless ORK_DEPRECATED_PROBES is defined. */
@@ -8,7 +8,7 @@
 int main(void){ fprintf(stderr,"[deprecated] i16out_fix_probe: quarantined duplicate of i16out_probe (build -DORK_DEPRECATED_PROBES to run)\n"); return 0; }
 #else
 /* i16out_fix_probe — root-cause + MAP the int16 matmul output stage (set_i16_out). Runs an int8 matmul with
- * the int16 output stage (ork_npu_probe_i16_out) using inputs crafted so acc(m,n)=n+32m is UNIQUE per (m,n),
+ * the int16 output stage (ork_i16_npu_probe_out) using inputs crafted so acc(m,n)=n+32m is UNIQUE per (m,n),
  * so each raw-buffer int16 slot decodes to exactly one (m,n) -> reveals the output tile layout directly.
  * Test reg fixes via env (no recompile): ORK_MM_R4010/R4038/R4050/R40c0. ORK_MM_TIMEOUT bounds a stall. Board only.
  */
@@ -26,7 +26,7 @@ int main(void){
     for(int n=0;n<N;n++){ B[0*N+n]=(int8_t)n; B[1*N+n]=32; }     /* = n + 32m  (unique 0..127) */
     int16_t out[M*N]; for(int i=0;i<M*N;i++) out[i]=-1;
     double us=0;
-    int rc=ork_npu_probe_i16_out(c,M,K,N,A,B,mult,shift,out,&us);
+    int rc=ork_i16_npu_probe_out(c,M,K,N,A,B,mult,shift,out,&us);
     printf("probe_i16_out rc=%d (0=ran,-1=wedge) %.0fus  M=%d N=%d\n", rc, us, M, N);
     if(rc==0){
         const int16_t *ob=out;

@@ -25,7 +25,7 @@ int main(void){
 
     /* build the rsqrt LUT calibrated to the ss range (+10%% margin) */
     int16_t lut[1030]; double S=0,R=0,osc=0;
-    int brc = ork_mm_build_f16_rsqrt_lut(npu, n, eps, ss_min*0.9, ss_max*1.1, lut, &S, &R, &osc);
+    int brc = ork_f16_mm_build_rsqrt_lut(npu, n, eps, ss_min*0.9, ss_max*1.1, lut, &S, &R, &osc);
     if(brc){ fprintf(stderr,"build_rsqrt_lut rc=%d (ppu-fuse off? -> SKIP)\n", brc); ork_npu_free(npu); return brc==-2?77:1; }
     fprintf(stderr,"LUT built: S=%.5f R=%.3f out_scale=%.6g\n", S, R, osc);
 
@@ -33,9 +33,9 @@ int main(void){
     ork_f16 *B=malloc((size_t)n*16*2), *sq=malloc((size_t)M*n*2); float *C=malloc((size_t)M*16*4);
     for(size_t i=0;i<(size_t)n*16;i++) B[i]=(ork_f16)(-S);
     for(size_t i=0;i<(size_t)M*n;i++){ float v=x[i]; sq[i]=(ork_f16)(v*v); }
-    ork_w *w = ork_mm_pack(npu, n, 16, B);
+    ork_w *w = ork_f16_mm_pack(npu, n, 16, B);
     if(!w){ fprintf(stderr,"pack failed\n"); return 1; }
-    int rrc = ork_mm_run_f16_silu(npu, w, M, sq, C, 0, 0xffffc000u, 0x56391100u, lut, 1030);
+    int rrc = ork_f16_mm_run_silu(npu, w, M, sq, C, 0, 0xffffc000u, 0x56391100u, lut, 1030);
     if(rrc){ fprintf(stderr,"run_f16_silu rc=%d\n", rrc); ork_mm_free(npu,w); return 1; }
 
     double maxrel=0; int worst=0;
@@ -54,9 +54,9 @@ int main(void){
     ork_f16 *Bd=malloc((size_t)Kd*16*2), *Ad=malloc((size_t)M*Kd*2); float *Cd=malloc((size_t)M*16*4);
     for(int i=0;i<Kd*16;i++) Bd[i]=(ork_f16)(-S*G/(double)Kd);
     for(int m=0;m<M;m++) for(int k=0;k<Kd;k++) Ad[(size_t)m*Kd+k]=(ork_f16)(ss[m]/G);
-    ork_w *wd=ork_mm_pack(npu,Kd,16,Bd);
+    ork_w *wd=ork_f16_mm_pack(npu,Kd,16,Bd);
     double dmax=0;
-    if(wd && ork_mm_run_f16_silu(npu,wd,M,Ad,Cd,0,0xffffc000u,0x56391100u,lut,1030)==0){
+    if(wd && ork_f16_mm_run_silu(npu,wd,M,Ad,Cd,0,0xffffc000u,0x56391100u,lut,1030)==0){
         for(int m=0;m<M;m++){ double snpu=(double)Cd[(size_t)m*16]*osc; double r=fabs(snpu-sref[m])/(fabs(sref[m])+1e-6);
             if(r>dmax)dmax=r; fprintf(stderr,"  [K32] m=%d ss=%.1f scale_npu=%.5f ref=%.5f rel=%.4f\n",m,ss[m],snpu,sref[m],r); }
     } else fprintf(stderr,"[K32] run failed\n");

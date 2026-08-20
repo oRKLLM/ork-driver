@@ -36,7 +36,7 @@ void ork_i8_fuzz_clear(void){ orki_i8_fovr_n=0; }
 
 void ork_i8_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(orki_i8_fovr_n<16){ orki_i8_fovr[orki_i8_fovr_n].blk=blk; orki_i8_fovr[orki_i8_fovr_n].reg=reg; orki_i8_fovr[orki_i8_fovr_n].val=val; orki_i8_fovr_n++; } }
 
-int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
+int ork_i8_npu_probe_mtile(ork_npu *c,int M,int K,int N,int mode,
                            const int8_t *A,const int8_t *B,int32_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
@@ -49,7 +49,7 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     if(mode==1){   /* override with the rkllm-captured M-tile program */
         orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,0x20);
         orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K/64)*M);
@@ -73,7 +73,7 @@ int ork_npu_probe_mtile_i8(ork_npu *c,int M,int K,int N,int mode,
     return ok;
 }
 
-int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
+int ork_i8_npu_probe_single(ork_npu *c,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
@@ -85,7 +85,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     int8_t*ad=c->Af.cpu; for(int j=0;j<K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);                 /* prime for int8 / clear any prior wedge */
     uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_i8_synth(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_single_i8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
@@ -99,7 +99,7 @@ int ork_npu_probe_single_i8(ork_npu *c,int K,int N,const int8_t *A,const int8_t 
     return ok;
 }
 
-int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+int ork_i8_npu_probe_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                           int mult,int shift,int8_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
@@ -112,8 +112,8 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    orki_set_i8_out8(rc,N,0,mult,shift);           /* rewrite output stage: int32 -> int8 requantize */
+    orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_i8_set_out8(rc,N,0,mult,shift);           /* rewrite output stage: int32 -> int8 requantize */
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_i8_out8", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -133,7 +133,7 @@ int ork_npu_probe_i8_out8(ork_npu *c,int M,int K,int N,const int8_t *A,const int
  * ork_i8_fuzz_add overrides apply inside synth_i8, so a caller can flip int8 stream->batch (0x405c=0 etc.)
  * and observe the resulting output layout. Output buffer is 2*M*N int32 (room for a stride-2 batch layout).
  * 0/ok, -1 wedged, -2 dims. Submit timeout honors ORK_I4_PROBE_TO_MS (fast-fail for wedgy fuzz values). */
-int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *raw){
+int ork_i8_npu_probe_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *raw){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N,0x403,-1); if(!W.cpu) return -2;
@@ -146,7 +146,7 @@ int ork_npu_probe_i8_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
     int i8sched=1; { const char*e=getenv("ORK_I8_PROBE_SCHED"); if(e) i8sched=atoi(e); }  /* 0 = no 0x1040 streaming schedule (batch test) */
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,i8sched,CBUF,0);   /* ork_i8_fuzz overrides apply inside */
+    orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,i8sched,CBUF,0);   /* ork_i8_fuzz overrides apply inside */
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_i8_mm", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);

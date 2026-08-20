@@ -37,10 +37,10 @@ int main(int argc, char **argv){
         int M=sh[s].M,K=sh[s].K,N=sh[s].N;
         signed char *A=malloc((size_t)M*K),*W=malloc((size_t)K*N); int32_t *C=malloc((size_t)M*N*4);
         for(int i=0;i<M*K;i++)A[i]=1; for(int i=0;i<K*N;i++)W[i]=1;
-        ork_w *w=ork_mm_pack_i8(c,K,N,W); if(!w){printf("%-14s pack fail\n","x");free(A);free(W);free(C);continue;}
-        ork_mm_run_i8(c,w,M,A,C);
+        ork_w *w=ork_i8_mm_pack(c,K,N,W); if(!w){printf("%-14s pack fail\n","x");free(A);free(W);free(C);continue;}
+        ork_i8_mm_run(c,w,M,A,C);
         ork_npu_floor_reset();
-        double b0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_i8(c,w,M,A,C); double wall=(now_us()-b0)/iters;
+        double b0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run(c,w,M,A,C); double wall=(now_us()-b0)/iters;
         double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
         double iou=io/n, hwu=(hw/1000.0)/n, host=wall-iou*(n/iters), disp=iou-hwu; /* iou,hwu per-submit */
         double per_call_io=io/iters, per_call_hw=(hw/1000.0)/iters;
@@ -59,16 +59,16 @@ int main(int argc, char **argv){
     { const int M=64,K=512,N=64;
       signed char *A=malloc((size_t)M*K),*W=malloc((size_t)K*N);
       for(int i=0;i<M*K;i++)A[i]=1; for(int i=0;i<K*N;i++)W[i]=1;
-      ork_w *w=ork_mm_pack_i8(c,K,N,W);
+      ork_w *w=ork_i8_mm_pack(c,K,N,W);
       static int32_t CC[8][64*64];
       int Ns[4]={1,2,4,8};
       for(int q=0;q<4;q++){ int NT=Ns[q];
         ork_mm_task_i8 mt[8]; for(int j=0;j<NT;j++){mt[j].w=w;mt[j].M=M;mt[j].A=A;mt[j].C=CC[j];}
-        int rc = (NT==1)? ork_mm_run_i8(c,w,M,A,CC[0]) : ork_mm_run_chain_i8(c,NT,mt);
+        int rc = (NT==1)? ork_i8_mm_run(c,w,M,A,CC[0]) : ork_i8_mm_run_chain(c,NT,mt);
         if(rc){printf("N=%d rc=%d\n",NT,rc);continue;}
         ork_npu_floor_reset();
         double b0=now_us();
-        for(int it=0;it<iters;it++){ if(NT==1) ork_mm_run_i8(c,w,M,A,CC[0]); else ork_mm_run_chain_i8(c,NT,mt); }
+        for(int it=0;it<iters;it++){ if(NT==1) ork_i8_mm_run(c,w,M,A,CC[0]); else ork_i8_mm_run_chain(c,NT,mt); }
         double wall=(now_us()-b0)/iters;
         double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
         double per_call_io=io/iters, per_call_hw=(hw/1000.0)/iters;
@@ -80,26 +80,26 @@ int main(int argc, char **argv){
 
     /* ---------------- (3) 3-core concurrency: run_stream S independent tasks ---------------- */
     printf("\n=== (3) 3-CORE CONCURRENCY (S independent M=64,K=512,N=64 matmuls) ===\n");
-    printf("serial = S× run_i8 (1 core). stream = ork_mm_run_stream_i8 (round-robin 3 cores).\n");
+    printf("serial = S× run_i8 (1 core). stream = ork_i8_mm_run_stream (round-robin 3 cores).\n");
     printf("if stream ≈ serial/3, independent tasks truly overlap across cores.\n\n");
     printf("%-4s %12s %12s %9s %12s\n","S","serial_us","stream_us","speedup","stream/S");
     { const int M=64,K=512,N=64;
       signed char *A=malloc((size_t)M*K),*W=malloc((size_t)K*N);
       for(int i=0;i<M*K;i++)A[i]=1; for(int i=0;i<K*N;i++)W[i]=1;
       /* distinct resident weights per task (independent) */
-      ork_w *ws[12]; for(int j=0;j<12;j++) ws[j]=ork_mm_pack_i8(c,K,N,W);
+      ork_w *ws[12]; for(int j=0;j<12;j++) ws[j]=ork_i8_mm_pack(c,K,N,W);
       static int32_t CC[12][64*64];
       int Ss[4]={3,6,9,12};
       for(int q=0;q<4;q++){ int S=Ss[q];
         ork_mm_task_i8 mt[12]; for(int j=0;j<S;j++){mt[j].w=ws[j];mt[j].M=M;mt[j].A=A;mt[j].C=CC[j];}
         /* serial */
-        for(int j=0;j<S;j++) ork_mm_run_i8(c,ws[j],M,A,CC[j]);   /* warm */
-        double s0=now_us(); for(int it=0;it<iters;it++) for(int j=0;j<S;j++) ork_mm_run_i8(c,ws[j],M,A,CC[j]);
+        for(int j=0;j<S;j++) ork_i8_mm_run(c,ws[j],M,A,CC[j]);   /* warm */
+        double s0=now_us(); for(int it=0;it<iters;it++) for(int j=0;j<S;j++) ork_i8_mm_run(c,ws[j],M,A,CC[j]);
         double serial=(now_us()-s0)/iters;
         /* stream (cross-core) */
-        int rc=ork_mm_run_stream_i8(c,S,mt);   /* warm */
+        int rc=ork_i8_mm_run_stream(c,S,mt);   /* warm */
         if(rc){printf("S=%d stream rc=%d\n",S,rc);continue;}
-        double t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_stream_i8(c,S,mt);
+        double t0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_stream(c,S,mt);
         double stream=(now_us()-t0)/iters;
         /* correctness: all-ones int8 A·W over K=512 => every C element == 512 */
         int ok=1; for(int j=0;j<S&&ok;j++) for(int e=0;e<M*N;e++) if(CC[j][e]!=K){ok=0;break;}
@@ -114,7 +114,7 @@ int main(int argc, char **argv){
     printf("%-4s %9s %9s %9s %9s %10s %6s\n","N","wall","ioctl","host","hw","hw/task","ok");
     { const int M=64,K=512,N=64;
       signed char *W=malloc((size_t)K*N); for(int i=0;i<K*N;i++)W[i]=1;
-      ork_w *w=ork_mm_pack_i8(c,K,N,W);
+      ork_w *w=ork_i8_mm_pack(c,K,N,W);
       signed char *A = ork_dma_alloc(c, (size_t)M*K);
       int32_t *Cd[32]; for(int j=0;j<32;j++) Cd[j]=ork_dma_alloc(c,(size_t)M*N*4);
       if(!A||!Cd[0]){ printf("dma_alloc failed (no dma-heap?) — skipping\n"); }
@@ -123,11 +123,11 @@ int main(int argc, char **argv){
         int Ns[6]={1,2,4,8,16,32};
         for(int q=0;q<6;q++){ int NT=Ns[q];
           ork_mm_task_i8 mt[32]; for(int j=0;j<NT;j++){mt[j].w=w;mt[j].M=M;mt[j].A=A;mt[j].C=Cd[j];}
-          int rc=(NT==1)?ork_mm_run_i8(c,w,M,A,Cd[0]):ork_mm_run_chain_i8(c,NT,mt);
+          int rc=(NT==1)?ork_i8_mm_run(c,w,M,A,Cd[0]):ork_i8_mm_run_chain(c,NT,mt);
           if(rc){printf("N=%d rc=%d\n",NT,rc);continue;}
           ork_npu_floor_reset();
           double b0=now_us();
-          for(int it=0;it<iters;it++){ if(NT==1) ork_mm_run_i8(c,w,M,A,Cd[0]); else ork_mm_run_chain_i8(c,NT,mt); }
+          for(int it=0;it<iters;it++){ if(NT==1) ork_i8_mm_run(c,w,M,A,Cd[0]); else ork_i8_mm_run_chain(c,NT,mt); }
           double wall=(now_us()-b0)/iters;
           double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
           double pio=io/iters, phw=(hw/1000.0)/iters;

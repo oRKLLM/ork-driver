@@ -1,4 +1,4 @@
-/* chain_bench — time ork_mm_run_chain_i8 for a batch of S independent int8 matmuls, so the cross-core
+/* chain_bench — time ork_i8_mm_run_chain for a batch of S independent int8 matmuls, so the cross-core
  * fan-out (ORK_CHAIN_MC) can be measured against single-core. This is the workload shape the fan-out
  * targets: many independent matmuls sharing one submit (EAGLE-3 verification, dense batches). Uses
  * malloc'd A/C (no per-task DMA) so multi-core actually engages (DMA tasks fall back to single-core).
@@ -34,7 +34,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < S; i++) {
         int8_t *B = malloc((size_t)K * N);
         for (size_t j = 0; j < (size_t)K * N; j++) B[j] = (int8_t)rnd8();
-        ork_w *w = ork_mm_pack_i8(c, K, N, B);
+        ork_w *w = ork_i8_mm_pack(c, K, N, B);
         free(B);
         if (!w) { fprintf(stderr, "pack_i8 failed at %d (K=%d N=%d)\n", i, K, N); return 1; }
         /* A/C in DMA buffers (ork_dma_alloc) so run_chain_i8 AND run_i8 use them IN-PLACE (dma_find hits)
@@ -49,7 +49,7 @@ int main(int argc, char **argv) {
     }
 
     int stream = getenv("ORK_STREAM") != NULL;
-    int rc = stream ? ork_mm_run_stream_i8(c, S, tasks) : ork_mm_run_chain_i8(c, S, tasks);  /* warmup */
+    int rc = stream ? ork_i8_mm_run_stream(c, S, tasks) : ork_i8_mm_run_chain(c, S, tasks);  /* warmup */
     if (rc) { fprintf(stderr, "run %s warmup failed rc=%d\n", stream ? "stream" : "chain", rc); return 1; }
 
     /* correctness: verify task 0 row 0 against the int32 CPU reference (the stream path is new) */
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
 
     double t0 = now_us();
     for (int it = 0; it < iters; it++) {
-        rc = stream ? ork_mm_run_stream_i8(c, S, tasks) : ork_mm_run_chain_i8(c, S, tasks);
+        rc = stream ? ork_i8_mm_run_stream(c, S, tasks) : ork_i8_mm_run_chain(c, S, tasks);
         if (rc) { fprintf(stderr, "run failed rc=%d (iter %d)\n", rc, it); return 1; }
     }
     double dt = now_us() - t0;
@@ -88,11 +88,11 @@ int main(int argc, char **argv) {
      * Skip with ORK_NO_SEP=1. */
     if (!getenv("ORK_NO_SEP")) {
         for (int i = 0; i < S; i++)   /* warm each weight on the single-submit path */
-            ork_mm_run_i8(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
+            ork_i8_mm_run(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
         double s0 = now_us();
         for (int it = 0; it < iters; it++)
             for (int i = 0; i < S; i++) {
-                rc = ork_mm_run_i8(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
+                rc = ork_i8_mm_run(c, tasks[i].w, tasks[i].M, tasks[i].A, tasks[i].C);
                 if (rc) { fprintf(stderr, "separate run failed rc=%d (i=%d)\n", rc, i); return 1; }
             }
         double sdt = now_us() - s0;

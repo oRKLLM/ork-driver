@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
            iters, K, N, mb, iters * mb / 1000.0);
 
     for (int i = 0; i < iters; i++) {
-        ork_w *w = ork_mm_pack_i8(c, K, N, B);
+        ork_w *w = ork_i8_mm_pack(c, K, N, B);
         if (!w) {
             printf("FAIL: pack #%d failed after %.1f GB cycled — IOVA NOT reclaimed (leak)\n", i, i * mb / 1000.0);
             free(B); ork_npu_free(c); return 2;

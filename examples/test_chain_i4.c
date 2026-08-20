@@ -20,7 +20,7 @@ int main(void) {
     for (int i=0; i<M2*K; i++) { sd=sd*1103515245+12345; A2[i] = (int8_t)((int)((sd>>17)%15)-7); }
     for (int i=0; i<K*N; i++) { sd=sd*1103515245+12345; B[i] = (int8_t)((int)((sd>>17)%15)-7); }
 
-    ork_w *w = ork_mm_pack_i4(ctx, K, N, B);
+    ork_w *w = ork_i4_mm_pack(ctx, K, N, B);
     if (!w) { printf("pack failed\n"); return 1; }
 
     int32_t *C1 = calloc(M1 * N, 4);
@@ -40,7 +40,7 @@ int main(void) {
         memset(C1, 0x5a, (size_t)M1 * N * 4);
         memset(C2, 0x5a, (size_t)M2 * N * 4);
 
-        int rc = ork_mm_run_chain_i4(ctx, 2, tasks);
+        int rc = ork_i4_mm_run_chain(ctx, 2, tasks);
         if (rc) { printf("run failed %d (rep %d)\n", rc, rep); return 1; }
 
         // verify task 1
@@ -80,11 +80,11 @@ int main(void) {
         SB[t] = malloc((size_t)SK * SN); SA[t] = malloc((size_t)Ms[t] * SK); SC[t] = calloc((size_t)Ms[t] * SN, 4);
         for (int i = 0; i < SK * SN; i++) { sd = sd*1103515245+12345; SB[t][i] = (int8_t)((int)((sd>>17)%15)-7); }
         for (int i = 0; i < Ms[t] * SK; i++) { sd = sd*1103515245+12345; SA[t][i] = (int8_t)((int)((sd>>17)%15)-7); }
-        sw[t] = ork_mm_pack_i4(ctx, SK, SN, SB[t]);
+        sw[t] = ork_i4_mm_pack(ctx, SK, SN, SB[t]);
         if (!sw[t]) { printf("stream pack failed\n"); return 1; }
         st[t] = (ork_mm_task_i4){ sw[t], Ms[t], SA[t], SC[t] };
     }
-    int src = ork_mm_run_stream_i4(ctx, NT, st);
+    int src = ork_i4_mm_run_stream(ctx, NT, st);
     int sbad = 0;
     if (src) { printf("stream run failed %d\n", src); sbad = 1; }
     else for (int t = 0; t < NT; t++)

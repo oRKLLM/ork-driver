@@ -64,8 +64,8 @@ static float rf(void){ g_s^=g_s<<13; g_s^=g_s>>17; g_s^=g_s<<5; return ((int)(g_
  * Returns 0 / nonzero rc. Times nothing; caller times. Uses run_stream_i8 (cross-core), falls back to
  * per-task run_i8 (the real handler's fallback) when the stream rejects the shape. */
 static int group_submit(ork_npu*c, int S, ork_mm_task_i8 *tasks, int use_stream){
-    int rc = use_stream ? ork_mm_run_stream_i8(c,S,tasks) : ork_mm_run_chain_i8(c,S,tasks);
-    if(rc){ rc=0; for(int x=0;x<S&&rc==0;x++) rc=ork_mm_run_i8(c,tasks[x].w,tasks[x].M,tasks[x].A,tasks[x].C); }
+    int rc = use_stream ? ork_i8_mm_run_stream(c,S,tasks) : ork_i8_mm_run_chain(c,S,tasks);
+    if(rc){ rc=0; for(int x=0;x<S&&rc==0;x++) rc=ork_i8_mm_run(c,tasks[x].w,tasks[x].M,tasks[x].A,tasks[x].C); }
     return rc;
 }
 
@@ -102,14 +102,14 @@ int main(int argc, char**argv){
         int build_ok=1;
         for(int e=0;e<CHAIN_DEPTH;e++){
             bsc[e]=malloc((size_t)N*sizeof(float));
-            wp[e]=ork_mm_pack_i8_f32(c,K,N,f32[e],bsc[e]);
+            wp[e]=ork_i8_mm_pack_f32(c,K,N,f32[e],bsc[e]);
             wl[e]=NULL;
             if(!wp[e]){ build_ok=0; break; }
             if(do_loaded){
                 size_t need=ork_w_dump(wp[e],NULL,0);
                 void *blob=malloc(need);
                 if(ork_w_dump(wp[e],blob,need)!=need){ printf("  dump FAIL e=%d\n",e); build_ok=0; free(blob); break; }
-                wl[e]=ork_mm_load_i8(c,K,N,blob,need);
+                wl[e]=ork_i8_mm_load(c,K,N,blob,need);
                 free(blob);
                 if(!wl[e]){ printf("  load_i8 FAIL e=%d (need=%zu)\n",e,need); build_ok=0; break; }
             }
@@ -138,7 +138,7 @@ int main(int argc, char**argv){
             double sm[REPS];
 
             /* correctness on the packed weight 0 */
-            int crc = ork_mm_run_i8(c,wp[0],M,A,Cnpu[0]);
+            int crc = ork_i8_mm_run(c,wp[0],M,A,Cnpu[0]);
             cpu_gemm_i8(M,K,N,A,B8[0],Cref);
             long maxd=0; for(size_t i=0;i<(size_t)M*N;i++){ long d=labs((long)Cnpu[0][i]-(long)Cref[i]); if(d>maxd)maxd=d; }
             int corr_bad = crc || (maxd > (long)K);
@@ -154,7 +154,7 @@ int main(int argc, char**argv){
                 for(int i=0;i<REPS;i++){ double t=now_us(); group_submit(c,CHAIN_DEPTH,tp,1); sm[i]=now_us()-t; }
                 pk_us=median(sm,REPS);
             }
-            ork_mm_run_i8(c,wp[0],M,A,Cnpu[0]); /* re-warm */
+            ork_i8_mm_run(c,wp[0],M,A,Cnpu[0]); /* re-warm */
 
             /* LOADED group submit */
             double ld_us=-1; int ld_rc=0;
@@ -162,7 +162,7 @@ int main(int argc, char**argv){
                 ork_mm_task_i8 tl[CHAIN_DEPTH];
                 for(int e=0;e<CHAIN_DEPTH;e++){ tl[e].w=wl[e]; tl[e].M=M; tl[e].A=A; tl[e].C=Cnpu[e]; }
                 /* correctness of loaded weight 0 */
-                int lcrc = ork_mm_run_i8(c,wl[0],M,A,Cnpu[0]);
+                int lcrc = ork_i8_mm_run(c,wl[0],M,A,Cnpu[0]);
                 long lmaxd=0; for(size_t i=0;i<(size_t)M*N;i++){ long d=labs((long)Cnpu[0][i]-(long)Cref[i]); if(d>lmaxd)lmaxd=d; }
                 if(lcrc || lmaxd>(long)K){ printf("  [M=%d] LOADED correctness FAIL rc=%d maxd=%ld\n",M,lcrc,lmaxd); overall_ok=0; }
                 ld_rc = group_submit(c,CHAIN_DEPTH,tl,1);
@@ -171,7 +171,7 @@ int main(int argc, char**argv){
                     for(int i=0;i<REPS;i++){ double t=now_us(); group_submit(c,CHAIN_DEPTH,tl,1); sm[i]=now_us()-t; }
                     ld_us=median(sm,REPS);
                 }
-                ork_mm_run_i8(c,wp[0],M,A,Cnpu[0]);
+                ork_i8_mm_run(c,wp[0],M,A,Cnpu[0]);
             }
 
             /* CPU: S experts x M rows */

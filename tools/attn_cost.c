@@ -30,15 +30,15 @@ int main(int argc,char**argv){
     float*S=malloc((size_t)M*L2*4),*O=malloc((size_t)M*HD*4);
     /* pack K^T (HD x L2) and V (L2 x HD) once per kv-head (GQA shares across grp q-heads) */
     ork_w*wK[NKV],*wV[NKV];
-    for(int kv=0;kv<NKV;kv++){ wK[kv]=ork_mm_pack(c,HD,L2,Kt); wV[kv]=ork_mm_pack(c,L2,HD,V);
+    for(int kv=0;kv<NKV;kv++){ wK[kv]=ork_f16_mm_pack(c,HD,L2,Kt); wV[kv]=ork_f16_mm_pack(c,L2,HD,V);
         if(!wK[kv]||!wV[kv]){printf("pack failed (M=%d L2=%d: HD%%32=%d L2%%16=%d L2%%32=%d)\n",M,L2,HD%32,L2%16,L2%32);return 1;} }
     /* warm */
-    ork_mm_run(c,wK[0],M,Q,S); ork_mm_run(c,wV[0],M,P,O);
+    ork_f16_mm_run(c,wK[0],M,Q,S); ork_f16_mm_run(c,wV[0],M,P,O);
     double t0=now();
     for(int l=0;l<NL;l++)
         for(int h=0;h<NH;h++){int kv=h/grp;
-            ork_mm_run(c,wK[kv],M,Q,S);   /* QK^T -> S[M,L2]  (softmax on CPU, omitted: cheap) */
-            ork_mm_run(c,wV[kv],M,P,O); }  /* PV   -> O[M,HD] */
+            ork_f16_mm_run(c,wK[kv],M,Q,S);   /* QK^T -> S[M,L2]  (softmax on CPU, omitted: cheap) */
+            ork_f16_mm_run(c,wV[kv],M,P,O); }  /* PV   -> O[M,HD] */
     double dt=now()-t0;
     printf("NPU attention floor: M=%d  %d matmuls (%d layers x %d heads x 2) in %.0f ms\n",
            M,NL*NH*2,NL,NH,dt*1e3);

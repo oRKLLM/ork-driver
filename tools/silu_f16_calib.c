@@ -1,4 +1,4 @@
-/* tools/silu_f16_calib.c — calibrate the fp16 fused SiLU (ork_mm_run_f16_silu), same 2-pass scheme as
+/* tools/silu_f16_calib.c — calibrate the fp16 fused SiLU (ork_f16_mm_run_silu), same 2-pass scheme as
  * silu_native does for int8: (1) probe the output relation out = R*LUT[idx] + bias via flat LUTs; (2) recover
  * idx(gate) via a ramp LUT; (3) build the silu curve at those indices; (4) validate vs CPU silu. idx_off is
  * tunable (arg) because the fp16 program's index-centering differs from int8 (positives were landing out of
@@ -18,7 +18,7 @@ static double silu(double x){ return x/(1.0+exp(-x)); }
 static ork_npu*c; static ork_w*w; static const int M=8;
 static ork_f16 *A,*B; static float *C; static double gate[N];
 static unsigned g_io, g_c4;
-static int run(const int16_t*lut){ return ork_mm_run_f16_silu(c,w,M,A,C,0,g_io,g_c4,lut,1030); }
+static int run(const int16_t*lut){ return ork_f16_mm_run_silu(c,w,M,A,C,0,g_io,g_c4,lut,1030); }
 
 int main(int argc,char**argv){
     g_io = argc>1?(unsigned)strtoul(argv[1],0,0):0xffffc000u;
@@ -32,7 +32,7 @@ int main(int argc,char**argv){
     /* NEGATE the gate: feed acc = -true*S so POSITIVE true gates -> negative acc (the region that spreads);
      * negative true gates -> positive acc -> clamp ~0 (== silu(neg)). true = -acc/S = -gate/S. */
     for(int n=0;n<N;n++){ double tru=0.25*(n-32); double b=(-tru*S)/(double)K; for(int k=0;k<K;k++)B[(size_t)k*N+n]=(ork_f16)b; gate[n]=(double)K*b; }
-    w=ork_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
+    w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
     int16_t lut[1030];
 
     /* (1) output relation: flat LUT V -> out = R*V + bias (independent of gate/idx) */

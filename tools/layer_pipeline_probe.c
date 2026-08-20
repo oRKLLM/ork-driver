@@ -24,14 +24,14 @@ static void dequant_rows(const int32_t*C,float*out,const float*as,int M,int N){
 /* run a group of nw independent matmuls sharing input xi (already quantized), SYNC. */
 static double group_sync(ork_npu*c,ork_w**W,int nw,int M,int K,int*Ns,const int8_t*xi,int32_t**Cout,float*as,float**Fout){
   double t0=now_us();
-  for(int i=0;i<nw;i++){ ork_mm_run_i8(c,W[i],M,xi,Cout[i]); dequant_rows(Cout[i],Fout[i],as,M,Ns[i]); }
+  for(int i=0;i<nw;i++){ ork_i8_mm_run(c,W[i],M,xi,Cout[i]); dequant_rows(Cout[i],Fout[i],as,M,Ns[i]); }
   return now_us()-t0; }
 /* same group, PIPELINED: dequant[i] overlaps submit[i+1]. */
 static double group_pipe(ork_npu*c,ork_w**W,int nw,int M,int K,int*Ns,const int8_t*xi,int32_t**Cout,float*as,float**Fout){
   double t0=now_us();
-  ork_async*h=ork_mm_run_i8_async(c,W[0],M,xi,Cout[0]);
+  ork_async*h=ork_i8_mm_run_async(c,W[0],M,xi,Cout[0]);
   for(int i=0;i<nw;i++){ ork_async_wait(h);
-    if(i+1<nw) h=ork_mm_run_i8_async(c,W[i+1],M,xi,Cout[i+1]);
+    if(i+1<nw) h=ork_i8_mm_run_async(c,W[i+1],M,xi,Cout[i+1]);
     dequant_rows(Cout[i],Fout[i],as,M,Ns[i]); }   /* overlaps submit[i+1] */
   return now_us()-t0; }
 
@@ -43,8 +43,8 @@ int main(int argc,char**argv){
   int qkvN[3]={2048,2048,2048}, guN[2]={6144,6144};
   ork_w *Wqkv[3],*Wgu[2];
   int8_t*Bbuf=malloc((size_t)K*6144); for(size_t i=0;i<(size_t)K*6144;i++)Bbuf[i]=(int8_t)((i*131+7)%255-127);
-  for(int i=0;i<3;i++){ Wqkv[i]=ork_mm_pack_i8(c,K,qkvN[i],Bbuf); if(!Wqkv[i]){printf("pack fail\n");return 1;} }
-  for(int i=0;i<2;i++){ Wgu[i]=ork_mm_pack_i8(c,K,guN[i],Bbuf); if(!Wgu[i]){printf("pack fail\n");return 1;} }
+  for(int i=0;i<3;i++){ Wqkv[i]=ork_i8_mm_pack(c,K,qkvN[i],Bbuf); if(!Wqkv[i]){printf("pack fail\n");return 1;} }
+  for(int i=0;i<2;i++){ Wgu[i]=ork_i8_mm_pack(c,K,guN[i],Bbuf); if(!Wgu[i]){printf("pack fail\n");return 1;} }
   float*x=malloc((size_t)M*K*4); for(size_t i=0;i<(size_t)M*K;i++)x[i]=((i*1103515245u+12345)%2000)/1000.0f-1.0f;
   int8_t*xi=malloc((size_t)M*K); float*as=malloc(M*4); quant_rows(x,xi,as,M,K);
   int32_t*Cq[3]; float*Fq[3],*Fq2[3]; for(int i=0;i<3;i++){Cq[i]=malloc((size_t)M*qkvN[i]*4);Fq[i]=malloc((size_t)M*qkvN[i]*4);Fq2[i]=malloc((size_t)M*qkvN[i]*4);}

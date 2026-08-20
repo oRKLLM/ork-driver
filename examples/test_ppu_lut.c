@@ -217,8 +217,8 @@ int main(int argc, char **argv) {
         int32_t *Cw = malloc((size_t)Mw * Nw * sizeof(int32_t));
         for (size_t i = 0; i < (size_t)Kw * Nw; i++) Bw[i] = (int8_t)(i & 0x3f);
         for (size_t i = 0; i < (size_t)Mw * Kw; i++) Aw[i] = (int8_t)(i & 0x1f);
-        ork_w *ww = ork_mm_pack_i8(c, Kw, Nw, Bw);
-        int wrc = ww ? ork_mm_run_i8(c, ww, Mw, Aw, Cw) : -99;
+        ork_w *ww = ork_i8_mm_pack(c, Kw, Nw, Bw);
+        int wrc = ww ? ork_i8_mm_run(c, ww, Mw, Aw, Cw) : -99;
         printf("[test_ppu_lut] WARM: matmul rc=%d C[0]=%d (NPU confirmed executing in this context)\n", wrc, Cw[0]);
         free(Bw); free(Aw); free(Cw);
     }

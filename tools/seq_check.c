@@ -13,7 +13,7 @@ typedef struct { const char*tag; int K,N; int8_t*B; int8_t*A; ork_w*w; } mm;
 
 static int run_check(ork_npu*c, mm*m, int M){
     int K=m->K,N=m->N; int32_t*C=malloc((size_t)M*N*4);
-    ork_mm_run_i8(c,m->w,M,m->A,C);
+    ork_i8_mm_run(c,m->w,M,m->A,C);
     int mism=0; long maxe=0;
     for(int i=0;i<M;i++)for(int j=0;j<N;j++){
         long acc=0; for(int k=0;k<K;k++) acc+=(long)m->A[(size_t)i*K+k]*m->B[(size_t)k*N+j];
@@ -39,7 +39,7 @@ int main(int argc,char**argv){
         seq[s].B=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++) seq[s].B[i]=(int8_t)((i%5)-2);
         seq[s].A=malloc((size_t)M*K); for(size_t i=0;i<(size_t)M*K;i++) seq[s].A[i]=(int8_t)(((i+s)%7)-3);
         ork_npu_set_pack_domain(c,0);
-        seq[s].w=ork_mm_pack_i8(c,K,N,seq[s].B); if(!seq[s].w){printf("pack %s failed\n",tags[s]);return 1;}
+        seq[s].w=ork_i8_mm_pack(c,K,N,seq[s].B); if(!seq[s].w){printf("pack %s failed\n",tags[s]);return 1;}
     }
     int fail=0;
     for(int r=0;r<reps;r++){

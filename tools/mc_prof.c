@@ -14,8 +14,8 @@
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 
 static double run(ork_npu*c,ork_w*w,int M,int K,int8_t*A,int32_t*C,int iters){
-    ork_mm_run_i8(c,w,M,A,C);                          /* warm */
-    double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,C);
+    ork_i8_mm_run(c,w,M,A,C);                          /* warm */
+    double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,C);
     return (now_us()-t0)/iters;
 }
 
@@ -29,7 +29,7 @@ int main(int argc,char**argv){
     int8_t*A=dma?ork_dma_alloc(c,(size_t)M*K):malloc((size_t)M*K); if(A)memset(A,1,(size_t)M*K);
     int32_t*C=malloc((size_t)M*N*4);
     if(dma) printf("[A in zero-copy DMA buffer]\n");
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
     printf("int8 matmul %dx%dx%d, %d warm iters. us/matmul:\n",M,K,N,iters);
 
     ork_npu_set_core_budget(c,1);

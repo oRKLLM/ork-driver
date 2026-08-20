@@ -73,7 +73,7 @@ int main(int argc,char**argv){
 
     int8_t*A=malloc(K); for(int k=0;k<K;k++) A[k]=a8((unsigned)(0x9e37u+k*2654435761u));
     int8_t*B=malloc((size_t)K*N); for(size_t j=0;j<(size_t)K*N;j++) B[j]=a8((unsigned)(0x85ebu+j*40503u));
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*ref=malloc((size_t)N*4); for(int n=0;n<N;n++){ long acc=0; for(int k=0;k<K;k++) acc+=(long)A[k]*(long)B[(size_t)k*N+n]; ref[n]=(int32_t)acc; }
     free(B);
 

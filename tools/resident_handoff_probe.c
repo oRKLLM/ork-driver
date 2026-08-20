@@ -25,7 +25,7 @@ enum { SH=2 };
 
 /* worker: run one NPU matmul (blocks its thread on the NPU HW) so the main thread's CPU work overlaps it */
 struct mmarg { ork_npu*c; ork_w*w; int M; const int8_t*A; int32_t*C; int rc; };
-static void* mm_worker(void*p){ struct mmarg*a=p; a->rc=ork_mm_run_i8(a->c,a->w,a->M,a->A,a->C); return NULL; }
+static void* mm_worker(void*p){ struct mmarg*a=p; a->rc=ork_i8_mm_run(a->c,a->w,a->M,a->A,a->C); return NULL; }
 
 int main(void){
     int M=32, K=512, N=512, N2=512;
@@ -43,7 +43,7 @@ int main(void){
     for(size_t i=0;i<(size_t)M*K;i++) A1[i]=(int8_t)s3();
     for(size_t i=0;i<(size_t)K*N;i++) W1b[i]=(int8_t)s3();
     for(size_t i=0;i<(size_t)N*N2;i++) W2b[i]=(int8_t)s3();
-    ork_w *W1=ork_mm_pack_i8(c,K,N,W1b), *W2=ork_mm_pack_i8(c,N,N2,W2b);
+    ork_w *W1=ork_i8_mm_pack(c,K,N,W1b), *W2=ork_i8_mm_pack(c,N,N2,W2b);
     if(!W1||!W2){ printf("pack failed\n"); return 2; }
 
     /* ---- pure-integer CPU reference of the whole chain ---- */
@@ -53,12 +53,12 @@ int main(void){
     for(int m=0;m<M;m++) for(int n=0;n<N2;n++){ long a=0; for(int nn=0;nn<N;nn++) a+=A2r[(size_t)m*N+nn]*W2b[(size_t)nn*N2+n]; C2r[(size_t)m*N2+n]=(int32_t)a; }
 
     /* ---- COHERENCY: run the chain on the NPU with a CPU glue op in the middle, all through resident buffers ---- */
-    double t0=now_us(); int rc1=ork_mm_run_i8(c,W1,M,A1,Bc);              /* NPU writes Bc (resident) */
+    double t0=now_us(); int rc1=ork_i8_mm_run(c,W1,M,A1,Bc);              /* NPU writes Bc (resident) */
     double t1=now_us();
     if(rc1){ printf("mm1 rc=%d\n",rc1); return 1; }
     /* CPU reads Bc (NPU output) + writes A2 (matmul2 input) — the domain-free glue op on resident memory */
     for(size_t i=0;i<(size_t)M*N;i++){ long q=(long)Bc[i]>>SH; if(q>127)q=127; if(q<-127)q=-127; A2[i]=(int8_t)q; }
-    double t2=now_us(); int rc2=ork_mm_run_i8(c,W2,M,A2,C2);              /* NPU reads A2 (resident) */
+    double t2=now_us(); int rc2=ork_i8_mm_run(c,W2,M,A2,C2);              /* NPU reads A2 (resident) */
     double t3=now_us();
     if(rc2){ printf("mm2 rc=%d\n",rc2); return 1; }
 
@@ -76,8 +76,8 @@ int main(void){
     int32_t *Cx=ork_dma_alloc(c,(size_t)M*N2*4); if(!Cx)Cx=C2;
     volatile long sink=0; size_t CPUN=(size_t)M*N*40;   /* a chunk of domain-free CPU glue work */
     int8_t *scratch=malloc(CPUN); for(size_t i=0;i<CPUN;i++) scratch[i]=(int8_t)(i*7);
-    /* warm */ ork_mm_run_i8(c,W2,M,A2,Cx);
-    double na=now_us(); for(int r=0;r<5;r++) ork_mm_run_i8(c,W2,M,A2,Cx); double npu1=(now_us()-na)/5;
+    /* warm */ ork_i8_mm_run(c,W2,M,A2,Cx);
+    double na=now_us(); for(int r=0;r<5;r++) ork_i8_mm_run(c,W2,M,A2,Cx); double npu1=(now_us()-na)/5;
     double ca=now_us(); for(int r=0;r<5;r++){ long acc=0; for(size_t i=0;i<CPUN;i++){ long q=(long)scratch[i]>>1; if(q>63)q=63; acc+=q; } sink+=acc; } double cpu1=(now_us()-ca)/5;
     double ba=now_us();
     for(int r=0;r<5;r++){ struct mmarg a={c,W2,M,A2,Cx,0}; pthread_t th; pthread_create(&th,0,mm_worker,&a);

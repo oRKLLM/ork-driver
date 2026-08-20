@@ -36,11 +36,11 @@ typedef struct { int K,N; f16 *Brow; ork_w *w; } weight;
 static weight mkw(ork_npu*ctx,int K,int N,unsigned seed){weight wt={K,N,malloc((size_t)K*N*2),NULL};
     float sc=0.5f/sqrtf((float)K);   /* 1/sqrt(K) init so stacked-layer activations stay fp16-safe */
     unsigned s=seed; for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;wt.Brow[i]=(f16)((((int)((s>>16)%9))-4)*sc);}
-    wt.w=ork_mm_pack(ctx,K,N,wt.Brow); return wt;}
+    wt.w=ork_f16_mm_pack(ctx,K,N,wt.Brow); return wt;}
 static void mm(ork_npu*ctx,weight*wt,int M,const float*Af32,float*C,int useNPU){
     int K=wt->K,N=wt->N; f16*A=malloc((size_t)M*K*2);
     for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af32[i];
-    if(useNPU) ork_mm_run(ctx,wt->w,M,A,C);
+    if(useNPU) ork_f16_mm_run(ctx,wt->w,M,A,C);
     else for(int m=0;m<M;m++)for(int n=0;n<N;n++){float acc=0;for(int k=0;k<K;k++)acc+=(float)A[(size_t)m*K+k]*(float)wt->Brow[(size_t)k*N+n];C[(size_t)m*N+n]=acc;}
     free(A);
 }

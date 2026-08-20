@@ -88,7 +88,7 @@ int orki_chain_build_lut_fn(ork_npu*c, double(*fn)(double), double in_scale, dou
     for(int n=0;n<N;n++){ int a=0; for(int k=0;k<K;k++)a+=A[k]*B[k*N+n]; acc[n]=a; }
     /* pass 1: ramp LUT[i]=(i-512)*8 -> out = R*LUT[idx] -> idx = round(out/(R*8)) + 512 */
     for(int i=0;i<1030;i++){ int v=(i-512)*8; if(v>32767)v=32767; if(v<-32768)v=-32768; ramp[i]=(int16_t)v; }
-    if(ork_npu_probe_i8_silu_cfg(c,1,K,N,A,B,r_mult,r_shift,0u,0xffffc000u,cfg4068,ramp,1030,C,0)){
+    if(ork_i8_npu_probe_silu_cfg(c,1,K,N,A,B,r_mult,r_shift,0u,0xffffc000u,cfg4068,ramp,1030,C,0)){
         free(A);free(B);free(C);free(ramp);free(acc);free(idx); return -1; }
     for(int n=0;n<N;n++){ int i=(int)lround(C[n]/(R*8.0))+512; idx[n]=i; }
     /* pass 2: build ork's silu LUT at the measured indices; interp gaps, hold at ends */
@@ -106,8 +106,8 @@ int orki_chain_build_lut_fn(ork_npu*c, double(*fn)(double), double in_scale, dou
 }
 
 /* Build the int16 activation LUT curve for `f` at (in_scale,out_scale) into lut[1030]. Calibrates the idx map
- * once per ctx (a STANDALONE probe — must run outside any chain). 0/ok. Shared by orki_act_lut_i16 (standalone) and
- * the HW-chained silu prologue in ork_dyn_begin_seq_i8_mc. */
+ * once per ctx (a STANDALONE probe — must run outside any chain). 0/ok. Shared by orki_i16_act_lut (standalone) and
+ * the HW-chained silu prologue in ork_i8_dyn_begin_seq_mc. */
 int orki_build_act_lut16(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
     if(orki_silu_calibrate_idx16(c)) return -1;
     static double qsum[1030]; static int qn[1030];
@@ -129,7 +129,7 @@ int orki_silu_calibrate_idx(ork_npu *c){
     int8_t in[256],out[256]; int16_t lut[1030];
     for(int i=0;i<256;i++) in[i]=(int8_t)(i-128);
     for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
-    if(ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,0)) return -1;
+    if(ork_i8_npu_probe_silu_std(c,in,M,N,0x2000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,0)) return -1;
     for(int v=0;v<256;v++) c->silu_idx[v]=-1;
     for(int i=0;i<M*N;i++){ int v=(uint8_t)in[i]; int o=out[i]; if(o>-127&&o<127) c->silu_idx[v]=(short)(2*o+512); }
     c->silu_idx_ok=1; return 0;
@@ -158,8 +158,8 @@ int orki_silu_calibrate_idx16(ork_npu *c){
     for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
     /* NB: runs LAZILY on the first silu call — in the FFN chain that's right after a MULTI-CORE matmul,
      * so this pure-SDP probe hits the chain-context wedge (retry does NOT help — it wedges every attempt
-     * even after soft-resets). See ork_npu_probe_silu_std_i16 (#35). Standalone it's clean. */
-    if(ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
+     * even after soft-resets). See ork_i16_npu_probe_silu_std (#35). Standalone it's clean. */
+    if(ork_i16_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
     for(int s=0;s<SILU16_NS;s++){ int o=out[s]; c->silu_idx16[s]=(o>-490&&o<510)?(short)(o+512):(short)-32768; }
     c->silu_idx16_ok=1; return 0;
 }

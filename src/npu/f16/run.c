@@ -59,7 +59,7 @@ static void tile_i8_to_f16_range(int lo,int hi,void *a){
     }
 }
 
-ork_w *ork_mm_f16_scratch(ork_npu *c,int K,int N){
+ork_w *ork_f16_mm_scratch(ork_npu *c,int K,int N){
     if(K%32||N%16) return NULL;
     int KS=c->soc->ks, NMAX=c->soc->nmax;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
@@ -75,7 +75,7 @@ ork_w *ork_mm_f16_scratch(ork_npu *c,int K,int N){
     return w;
 }
 
-int ork_mm_inflate_i8_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *bscale,int K,int N){
+int ork_i8_mm_inflate_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *bscale,int K,int N){
     if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
     if(w->K!=K || w->N!=N || !i8) return -2;
     int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
@@ -88,7 +88,7 @@ int ork_mm_inflate_i8_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *b
     return 0;
 }
 
-int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
+int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
     if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
     if(w->K!=K || w->N!=N) return -2;
     int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
@@ -101,9 +101,9 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
     /* DERIVED-COPY COHERENCE (defect fix). The fp16 MULTI-CORE colsplit does NOT read Bb: it builds a
      * CONTIGUOUS concatenation of the Sk K-slice tiles ONCE and caches it on the weight (w->Bbc for
      * Sn==1, w->Bbc_ns[] for Sn>1) behind a *_valid latch that was never cleared. A repack that
-     * refreshed only Bb was therefore INVISIBLE to ork_mm_run()/run_multicore — every multi-core submit
+     * refreshed only Bb was therefore INVISIBLE to ork_f16_mm_run()/run_multicore — every multi-core submit
      * after the first kept computing against the FIRST weight ever packed into this slot, silently.
-     * Single-core orki_run() and ork_mm_run_stream_f16{,_chain} read Bb directly and were always correct,
+     * Single-core orki_run() and ork_f16_mm_run_stream{,_chain} read Bb directly and were always correct,
      * which is why this only surfaced in a repack-per-batch-slice caller (ggml-ork's ork_bmm_fp16:
      * batch slice 0 correct, every later slice stale — probe: scratchpad bmm_probe, Hkv=16/rk2=1 gave
      * NRMSE 1.37 from head 1 on multi-core, PASS with ORK_NPU_MC=1). Refresh the copies in place: K,N
@@ -126,7 +126,7 @@ int ork_mm_repack_f16(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
 /* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
  * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)
  * so the silu value is emitted at fp16→fp32 precision, NOT quantized to int8. Same flying-mode LUT-stage regs
- * as orki_set_i8_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
+ * as orki_i8_set_silu (the activation sub-module is shared; only the output precision differs — kept fp16 here, vs
  * set_i8_silu's set_i8_out8 override to int8). This is the "end-goal" higher-precision fused gate — currently
  * a measured net-loss (fp16 matmul ~3.3x int8, tools/f16_gate_bench) so gated OFF, kept for a future int8-win
  * pipeline. WIP: the acc->index map / LUT calibration for the fp16 gain is approximate. */
@@ -160,7 +160,7 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
     /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
 }
 
-int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
+int ork_f16_mm_run_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,const int16_t *lut,int nlut){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     /* fp16 weights live in w->Bb tiles (Bf is int8-only). Fused silu needs the WHOLE-K weight in one buffer,
@@ -199,7 +199,7 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
         ork_f16*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
         orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
         uint32_t rc[REGCMD_N];
-        orki_synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
+        orki_f16_synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
         set_f16_silu(rc,out_bias,idx_off,cfg4068);
         memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
@@ -212,7 +212,7 @@ int ork_mm_run_f16_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     return rc_ret;
 }
 
-int ork_mm_build_f16_lut(ork_npu *c, double (*fn)(double,void*), void *fnctx,
+int ork_f16_mm_build_lut(ork_npu *c, double (*fn)(double,void*), void *fnctx,
                          double in_lo, double in_hi, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
     if(!ork_ppu_fuse_enabled(c) || in_hi<=in_lo || !fn) return -2;
     const int Kp=512, Np=64;
@@ -224,8 +224,8 @@ int ork_mm_build_f16_lut(ork_npu *c, double (*fn)(double,void*), void *fnctx,
     for(int i=0;i<8*Kp;i++)A[i]=(ork_f16)1.0f;
     double tru[64];
     for(int n=0;n<Np;n++){ tru[n]=in_lo+(in_hi-in_lo)*n/(double)(Np-1); double b=(-S*tru[n])/(double)Kp; for(int k=0;k<Kp;k++)B[(size_t)k*Np+n]=(ork_f16)b; }
-    ork_w *w=ork_mm_pack(c,Kp,Np,B); if(!w){ free(A);free(B);free(C); return -2; }
-    #define F16LRUN() ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
+    ork_w *w=ork_f16_mm_pack(c,Kp,Np,B); if(!w){ free(A);free(B);free(C); return -2; }
+    #define F16LRUN() ork_f16_mm_run_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)
     int rc=-2;
     for(int i=0;i<1030;i++)lut[i]=1000; if(F16LRUN()){goto done;} double o1=C[32];
     for(int i=0;i<1030;i++)lut[i]=3000; if(F16LRUN()){goto done;} double o2=C[32];
@@ -254,7 +254,7 @@ static double f16lut_rsqrt(double x, void *ctx){ struct f16lut_rsqrt_ctx *p=ctx;
 
 static double f16act_negtramp(double u, void *p){ struct f16act_neg *q=p; return q->fn(-u,q->ctx); }
 
-ork_w *ork_mm_pack_f16_fused_act(ork_npu *c, int K, int N, const ork_f16 *B,
+ork_w *ork_f16_mm_pack_fused_act(ork_npu *c, int K, int N, const ork_f16 *B,
                                  double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
     if(!ork_ppu_fuse_enabled(c)) return NULL;
     if(!c||!B||!fn||K%32||N%16||in_hi<=in_lo) return NULL;
@@ -264,49 +264,49 @@ ork_w *ork_mm_pack_f16_fused_act(ork_npu *c, int K, int N, const ork_f16 *B,
     else return NULL;   /* mixed sign — unsupported by the single-signed fp16 index */
     int16_t *lut=malloc(1030*sizeof(int16_t)); if(!lut) return NULL;
     double S=0,R=0,osc=0;
-    if(ork_mm_build_f16_lut(c,bfn,bctx,blo,bhi,lut,&S,&R,&osc)){ free(lut); return NULL; }
+    if(ork_f16_mm_build_lut(c,bfn,bctx,blo,bhi,lut,&S,&R,&osc)){ free(lut); return NULL; }
     ork_f16 *Bs=malloc((size_t)K*N*sizeof(ork_f16)); if(!Bs){ free(lut); return NULL; }
     for(size_t i=0;i<(size_t)K*N;i++) Bs[i]=(ork_f16)(packsign*S*(double)(float)B[i]);   /* acc = packsign*S*(A·B) < 0 */
-    ork_w *w=ork_mm_pack(c,K,N,Bs); free(Bs);
+    ork_w *w=ork_f16_mm_pack(c,K,N,Bs); free(Bs);
     if(!w){ free(lut); return NULL; }
     w->fa_lut=lut; w->fa_osc=osc;   /* baked into the resident weight; freed by ork_mm_free */
     return w;
 }
 
-int ork_mm_run_f16_fused_act(ork_npu *c, ork_w *w, int M, const ork_f16 *A, float *C){
+int ork_f16_mm_run_fused_act(ork_npu *c, ork_w *w, int M, const ork_f16 *A, float *C){
     if(!c||!w||!A||!C||M<1) return -2;
-    if(!w->fa_lut) return -2;   /* not a fused-activation weight (use ork_mm_pack_f16_fused_act) */
-    int rc = ork_mm_run_f16_silu(c,w,M,A,C,0,0xffffc000u,0x56391100u,w->fa_lut,1030);   /* matmul + fused LUT, 1 submit */
+    if(!w->fa_lut) return -2;   /* not a fused-activation weight (use ork_f16_mm_pack_fused_act) */
+    int rc = ork_f16_mm_run_silu(c,w,M,A,C,0,0xffffc000u,0x56391100u,w->fa_lut,1030);   /* matmul + fused LUT, 1 submit */
     if(rc==0){ double osc=w->fa_osc; for(size_t i=0;i<(size_t)M*w->N;i++) C[i]=(float)((double)C[i]*osc); }   /* recover fn(A·B) */
     return rc;
 }
 
-int ork_mm_run_f16_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
+int ork_f16_mm_run_act(ork_npu *c, int K, int N, const ork_f16 *B, int M, const ork_f16 *A, float *C,
                        double (*fn)(double,void*), void *fnctx, double in_lo, double in_hi){
     if(!A||!C||M<1) return -2;
-    ork_w *w=ork_mm_pack_f16_fused_act(c,K,N,B,fn,fnctx,in_lo,in_hi);   /* calibrate + orki_pack (one-shot) */
+    ork_w *w=ork_f16_mm_pack_fused_act(c,K,N,B,fn,fnctx,in_lo,in_hi);   /* calibrate + orki_pack (one-shot) */
     if(!w) return -2;
-    int rc=ork_mm_run_f16_fused_act(c,w,M,A,C);
+    int rc=ork_f16_mm_run_fused_act(c,w,M,A,C);
     ork_mm_free(c,w);
     return rc;
 }
 
-int ork_mm_build_f16_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
+int ork_f16_mm_build_silu_lut(ork_npu *c, double Gmax, int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
     if(Gmax<=0) return -2;
     double gcap = getenv("ORK_F16_GCAP") ? atof(getenv("ORK_F16_GCAP")) : 40.0;
     if(gcap>0 && Gmax>gcap) Gmax=gcap;
-    return ork_mm_build_f16_lut(c, f16lut_silu, NULL, -Gmax, Gmax, lut, S_out, R_out, out_scale_out);
+    return ork_f16_mm_build_lut(c, f16lut_silu, NULL, -Gmax, Gmax, lut, S_out, R_out, out_scale_out);
 }
 
-int ork_mm_build_f16_rsqrt_lut(ork_npu *c, int n_feat, double eps, double ss_min, double ss_max,
+int ork_f16_mm_build_rsqrt_lut(ork_npu *c, int n_feat, double eps, double ss_min, double ss_max,
                                int16_t *lut, double *S_out, double *R_out, double *out_scale_out){
     if(n_feat<1) return -2;
     if(ss_min<0) ss_min=0;
     struct f16lut_rsqrt_ctx ctx = { n_feat, eps };
-    return ork_mm_build_f16_lut(c, f16lut_rsqrt, &ctx, ss_min, ss_max, lut, S_out, R_out, out_scale_out);
+    return ork_f16_mm_build_lut(c, f16lut_rsqrt, &ctx, ss_min, ss_max, lut, S_out, R_out, out_scale_out);
 }
 
-int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out){
+int ork_f16_mm_run_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out){
     if(!c||!w||!A||!out) return -2;
     if(w->dtype!=DT_F16||w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks, N<=nmax) */
     int K=w->K, N=w->N, fd=c->fd, CBUF=c->soc->cbuf_elems;
@@ -319,8 +319,8 @@ int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                          /* prime fp16 pipeline (keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);                            /* run_stream_f16 rule; small K => 0 */
-    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
-    orki_set_f16_out_fp16in(rc,M,N);                                              /* PROVEN vendor fp16-out stage (default CONTIGUOUS) */
+    orki_f16_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
+    orki_f16_set_out_fp16in(rc,M,N);                                              /* PROVEN vendor fp16-out stage (default CONTIGUOUS) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
       t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }

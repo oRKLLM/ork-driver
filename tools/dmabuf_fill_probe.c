@@ -42,7 +42,7 @@
 #include "ork_npu.h"
 
 /* diagnostic helpers exported from npu.c (not in the public header) */
-ork_w *ork_mm_load_i8_flags(ork_npu *c,int K,int N,const void *blob,size_t n,unsigned flags);
+ork_w *ork_i8_mm_load_flags(ork_npu *c,int K,int N,const void *blob,size_t n,unsigned flags);
 int    ork_w_ntiles(const ork_w *w);
 void  *ork_w_tile_cpu(const ork_w *w,int i);
 size_t ork_w_tile_size(const ork_w *w,int i);
@@ -138,7 +138,7 @@ static int correctness_ok(ork_npu*c, ork_w*w, const int8_t*Bi8, int K, int N, in
     if(!A||!Cn){ free(A); free(Cn); return -1; }
     unsigned s=0xC0FFEEu;
     for(size_t i=0;i<(size_t)M*K;i++){ s=s*1664525u+1013904223u; A[i]=(int8_t)((int)(s>>24)%9 - 4); } /* small int8 */
-    if(ork_mm_run_i8(c,w,M,A,Cn)!=0){ free(A); free(Cn); return -2; }
+    if(ork_i8_mm_run(c,w,M,A,Cn)!=0){ free(A); free(Cn); return -2; }
     /* spot-check a sample of (m,n) against the CPU reference (full K accumulation) */
     int bad=0, checked=0;
     unsigned r=0x1234u;
@@ -156,7 +156,7 @@ static int correctness_ok(ork_npu*c, ork_w*w, const int8_t*Bi8, int K, int N, in
 static void run_variant(ork_npu*c, int K, int N, const uint8_t*blob, size_t blob_sz,
                         const int8_t*Bi8, unsigned flag, int use_neon, int clean_only,
                         const char*name, double baseline_med){
-    ork_w *w = ork_mm_load_i8_flags(c,K,N,blob,blob_sz,flag);
+    ork_w *w = ork_i8_mm_load_flags(c,K,N,blob,blob_sz,flag);
     if(!w){ printf("    %-22s | load_i8_flags(0x%x) FAILED\n", name, flag); return; }
     size_t bytes = 0; for(int i=0;i<ork_w_ntiles(w);i++) bytes += ork_w_tile_size(w,i);
 
@@ -195,7 +195,7 @@ static void run_shape(ork_npu*c, int K, int N, const char*label){
     for(int n=0;n<N;n++){
         for(int k=0;k<K;k++){ s=s*1664525u+1013904223u; int v=(int)((s>>24)%255)-127; Bi8[(size_t)k*N+n]=(int8_t)v; } }
 
-    ork_w *w8 = ork_mm_pack_i8(c,K,N,Bi8);
+    ork_w *w8 = ork_i8_mm_pack(c,K,N,Bi8);
     if(!w8){ printf("  [%s] pack_i8 failed\n",label); free(Bi8); return; }
     size_t blob_sz = ork_w_dump(w8, NULL, 0);
     uint8_t *blob = malloc(blob_sz);
@@ -206,7 +206,7 @@ static void run_shape(ork_npu*c, int K, int N, const char*label){
     printf("    %-22s | fill us  | [p10/p90]    |  GB/s  | copy-only us (GB/s)   | bsync us | speedup | correct\n", "variant");
 
     /* (A) WC baseline establishes the reference fill time the speedups are relative to */
-    ork_w *wA = ork_mm_load_i8_flags(c,K,N,blob,blob_sz,FLAG_WC);
+    ork_w *wA = ork_i8_mm_load_flags(c,K,N,blob,blob_sz,FLAG_WC);
     double baseA = 0;
     if(wA){
         double samp[REPS];

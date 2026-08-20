@@ -14,7 +14,7 @@ The active reverse-engineering findings and optimization roadmap are documented 
 
 ## 1. What it is
 
-- Public API (`include/ork_npu.h`): `ork_npu_init` → `ork_mm_pack(K,N,B)` → `ork_mm_run(M,A,C)`.
+- Public API (`include/ork_npu.h`): `ork_npu_init` → `ork_f16_mm_pack(K,N,B)` → `ork_f16_mm_run(M,A,C)`.
 - `C[M,N]` (fp32) = `A[M,K]` (fp16) × `B[K,N]` (fp16); arbitrary M/K/N (`K%32==0`, `N%16==0`)
   via K-split + N-tiling + a single-submit M-scheduler, with resident weights.
 - One binary supports every Rockchip NPU: the SoC is detected at runtime from the device tree.
@@ -235,6 +235,35 @@ Doxyfile / `make docs`  scoped API docs -> docs/api/html (gitignored); excludes 
   precision-tagged, it belongs in that precision's folder. If its contract has no dtype in it, it is
   substrate — `npu/core/`. If it is an op family used by several precisions (activations, norms, the
   SSM scan), it is a peer module at `npu/<family>.c`. Only dtype DISPATCH stays in npu.c.
+### Naming convention — dtype FIRST (enforced by check 11)
+
+```
+ork_<dtype>_<family>_<verb>[_<mechanism>][_<modifier>…]
+     i8/i4/     mm/npu/   run/pack/  chain/stream/  silu/out8/
+     i4a8/nf4/  bmm/dyn/  load       fold/slice     grouped/import
+     f16/i16    w
+```
+
+`ork_i8_*` is the int8 datapath's namespace and mirrors `src/npu/i8/`. C has no namespaces — the prefix
+IS the namespace, as in `sqlite3_`/`png_`. Execution **mechanism** sits before the dtype only when it is
+part of the verb (`run_chain`, `run_stream`); everything else that is not universal — `silu`, `out8`,
+`grouped`, `import` — is its own trailing component.
+
+Dtype-**agnostic** surfaces carry no tag and must not gain one: `ork_dma_*`, `ork_npu_init`, `ork_pc_*`,
+`ork_dyn_begin`, `ork_w_dump`, `ork_stage_fill`.
+
+**Uniform names only where the operation is uniform.** The precisions are NOT parallel: int4 has no SDP
+ops because RK3588 is W8A8 *or* W4A4 symmetric, and int16 is the ACTIVATION tier, not a weight tier. Do
+not invent `ork_i4_npu_silu` or `ork_i16_mm_pack` to fill the grid — the hardware forbids them. See the
+capability matrix in README.md.
+
+Exemptions are catalogued in `tools/naming_exempt.txt` as CONVERSION (names two dtypes; prefix is the
+source, destination explicit as `_to_<dst>`), AGNOSTIC, or MULTI (one implementation serving several
+precisions — the matrix's dagger cases). `include/ork/compat.h` holds deprecated pre-rename spellings for
+the fork and states its own removal condition.
+
+Full old→new table and rationale: [`docs/NAMING_MIGRATION.md`](docs/NAMING_MIGRATION.md).
+
 - **SIZE BUDGET (enforced).** `tools/size_budget.txt` caps every `src/**` file at 900 lines by
   default, checked by `make check-registry` (check 9). `src/npu.c` has a ratcheted exception set
   just above its current size so the scaffold can only shrink. Exceeding a budget means editing
@@ -384,7 +413,7 @@ latter, and it stays an op responsibility.
   driver. Be precise about that in docs and messages.
 - Independent, community project — **not affiliated with or endorsed by Rockchip**. "Rockchip",
   "RK3576", "RK3588", "RKNN" are trademarks of Rockchip.
-- Both **fp16** (`ork_mm_pack`/`run`, fp16 A·B → fp32 C) and **int8/w8a8** (`ork_mm_pack_i8`/
+- Both **fp16** (`ork_f16_mm_pack`/`run`, fp16 A·B → fp32 C) and **int8/w8a8** (`ork_i8_mm_pack`/
   `run_i8`, int8 A·B → int32 C) are supported. Keep the public API stable when extending.
   Note: mixing both dtypes on one context works, but switching modes triggers a one-time NPU
   re-warm (the regcmd mode is stateful) — see `run()` in `src/npu.c`.

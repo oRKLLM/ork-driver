@@ -29,7 +29,7 @@
 #include "npu/core.h"
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
-int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,const int8_t *G,
+int ork_i8_npu_probe_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,const int8_t *G,
                            int mult,int shift,int8_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* PPU EW-mul RE'd against the rk3588 PPU layout only */
@@ -48,9 +48,9 @@ int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const in
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t base[REGCMD_I8_N], rc[REGCMD_I8_EW_N];
-    orki_synth_i8(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    orki_i8_synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     orki_splice_ew_lane(rc,base);                                    /* insert the 0x50xx second-input lane */
-    orki_set_i8_ewmul(rc,M,N,0,mult,shift,(uint32_t)Gb.dma);           /* int8 requant + EW-mul + 2nd-input addr */
+    orki_i8_set_ewmul(rc,M,N,0,mult,shift,(uint32_t)Gb.dma);           /* int8 requant + EW-mul + 2nd-input addr */
     if(getenv("ORK_EW_DUMP")){                                  /* inspect the assembled regcmd, no submit */
         printf("# assembled EW-mul regcmd (%d entries) aG=0x%x aC=0x%x\n",REGCMD_I8_EW_N/2,(uint32_t)Gb.dma,(uint32_t)O.dma);
         for(int k=0;k+1<REGCMD_I8_EW_N;k+=2){uint32_t w0=rc[k],w1=rc[k+1];
@@ -78,7 +78,7 @@ int ork_npu_probe_i8_ewmul(ork_npu *c,int M,int K,int N,const int8_t *A,const in
     return ok;
 }
 
-int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,int Wsz,
+int ork_i8_npu_probe_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,int Wsz,
                                 const void*gl,int Gsz,void*out,int Osz,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
@@ -121,7 +121,7 @@ int ork_npu_probe_i8_ewmul_tmpl(ork_npu *c,const void*in,int Isz,const void*wt,i
     return ok;
 }
 
-int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const int8_t *G,int8_t *C,double *us){
+int ork_i8_npu_probe_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const int8_t *G,int8_t *C,double *us){
     const int M=8,K=512,N=64; int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;   /* rk3588 PPU only */
     struct buf Wt=orki_bcreate(fd,0x18000,0x403,-1); if(!Wt.cpu) return -2;   /* weights + 0x5020 param region */
@@ -194,7 +194,7 @@ int ork_npu_probe_i8_ewmul_lin(ork_npu *c,const int8_t *A,const int8_t *B,const 
     return ok;
 }
 
-int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t *out,double *us){
+int ork_i8_npu_probe_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(n<1||n>4096) return -2;
@@ -250,7 +250,7 @@ int ork_npu_probe_i8_mul(ork_npu *c,const int8_t *a,const int8_t *b,int n,int8_t
  * the 2-input SDP op with ALU=add (REGCMD_ADD), reprogrammed to (M,N) by orki_set_mul_geom. Caller sets za(0x4044),
  * zb(0x4074), zo(0x4080), out scale mult(0x4084)/shift(0x4088), and the b-operand scale bscale(0x4078); the
  * ALU-mode regs (0x4040/0x4048/0x4070) stay from the template. a/b/out int8 [M*N], N%16==0. 0/ok,-1,-2,-3. */
-int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
+int ork_i8_npu_probe_add(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                          int mult,int shift,uint32_t bscale,int za,int zb,int zo,int8_t *out,double *us){
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -299,7 +299,7 @@ int ork_npu_probe_add_i8(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
  * keeps the captured curve. This is the RE/calibration entry (measure idx(in) with a ramp LUT, then build the
  * silu curve at those indices — same 2-pass scheme as ork_mm_silu_build_lut but through THIS op, not a matmul).
  * in/out int8 [M*N] row-major; N%16==0. 0/ok, -1 wedged, -2 bad shape, -3 non-rk3588. */
-int ork_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
+int ork_i8_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
                            int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,
                            uint32_t cfg4064,uint32_t cfg4068,const int16_t *lut,int nlut,
                            int8_t *out,double *us){

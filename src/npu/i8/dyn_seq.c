@@ -1,4 +1,4 @@
-/* npu/i8/dyn_seq.c — the HETEROGENEOUS single-core NONBLOCK chain: ork_dyn_begin_seq_i8{,_mc} and ork_dyn_seq_end.
+/* npu/i8/dyn_seq.c — the HETEROGENEOUS single-core NONBLOCK chain: ork_i8_dyn_begin_seq{,_mc} and ork_dyn_seq_end.
  *
  * Part of the int8 (W8A8) datapath. Split out of the 1,000-line npu/i8/dyn.c (MODULARIZE_PLAN.md
  * round 10) as a CONTIGUOUS line range — dyn.c had ZERO file-scope statics, so the cut costs no
@@ -29,7 +29,7 @@
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
-ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops, int ngroups, const int *gstart, int nc){
+ork_dyn_chain *ork_i8_dyn_begin_seq_mc(ork_npu *c, int n, const ork_seq_op *ops, int ngroups, const int *gstart, int nc){
     if(!c||n<1||n>256||!ops||ngroups<1||ngroups>n||!gstart) return NULL;
     if(!ork_ppu_fuse_enabled(c)) return NULL;
     if(gstart[0]!=0||gstart[ngroups]!=n) return NULL;
@@ -127,7 +127,7 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
     return h;
 }
 
-/* ================= HETEROGENEOUS SINGLE-CORE NONBLOCK CHAIN (ork_dyn_begin_seq_i8) =================
+/* ================= HETEROGENEOUS SINGLE-CORE NONBLOCK CHAIN (ork_i8_dyn_begin_seq) =================
  * Run ONE group of int8 ops [matmul + int8 SDP ...] as one core's PC-chain on begin_mc's recipe (mc_ensure
  * mrc/maf + a chain-owned warmed output scratch, clean-before, 64B-aligned program slots, per-op forward
  * descriptor), NONBLOCK, ping-pong OFF (an SDP task is present). The TERMINAL op MUST be a matmul — its int32
@@ -135,8 +135,8 @@ ork_dyn_chain *ork_dyn_begin_seq_i8_mc(ork_npu *c, int n, const ork_seq_op *ops,
  * the terminal + does per-op copy-back (matmul int32 dense; SDP int8 EWCUBE de-marshalled). Returns NULL if
  * ineligible (caller then runs the ops via the SW break). Stage 2: MM_I8 + EWMUL_I8; ADD/SILU/GELU follow.
  * SINGLE group / single core here; the scheduler slices a sequence into groups and (Stage 3) spreads them. */
-ork_dyn_chain *ork_dyn_begin_seq_i8(ork_npu *c, int n, const ork_seq_op *ops){
-    int gs[2]={0,n}; return ork_dyn_begin_seq_i8_mc(c,n,ops,1,gs,1);
+ork_dyn_chain *ork_i8_dyn_begin_seq(ork_npu *c, int n, const ork_seq_op *ops){
+    int gs[2]={0,n}; return ork_i8_dyn_begin_seq_mc(c,n,ops,1,gs,1);
 }
 
 int ork_dyn_seq_end(ork_dyn_chain *h){

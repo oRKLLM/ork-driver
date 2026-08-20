@@ -15,7 +15,7 @@ int main(void){
         unsigned s=7+i;
         for(int j=0;j<M*K;j++){s=s*1103515245+12345;A[j]=(ork_f16)((s>>16)&1);}
         for(int j=0;j<K*N;j++){s=s*1103515245+12345;B[j]=(ork_f16)((s>>16)&1);}
-        int rc=ork_npu_probe_f16_stridedA(c,M,K,N,(unsigned short*)A,P,(unsigned short*)B,(unsigned short*)out);
+        int rc=ork_f16_npu_probe_stridedA(c,M,K,N,(unsigned short*)A,P,(unsigned short*)B,(unsigned short*)out);
         int bad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];
             if((float)out[(size_t)m*N+n]!=acc) bad++; }
         printf("  M=%d K=%d N=%d apitch=%d: rc=%d %d/%d exact %s\n",M,K,N,P,rc,M*N-bad,M*N,(rc==0&&!bad)?"OK":"CHECK"); if(rc||bad)fail=1;

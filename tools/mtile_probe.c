@@ -28,7 +28,7 @@ int main(int argc,char**argv){
         for(int m=0;m<M;m++)for(int n=0;n<N;n++){int32_t s=0;for(int k=0;k<K;k++)s+=(int)A[(size_t)m*K+k]*(int)B[(size_t)k*N+n];ref[(size_t)m*N+n]=s;}
         char r0[64],r1[64];
         for(int mode=0;mode<2;mode++){
-            double us=0; int rc=ork_npu_probe_mtile_i8(c,M,K,N,mode,A,B,C,&us);
+            double us=0; int rc=ork_i8_npu_probe_mtile(c,M,K,N,mode,A,B,C,&us);
             char*o=mode?r1:r0;
             if(rc==0){ long bad=0; for(size_t j=0;j<(size_t)M*N;j++)if(C[j]!=ref[j])bad++;
                 double gops=us>0?(2.0*M*K*N)/(us*1e3):0;

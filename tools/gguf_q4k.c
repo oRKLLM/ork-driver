@@ -80,8 +80,8 @@ int main(int argc,char**argv){
         for(int k=0;k<K;k++){sd=sd*1103515245+12345;Af[m*K+k]=((int)(sd>>9)%2001-1000)/1000.0f;float a=Af[m*K+k];if(a<0)a=-a;if(a>mx)mx=a;}
         aS[m]=mx/127; for(int k=0;k<K;k++){int q=(int)lrintf(Af[m*K+k]/aS[m]);if(q>127)q=127;if(q<-127)q=-127;A[m*K+k]=q;} }
     ork_npu*c=ork_npu_init(); if(!c){printf("npu init failed\n");return 1;}
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed (K=%d N=%d)\n",K,N);return 1;}
-    int rc=ork_mm_run_i8(c,w,M,A,C); ork_w_free(w);
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed (K=%d N=%d)\n",K,N);return 1;}
+    int rc=ork_i8_mm_run(c,w,M,A,C); ork_w_free(w);
     if(rc){printf("run rc=%d\n",rc);return 1;}
     double se=0,sr=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double r=0; for(int k=0;k<K;k++)r+=(double)Af[m*K+k]*wf[(size_t)n*ne0+k];
         double deq=(double)aS[m]*bS[n]*C[m*N+n]; se+=(deq-r)*(deq-r); sr+=r*r; }

@@ -24,7 +24,7 @@ int main(int argc,char**argv){
     ork_f16_fuzz_clear();
     if(v!=0x20000120u) ork_f16_fuzz_add(0x0201,0x100c,v);
     printf("FP16-path 0x100c=0x%08x (proc=%u in=%u): submitting...\n", v, (v>>7)&7, (v>>4)&7);
-    int rc=ork_npu_probe_f16_mm(c,M,K,N,A,B,raw);
+    int rc=ork_f16_npu_probe_mm(c,M,K,N,A,B,raw);
     printf("FP16-path 0x100c=0x%08x -> rc=%d raw[0..3]= %.3f %.3f %.3f %.3f   (fp16 ref=64.0)\n",
            v, rc, raw[0],raw[1],raw[2],raw[3]);
     ork_npu_free(c); free(A);free(B);free(raw);

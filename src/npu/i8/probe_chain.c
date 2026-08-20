@@ -40,7 +40,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     /* pack an all-ones int8 weight [K,N] -> C = K everywhere */
     int8_t *wb=malloc((size_t)K*N); if(!wb) return -2; for(int i=0;i<K*N;i++) wb[i]=1;
-    ork_w *w=ork_mm_pack_i8(c,K,N,wb); free(wb); if(!w) return -2;
+    ork_w *w=ork_i8_mm_pack(c,K,N,wb); free(wb); if(!w) return -2;
     uint32_t wdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
     /* ewmul inputs + CPU ref (int8) */
     int8_t r1[512],s1[512],ref1[512]; uint32_t g=555;
@@ -63,7 +63,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     uint32_t *base=(uint32_t*)RC->cpu; memset(base,0,3*(size_t)REGCMD_I8_N*4);
     uint32_t am=(uint32_t)(AF->dma+offA);
     { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
-      orki_synth_i8(rc,M,K,N,am,wdma,o0,1,CBUF,0);                                  /* prog0 matmul -> o0 */
+      orki_i8_synth(rc,M,K,N,am,wdma,o0,1,CBUF,0);                                  /* prog0 matmul -> o0 */
       uint64_t nx=RC->dma + (size_t)1*REGCMD_I8_N*4; int amt=(69+3)/2;         /* -> prog1 (SDP regcfg 69) */
       rc[216]=0x0010|((uint32_t)(nx&0xffff)<<16); rc[217]=(0x0101u<<16)|(uint32_t)((nx>>16)&0xffff);
       rc[218]=0x0014|((uint32_t)amt<<16);         rc[219]=(0x0101u<<16);
@@ -77,7 +77,7 @@ int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
       rc[140]=0x0014|((uint32_t)amt<<16);         rc[141]=(0x0101u<<16);
       memcpy(base+1*REGCMD_I8_N, rc, REGCMD_MUL_N*4); }
     { uint32_t rc[REGCMD_I8_N]; memset(rc,0,sizeof rc);
-      orki_synth_i8(rc,M,K,N,am,wdma,o2,1,CBUF,0);                                  /* prog2 matmul -> o2 (TERMINAL) */
+      orki_i8_synth(rc,M,K,N,am,wdma,o2,1,CBUF,0);                                  /* prog2 matmul -> o2 (TERMINAL) */
       memcpy(base+2*REGCMD_I8_N, rc, REGCMD_I8_N*4); }
     orki_bsync(fd,RC,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->mtk[0].cpu; memset(tk,0,3*sizeof *tk);
@@ -140,7 +140,7 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ a0[EWC(m,n)]=r0[m*N+n]; b0[EWC(m,n)]=s0[m*N+n]; a1[EWC(m,n)]=r1[m*N+n]; b1[EWC(m,n)]=s1[m*N+n]; }
     orki_bsync(fd,&A0,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B0,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O0,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_bsync(fd,&A1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&B1,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O1,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* build the two ewmul regcmds exactly like the standalone ork_npu_ewmul_i8 (geom + addrs + scale) */
+    /* build the two ewmul regcmds exactly like the standalone ork_i8_npu_ewmul (geom + addrs + scale) */
     uint32_t rc0[REGCMD_MUL_N],rc1[REGCMD_MUL_N];
     memcpy(rc0,REGCMD_MUL,sizeof rc0); orki_set_mul_geom(rc0,REGCMD_MUL_N,M,N);
     orki_setrn(rc0,REGCMD_MUL_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O0.dma); orki_setrn(rc0,REGCMD_MUL_N,RK_SDP_5018,(uint32_t)A0.dma); orki_setrn(rc0,REGCMD_MUL_N,RK_SDP_5038,(uint32_t)B0.dma);
@@ -167,7 +167,7 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
         memset(C.cpu,0,(size_t)8*64*4);
         orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&C,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
         orki_act(fd,RKNPU_ACT_RESET,0);
-        orki_synth_i8(rmm,8,64,64,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)C.dma,1,CBUF,0);
+        orki_i8_synth(rmm,8,64,64,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)C.dma,1,CBUF,0);
     }
     ork_chain_prog progs[3]={ {rmm,REGCMD_I8_N,0xd,108,216}, {rc0,REGCMD_MUL_N,0x18,69,138}, {rc1,REGCMD_MUL_N,0x18,69,-1} };
     /* dom=-1 (default domain) to MATCH the orki_bcreate(...,-1) buffers + c->regcmd/c->task (a domain-0 submit

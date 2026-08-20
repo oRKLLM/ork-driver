@@ -52,7 +52,7 @@ int main(void){
     for(int i=0;i<D;i++) x[i]=frnd()*3; for(int i=0;i<D;i++) an[i]=1+0.1f*frnd(); for(int i=0;i<dk;i++){ qn[i]=1+0.1f*frnd(); kn[i]=1+0.1f*frnd(); }
     float *Kc=malloc((size_t)Hkv*nkv*dk*4), *Vc=malloc((size_t)Hkv*nkv*dv*4);
     for(size_t i=0;i<(size_t)Hkv*nkv*dk;i++) Kc[i]=frnd(); for(size_t i=0;i<(size_t)Hkv*nkv*dv;i++) Vc[i]=frnd();
-    ork_w *pWq=ork_mm_pack_i8(c,D,Nq,Wq), *pWk=ork_mm_pack_i8(c,D,Nkv,Wk), *pWv=ork_mm_pack_i8(c,D,Nkv,Wv), *pWo=ork_mm_pack_i8(c,Nq,D,Wo);
+    ork_w *pWq=ork_i8_mm_pack(c,D,Nq,Wq), *pWk=ork_i8_mm_pack(c,D,Nkv,Wk), *pWv=ork_i8_mm_pack(c,D,Nkv,Wv), *pWo=ork_i8_mm_pack(c,Nq,D,Wo);
     if(!pWq||!pWk||!pWv||!pWo){ printf("pack fail\n"); return 2; }
     float scale=1.0f/sqrtf(dk);
 

@@ -24,14 +24,14 @@ int main(int argc, char **argv) {
     int8_t *B = malloc((size_t) K * N); for (size_t i = 0; i < (size_t) K * N; i++) B[i] = (int8_t)(i & 0x7f);
     /* build a pre-tiled blob once (for the import path) */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *wt = ork_mm_pack_i8(c, K, N, B);
+    ork_w *wt = ork_i8_mm_pack(c, K, N, B);
     size_t need = ork_w_dump(wt, NULL, 0); void *blob = malloc(need); ork_w_dump(wt, blob, need); ork_mm_free(c, wt);
     printf("mode=%s cycles=%d dom=%d K=%d N=%d (~%zuMB blob)\n", mode, cyc, dom, K, N, need >> 20);
     ork_npu_set_pack_domain(c, dom);
     int ok = 0;
     for (int i = 0; i < cyc; i++) {
-        ork_w *w = native ? ork_mm_pack_i8(c, K, N, B)
-                          : ork_mm_load_i8_import(c, K, N, blob, need);
+        ork_w *w = native ? ork_i8_mm_pack(c, K, N, B)
+                          : ork_i8_mm_load_import(c, K, N, blob, need);
         if (!w) { printf("*** cycle %d: ALLOC FAILED (mode=%s) after %d successful free-cycles => IOVA NOT reclaimed (LEAK)\n", i, mode, ok); break; }
         if (!hold) ork_mm_free(c, w);   /* reclaim; hold mode LEAVES it for the process-exit kernel cleanup */
         ok++;

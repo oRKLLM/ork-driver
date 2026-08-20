@@ -37,7 +37,7 @@ struct ork_dom_scratch {
     struct buf mrc[ORK_MAXCORE], mtk[ORK_MAXCORE], maf[ORK_MAXCORE], mcc[ORK_MAXCORE], mtk_all;
     size_t mccsz[ORK_MAXCORE]; int mwarm[ORK_MAXCORE]; int mc_alloc;
 };
-struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int scratch_import; /* 1 once a native-int4 weight is bimported: route run scratch via orki_bimport (bcreate EINVALs in a bimport-filled domain). Set by ork_mm_load_i4_import; int8/fp16 never set it. */ int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_mm_layer_i8 per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
+struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af, Cc; size_t ccsz; void *cres; size_t cressz; int warmed, last_dt; int scratch_import; /* 1 once a native-int4 weight is bimported: route run scratch via orki_bimport (bcreate EINVALs in a bimport-filled domain). Set by ork_i4_mm_load_import; int8/fp16 never set it. */ int last_chain; int core_budget; int layer_warmed; uint64_t layer_warm[7];  /* ork_i8_mm_layer per-NPU doorbell warm cache (keyed on the 7 weight ptrs) */ orkd_conn *daemon;  /* Path B: non-NULL => client mode, ork_mm_* route through orkd instead of a local NPU (fd=-1) */
     /* fused-chain PER-CORE scratch (increment 2: concurrent round-robin — one independent buffer set per core so
      * chains dispatched to different cores never share DRAM). chain_rc = P-program regcmd, chain_tk = P-task array,
      * chain_lrc = LUT-load regcmd (DRAM source), chain_lsc = LUT SDP scratch. Lazily allocated per core on first use. */
@@ -222,13 +222,13 @@ struct ork_dyn_chain {
                              * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
     int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
                              * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
-    /* GROUPED int4 (ork_dyn_begin_mc_i4_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
+    /* GROUPED int4 (ork_i4_dyn_begin_mc_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
      * blocks scaled + FLOAT-accumulated — C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]. */
     int          i4g;              /* 1 = grouped-int4 float drain */
     const float *i4g_aS, *i4g_bS;  /* activation scale (M*Sk), weight scale (Sk*N) — caller host arrays */
     float       *i4g_Cf;           /* float output C[M,N] */
     int          i4g_N, i4g_Sk;    /* N + group count */
-    /* SEQ chain (ork_dyn_begin_seq_i8 — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
+    /* SEQ chain (ork_i8_dyn_begin_seq — heterogeneous single-group int8 chain, drained by ork_dyn_seq_end):
      * all ops share ONE output scratch; per-op layout/esz differ (matmul int32 dense, SDP int8 EWCUBE). */
     int        seq;             /* 1 = built by begin_seq_i8 */
     int        seq_term;        /* (single-core) op index whose terminal int32 last-col sentinel gates completion */
@@ -248,17 +248,17 @@ unsigned orki_mm_timeout_ms(void);
 int      ork_i4_batch(void);
 void     orki_bdestroy(int fd, struct buf *b);
 int      orki_budget(ork_npu *c, int M);
-void     orki_synth_i4(uint32_t *rc, int mc, int K, int N, uint32_t aA, uint32_t aB, uint32_t aC);
+void     orki_i4_synth(uint32_t *rc, int mc, int K, int N, uint32_t aA, uint32_t aB, uint32_t aC);
 int      orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n);
-void     orki_tile_i4_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
+void     orki_i4_tile_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
 extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_wdom, orki_last_import;
 extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;
 
 /* ---- provided BY src/npu/i4/ to the scaffold ---- */
 int  orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);
 int  orki_i4_submit_tmo_ms(void);
-int  orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
-int  orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);
+int  orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
+int  orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);
 
 struct ork_xspec { uint8_t kwp, rst, wtg, wc, stg, sc, setdt; };
 
@@ -287,21 +287,21 @@ static inline int ork_softmax_npu_enabled(void){ static int v=-1; if(v<0) v=gete
 /* ---- scaffold <-> f16 module ---- */
 double orki_silu_f(double x);
 int ork_f16_colsplit(void);
-int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out);
+int ork_f16_mm_run_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out);
 int ork_norm_reduce_npu(ork_npu *c,int M,int n,const f16 *x,float *ss_out);
 int ork_norm_rsqrt_npu(ork_npu *c,int M,int nf,double eps,const float *ss,float *scale);
 int orki_bmm_c_dense(const ork_bmm_strides *s,int N);
 ork_bmm_strides orki_bmm_natural(int M,int K,int N);
 unsigned orki_ew_timeout_ms(void);
 void orki_bmm_scatter_i32(int32_t *dst, const int32_t *src, int rows, int cols, long sr, long sc);
-void orki_set_f16_out(uint32_t*rc,int N,int stride);
-void orki_set_f16_out_fp16in(uint32_t*rc,int M,int N);
+void orki_f16_set_out(uint32_t*rc,int N,int stride);
+void orki_f16_set_out_fp16in(uint32_t*rc,int M,int N);
 void orki_set_mul_geom(uint32_t *rc,int n,int M,int N);
 void orki_splice_ew_lane(uint32_t*rc,const uint32_t*base);
-void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf);
+void orki_f16_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf);
 
-void orki_bmm_gather_i8(int8_t *dst, const int8_t *src, int rows, int cols, long sr, long sc);
-void orki_bmm_gather_f16(f16 *dst, const f16 *src, int rows, int cols, long sr, long sc);
+void orki_i8_bmm_gather(int8_t *dst, const int8_t *src, int rows, int cols, long sr, long sc);
+void orki_f16_bmm_gather(f16 *dst, const f16 *src, int rows, int cols, long sr, long sc);
 
 /* ---- shared op/SDP constants (used by more than one precision module) ---- */
 #define ORK_DYN_HEADROOM 2
@@ -328,10 +328,10 @@ int orki_mtile_cap(int Kred);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);
-ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
+ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 void orki_mc_recover_resubmit(ork_dyn_chain *h);
 void ork_install_term(void);
-void orki_set_i16_out(uint32_t*rc,int N,int stride,int mult,int shift);
+void orki_i16_set_out(uint32_t*rc,int N,int stride,int mult,int shift);
 void orki_seq_build_op(ork_dyn_chain *h, const ork_seq_op *o, int gi, struct buf *RC, struct buf *AF, struct rknpu_task *tks, size_t *astage, size_t *coff, int pp, int nx_pp, int nx_kind, int CBUF);
 
 
@@ -340,24 +340,24 @@ enum ork_async_kind { OAK_F16=0, OAK_I8, OAK_I4, OAK_CHAIN_I8, OAK_CHAIN_I4, OAK
 
 /* ---- i8 subtree symbols the scaffold calls ---- */
 int ork_dyn_done_i(ork_dyn_chain *h, int i);
-int orki_chain_fullk_mcap_i8(ork_npu *c, int K);
+int orki_i8_chain_fullk_mcap(ork_npu *c, int K);
 struct chain_silu_spec { const ork_chain_op *ops; int task; int sdp_task; int r_mult, r_shift; int gate_mult, gate_shift; uint32_t out_bias, idx_off, cfg4064, cfg4068; const int16_t *lut; int nlut; };
-int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core);
-int orki_run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
+int orki_i8_run_chain_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core);
+int orki_i4_run_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
 int orki_silu_calibrate_idx(ork_npu *c);
 int orki_silu_calibrate_idx16(ork_npu *c);
 int orki_slice_rescue_or_refuse(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc);
-int orki_slice_run_i8(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
-ork_w_sliced *orki_slice_pack_i8(ork_npu *c, int K, int N, const int8_t *B);
-void orki_inflate_chan_nf4_i8(const uint8_t *nib, int K, const int8_t lut[16], int8_t *i8);
-void orki_set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift);
-void orki_set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift, uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068);
+int orki_i8_slice_run(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
+ork_w_sliced *orki_i8_slice_pack(ork_npu *c, int K, int N, const int8_t *B);
+void orki_nf4_inflate_chan_to_i8(const uint8_t *nib, int K, const int8_t lut[16], int8_t *i8);
+void orki_i8_set_out8(uint32_t*rc,int N,int stride,int mult,int shift);
+void orki_i8_set_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift, uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068);
 void orki_silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut);
 void orki_silu_build_curve_biased(ork_npu *c,double(*f)(double),double in_scale,double out_scale,double bias,int16_t *lut);
-void orki_tile_f32_i8(ork_npu *c, ork_w *w, int K, int N, const float *f32, const float *inv);
-void orki_tile_i8_range(int lo,int hi,void *a);
-void orki_tile_i8_to_import_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8);
-void orki_tile_i8_to_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8);
+void orki_i8_tile_f32(ork_npu *c, ork_w *w, int K, int N, const float *f32, const float *inv);
+void orki_i8_tile_range(int lo,int hi,void *a);
+void orki_i8_tile_to_import_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8);
+void orki_i8_tile_to_tiles(ork_npu *c, ork_w *w, int K, int N, const int8_t *i8);
 
 enum { OP_MM32=0, OP_MM8=1, OP_SILU=2, OP_EWMUL=3 };   /* ork_chain_op.kind values (struct is in ork_npu.h) */
 
@@ -377,7 +377,7 @@ struct ork_pc_chain {
     struct buf *outbuf[512]; int32_t *outptr[512];
 };
 
-void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG);
+void orki_i8_set_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG);
 void orki_apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf);
 void *ork_fbc_thread(void *vp);
 
@@ -408,7 +408,7 @@ ork_w *orki_pack(ork_npu *c,int K,int N,const void *B,int dt);
 extern long orki_imp_wn;
 void orki_chan_scales_f32(const float *f32, int K, int N, float *inv, float *bscale);
 extern const float ORKI_NF4_LEVELS[16];
-void orki_expand_chan_i4_i8(const uint8_t *nib, int K, int8_t *i8);
+void orki_i4_expand_chan_to_i8(const uint8_t *nib, int K, int8_t *i8);
 
 /* named so a module-owned regcmd fuzz-override table can be extern-declared across the split */
 struct ork_regovr { uint32_t blk, reg, val; };
@@ -421,13 +421,13 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C);
 void *orki_slice_acc_worker(void *p);
 int orki_fused_mtile(int K,int M);
 
-void orki_set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068);
+void orki_i8_set_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068);
 int orki_chain_build_lut_fn(ork_npu*c, double(*fn)(double), double in_scale, double out_scale, int r_mult, int r_shift, uint32_t cfg4068, int16_t *lut);
 double orki_gelu_f(double x);
 double orki_rsqrt_f(double x);
-int orki_act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us);
+int orki_i16_act_lut(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us);
 void *orki_stream_worker_i8sk(void *vp);
-int orki_act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us);
+int orki_i8_act_lut(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us);
 
 #define ORK_I4A8_MAGIC  0x4F344E31u           /* 'O','4','N','1' */
 #define ORK_I4A8_VER    ork_pack_format_version()  /* int4 blob compat = library MAJOR (see ork_npu.h) */
@@ -435,12 +435,12 @@ int orki_act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,d
 
 /* xorshift PRNG for stochastic int4 rounding — tiny and hot, header-inline so every module gets it */
 static inline uint32_t ork_xs32(uint32_t *s){ uint32_t x=*s; x^=x<<13; x^=x>>17; x^=x<<5; *s=x; return x; }
-ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);
+ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);
 
 extern struct ork_regovr orki_i4_fovr[16]; extern int orki_i4_fovr_n;
 
-ork_w_sliced *orki_slice_pack_i4(ork_npu *c, int K, int N, const int8_t *B);
-int orki_slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
+ork_w_sliced *orki_i4_slice_pack(ork_npu *c, int K, int N, const int8_t *B);
+int orki_i4_slice_run(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
 
 struct ork_i4a8_hdr { uint32_t magic, version; int32_t K, N; uint32_t quant_kind; };
 

@@ -162,7 +162,7 @@ int ork_dom(int dom);
 void orki_fold_scratch_free(ork_npu *c);
 void orki_live_add(int fd, uint32_t h, uint64_t o);
 void orki_live_del(uint32_t h);
-void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride);
+void orki_i8_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride);
 
 extern struct buf **orki_imp;
 extern int orki_imp_n, orki_imp_cap;
@@ -171,6 +171,6 @@ void ork_sig_teardown(int sig);
 
 void orki_setrn(uint32_t *rc, int n, enum ork_reg_id id, uint32_t v);
 
-void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
+void orki_i8_synth_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
 
 #endif /* ORK_NPU_CORE_H */

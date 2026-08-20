@@ -31,7 +31,7 @@ int main(void) {
      *     orkd shapes differ ONLY in the transport handle and the weight reference (ork_w* vs uint64_t id). */
 
     /* run_i8 — lib carries K,N inside ork_w; orkd passes them explicitly after the id (int32_t == int) */
-    int (*l_run_i8)(ork_npu *, ork_w *, int, const int8_t *, int32_t *) = ork_mm_run_i8;
+    int (*l_run_i8)(ork_npu *, ork_w *, int, const int8_t *, int32_t *) = ork_i8_mm_run;
     int (*o_run_i8)(orkd_conn *, uint64_t, int, int, int, const int8_t *, int32_t *) = orkd_run_i8;
     (void) l_run_i8; (void) o_run_i8;
 
@@ -55,7 +55,7 @@ int main(void) {
     int (*l_layer)(ork_npu *, const struct ork_layer_dims *,
                    ork_w *, ork_w *, ork_w *, ork_w *, ork_w *, ork_w *, ork_w *,
                    const float *, const float *, const float *,
-                   const float *, const float *, const float *, float *) = ork_mm_layer_i8;
+                   const float *, const float *, const float *, float *) = ork_i8_mm_layer;
     int (*o_layer)(orkd_conn *, struct orkd_layer *,
                    const float *, const float *, const float *,
                    const float *, const float *, const float *, float *) = orkd_layer_i8;

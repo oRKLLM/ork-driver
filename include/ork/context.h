@@ -15,7 +15,7 @@ const char  *ork_npu_version(void);
 /**
  * @brief On-disk pack-format (.orkpack) compatibility token — the library's MAJOR version.
  *
- * A persisted weight (ork_w_dump / ork_w_dump_i4a8) is only binary-compatible with builds that share
+ * A persisted weight (ork_w_dump / ork_i4a8_w_dump) is only binary-compatible with builds that share
  * this value (ORK_PACK_FORMAT_VERSION). It tracks the MAJOR of the last format-changing release but is
  * DECOUPLED from ORK_NPU_VERSION's MAJOR (a library major bump that does NOT touch the on-disk bytes — e.g.
  * the 1.0.0 stability release — keeps this at its prior value so existing .orkpacks stay valid). Bump it
@@ -23,7 +23,7 @@ const char  *ork_npu_version(void);
  * cap / N-tiling, the 32x32 block or Bb dump order) or a weight QUANT change (int8/int4 scale rule,
  * int4 nibble packing, NF4 codebook).
  *
- * ork-driver stamps this into the int4 blob header and rejects a mismatch on load (ork_mm_load_i4a8
+ * ork-driver stamps this into the int4 blob header and rejects a mismatch on load (ork_i4a8_mm_load
  * returns NULL). The int8 dump (ork_w_dump) is a headerless raw-tile stream — same-(K,N) blobs from an
  * incompatible major have the SAME size, so ork-driver cannot self-detect there; the caller's on-disk
  * container (e.g. oRKLLM's .orkpack file) MUST record ork_pack_format_version() next to the bytes and
@@ -108,9 +108,9 @@ void         ork_npu_set_priority(ork_npu *ctx, unsigned prio);
 
 /* Per-weight NPU IOMMU domain placement. The rk_iommu 32-bit IOVA window (~4 GiB) is per
  * iommu_domain_id, so a model larger than 4 GiB can stay FULLY resident (no streaming, no per-token
- * map/unmap) by placing its weights across several domains. Call this before ork_mm_pack_i8 /
- * ork_mm_load_i8 (and the fp16/int4 variants): each weight packed/loaded afterward lands its resident
- * tiles in `domain` and records it; ork_mm_run* then submits that weight's matmuls against the same
+ * map/unmap) by placing its weights across several domains. Call this before ork_i8_mm_pack /
+ * ork_i8_mm_load (and the fp16/int4 variants): each weight packed/loaded afterward lands its resident
+ * tiles in `domain` and records it; ork_f16_mm_run* then submits that weight's matmuls against the same
  * domain automatically. domain<0 reverts to the process default (env ORK_IOMMU_DOMAIN, else 0). */
 void         ork_npu_set_pack_domain(ork_npu *ctx, int domain);
 int          ork_npu_pack_domain(const ork_npu *ctx);   /* current pack domain (for save/restore) */

@@ -22,10 +22,10 @@
 
 /* CHAIN (M4 building block): int8-matmul(int16-out) -> PER-CHANNEL-scale(int16) in ONE PC-chain via
  * chain_progs — the A·V->normalize pattern. The matmul's int16 output G IS the per-channel op's input
- * (0x5018), validating the intermediate-buffer bridge (like ork_npu_chain_gatesilu_i16 but SDP=per-channel
+ * (0x5018), validating the intermediate-buffer bridge (like ork_i16_npu_chain_gatesilu but SDP=per-channel
  * scale instead of silu). out = clamp_i16( requant_i16(A[M,K]xB[K,N], m1,s1) * scale[n] * m2 >> s2 ).
  * A int8[M*K], B int8[K*N] row-major, scale int16[N] per-channel. K%32,N%32,N<=nmax,M<=64. 0/ok,<0. */
-int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+int ork_i16_npu_chain_mm_perchan(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                                  const int16_t *scale,int m1,int s1,int m2,int s2,int16_t *out,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -39,7 +39,7 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
         bb[(size_t)nt*KT*32*32+(size_t)kt*32*32+nl*32+kk]=B[(size_t)(kt*32+kk)*N+(nt*32+nl)]; }
     memset(G.cpu,0,sz); memset(O.cpu,0,sz); memset(SB.cpu,0,4096);
     { int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; }
-    /* ALL-INT16 dtype-matched chain (the fp16-out matmul writeout is a HW dead end — see orki_set_f16_out_fp16in NOTE).
+    /* ALL-INT16 dtype-matched chain (the fp16-out matmul writeout is a HW dead end — see orki_f16_set_out_fp16in NOTE).
      * int8 matmul -> INT16 G (set_i16_out, PROVEN by the gate->silu chain) -> INT16 2-input per-channel SDP
      * (REGCMD_MUL_I16, PROC_PRECISION=1, DATA_FORMAT 0x24000001). Both int16 => dtype-path matched (the same fix
      * that unhung the fp16 pair), and the matmul CAN emit int16 (unlike fp16). PC16/EWCUBEH atom-8 layout is shared
@@ -57,11 +57,11 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     if(getenv("ORK_I16_ENTER")) ork_npu_enter(c,DT_I8,XP_SC_MM,OCK_NONE);   /* layer entry */
     else orki_act(fd,RKNPU_ACT_RESET,0);                                         /* gatesilu-style bare reset (proven for this chained int16-out matmul) */
     static uint32_t mm[REGCMD_I8_N], pc[REGCMD_MUL_I16_N];
-    orki_synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
-    orki_set_i16_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
+    orki_i8_synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);   /* prog0: matmul INT16-out -> G */
+    orki_i16_set_out(mm,N,0,m1,s1);                                                        /* int16 G (m1/s1 requant) — matches the int16 SDP */
     { const char*e=getenv("ORK_I16_MM4010"); if(e) orki_setrn(mm,REGCMD_I8_N,RK_DPU_OUT_PRECISION,(uint32_t)strtoul(e,0,0)); } /* dtype-path: match matmul G-write precision to the SDP's read precision */
     /* prog1: INT16 2-input per-channel SDP (REGCMD_MUL_I16), patched exactly as the bit-exact standalone
-     * ork_npu_mul_perchan_i16: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
+     * ork_i16_npu_mul_perchan: per-channel ERDMA (0x5034=0x08, b=[N] contiguous), m2/s2 requant, clear the
      * standalone-only captured zero-points (0x4080/0x4044/0x4074). */
     if(getenv("ORK_I16_MULTMPL")){   /* OLD: standalone-captured REGCMD_MUL_I16 (hangs chained — no chained-ERDMA arming) */
         memcpy(pc,REGCMD_MUL_I16,sizeof pc);
@@ -120,14 +120,14 @@ int ork_npu_chain_mm_perchan_i16(ork_npu *c,int M,int K,int N,const int8_t *A,co
     return crc;
 }
 
-int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,
+int ork_i16_npu_chain_mm_silu(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,
                               int16_t *out,int *mm_ran,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     if(orki_silu_calibrate_idx16(c)) return -1;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    /* build the int16 silu LUT curve for (in_scale,out_scale) — same as orki_act_lut_i16 */
+    /* build the int16 silu LUT curve for (in_scale,out_scale) — same as orki_i16_act_lut */
     static double qsum[1030]; static int qn[1030];
     for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
     for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
@@ -164,7 +164,7 @@ int ork_npu_chain_mm_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in
     { uint32_t *mm=(uint32_t*)c->regcmd.cpu;                  /* task0 regcmd at word 0 */
       uint32_t *si=(uint32_t*)((char*)c->regcmd.cpu + (size_t)REGCMD_I8_N*4);   /* task1 regcmd */
       memset(mm,0,REGCMD_I8_N*4);
-      orki_synth_i8(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,1,CBUF,0);
+      orki_i8_synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,1,CBUF,0);
       uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;         /* next = silu regcmd addr */
       mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;   /* next register-amount = (silu regcfg+3)/2 */
@@ -204,7 +204,7 @@ fail:
 }
 
 /* CHAIN ASSEMBLER increment-1: DATA-CONNECTED int8-matmul(int16-out) -> int16-silu in ONE PC-chain via the
- * general ork_npu_chain_progs core. Unlike ork_npu_chain_mm_silu_i16 (which only proves the chain WALKS --
+ * general ork_npu_chain_progs core. Unlike ork_i16_npu_chain_mm_silu (which only proves the chain WALKS --
  * its matmul output and silu input are SEPARATE buffers), here the gate matmul's int16 output buffer G IS
  * the silu's input, so it validates the INTERMEDIATE-BUFFER BRIDGE (the crux of the FFN chain): does the
  * matmul set_i16_out layout match the silu's 0x5018 EWCUBEH cube input layout. Computes
@@ -212,7 +212,7 @@ fail:
  * A int8 [M*K] row-major, B int8 [K*N] row-major (de-tiled here); mult/shift = the int32->int16 requant.
  * gate_out (nullable) returns G read back via EWCUBEH so a caller can localize a mismatch to the matmul
  * stage vs the silu stage. Small-shape validated regime (probe_i16_out N range). 0/ok,-1 wedge,-2 dims,-3 SoC. */
-int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+int ork_i16_npu_chain_gatesilu(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                                int mult,int shift,double in_scale,double out_scale,
                                int16_t *gate_out,int16_t *out,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
@@ -220,7 +220,7 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
     if(orki_silu_calibrate_idx16(c)) return -1;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
-    /* silu LUT for (in_scale,out_scale) -- same construction as orki_act_lut_i16 / Phase-0 */
+    /* silu LUT for (in_scale,out_scale) -- same construction as orki_i16_act_lut / Phase-0 */
     static double qsum[1030]; static int qn[1030];
     for(int k=0;k<1030;k++){ qsum[k]=0; qn[k]=0; }
     for(int s=0;s<SILU16_NS;s++){ int k=c->silu_idx16[s]; if(k<0||k>1029)continue; qsum[k]+=-32768.0+s*SILU16_QSTEP; qn[k]++; }
@@ -262,8 +262,8 @@ int ork_npu_chain_gatesilu_i16(ork_npu *c,int M,int K,int N,const int8_t *A,cons
 
     /* build the 2 chained programs: [0] matmul int16-out -> G ; [1] silu G -> O */
     static uint32_t mm[REGCMD_I8_N], si[REGCMD_SILU_STD_I16_N];
-    orki_synth_i8(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);
-    orki_set_i16_out(mm,N,0,mult,shift);
+    orki_i8_synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,1,CBUF,0);
+    orki_i16_set_out(mm,N,0,mult,shift);
     memcpy(si,REGCMD_SILU_STD_I16,(size_t)REGCMD_SILU_STD_I16_N*4);
     orki_set_mul_geom(si,REGCMD_SILU_STD_I16_N,M,N);
     orki_setrn(si,REGCMD_SILU_STD_I16_N,RK_SDP_5040,0);

@@ -26,7 +26,7 @@ int main(void){
     printf("ork_dyn_spin_test: S=%d K=%d N=%d | ORK_DYN_SPIN=%s ORK_DYN_RESERVE=%s\n", S,K,N, spin?"1":"unset", rv?rv:"unset");
     int8_t*A=malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); free(B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); free(B); if(!w){printf("pack fail\n");return 1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!O){printf("dma fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }

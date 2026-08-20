@@ -3,7 +3,7 @@
  * Separate from domain_probe.c (which tests >4GiB residence CAPACITY). This tests COMPUTE
  * PARALLELISM. rkllm round-robins single-core submits across cores 0/1/2 (no barrier) to keep the
  * NPU fed (91% util at decode). Two questions:
- *   (1) does ork's async round-robin (ork_mm_run_stream_i8) actually overlap 3 cores? (vs 1-core serial)
+ *   (1) does ork's async round-robin (ork_i8_mm_run_stream) actually overlap 3 cores? (vs 1-core serial)
  *   (2) does putting each core's weight in a DIFFERENT domain (0/1/2) still overlap, or serialize?
  *       (= can the rk_iommu run 3 translation contexts at once → cross-domain parallelism for >4GiB)
  *
@@ -34,14 +34,14 @@ int main(int argc,char**argv){
 
     /* ---- PART 1: cross-core overlap in ONE domain (the rkllm round-robin question) ---- */
     ork_w *wsame[3];
-    for(int i=0;i<3;i++){ ork_npu_set_pack_domain(c,0); wsame[i]=ork_mm_pack_i8(c,K,N,B); if(!wsame[i]){printf("pack same %d failed\n",i);return 1;} }
+    for(int i=0;i<3;i++){ ork_npu_set_pack_domain(c,0); wsame[i]=ork_i8_mm_pack(c,K,N,B); if(!wsame[i]){printf("pack same %d failed\n",i);return 1;} }
     ork_mm_task_i8 tsame[3]; for(int i=0;i<3;i++) tsame[i]=(ork_mm_task_i8){wsame[i],M,A,C[i]};
-    ork_npu_set_core_budget(c,cores); ork_mm_run_stream_i8(c,3,tsame);                 /* warm */
-    ork_npu_set_core_budget(c,1); for(int i=0;i<3;i++) ork_mm_run_i8(c,wsame[i],M,A,C[i]);
+    ork_npu_set_core_budget(c,cores); ork_i8_mm_run_stream(c,3,tsame);                 /* warm */
+    ork_npu_set_core_budget(c,1); for(int i=0;i<3;i++) ork_i8_mm_run(c,wsame[i],M,A,C[i]);
     ork_npu_set_core_budget(c,1);
-    double t0=now_us(); for(int it=0;it<iters;it++){ for(int i=0;i<3;i++) ork_mm_run_i8(c,wsame[i],M,A,C[i]); } double tser=(now_us()-t0)/iters;
+    double t0=now_us(); for(int it=0;it<iters;it++){ for(int i=0;i<3;i++) ork_i8_mm_run(c,wsame[i],M,A,C[i]); } double tser=(now_us()-t0)/iters;
     ork_npu_set_core_budget(c,cores);
-    t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_stream_i8(c,3,tsame); double tsm=(now_us()-t0)/iters;
+    t0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_stream(c,3,tsame); double tsm=(now_us()-t0)/iters;
     printf("\n--- 3 independent %dx%dx%d int8 matmuls (us, mean of %d) ---\n",M,K,N,iters);
     printf("  (a) 1-core serial:                  %.0f\n", tser);
     printf("  (b) run_stream SAME domain (0,0,0): %.0f   speedup = %.2fx  -> cross-core overlap %s\n",
@@ -52,8 +52,8 @@ int main(int argc,char**argv){
      * per-task-domain run_stream variant. This probe now only measures same-domain cross-core round-robin. */
     /* (d) run_chain: PC-chain the 3 matmuls into ONE submit (rkllm's actual mechanism: task_number=3). */
     ork_npu_set_core_budget(c,1);   /* chain is single-core */
-    ork_mm_run_chain_i8(c,3,tsame); /* warm */
-    t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_chain_i8(c,3,tsame); double tch=(now_us()-t0)/iters;
+    ork_i8_mm_run_chain(c,3,tsame); /* warm */
+    t0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_chain(c,3,tsame); double tch=(now_us()-t0)/iters;
     printf("  (d) run_chain (3 matmuls -> 1 submit, single-core): %.0f   speedup vs serial = %.2fx\n", tch, tser/tch);
     printf("  -> chaining amortizes dispatch %s\n", (tser/tch>1.3)?"YES (rkllm mechanism reproduced)":"NO");
     ork_npu_free(c); free(A); free(B); return 0;

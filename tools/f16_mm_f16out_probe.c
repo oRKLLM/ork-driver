@@ -13,7 +13,7 @@ int main(void){
     unsigned s=5;
     for(int i=0;i<M*K;i++){ s=s*1103515245+12345; A[i]=(ork_f16)((s>>16)&1); }
     for(int i=0;i<K*N;i++){ s=s*1103515245+12345; B[i]=(ork_f16)((s>>16)&1); }
-    int rc=ork_npu_probe_f16_mm_f16out(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)out);
+    int rc=ork_f16_npu_probe_mm_f16out(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)out);
     int bad=0,nz=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];
         float got=(float)out[(size_t)m*N+n]; if(got!=0)nz++;

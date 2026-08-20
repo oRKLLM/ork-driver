@@ -23,12 +23,12 @@ int main(int argc, char **argv) {
 
     /* warm domain 0 (native) — the weight we switch AWAY to each iteration */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w0 = ork_mm_pack_i8(c, K, N, B);
-    if (!w0 || ork_mm_run_i8(c, w0, M, A, C)) { printf("warm dom0 failed\n"); return 1; }
+    ork_w *w0 = ork_i8_mm_pack(c, K, N, B);
+    if (!w0 || ork_i8_mm_run(c, w0, M, A, C)) { printf("warm dom0 failed\n"); return 1; }
 
     /* pre-tiled blob to import (from a native pack) */
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wt = ork_mm_pack_i8(c, K, N, B);
+    ork_w *wt = ork_i8_mm_pack(c, K, N, B);
     size_t need = ork_w_dump(wt, NULL, 0);
     void *blob = malloc(need); ork_w_dump(wt, blob, need);
     ork_mm_free(c, wt);
@@ -37,12 +37,12 @@ int main(int argc, char **argv) {
     printf("accumulating imported weights in domain 1 (each ~%zuKB, %d foreign maps)...\n", need>>10, per);
     for (int i = 0; i < maxW; i++) {
         ork_npu_set_pack_domain(c, 1);
-        ork_w *wi = ork_mm_load_i8_import(c, K, N, blob, need);
+        ork_w *wi = ork_i8_mm_load_import(c, K, N, blob, need);
         if (!wi) { printf("*** import #%d: LOAD/MEM_CREATE FAILED (foreign maps ~%d, ~%zuMB)\n",
                           i, i*per, ((size_t)i*need)>>20); break; }
         memset(C, 0, (size_t)M*N*4);
-        ork_mm_run_i8(c, w0, M, A, C);            /* switch -> domain 0 */
-        int rc = ork_mm_run_i8(c, wi, M, A, C);   /* switch -> domain 1, submit against import #i */
+        ork_i8_mm_run(c, w0, M, A, C);            /* switch -> domain 0 */
+        int rc = ork_i8_mm_run(c, wi, M, A, C);   /* switch -> domain 1, submit against import #i */
         if (rc != 0 || C[0] != K) {
             printf("*** SUBMIT FAULT at import weight #%d: rc=%d C[0]=%d | foreign maps ~%d | total ~%zuMB\n",
                    i, rc, C[0], (i+1)*per, ((size_t)(i+1)*need)>>20);

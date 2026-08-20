@@ -62,7 +62,7 @@ int main(int argc,char**argv){
     /* int8 weight+activation (D-like): K=512,N=512,M=4 */
     int Ki=512,Ni=512,Mi=4;
     int8_t*Bi=malloc((size_t)Ki*Ni); memset(Bi,1,(size_t)Ki*Ni);
-    ork_w*wi=ork_mm_pack_i8(c,Ki,Ni,Bi); if(!wi){printf("i8 pack fail\n");return 1;}
+    ork_w*wi=ork_i8_mm_pack(c,Ki,Ni,Bi); if(!wi){printf("i8 pack fail\n");return 1;}
     int8_t*Ai=(int8_t*)malloc((size_t)Mi*Ki); memset(Ai,1,(size_t)Mi*Ki);
     int32_t*Oi=(int32_t*)ork_dma_alloc(c,(size_t)S*Mi*Ni*4); if(!Oi){printf("Oi fail\n");return 1;}
 
@@ -71,7 +71,7 @@ int main(int argc,char**argv){
     int Kf=512,Nf=256,Mf=2; ork_f16 one=(ork_f16)1.0f;
     ork_w*wf=NULL; ork_f16*Af=NULL; float*Of=NULL;
     #define F16_ENSURE() do { if(!wf){ ork_f16*Bf=malloc((size_t)Kf*Nf*sizeof(ork_f16)); for(size_t i=0;i<(size_t)Kf*Nf;i++)Bf[i]=one; \
-        wf=ork_mm_pack(c,Kf,Nf,Bf); if(!wf){printf("f16 pack fail\n");return 1;} \
+        wf=ork_f16_mm_pack(c,Kf,Nf,Bf); if(!wf){printf("f16 pack fail\n");return 1;} \
         Af=(ork_f16*)ork_dma_alloc(c,(size_t)Mf*Kf*sizeof(ork_f16)); for(int i=0;i<Mf*Kf;i++)Af[i]=one; \
         Of=(float*)ork_dma_alloc(c,(size_t)S*Mf*Nf*4); if(!Af||!Of){printf("f16 buf fail\n");return 1;} } } while(0)
 
@@ -79,7 +79,7 @@ int main(int argc,char**argv){
     int Kf2=1024,Nf2=512,Mf2=3;
     ork_w*wf2=NULL; ork_f16*Af2=NULL; float*Of2=NULL;
     #define F16_2_ENSURE() do { if(!wf2){ ork_f16*Bf2=malloc((size_t)Kf2*Nf2*sizeof(ork_f16)); for(size_t i=0;i<(size_t)Kf2*Nf2;i++)Bf2[i]=one; \
-        wf2=ork_mm_pack(c,Kf2,Nf2,Bf2); if(!wf2){printf("f16 sh2 pack fail\n");return 1;} \
+        wf2=ork_f16_mm_pack(c,Kf2,Nf2,Bf2); if(!wf2){printf("f16 sh2 pack fail\n");return 1;} \
         Af2=(ork_f16*)ork_dma_alloc(c,(size_t)Mf2*Kf2*sizeof(ork_f16)); for(int i=0;i<Mf2*Kf2;i++)Af2[i]=one; \
         Of2=(float*)ork_dma_alloc(c,(size_t)S*Mf2*Nf2*4); if(!Af2||!Of2){printf("f16 sh2 buf fail\n");return 1;} } } while(0)
 

@@ -4,9 +4,9 @@
  * Executes SSM_ON_NPU §8 "what remains": end-to-end REAL-DATA validation of the on-NPU scan, using the
  * proven public primitives (RK3588_SSM_NPU_Investigation.md §6-§7). Three modes, increasing on-NPU coverage:
  *   mode 0 MATMUL : 4 contractions on NPU (ork_bmm_fp16, per-head fp16); cumsum/exp/mul on CPU.
- *   mode 1 EXP    : + decay exp on NPU (ork_npu_exp_i16, int16, k=0.9357).   [fp16<->int16 bridge]
+ *   mode 1 EXP    : + decay exp on NPU (ork_i16_npu_exp, int16, k=0.9357).   [fp16<->int16 bridge]
  *   mode 2 FULL   : + cumsum on NPU (CumBA = tril_ones matmul) + all decay MULTIPLIES on NPU
- *                   (ork_npu_ewmul_i16, calibrated int16). WHOLE decay-elementwise path on-NPU.
+ *                   (ork_i16_npu_ewmul, calibrated int16). WHOLE decay-elementwise path on-NPU.
  * Residual adds (Yd+Yoff+D*x, inter-chunk carry) stay on CPU (int16 add is experimental; adds aren't the
  * XAMBA concern). Skips (exit 0) with no NPU. Board only for a real result.
  */
@@ -48,17 +48,17 @@ typedef struct { int H,P,Nst,G,CS,NC; } ssd_dims;
 static double frand(void){ return (double)rand()/RAND_MAX; }
 static double frand_sym(void){ return frand()*2.0 - 1.0; }
 
-/* On-NPU exp via int16 (ork_npu_exp_i16) with the investigation's validated calibration (§7). N%8. */
+/* On-NPU exp via int16 (ork_i16_npu_exp) with the investigation's validated calibration (§7). N%8. */
 static void npu_exp_i16_calib(ork_npu *ctx, const double *arg, int M, int N, double *out){
     const double in_scale=30.0/30000.0, out_scale=1.0/30000.0, k=0.9357;
     size_t n=(size_t)M*N; short *in=malloc(n*2),*o=malloc(n*2); double us=0;
     for(size_t i=0;i<n;i++){ long q=lround(arg[i]/in_scale); if(q>32767)q=32767; if(q<-32768)q=-32768; in[i]=(short)q; }
-    int rc=ork_npu_exp_i16(ctx,in,M,N,in_scale,out_scale,o,&us);
+    int rc=ork_i16_npu_exp(ctx,in,M,N,in_scale,out_scale,o,&us);
     for(size_t i=0;i<n;i++) out[i] = rc ? exp(arg[i]) : (double)o[i]*out_scale*k;
     free(in);free(o);
 }
 
-/* On-NPU element-wise multiply via int16 (ork_npu_ewmul_i16): out=up*sil. Per-call symmetric-int16 quant
+/* On-NPU element-wise multiply via int16 (ork_i16_npu_ewmul): out=up*sil. Per-call symmetric-int16 quant
  * (scale=amax/30000 each operand), requant mult/2^shift = s_up*s_sil/s_out chosen for int16 precision.
  * Dequant out_i16*s_out == up*sil. Falls back to CPU on rc!=0. N%8. */
 static void npu_ewmul_calib(ork_npu *ctx, const double *up, const double *sil, int M, int N, double *out){
@@ -71,18 +71,18 @@ static void npu_ewmul_calib(ork_npu *ctx, const double *up, const double *sil, i
     short *qu=malloc(n*2),*qs=malloc(n*2),*qo=malloc(n*2); double us=0;
     for(size_t i=0;i<n;i++){ long a=lround(up[i]/su),b=lround(sil[i]/ss);
         if(a>32767)a=32767; if(a<-32768)a=-32768; if(b>32767)b=32767; if(b<-32768)b=-32768; qu[i]=(short)a; qs[i]=(short)b; }
-    int rc=ork_npu_ewmul_i16(ctx,qu,qs,M,N,mult,shift,qo,&us);
+    int rc=ork_i16_npu_ewmul(ctx,qu,qs,M,N,mult,shift,qo,&us);
     for(size_t i=0;i<n;i++) out[i] = rc ? up[i]*sil[i] : (double)qo[i]*so;
     free(qu);free(qs);free(qo);
 }
 
-/* On-NPU fp16 element-wise multiply (ork_npu_ewmul_f16): out=up*sil, MATMUL precision (no int16 switch,
+/* On-NPU fp16 element-wise multiply (ork_f16_npu_ewmul): out=up*sil, MATMUL precision (no int16 switch,
  * no requant). Keeps the multiplies in the fp16 datapath so the only int16 op is exp — avoiding the
  * fp16-matmul-after-int16-SDP mode-switch wedge (npu.c:3519 only ACT_RESETs on int8 entry). N%8. */
 static void npu_ewmul_f16(ork_npu *ctx, const double *up, const double *sil, int M, int N, double *out){
     size_t n=(size_t)M*N; ork_f16 *u=malloc(n*2),*s=malloc(n*2),*o=malloc(n*2); double us=0;
     for(size_t i=0;i<n;i++){ u[i]=(ork_f16)up[i]; s[i]=(ork_f16)sil[i]; }
-    int rc=ork_npu_ewmul_f16(ctx,u,s,M,N,o,&us);
+    int rc=ork_f16_npu_ewmul(ctx,u,s,M,N,o,&us);
     for(size_t i=0;i<n;i++) out[i] = rc ? up[i]*sil[i] : (double)o[i];
     free(u);free(s);free(o);
 }
@@ -121,9 +121,9 @@ static double g_ssd_mm_us, g_ssd_tot_us;   /* ORK_SSD_PROF breakdown: matmul vs 
 static int stage_stream(ork_npu *ctx, ork_w **pool, int H, int M, int K, int N,
                         const ork_f16 *A, const ork_f16 *B, float *C){
     ork_mm_task_f16 tk[128]; if(H>128) return -2;
-    for(int h=0;h<H;h++){ if(ork_mm_repack_f16(ctx,pool[h],K,N,B+(size_t)h*K*N)) return -1;
+    for(int h=0;h<H;h++){ if(ork_f16_mm_repack(ctx,pool[h],K,N,B+(size_t)h*K*N)) return -1;
         tk[h]=(ork_mm_task_f16){pool[h],M,A+(size_t)h*M*K,C+(size_t)h*M*N}; }
-    return ork_mm_run_stream_f16(ctx,H,tk);
+    return ork_f16_mm_run_stream(ctx,H,tk);
 }
 static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, const double *dt,
                            const double *A, const double *B, const double *C, const double *D,
@@ -138,8 +138,8 @@ static int ssd_chunked_npu(ork_npu *ctx, const ssd_dims *d, const double *x, con
     /* MM: timed matmul dispatch. 7=pure CPU gemm (baseline); 5/6=pooled 3-core stream; else BMM. */
     #define MM(pool,...) ({ double _mt=now_us(); int _r=cpu?cpu_bmm_f16(__VA_ARGS__):strm5?stage_stream(ctx,pool,__VA_ARGS__):BMM(__VA_ARGS__); g_ssd_mm_us+=now_us()-_mt; _r; })
     ork_w *pl_sc[128]={0},*pl_cs[128]={0},*pl_yo[128]={0},*pl_yd[128]={0};
-    if(strm5) for(int h=0;h<H;h++){ pl_sc[h]=ork_mm_f16_scratch(ctx,Nst,CS); pl_cs[h]=ork_mm_f16_scratch(ctx,CS,Nst);
-        pl_yo[h]=ork_mm_f16_scratch(ctx,Nst,P); pl_yd[h]=ork_mm_f16_scratch(ctx,CS,P); }
+    if(strm5) for(int h=0;h<H;h++){ pl_sc[h]=ork_f16_mm_scratch(ctx,Nst,CS); pl_cs[h]=ork_f16_mm_scratch(ctx,CS,Nst);
+        pl_yo[h]=ork_f16_mm_scratch(ctx,Nst,P); pl_yd[h]=ork_f16_mm_scratch(ctx,CS,P); }
     g_ssd_mm_us=0; double _tot0=now_us();
     double *Acs=malloc((size_t)H*CS*sizeof(double)),*Acs_last=malloc((size_t)H*sizeof(double));
     double *Acs_last_prev=calloc(H,sizeof(double));

@@ -5,6 +5,10 @@
 # the first time someone adds a function. `make matrix` regenerates it; paste into README.md.
 #
 # HOW IT CLASSIFIES: a symbol serves a precision if its NAME carries that dtype token (i8/f16/i4/i16),
+# which under the dtype-FIRST convention sits right after the ork_/orki_ prefix. The capability
+# patterns below therefore allow an optional segment there (^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_pack), so they match
+# both ork_i8_mm_pack and any untagged sibling. Anchoring them to ^ork_mm_ silently emptied the whole
+# table during the rename — the generator reported "—" everywhere rather than failing.
 # otherwise by the module folder it lives in. That is right where the dtype is in the name, and WRONG for
 # shared implementations serving several dtypes under one name — those are listed in tools/precision_overrides.tsv
 # and render with a dagger. Each cites the sharing symbol, which check_registry check 8 verifies still exists.
@@ -61,23 +65,23 @@ while IFS='	' read -r cap re; do
   done
   printf '%s\n' "$row"
 done <<CAPS
-regcmd synth	^orki_synth
-output stage (requant)	^orki_set_.*(out8|out16|_out\$|fp16in)
-fused-act output stage	^orki_set_.*silu
-pack weights	^ork_mm_pack
-load / .orkpack persist	^ork_mm_load|^ork_w_dump
+regcmd synth	^orki_((i8|i4a8|i4|nf4|f16|i16)_)?synth
+output stage (requant)	^orki_((i8|i4a8|i4|nf4|f16|i16)_)?set_.*(out8|out16|_?out\$|fp16in)
+fused-act output stage	^orki_((i8|i4a8|i4|nf4|f16|i16)_)?set_.*silu
+pack weights	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_pack
+load / .orkpack persist	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_load|^ork_((i8|i4a8|i4|nf4|f16|i16)_)?w_dump
 zero-copy import / adopt	import|adopt
 quantise from f32	quant_chan|pack_.*f32|chan_scales
-run — single core	^ork_mm_run_?[a-z0-9]*\$|^orki_run
+run — single core	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_run\$|^orki_((i8|i4a8|i4|nf4|f16|i16)_)?run\$
 run — multicore	mc_db|_mc\$|colsplit|multicore
-run — HW chain	^ork_mm_run_chain|chain_i8_impl|bch_db
-run — async stream	^ork_mm_run_stream|stream_worker
-run — NONBLOCK doorbell	^ork_dyn_
-batched GEMM (bmm)	^ork_bmm
-fused matmul+activation	^ork_mm_run_.*(silu|act)
-SDP activations	^ork_npu_(silu|gelu|rsqrt|exp)_|act_lut
+run — HW chain	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_run_chain|run_chain_impl|bch_db
+run — async stream	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_run_stream|stream_worker
+run — NONBLOCK doorbell	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?dyn_
+batched GEMM (bmm)	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?bmm
+fused matmul+activation	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?mm_run_.*(silu|act)
+SDP activations	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?npu_(silu|gelu|rsqrt|exp)|act_lut
 elementwise mul	ewmul
-elementwise add	^ork_npu_add_
+elementwise add	^ork_((i8|i4a8|i4|nf4|f16|i16)_)?npu_add
 per-channel multiply	perchan
 slice-and-dice tiles	slice_(pack|run)
 M-fold chain	fold

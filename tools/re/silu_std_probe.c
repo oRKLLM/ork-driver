@@ -1,4 +1,4 @@
-/* silu_std_probe.c — RE/calibration harness for the standalone on-NPU SiLU op (ork_npu_probe_silu_std).
+/* silu_std_probe.c — RE/calibration harness for the standalone on-NPU SiLU op (ork_i8_npu_probe_silu_std).
  * Phase 1 ("ramp"): load a ramp LUT (LUT[i]=i-512) and sweep the full int8 input range, printing the
  * transfer curve out(in) — this reveals the op's index math idx(in) so we can build a silu curve.
  * Phase 2 ("silu"): build a silu LUT for a chosen (in_scale,out_scale) under the measured index model and
@@ -42,7 +42,7 @@ int main(int argc, char**argv){
         unsigned c4068    = argc>7?(unsigned)strtoul(argv[7],0,16):0;
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);   /* ramp: LUT[idx]=idx-512 */
         double us=0;
-        int r = ork_npu_probe_silu_std(c,in,M,N,r_mult,r_shift,out_bias,idx_off,c4064,c4068,lut,1030,out,&us);
+        int r = ork_i8_npu_probe_silu_std(c,in,M,N,r_mult,r_shift,out_bias,idx_off,c4064,c4068,lut,1030,out,&us);
         printf("ramp rc=%d (%.1f us)  r=0x%x/2^%d out_bias=0x%x idx_off=0x%x c4064=0x%x c4068=0x%x\n",
                r,us,r_mult,r_shift,out_bias,idx_off,c4064,c4068);
         if(r){ ork_npu_free(c); return 1; }
@@ -63,7 +63,7 @@ int main(int argc, char**argv){
          * R=0.5 keeps out unclamped across the full int8 input range (idx~[245,762]); mapping is R-independent. */
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         for(int i=0;i<M*N;i++) in[i]=(signed char)((i%256)-128);
-        if(ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,idx_off,c4064,c4068,lut,1030,out,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i8_npu_probe_silu_std(c,in,M,N,0x2000,14,0,idx_off,c4064,c4068,lut,1030,out,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
         int idxof[256]; for(int v=0;v<256;v++) idxof[v]=-1;
         for(int i=0;i<M*N;i++){ int v=(unsigned char)in[i]; int o=out[i];
             if(o>-127&&o<127) idxof[v]=2*o+512; }             /* skip saturated ends */
@@ -76,7 +76,7 @@ int main(int argc, char**argv){
         for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
             lut[i]=(short)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
         /* pass 3: run with the built curve + chosen R, validate vs CPU silu */
-        if(ork_npu_probe_silu_std(c,in,M,N,r_mult,r_shift,0,idx_off,c4064,c4068,lut,1030,out,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i8_npu_probe_silu_std(c,in,M,N,r_mult,r_shift,0,idx_off,c4064,c4068,lut,1030,out,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
         int bad=0; double mx=0;
         for(int i=0;i<M*N;i++){ double ref=siluf(in[i]*in_scale)/out_scale; double got=out[i];
             double e=fabs(got-ref); if(e>mx)mx=e; if(e>2)bad++;
@@ -95,7 +95,7 @@ int main(int argc, char**argv){
         for(int i=0;i<1030;i++) lut[i]=f2hbits((double)(i-512));   /* LUT holds fp16 bits of (i-512) */
         for(int i=0;i<Mf*Nf;i++){ double x=lo+(hi-lo)*i/(Mf*Nf-1); inf[i]=(ork_f16)x; }
         double us=0;
-        int r=ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us);
+        int r=ork_f16_npu_probe_silu_std(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us);
         printf("rampf16 rc=%d (%.1f us) idx_off=0x%x c4064=0x%x c4068=0x%x\n",r,us,idx_off,c4064,c4068);
         if(r){ ork_npu_free(c); return 1; }
         for(int i=0;i<Mf*Nf;i+=16) printf("  in=%8.3f -> out=%8.3f\n",(double)(float)inf[i],(double)(float)outf[i]);
@@ -111,7 +111,7 @@ int main(int argc, char**argv){
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         for(int i=0;i<Mf*Nf;i++){ xv[i]=lo+(hi-lo)*i/(Mf*Nf-1); inf[i]=(ork_f16)xv[i]; }
         double us=0;
-        if(ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_f16_npu_probe_silu_std(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
         int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
         for(int i=0;i<Mf*Nf;i++){ int idx=(int)lround((double)(float)outf[i])+512; idxv[i]=idx;
             if(idx>=0&&idx<1030){ double s=siluf(xv[i]); lut[idx]=(short)clampi16(lround(s*256.0)); set[idx]=1; } } /* scale silu by 256 in LUT */
@@ -119,7 +119,7 @@ int main(int argc, char**argv){
         for(int i=0;i<flo;i++)lut[i]=lut[flo]; for(int i=fhi+1;i<1030;i++)lut[i]=lut[fhi];
         for(int i=flo;i<=fhi&&flo>=0;i++){ if(set[i])continue; int a=i,b=i; while(a>flo&&!set[a])a--; while(b<fhi&&!set[b])b++;
             lut[i]=(short)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
-        if(ork_npu_probe_silu_std_f16(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_f16_npu_probe_silu_std(c,inf,Mf,Nf,idx_off,c4064,c4068,lut,1030,outf,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
         int bad=0; double mx=0;
         for(int i=0;i<Mf*Nf;i++){ double ref=siluf(xv[i]), got=(double)(float)outf[i];
             double e=fabs(got-ref); if(e>mx)mx=e; if(e>0.5)bad++;
@@ -137,7 +137,7 @@ int main(int argc, char**argv){
         for(int i=0;i<M*N;i++) in[i]=(signed char)((i%256)-128);
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         double us=0;
-        int r=ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,idx_off,c4064,c4068,lut,1030,out,&us);
+        int r=ork_i8_npu_probe_silu_std(c,in,M,N,0x2000,14,0,idx_off,c4064,c4068,lut,1030,out,&us);
         if(r){ printf("c4064=%08x c4068=%08x WEDGED\n",c4064,c4068); ork_npu_free(c); return 1; }
         for(int i=0;i<M*N;i++){ int v=(unsigned char)in[i]; int o=out[i]; if(o>-127&&o<127) idxof[v]=2*o+512; }
         /* fit slope/intercept from unsaturated samples via least squares */
@@ -160,7 +160,7 @@ int main(int argc, char**argv){
         for(int i=0;i<Mf*Nf;i++) in16[i]=(short)(-A + (2*A)*i/(Mf*Nf-1));
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         double us=0;
-        int r=ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us);
+        int r=ork_i16_npu_probe_silu_std(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us);
         if(r){ printf("c4064=%08x c4068=%08x WEDGED\n",c4064,c4068); ork_npu_free(c); return 1; }
         double sx=0,sy=0,sxx=0,sxy=0; int n=0;
         for(int i=0;i<Mf*Nf;i++){ int o=out16[i]; if(o<=-32000||o>=32000)continue; double x=in16[i],y=o+512; sx+=x;sy+=y;sxx+=x*x;sxy+=x*y;n++; }
@@ -184,7 +184,7 @@ int main(int argc, char**argv){
         /* (1) fractional-idx calibration: linear ramp LUT (interpolated EXACTLY), R=64 -> out=64*(idx-512) */
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         double us=0;
-        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,8,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i16_npu_probe_silu_std(c,in16,Mf,Nf,0x4000,8,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
         double gsum=0; int gc=0; double prevI=-1;
         for(int i=0;i<Mf*Nf;i++){ int v=in16[i]; double I=out16[i]/64.0+512.0; if(I<2||I>1027)continue;
             Iv[nv]=I; Tv[nv]=siluf(v*in_scale)/out_scale; if(prevI>0){gsum+=fabs(I-prevI);gc++;} prevI=I; nv++; }
@@ -201,7 +201,7 @@ int main(int argc, char**argv){
             if(maxr<0.005)break; }
         for(int k=0;k<1030;k++){ long q=lround(flut[k]); if(q>32767)q=32767; if(q<-32768)q=-32768; lut[k]=(short)q; }
         /* (3) run at R=1, validate over the in-range inputs */
-        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i16_npu_probe_silu_std(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
         int bad=0; long mx=0; int checked=0;
         for(int i=0;i<Mf*Nf;i++){ int v=in16[i]; double I=64.0; /* recompute in-range via idx from calib not avail; use target range */
             double ref_d=siluf(v*in_scale)/out_scale; long ref=lround(ref_d); if(ref>32767)ref=32767; if(ref<-32768)ref=-32768;
@@ -226,7 +226,7 @@ int main(int argc, char**argv){
         for(int i=0;i<1030;i++) lut[i]=(short)clampi16(i-512);
         double us=0;
         /* int16 output isn't clamped at 127, so calibrate AND run at R=1 (out=idx-512 -> idx=out+512) */
-        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i16_npu_probe_silu_std(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("calib wedged\n"); ork_npu_free(c); return 1; }
         int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
         for(int i=0;i<Mf*Nf;i++){ int o=out16[i]; idxof[i]=(o>-32000&&o<32000)?o+512:-1; int idx=idxof[i];
             if(idx>=0&&idx<1030){ double s=siluf(in16[i]*in_scale)/out_scale; lut[idx]=(short)clampi16(lround(s)); set[idx]=1; } }
@@ -235,7 +235,7 @@ int main(int argc, char**argv){
         for(int i=0;i<flo;i++)lut[i]=lut[flo]; for(int i=fhi+1;i<1030;i++)lut[i]=lut[fhi];
         for(int i=flo;i<=fhi;i++){ if(set[i])continue; int a=i,b=i; while(a>flo&&!set[a])a--; while(b<fhi&&!set[b])b++;
             lut[i]=(short)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
-        if(ork_npu_probe_silu_std_i16(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
+        if(ork_i16_npu_probe_silu_std(c,in16,Mf,Nf,0x4000,14,0,idx_off,c4064,c4068,lut,1030,out16,&us)){ printf("run wedged\n"); ork_npu_free(c); return 1; }
         int bad=0; double mx=0;
         for(int i=0;i<Mf*Nf;i++){ double ref=siluf(in16[i]*in_scale)/out_scale, got=out16[i];
             double e=fabs(got-ref); if(e>mx)mx=e; if(e>2)bad++;

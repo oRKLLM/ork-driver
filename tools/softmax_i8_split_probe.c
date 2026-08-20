@@ -34,10 +34,10 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)N*N;i++){ double v=exp(((double)csc[i]-gmax)*in_scale)/out_scale; long q=lround(v); if(q>127)q=127; if(q<-128)q=-128; ecpu[i]=(int8_t)q; }
     printf("  gmax=%d\n",gmax);
 
-    { int8_t wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(int8_t)(i-16); ork_npu_exp_i8(c,wi,1,32,in_scale,out_scale,wo,NULL); }
-    ork_w *w_kt=ork_mm_pack_i8(c,Kp,N,KTp); if(!w_kt){printf("pack KT fail\n");return 2;}
+    { int8_t wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(int8_t)(i-16); ork_i8_npu_exp(c,wi,1,32,in_scale,out_scale,wo,NULL); }
+    ork_w *w_kt=ork_i8_mm_pack(c,Kp,N,KTp); if(!w_kt){printf("pack KT fail\n");return 2;}
     int8_t *ones=malloc((size_t)N*32); memset(ones,1,(size_t)N*32);
-    ork_w *w_ones=ork_mm_pack_i8(c,N,32,ones); if(!w_ones){printf("pack ones fail\n");return 2;}
+    ork_w *w_ones=ork_i8_mm_pack(c,N,32,ones); if(!w_ones){printf("pack ones fail\n");return 2;}
     int8_t *scores=malloc((size_t)N*N), *e=malloc((size_t)N*N); int32_t *ss=malloc((size_t)N*32*4);
     for(size_t i=0;i<(size_t)N*N;i++){ scores[i]=-128; e[i]=-128; }
     int fail=0;

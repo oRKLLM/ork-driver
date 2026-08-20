@@ -1,5 +1,5 @@
 /* tools/i4_probe.c — validate ork-driver's W4A4 (int4 A x int4 B -> int16 C) against a CPU
- * reference, using the captured RK3588 regcmd (REGCMD_I4, via synth_i4 / ork_npu_probe_i4, M=4).
+ * reference, using the captured RK3588 regcmd (REGCMD_I4, via synth_i4 / ork_i4_npu_probe, M=4).
  * The register program is the real librknnrt capture (tools/int4_capture.c), so the only unknown is
  * the native int4 TILE LAYOUT of A and B — we sweep candidate packings until the NPU output matches
  * the CPU int4xint4 reference. No librknnrt at runtime (we own both sides).
@@ -37,7 +37,7 @@ int main(int argc,char**argv){
     printf("W4A4 M=%d K=%d N=%d  ref C[0,0]=%ld  (documented native layout; sweeping nibble order)\n",M,K,N,ref[0]);
     int hits=0;
     for(int nb=b0;nb<b1;nb++)for(int na=a0;na<a1;na++){
-        int rc=ork_npu_probe_i4(c,M,K,N,nb,na,nov,regs,vals,A,B,C);
+        int rc=ork_i4_npu_probe(c,M,K,N,nb,na,nov,regs,vals,A,B,C);
         if(rc){ printf("  nibB=%d nibA=%d  rc=%d (wedge/abort)\n",nb,na,rc); continue; }
         long me=0; int n0=0; for(int i=0;i<M*N;i++){ long e=C[i]-ref[i]; if(e<0)e=-e; if(e>me){me=e;n0=i;} }
         int hit = me==0;
@@ -56,7 +56,7 @@ int main(int argc,char**argv){
             for(int k=0;k<K;k++){ int q=(int)(Af[m*K+k]/sa[m]+(Af[m*K+k]>=0?0.5f:-0.5f)); if(q>7)q=7;if(q<-8)q=-8; A[m*K+k]=(signed char)q; } }
         for(int n=0;n<N;n++){ float mx=1e-9f; for(int k=0;k<K;k++){float b=Bf[k*N+n];if(b<0)b=-b;if(b>mx)mx=b;} sb[n]=mx/7;
             for(int k=0;k<K;k++){ int q=(int)(Bf[k*N+n]/sb[n]+(Bf[k*N+n]>=0?0.5f:-0.5f)); if(q>7)q=7;if(q<-8)q=-8; B[k*N+n]=(signed char)q; } }
-        int rc=ork_npu_probe_i4(c,M,K,N,0,0,0,0,0,A,B,C);
+        int rc=ork_i4_npu_probe(c,M,K,N,0,0,0,0,0,A,B,C);
         if(!rc){ double se=0,sr=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){
                 double ref32=0; for(int k=0;k<K;k++) ref32+=(double)Af[m*K+k]*Bf[k*N+n];
                 double deq=(double)sa[m]*sb[n]*C[m*N+n]; se+=(deq-ref32)*(deq-ref32); sr+=ref32*ref32; }

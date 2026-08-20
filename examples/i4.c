@@ -1,4 +1,4 @@
-/* examples/i4.c — W4A4 (int4 A x int4 B -> int32 C) via the public ork_mm_pack_i4 / ork_mm_run_i4.
+/* examples/i4.c — W4A4 (int4 A x int4 B -> int32 C) via the public ork_i4_mm_pack / ork_i4_mm_run.
  * Self-validates the NPU result against a CPU int4xint4 reference across shapes that exercise the
  * API's tiling: M>1 (M-tiling), N>64 (N-tiling at 64), and K>10752 (K-split with int32 accumulate).
  *   make i4 && sudo ./i4
@@ -16,8 +16,8 @@ static int test(ork_npu*c,int M,int K,int N){
     unsigned sd=99+M*7+K*13+N*17;
     for(size_t i=0;i<(size_t)M*K;i++){ sd=sd*1103515245+12345; A[i]=(int8_t)((int)((sd>>17)%15)-7); }
     for(size_t i=0;i<(size_t)K*N;i++){ sd=sd*1103515245+12345; B[i]=(int8_t)((int)((sd>>17)%15)-7); }
-    ork_w*w=ork_mm_pack_i4(c,K,N,B); if(!w){ printf("  M=%d K=%d N=%d: pack failed\n",M,K,N); free(A);free(B);free(C); return 1; }
-    int rc=ork_mm_run_i4(c,w,M,A,C); ork_w_free(w);
+    ork_w*w=ork_i4_mm_pack(c,K,N,B); if(!w){ printf("  M=%d K=%d N=%d: pack failed\n",M,K,N); free(A);free(B);free(C); return 1; }
+    int rc=ork_i4_mm_run(c,w,M,A,C); ork_w_free(w);
     if(rc){ printf("  M=%d K=%d N=%d: run rc=%d\n",M,K,N,rc); free(A);free(B);free(C); return 1; }
     long maxe=0; int bad=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long s=0; for(int k=0;k<K;k++) s+=(long)A[m*K+k]*B[k*N+n];
@@ -39,9 +39,9 @@ static int gtest(ork_npu*c,int M,int K,int N,int G){
         aS[m*Sk+g]=mx/7; for(int j=0;j<G;j++){int q=(int)(Af[m*K+g*G+j]/aS[m*Sk+g]+(Af[m*K+g*G+j]>=0?.5f:-.5f));if(q>7)q=7;if(q<-8)q=-8;Ai[m*K+g*G+j]=(signed char)q;} }
     for(int g=0;g<Sk;g++)for(int n=0;n<N;n++){ float mx=1e-9f; for(int j=0;j<G;j++){float b=Bf[(g*G+j)*N+n];if(b<0)b=-b;if(b>mx)mx=b;}
         bS[g*N+n]=mx/7; for(int j=0;j<G;j++){int q=(int)(Bf[(g*G+j)*N+n]/bS[g*N+n]+(Bf[(g*G+j)*N+n]>=0?.5f:-.5f));if(q>7)q=7;if(q<-8)q=-8;Bi[(g*G+j)*N+n]=(signed char)q;} }
-    ork_w*w=ork_mm_pack_i4_grouped(c,K,N,Bi,G);
+    ork_w*w=ork_i4_mm_pack_grouped(c,K,N,Bi,G);
     if(!w){printf("  grouped M=%d K=%d N=%d G=%d: pack failed\n",M,K,N,G);return 1;}
-    int rc=ork_mm_run_i4_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
+    int rc=ork_i4_mm_run_grouped(c,w,M,Ai,aS,bS,C); ork_w_free(w);
     if(rc){printf("  grouped M=%d K=%d N=%d G=%d: run rc=%d\n",M,K,N,G,rc);return 1;}
     double maxe=0,se=0,sr=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){
@@ -59,7 +59,7 @@ static int gtest(ork_npu*c,int M,int K,int N,int G){
 }
 int main(void){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed (NPU?)\n");return 1;}
-    printf("W4A4 public API (ork_mm_pack_i4/ork_mm_run_i4) vs CPU int4 reference:\n");
+    printf("W4A4 public API (ork_i4_mm_pack/ork_i4_mm_run) vs CPU int4 reference:\n");
     int fail=0;
     fail|=test(c,1,64,64);        /* baseline (decode)            */
     fail|=test(c,4,128,128);      /* M-tiling + N-tiling          */
@@ -110,9 +110,9 @@ int main(void){
         signed char*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
         for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int)(i%15)-7;
         for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int)(i%15)-7;
-        ork_w*w=ork_mm_pack_i4(c,K,N,B);
-        if(w){ ork_mm_run_i4(c,w,M,A,C); ork_mm_run_i4(c,w,M,A,C);   /* warm */
-            double t0=ms(); for(int r=0;r<R;r++) ork_mm_run_i4(c,w,M,A,C); double dt=(ms()-t0)/R;
+        ork_w*w=ork_i4_mm_pack(c,K,N,B);
+        if(w){ ork_i4_mm_run(c,w,M,A,C); ork_i4_mm_run(c,w,M,A,C);   /* warm */
+            double t0=ms(); for(int r=0;r<R;r++) ork_i4_mm_run(c,w,M,A,C); double dt=(ms()-t0)/R;
             printf("bench M=%d K=%d N=%d: %.3f ms/matmul (%.1f Mrow/s, %.0f matmul/s)  msched=%s\n",
                    M,K,N,dt, (M*1e-3)/dt, 1000.0/dt, getenv("ORK_I4_MSCHED")?getenv("ORK_I4_MSCHED"):"default");
             ork_w_free(w); }

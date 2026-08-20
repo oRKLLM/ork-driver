@@ -1,5 +1,5 @@
 /* fused_softmax_probe — task #20 (a): the full softmax built on the HW-chained fused exp (M4.8).
- *   e   = exp(Q·K^T)         ork_mm_run_f16_act(fn=exp)  — exp fused on the score matmul, ONE submit (free exp)
+ *   e   = exp(Q·K^T)         ork_f16_mm_run_act(fn=exp)  — exp fused on the score matmul, ONE submit (free exp)
  *   Sig = e . ones[n,16]     MM_F16                       — Σ reduce on-NPU
  *   P   = e / Σ                                            — softmax
  * Scores constructed ≤0 (Q≥0, K^T≤0), the post-max softmax domain (exp≤1, no overflow, single-signed index).
@@ -29,14 +29,14 @@ int main(int argc,char**argv){
         double sum=0; for(int j=0;j<n;j++) sum+=exp((double)sc[(size_t)m*n+j]); for(int j=0;j<n;j++) ref[(size_t)m*n+j]=(float)(exp((double)sc[(size_t)m*n+j])/sum); }
     /* fused exp(Q·K^T) — one submit */
     float *e=malloc((size_t)M*n*4);
-    int rc=ork_mm_run_f16_act(c,d,n,KT,M,Q,e,myexp,NULL,(double)lo-0.01,0.0);
+    int rc=ork_f16_mm_run_act(c,d,n,KT,M,Q,e,myexp,NULL,(double)lo-0.01,0.0);
     printf("  fused exp(QK^T) rc=%d e[0]=%.5f (want %.5f)\n",rc,e[0],exp(sc[0]));
     if(rc){ printf("FAIL rc=%d\n",rc); ork_npu_free(c); return 1; }
     /* Sigma = e . ones[n,16] on-NPU (narrow e->f16 first) */
     ork_f16 *ef=malloc((size_t)M*n*sizeof(ork_f16)); for(size_t i=0;i<(size_t)M*n;i++) ef[i]=(ork_f16)e[i];
     ork_f16 *ones=malloc((size_t)n*16*sizeof(ork_f16)); for(size_t i=0;i<(size_t)n*16;i++) ones[i]=(ork_f16)1.0f;
-    ork_w *w=ork_mm_pack(c,n,16,ones); float *ss=malloc((size_t)M*16*4);
-    int rrc=-1; if(w){ ork_mm_task_f16 t={w,M,ef,ss}; rrc=ork_mm_run_stream_f16(c,1,&t); }
+    ork_w *w=ork_f16_mm_pack(c,n,16,ones); float *ss=malloc((size_t)M*16*4);
+    int rrc=-1; if(w){ ork_mm_task_f16 t={w,M,ef,ss}; rrc=ork_f16_mm_run_stream(c,1,&t); }
     /* normalize P = e / Sigma */
     float *P=malloc((size_t)M*n*4);
     for(int m=0;m<M;m++){ double S=(rrc==0)?ss[(size_t)m*16]:0; if(rrc!=0){ for(int j=0;j<n;j++) S+=e[(size_t)m*n+j]; } if(S<=0)S=1;

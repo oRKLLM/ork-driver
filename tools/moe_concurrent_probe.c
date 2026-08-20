@@ -6,7 +6,7 @@
  * so per-token MoE latency becomes max(NPU_part, CPU_part) + crossing, NOT the sum. The win (if any) is
  * overlap/saturation, not the NPU being faster per-expert.
  *
- * ork_mm_run_stream_i8 is BLOCKING (runs core0 on the calling thread + joins its pool); the rknpu submit
+ * ork_i8_mm_run_stream is BLOCKING (runs core0 on the calling thread + joins its pool); the rknpu submit
  * ioctl is a blocking kernel wait. We overlap by running the WHOLE stream call on a DEDICATED thread while
  * the remaining k-j experts run on a CPU threadpool on the COMPLEMENTARY big cores. The NPU stream pins
  * its workers top-down (cpu = ncpu-1-id => 7,6,5..); we pin the CPU experts BOTTOM big core(s) (4,5..) so
@@ -127,8 +127,8 @@ static void cpu_pool_stop(struct cpu_pool *p){
 struct npu_arg { ork_npu *c; int S; ork_mm_task_i8 *tasks; int rc; };
 static void *npu_thread(void *vp){
     struct npu_arg *a = vp;
-    a->rc = ork_mm_run_stream_i8(a->c, a->S, a->tasks);
-    if(a->rc){ a->rc=0; for(int x=0;x<a->S && a->rc==0;x++) a->rc=ork_mm_run_i8(a->c,a->tasks[x].w,a->tasks[x].M,a->tasks[x].A,a->tasks[x].C); }
+    a->rc = ork_i8_mm_run_stream(a->c, a->S, a->tasks);
+    if(a->rc){ a->rc=0; for(int x=0;x<a->S && a->rc==0;x++) a->rc=ork_i8_mm_run(a->c,a->tasks[x].w,a->tasks[x].M,a->tasks[x].A,a->tasks[x].C); }
     return NULL;
 }
 
@@ -173,7 +173,7 @@ int main(int argc, char**argv){
         for(int e=0;e<topk;e++){
             f32[e]=malloc((size_t)N*K*sizeof(float)); for(size_t i=0;i<(size_t)N*K;i++) f32[e][i]=rf();
             bsc[e]=malloc((size_t)N*sizeof(float));
-            w[e]=ork_mm_pack_i8_f32(c,K,N,f32[e],bsc[e]);
+            w[e]=ork_i8_mm_pack_f32(c,K,N,f32[e],bsc[e]);
             if(!w[e]){ printf("  pack FAIL e=%d\n",e); return 1; }
             B8[e]=malloc((size_t)N*K);
             for(int n=0;n<N;n++){ const float*wn=f32[e]+(size_t)n*K; float amax=0; for(int k=0;k<K;k++){float a=fabsf(wn[k]); if(a>amax)amax=a;}
@@ -187,7 +187,7 @@ int main(int argc, char**argv){
 
         /* ---- sanity: NPU stream output matches CPU for expert 0 (M=1) ---- */
         ork_mm_task_i8 chk = { .w=w[0], .M=1, .A=A, .C=C[0] };
-        int crc = ork_mm_run_stream_i8(c,1,&chk);
+        int crc = ork_i8_mm_run_stream(c,1,&chk);
         if(crc==0){
             cpu_gemv_i8(K,N,A,B8[0],Cref);
             long maxd=0; for(int i=0;i<N;i++){ long d=labs((long)C[0][i]-(long)Cref[i]); if(d>maxd)maxd=d; }
@@ -229,8 +229,8 @@ int main(int argc, char**argv){
         /* anchor: NPU submit floor for ONE expert via stream (j=1) */
         {
             ork_mm_task_i8 t1 = { .w=w[0], .M=1, .A=A, .C=C[0] };
-            for(int i=0;i<WARM;i++) ork_mm_run_stream_i8(c,1,&t1);
-            for(int r=0;r<REPS;r++){ double t=now_us(); ork_mm_run_stream_i8(c,1,&t1); sm[r]=now_us()-t; }
+            for(int i=0;i<WARM;i++) ork_i8_mm_run_stream(c,1,&t1);
+            for(int r=0;r<REPS;r++){ double t=now_us(); ork_i8_mm_run_stream(c,1,&t1); sm[r]=now_us()-t; }
             printf("  [anchor] NPU stream 1-expert floor = %.2f us\n", median(sm,REPS));
         }
 

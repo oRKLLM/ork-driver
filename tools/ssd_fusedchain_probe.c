@@ -1,7 +1,7 @@
 /* ssd_fusedchain_probe — validate + time the multi-matmul real-operand fused chain (the SSD scan's
  * per-stage H-batch): nb fp16 matmuls (distinct data) in ONE PC-chained submit via
  * ork_bmm_fp16_fused, vs a CPU reference. Also times fused (1 submit) vs nb separate submits
- * (ork_ssd_probe_fusedmm_f16) to show the ~48us/submit floor amortization. Board only.
+ * (ork_f16_ssd_probe_fusedmm) to show the ~48us/submit floor amortization. Board only.
  *   make ssd_fusedchain_probe && sudo ./ssd_fusedchain_probe [nb] [M] [K] [N]
  */
 #define _GNU_SOURCE
@@ -37,7 +37,7 @@ int main(int argc,char**argv){
         /* timing: fused chain vs nb separate submits */
         double f0=now_us(); for(int r=0;r<20;r++) ork_bmm_fp16_fused(c,nb,M,K,N,A,B,C); double fus=(now_us()-f0)/20;
         double p0=now_us(); for(int r=0;r<5;r++) for(int b=0;b<nb;b++){ float cc[64*64]; (void)cc;
-            ork_ssd_probe_fusedmm_f16(c,M,K,N,A+(size_t)b*M*K,B+(size_t)b*K*N,C+(size_t)b*M*N); } double per=(now_us()-p0)/5;
+            ork_f16_ssd_probe_fusedmm(c,M,K,N,A+(size_t)b*M*K,B+(size_t)b*K*N,C+(size_t)b*M*N); } double per=(now_us()-p0)/5;
         fprintf(stderr,"  timing: fused(1 submit, %d mm)=%.1fus | per-op(%d submits)=%.1fus | amortization %.2fx\n",
                 nb,fus,nb,per, per>0?per/fus:0);
     }

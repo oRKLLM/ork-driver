@@ -29,7 +29,7 @@
 #include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
-void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
+void orki_i8_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride){
     memcpy(rc,REGCMD_I8,REGCMD_I8_N*4);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE0,K*N);orki_setrn(rc,REGCMD_I8_N,RK_CNA_WEIGHT_SIZE1,K);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON1,(K+63)/64);orki_setrn(rc,REGCMD_I8_N,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,REGCMD_I8_N,RK_CNA_DMA_CON1,K/16);
@@ -61,8 +61,8 @@ void orki_synth_i8(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
     for(int i=0;i<orki_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,orki_i8_fovr[i].blk,orki_i8_fovr[i].reg,orki_i8_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
-void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
-    orki_synth_i8(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
+void orki_i8_synth_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf){
+    orki_i8_synth(rc,mc,K,N,aA,aB,aC,0,cbuf,0);                       /* ork baseline; non-delta regs already match */
     /* --- register-level clone of rkllm's captured M=36 mfold (named via ork_regs.h) --- */
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON1,      OKV_CONV1_GROUP_LINE);            /* GROUP_LINE_OFF feature-read (rkllm SETS this for the big-M fold tasks) */
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CONV_CON2,      0x20);                     /* FEATURE_GRAINS=2 */
@@ -94,7 +94,7 @@ void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,
     for(int i=0;i<orki_i8_fovr_n;i++) orki_setr(rc,REGCMD_I8_N,orki_i8_fovr[i].blk,orki_i8_fovr[i].reg,orki_i8_fovr[i].val);
 }
 
-void orki_set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
+void orki_i8_set_out8(uint32_t*rc,int N,int stride,int mult,int shift){
     int s=stride>0?stride:N;
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0);                                   /* clear the 0x8000 int32-output bit -> int8 out */
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_DATA_CUBE_NOTCH,(((s/16)-1)<<16)|((N/16)-1));         /* output group stride: int8 packs 4x denser than int32 (N/16 vs N/4) */
@@ -104,9 +104,9 @@ void orki_set_i8_out8(uint32_t*rc,int N,int stride,int mult,int shift){
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_SHIFT,shift);                             /* requant shift (>>) */
 }
 
-void orki_set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
+void orki_i8_set_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
-    orki_set_i8_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
+    orki_i8_set_out8(rc,N,stride,r_mult,r_shift);       /* int8-output byte layout + the unified scale R (0x4084/0x4088) */
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_S_POINTER,0x0030); orki_setrn(rc,REGCMD_I8_N,RK_SDP_5004,0x0030); /* activation mode on */
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_PRECISION,0x44e0);     /* LUT/activation enable (output-stage high byte 0x44) */
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_BN_CFG,0x00020040); /* activation mode bit 0x0002 (fixed) */
@@ -121,8 +121,8 @@ void orki_set_i8_silu(uint32_t*rc,int N,int stride,int r_mult,int r_shift,
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0); /* fixed config */
 }
 
-void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG){
-    orki_set_i8_out8(rc,N,stride,mult,shift);                         /* ork conv + int8-out; OUT_CVT gain=0x4084/88 */
+void orki_i8_set_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uint32_t aG){
+    orki_i8_set_out8(rc,N,stride,mult,shift);                         /* ork conv + int8-out; OUT_CVT gain=0x4084/88 */
     int s=stride>0?stride:N;
     if(getenv("ORK_EW_REGOP")){
         /* DECISIVE ISOLATION: EW multiply with a REGISTER-constant operand (EW_OP_SRC=0, bit6=0), NO RDMA.
@@ -180,13 +180,13 @@ void orki_set_i8_ewmul(uint32_t*rc,int M,int N,int stride,int mult,int shift,uin
     { const char*e=getenv("ORK_EW_BIAS"); if(e) orki_setrn(rc,REGCMD_I8_N,RK_DPU_OUT_CVT_OFFSET,(uint32_t)strtoul(e,0,0)); }
 }
 
-/* orki_set_i8_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
+/* orki_i8_set_silu32 — fused SiLU output stage with INT32 output (silu value NOT quantized to int8). Keeps
  * synth_i8's default int32 output format (does NOT apply set_i8_out8's int8 override) and enables the SiLU
  * LUT with the int32-output bit (0x8000) set in 0x4010. out_i32 = R*V16[idx(acc)] + out_bias, unclamped —
  * with a fine-scale LUT that maps silu across ~±8000 (int16 V16 * R), that's ~13-14 bit silu instead of int8.
  * The ablation (ORK_GATE_ABLATE — historical) showed the int8 silu OUTPUT is the ENTIRE FFN-chain quality gap (fp32 silu
  * = baseline PPL); this recovers it while keeping silu free on-NPU. Same LUT/config regs as set_i8_silu. */
-void orki_set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
+void orki_i8_set_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068){
     /* SWEEP knobs: output-format registers env-configurable to find the matmul+LUT non-int8 output encoding.
      * PREC = bits[1:0] of 0x4010 (int8=0, int16=1, fp16=2; bit31=int32-bypass-CVT). int8+silu = 0x44e0. */
     static uint32_t r4010=0,r40c0=0,r4050=0,r84=0,r88=0; static int div38=0,ovg=0,init=0;
@@ -243,7 +243,7 @@ void orki_apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
 }
 
 /* Splice the 0x50xx second-DPU lane into a synth_i8'd matmul regcmd. base[] is a full REGCMD_I8_N buffer
- * already filled by orki_synth_i8 (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
+ * already filled by orki_i8_synth (108 reg entries in words 0..215, then the 8-word trailer). Output rc[] gets:
  * [108 reg entries] [REGCMD_EW_LANE 18 entries] [8-word trailer]. */
 void orki_splice_ew_lane(uint32_t*rc,const uint32_t*base){
     memcpy(rc,               base,             216*4);                 /* 108 register entries (0x10xx/0x30xx/0x40xx) */

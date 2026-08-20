@@ -34,7 +34,7 @@ static int run(int mode,int reserve,int S,int K,int N){
     ork_npu*c=ork_npu_init(); if(!c){printf("  init fail\n");return -1;}
     int8_t*A=malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); free(B); if(!w){printf("  pack fail\n");ork_npu_free(c);return -1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); free(B); if(!w){printf("  pack fail\n");ork_npu_free(c);return -1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*4); if(!O){printf("  dma fail\n");ork_npu_free(c);return -1;}
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
@@ -85,7 +85,7 @@ static int run_cold(int S,int K,int N){
     setenv("ORK_DYN_SPIN","1",1); setenv("ORK_DYN_RESERVE","32",1);
     ork_npu*c=ork_npu_init(); if(!c) return -1;
     int8_t*A=malloc(K); memset(A,1,K); int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); free(B);
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); free(B);
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*4);
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*S); for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
     for(int i=0;i<S;i++) seed(O,(size_t)i*N+(N-1),1);
@@ -124,7 +124,7 @@ int main(void){
     { ork_npu*c=ork_npu_init();
       if(!c){ printf("  init fail\n"); return 0; }
       int8_t*A=malloc(K); memset(A,1,K); int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-      ork_w*w=ork_mm_pack_i8(c,K,N,B); free(B);
+      ork_w*w=ork_i8_mm_pack(c,K,N,B); free(B);
       int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*4);
       ork_mm_task_i8*tk=malloc(sizeof(*tk)*S); for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
       int R=20, clean=0, recov=0, faulted=0;

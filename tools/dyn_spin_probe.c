@@ -20,13 +20,13 @@ int main(int argc,char**argv){
     printf("dyn_spin_probe: circular spin + redirect into %d-op chain (K=%d,N=%d), spin=%dms\n",S,K,N,spin_ms);
     int8_t*A=(int8_t*)malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!O){printf("dma fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
 
     /* warm the int8-chain mode with a quick real chain first (spin_probe assumes warmed) */
-    ork_mm_run_chain_i8(c,S,tk);
+    ork_i8_mm_run_chain(c,S,tk);
 
     int spin_alive=-1;
     int comp=ork_dyn_spin_probe(c,S,tk,spin_ms*1000,&spin_alive);

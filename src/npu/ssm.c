@@ -109,7 +109,7 @@ static int ssm_stg_i8(ork_npu *c, ork_w **pool, int M,int K,int N,
         const ork_f16 *B=Bop+(size_t)h*K*N; float *bs=bscale+(size_t)h*N;
         for(int n=0;n<N;n++){ float mx=1e-9f; for(int k=0;k<K;k++){ float v=fabsf((float)B[(size_t)k*N+n]); if(v>mx)mx=v; } bs[n]=mx/127.0f; }
         for(int k=0;k<K;k++)for(int n=0;n<N;n++){ int q=(int)lrintf((float)B[(size_t)k*N+n]/bs[n]); if(q>127)q=127; if(q<-127)q=-127; bi8[(size_t)k*N+n]=(int8_t)q; }
-        if(ork_mm_repack_i8(c,pool[h],K,N,bi8)){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] repack_i8 h=%d rc\n",h); ret=-1; goto done; }
+        if(ork_i8_mm_repack(c,pool[h],K,N,bi8)){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] repack_i8 h=%d rc\n",h); ret=-1; goto done; }
         /* activation A[M,K] fp16 -> per-row int8 (ascale[m]=absmax(row)/127) */
         const ork_f16 *Aa=Aop+(size_t)h*M*K; int8_t *Ai=ai8+(size_t)h*M*K; float *as=ascale+(size_t)h*M;
         for(int m=0;m<M;m++){ const ork_f16 *r=Aa+(size_t)m*K; float mx=1e-9f;
@@ -120,10 +120,10 @@ static int ssm_stg_i8(ork_npu *c, ork_w **pool, int M,int K,int N,
     }
     /* small-K int8 batched 3-core stream (ORK_SSM_I8_PERHEAD=1 forces the per-head single-core path for A/B) */
     if(getenv("ORK_SSM_I8_PERHEAD")){
-        for(int h=0;h<nh;h++){ int rr=ork_mm_run_i8(c,pool[h],M,ai8+(size_t)h*M*K,ci32+(size_t)h*M*N);
+        for(int h=0;h<nh;h++){ int rr=ork_i8_mm_run(c,pool[h],M,ai8+(size_t)h*M*K,ci32+(size_t)h*M*N);
             if(rr){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] run_i8 h=%d rc=%d\n",h,rr); ret=-1; goto done; } }
     } else {
-        int rr=ork_mm_run_stream_i8_sk(c,nh,c->ssm_tki8);
+        int rr=ork_i8_mm_run_stream_sk(c,nh,c->ssm_tki8);
         if(rr){ if(getenv("ORK_SSM_DBG"))fprintf(stderr,"[ssm i8] run_stream_i8_sk nh=%d M=%d K=%d N=%d rc=%d\n",nh,M,K,N,rr); ret=-1; goto done; }
     }
     for(int h=0;h<nh;h++){ const int32_t *ci=ci32+(size_t)h*M*N; const float *as=ascale+(size_t)h*M,*bs=bscale+(size_t)h*N; float *co=Cop+(size_t)h*M*N;
@@ -155,7 +155,7 @@ static int ssm_pool_ensure(ork_npu *c,int nc,int nr,int nh,int CS,int nb){
     int NS=nh*nb;   /* nh heads x nb chunk-slots (nb=NC when batched, else 1) */
     c->ssm_pS=calloc(NS,sizeof(ork_w*));c->ssm_pD=calloc(NS,sizeof(ork_w*));c->ssm_pC=calloc(NS,sizeof(ork_w*));c->ssm_pO=calloc(NS,sizeof(ork_w*));
     if(!c->ssm_pS||!c->ssm_pD||!c->ssm_pC||!c->ssm_pO){ orki_ssm_pool_free(c); return -1; }
-    for(int h=0;h<NS;h++){ c->ssm_pS[h]=ork_mm_f16_scratch(c,nc,CS); c->ssm_pD[h]=ork_mm_f16_scratch(c,CS,nr); c->ssm_pC[h]=ork_mm_f16_scratch(c,CS,nc); c->ssm_pO[h]=ork_mm_f16_scratch(c,nc,nr);
+    for(int h=0;h<NS;h++){ c->ssm_pS[h]=ork_f16_mm_scratch(c,nc,CS); c->ssm_pD[h]=ork_f16_mm_scratch(c,CS,nr); c->ssm_pC[h]=ork_f16_mm_scratch(c,CS,nc); c->ssm_pO[h]=ork_f16_mm_scratch(c,nc,nr);
         if(!c->ssm_pS[h]||!c->ssm_pD[h]||!c->ssm_pC[h]||!c->ssm_pO[h]){ c->ssm_nh=nh; c->ssm_nb=nb; orki_ssm_pool_free(c); return -1; } }
     c->ssm_aS=malloc((size_t)NS*CS*nc*2);c->ssm_bS=malloc((size_t)NS*nc*CS*2);c->ssm_G=malloc((size_t)NS*CS*CS*4);
     c->ssm_aD=malloc((size_t)NS*CS*CS*2);c->ssm_bD=malloc((size_t)NS*CS*nr*2);c->ssm_Yd=malloc((size_t)NS*CS*nr*4);
@@ -170,7 +170,7 @@ static int ssm_pool_ensure(ork_npu *c,int nc,int nr,int nh,int CS,int nb){
     if(c->ssm_i8&1){
         c->ssm_pSi8=calloc(nh,sizeof(ork_w*)); if(!c->ssm_pSi8){ c->ssm_nh=nh; orki_ssm_pool_free(c); return -1; }
         int8_t *zero=calloc((size_t)nc*CS,1);
-        for(int h=0;h<nh;h++){ c->ssm_pSi8[h]=ork_mm_pack_i8(c,nc,CS,zero); if(!c->ssm_pSi8[h]){ free(zero); c->ssm_nh=nh; orki_ssm_pool_free(c); return -1; } }
+        for(int h=0;h<nh;h++){ c->ssm_pSi8[h]=ork_i8_mm_pack(c,nc,CS,zero); if(!c->ssm_pSi8[h]){ free(zero); c->ssm_nh=nh; orki_ssm_pool_free(c); return -1; } }
         free(zero);
         c->ssm_ai8=malloc((size_t)nh*CS*nc); c->ssm_ci32=malloc((size_t)nh*CS*nc*4);
         c->ssm_ascale=malloc((size_t)nh*CS*4); c->ssm_bscale=malloc((size_t)nh*nc*4);
@@ -194,14 +194,14 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
     ork_mm_task_f16 *tk=c->ssm_tk;
     int ret=0;
     #define _NOW (g_ssm_prof?ork_now_us():0.0)
-    #define STG(SID,pool,M,K,N,Aop,Bop,Cop) do{ double _r=_NOW; for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pool[h],K,N,(Bop)+(size_t)h*(size_t)(K)*(N))){ret=-1;goto done2;} \
+    #define STG(SID,pool,M,K,N,Aop,Bop,Cop) do{ double _r=_NOW; for(int h=0;h<nh;h++){ if(ork_f16_mm_repack(c,pool[h],K,N,(Bop)+(size_t)h*(size_t)(K)*(N))){ret=-1;goto done2;} \
         tk[h]=(ork_mm_task_f16){pool[h],M,(Aop)+(size_t)h*(size_t)(M)*(K),(Cop)+(size_t)h*(size_t)(M)*(N)}; } double _q=_NOW; g_ssm_repack+=_q-_r; \
-        if((ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,nh,tk)){ret=-1;goto done2;} double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[SID]+=_e-_r; }while(0)
+        if((ork_ssm_chain()?ork_f16_mm_run_stream_chain:ork_f16_mm_run_stream)(c,nh,tk)){ret=-1;goto done2;} double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[SID]+=_e-_r; }while(0)
     if(g_ssm_prof<0)g_ssm_prof=getenv("ORK_SSM_PROF")?1:0; g_ssm_calls++;
     /* BATCHED dispatch (nb=NC): one stage = one run over nh*NC matmuls; slot idx = cc*nh+h. */
-    #define STGB(SID,pool,M,K,N,Aop,Bop,Cop) do{ double _r=_NOW; int _S=nh*NC; for(int s=0;s<_S;s++){ if(ork_mm_repack_f16(c,pool[s],K,N,(Bop)+(size_t)s*(size_t)(K)*(N))){ret=-1;goto done2;} \
+    #define STGB(SID,pool,M,K,N,Aop,Bop,Cop) do{ double _r=_NOW; int _S=nh*NC; for(int s=0;s<_S;s++){ if(ork_f16_mm_repack(c,pool[s],K,N,(Bop)+(size_t)s*(size_t)(K)*(N))){ret=-1;goto done2;} \
         tk[s]=(ork_mm_task_f16){pool[s],M,(Aop)+(size_t)s*(size_t)(M)*(K),(Cop)+(size_t)s*(size_t)(M)*(N)}; } double _q=_NOW; g_ssm_repack+=_q-_r; \
-        if((ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,_S,tk)){ret=-1;goto done2;} double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[SID]+=_e-_r; }while(0)
+        if((ork_ssm_chain()?ork_f16_mm_run_stream_chain:ork_f16_mm_run_stream)(c,_S,tk)){ret=-1;goto done2;} double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[SID]+=_e-_r; }while(0)
     if(nb>1){
       for(int seq=0; seq<ns && !ret; seq++){
         double _t=_NOW;
@@ -268,10 +268,10 @@ int ork_ssm_scan_f32(ork_npu *c,int nc,int nr,int nh,int ng,int nt,int ns,
             int hstarted=ssm_helper_ensure(c);                                  /* persistent little-core helper */
             if(hstarted) ssm_helper_fire(c,&ha); else ssm_marshal_gi(&ha);
             double _r=_NOW;                                                     /* pS dispatch (inline; join helper before any error) */
-            for(int h=0;h<nh;h++){ if(ork_mm_repack_f16(c,pS[h],nc,CS,bS+(size_t)h*nc*CS)){ if(hstarted)ssm_helper_join(c); ret=-1; goto done2; }
+            for(int h=0;h<nh;h++){ if(ork_f16_mm_repack(c,pS[h],nc,CS,bS+(size_t)h*nc*CS)){ if(hstarted)ssm_helper_join(c); ret=-1; goto done2; }
                 tk[h]=(ork_mm_task_f16){pS[h],CS,aS+(size_t)h*CS*nc,G+(size_t)h*CS*CS}; }
             double _q=_NOW; g_ssm_repack+=_q-_r;
-            int prc=(ork_ssm_chain()?ork_mm_run_stream_f16_chain:ork_mm_run_stream_f16)(c,nh,tk);
+            int prc=(ork_ssm_chain()?ork_f16_mm_run_stream_chain:ork_f16_mm_run_stream)(c,nh,tk);
             double _e=_NOW; g_ssm_npu+=_e-_q; g_ssm_stg[0]+=_e-_r;
             if(hstarted)ssm_helper_join(c);
             if(prc){ret=-1;goto done2;}
@@ -376,7 +376,7 @@ int ork_ssd_probe_mixchain(ork_npu *c,int *mm_ok,int *silu_ok,double *us){
     /* chain: [0]=FP16 matmul (synth) -> [1]=int16 silu */
     { uint32_t *mm=(uint32_t*)c->regcmd.cpu, *si=(uint32_t*)((char*)c->regcmd.cpu+(size_t)REGCMD_I8_N*4);
       memset(mm,0,REGCMD_I8_N*4);
-      orki_synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,0,CBUF);   /* FP16 matmul task0 (sched=0: K=32<96 small-K 0x1040 fix) */
+      orki_f16_synth(mm,1,32,32,(uint32_t)Ad.dma,(uint32_t)Wd.dma,(uint32_t)Cd.dma,0,CBUF);   /* FP16 matmul task0 (sched=0: K=32<96 small-K 0x1040 fix) */
       uint64_t nx=c->regcmd.dma+(size_t)REGCMD_I8_N*4;
       mm[216]=0x0010|((nx&0xffff)<<16); mm[217]=(0x0101u<<16)|((nx>>16)&0xffff);
       mm[218]=0x0014|(((69+3)/2)<<16);  mm[219]=(0x0101u<<16)|0;
@@ -453,8 +453,8 @@ int ork_ssd_fused_scan_bench(ork_npu *c,int H,int P,int Nst,int G,int CS,int NC,
     for(int i=0;i<np;i++){
         uint32_t *rc=rcs+(size_t)i*REGCMD_I8_N;
         uint32_t aC=(uint32_t)(Cb.dma+cOff[i]*4);
-        if(f16) orki_synth   (rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF);      /* fp16, dense [M,Nc] out */
-        else    orki_synth_i8(rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF,0);    /* int8, dense [M,Nc] out */
+        if(f16) orki_f16_synth   (rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF);      /* fp16, dense [M,Nc] out */
+        else    orki_i8_synth(rc,tM[i],tK[i],tN[i],(uint32_t)Ab.dma,(uint32_t)Bb.dma,aC,1,CBUF,0);    /* int8, dense [M,Nc] out */
         progs[i]=(ork_chain_prog){rc,REGCMD_I8_N,0xd,108,216};
     }
     /* fp16 needs the NPU in fp16 mode: force a reset on entry (the int8-oriented chain assembler keeps

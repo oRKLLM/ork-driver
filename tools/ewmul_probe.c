@@ -1,6 +1,6 @@
 /* tools/ewmul_probe.c — board diagnostic for the fused EW-mul (SwiGLU dual-input) output stage.
  *
- * Runs ork_npu_probe_i8_ewmul at the captured shape (M=8,N=32) and prints, per output column,
+ * Runs ork_i8_npu_probe_ewmul at the captured shape (M=8,N=32) and prints, per output column,
  *   acc = sum_k A*B, r = requant(acc), G = 2nd input, C = NPU output
  * so the multiply/scale semantics can be read off (is C ~ r*G, r*G>>7, clamp(r*G), ...?).
  * First goal: does the 126-reg spliced program EXECUTE (not wedge)? Then read the numeric relationship.
@@ -36,7 +36,7 @@ int main(int argc,char**argv){
         int mult=argc>2?atoi(argv[2]):16384, shift=argc>3?atoi(argv[3]):14;   /* gain=mult/2^shift, default 1 */
         setenv("ORK_EW_AOFF","0",1);setenv("ORK_EW_COFF","0",1);setenv("ORK_EW_BIAS","0",1);
         char ms[16],ss[16]; sprintf(ms,"%d",mult);sprintf(ss,"%d",shift); setenv("ORK_EW_MULT",ms,1);setenv("ORK_EW_SHIFT",ss,1);
-        double us=0; int r=ork_npu_probe_i8_mul(c,ac,bc,512,oc2,&us);
+        double us=0; int r=ork_i8_npu_probe_mul(c,ac,bc,512,oc2,&us);
         if(r){ printf("sg returned %d\n",r); ork_npu_free(c); return 1; }
         int mism=0,mx=0,shown=0;
         for(int m=0;m<Mt;m++)for(int n=0;n<Nc;n++){ int p=(n/oa)*(8*oa)+m*oa+(n%oa); int o=oc2[p];
@@ -54,7 +54,7 @@ int main(int argc,char**argv){
         int bperm=(bv==998);                  /* b=998 => position-index on the EW operand b */
         for(int i=0;i<Nn;i++){ a[i]=perm?(int8_t)(i&0x3f):(ramp?(int8_t)((i%64)-32):(int8_t)av);
                                b[i]=bperm?(int8_t)(i&0x3f):(int8_t)bv; }
-        double us=0; int r=ork_npu_probe_i8_mul(c,a,b,Nn,o,&us);
+        double us=0; int r=ork_i8_npu_probe_mul(c,a,b,Nn,o,&us);
         if(r){ printf("mul returned %d (%s)\n",r,r==-1?"WEDGED":"bad dims"); ork_npu_free(c); return 1; }
         printf("STANDALONE MUL EXECUTED OK, %.1f us. a=%s b=%d\n", us, perm?"posidx":(ramp?"ramp":"const"), bv);
         int rows=(perm||ramp||bperm)?Nn:16;
@@ -67,7 +67,7 @@ int main(int argc,char**argv){
         static signed char A[8*512], B[512*64], G[8*64]; static int8_t C[8*64];
         for(int i=0;i<8*512;i++)A[i]=1; for(int i=0;i<512*64;i++)B[i]=1;
         for(int m=0;m<8;m++)for(int n=0;n<64;n++)G[m*64+n]=(signed char)(n-32);
-        double us=0; int r=ork_npu_probe_i8_ewmul(c,8,512,64,A,B,G,0x4000,14,C,&us);
+        double us=0; int r=ork_i8_npu_probe_ewmul(c,8,512,64,A,B,G,0x4000,14,C,&us);
         if(r){ printf("ew64 WEDGED (rc=%d) RK=%s\n",r,getenv("ORK_EW_RK")?getenv("ORK_EW_RK"):"0"); ork_npu_free(c); return 1; }
         printf("ew64 EXECUTED %.1fus RK=%s. out[0..15]: ",us,getenv("ORK_EW_RK")?getenv("ORK_EW_RK"):"0");
         for(int i=0;i<16;i++)printf("%d ",C[i]); printf("\n");
@@ -80,7 +80,7 @@ int main(int argc,char**argv){
         setenv("ORK_EW_DUMP","1",1);
         static signed char A[8*512], B[512*64], G[8*64]; static int8_t C[8*64];
         for(int i=0;i<8*512;i++)A[i]=1; for(int i=0;i<512*64;i++)B[i]=1; for(int i=0;i<8*64;i++)G[i]=1;
-        ork_npu_probe_i8_ewmul(c,8,512,64,A,B,G,0x100,14,C,0);
+        ork_i8_npu_probe_ewmul(c,8,512,64,A,B,G,0x100,14,C,0);
         ork_npu_free(c); return 0;
     }
 
@@ -90,7 +90,7 @@ int main(int argc,char**argv){
         int iv=argc>2?atoi(argv[2]):1, wv=argc>3?atoi(argv[3]):1, gv=argc>4?atoi(argv[4]):64;
         static signed char in[4096], wt[0x6000], gl[0x2000]; static int8_t out[4096];
         memset(in,iv,4096); memset(wt,wv,0x6000); memset(gl,gv,0x2000);
-        double us=0; int r=ork_npu_probe_i8_ewmul_tmpl(c,in,4096,wt,0x6000-0x2300,gl,0x2000-0x400,out,4096,&us);
+        double us=0; int r=ork_i8_npu_probe_ewmul_tmpl(c,in,4096,wt,0x6000-0x2300,gl,0x2000-0x400,out,4096,&us);
         if(r){ printf("verbatim EW-mul returned %d (%s)\n",r,r==-1?"WEDGED":"bad dims"); ork_npu_free(c); return 1; }
         printf("VERBATIM EW-mul EXECUTED OK, %.1f us. in=%d wt=%d gl(silu)=%d\n", us,iv,wv,gv);
         printf("output bytes[0..31]: "); for(int i=0;i<32;i++)printf("%d ",out[i]); printf("\n");
@@ -108,7 +108,7 @@ int main(int argc,char**argv){
         for(int i=0;i<Kl*Nl;i++)B[i]=bv;
         if(gc!=0x7fff) for(int i=0;i<Ml*Nl;i++)G[i]=(signed char)gc;               /* constant G */
         else for(int m=0;m<Ml;m++)for(int n=0;n<Nl;n++)G[m*Nl+n]=(signed char)(n-32);
-        double us=0; int r=ork_npu_probe_i8_ewmul_lin(c,A,B,G,C,&us);
+        double us=0; int r=ork_i8_npu_probe_ewmul_lin(c,A,B,G,C,&us);
         if(r){ printf("ewmul_lin returned %d (%s)\n",r,r==-1?"WEDGED":"bad dims"); ork_npu_free(c); return 1; }
         long acc=(long)av*bv*Kl;   /* every column: sum_k A*B */
         printf("MATMUL EW-mul EXECUTED OK, %.1f us. A=%d B=%d up_acc(all cols)=%ld\n",us,av,bv,acc);
@@ -125,7 +125,7 @@ int main(int argc,char**argv){
     for(int k=0;k<K;k++)for(int n=0;n<N;n++)B[k*N+n]=(signed char)((n%3)-1);  /* -1/0/1 -> acc = K*(n%3-1) */
     for(int m=0;m<M;m++)for(int n=0;n<N;n++)G[m*N+n]=(signed char)(n-16);      /* -16..15 */
 
-    double us=0; int r=ork_npu_probe_i8_ewmul(c,M,K,N,A,B,G,mult,shift,C,&us);
+    double us=0; int r=ork_i8_npu_probe_ewmul(c,M,K,N,A,B,G,mult,shift,C,&us);
     if(r){ printf("probe returned %d (%s)\n", r, r==-1?"WEDGED":"bad dims"); ork_npu_free(c); return 1; }
     printf("EW-mul probe OK, %.1f us. mult=0x%x shift=%d\n", us, mult, shift);
     printf(" n : acc      req      G     C(npu)   r*G   (r*G)>>7  clamp(r*G>>?)\n");

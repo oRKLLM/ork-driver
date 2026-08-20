@@ -25,7 +25,7 @@
 #define ORK_IM_CLIP_N ((int)(sizeof(ORK_IM_CLIP_GRID)/sizeof(ORK_IM_CLIP_GRID[0])))
 static const float ORK_IM_CLIP_GRID[] = { 1.0f, 0.92f, 0.85f, 0.78f, 0.70f, 0.62f, 0.55f };
 
-void orki_quant_chan_i4(const float *fr, int K, float scale, int sr, uint32_t *seed, uint8_t *nib, float *qf32) {
+void orki_i4_quant_chan(const float *fr, int K, float scale, int sr, uint32_t *seed, uint8_t *nib, float *qf32) {
     float inv = scale > 0 ? 1.0f/scale : 0.0f;
     for (int k = 0; k < K; k++) {
         int q;
@@ -39,7 +39,7 @@ void orki_quant_chan_i4(const float *fr, int K, float scale, int sr, uint32_t *s
     }
 }
 
-void orki_expand_chan_i4_f32(const uint8_t *nib, int K, float *qf32) {
+void orki_i4_expand_chan_f32(const uint8_t *nib, int K, float *qf32) {
     int k = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     uint8x8_t vlo = vdup_n_u8(0x0f);
@@ -67,7 +67,7 @@ void orki_expand_chan_i4_f32(const uint8_t *nib, int K, float *qf32) {
     }
 }
 
-void orki_quant_chan_nf4(const float *fr, int K, float absmax, int sr, uint32_t *seed, uint8_t *nib, uint8_t *qidx) {
+void orki_nf4_quant_chan(const float *fr, int K, float absmax, int sr, uint32_t *seed, uint8_t *nib, uint8_t *qidx) {
     float inv = absmax > 0 ? 1.0f/absmax : 0.0f;
     for (int k = 0; k < K; k++) {
         float wn = fr[k]*inv; if (wn > 1.0f) wn = 1.0f; else if (wn < -1.0f) wn = -1.0f;
@@ -89,7 +89,7 @@ void orki_quant_chan_nf4(const float *fr, int K, float absmax, int sr, uint32_t 
     }
 }
 
-void orki_inflate_chan_nf4_f32(const uint8_t *qidx, int K, const int8_t lut[16], float *qf32) {
+void orki_nf4_inflate_chan_f32(const uint8_t *qidx, int K, const int8_t lut[16], float *qf32) {
     int k = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     int8x16_t vlut = vld1q_s8(lut);
@@ -107,7 +107,7 @@ void orki_inflate_chan_nf4_f32(const uint8_t *qidx, int K, const int8_t lut[16],
     for (; k < K; k++) qf32[k] = (float)lut[qidx[k]];
 }
 
-void orki_expand_chan_i4_i8(const uint8_t *nib, int K, int8_t *i8) {
+void orki_i4_expand_chan_to_i8(const uint8_t *nib, int K, int8_t *i8) {
     int k = 0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
     uint8x8_t vlo = vdup_n_u8(0x0f);

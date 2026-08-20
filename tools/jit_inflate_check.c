@@ -1,13 +1,13 @@
 /* tools/jit_inflate_check.c — validate int8 JIT-inflate to fp16 (emulated W8A16) is bit-exact.
  *
- * Claim: ork_mm_f16_scratch + ork_mm_inflate_i8_to_f16(i8,bscale) produces resident tiles that are
- * BYTE-IDENTICAL to ork_mm_pack of the row-major dequantized weight wf16[k,n]=(f16)(i8[k*N+n]*bscale[n]),
+ * Claim: ork_f16_mm_scratch + ork_i8_mm_inflate_to_f16(i8,bscale) produces resident tiles that are
+ * BYTE-IDENTICAL to ork_f16_mm_pack of the row-major dequantized weight wf16[k,n]=(f16)(i8[k*N+n]*bscale[n]),
  * and therefore run bit-identically through the (already-validated) fp16 matmul kernel. So the scratch
  * costs only ONE fp16 buffer of IOVA (reused across layers) while giving the exact fp16-path result for
  * int8-precision weights + unquantized fp16 activations.
  *
  * Test: (1) DUMP compare — memcmp ork_w_dump(scratch) vs ork_w_dump(direct pack) == 0.
- *       (2) RUN compare — ork_mm_run on both, C bit-identical.
+ *       (2) RUN compare — ork_f16_mm_run on both, C bit-identical.
  *       (3) REUSE — re-inflate the same scratch with a second int8 weight, must match a fresh direct pack.
  *   make jit_inflate_check && sudo ./jit_inflate_check [K] [N] [M]   (board only)
  */
@@ -53,9 +53,9 @@ int main(int argc,char**argv){
     gen_weight(i8,bscale,K,N,1);
     dequant_f16(ref,i8,bscale,K,N);
 
-    ork_w *sc=ork_mm_f16_scratch(c,K,N);        if(!sc){printf("scratch alloc fail\n");return 1;}
-    if(ork_mm_inflate_i8_to_f16(c,sc,i8,bscale,K,N)){printf("inflate fail\n");return 1;}
-    ork_w *dp=ork_mm_pack(c,K,N,ref);            if(!dp){printf("direct pack fail\n");return 1;}
+    ork_w *sc=ork_f16_mm_scratch(c,K,N);        if(!sc){printf("scratch alloc fail\n");return 1;}
+    if(ork_i8_mm_inflate_to_f16(c,sc,i8,bscale,K,N)){printf("inflate fail\n");return 1;}
+    ork_w *dp=ork_f16_mm_pack(c,K,N,ref);            if(!dp){printf("direct pack fail\n");return 1;}
 
     /* (1) DUMP compare — the decisive bit-exact check (no NPU run needed) */
     size_t la,lb; void*da=dump_w(sc,&la),*db=dump_w(dp,&lb);
@@ -64,7 +64,7 @@ int main(int argc,char**argv){
     if(!dumpeq) fail=1;
 
     /* (2) RUN compare */
-    int ra=ork_mm_run(c,sc,M,A,Ca), rb=ork_mm_run(c,dp,M,A,Cb);
+    int ra=ork_f16_mm_run(c,sc,M,A,Ca), rb=ork_f16_mm_run(c,dp,M,A,Cb);
     if(ra||rb){ printf("  [2] run rc: scratch=%d direct=%d\n",ra,rb); fail=1; }
     else {
         double maxd=0; int nbad=0;
@@ -77,8 +77,8 @@ int main(int argc,char**argv){
     /* (3) REUSE — re-inflate the SAME scratch with weight #2, compare to a fresh direct pack */
     gen_weight(i8,bscale,K,N,2);
     dequant_f16(ref,i8,bscale,K,N);
-    if(ork_mm_inflate_i8_to_f16(c,sc,i8,bscale,K,N)){printf("re-inflate fail\n");return 1;}
-    ork_w *dp2=ork_mm_pack(c,K,N,ref);
+    if(ork_i8_mm_inflate_to_f16(c,sc,i8,bscale,K,N)){printf("re-inflate fail\n");return 1;}
+    ork_w *dp2=ork_f16_mm_pack(c,K,N,ref);
     size_t l2a,l2b; void*d2a=dump_w(sc,&l2a),*d2b=dump_w(dp2,&l2b);
     int reuseeq=(l2a==l2b)&&(memcmp(d2a,d2b,l2a)==0);
     printf("  [3] reuse re-inflate dump: %s\n",reuseeq?"IDENTICAL":"DIFFER");

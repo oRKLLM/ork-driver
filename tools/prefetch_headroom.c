@@ -3,7 +3,7 @@
  * THE QUESTION: when a weight is cycled through the 4 GiB NPU window as int4, expanded to int8, and run,
  * can a CPU prefetch thread that prepares slice i+1 hide its cost behind the NPU computing slice i?
  *
- *   t_npu  = NPU int8 matmul time for the slice (ork_mm_run_i8).
+ *   t_npu  = NPU int8 matmul time for the slice (ork_i8_mm_run).
  *   t_prep = CPU per-slice STEADY-STATE prep = NEON int4->int8 inflate + tile into an ALREADY-ALLOCATED,
  *            reused NPU DMA buffer. NO bcreate/alloc per slice (that's a one-time cost). Split into:
  *              t_inflate = NEON int4->int8 expand (UNIFORM and NF4 measured separately)
@@ -16,9 +16,9 @@
  * split says whether a CPU prefetch thread (overlaps inflate, a CPU op) suffices, or the wall is the
  * tile/copy transfer (bandwidth) which a thread can't speed up.
  *
- * To isolate STEADY-STATE prep with NO per-slice alloc: pack the int4 weight ONCE (ork_mm_pack_i4a8 ->
+ * To isolate STEADY-STATE prep with NO per-slice alloc: pack the int4 weight ONCE (ork_i4a8_mm_pack ->
  * resident DMA buffers + the compact nibble store), then in the timed loop re-run ONLY the inflate + tile
- * tail (internal ork_slice_inflate_i4a8_kind / ork_slice_tile_i8 — they reuse the production tile path and
+ * tail (internal ork_i4a8_slice_inflate_kind / ork_i8_slice_tile — they reuse the production tile path and
  * the already-allocated buffers; they do not alloc or change pack/run behavior).
  *
  *   make prefetch_headroom
@@ -37,8 +37,8 @@
 #include "ork_npu.h"
 
 /* internal diagnostic helpers exported from npu.c (not in the public header) */
-void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind);
-void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
+void ork_i4a8_slice_inflate_kind(const ork_w *w, float *qf32, int kind);
+void ork_i8_slice_tile(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 static int cmp_d(const void*a,const void*b){ double x=*(const double*)a,y=*(const double*)b; return x<y?-1:x>y?1:0; }
@@ -89,7 +89,7 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
     for(size_t i=0;i<(size_t)N*K;i++){ s=s*1664525u+1013904223u; float u=(s>>8)*(1.0f/16777216.0f); f32[i]=(u-0.5f)*0.2f; }
 
     float *bscale = malloc((size_t)N*sizeof(float));
-    ork_w *w = ork_mm_pack_i4a8(c,K,N,f32,bscale);   /* UNIFORM int4 (resident DMA + compact nibbles) */
+    ork_w *w = ork_i4a8_mm_pack(c,K,N,f32,bscale);   /* UNIFORM int4 (resident DMA + compact nibbles) */
     if(!w){ printf("  [%s] pack_i4a8 failed (K=%d N=%d)\n",label,K,N); free(f32); free(bscale); return; }
 
     /* prep scratch: inflated codes f32[N*K] + inv[N]=1 (codes are exact; the tiler rescales by inv) */
@@ -101,19 +101,19 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
     double samp[REPS];
 
     /* ---- t_inflate: UNIFORM (sign-extend) ---- */
-    for(int i=0;i<WARM;i++) ork_slice_inflate_i4a8_kind(w,qf32,ORK_QK_UNIFORM);
-    for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_inflate_i4a8_kind(w,qf32,ORK_QK_UNIFORM); samp[i]=now_us()-t; }
+    for(int i=0;i<WARM;i++) ork_i4a8_slice_inflate_kind(w,qf32,ORK_QK_UNIFORM);
+    for(int i=0;i<REPS;i++){ double t=now_us(); ork_i4a8_slice_inflate_kind(w,qf32,ORK_QK_UNIFORM); samp[i]=now_us()-t; }
     stat inf_u = summarize(samp,REPS);
 
     /* ---- t_inflate: NF4 (LUT vqtbl) — forced on the same nibble store (cost is data-independent) ---- */
-    for(int i=0;i<WARM;i++) ork_slice_inflate_i4a8_kind(w,qf32,ORK_QK_CODEBOOK_NF4);
-    for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_inflate_i4a8_kind(w,qf32,ORK_QK_CODEBOOK_NF4); samp[i]=now_us()-t; }
+    for(int i=0;i<WARM;i++) ork_i4a8_slice_inflate_kind(w,qf32,ORK_QK_CODEBOOK_NF4);
+    for(int i=0;i<REPS;i++){ double t=now_us(); ork_i4a8_slice_inflate_kind(w,qf32,ORK_QK_CODEBOOK_NF4); samp[i]=now_us()-t; }
     stat inf_n = summarize(samp,REPS);
 
     /* ---- t_tile: tile inflated codes into the EXISTING resident DMA buffers + bsync(TO_DEVICE) ---- */
-    ork_slice_inflate_i4a8_kind(w,qf32,ORK_QK_UNIFORM);          /* ensure qf32 valid */
-    for(int i=0;i<WARM;i++) ork_slice_tile_i8(c,w,qf32,inv1);
-    for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_tile_i8(c,w,qf32,inv1); samp[i]=now_us()-t; }
+    ork_i4a8_slice_inflate_kind(w,qf32,ORK_QK_UNIFORM);          /* ensure qf32 valid */
+    for(int i=0;i<WARM;i++) ork_i8_slice_tile(c,w,qf32,inv1);
+    for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_slice_tile(c,w,qf32,inv1); samp[i]=now_us()-t; }
     stat tile = summarize(samp,REPS);
 
     /* the slice is re-tiled with valid codes; safe to run NPU matmuls against it for each M */
@@ -130,9 +130,9 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
         if(!A||!C){ printf("    M=%d OOM act\n",M); free(A); free(C); continue; }
         memset(A,1,(size_t)M*K);
 
-        if(ork_mm_run_i8(c,w,M,A,C)!=0){ printf("    M=%d ork_mm_run_i8 FAILED\n",M); free(A); free(C); continue; }
-        for(int i=0;i<WARM;i++) ork_mm_run_i8(c,w,M,A,C);
-        for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_run_i8(c,w,M,A,C); samp[i]=now_us()-t; }
+        if(ork_i8_mm_run(c,w,M,A,C)!=0){ printf("    M=%d ork_i8_mm_run FAILED\n",M); free(A); free(C); continue; }
+        for(int i=0;i<WARM;i++) ork_i8_mm_run(c,w,M,A,C);
+        for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_run(c,w,M,A,C); samp[i]=now_us()-t; }
         stat npu = summarize(samp,REPS);
 
         /* report against the UNIFORM inflate (the production default path); t_prep = inflate + tile */

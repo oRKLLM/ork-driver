@@ -1,0 +1,23 @@
+# naming_exempt.txt — symbols check 11 must not flag, and WHY.
+#
+# The convention is dtype-FIRST: ork_<dtype>_<family>_<verb>[_<mechanism>][_<modifier>]. Check 11 flags any
+# symbol that NAMES a dtype somewhere other than immediately after the ork_/orki_ prefix. Three things
+# legitimately trip that:
+#
+#   CONVERSION — names two dtypes on purpose; prefix is the SOURCE, destination is explicit (_to_<dst>).
+#   AGNOSTIC   — dtype-agnostic by design and correctly untagged. Nothing to fix.
+#   MULTI      — ONE implementation genuinely serving several precisions, so no single tag is truthful.
+#                These are the same cases the capability matrix marks with a dagger.
+#
+# include/ork/compat.h is skipped wholesale: it exists to hold the deprecated pre-rename spellings.
+#
+# <symbol>                      <kind>       <note>
+ork_i8_mm_inflate_to_f16        CONVERSION   int8 source -> fp16 destination
+ork_i4_mm_pack_to_i8            CONVERSION   int4 source -> int8 tiles
+orki_i4_expand_chan_to_i8       CONVERSION   int4 source -> int8
+orki_nf4_inflate_chan_to_i8     CONVERSION   NF4 source -> int8
+orki_i4_tile_direct_to_i8       CONVERSION   int4 source -> int8, no f32 intermediate
+ork_w_dump                      AGNOSTIC     walks w->Bb tiles for ANY packed dtype; no dtype check
+ork_stage_fill                  AGNOSTIC     takes a generic ork_w; ork_i8_stage_fill is the int8-specific one
+ork_dyn_begin_mc                MULTI        one doorbell path serving int8 AND fp16 (matrix dagger case)
+ork_dyn_begin_colsplit          MULTI        the ONLY fp16 multicore path, implemented in i8/colsplit.c

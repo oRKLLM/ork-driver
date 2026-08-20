@@ -45,7 +45,7 @@ int main(int argc,char**argv){
         int8_t *KTp=calloc((size_t)Kp*L,1),*Vp=malloc((size_t)L*HD);
         for(int e=0;e<HD;e++)for(int j=0;j<L;j++) KTp[(size_t)e*L+j]=(int8_t)lrintf(Kf[h][(size_t)j*HD+e]*ksv[h]);
         for(size_t i=0;i<(size_t)L*HD;i++) Vp[i]=(int8_t)lrintf(Vf[h][i]*vsv[h]);
-        wkt[h]=ork_mm_pack_i8(c,Kp,L,KTp); wv[h]=ork_mm_pack_i8(c,L,HD,Vp); free(KTp); free(Vp);
+        wkt[h]=ork_i8_mm_pack(c,Kp,L,KTp); wv[h]=ork_i8_mm_pack(c,L,HD,Vp); free(KTp); free(Vp);
         if(!wkt[h]||!wv[h]){ printf("pack fail h=%d\n",h); return 2; }
     }
     int8_t *w8=malloc((size_t)L); int32_t *scores=malloc((size_t)L*4),*attv=malloc((size_t)HD*4);
@@ -53,12 +53,12 @@ int main(int argc,char**argv){
 
     /* one head's attention using the RESIDENT packed weights (softmax on host) */
     #define RUN_HEAD(h) do{ \
-        ork_mm_task_i8 t1={ wkt[h],1,Q8[h],scores }; if(ork_mm_run_chain_i8(c,1,&t1)) return 1; \
+        ork_mm_task_i8 t1={ wkt[h],1,Q8[h],scores }; if(ork_i8_mm_run_chain(c,1,&t1)) return 1; \
         double mx=-1e300; for(int j=0;j<L;j++){ sc[j]=(double)scores[j]/((double)qsv[h]*ksv[h])*scale; if(sc[j]>mx)mx=sc[j]; } \
         double Z=0; for(int j=0;j<L;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1; \
         double wmax=0; for(int j=0;j<L;j++){ sc[j]/=Z; if(sc[j]>wmax)wmax=sc[j]; } double ws=127.0/(wmax>1e-9?wmax:1.0); \
         for(int j=0;j<L;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); } \
-        ork_mm_task_i8 t2={ wv[h],1,w8,attv }; if(ork_mm_run_chain_i8(c,1,&t2)) return 1; \
+        ork_mm_task_i8 t2={ wv[h],1,w8,attv }; if(ork_i8_mm_run_chain(c,1,&t2)) return 1; \
         for(int e=0;e<HD;e++) att[e]=(float)((double)attv[e]/(ws*vsv[h])); }while(0)
 
     /* coherence (resident path) vs pure-fp CPU */

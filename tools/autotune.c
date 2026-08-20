@@ -14,7 +14,7 @@
  *
  * Because run_i8 caches its env knobs at first call (static), the M/N/K-tile knobs are swept by a
  * DRIVER that re-execs this binary once per env-combo (the shell loop in run_autotune.sh). This
- * process: packs each shape once, times ork_mm_run_i8 warm (rep0/1 warmup, median of rep2..r),
+ * process: packs each shape once, times ork_i8_mm_run warm (rep0/1 warmup, median of rep2..r),
  * bit-exact-gates, and prints one parseable line per (shape, core) it ran under the ambient env.
  *
  *   make autotune && sudo ./autotune [M] [reps]
@@ -91,7 +91,7 @@ int main(int argc,char**argv){
             }
         }
 
-        ork_w *w = ork_mm_pack_i8(c,K,N,B);
+        ork_w *w = ork_i8_mm_pack(c,K,N,B);
         if(!w){ printf("[AUTOTUNE] shape=%s M=%d K=%d N=%d status=PACKFAIL\n",SHAPES[s].name,M,K,N); continue; }
 
         for(int cores=1;cores<=socc;cores++){
@@ -99,7 +99,7 @@ int main(int argc,char**argv){
             int rc=-99;
             for(int r=0;r<reps;r++){
                 double t0=now_us();
-                rc=ork_mm_run_i8(c,w,M,A,C);
+                rc=ork_i8_mm_run(c,w,M,A,C);
                 double dt=now_us()-t0;
                 rt[r]=dt;
                 if(rc!=0) break;

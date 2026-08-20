@@ -1,7 +1,7 @@
 /* i4_sn_probe — A1 validation: int4 with Sn>1 (wide-N, N-tiled) on the NONBLOCK doorbell.
  *
  * nmax=8192, so a weight with N>8192 packs Sn>1 N-slices. With ORK_I4_NODB unset (default), M>=2 int4 rides
- * ork_dyn_begin_mc_i4, which A1 extended to emit Sn chained column-slice programs per row. Verifies the
+ * ork_i4_dyn_begin_mc, which A1 extended to emit Sn chained column-slice programs per row. Verifies the
  * doorbell output bit-exact vs the CPU int4 reference AND vs the blocking run_i4_mc (ORK_I4_NODB=1). Board only.
  *   make i4_sn_probe && sudo env ORKD... ./i4_sn_probe
  */
@@ -22,12 +22,12 @@ static int run_case(ork_npu *c, int K, int N, int M, int mag){
                          : (int8_t)((int)(((g=g*1103515245u+12345u)>>20) % (2*mag+1)) - mag))
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=I4();
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=I4();
-    ork_w *w=ork_mm_pack_i4(c,K,N,B);
+    ork_w *w=ork_i4_mm_pack(c,K,N,B);
     if(!w){ printf("  K=%d N=%d M=%d: pack_i4 failed\n",K,N,M); free(B);free(A);free(C);free(R); return 1; }
     /* CPU int4 reference: raw int32 accumulator */
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long a=0; for(int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; R[m*N+n]=(int)a; }
     memset(C,0,(size_t)M*N*4);
-    int rc=ork_mm_run_i4(c,w,M,A,C);
+    int rc=ork_i4_mm_run(c,w,M,A,C);
     int bad = rc?1:0, nbad=0;
     if(!rc) for(size_t i=0;i<(size_t)M*N;i++) if(C[i]!=R[i]){ if(nbad<3) fprintf(stderr,"    [%zu] %d!=%d\n",i,C[i],R[i]); nbad++; }
     if(nbad) bad=1;

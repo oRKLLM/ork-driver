@@ -1,7 +1,7 @@
 /* examples/test_mm_i8_out8.c — validate the PPU int8-REQUANTIZED output stage (fused-path step 1).
  *
  * The matmul normally writes an int32 accumulator (INT8_MM_INT8_TO_INT32); the caller then requantizes
- * on the CPU/NEON. ork_npu_probe_i8_out8 instead runs the matmul with the int8-output stage on-chip
+ * on the CPU/NEON. ork_i8_npu_probe_out8 instead runs the matmul with the int8-output stage on-chip
  * (set_i8_out8): out_i8 = clamp_i8((acc_i32 * mult) >> shift). This is the foundation the fused SiLU
  * (LUT) and the SwiGLU elementwise-mul are layered on. Here we prove it bit-exact vs the CPU model,
  * for identity requant (mult=0x4000, shift=14 -> pass-through-then-clamp) and a couple of scales.
@@ -40,7 +40,7 @@ static int check(ork_npu *ctx, int M, int K, int N, int mult, int shift){
     for (size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)((rnd()&7)-3);
     for (size_t i=0;i<(size_t)K*N;i++) B[i]=(int8_t)((rnd()&7)-3);
     double us=0;
-    int r = ork_npu_probe_i8_out8(ctx, M, K, N, A, B, mult, shift, C, &us);
+    int r = ork_i8_npu_probe_out8(ctx, M, K, N, A, B, mult, shift, C, &us);
     if (r){ printf("  probe_i8_out8 M=%d K=%d N=%d rc=%d (%s)\n", M,K,N,r, r==-1?"WEDGED":"bad dims"); free(A);free(B);free(C); return 1; }
     int bad=0, first=1;
     for (int i=0;i<M;i++) for (int n=0;n<N;n++){

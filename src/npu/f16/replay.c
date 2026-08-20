@@ -34,7 +34,7 @@ static void *ork_rsh_patcher(void *p){ struct ork_rsh_patch *a=p; usleep(a->dela
     else { struct rknpu_task *tk=(struct rknpu_task*)a->c->task.cpu; tk[a->idx]=a->marker; orki_bsync(a->c->fd,&a->c->task,RKNPU_MEM_SYNC_TO_DEVICE); }
     __asm__ __volatile__("dsb sy":::"memory"); return NULL; }
 
-int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint16_t *reshape_raw,int reshape_words,double *us){
+int ork_f16_npu_replay_reshape(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint16_t *reshape_raw,int reshape_words,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     const uint32_t IB=0xfffed000u; const size_t ISZ=0x13000;   /* vendor image span */
@@ -145,7 +145,7 @@ int ork_npu_replay_reshape_f16(ork_npu *c,uint16_t *gemm_raw,int gemm_words,uint
 }
 
 
-int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
+int ork_f16_npu_probe_silu_std(ork_npu *c,const ork_f16 *in,int M,int N,
                                uint32_t idx_off,uint32_t cfg4064,uint32_t cfg4068,
                                const int16_t *lut,int nlut,ork_f16 *out,double *us){
     int fd=c->fd;
@@ -182,7 +182,7 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
       /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
        * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
        * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
-       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
+       * silu in-chain wedge). Matches ork_i8_mm_run_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
@@ -212,9 +212,9 @@ int ork_npu_probe_silu_std_f16(ork_npu *c,const ork_f16 *in,int M,int N,
 
 /* Faithful fp16 replay: run RKNN's fp16 LUT-LOAD program (loader/ln, the LE-table exponential-mode loader with
  * RKNN's curve baked in) verbatim + the fp16 compute op (REGCMD_SILU_STD_F16) verbatim — patching only the I/O
- * addresses + M/N. Unlike ork_npu_probe_silu_std_f16, this uses the fp16 loader (NOT the int8 LO-table loader)
+ * addresses + M/N. Unlike ork_f16_npu_probe_silu_std, this uses the fp16 loader (NOT the int8 LO-table loader)
  * and keeps the compute's baked index params. in/out fp16 [M*N], N%8==0. 0/ok,-1,-2,-3. */
-int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us){
+int ork_f16_npu_replay_full(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)||ln<2200||ln>2300) return -2;
@@ -265,7 +265,7 @@ int ork_npu_replay_full_f16(ork_npu *c,const uint32_t *loader,int ln,const ork_f
     return 0;
 }
 
-int ork_npu_replay_softmax_f16(ork_npu *c, const void *in, void *out, double *us){
+int ork_f16_npu_replay_softmax(ork_npu *c, const void *in, void *out, double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     struct buf IN=orki_bcreate(fd,32768,0x403,-1), OUT=orki_bcreate(fd,32768,0x403,-1),

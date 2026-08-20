@@ -32,13 +32,13 @@ static int worker(int idx, int iters){
     unsigned g = 0x9e3779b9u ^ (unsigned)(idx*2654435761u);
     #define RND() ((int8_t)(((g=g*1103515245u+12345u)>>18&0x1f)-16))   /* [-16,15] */
     for(int i=0;i<K*N;i++) B[i]=RND();          /* weight distinct per worker */
-    ork_w *w = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w = ork_i8_mm_pack(c, K, N, B);
     int bad=0;
     for(int it=0; it<iters && !bad; it++){
         for(int i=0;i<M*K;i++) A[i]=RND();       /* activations distinct per worker+iter */
         for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long a=0; for(int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; R[m*N+n]=(int)a; }
         memset(C,0,(size_t)M*N*4);
-        if(!w || ork_mm_run_i8(c, w, M, A, C)){ fprintf(stderr,"[w%d] run it=%d FAIL\n", idx, it); bad=1; break; }
+        if(!w || ork_i8_mm_run(c, w, M, A, C)){ fprintf(stderr,"[w%d] run it=%d FAIL\n", idx, it); bad=1; break; }
         for(int i=0;i<M*N;i++) if(C[i]!=R[i]){ fprintf(stderr,"[w%d] it=%d MISMATCH [%d] %d!=%d\n", idx,it,i,C[i],R[i]); bad=1; break; }
     }
     if(w) ork_mm_free(c, w);

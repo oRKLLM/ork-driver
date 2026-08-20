@@ -46,7 +46,7 @@ int main(int argc,char**argv){
 
     /* ones_i8[n,32] weight for the int8 sum-reduce (int8 pack needs N%32; Σ lands in col 0) */
     int8_t *ones=malloc((size_t)n*32); memset(ones,1,(size_t)n*32);
-    ork_w *w_ones=ork_mm_pack_i8(c,n,32,ones); if(!w_ones){ printf("pack_i8 fail\n"); return 2; }
+    ork_w *w_ones=ork_i8_mm_pack(c,n,32,ones); if(!w_ones){ printf("pack_i8 fail\n"); return 2; }
     int32_t *ss=malloc((size_t)M*32*4);
     for(size_t i=0;i<(size_t)M*n;i++) ei8[i]=-128;   /* poison */
 

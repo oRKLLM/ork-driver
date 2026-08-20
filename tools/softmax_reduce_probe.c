@@ -1,6 +1,6 @@
 /* softmax_reduce_probe — the gating experiment for a fused on-NPU softmax chain: does the
  * exp(NPU activation/SDP) -> Sigma(NPU reduce-matmul) sequence work POST-REFACTOR, or does it still
- * ETIMEDOUT on the activation->matmul mode-switch (the reason ork_npu_softmax_f16 keeps the sum on CPU)?
+ * ETIMEDOUT on the activation->matmul mode-switch (the reason ork_f16_npu_softmax keeps the sum on CPU)?
  * If ork_npu_enter now carries this transition, the full softmax (max+exp+sum+norm) can run on-NPU and
  * a single-submit QK^T->softmax->A.V chain becomes buildable. Reduce = e . ones[n,16] (sum in col 0).
  * Self-validating: sum_j exp(x-max) vs CPU. BOARD: sudo ./softmax_reduce_probe */
@@ -15,7 +15,7 @@ int main(void){
     int M=256,n=256;
     /* ones[n,16] fp16 reduce weight */
     ork_f16*ones=malloc((size_t)n*16*2); for(size_t i=0;i<(size_t)n*16;i++)ones[i]=(ork_f16)1.0f;
-    ork_w*ow=ork_mm_pack(c,n,16,ones); free(ones); if(!ow){printf("pack ones failed\n");return 2;}
+    ork_w*ow=ork_f16_mm_pack(c,n,16,ones); free(ones); if(!ow){printf("pack ones failed\n");return 2;}
     ork_f16*x=malloc((size_t)M*n*2); float*mx=malloc((size_t)M*4);
     int16_t*xi=malloc((size_t)M*n*2),*ei=malloc((size_t)M*n*2);
     ork_f16*e=malloc((size_t)M*n*2); float*ss=malloc((size_t)M*16*4);
@@ -28,11 +28,11 @@ int main(void){
     for(int it=0; it<4; it++){
         for(int m=0;m<M;m++)for(int j=0;j<n;j++){long q=lround(((double)((float)x[(size_t)m*n+j]-mx[m]))/in_scale); if(q<-32768)q=-32768; if(q>32767)q=32767; xi[(size_t)m*n+j]=(int16_t)q;}
         double t0=now();
-        int er=ork_npu_exp_i16(c,xi,M,n,in_scale,out_scale,ei,NULL);          /* exp on NPU (SDP) */
+        int er=ork_i16_npu_exp(c,xi,M,n,in_scale,out_scale,ei,NULL);          /* exp on NPU (SDP) */
         double t_exp=now()-t0;
         for(int i=0;i<M*n;i++)e[i]=(ork_f16)((double)ei[i]*out_scale);
         t0=now();
-        int rr=ork_mm_run(c,ow,M,e,ss);                                       /* Sigma on NPU (reduce-matmul) -- the mode-switch */
+        int rr=ork_f16_mm_run(c,ow,M,e,ss);                                       /* Sigma on NPU (reduce-matmul) -- the mode-switch */
         double t_red=now()-t0;
         /* coherence: NPU sum vs CPU sum of exp(x-max) */
         double maxrel=0;

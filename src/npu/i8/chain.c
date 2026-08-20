@@ -33,7 +33,7 @@ struct chainrr_w { ork_npu *c; int core; int nchains; const ork_mm_task_i8 *cons
 static void *chainrr_worker(void *vp){
     struct chainrr_w *a=vp; orki_pin_big_core(a->core); a->rc=0; int k;
     while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->nchains){
-        int r=orki_run_chain_i8_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
+        int r=orki_i8_run_chain_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
         if(r) a->rc=r;
     }
     return NULL;
@@ -44,7 +44,7 @@ static void *chainrr_worker(void *vp){
 
 
 
-int orki_chain_fullk_mcap_i8(ork_npu *c, int K) {
+int orki_i8_chain_fullk_mcap(ork_npu *c, int K) {
     int RB = 2 * c->soc->cbuf_elems, R = RB / K; if (R < 1) R = 1;
     { int rp2 = 1; while (rp2 * 2 <= R) rp2 *= 2; R = rp2; }
     double scale = (double)K / 512.0; int base = (int)(177.0 - 15.0 * (scale - 1.0)), slope = (int)(15.0 * scale);
@@ -53,7 +53,7 @@ int orki_chain_fullk_mcap_i8(ork_npu *c, int K) {
     return chunk;
 }
 
-int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+int ork_i8_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     if (c && c->daemon){   /* Path B: fused chain on the daemon (all task weights are daemon-resident is_orkd) */
         if (S < 1) return -2;
         orkd_chain_task_c *ct = malloc((size_t)S * sizeof *ct);
@@ -67,9 +67,9 @@ int ork_mm_run_chain_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         free(ct);
         return rc;
     }
-    return orki_run_chain_i8_impl(c, S, tasks, NULL, -1); }
+    return orki_i8_run_chain_impl(c, S, tasks, NULL, -1); }
 
-int ork_mm_layer_i8(ork_npu *c, const struct ork_layer_dims *d,
+int ork_i8_mm_layer(ork_npu *c, const struct ork_layer_dims *d,
                     ork_w *wq, ork_w *wk, ork_w *wv, ork_w *wo, ork_w *wg, ork_w *wu, ork_w *wd,
                     const float *attn_norm, const float *q_norm, const float *ffn_norm,
                     const float *x, const float *Kc, const float *Vc, float *x_out){
@@ -127,33 +127,33 @@ int ork_mm_layer_i8(ork_npu *c, const struct ork_layer_dims *d,
 }
 
 /* Chain [gate*silu -> up -> ...] in ONE submit: task[gate_task] gets a FUSED int8 SiLU output stage; its C
- * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_mm_run_i8_silu
+ * receives int8 silu(gate) (M*N bytes). Other tasks are plain int32 matmuls. lut/params as ork_i8_mm_run_silu
  * (build via ork_mm_silu_build_lut). Single M-tile per task for now (M<=chain mcap). 0/ok,-1 wedge,-2 dims. */
-int ork_mm_run_chain_i8_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int gate_task,
+int ork_i8_mm_run_chain_gsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int gate_task,
                               int r_mult, int r_shift, uint32_t out_bias, uint32_t idx_off, uint32_t cfg4068,
                               const int16_t *lut, int nlut) {
     if (gate_task < 0 || gate_task >= S || !lut) return -2;
     struct chain_silu_spec ss = { NULL, gate_task, -1, r_mult, r_shift, 0, 0, out_bias, idx_off, 0, cfg4068, lut, nlut };
-    return orki_run_chain_i8_impl(c, S, tasks, &ss, -1);
+    return orki_i8_run_chain_impl(c, S, tasks, &ss, -1);
 }
 
 /* OPTION B: chain [... -> gate matmul(int8-out) -> silu-SDP -> ...] where task[sdp_task] is a STANDALONE int8
  * silu-SDP op reading task[sdp_task-1]'s (gate) output via aliased buffers (the vendor's matmul->SDP pattern),
- * NOT a fused matmul output stage. The gate task (sdp_task-1) gets orki_set_i8_out8 (int8 output, requant
- * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_npu_silu_i8).
+ * NOT a fused matmul output stage. The gate task (sdp_task-1) gets orki_i8_set_out8 (int8 output, requant
+ * gate_mult/gate_shift). The silu LUT for (in_scale,out_scale) is built internally (same as ork_i8_npu_silu).
  * tasks[sdp_task].C receives int8 silu (M*N bytes). Single M-tile per task. 0/ok,-1 wedge,-2 dims,-3 SoC. */
-int ork_mm_run_chain_i8_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int sdp_task,
+int ork_i8_mm_run_chain_sdpsilu(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int sdp_task,
                                 int gate_mult, int gate_shift, double in_scale, double out_scale) {
     if (sdp_task < 1 || sdp_task >= S) return -2;
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (orki_silu_calibrate_idx(c)) return -1;
-    static int16_t lut[1030]; orki_silu_build_curve(c, orki_silu_f, in_scale, out_scale, lut);   /* same curve as orki_act_lut_i8 */
+    static int16_t lut[1030]; orki_silu_build_curve(c, orki_silu_f, in_scale, out_scale, lut);   /* same curve as orki_i8_act_lut */
     struct chain_silu_spec ss = { NULL, -1, sdp_task, 0x4000, 14, gate_mult, gate_shift, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return orki_run_chain_i8_impl(c, S, tasks, &ss, -1);
+    return orki_i8_run_chain_impl(c, S, tasks, &ss, -1);
 }
 
-int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+int ork_i8_mm_run_chain_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
                             const ork_chain_op *ops, double in_scale, double out_scale) {
     if (S < 1 || !ops) return -2;
     if (!ork_ppu_fuse_enabled(c)) return -3;
@@ -161,23 +161,23 @@ int ork_mm_run_chain_i8_ffn(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
     static int16_t lut[1030]; orki_silu_build_curve(c, orki_silu_f, in_scale, out_scale, lut);
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return orki_run_chain_i8_impl(c, S, tasks, &ss, -1);
+    return orki_i8_run_chain_impl(c, S, tasks, &ss, -1);
 }
 
-int ork_mm_run_chain_i8_ffn_exp_biased(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+int ork_i8_mm_run_chain_ffn_exp_biased(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
                                        const ork_chain_op *ops, double in_scale, double out_scale, double max_bias) {
     if (S < 1 || !ops) return -2;
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (orki_silu_calibrate_idx(c)) return -1;
     /* build-once: the exp curve depends only on (in_scale,out_scale,max_bias); skip the host rebuild when
-     * unchanged so the static lut CONTENTS are stable across calls (which is what makes orki_run_chain_i8_impl's
+     * unchanged so the static lut CONTENTS are stable across calls (which is what makes orki_i8_run_chain_impl's
      * pointer-keyed LUT cache correct). Per-layer biases that DIFFER within a process force a rebuild each call
      * (correct, but defeats the pointer cache for that call) — prefer a single process-wide bias (e.g. the int8
      * score-ceiling) so this stays a one-time build. */
     static int16_t lut[1030]; static double c_is=-1, c_os=-1, c_bias=-1e300;
     if (in_scale != c_is || out_scale != c_os || max_bias != c_bias) {
         orki_silu_build_curve_biased(c, orki_exp_f, in_scale, out_scale, max_bias, lut); c_is=in_scale; c_os=out_scale; c_bias=max_bias;
-        /* contents of `lut` changed IN PLACE (same address). orki_run_chain_i8_impl keys its device-LUT (re)load on the
+        /* contents of `lut` changed IN PLACE (same address). orki_i8_run_chain_impl keys its device-LUT (re)load on the
          * ss->lut POINTER (chain_lut_p[cc]), so an in-place rebuild would leave the STALE curve resident on the NPU
          * SRAM. Invalidate the pointer cache on all cores so the next submit rebuilds the core Lrc + reuploads the
          * new curve. (Without this, a per-call-varying in_scale/bias serves the FIRST call's LUT — measured: same
@@ -185,15 +185,15 @@ int ork_mm_run_chain_i8_ffn_exp_biased(ork_npu *c, int S, const ork_mm_task_i8 *
         for (int i=0;i<ORK_MAXCORE;i++) c->chain_lut_p[i] = NULL; }
     struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0,
                                   ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
-    return orki_run_chain_i8_impl(c, S, tasks, &ss, -1);
+    return orki_i8_run_chain_impl(c, S, tasks, &ss, -1);
 }
 
-int ork_mm_run_chain_i8_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
+int ork_i8_mm_run_chain_ffn_exp(ork_npu *c, int S, const ork_mm_task_i8 *tasks,
                                 const ork_chain_op *ops, double in_scale, double out_scale) {
-    return ork_mm_run_chain_i8_ffn_exp_biased(c, S, tasks, ops, in_scale, out_scale, 0.0);
+    return ork_i8_mm_run_chain_ffn_exp_biased(c, S, tasks, ops, in_scale, out_scale, 0.0);
 }
 
-int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core) {
+int orki_i8_run_chain_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const struct chain_silu_spec *ss, int force_core) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
@@ -210,7 +210,7 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
     /* A single matmul has nothing to chain — dispatch to the optimized run_i8 path (multi-core
      * N-split / full-K single-submit decode via the auto-tuner). The chain path is single-core and
      * allocs per-call scratch, so it must only be used to batch S>1 independent matmuls. */
-    if (S == 1) return ork_mm_run_i8(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+    if (S == 1) return ork_i8_mm_run(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     int fd = c->fd, CBUF = c->soc->cbuf_elems;
     int KS_CHAIN = orki_int8_ks(c);   // K-slice size for the FFN chain down projection (default 1024)
@@ -240,13 +240,13 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
                          (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && w->K > 4096;
         if (ffn_ksplit) { if (w->K % KS_CHAIN != 0 || !w->Bb) return -2; continue; }
         if (w->Sk != 1 && !w->Bf) return -2;
-        // The full-K Bf submit uses orki_synth_i8(sched=1), whose 0x1040 K-reduction schedule is only valid for
+        // The full-K Bf submit uses orki_i8_synth(sched=1), whose 0x1040 K-reduction schedule is only valid for
         // K%512==0 && K<=4096 (same envelope as orki_run()'s M>1 Bf path; 512/1024 are covered, 1536-4096 too).
         // For other K (e.g. 768 down_proj, or K>4096) a full-K single submit is WRONG — reject so the caller
         // falls back to per-task run_i8 (which K-splits correctly). -3 distinguishes this from bad-arg -2.
         if (w->K % 512 != 0 || w->K > 4096) return -3;
         // M>mcap is fine — the synth loop M-tiles it into multiple chained programs (Step B below).
-        if (orki_check_overlap("ork_mm_run_chain_i8", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
+        if (orki_check_overlap("ork_i8_mm_run_chain", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
     /* P1a — SPINE MIGRATION (submit consolidation). Route the plain (ss==NULL) M=1 single-slice resident-C
@@ -357,21 +357,21 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
         int ffn_ksplit = ss && ss->ops && ss->ops[i].in0 >= 0 &&
                          (ss->ops[i].kind == OP_MM32 || ss->ops[i].kind == OP_MM8) && tasks[i].w->K > 4096;
         if (ffn_ksplit) { P += tasks[i].w->K / KS_CHAIN; continue; }   // down: one program per K-slice
-        int mcap = orki_chain_fullk_mcap_i8(c, tasks[i].w->K);
+        int mcap = orki_i8_chain_fullk_mcap(c, tasks[i].w->K);
         P += (tasks[i].M + mcap - 1) / mcap;
     }
     if (P > 1024) { ok = -2; goto cleanup; }   // too many M-tiles for the chain regcmd/task buffers
 
     // run_chain_i8 is SINGLE-CORE: it PC-chains all P programs into ONE submit (low latency, one ioctl
     // for S matmuls — e.g. decode QKV/gate-up sharing an input). Cross-core throughput is now served by
-    // ork_mm_run_stream_i8 (async round-robin, ~3x); the old barrier fan-out here was superseded (~1.3x).
+    // ork_i8_mm_run_stream (async round-robin, ~3x); the old barrier fan-out here was superseded (~1.3x).
     // task op kind: ops[] path, else legacy (silu-SDP at sdp_task; everything else matmul). SDP-containing
     // chains assume single M-tile per task (P==S, program p == task p) so this program<->task map holds.
     #define CHAIN_KIND(ii) (ss ? (ss->ops ? ss->ops[ii].kind : ((ii)==ss->sdp_task ? OP_SILU : OP_MM32)) : OP_MM32)
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        int M = tasks[i].M, K = w->K, N = w->N, mcap = orki_chain_fullk_mcap_i8(c, K);
+        int M = tasks[i].M, K = w->K, N = w->N, mcap = orki_i8_chain_fullk_mcap(c, K);
         // full-K single submit: Bf[0] (the K<=10752 full-K layout, e.g. Sk=2 experts) if present,
         // else Bb[0] (which holds the whole K only when Sk==1). Both are the synth_i8 tile layout.
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
@@ -385,7 +385,7 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
             for (int ks = 0; ks < Sk; ks++, p++) {
                 memset(rc, 0, sizeof(rc));
                 orki_bsync(fd, &w->Bb[ks], RKNPU_MEM_SYNC_TO_DEVICE);
-                orki_synth_i8(rc, M, KS_CHAIN, N, glu_dma + (uint32_t)((size_t)ks * KS_CHAIN * M),
+                orki_i8_synth(rc, M, KS_CHAIN, N, glu_dma + (uint32_t)((size_t)ks * KS_CHAIN * M),
                          (uint32_t)w->Bb[ks].dma, out_dma[i] + (uint32_t)((size_t)ks * M * N * 4), 1, CBUF, 0);
                 if (orki_validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
                 if (p < P - 1) {   // chain to the next K-slice (or terminate on the last)
@@ -402,7 +402,7 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
         for (int m0 = 0; m0 < M; m0 += mcap, p++) {
             int mc = (M - m0 < mcap) ? (M - m0) : mcap;
             memset(rc, 0, sizeof(rc));
-            // Let orki_synth_i8(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
+            // Let orki_i8_synth(sched=1) set the 0x1040 K-reduction schedule from mc (= ceil(mc/64) group).
             // Do NOT hardcode it (the old 0xb1 was an M=1 value; for mc>16 it computes rows past the
             // first 64-group against the wrong K-partition — same class as the full-K prefill bug).
             int kind = CHAIN_KIND(i);
@@ -433,11 +433,11 @@ int orki_run_chain_i8_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
                 uint32_t a_dma = (ss && ss->ops && ss->ops[i].in0 >= 0)
                                ? out_dma[ss->ops[i].in0]
                                : act_dma[i] + (uint32_t)((size_t)m0 * K);
-                orki_synth_i8(rc, mc, K, N, a_dma,
+                orki_i8_synth(rc, mc, K, N, a_dma,
                          bdma, out_dma[i] + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
-                if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) orki_set_i8_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
-                else if (kind == OP_MM8) orki_set_i8_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)
-                else if (ss && !ss->ops && ss->sdp_task >= 1 && i == ss->sdp_task - 1) orki_set_i8_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);   // legacy gate->silu
+                if (ss && !ss->ops && i == ss->task && !getenv("ORK_GSILU_NOSILU")) orki_i8_set_silu(rc, N, 0, ss->r_mult, ss->r_shift, ss->out_bias, ss->idx_off, ss->cfg4068);
+                else if (kind == OP_MM8) orki_i8_set_out8(rc, N, 0, ss->ops ? ss->ops[i].mult : ss->gate_mult, ss->ops ? ss->ops[i].shift : ss->gate_shift);  // int8 out (feeds an SDP task)
+                else if (ss && !ss->ops && ss->sdp_task >= 1 && i == ss->sdp_task - 1) orki_i8_set_out8(rc, N, 0, ss->gate_mult, ss->gate_shift);   // legacy gate->silu
                 if (orki_validate_regcmd("run_chain_i8", c, rc, REGCMD_I8_N, w, extra, extra_n)) { ok = -1; goto cleanup; }
             }
             if (p < P - 1) {   // PC-chain: this program jumps to the next; the last keeps the template's raise-interrupt tail
@@ -613,7 +613,7 @@ cleanup:
     return ok;
 }
 
-ork_async *ork_mm_run_chain_i8_async (ork_npu *c, int S, const ork_mm_task_i8 *tasks){
+ork_async *ork_i8_mm_run_chain_async (ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if (!c || S < 1 || !tasks) return NULL;
     return ork_async_launch((struct ork_async){ .kind=OAK_CHAIN_I8, .c=c, .S=S, .tasks=tasks }); }
 int ork_mm_ffn_orkd(ork_npu *c, ork_w *wg, ork_w *wu, ork_w *wd,
@@ -669,7 +669,7 @@ int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t
         for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
             if (!h) break; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } }
     }
-    if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
+    if (ork_i8_mm_run(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
     return -1; }
 
 /* ============ CONCURRENT ROUND-ROBIN CHAIN DISPATCH (ork_mm_run_chains_rr) — increment 2 ============
@@ -677,15 +677,15 @@ int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t
  * (chain -> core via atomic work-stealing), each on its OWN per-core scratch (chain_rc/tk/lrc/lsc[core]) so there
  * is NO cross-core DRAM sharing. Targets ~3x over single-core for a deep prefill queue. Shared mode state
  * (ork_npu_enter) + the domain are established ONCE here single-threaded; workers pass force_core>=0 so
- * orki_run_chain_i8_impl skips the re-enter (racing the mode reset would wedge a sibling core). Chains are homogeneous:
+ * orki_i8_run_chain_impl skips the re-enter (racing the mode reset would wedge a sibling core). Chains are homogeneous:
  * same op graph (ops[]) + scales + domain; each carries its own S-task array (chains[i]). */
 /* BIASED round-robin: same concurrent dispatch as ork_mm_run_chains_rr, but the fused exp bakes in a scalar
  * max-subtract (e=exp((score-max_bias)*in_scale)/out_scale) so the chains are correct on REAL (positive) scores
  * without a live per-query max (registry: scalar global-max-biased exp; bias cancels in av/Sigma). This lets N
  * independent attention cores' [QK^T->exp->reduce,e.V] chains fan across the NPU cores from a single dispatch.
- * The exp LUT contents change IN PLACE at one static address, so orki_run_chain_i8_impl's POINTER-keyed per-core
+ * The exp LUT contents change IN PLACE at one static address, so orki_i8_run_chain_impl's POINTER-keyed per-core
  * device-LUT cache (chain_lut_p[cc]) would go stale. We invalidate all cores ONCE here, single-threaded, BEFORE
- * the workers start — each worker's orki_run_chain_i8_impl then rebuilds+reuploads THIS core's per-core SDP-SRAM LUT
+ * the workers start — each worker's orki_i8_run_chain_impl then rebuilds+reuploads THIS core's per-core SDP-SRAM LUT
  * on its first chain (the "LUT-cache-update op at the front of the chain, injected per core"). Per-core buffers
  * make that reload concurrency-safe. Returns 0/ok, <0 err. Local NPU only (the daemon calls it on its own ctx). */
 int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,

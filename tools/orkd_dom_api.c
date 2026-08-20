@@ -4,7 +4,7 @@
  * before each pack), runs a matmul against each, and checks both bit-exact vs a CPU reference. This exercises:
  *   - ork_npu_domain_alloc  -> (Path B) ORKD_DOM_REQ, the daemon's coordinated pool
  *   - ork_npu_set_pack_domain -> the pack carries the client-chosen domain id (orkd_pack.domain)
- *   - ork_mm_pack_i8/run_i8 landing + computing in the requested domain
+ *   - ork_i8_mm_pack/run_i8 landing + computing in the requested domain
  *   - ork_npu_domain_free   -> ORKD_DOM_REL back to the pool
  * Works both direct (local domain ids) and routed (sudo env ORK_USE_ORKD=1 ... ./orkd_dom_api). 0/ok, nonzero/fail.
  */
@@ -29,10 +29,10 @@ static int one_domain(ork_npu*c,int dom,int M,int K,int N,uint32_t seed){
     for(int i=0;i<K*N;i++) B[i]=rnd8();
     for(int i=0;i<M*K;i++) A[i]=rnd8();
     ork_npu_set_pack_domain(c, dom);                 /* land the weight in this client-chosen domain */
-    ork_w *w = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w = ork_i8_mm_pack(c, K, N, B);
     int rc = -1;
     if(w){
-        if(ork_mm_run_i8(c, w, M, A, C)==0){
+        if(ork_i8_mm_run(c, w, M, A, C)==0){
             ref_i8(M,K,N,A,B,R);
             rc = memcmp(C,R,(size_t)M*N*4)==0 ? 0 : -2;
         }

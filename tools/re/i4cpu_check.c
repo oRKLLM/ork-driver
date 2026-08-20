@@ -1,5 +1,5 @@
-/* i4cpu_check.c — validate ork_pack_i4a8_cpu_blob is BYTE-IDENTICAL to the NPU path
- * (ork_mm_pack_i4a8_im + ork_w_dump_i4a8). Packs the same random f32 [N][K] weight both ways and memcmps.
+/* i4cpu_check.c — validate ork_i4a8_pack_cpu_blob is BYTE-IDENTICAL to the NPU path
+ * (ork_i4a8_mm_pack_im + ork_i4a8_w_dump). Packs the same random f32 [N][K] weight both ways and memcmps.
  * Exercises a few shapes. Exit 0 = bit-exact, nonzero = mismatch.  ./i4cpu_check
  */
 #define _GNU_SOURCE
@@ -16,15 +16,15 @@ static int check(ork_npu *c, int K, int N) {
 
     /* NPU path: pack (bcreate+tile) then serialize the compact int4 blob */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w = ork_mm_pack_i4a8_im(c, K, N, f32, NULL, NULL);
+    ork_w *w = ork_i4a8_mm_pack_im(c, K, N, f32, NULL, NULL);
     if (!w) { printf("K=%d N=%d: NPU pack FAILED\n", K, N); free(f32); return 1; }
-    size_t nb = ork_w_dump_i4a8(w, NULL, 0);
-    void *bnpu = malloc(nb); ork_w_dump_i4a8(w, bnpu, nb);
+    size_t nb = ork_i4a8_w_dump(w, NULL, 0);
+    void *bnpu = malloc(nb); ork_i4a8_w_dump(w, bnpu, nb);
     ork_mm_free(c, w);
 
     /* CPU path: pack straight to the same blob, no NPU */
-    size_t cb = ork_pack_i4a8_cpu_blob(c, K, N, f32, NULL, NULL, 0);
-    void *bcpu = malloc(cb); size_t got = ork_pack_i4a8_cpu_blob(c, K, N, f32, NULL, bcpu, cb);
+    size_t cb = ork_i4a8_pack_cpu_blob(c, K, N, f32, NULL, NULL, 0);
+    void *bcpu = malloc(cb); size_t got = ork_i4a8_pack_cpu_blob(c, K, N, f32, NULL, bcpu, cb);
 
     int ok = (nb == cb) && (got == cb) && (memcmp(bnpu, bcpu, nb) == 0);
     if (!ok) {

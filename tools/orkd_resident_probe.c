@@ -51,7 +51,7 @@ int main(int argc,char**argv){
           rQ[(size_t)i*d+o]=(float)q; rK[(size_t)i*d+o]=(float)kk; rV[(size_t)i*d+o]=(float)vv; }
       free(xn); }
 
-    ork_w *wq=ork_mm_pack(c,d,d,Wq), *wk=ork_mm_pack(c,d,d,Wk), *wv=ork_mm_pack(c,d,d,Wv);
+    ork_w *wq=ork_f16_mm_pack(c,d,d,Wq), *wk=ork_f16_mm_pack(c,d,d,Wk), *wv=ork_f16_mm_pack(c,d,d,Wv);
     if(!wq||!wk||!wv){ printf("pack fail\n"); return 2; }
 
     /* xn is op0's OUTPUT and op1/2/3's INPUT — the same buffer (aliased) => A2 back-reference. */

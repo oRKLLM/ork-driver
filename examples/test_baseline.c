@@ -48,10 +48,10 @@ int main(void) {
         int16_t *raw = calloc((size_t)M * N, 2);
         for (size_t i = 0; i < (size_t)M * N; i++) raw[i] = 0x7aaa;
         
-        // We call ork_npu_probe_i4_mm but we need to see if it sets mc to the second arg
-        // Wait, ork_npu_probe_i4_mm calls synth_i4 with mc=M.
-        // So we can call ork_npu_probe_i4_mm(ctx, mc, K, N, A, B, raw)
-        int rc = ork_npu_probe_i4_mm(ctx, mc, K, N, A, B, raw);
+        // We call ork_i4_npu_probe_mm but we need to see if it sets mc to the second arg
+        // Wait, ork_i4_npu_probe_mm calls synth_i4 with mc=M.
+        // So we can call ork_i4_npu_probe_mm(ctx, mc, K, N, A, B, raw)
+        int rc = ork_i4_npu_probe_mm(ctx, mc, K, N, A, B, raw);
         printf("Submit rc=%d\n", rc);
         
         if (rc == 0) {

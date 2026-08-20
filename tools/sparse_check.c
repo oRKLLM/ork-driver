@@ -1,5 +1,5 @@
 /* sparse_check.c — verify NPU int8 matmul correctness at a shape whose FULL O(M*N*K) ref is too slow.
- * Runs ork_mm_run_i8(M,K,N) on `cores` cores, then checks a SPREAD of sampled (row,col) cells with a
+ * Runs ork_i8_mm_run(M,K,N) on `cores` cores, then checks a SPREAD of sampled (row,col) cells with a
  * full-K dot product (cheap: ~samples*K MACs). Catches M-tile/K-slice boundary miscompute fast.
  *   sparse_check M K N [cores]   (env ORK_TMM_CORES ignored; pass cores arg) */
 #include <stdio.h>
@@ -12,8 +12,8 @@ int main(int argc,char**argv){
     int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
     unsigned s=12345; for(size_t i=0;i<(size_t)M*K;i++){s=s*1103515245u+12345u;A[i]=(int8_t)(((s>>16)%7)-3);}
     for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245u+12345u;B[i]=(int8_t)(((s>>16)%5)-2);}
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
-    if(ork_mm_run_i8(c,w,M,A,C)){printf("run failed\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    if(ork_i8_mm_run(c,w,M,A,C)){printf("run failed\n");return 1;}
     /* sample rows spread across M (incl. the M-tile boundaries 63/64/127/128) and cols across N */
     int rows[]={0,1,63,64,65,127,128,129,200,255, M-1}; int nr=sizeof(rows)/sizeof(rows[0]);
     int cols[]={0,1,63,64,N/2,N-65,N-64,N-1}; int ncl=sizeof(cols)/sizeof(cols[0]);

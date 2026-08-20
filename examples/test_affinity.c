@@ -25,10 +25,10 @@ int main(void){
     int8_t *B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
     int8_t *A=malloc((size_t)M*K); for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)((i%7)-3);
     int32_t *Cs=malloc((size_t)M*N*4), *Ca=malloc((size_t)M*N*4);
-    ork_w *w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    ork_w *w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
 
-    ork_mm_run_i8(c,w,M,A,Cs);                       /* synchronous reference */
-    ork_async *h=ork_mm_run_i8_async(c,w,M,A,Ca);    /* same submit on the async worker */
+    ork_i8_mm_run(c,w,M,A,Cs);                       /* synchronous reference */
+    ork_async *h=ork_i8_mm_run_async(c,w,M,A,Ca);    /* same submit on the async worker */
     if(!h){ printf("FAIL: async launch returned NULL\n"); return 1; }
     int rc=ork_async_wait(h);
     if(rc){ printf("FAIL: async run rc=%d\n", rc); return 1; }

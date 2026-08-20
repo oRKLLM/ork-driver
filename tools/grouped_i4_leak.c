@@ -27,7 +27,7 @@ int main(int argc,char**argv){
 
     long rss0=0;
     for(int it=0; it<iters; it++){
-        ork_w *w = ork_mm_pack_i4_grouped(c,K,N,B,G);
+        ork_w *w = ork_i4_mm_pack_grouped(c,K,N,B,G);
         if(!w){ fprintf(stderr,"FAIL: pack_i4_grouped returned NULL at iter %d (IOVA leak / exhaustion)\n", it); free(B); ork_npu_free(c); return 1; }
         size_t wb = ork_w_bytes(w);   /* note: grouped views report 0 (own_buf holds the bytes); fine for the leak check */
         (void)wb;

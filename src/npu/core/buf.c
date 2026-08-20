@@ -198,7 +198,7 @@ struct buf *orki_warena_reserve(ork_npu *c,size_t need,size_t *base){
 }
 
 /* ---- zero-copy DMA buffers (NPU-coherent, CPU-mapped). A matmul whose A and/or C live in one of
- * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_mm_run_i8 detects
+ * these has the regcmd point at it directly — no host gather/writeout memcpy. ork_i8_mm_run detects
  * residency automatically (no API change); the caller just allocates A/C here. ---- */
 /* Clean CPU writes -> device for an imported (or ork_dma_alloc) buffer; the bsync the weight fill
  * issues once before the first submit (write-once-read-many weights). size 0 = whole buffer. */
@@ -258,7 +258,7 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
 /* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
  * rknpu mem-create flag set, so the probe can A/B the write-combine (0x401) vs cacheable (0x403) fill
  * bandwidth + NPU-read correctness WITHOUT changing the default ork_dma_alloc behavior. Additive; not
- * in the public header. The buffer is registered in dma_tab so ork_mm_run_i8 zero-copy + dma_find work. */
+ * in the public header. The buffer is registered in dma_tab so ork_i8_mm_run zero-copy + dma_find work. */
 void *ork_dma_alloc_flags(ork_npu *c, size_t size, unsigned flags){
     if(!c || c->dma_n >= (int)(sizeof c->dma_tab/sizeof c->dma_tab[0])) return NULL;
     struct buf b=orki_bcreate(c->fd,size,flags,c->pack_domain); if(!b.cpu) return NULL;

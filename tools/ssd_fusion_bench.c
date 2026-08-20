@@ -43,16 +43,16 @@ int main(int argc, char **argv){
     static signed char A[64*512], W[512*64];
     for(int i=0;i<M*K;i++) A[i]=1;
     for(int i=0;i<K*N;i++) W[i]=1;
-    ork_w *w = ork_mm_pack_i8(c,K,N,W);
+    ork_w *w = ork_i8_mm_pack(c,K,N,W);
     if(!w){ printf("pack failed\n"); ork_npu_free(c); return 1; }
 
     /* ================= DECISIVE: matmul-only, submit-floor amortization (no LUT) ================= */
     static int CC[8][64*64];
     /* raw single-submit floor */
-    ork_mm_run_i8(c,w,M,A,CC[0]);                              /* warm */
+    ork_i8_mm_run(c,w,M,A,CC[0]);                              /* warm */
     double st0,su0,cp0,st1,su1,cp1; long n0,n1;
     ork_npu_run_timing(&st0,&su0,&cp0,&n0);
-    double b0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_i8(c,w,M,A,CC[0]); double t_floor=(now_us()-b0)/iters;
+    double b0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run(c,w,M,A,CC[0]); double t_floor=(now_us()-b0)/iters;
     ork_npu_run_timing(&st1,&su1,&cp1,&n1);
     long dn = n1-n0; double d_setup=(st1-st0), d_submit=(su1-su0), d_copy=(cp1-cp0);   /* us totals over dn calls */
 
@@ -64,11 +64,11 @@ int main(int argc, char **argv){
         ork_mm_task_i8 mt[8];
         for(int j=0;j<s;j++){ mt[j].w=w; mt[j].M=M; mt[j].A=A; mt[j].C=CC[j]; }
         /* UNFUSED: s separate submits */
-        double u0=now_us(); for(int it=0;it<iters;it++) for(int j=0;j<s;j++) ork_mm_run_i8(c,w,M,A,CC[j]); t_unf[si]=(now_us()-u0)/iters;
+        double u0=now_us(); for(int it=0;it<iters;it++) for(int j=0;j<s;j++) ork_i8_mm_run(c,w,M,A,CC[j]); t_unf[si]=(now_us()-u0)/iters;
         /* FUSED: s tasks, ONE chained ioctl */
-        int rc=ork_mm_run_chain_i8(c,s,mt);                    /* warm */
+        int rc=ork_i8_mm_run_chain(c,s,mt);                    /* warm */
         if(rc){ printf("chain S=%d rc=%d (%s)\n", s, rc, rc==-1?"WEDGED":"err"); ork_npu_free(c); return 1; }
-        double f0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_chain_i8(c,s,mt); t_fused[si]=(now_us()-f0)/iters;
+        double f0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_chain(c,s,mt); t_fused[si]=(now_us()-f0)/iters;
         for(int i=0;i<M*N;i++){ if(CC[0][i]!=K||CC[s-1][i]!=K){ chain_ok=0; break; } }
     }
     double t_fused_mm=t_fused[1], t_unfused_mm=t_unf[1];       /* S=4 headline */
@@ -79,8 +79,8 @@ int main(int argc, char **argv){
     static int Cg[64*64],Cs[64*64],Cu[64*64],Ch[64*64];
     ork_mm_task_i8 t[4]={ {w,M,A,Cg},{w,M,A,Cs},{w,M,A,Cu},{w,M,A,Ch} };
     ork_chain_op ops[4]={ {1,-1,0,0x4000,18}, {2,0,0,0,0}, {1,-1,0,0x4000,18}, {3,1,2,0x4000,19} };
-    int rc_mixed = ork_mm_run_chain_i8_ffn(c,4,t,ops,is,os);   /* warm (builds LUT internally each call) */
-    double m0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_chain_i8_ffn(c,4,t,ops,is,os); double t_mixed=(now_us()-m0)/iters;
+    int rc_mixed = ork_i8_mm_run_chain_ffn(c,4,t,ops,is,os);   /* warm (builds LUT internally each call) */
+    double m0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_chain_ffn(c,4,t,ops,is,os); double t_mixed=(now_us()-m0)/iters;
     signed char *g8=(signed char*)Cg; int mixed_ok=(rc_mixed==0 && g8[0]==32);
 
     printf("\n=== GATE G1 — SSD fusion micro-bench (M=%d K=%d N=%d, %d iters, single-core) ===\n", M,K,N,iters);

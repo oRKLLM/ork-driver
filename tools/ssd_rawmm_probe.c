@@ -1,8 +1,8 @@
 /* ssd_rawmm_probe — (b) slice B1: does the raw-synth fp16 fused-chain path read ROW-MAJOR operands?
- * Runs one fp16 matmul C=A·B through ork_ssd_probe_rawmm_f16 (the exact synth + chain_progs mechanism the
+ * Runs one fp16 matmul C=A·B through ork_f16_ssd_probe_rawmm (the exact synth + chain_progs mechanism the
  * fused SSD scan uses) with real random row-major A[M,K],B[K,N], and compares to a CPU reference.
  * PASS => a real-operand fused scan can stage row-major operands directly (no manual 32x32 tiling).
- * FAIL => the fused path needs ork_mm_pack-style tiling (the harder route). Board only.
+ * FAIL => the fused path needs ork_f16_mm_pack-style tiling (the harder route). Board only.
  */
 #include "ork_npu.h"
 #include <stdio.h>
@@ -22,7 +22,7 @@ int main(int argc,char**argv){
         for(int k=0;k<K;k++) a+=(double)A[(size_t)m*K+k]*(double)B[(size_t)k*N+n];
         ref[(size_t)m*N+n]=(float)a; }
     int fused = argc>4 && argv[4][0]=='f';   /* "f" -> fused (packed-B + row-major-A); else raw row-major */
-    int rc = fused ? ork_ssd_probe_fusedmm_f16(c,M,K,N,A,B,C) : ork_ssd_probe_rawmm_f16(c,M,K,N,A,B,C);
+    int rc = fused ? ork_f16_ssd_probe_fusedmm(c,M,K,N,A,B,C) : ork_f16_ssd_probe_rawmm(c,M,K,N,A,B,C);
     int fail;
     if(rc){ fprintf(stderr,"probe rc=%d\n",rc); fail=1; }
     else { double num=0,den=0; for(size_t i=0;i<(size_t)M*N;i++){ double e=C[i]-ref[i]; num+=e*e; den+=ref[i]*ref[i]; }

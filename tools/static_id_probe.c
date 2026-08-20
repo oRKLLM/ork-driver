@@ -19,7 +19,7 @@ static inline void cvac (volatile void*p){ __asm__ volatile("dc cvac,%0" ::"r"(p
 #define SENT 0x7fffffff
 
 static ork_npu*gC; static int gS; static ork_mm_task_i8*gTK; static volatile int gRc,gDone;
-static void* chain_thr(void*p){ (void)p; gRc=ork_mm_run_chain_i8(gC,gS,gTK); gDone=1; return NULL; }
+static void* chain_thr(void*p){ (void)p; gRc=ork_i8_mm_run_chain(gC,gS,gTK); gDone=1; return NULL; }
 
 int main(int argc,char**argv){
     int S=argc>1?atoi(argv[1]):8, K=512, N=32;   /* K%512==0 chain-conforming; N%16==0 */
@@ -29,7 +29,7 @@ int main(int argc,char**argv){
     int8_t*A=malloc(K); memset(A,1,K);                          /* all-ones activation */
     /* S weights: B_i[0*N+0]=i+1, rest 0 => C[0] = sum_k A[k]*B[k][0] = 1*(i+1) = i+1 (the ID) */
     ork_w**w=malloc(sizeof(ork_w*)*S);
-    for(int i=0;i<S;i++){ int8_t*B=calloc((size_t)K*N,1); B[0*N+0]=(int8_t)(i+1); w[i]=ork_mm_pack_i8(c,K,N,B); free(B);
+    for(int i=0;i<S;i++){ int8_t*B=calloc((size_t)K*N,1); B[0*N+0]=(int8_t)(i+1); w[i]=ork_i8_mm_pack(c,K,N,B); free(B);
         if(!w[i]){printf("pack %d fail\n",i);return 1;} }
     int32_t*slot=(int32_t*)ork_dma_alloc(c,(size_t)N*sizeof(int32_t)); if(!slot){printf("dma_alloc fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(ork_mm_task_i8)*S);
@@ -37,7 +37,7 @@ int main(int argc,char**argv){
     gTK=tk; gS=S;
 
     /* warm + correctness (last op wins => slot[0]==S) */
-    if(ork_mm_run_chain_i8(c,S,tk)){printf("warm rc!=0\n");return 1;}
+    if(ork_i8_mm_run_chain(c,S,tk)){printf("warm rc!=0\n");return 1;}
     printf("  after chain, slot[0]=%d (expect %d = last ID): %s\n", slot[0], S, slot[0]==S?"PASS":"FAIL");
 
     /* seed sentinel, run on a thread, poll the ONE slot and log every distinct value seen */

@@ -55,7 +55,7 @@ enum orkd_msg_type {
     ORKD_SDP          = 36, /* client->daemon: {orkd_sdp} + nin input payloads -> run silu/gelu/ewmul/add on the NPU */
     ORKD_SDP_OK       = 37, /* daemon->client: {orkd_handle} + output payload (M*N*out_esz) when rc==0 */
     /* ---- fused int8 matmul chain (S resident weights, one PC-chained submit) ---- */
-    ORKD_CHAIN        = 38, /* client->daemon: {orkd_chain_hdr} + S*{orkd_chain_task} + concatenated A payloads -> ork_mm_run_chain_i8 */
+    ORKD_CHAIN        = 38, /* client->daemon: {orkd_chain_hdr} + S*{orkd_chain_task} + concatenated A payloads -> ork_i8_mm_run_chain */
     ORKD_CHAIN_OK     = 39, /* daemon->client: {orkd_handle} + concatenated C payloads (task order, each M*N*4) when rc==0 */
     /* ---- heterogeneous op-sequence submit (ork_submit_seq): batch doorbell-eligible ops, break to SW, resume ---- */
     ORKD_SEQ          = 40, /* client->daemon: {orkd_seq_hdr} + n*{orkd_seq_op} + concatenated inputs (A[,B] per op) -> ork_submit_seq */
@@ -73,7 +73,7 @@ enum orkd_msg_type {
     ORKD_IMPORT       = 47, /* client->daemon: {orkd_import} + pre-tiled weight dma-buf fd (SCM_RIGHTS) -> resident weight (views into it) */
     ORKD_IMPORT_OK    = 48, /* daemon->client: {orkd_handle} weight id                                            */
     /* ---- coalesced FFN inner: the whole SwiGLU [gate->silu->up->glu->down] as ONE on-NPU chain submit
-     * (ork_mm_run_chain_i8_ffn, SDP-op address-aliasing) against 3 resident weights. The transport win: one
+     * (ork_i8_mm_run_chain_ffn, SDP-op address-aliasing) against 3 resident weights. The transport win: one
      * socket round-trip + one submit for the entire FFN inner, intermediates never leave the NPU. */
     ORKD_FFN          = 49, /* client->daemon: {orkd_ffn} + A payload (M*K int8) -> coalesced FFN inner chain    */
     ORKD_FFN_OK       = 50, /* daemon->client: {orkd_handle} + down output payload (M*Kd int32) when rc==0        */
@@ -96,27 +96,27 @@ enum orkd_msg_type {
 
 /* SDP op selector for orkd_sdp.op. Only the bit-exact-class ops are wired (int16 silu/add are experimental). */
 enum orkd_sdp_op {
-    ORKD_SDP_SILU_I8   = 1,   /* unary  i8->i8  (ork_npu_silu_i8:  in_scale,out_scale) */
-    ORKD_SDP_GELU_I8   = 2,   /* unary  i8->i8  (ork_npu_gelu_i8:  in_scale,out_scale) */
-    ORKD_SDP_EWMUL_I8  = 3,   /* binary i8->i8  (ork_npu_ewmul_i8: mult,shift)         */
-    ORKD_SDP_EWMUL_F16 = 4,   /* binary f16->f16(ork_npu_ewmul_f16: no scale)          */
-    ORKD_SDP_ADD_I8    = 5,   /* binary i8->i8  (ork_npu_add_i8:   a_scale,b_scale,out_scale) */
-    ORKD_SDP_ADD_F16   = 6,   /* binary f16->f16(ork_npu_add_f16:  no scale)           */
-    ORKD_SDP_SILU_I16  = 7,   /* unary  i16->i16 (ork_npu_silu_i16: in_scale,out_scale) */
-    ORKD_SDP_GELU_I16  = 8,   /* unary  i16->i16 (ork_npu_gelu_i16) */
-    ORKD_SDP_RSQRT_I16 = 9,   /* unary  i16->i16 (ork_npu_rsqrt_i16) */
-    ORKD_SDP_EXP_I16   = 10,  /* unary  i16->i16 (ork_npu_exp_i16) */
-    ORKD_SDP_EWMUL_I16 = 11,  /* binary i16->i16 (ork_npu_ewmul_i16: mult,shift) */
-    ORKD_SDP_ADD_I16   = 12,  /* binary i16->i16 (ork_npu_add_i16:  a_scale,b_scale,out_scale) */
-    ORKD_SDP_RSQRT_I8  = 13,  /* unary  i8->i8  (ork_npu_rsqrt_i8:  in_scale,out_scale) */
-    ORKD_SDP_EXP_I8    = 14,  /* unary  i8->i8  (ork_npu_exp_i8:   in_scale,out_scale) */
+    ORKD_SDP_SILU_I8   = 1,   /* unary  i8->i8  (ork_i8_npu_silu:  in_scale,out_scale) */
+    ORKD_SDP_GELU_I8   = 2,   /* unary  i8->i8  (ork_i8_npu_gelu:  in_scale,out_scale) */
+    ORKD_SDP_EWMUL_I8  = 3,   /* binary i8->i8  (ork_i8_npu_ewmul: mult,shift)         */
+    ORKD_SDP_EWMUL_F16 = 4,   /* binary f16->f16(ork_f16_npu_ewmul: no scale)          */
+    ORKD_SDP_ADD_I8    = 5,   /* binary i8->i8  (ork_i8_npu_add:   a_scale,b_scale,out_scale) */
+    ORKD_SDP_ADD_F16   = 6,   /* binary f16->f16(ork_f16_npu_add:  no scale)           */
+    ORKD_SDP_SILU_I16  = 7,   /* unary  i16->i16 (ork_i16_npu_silu: in_scale,out_scale) */
+    ORKD_SDP_GELU_I16  = 8,   /* unary  i16->i16 (ork_i16_npu_gelu) */
+    ORKD_SDP_RSQRT_I16 = 9,   /* unary  i16->i16 (ork_i16_npu_rsqrt) */
+    ORKD_SDP_EXP_I16   = 10,  /* unary  i16->i16 (ork_i16_npu_exp) */
+    ORKD_SDP_EWMUL_I16 = 11,  /* binary i16->i16 (ork_i16_npu_ewmul: mult,shift) */
+    ORKD_SDP_ADD_I16   = 12,  /* binary i16->i16 (ork_i16_npu_add:  a_scale,b_scale,out_scale) */
+    ORKD_SDP_RSQRT_I8  = 13,  /* unary  i8->i8  (ork_i8_npu_rsqrt:  in_scale,out_scale) */
+    ORKD_SDP_EXP_I8    = 14,  /* unary  i8->i8  (ork_i8_npu_exp:   in_scale,out_scale) */
 };
 
 /* dtype for orkd_pack.dtype (wire-stable; decoupled from the library's internal enum). #2b-1 = int8 only. */
 enum orkd_dtype {
-    ORKD_DT_I8  = 1,   /* int8 A·B -> int32 C  (ork_mm_pack_i8  / ork_mm_run_i8)  — A=M*K bytes, C=M*N*4 */
-    ORKD_DT_F16 = 2,   /* fp16 A·B -> fp32 C   (ork_mm_pack     / ork_mm_run)     — A=M*K*2 bytes, C=M*N*4 */
-    ORKD_DT_I4  = 3,   /* int4 A·B -> int32 C  (ork_mm_pack_i4  / ork_mm_run_i4)  — int4 in int8 [-8,7], wire = int8 */
+    ORKD_DT_I8  = 1,   /* int8 A·B -> int32 C  (ork_i8_mm_pack  / ork_i8_mm_run)  — A=M*K bytes, C=M*N*4 */
+    ORKD_DT_F16 = 2,   /* fp16 A·B -> fp32 C   (ork_f16_mm_pack     / ork_f16_mm_run)     — A=M*K*2 bytes, C=M*N*4 */
+    ORKD_DT_I4  = 3,   /* int4 A·B -> int32 C  (ork_i4_mm_pack  / ork_i4_mm_run)  — int4 in int8 [-8,7], wire = int8 */
 };
 
 /* error codes carried in orkd_error.code */

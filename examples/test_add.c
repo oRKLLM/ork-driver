@@ -1,5 +1,5 @@
 /* examples/test_add.c — validate the on-NPU element-wise ADD (residual add) vs a CPU reference.
- * ork_npu_add_i8 computes out = clamp_i8(round((a*a_scale + b*b_scale)/out_scale)) on the NPU via the 2-input
+ * ork_i8_npu_add computes out = clamp_i8(round((a*a_scale + b*b_scale)/out_scale)) on the NPU via the 2-input
  * SDP ALU=add op. Residual add (equal scales) must be bit-exact (out=clamp(a+b)); scaled cases within rounding.
  * Skips gracefully (exit 0) off-board / on a non-PPU SoC.
  *   make test_add && sudo ./test_add            (board only)
@@ -17,7 +17,7 @@ static int run_case(ork_npu *c, const char *name, int M, int N, double sa, doubl
     static signed char a[MAXE], b[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++){ a[i]=(signed char)(((i*5)%201)-100); b[i]=(signed char)(((i*3)%161)-80); }
     double us=0;
-    int r = ork_npu_add_i8(c, a, b, M, N, sa, sb, so, out, &us);
+    int r = ork_i8_npu_add(c, a, b, M, N, sa, sb, so, out, &us);
     if(r){ printf("  %-10s [%dx%-4d] FAIL (rc=%d)\n", name, M, N, r); return 1; }
     int mism=0, mx=0;
     for(int i=0;i<M*N;i++){
@@ -34,7 +34,7 @@ static int run_f16(ork_npu *c, int M, int N){
     static ork_f16 a[MAXE], b[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++){ a[i]=(ork_f16)((((i*7)%23)-11)*0.25f); b[i]=(ork_f16)((((i*5)%17)-8)*0.5f); }
     double us=0;
-    int r=ork_npu_add_f16(c,a,b,M,N,out,&us);
+    int r=ork_f16_npu_add(c,a,b,M,N,out,&us);
     if(r){ printf("  f16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
     int bad=0; float mx=0;
     for(int i=0;i<M*N;i++){ float ref=(float)(ork_f16)((float)a[i]+(float)b[i]); float e=fabsf((float)out[i]-ref);
@@ -48,7 +48,7 @@ static int run_i16(ork_npu *c, int M, int N){
     static short a[MAXE], b[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++){ a[i]=(short)(((i*97)%28000)-14000); b[i]=(short)(((i*53)%36000)-18000)/2; }
     double us=0;
-    int r=ork_npu_add_i16(c,a,b,M,N,0.001,0.001,0.001,out,&us);
+    int r=ork_i16_npu_add(c,a,b,M,N,0.001,0.001,0.001,out,&us);
     if(r){ printf("  i16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
     int mism=0; long mx=0;
     for(int i=0;i<M*N;i++){ long ref=(long)a[i]+b[i]; if(ref>32767)ref=32767; if(ref<-32768)ref=-32768;

@@ -135,8 +135,8 @@ static void cpu_pool_stop(struct cpu_pool *p){
 struct npu_arg { ork_npu *c; int S; ork_mm_task_i8 *tasks; int rc; };
 static void *npu_thread(void *vp){
     struct npu_arg *a = vp;
-    a->rc = a->S>0 ? ork_mm_run_stream_i8(a->c, a->S, a->tasks) : 0;
-    if(a->rc){ a->rc=0; for(int x=0;x<a->S && a->rc==0;x++) a->rc=ork_mm_run_i8(a->c,a->tasks[x].w,a->tasks[x].M,a->tasks[x].A,a->tasks[x].C); }
+    a->rc = a->S>0 ? ork_i8_mm_run_stream(a->c, a->S, a->tasks) : 0;
+    if(a->rc){ a->rc=0; for(int x=0;x<a->S && a->rc==0;x++) a->rc=ork_i8_mm_run(a->c,a->tasks[x].w,a->tasks[x].M,a->tasks[x].A,a->tasks[x].C); }
     return NULL;
 }
 
@@ -182,7 +182,7 @@ int main(int argc, char**argv){
         for(int e=0;e<topk;e++){
             f32[e]=malloc((size_t)N*K*sizeof(float)); for(size_t i=0;i<(size_t)N*K;i++) f32[e][i]=rf();
             bsc[e]=malloc((size_t)N*sizeof(float));
-            w[e]=ork_mm_pack_i8_f32(c,K,N,f32[e],bsc[e]);
+            w[e]=ork_i8_mm_pack_f32(c,K,N,f32[e],bsc[e]);
             if(!w[e]){ printf("  pack FAIL e=%d\n",e); return 1; }
             B8[e]=malloc((size_t)N*K);
             for(int n=0;n<N;n++){ const float*wn=f32[e]+(size_t)n*K; float amax=0; for(int k=0;k<K;k++){float a=fabsf(wn[k]); if(a>amax)amax=a;}
@@ -198,8 +198,8 @@ int main(int argc, char**argv){
         {
             int Ms_chk = conforming ? 16 : 8;
             ork_mm_task_i8 chk = { .w=w[0], .M=Ms_chk, .A=A, .C=C[0] };
-            int crc = ork_mm_run_stream_i8(c,1,&chk);
-            if(crc){ crc = ork_mm_run_i8(c,w[0],Ms_chk,A,C[0]); }
+            int crc = ork_i8_mm_run_stream(c,1,&chk);
+            if(crc){ crc = ork_i8_mm_run(c,w[0],Ms_chk,A,C[0]); }
             if(crc==0){
                 cpu_gemm_i8(Ms_chk,K,N,A,B8[0],Cref);
                 long maxd=0; for(size_t i=0;i<(size_t)Ms_chk*N;i++){ long d=labs((long)C[0][i]-(long)Cref[i]); if(d>maxd)maxd=d; }

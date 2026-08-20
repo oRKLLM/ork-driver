@@ -1,6 +1,6 @@
 // Decode RR payoff probe: for a group of INDEPENDENT int8 matmuls (like QKV, gate/up) at a given M,
-// compare running them sequentially via ork_mm_run_i8 (each a single-core submit — the current backbone
-// path) vs one ork_mm_run_stream_i8 (round-robin across the NPU cores). Answers: is decode core-bound
+// compare running them sequentially via ork_i8_mm_run (each a single-core submit — the current backbone
+// path) vs one ork_i8_mm_run_stream (round-robin across the NPU cores). Answers: is decode core-bound
 // (RR wins ~Ncores) or submit-floor/work bound (RR ~flat or loses)? Single domain (default).
 #include "ork_npu.h"
 #include <stdio.h>
@@ -13,7 +13,7 @@ static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t)
 static ork_w *mkw(ork_npu *c, int K, int N){
     int8_t *B = malloc((size_t)K*N);
     for (size_t i=0;i<(size_t)K*N;i++) B[i] = (int8_t)((i*131u+7u)&0x7f);
-    ork_w *w = ork_mm_pack_i8(c, K, N, B); free(B); return w;
+    ork_w *w = ork_i8_mm_pack(c, K, N, B); free(B); return w;
 }
 
 static void bench(ork_npu *c, const char *label, int K, const int *Ns, int ng, int M, int iters){
@@ -21,11 +21,11 @@ static void bench(ork_npu *c, const char *label, int K, const int *Ns, int ng, i
     for (size_t i=0;i<(size_t)M*K;i++) A[i] = (int8_t)((i*7u+3u)&0x3f);
     ork_w *w[8]; int32_t *C[8]; ork_mm_task_i8 tk[8];
     for (int i=0;i<ng;i++){ w[i]=mkw(c,K,Ns[i]); C[i]=calloc((size_t)M*Ns[i],4); tk[i]=(ork_mm_task_i8){w[i],M,A,C[i]}; }
-    for (int i=0;i<ng;i++) ork_mm_run_i8(c,w[i],M,A,C[i]);   // warm
-    ork_mm_run_stream_i8(c,ng,tk);
-    double t0=now_us(); for(int it=0;it<iters;it++) for(int i=0;i<ng;i++) ork_mm_run_i8(c,w[i],M,A,C[i]);
+    for (int i=0;i<ng;i++) ork_i8_mm_run(c,w[i],M,A,C[i]);   // warm
+    ork_i8_mm_run_stream(c,ng,tk);
+    double t0=now_us(); for(int it=0;it<iters;it++) for(int i=0;i<ng;i++) ork_i8_mm_run(c,w[i],M,A,C[i]);
     double t_seq=(now_us()-t0)/iters;
-    t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_stream_i8(c,ng,tk);
+    t0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run_stream(c,ng,tk);
     double t_rr=(now_us()-t0)/iters;
     printf("%-14s M=%-3d ng=%d: seq(single-core %dx run_i8)=%7.1fus  RR(run_stream)=%7.1fus  speedup=%.2fx\n",
            label, M, ng, ng, t_seq, t_rr, t_seq/t_rr);

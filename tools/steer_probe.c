@@ -29,14 +29,14 @@ int main(int argc,char**argv){
     printf("steer_probe: S=%d chained ops (K=%d,N=%d), halt-inject at prog H=%d\n",S,K,N,H);
     int8_t*A=malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*Obuf=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!Obuf){printf("dma_alloc fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(ork_mm_task_i8)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=Obuf+(size_t)i*N; }
 
     /* WARM (env unset => no steer): full chain, all S outputs must == K */
     unsetenv("ORK_STEER_HALT_AT");
-    if(ork_mm_run_chain_i8(c,S,tk)){printf("warm chain rc!=0\n");return 1;}
+    if(ork_i8_mm_run_chain(c,S,tk)){printf("warm chain rc!=0\n");return 1;}
     int warmok=1; for(int i=0;i<S;i++) if(Obuf[(size_t)i*N+(N-1)]!=K){warmok=0;break;}
     printf("  warm full chain (all %d outputs==%d): %s\n",S,K,warmok?"PASS":"FAIL");
     if(!warmok){ ork_npu_free(c); return 2; }
@@ -47,7 +47,7 @@ int main(int argc,char**argv){
 
     /* STEER run: ork-driver submits NONBLOCK + zeroes prog H's 0x0014 mid-flight */
     char hs[16]; snprintf(hs,sizeof hs,"%d",H); setenv("ORK_STEER_HALT_AT",hs,1);
-    int rc=ork_mm_run_chain_i8(c,S,tk);
+    int rc=ork_i8_mm_run_chain(c,S,tk);
     unsetenv("ORK_STEER_HALT_AT");
 
     /* count written slots (invalidate to see the NPU's writes) */

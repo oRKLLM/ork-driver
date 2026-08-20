@@ -37,7 +37,7 @@ int main(int argc,char**argv){
         int K=KN[m][0],N=KN[m][1];
         int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
         ork_npu_set_pack_domain(c,0);
-        w[m]=ork_mm_pack_i8(c,K,N,B); free(B);
+        w[m]=ork_i8_mm_pack(c,K,N,B); free(B);
         if(!w[m]){printf("pack %s failed\n",nm[m]);return 1;}
     }
     int maxK=18944, maxN=18944, maxM=32;
@@ -50,17 +50,17 @@ int main(int argc,char**argv){
     for(unsigned mi=0; mi<sizeof(Ms)/sizeof(int); mi++){
         int M=Ms[mi];
         /* warm */
-        ork_npu_set_core_budget(c,1);     for(int m=0;m<7;m++) ork_mm_run_i8(c,w[m],M,A,C);
-        ork_npu_set_core_budget(c,cores); for(int m=0;m<7;m++) ork_mm_run_i8(c,w[m],M,A,C);
+        ork_npu_set_core_budget(c,1);     for(int m=0;m<7;m++) ork_i8_mm_run(c,w[m],M,A,C);
+        ork_npu_set_core_budget(c,cores); for(int m=0;m<7;m++) ork_i8_mm_run(c,w[m],M,A,C);
 
         ork_npu_set_core_budget(c,1);
         double t0=now_us();
-        for(int it=0;it<iters;it++) for(int m=0;m<7;m++) ork_mm_run_i8(c,w[m],M,A,C);
+        for(int it=0;it<iters;it++) for(int m=0;m<7;m++) ork_i8_mm_run(c,w[m],M,A,C);
         double t1=(now_us()-t0)/iters;
 
         ork_npu_set_core_budget(c,cores);
         t0=now_us();
-        for(int it=0;it<iters;it++) for(int m=0;m<7;m++) ork_mm_run_i8(c,w[m],M,A,C);
+        for(int it=0;it<iters;it++) for(int m=0;m<7;m++) ork_i8_mm_run(c,w[m],M,A,C);
         double t3=(now_us()-t0)/iters;
 
         double per_tok=t3/M;

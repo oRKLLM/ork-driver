@@ -1,5 +1,5 @@
 // persist_probe — validate the .orkpack persist primitive: pack a weight, dump its tile bytes, reload
-// them with ork_mm_load_i8 (no dequant/quant/tile), and confirm the reloaded weight is byte-identical
+// them with ork_i8_mm_load (no dequant/quant/tile), and confirm the reloaded weight is byte-identical
 // NPU input (dump(load(dump(pack))) == dump(pack)). Also times pack (tile) vs load (DMA copy).
 //
 // Byte-equality is decisive: the NPU reads Bb verbatim, so identical Bb bytes ⇒ identical matmul.
@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < (size_t) K * N; i++) B[i] = (int8_t)((i * 2654435761u) >> 24);  // deterministic pseudo-random
 
     double t0 = ms_now();
-    ork_w *w1 = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w1 = ork_i8_mm_pack(c, K, N, B);
     double t_pack = ms_now() - t0;
     if (!w1) { fprintf(stderr, "pack failed\n"); return 1; }
 
@@ -36,9 +36,9 @@ int main(int argc, char **argv) {
     ork_w_dump(w1, blob1, blobn);
 
     t0 = ms_now();
-    ork_w *w2 = ork_mm_load_i8(c, K, N, blob1, blobn);
+    ork_w *w2 = ork_i8_mm_load(c, K, N, blob1, blobn);
     double t_load = ms_now() - t0;
-    if (!w2) { fprintf(stderr, "FAIL: ork_mm_load_i8 returned NULL (shape/size mismatch)\n"); return 2; }
+    if (!w2) { fprintf(stderr, "FAIL: ork_i8_mm_load returned NULL (shape/size mismatch)\n"); return 2; }
 
     size_t n2 = ork_w_dump(w2, blob2, blobn);
     int match = (n2 == blobn) && (memcmp(blob1, blob2, blobn) == 0);

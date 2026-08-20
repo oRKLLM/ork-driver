@@ -28,11 +28,11 @@ int main(int argc,char**argv){
     int8_t *xn=malloc((size_t)M*d), *Wq=malloc((size_t)d*dh), *Wk=malloc((size_t)d*dh), *Wv=malloc((size_t)d*dh);
     for(size_t i=0;i<(size_t)M*d;i++)xn[i]=(int8_t)r8();
     for(size_t i=0;i<(size_t)d*dh;i++){ Wq[i]=(int8_t)r8(); Wk[i]=(int8_t)r8(); Wv[i]=(int8_t)r8(); }
-    ork_w *wq=ork_mm_pack_i8(c,d,dh,Wq), *wk=ork_mm_pack_i8(c,d,dh,Wk), *wv=ork_mm_pack_i8(c,d,dh,Wv);
+    ork_w *wq=ork_i8_mm_pack(c,d,dh,Wq), *wk=ork_i8_mm_pack(c,d,dh,Wk), *wv=ork_i8_mm_pack(c,d,dh,Wv);
     if(!wq||!wk||!wv){ printf("pack fail\n"); return 2; }
     int32_t *Q=calloc((size_t)M*dh,4), *K=calloc((size_t)M*dh,4), *V=calloc((size_t)M*dh,4);
     ork_mm_task_i8 tasks[3] = { { wq, M, xn, Q }, { wk, M, xn, K }, { wv, M, xn, V } };   /* 3 independent projections */
-    int rc=ork_mm_run_chain_i8(c,3,tasks);   /* ONE coalesced submit */
+    int rc=ork_i8_mm_run_chain(c,3,tasks);   /* ONE coalesced submit */
     printf("  run_chain_i8([Q,K,V]) rc=%d  Q[0]=%d K[0]=%d V[0]=%d\n", rc, Q[0], K[0], V[0]);
     if(rc){ printf("FAIL rc=%d\n",rc); return 1; }
     int fail=0;

@@ -9,7 +9,7 @@
  *
  *  1. Submission model. The kernel rejects task_number>1 (tools/batch_probe.c proved this — it
  *     times out). The *proven* monolithic-chain mechanism is task_number=1 + 0x0010 NEXT-pointer
- *     patching, which is exactly what ork_mm_run_chain_i8() already synthesizes: E expert matmuls
+ *     patching, which is exactly what ork_i8_mm_run_chain() already synthesizes: E expert matmuls
  *     strung into a single driver flight. So we chain, we do not "fuse N tasks".
  *
  *  2. The gate/mask node. An element-wise multiply node *on the NPU* (PPU) is not a validated
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
     for (int e = 0; e < E; e++) {
         Bx[e] = malloc((size_t)K * N);
         for (size_t j = 0; j < (size_t)K * N; j++) Bx[e][j] = (int8_t)rnd8();
-        w[e] = ork_mm_pack_i8(c, K, N, Bx[e]);
+        w[e] = ork_i8_mm_pack(c, K, N, Bx[e]);
         if (!w[e]) { fprintf(stderr, "pack_i8 failed at expert %d\n", e); return 1; }
     }
 
@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
     printf("]  (%d/%d experts selected)\n", nsel, E);
 
     /* Warm + one chained flight. */
-    int rc = ork_mm_run_chain_i8(c, E, tasks);
+    int rc = ork_i8_mm_run_chain(c, E, tasks);
     if (rc) { fprintf(stderr, "run_chain_i8 warmup failed rc=%d\n", rc); return 1; }
 
     /* --- Correctness: did the zero-masks collapse the gated experts without corrupting the rest? --- */
@@ -138,17 +138,17 @@ int main(int argc, char **argv) {
 
     /* --- Timing: chained single-trip vs simulated multi-trip sequential dispatch --- */
     double t0 = now_us();
-    for (int it = 0; it < iters; it++) { rc = ork_mm_run_chain_i8(c, E, tasks); if (rc) { fprintf(stderr, "chain rc=%d\n", rc); return 1; } }
+    for (int it = 0; it < iters; it++) { rc = ork_i8_mm_run_chain(c, E, tasks); if (rc) { fprintf(stderr, "chain rc=%d\n", rc); return 1; } }
     double us_chain = (now_us() - t0) / iters;
 
     t0 = now_us();
     for (int it = 0; it < iters; it++)
-        for (int e = 0; e < E; e++) { rc = ork_mm_run_i8(c, w[e], M, Abuf + (size_t)e*K, Cbuf + (size_t)e*N); if (rc) { fprintf(stderr, "seq rc=%d\n", rc); return 1; } }
+        for (int e = 0; e < E; e++) { rc = ork_i8_mm_run(c, w[e], M, Abuf + (size_t)e*K, Cbuf + (size_t)e*N); if (rc) { fprintf(stderr, "seq rc=%d\n", rc); return 1; } }
     double us_seq_all = (now_us() - t0) / iters;
 
     t0 = now_us();
     for (int it = 0; it < iters; it++)
-        for (int e = 0; e < E; e++) if (mask[e] != 0.0f) { rc = ork_mm_run_i8(c, w[e], M, Abuf + (size_t)e*K, Cbuf + (size_t)e*N); if (rc) { fprintf(stderr, "seqsel rc=%d\n", rc); return 1; } }
+        for (int e = 0; e < E; e++) if (mask[e] != 0.0f) { rc = ork_i8_mm_run(c, w[e], M, Abuf + (size_t)e*K, Cbuf + (size_t)e*N); if (rc) { fprintf(stderr, "seqsel rc=%d\n", rc); return 1; } }
     double us_seq_sel = (now_us() - t0) / iters;
 
     /* The architecture this actually points at: a DYNAMIC chain of just the selected experts in one
@@ -156,9 +156,9 @@ int main(int argc, char **argv) {
      * token from the routing decision; that synthesis cost is on the CPU, off the NPU's clock.) */
     ork_mm_task_i8 *tsel = calloc((size_t)nsel, sizeof *tsel);
     for (int e = 0, s = 0; e < E; e++) if (mask[e] != 0.0f) tsel[s++] = tasks[e];
-    rc = ork_mm_run_chain_i8(c, nsel, tsel);  /* warm */
+    rc = ork_i8_mm_run_chain(c, nsel, tsel);  /* warm */
     t0 = now_us();
-    for (int it = 0; it < iters; it++) { rc = ork_mm_run_chain_i8(c, nsel, tsel); if (rc) { fprintf(stderr, "chainsel rc=%d\n", rc); return 1; } }
+    for (int it = 0; it < iters; it++) { rc = ork_i8_mm_run_chain(c, nsel, tsel); if (rc) { fprintf(stderr, "chainsel rc=%d\n", rc); return 1; } }
     double us_chain_sel = (now_us() - t0) / iters;
     free(tsel);
 

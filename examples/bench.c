@@ -28,7 +28,7 @@ typedef ork_f16 f16;
 #define EPS 1e-5f
 
 static int g_i8=0;          /* 0 = fp16 weights, 1 = int8/w8a8 */
-static double g_mm=0;       /* accumulated time inside ork_mm_run* (NPU + library) */
+static double g_mm=0;       /* accumulated time inside ork_f16_mm_run* (NPU + library) */
 static double g_att=0;      /* accumulated time in the (CPU) attention block */
 /* big.LITTLE: attention threads must run on the PERFORMANCE cores (A55 stragglers gate the join).
  * Detect the big cores (highest cpufreq max) once; pin attention there, oversubscribed 2x (hides
@@ -85,9 +85,9 @@ static float silu(float x){return x/(1.0f+expf(-x));}
 
 typedef struct { ork_w*Wq,*Wk,*Wv,*Wo,*Wg,*Wu,*Wd; float n1[H],n2[H]; } Layer;
 static ork_w* mkw(ork_npu*ctx,int K,int N){
-    if(g_i8){ int8_t*B=malloc((size_t)K*N);unsigned s=K*7+N*13+1;for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;B[i]=(int8_t)(((int)((s>>16)%7))-3);}ork_w*w=ork_mm_pack_i8(ctx,K,N,B);free(B);return w; }
+    if(g_i8){ int8_t*B=malloc((size_t)K*N);unsigned s=K*7+N*13+1;for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;B[i]=(int8_t)(((int)((s>>16)%7))-3);}ork_w*w=ork_i8_mm_pack(ctx,K,N,B);free(B);return w; }
     f16*B=malloc((size_t)K*N*2);unsigned s=K*7+N*13+1;float sc=0.4f/sqrtf((float)K);
-    for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;B[i]=(f16)((((int)((s>>16)%9))-4)*sc);} ork_w*w=ork_mm_pack(ctx,K,N,B);free(B);return w;}
+    for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;B[i]=(f16)((((int)((s>>16)%9))-4)*sc);} ork_w*w=ork_f16_mm_pack(ctx,K,N,B);free(B);return w;}
 static void mkl(ork_npu*ctx,Layer*L){for(int i=0;i<H;i++){L->n1[i]=1.0f;L->n2[i]=1.0f;}
     L->Wq=mkw(ctx,H,QD);L->Wk=mkw(ctx,H,KVD);L->Wv=mkw(ctx,H,KVD);L->Wo=mkw(ctx,QD,H);L->Wg=mkw(ctx,H,FFN);L->Wu=mkw(ctx,H,FFN);L->Wd=mkw(ctx,FFN,H);}
 /* pooled CPU ops (#1: cut the prefill "other-CPU" — quant/dequant/silu — across the perf cores) */
@@ -105,11 +105,11 @@ static void dequant_pf(int lo,int hi,void*vp){struct dqctx*c=vp;for(int i=lo;i<h
 static void mm(ork_npu*ctx,ork_w*w,int K,int N,int M,const float*Af,float*C){
     if(g_i8){ int8_t*A=malloc((size_t)M*K);int32_t*Ci=malloc((size_t)M*N*4);
         struct qctx qc={Af,A}; pfor(M>=8,(int)((size_t)M*K),quant_pf,&qc);
-        double t=now(); ork_mm_run_i8(ctx,w,M,A,Ci); g_mm+=now()-t;
+        double t=now(); ork_i8_mm_run(ctx,w,M,A,Ci); g_mm+=now()-t;
         struct dqctx dc={Ci,C}; pfor(M>=8,(int)((size_t)M*N),dequant_pf,&dc);
         free(A);free(Ci); return; }
     f16*A=malloc((size_t)M*K*2);for(size_t i=0;i<(size_t)M*K;i++)A[i]=(f16)Af[i];
-    double t=now(); ork_mm_run(ctx,w,M,A,C); g_mm+=now()-t; free(A);
+    double t=now(); ork_f16_mm_run(ctx,w,M,A,C); g_mm+=now()-t; free(A);
 }
 /* Attention is the prefill bottleneck (O(M^2 * heads * HD), ~65-72% of prefill CPU). Flash-style:
  * online softmax in a SINGLE pass over keys, O(HD) running state (no sc[L2] buffer, one read of
@@ -169,7 +169,7 @@ int main(int argc,char**argv){
         rmsnorm(fn,t1,Ls[0].n1,H); mm(ctx,Wlm,H,VOCAB,1,fn,logits); }
     double dt=now()-t0;
     printf("DECODE : %d tok in %.2fs = %.2f tok/s  (%.1f ms/tok)\n",TDEC,dt,TDEC/dt,dt/TDEC*1e3);
-    printf("         of which ork_mm_run (NPU+lib): %.1f ms/tok (%.0f%%);  rest (quant/ops/alloc on CPU): %.1f ms/tok (%.0f%%)\n",
+    printf("         of which ork_f16_mm_run (NPU+lib): %.1f ms/tok (%.0f%%);  rest (quant/ops/alloc on CPU): %.1f ms/tok (%.0f%%)\n",
         g_mm/TDEC*1e3, g_mm/dt*100, (dt-g_mm)/TDEC*1e3, (dt-g_mm)/dt*100);
     for(size_t i=0;i<(size_t)TPRE*H;i++){s=s*1103515245+12345;x[i]=(((int)((s>>16)%17))-8)*0.05f;}
     memset(Kc,0,(size_t)NL*MAXSEQ*KVD*4);memset(Vc,0,(size_t)NL*MAXSEQ*KVD*4);

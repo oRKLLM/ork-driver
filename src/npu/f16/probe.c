@@ -29,7 +29,7 @@
 #include "npu/core.h"
 #include "npu/f16/f16.h"
 
-int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,float *raw){
+int ork_f16_npu_probe_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,float *raw){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%16||N>c->soc->nmax||M<1||M>64) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;   /* fp16 weight: 2 B/elem */
@@ -41,7 +41,7 @@ int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const ui
     uint16_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_N];
-    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);   /* ork_f16_fuzz overrides apply inside */
+    orki_f16_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);   /* ork_f16_fuzz overrides apply inside */
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_f16_mm", c, rc, REGCMD_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
@@ -55,7 +55,7 @@ int ork_npu_probe_f16_mm(ork_npu *c,int M,int K,int N,const uint16_t *A,const ui
     return ok;
 }
 
-int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,uint16_t *out){
+int ork_f16_npu_probe_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,uint16_t *out){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
@@ -76,9 +76,9 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset; keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=getenv("ORK_F16_SCHED")?atoi(getenv("ORK_F16_SCHED")):((K&(K-1))==0 && K>=128 && K<2048);  /* run_stream_f16 rule; small K => 0 */
-    orki_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    orki_f16_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
     if(rowpitch!=K) orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,rowpitch/8);        /* CNA LINE_STRIDE = pitch/8 surfaces (strided activation) */
-    if(!getenv("ORK_F16_FP32OUT")) orki_set_f16_out_fp16in(rc,M,N);        /* vendor fp16-out stage (atom-8); skip => synth's native fp32-out (compute sanity) */
+    if(!getenv("ORK_F16_FP32OUT")) orki_f16_set_out_fp16in(rc,M,N);        /* vendor fp16-out stage (atom-8); skip => synth's native fp32-out (compute sanity) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
       t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
@@ -101,7 +101,7 @@ int ork_npu_probe_f16_mm_f16out(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     return ok;
 }
 
-int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,int apitch,const uint16_t *B,uint16_t *out){
+int ork_f16_npu_probe_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,int apitch,const uint16_t *B,uint16_t *out){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)||apitch<K||(apitch&7)) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N*2,0x403,-1); if(!W.cpu) return -2;
@@ -118,9 +118,9 @@ int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,in
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    orki_synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
+    orki_f16_synth(rc,M,K,N,(uint32_t)Adev.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);     /* activation base = the DMA buffer (ZERO-COPY, no c->Af) */
     orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,apitch/8);                                          /* CNA LINE_STRIDE = apitch/8 surfaces (read the strided view) */
-    orki_set_f16_out_fp16in(rc,M,N);
+    orki_f16_set_out_fp16in(rc,M,N);
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
       t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
@@ -133,7 +133,7 @@ int ork_npu_probe_f16_stridedA(ork_npu *c,int M,int K,int N,const uint16_t *A,in
     return ok;
 }
 
-int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *nz0, long *nz1, double *us) {
+int ork_f16_npu_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *nz0, long *nz1, double *us) {
     int fd = c->fd, CBUF = c->soc->cbuf_elems, dom = c->dom_active;
     if (!ork_ppu_fuse_enabled(c)) return -3;
     if (Kp % 32 || N % 32 || N > c->soc->nmax || M < 1 || M > 64 || (N & 7)) return -2;
@@ -155,8 +155,8 @@ int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *n
     orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm0[REGCMD_N], mm1[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
     int sched = ((Kp&(Kp-1))==0 && Kp>=128 && Kp<2048);
-    orki_synth(mm0,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)G0.dma,sched,CBUF); orki_set_f16_out_fp16in(mm0,M,N);
-    orki_synth(mm1,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G1.dma,sched,CBUF); orki_set_f16_out_fp16in(mm1,M,N);
+    orki_f16_synth(mm0,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W0.dma,(uint32_t)G0.dma,sched,CBUF); orki_f16_set_out_fp16in(mm0,M,N);
+    orki_f16_synth(mm1,M,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W1.dma,(uint32_t)G1.dma,sched,CBUF); orki_f16_set_out_fp16in(mm1,M,N);
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc); orki_set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
     orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)GO.dma);
     orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_SDP_5018,(uint32_t)GI.dma);   /* gap INPUT = dummy scratch (NOT the matmul output) */
@@ -176,7 +176,7 @@ int ork_npu_f16_gap_probe(ork_npu *c, int M, int Kp, int N, int use_gap, long *n
     return crc;
 }
 
-int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const ork_f16*B,float*Cout,double*us,int mode){
+int ork_f16_npu_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const ork_f16*B,float*Cout,double*us,int mode){
     if(!c) return -3;
     int CBUF=c->soc->cbuf_elems;
     int cores=c->soc->cores; if(cores>ORK_MAXCORE) cores=ORK_MAXCORE; if(cores<1) cores=1;
@@ -219,8 +219,8 @@ int ork_npu_f16_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const 
         rcb[i]=orki_bcreate(cfd[i],(size_t)REGCMD_N*4,0x403,0); if(!rcb[i].cpu) goto done;
         tkb[i]=orki_bcreate(cfd[i],4096,0x40b,0); if(!tkb[i].cpu) goto done;
         uint32_t rc[REGCMD_N];
-        orki_synth(rc,M,K,Ncol,(uint32_t)abuf[i].dma,aB,(uint32_t)cob[i].dma,sched,CBUF);
-        orki_set_f16_out_fp16in(rc,M,Ncol);                                   /* fp16-out, contiguous [M][Ncol] (no ORK_F16_ATOM8) */
+        orki_f16_synth(rc,M,K,Ncol,(uint32_t)abuf[i].dma,aB,(uint32_t)cob[i].dma,sched,CBUF);
+        orki_f16_set_out_fp16in(rc,M,Ncol);                                   /* fp16-out, contiguous [M][Ncol] (no ORK_F16_ATOM8) */
         memcpy(rcb[i].cpu,rc,(size_t)REGCMD_N*4);
         orki_bsync(cfd[i],&rcb[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task*t=(struct rknpu_task*)tkb[i].cpu; memset(t,0,sizeof *t);
@@ -249,7 +249,7 @@ done:
     return ret;
 }
 
-int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
+int ork_f16_npu_probe_slice(ork_npu *c,int Kfull,int N,int Kp,int nov,
                             const uint32_t *ovr_reg,const uint32_t *ovr_val,
                             const f16 *A,const f16 *B,float *C){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
@@ -262,7 +262,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     struct buf O=orki_bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
     f16*ad=c->Af.cpu; for(int j=0;j<Kp;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N];
-    orki_synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
+    orki_f16_synth(rc,1,Kp,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF);
     orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,0xb1);
     for(int i=0;i<nov && i<4;i++) orki_setr(rc,REGCMD_N,0x201,ovr_reg[i],ovr_val[i]);
     struct buf extra[2] = {W, O};
@@ -277,7 +277,7 @@ int ork_npu_probe_slice_f16(ork_npu *c,int Kfull,int N,int Kp,int nov,
     return ok;
 }
 
-int ork_ssd_probe_rawmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
+int ork_f16_ssd_probe_rawmm(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||M<1||K<1||N<1||K%32||N%16) return -2;
     int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=-1,ret=0;
     struct buf Ab=orki_bcreate(fd,(size_t)M*K*2,0x403,dom),Bb=orki_bcreate(fd,(size_t)K*N*2,0x403,dom),Cb=orki_bcreate(fd,(size_t)M*N*4,0x403,dom);
@@ -286,7 +286,7 @@ int ork_ssd_probe_rawmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,
     orki_bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Bb,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
     { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done; }
-      orki_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)Bb.dma,(uint32_t)Cb.dma,1,CBUF);
+      orki_f16_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)Bb.dma,(uint32_t)Cb.dma,1,CBUF);
       ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
       ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
     if(ret) goto done;
@@ -296,9 +296,9 @@ done:
     return ret;
 }
 
-int ork_ssd_probe_fusedmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
+int ork_f16_ssd_probe_fusedmm(ork_npu*c,int M,int K,int N,const f16*A,const f16*B,float*C){
     if(!c||M<1||K<1||N<1||K%32||N%16) return -2;
-    ork_w *w=ork_mm_pack(c,K,N,B); if(!w) return -3;
+    ork_w *w=ork_f16_mm_pack(c,K,N,B); if(!w) return -3;
     if(w->Sk!=1||w->Sn!=1){ ork_mm_free(c,w); return -2; }   /* probe: single tile only */
     int fd=c->fd,CBUF=c->soc->cbuf_elems,dom=w->domain,ret=0;
     struct buf Ab=orki_bcreate(fd,(size_t)M*K*2,0x403,dom), Cb=orki_bcreate(fd,(size_t)M*N*4,0x403,dom);
@@ -307,7 +307,7 @@ int ork_ssd_probe_fusedmm_f16(ork_npu*c,int M,int K,int N,const f16*A,const f16*
     orki_bsync(fd,&Ab,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&Cb,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0); c->warmed=0; c->last_dt=DT_F16;
     { uint32_t *rc=calloc(REGCMD_I8_N,4); if(!rc){ ret=-3; goto done2; }
-      orki_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)w->Bb[0].dma,(uint32_t)Cb.dma,1,CBUF);
+      orki_f16_synth(rc,M,K,N,(uint32_t)Ab.dma,(uint32_t)w->Bb[0].dma,(uint32_t)Cb.dma,1,CBUF);
       ork_chain_prog p={rc,REGCMD_I8_N,0xd,108,216};
       ret=ork_npu_chain_progs(c,1,&p,dom); free(rc); }
     if(ret) goto done2;

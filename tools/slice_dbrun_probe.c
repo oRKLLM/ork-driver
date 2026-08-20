@@ -1,7 +1,7 @@
 /* slice_dbrun_probe — execution proof + test for the slice-and-dice library primitive
  * (ork_mm_pack_i8_sliced / ork_mm_run_i8_sliced). Runs an arbitrary int8 matmul ENTIRELY on the doorbell by
  * decomposing it into c_base tiles (K-slice int32-accumulate + N-tile scatter + M), and compares BIT-EXACT
- * vs the blocking full reference (ork_mm_run_i8). Wide-K (ffn_down) wedges as one submit; sliced it runs
+ * vs the blocking full reference (ork_i8_mm_run). Wide-K (ffn_down) wedges as one submit; sliced it runs
  * wedge-free. `make slice_dbrun_probe && sudo ./slice_dbrun_probe [K=6144] [N=2048] [M=256] [nc=0(all)]`
  * (nc=1 sidesteps the non-even-N colsplit driver bug #36 when validating wide-N correctness).
  */
@@ -26,10 +26,10 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < (size_t) M*K; i++) A[i] = r8();
     for (size_t i = 0; i < (size_t) K*N; i++) B[i] = r8();
 
-    /* reference: blocking full matmul (ork_mm_run_i8 -> mcworker at M>1 wide-K/wide-N) */
-    ork_w *wf = ork_mm_pack_i8(c, K, N, B); if (!wf) { printf("ref pack fail\n"); return 1; }
+    /* reference: blocking full matmul (ork_i8_mm_run -> mcworker at M>1 wide-K/wide-N) */
+    ork_w *wf = ork_i8_mm_pack(c, K, N, B); if (!wf) { printf("ref pack fail\n"); return 1; }
     int32_t *Cref = (int32_t *) malloc((size_t) M*N*4);
-    if (ork_mm_run_i8(c, wf, M, A, Cref)) { printf("ref run FAIL\n"); return 1; }
+    if (ork_i8_mm_run(c, wf, M, A, Cref)) { printf("ref run FAIL\n"); return 1; }
 
     /* slice-and-dice library primitive: pack once (c_base tiles), run on the doorbell (general dtype API) */
     ork_w_sliced *ws = ork_mm_pack_sliced(c, K, N, B, ORK_DT_I8);
@@ -44,7 +44,7 @@ int main(int argc, char **argv) {
     printf(" -> %s\n", bad ? "DIFFER" : "identical");
 
     /* CPU int32 reference (CPUREF=1) — the ONLY trustworthy truth when the driver path itself is suspect
-     * (task #36: N=3584 colsplit can break ork_mm_run_i8, so "sliced vs run_i8" above would be meaningless).
+     * (task #36: N=3584 colsplit can break ork_i8_mm_run, so "sliced vs run_i8" above would be meaningless).
      * O(M*N*K): use a SMALL M. Reports run_i8 AND sliced EACH vs CPU, so we see which path is correct. */
     if (getenv("CPUREF")) {
         int32_t *Ccpu = (int32_t *) malloc((size_t) M*N*4);
@@ -63,10 +63,10 @@ int main(int argc, char **argv) {
 
     /* A/B throughput: blocking mcworker (run_i8) vs sliced doorbell (run_sliced), same shape. REPS env (default 40). */
     int reps = getenv("REPS") ? atoi(getenv("REPS")) : 40; if (reps < 1) reps = 1;
-    for (int w = 0; w < 3; w++) { ork_mm_run_i8(c, wf, M, A, Cref); ork_mm_run_sliced(c, ws, M, A, Cslc, nc); }   /* warmup */
+    for (int w = 0; w < 3; w++) { ork_i8_mm_run(c, wf, M, A, Cref); ork_mm_run_sliced(c, ws, M, A, Cslc, nc); }   /* warmup */
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    for (int r = 0; r < reps; r++) ork_mm_run_i8(c, wf, M, A, Cref);
+    for (int r = 0; r < reps; r++) ork_i8_mm_run(c, wf, M, A, Cref);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double us_block = ((t1.tv_sec-t0.tv_sec)*1e6 + (t1.tv_nsec-t0.tv_nsec)*1e-3) / reps;
     clock_gettime(CLOCK_MONOTONIC, &t0);

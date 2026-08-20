@@ -18,7 +18,9 @@
 # int8 row, not an i16 one). Hand-written matrix claims rot in exactly this direction.
 #
 # capability<TAB>dtype<TAB>symbol<TAB>why
-run — single core	f16	orki_run	ork_mm_run / orki_run in npu.c dispatch fp16 — the dispatcher is dtype-agnostic by design, so there is no token to match
+# RETIRED 2026-08-20 (dtype-first migration): the "run — single core / f16" row is gone. It existed
+# only because fp16's run entry point was the untagged legacy ork_mm_run; it is now ork_f16_mm_run and
+# the generator matches it directly. A dagger that becomes unnecessary is a sign the naming got better.
 run — multicore	f16	ork_dyn_begin_colsplit	i8/colsplit.c is the ONLY fp16 multicore path (#45)
 run — NONBLOCK doorbell	f16	ork_dyn_begin_colsplit	same colsplit path — fp16 wide-K rides the doorbell
 run — HW chain	i16	ork_npu_chain_progs	the i16 chain rides the general PC-chain core in i8/probe.c rather than a dedicated i16 one

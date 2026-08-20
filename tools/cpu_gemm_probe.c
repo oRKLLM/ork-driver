@@ -3,7 +3,7 @@
  * The prefill overlap win requires relocating/splitting matmul COMPUTE onto the idle CPU (prefill is
  * latency-bound: NPU ~0.7%, CPU ~22%). That only pays off if the CPU can do int8 GEMM at a meaningful fraction
  * of the NPU. This probe measures a NEON-dotprod int8 GEMM (C[M,N] int32 = A[M,K] i8 · B[K,N] i8) at prefill
- * dims and prints its throughput next to ork_mm_run_i8 (NPU) on the SAME shape, so the achievable column-split
+ * dims and prints its throughput next to ork_i8_mm_run (NPU) on the SAME shape, so the achievable column-split
  * ceiling (npu_rate + cpu_rate) is sized before any hot-path wiring. Correctness checked vs a scalar reference.
  *
  *   make cpu_gemm_probe && sudo env ORK_MM_TIMEOUT=3000 ./cpu_gemm_probe [M] [K] [N]
@@ -84,13 +84,13 @@ int main(int argc, char**argv){
     printf("  CPU  NEON-dotprod: %.2f ms/gemm  (%.1f GMAC/s, %d threads = %.2fx scaling)\n",
            mt_us/1e3, gmac/(mt_us/1e6), NT, cpu_us/mt_us);
 
-    /* NPU same shape via ork_mm_run_i8 */
+    /* NPU same shape via ork_i8_mm_run */
     ork_npu *c = ork_npu_init(); if(!c){ printf("  (no NPU — CPU-only run)\n"); return bad?1:0; }
-    ork_w *W = ork_mm_pack_i8(c,K,N,B);
+    ork_w *W = ork_i8_mm_pack(c,K,N,B);
     if (W){ int32_t *Cn=ork_dma_alloc(c,(size_t)M*N*4); if(Cn){
-        ork_mm_run_i8(c,W,M,A,Cn);   /* warm */
-        double n0=now_us(); for(int i=0;i<it;i++) ork_mm_run_i8(c,W,M,A,Cn); double npu_us=(now_us()-n0)/it;
-        printf("  NPU  ork_mm_run_i8: %.2f ms/gemm  (%.1f GMAC/s)\n", npu_us/1e3, gmac/(npu_us/1e6));
+        ork_i8_mm_run(c,W,M,A,Cn);   /* warm */
+        double n0=now_us(); for(int i=0;i<it;i++) ork_i8_mm_run(c,W,M,A,Cn); double npu_us=(now_us()-n0)/it;
+        printf("  NPU  ork_i8_mm_run: %.2f ms/gemm  (%.1f GMAC/s)\n", npu_us/1e3, gmac/(npu_us/1e6));
         double frac1 = (cpu_us>0)? (npu_us/cpu_us) : 0;   /* single-thread CPU fraction of NPU rate */
         double fracN = (mt_us>0)? (npu_us/mt_us) : 0;      /* NT-thread CPU fraction of NPU rate */
         printf("  => CPU 1-thread is %.0f%% of NPU (split ceiling ~%.2fx); %d-thread is %.0f%% of NPU (split ceiling ~%.2fx over NPU-alone)\n",

@@ -27,7 +27,7 @@ int main(int argc,char**argv){
     for(int i=0;i<NK;i++){int K=Ks[i],tiles=(K+63)/64;
         for(int j=0;j<K;j++)A[j]=(int8_t)rnd();
         for(size_t j=0;j<(size_t)K*N;j++)B[j]=(int8_t)rnd();
-        int rc=ork_npu_probe_single_i8(c,K,N,A,B,C);
+        int rc=ork_i8_npu_probe_single(c,K,N,A,B,C);
         if(rc==0){ int bad=0;
             for(int n=0;n<N;n++){int32_t ref=0;for(int k=0;k<K;k++)ref+=(int)A[k]*(int)B[(size_t)k*N+n];if(C[n]!=ref)bad++;}
             printf("  K=%-6d %3d tiles : %s\n",K,tiles,bad?"COMPLETED BUT WRONG":"OK (single submit, correct)");

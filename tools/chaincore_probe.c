@@ -30,9 +30,9 @@ int main(int argc,char**argv){
         long s=(a*r_mult)>>r_shift; if(s>127)s=127; if(s<-128)s=-128; double e=exp((double)s*in_scale)/out_scale; if(e>127)e=127;
         int ei=(int)lround(e); ce[(size_t)i*Nk+j]=(int8_t)ei; S+=ei; } cS[i]=S;
       for(int x=0;x<dv;x++){ double av=0; for(int j=0;j<Nk;j++) av+=(double)ce[(size_t)i*Nk+j]*V[(size_t)j*dv+x]; cav[(size_t)i*dv+x]=av; } }
-    ork_w *w_kt=ork_mm_pack_i8(c,Kp,Nk,KTp), *w_ones, *w_v;
-    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,ones); free(ones); }
-    w_v=ork_mm_pack_i8(c,Nk,dv,V);
+    ork_w *w_kt=ork_i8_mm_pack(c,Kp,Nk,KTp), *w_ones, *w_v;
+    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,ones); free(ones); }
+    w_v=ork_i8_mm_pack(c,Nk,dv,V);
     if(!w_kt||!w_ones||!w_v){ printf("pack fail\n"); return 2; }
     int32_t *scb=calloc((size_t)Nq*Nk,4), *eb=calloc((size_t)Nq*Nk,4), *ss=calloc((size_t)Nq*32,4), *avb=calloc((size_t)Nq*dv,4);
     ork_mm_task_i8 tasks[4] = { { w_kt,Nq,Qp,scb }, { w_kt,Nq,(int8_t*)scb,eb }, { w_ones,Nq,(int8_t*)eb,ss }, { w_v,Nq,(int8_t*)eb,avb } };
@@ -44,7 +44,7 @@ int main(int argc,char**argv){
     for(int core=0; core<3; core++){
         ork_npu_set_chain_core(c, core);
         memset(ss,0,(size_t)Nq*32*4); memset(avb,0,(size_t)Nq*dv*4);
-        int rc=ork_mm_run_chain_i8_ffn_exp(c,4,tasks,ops,in_scale,out_scale);
+        int rc=ork_i8_mm_run_chain_ffn_exp(c,4,tasks,ops,in_scale,out_scale);
         if(rc){ printf("  core %d: rc=%d FAIL\n",core,rc); fail=1; continue; }
         int bad=0; double me=0;
         for(int i=0;i<Nq;i++){ double Sn=(double)ss[(size_t)i*32]; if(Sn<=0)Sn=1; double Sc=cS[i]>0?cS[i]:1;

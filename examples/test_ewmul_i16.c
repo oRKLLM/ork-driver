@@ -1,5 +1,5 @@
 /* examples/test_ewmul_i16.c — validate the on-NPU int16 element-wise MULTIPLY vs a CPU reference.
- * ork_npu_ewmul_i16 computes out=clamp_i16(round(up*silu*mult/2^shift)) on the NPU (standalone SDP int16 op).
+ * ork_i16_npu_ewmul computes out=clamp_i16(round(up*silu*mult/2^shift)) on the NPU (standalone SDP int16 op).
  * This is the w4a4 path's EW precision (ork's int4 matmul outputs int16). Runs several (M,N) shapes to
  * exercise the generalized geometry (N must be a multiple of 8 for int16 atom-8). Exits nonzero on any
  * mismatch; skips gracefully (exit 0) off-board / non-PPU SoC.
@@ -17,7 +17,7 @@ static long clampi16(long v){ if(v>32767)v=32767; if(v<-32768)v=-32768; return v
 static int run_case(ork_npu *c, const char *name, int M, int N, const int16_t *up, const int16_t *si, int mult, int shift, int tol){
     static int16_t out[MAXE];
     double us = 0;
-    int r = ork_npu_ewmul_i16(c, up, si, M, N, mult, shift, out, &us);
+    int r = ork_i16_npu_ewmul(c, up, si, M, N, mult, shift, out, &us);
     if (r) { printf("  %-14s [%dx%-4d] FAIL (rc=%d)\n", name, M, N, r); return 1; }
     int mism = 0; long mx = 0;
     for (int i = 0; i < M*N; i++) {

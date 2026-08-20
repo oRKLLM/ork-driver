@@ -1,8 +1,8 @@
 /* tools/hadamard_i4_npu.c — Tier 4a Hadamard rotation for W4A4, validated ON THE NPU (not just CPU math).
  *
  * hadamard_int4.c / hadamard_real.c prove the rotation cuts int4 quant RMS in a pure-CPU model. This
- * tool proves it END-TO-END on real silicon through the public grouped-W4A4 path (ork_mm_pack_i4_grouped
- * / ork_mm_run_i4_grouped): a per-group (block) Hadamard of size G is exactly rotation-invariant within
+ * tool proves it END-TO-END on real silicon through the public grouped-W4A4 path (ork_i4_mm_pack_grouped
+ * / ork_i4_mm_run_grouped): a per-group (block) Hadamard of size G is exactly rotation-invariant within
  * each group, so it composes with per-group int4 quant WITHOUT changing the matmul result — the NPU still
  * computes A.B, just with the outliers spread so the int4 quantization is more accurate.
  *
@@ -47,9 +47,9 @@ static double run_case(ork_npu *c, const float *Af, const float *Bf, const float
         float s = mx/7, inv = 7/mx; bS[g*N+n] = s;
         for (int j = 0; j < G; j++) { int q = (int)lrintf(tmp[j]*inv); if (q>7) q=7; if (q<-8) q=-8; Bi[(size_t)(g*G+j)*N+n] = (signed char)q; }
     }
-    ork_w *w = ork_mm_pack_i4_grouped(c, K, N, Bi, G);
+    ork_w *w = ork_i4_mm_pack_grouped(c, K, N, Bi, G);
     if (!w) { printf("  pack_i4_grouped failed\n"); free(Ai);free(Bi);free(aS);free(bS);free(C);free(tmp); return -1; }
-    int rc = ork_mm_run_i4_grouped(c, w, M, Ai, aS, bS, C); ork_w_free(w);
+    int rc = ork_i4_mm_run_grouped(c, w, M, Ai, aS, bS, C); ork_w_free(w);
     if (rc) { printf("  run_i4_grouped rc=%d\n", rc); free(Ai);free(Bi);free(aS);free(bS);free(C);free(tmp); return -1; }
     double se = 0, sr = 0, me = 0;
     for (int m = 0; m < M; m++) for (int n = 0; n < N; n++) {

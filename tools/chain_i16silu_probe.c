@@ -1,5 +1,5 @@
 /* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
- * Duplicate of the pre-session probe chain_gatesilu_probe (both drive ork_npu_chain_gatesilu_i16). Its
+ * Duplicate of the pre-session probe chain_gatesilu_probe (both drive ork_i16_npu_chain_gatesilu). Its
  * "BRIDGE WORKS" verdict CONTRADICTS the pre-session abandoned/wedge verdict ONLY because it runs against the
  * UNMERGED set_i16_out change (6fb8b9f) — so it is NOT independent validation and is NOT a source for the SDK
  * supported-op derivation (origin/main examples only). Delete once the int16 bridge is validated against a
@@ -9,7 +9,7 @@
 int main(void){ fprintf(stderr,"[deprecated] chain_i16silu_probe: quarantined duplicate of chain_gatesilu_probe (build -DORK_DEPRECATED_PROBES to run)\n"); return 0; }
 #else
 /* chain_i16silu_probe — validate the FIXED set_i16_out feeds the int16 SiLU (the matmul-i16-out -> int16-silu
- * data bridge, the gating step for the fp16/int16-quality coalesced FFN). ork_npu_chain_gatesilu_i16 does
+ * data bridge, the gating step for the fp16/int16-quality coalesced FFN). ork_i16_npu_chain_gatesilu does
  * gate=A*B (int8 matmul, set_i16_out -> int16 G) then silu(G) -> O, with the silu reading G's buffer directly.
  * ORK_GS_SEQ=1 isolates the DATA bridge (two submits, no PC-chain walk). Coherence: O ~= silu(gate). Board only.
  */
@@ -31,7 +31,7 @@ int main(void){
         gate16[m*N+n]=clampi16((shift>=0)?((acc*mult)>>shift):(acc*mult)); double a=fabs((double)gate16[m*N+n]); if(a>gmax)gmax=a; }
     if(gmax<1)gmax=1; double is=gmax/32000.0, os=1.0/32000.0;
     short gate_hw[M*N], out_hw[M*N]; double us=0;
-    int rc=ork_npu_chain_gatesilu_i16(c,M,K,N,A,B,mult,shift,is,os,gate_hw,out_hw,&us);
+    int rc=ork_i16_npu_chain_gatesilu(c,M,K,N,A,B,mult,shift,is,os,gate_hw,out_hw,&us);
     printf("chain_gatesilu_i16 rc=%d (0=ran,-1=wedge) %.0fus  M=%d K=%d N=%d  mode=%s\n",
            rc,us,M,K,N, getenv("ORK_GS_SEQ")?"GS_SEQ(2 submits)":"chain_progs");
     if(rc!=0){ printf("  VERDICT: %s\n", rc==-1?"WEDGE/stall":"err"); ork_npu_free(c); return 1; }

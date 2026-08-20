@@ -1,4 +1,4 @@
-/* tools/silu_f16_check.c — smoke-test the fp16 fused gate+SiLU primitive (ork_mm_run_f16_silu): does it RUN
+/* tools/silu_f16_check.c — smoke-test the fp16 fused gate+SiLU primitive (ork_f16_mm_run_silu): does it RUN
  * (not wedge) and produce finite, silu-shaped fp16->fp32 output? Calibration is a follow-up; this validates
  * the pipeline structure (fp16 matmul + grafted silu output stage, fp16 output CVT kept).
  *   make silu_f16_check && sudo ./silu_f16_check [M]      (board only)
@@ -21,11 +21,11 @@ int main(int argc,char**argv){
     for(int m=0;m<M;m++)for(int k=0;k<K;k++) A[(size_t)m*K+k]=(ork_f16)(1.0f + 0.002f*(float)(((m*7+k)%13)-6));
     double bcol[64];
     for(int n=0;n<N;n++){ double b=0.0005*(n-32); bcol[n]=b; for(int k=0;k<K;k++)B[(size_t)k*N+n]=(ork_f16)(b); } /* gate=K*b in ~[-8,8] */
-    ork_w*w=ork_mm_pack(c,K,N,B); if(!w){printf("fp16 pack fail\n");return 2;}
+    ork_w*w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("fp16 pack fail\n");return 2;}
     float*Cf=malloc((size_t)M*N*4);
     /* NULL lut = built-in default silu curve (calibration TBD); we just check it runs + is silu-shaped */
-    int r=ork_mm_run_f16_silu(c,w,M,A,Cf,0,0xffffc000u,0x56391100u,NULL,0);
-    if(r){ printf("ork_mm_run_f16_silu rc=%d (wedge/shape/soc)\n",r); return 1; }
+    int r=ork_f16_mm_run_silu(c,w,M,A,Cf,0,0xffffc000u,0x56391100u,NULL,0);
+    if(r){ printf("ork_f16_mm_run_silu rc=%d (wedge/shape/soc)\n",r); return 1; }
     int finite=1,mono=1; double prev=-1e9;
     printf("  n   gate      npu_out    cpu_silu(gate)\n");
     for(int n=0;n<N;n++){ double gate=(double)K*bcol[n]; double got=Cf[n]; double ref=silu(gate);

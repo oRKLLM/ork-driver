@@ -8,7 +8,7 @@
  *   1  K=64,N=64,M=64: default vs fuzz 0x201:0x1040=0xB1 (template default) — the causation test
  *   2  K sweep at N=64,M=64: dump the sched=1 0x1040 formula value + result, vs 0x1040=0xB1 override
  *
- * ork_npu_probe_f16_mm runs ONE fp16 matmul through bare synth() (hardcoded sched=1); ork_f16_fuzz_add
+ * ork_f16_npu_probe_mm runs ONE fp16 matmul through bare synth() (hardcoded sched=1); ork_f16_fuzz_add
  * injects regcmd overrides applied at the END of synth() (so they win over the sched logic). Classifies
  * the raw fp32 output vs a CPU (fp16-operand, f64-accum) reference.
  */
@@ -34,7 +34,7 @@ static double run_shape(ork_npu*c,int M,int K,int N,u16*A,u16*B,float*raw,
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double a=0;
         for(int k=0;k<K;k++) a+=h2f(A[(size_t)m*K+k])*h2f(B[(size_t)k*N+n]);
         ref[(size_t)m*N+n]=a; }
-    int rc=ork_npu_probe_f16_mm(c,M,K,N,A,B,raw);
+    int rc=ork_f16_npu_probe_mm(c,M,K,N,A,B,raw);
     *rc_out=rc;
     if(rc){ *ncorr_col=*ncorr_row=0; *iszero=0; return -1; }
     /* overall rel-L2 */
@@ -110,7 +110,7 @@ int main(int argc,char**argv){
     }
 
     if(mode==3 || mode==4){
-        /* int8 path: ork_npu_probe_i8_mm runs one int8 matmul via bare synth_i8() (hardcoded sched=1).
+        /* int8 path: ork_i8_npu_probe_mm runs one int8 matmul via bare synth_i8() (hardcoded sched=1).
          * mode 3: K sweep (M=64,N=64). mode 4: N sweep incl N=1024 (M=64,K=64) — the FLOOR_DECOMP case. */
         signed char *Ai=malloc((size_t)MAXM*MAXK), *Bi=malloc((size_t)MAXK*MAXN);
         int *iraw=malloc((size_t)2*MAXM*MAXN*sizeof(int));
@@ -126,7 +126,7 @@ int main(int argc,char**argv){
                 if(refsz<(size_t)M*N){ref=realloc(ref,(size_t)M*N*sizeof(double));refsz=(size_t)M*N;}
                 for(int m=0;m<M;m++)for(int n=0;n<N;n++){double a=0;for(int k=0;k<K;k++)a+=(double)Ai[(size_t)m*K+k]*(double)Bi[(size_t)k*N+n];ref[(size_t)m*N+n]=a;}
                 ork_i8_fuzz_clear();
-                int rc=ork_npu_probe_i8_mm(c,M,K,N,Ai,Bi,iraw);
+                int rc=ork_i8_npu_probe_mm(c,M,K,N,Ai,Bi,iraw);
                 double num=0,den=0,amax=0; int cc=0;
                 if(!rc){ for(int i=0;i<M*N;i++){double e=iraw[i]-ref[i];num+=e*e;den+=ref[i]*ref[i];if(fabs((double)iraw[i])>amax)amax=fabs((double)iraw[i]);}
                     for(int n=0;n<N;n++){double cn=0,cd=0;for(int m2=0;m2<M;m2++){double e=iraw[(size_t)m2*N+n]-ref[(size_t)m2*N+n];cn+=e*e;cd+=ref[(size_t)m2*N+n]*ref[(size_t)m2*N+n];}if(cd==0||sqrt(cn/cd)<0.02)cc++;} }
@@ -142,7 +142,7 @@ int main(int argc,char**argv){
                 if(refsz<(size_t)M*N){ref=realloc(ref,(size_t)M*N*sizeof(double));refsz=(size_t)M*N;}
                 for(int m=0;m<M;m++)for(int n=0;n<N;n++){double a=0;for(int k=0;k<K;k++)a+=(double)Ai[(size_t)m*K+k]*(double)Bi[(size_t)k*N+n];ref[(size_t)m*N+n]=a;}
                 ork_i8_fuzz_clear();
-                int rc=ork_npu_probe_i8_mm(c,M,K,N,Ai,Bi,iraw);
+                int rc=ork_i8_npu_probe_mm(c,M,K,N,Ai,Bi,iraw);
                 double num=0,den=0,amax=0; int cc=0;
                 if(!rc){ for(int i=0;i<M*N;i++){double e=iraw[i]-ref[i];num+=e*e;den+=ref[i]*ref[i];if(fabs((double)iraw[i])>amax)amax=fabs((double)iraw[i]);}
                     for(int n=0;n<N;n++){double cn=0,cd=0;for(int m2=0;m2<M;m2++){double e=iraw[(size_t)m2*N+n]-ref[(size_t)m2*N+n];cn+=e*e;cd+=ref[(size_t)m2*N+n]*ref[(size_t)m2*N+n];}if(cd==0||sqrt(cn/cd)<0.02)cc++;} }

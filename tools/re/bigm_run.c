@@ -69,7 +69,7 @@ int main(int argc,char**argv){
 
     ork_npu*c=ork_npu_init(); if(!c){ printf("init (board only)\n"); return 77; }
     ork_npu_set_core_budget(c,1);
-    { ork_w*ww=ork_mm_pack_i8(c,K,N,W); if(ww){int32_t*t=calloc((size_t)8*N,4);int8_t*a8=calloc((size_t)8*K,1);ork_mm_run_i8(c,ww,8,a8,t);free(t);free(a8);ork_mm_free(c,ww);} }
+    { ork_w*ww=ork_i8_mm_pack(c,K,N,W); if(ww){int32_t*t=calloc((size_t)8*N,4);int8_t*a8=calloc((size_t)8*K,1);ork_i8_mm_run(c,ww,8,a8,t);free(t);free(a8);ork_mm_free(c,ww);} }
     int ws[1]={Mtot}; double us=0;                                /* size buffers for M_total (surfstr in-bounds) */
     int r=ork_npu_mfold_chain_v(c,1,ws,K,N,sc,232,Ap,Wp,Craw,0,3,&us);
     if(r){ printf("RESULT: chain_v rc=%d (STALL/errno-110) — tile did not complete\n",r); ork_npu_free(c); return 1; }

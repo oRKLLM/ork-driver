@@ -18,10 +18,10 @@ static double bench_ork(int M,int K,int N,int iters,int cores){
   int8_t* B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
   int8_t* A=malloc((size_t)M*K); memset(A,1,(size_t)M*K);
   int32_t* C=malloc((size_t)M*N*4);
-  ork_w* w=ork_mm_pack_i8(c,K,N,B); if(!w)return -1;
-  if(ork_mm_run_i8(c,w,M,A,C))return -1;
+  ork_w* w=ork_i8_mm_pack(c,K,N,B); if(!w)return -1;
+  if(ork_i8_mm_run(c,w,M,A,C))return -1;
   ork_npu_mc_reset();
-  double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,A,C);
+  double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,C);
   double us=(now_us()-t0)/iters;
   if(getenv("ORK_MCPROF") && cores>1 && M>1){            /* per-core balance check (prefill path) */
     for(int i=0;i<cores;i++){ double cp,su,ac; long n; ork_npu_mc_timing(i,&cp,&su,&ac,&n);

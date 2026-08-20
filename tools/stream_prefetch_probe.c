@@ -40,7 +40,7 @@ int   ork_stage_map  (ork_npu *c, struct ork_stage *s);
 int   ork_stage_run  (ork_npu *c, struct ork_stage *s, int M, const int8_t *A, int32_t *C);
 void  ork_stage_unmap(ork_npu *c, struct ork_stage *s);
 void  ork_stage_free (ork_npu *c, struct ork_stage *s);
-void  ork_slice_direct_inflate_i8(const ork_w *w, int8_t *i8, int kind); /* nibble -> linear int8[N*K] */
+void  ork_i8_slice_direct_inflate(const ork_w *w, int8_t *i8, int kind); /* nibble -> linear int8[N*K] */
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 static int cmp_d(const void*a,const void*b){ double x=*(const double*)a,y=*(const double*)b; return x<y?-1:x>y?1:0; }
@@ -85,10 +85,10 @@ static int run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*l
     for(int e=0;e<NSRC;e++){
         unsigned s=0x1234u+(unsigned)(K*131+N+e*7919);
         for(size_t i=0;i<(size_t)N*K;i++){ s=s*1664525u+1013904223u; float u=(s>>8)*(1.0f/16777216.0f); f32[i]=(u-0.5f)*0.2f; }
-        src[e]=ork_mm_pack_i4a8(c,K,N,f32,bsc);
+        src[e]=ork_i4a8_mm_pack(c,K,N,f32,bsc);
         if(!src[e]){ printf("  [%s] pack_i4a8 failed K=%d N=%d\n",label,K,N); rc=1; goto done; }
         /* inflate nibble store -> linear int8[N*K], then transpose to row-major Bi8[K*N] for the CPU ref */
-        int8_t *lin=malloc((size_t)N*K); ork_slice_direct_inflate_i8(src[e],lin,0); /* UNIFORM (matches pack default) */
+        int8_t *lin=malloc((size_t)N*K); ork_i8_slice_direct_inflate(src[e],lin,0); /* UNIFORM (matches pack default) */
         Bi8[e]=malloc((size_t)K*N);
         for(int n=0;n<N;n++)for(int k=0;k<K;k++) Bi8[e][(size_t)k*N+n]=lin[(size_t)n*K+k];
         free(lin);
@@ -198,7 +198,7 @@ static int run_int8_maponly(ork_npu*c,int K,int N){
     /* fill once with arbitrary int4 src inflated to int8 (we only care about the map cost) */
     float *f32=malloc((size_t)N*K*sizeof(float)),*bsc=malloc((size_t)N*sizeof(float));
     for(size_t i=0;i<(size_t)N*K;i++) f32[i]=0.01f;
-    ork_w*src=ork_mm_pack_i4a8(c,K,N,f32,bsc);
+    ork_w*src=ork_i4a8_mm_pack(c,K,N,f32,bsc);
     ork_stage_fill(c,S,src);                              /* ONE fill; stays resident in the bare dma-buf */
     double samp[REPS];
     for(int i=0;i<WARM;i++){ ork_stage_map(c,S); ork_stage_unmap(c,S); }
@@ -209,39 +209,39 @@ static int run_int8_maponly(ork_npu*c,int K,int N){
     return 0;
 }
 
-/* ---- Phase 2 validation: ork_mm_load_i4a8_import + ork_stream_pool_* bit-exact vs CPU ref ---- */
+/* ---- Phase 2 validation: ork_i4a8_mm_load_import + ork_stream_pool_* bit-exact vs CPU ref ---- */
 static int validate_pool(ork_npu*c){
     int K=2048,N=512,M=8,rc=0;
     printf("=== Phase 2 validation (load_i4a8_import + ork_stream_pool_*) K=%d N=%d M=%d ===\n",K,N,M);
     float *f32=malloc((size_t)N*K*sizeof(float)),*bsc=malloc((size_t)N*sizeof(float));
     unsigned s=0xABCD; for(size_t i=0;i<(size_t)N*K;i++){ s=s*1664525u+1013904223u; f32[i]=((s>>8)*(1.0f/16777216.0f)-0.5f)*0.2f; }
-    ork_w*wp=ork_mm_pack_i4a8(c,K,N,f32,bsc); if(!wp){ printf("  pack_i4a8 failed\n"); return 1; }
-    size_t i4sz=ork_w_dump_i4a8(wp,NULL,0); void*i4blob=malloc(i4sz); ork_w_dump_i4a8(wp,i4blob,i4sz);
+    ork_w*wp=ork_i4a8_mm_pack(c,K,N,f32,bsc); if(!wp){ printf("  pack_i4a8 failed\n"); return 1; }
+    size_t i4sz=ork_i4a8_w_dump(wp,NULL,0); void*i4blob=malloc(i4sz); ork_i4a8_w_dump(wp,i4blob,i4sz);
     /* CPU ref from the inflated int8 codes (row-major) */
-    int8_t*lin=malloc((size_t)N*K); ork_slice_direct_inflate_i8(wp,lin,0);
+    int8_t*lin=malloc((size_t)N*K); ork_i8_slice_direct_inflate(wp,lin,0);
     int8_t*Bi8=malloc((size_t)K*N); for(int n=0;n<N;n++)for(int k=0;k<K;k++) Bi8[(size_t)k*N+n]=lin[(size_t)n*K+k]; free(lin);
     int8_t*A=malloc((size_t)M*K); for(size_t i=0;i<(size_t)M*K;i++){ s=s*1103515245+12345; A[i]=(int8_t)(((s>>16)%5)-2); }
     int32_t*Cref=malloc((size_t)M*N*4),*C=malloc((size_t)M*N*4); ref_i8(M,K,N,A,Bi8,Cref);
     ork_mm_free(c,wp);
 
-    /* (1) ork_mm_load_i4a8_import vs CPU ref */
-    ork_w*wi=ork_mm_load_i4a8_import(c,K,N,i4blob,i4sz);
+    /* (1) ork_i4a8_mm_load_import vs CPU ref */
+    ork_w*wi=ork_i4a8_mm_load_import(c,K,N,i4blob,i4sz);
     if(!wi){ printf("  load_i4a8_import NULL (import unavailable)\n"); rc=2; }
-    else { ork_mm_run_i8(c,wi,M,A,C); int bad=memcmp(C,Cref,(size_t)M*N*4)?1:0;
+    else { ork_i8_mm_run(c,wi,M,A,C); int bad=memcmp(C,Cref,(size_t)M*N*4)?1:0;
         printf("  load_i4a8_import: %s vs CPU ref\n",bad?"WRONG":"ok"); rc|=bad; ork_mm_free(c,wi); }
 
     /* (2) ork_stream_pool: add i4a8 entry, map/run/unmap thrice (cache-hit remap), check each */
     ork_stream_pool*pool=ork_stream_pool_create(c);
     if(!pool){ printf("  pool_create NULL (import unavailable)\n"); rc=(rc==2)?2:rc; goto done; }
-    ork_stream_entry*e4=ork_stream_pool_add_i4a8(pool,K,N,i4blob,i4sz);
+    ork_stream_entry*e4=ork_i4a8_stream_pool_add(pool,K,N,i4blob,i4sz);
     if(!e4){ printf("  pool_add_i4a8 NULL\n"); rc=1; }
     else { int bad=0; for(int it=0;it<3;it++){ ork_stream_pool_map(pool,e4); ork_stream_pool_run(pool,e4,M,A,C);
             if(memcmp(C,Cref,(size_t)M*N*4)) bad++; ork_stream_pool_unmap(pool,e4); }
         printf("  pool i4a8 (3 map/run/unmap cycles): %s  (entry RAM=%.2f MiB)\n",bad?"WRONG":"ok",(double)ork_stream_entry_bytes(e4)/1048576.0); rc|=bad; }
 
     /* (3) ork_stream_pool: add i8 entry (from an int8 dump of the SAME weights) */
-    ork_w*w8=ork_mm_pack_i8(c,K,N,Bi8); size_t i8sz=ork_w_dump(w8,NULL,0); void*i8blob=malloc(i8sz); ork_w_dump(w8,i8blob,i8sz); ork_mm_free(c,w8);
-    ork_stream_entry*e8=ork_stream_pool_add_i8(pool,K,N,i8blob,i8sz);
+    ork_w*w8=ork_i8_mm_pack(c,K,N,Bi8); size_t i8sz=ork_w_dump(w8,NULL,0); void*i8blob=malloc(i8sz); ork_w_dump(w8,i8blob,i8sz); ork_mm_free(c,w8);
+    ork_stream_entry*e8=ork_i8_stream_pool_add(pool,K,N,i8blob,i8sz);
     if(!e8){ printf("  pool_add_i8 NULL\n"); rc=1; }
     else { ork_stream_pool_map(pool,e8); ork_stream_pool_run(pool,e8,M,A,C); int bad=memcmp(C,Cref,(size_t)M*N*4)?1:0; ork_stream_pool_unmap(pool,e8);
         printf("  pool i8: %s vs CPU ref\n",bad?"WRONG":"ok"); rc|=bad; }
@@ -249,7 +249,7 @@ static int validate_pool(ork_npu*c){
 
     /* (4) remove + re-add (evict then reload), check still correct + no crash */
     if(e4){ ork_stream_pool_remove(pool,e4);
-        ork_stream_entry*e4b=ork_stream_pool_add_i4a8(pool,K,N,i4blob,i4sz);
+        ork_stream_entry*e4b=ork_i4a8_stream_pool_add(pool,K,N,i4blob,i4sz);
         if(e4b){ ork_stream_pool_map(pool,e4b); ork_stream_pool_run(pool,e4b,M,A,C); int bad=memcmp(C,Cref,(size_t)M*N*4)?1:0; ork_stream_pool_unmap(pool,e4b);
             printf("  pool evict+reload: %s\n",bad?"WRONG":"ok"); rc|=bad; } }
     ork_stream_pool_free(pool);

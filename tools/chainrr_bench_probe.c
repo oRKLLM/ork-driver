@@ -1,5 +1,5 @@
 /* chainrr_bench_probe — throughput: N attention-core chains via ork_mm_run_chains_rr (concurrent, all cores)
- * vs the same N run sequentially on core 0 (ork_mm_run_chain_i8_ffn_exp). Reports chains/s + speedup. Steady
+ * vs the same N run sequentially on core 0 (ork_i8_mm_run_chain_ffn_exp). Reports chains/s + speedup. Steady
  * state: warm cores + one warmup pass to populate the per-core LUT/task caches, then R timed repeats. Run with
  * ORK_CHAIN_LUT_STICKY=1 so the ~148us/core LUT-load is amortized (the prefill-queue case).
  *   sudo env ORK_CHAIN_LUT_STICKY=1 ORK_MM_TIMEOUT=3000 ./chainrr_bench_probe [nchains] [repeats] [Nq]
@@ -31,8 +31,8 @@ int main(int argc,char**argv){
     int8_t *Qp=calloc((size_t)Nq*Kp,1), *KTp=calloc((size_t)Kp*Nk,1);
     for(int i=0;i<Nq;i++)for(int k=0;k<d;k++) Qp[(size_t)i*Kp+k]=Q[(size_t)i*d+k];
     for(int k=0;k<d;k++)for(int j=0;j<Nk;j++) KTp[(size_t)k*Nk+j]=K[(size_t)j*d+k];
-    ork_w *w_kt=ork_mm_pack_i8(c,Kp,Nk,KTp), *w_v=ork_mm_pack_i8(c,Nk,dv,V), *w_ones;
-    { int8_t *o=malloc((size_t)Nk*32); memset(o,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,o); free(o); }
+    ork_w *w_kt=ork_i8_mm_pack(c,Kp,Nk,KTp), *w_v=ork_i8_mm_pack(c,Nk,dv,V), *w_ones;
+    { int8_t *o=malloc((size_t)Nk*32); memset(o,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,o); free(o); }
     if(!w_kt||!w_v||!w_ones){ printf("pack fail\n"); return 2; }
     /* per-chain IO buffers (intermediates MUST be per-chain so concurrent chains don't collide) */
     ork_mm_task_i8 **chains=calloc(NCH,sizeof*chains); int *S=calloc(NCH,sizeof*S);
@@ -45,9 +45,9 @@ int main(int argc,char**argv){
         chains[ch][3]=(ork_mm_task_i8){ w_v,Nq,(int8_t*)eb,avb };
     }
     /* warm all cores (prefill precondition) + one warmup pass each path to populate per-core caches */
-    { int32_t *wc=calloc((size_t)Nq*Nk,4); ork_mm_task_i8 wt={ w_kt, Nq, Qp, wc }; ork_mm_run_chain_i8(c,1,&wt); free(wc); }
+    { int32_t *wc=calloc((size_t)Nq*Nk,4); ork_mm_task_i8 wt={ w_kt, Nq, Qp, wc }; ork_i8_mm_run_chain(c,1,&wt); free(wc); }
     ork_mm_run_chains_rr(c,NCH,(const ork_mm_task_i8*const*)chains,S,ops,in_scale,out_scale);
-    for(int ch=0;ch<NCH;ch++) ork_mm_run_chain_i8_ffn_exp(c,S[ch],chains[ch],ops,in_scale,out_scale);
+    for(int ch=0;ch<NCH;ch++) ork_i8_mm_run_chain_ffn_exp(c,S[ch],chains[ch],ops,in_scale,out_scale);
 
     /* timed: concurrent round-robin */
     double t0=now_ms();
@@ -55,7 +55,7 @@ int main(int argc,char**argv){
     double rr_ms=(now_ms()-t0)/REP;
     /* timed: single-core sequential (core 0) */
     t0=now_ms();
-    for(int r=0;r<REP;r++){ for(int ch=0;ch<NCH;ch++){ int rc=ork_mm_run_chain_i8_ffn_exp(c,S[ch],chains[ch],ops,in_scale,out_scale); if(rc){printf("sc rc=%d\n",rc);return 1;} } }
+    for(int r=0;r<REP;r++){ for(int ch=0;ch<NCH;ch++){ int rc=ork_i8_mm_run_chain_ffn_exp(c,S[ch],chains[ch],ops,in_scale,out_scale); if(rc){printf("sc rc=%d\n",rc);return 1;} } }
     double sc_ms=(now_ms()-t0)/REP;
 
     printf("  single-core (core0 seq): %8.2f ms/pass  %8.1f chains/s\n", sc_ms, NCH*1e3/sc_ms);

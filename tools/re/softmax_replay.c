@@ -21,7 +21,7 @@ int main(void){
     memset(out,0,sizeof out);
 
     double us=0;
-    int r=ork_npu_replay_softmax_f16(c, in, out, &us);
+    int r=ork_f16_npu_replay_softmax(c, in, out, &us);
     printf("replay_softmax rc=%d (%.1f us)\n", r, us);
     if(r){ ork_npu_free(c); return r==-3?0:1; }
 

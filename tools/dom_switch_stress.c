@@ -43,8 +43,8 @@ int main(int argc,char**argv){
     g_s=0x3333u; for(int i=0;i<M*K;i++) A[i]=rnd8();
     if(!noref){ ref_i8(M,K,N,A,B1,R1); ref_i8(M,K,N,A,B2,R2); }
 
-    ork_npu_set_pack_domain(c,d1); ork_w *w1=ork_mm_pack_i8(c,K,N,B1);
-    ork_npu_set_pack_domain(c,d2); ork_w *w2=ork_mm_pack_i8(c,K,N,B2);
+    ork_npu_set_pack_domain(c,d1); ork_w *w1=ork_i8_mm_pack(c,K,N,B1);
+    ork_npu_set_pack_domain(c,d2); ork_w *w2=ork_i8_mm_pack(c,K,N,B2);
     if(!w1||!w2){ fprintf(stderr,"pack failed (w1=%p w2=%p) — already wedged?\n",(void*)w1,(void*)w2); return 1; }
 
     printf("dom_switch_stress: d1=%d d2=%d, %d iters (1 domain switch/iter)\n", d1, d2, iters);
@@ -52,7 +52,7 @@ int main(int argc,char**argv){
     for(int i=0;i<iters;i++){
         ork_w *w = (i&1) ? w2 : w1;              /* alternate -> a domain switch every iter */
         int32_t *ref = (i&1) ? R2 : R1;
-        int rc = ork_mm_run_i8(c, w, M, A, C);
+        int rc = ork_i8_mm_run(c, w, M, A, C);
         if(rc!=0){ printf("*** WEDGE at iter %d (after %d clean switches): run_i8 rc=%d (dom %d) ***\n", i, switches, rc, (i&1)?d2:d1); fflush(stdout); return 1; }
         if(!noref && memcmp(C,ref,(size_t)M*N*4)!=0){ printf("*** MISMATCH at iter %d (dom %d) after %d clean switches ***\n", i, (i&1)?d2:d1, switches); fflush(stdout); return 1; }
         switches++;

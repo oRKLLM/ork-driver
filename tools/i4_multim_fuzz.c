@@ -1,7 +1,7 @@
 /* tools/i4_multim_fuzz.c — INT4 multi-M K-schedule fuzzer (RE), state-saving + wedge-resumable.
  *
  * Resurrects the fuzzer that discovered native int4 multi-M (Exp-2026-06-19) — but rewritten to drive the
- * REAL synth_i4 in src/npu.c through the public ork_i4_fuzz_add/clear + ork_npu_probe_i4_mm hooks (the old
+ * REAL synth_i4 in src/npu.c through the public ork_i4_fuzz_add/clear + ork_i4_npu_probe_mm hooks (the old
  * copy duplicated npu.c internals and silently drifted out of sync). Re-pointed at the REMAINING wall
  * (Exp-2026-07-07): native batch mode is bit-exact at the capture K=64 (mregs=0x1f, reg 0x1040 left at its
  * base), but at production K (>=512) only row 0 computes. The int4 K-reduction schedule (reg 0x1040) and/or
@@ -127,14 +127,14 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=r4();
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){int s=0;for(int k=0;k<K;k++)s+=A[(size_t)m*K+k]*B[(size_t)k*N+n];ref[(size_t)m*N+n]=s;}
 
-    setenv("ORK_I4_ALAY","1",1);   /* per-row contiguous A (Exp-2026-06-19); ork_npu_probe_i4_mm honors it */
+    setenv("ORK_I4_ALAY","1",1);   /* per-row contiguous A (Exp-2026-06-19); ork_i4_npu_probe_mm honors it */
     /* short submit timeout so a wedging candidate fails FAST in-process (kernel times out the job, ~1.5s)
      * and the next probe's ACT_RESET recovers the NPU — the whole sweep runs in one process, no external
      * kill needed. Overridable; the external `timeout -s INT` is only a backstop for a true hard hang. */
     if(!getenv("ORK_I4_PROBE_TO_MS")) setenv("ORK_I4_PROBE_TO_MS","1500",1);
 
     ork_i4_fuzz_clear();
-    int base=(ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
+    int base=(ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw)==0)?score_rows(raw,ref,M,N):-1;
     if(!strcmp(mode,"base")){ printf("K=%d M=%d N=%d -> rows %d\n",K,M,N,base); ork_npu_free(ctx); return 0; }
     /* stream: attempt int4 STREAMING by applying int8-stream's config to int4 (from the synth_i8 vs synth_i4
      * diff): contiguous output-stride (0x405c=(M-1)<<16), M-count=M (not 2M), 0x4038 out-width, and sweep the
@@ -159,7 +159,7 @@ int main(int argc,char**argv){
             ork_i4_fuzz_add(0x1001,0x405c,(uint32_t)(M-1)<<16);                          /* contiguous M-stride (stream) */
             ork_i4_fuzz_add(0x1001,0x4038,(uint32_t)((((N/4)-1)<<16)|((N/4)-1)));
             ork_i4_fuzz_add(0x201,0x1040,sch);                                           /* K-reduction schedule */
-            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
             int hit=0; if(rc==0) for(int m=0;m<M;m++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw[(size_t)m*N+n]!=ref[(size_t)m*N+n]) ok=0; if(ok) hit++; }
             printf("  0x1040=0x%03x -> %d contiguous rows (rc=%d)%s\n",sch,hit,rc, hit>cap?"  <<< STREAMING!":"");
             if(hit>best) best=hit;
@@ -189,7 +189,7 @@ int main(int argc,char**argv){
             ork_i4_fuzz_add(0x1001,0x4034,(uint32_t)(M-1)); ork_i4_fuzz_add(0x801,0x3014,(uint32_t)(M-1)<<16);
             ork_i4_fuzz_add(0x1001,0x405c,(uint32_t)(M-1)<<16); ork_i4_fuzz_add(0x1001,0x4038,(uint32_t)((((N/4)-1)<<16)|((N/4)-1)));
             ork_i4_fuzz_add(0x201,0x107c,es[a]); ork_i4_fuzz_add(0x201,0x1044,kp[b2]); ork_i4_fuzz_add(0x201,0x1040,sc[cc]);
-            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
             int hit=0; if(rc==0) for(int m=0;m<M;m++){int ok=1; for(int n=0;n<N&&ok;n++) if(raw[(size_t)m*N+n]!=ref[(size_t)m*N+n])ok=0; if(ok)hit++;}
             if(hit>cap) printf("  0x107c=%u 0x1044=%u 0x1040=0x%x alay=%d -> %d rows (rc=%d)  <<< STREAMING!\n",es[a],kp[b2],sc[cc],alay,hit,rc);
             if(hit>best){best=hit;bcfg[0]=es[a];bcfg[1]=kp[b2];bcfg[2]=sc[cc];bcfg[3]=(uint32_t)alay;}
@@ -214,14 +214,14 @@ int main(int argc,char**argv){
             for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw8[off+n]!=ref8[(size_t)m*N+n]) ok=0; if(ok){at=(long)off;break;} } \
             printf(" %d:%s%ld", m, at<0?"X":"", at<0?0:at/N); } printf("\n"); }while(0)
         ork_i8_fuzz_clear();
-        int rc1=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        int rc1=ork_i8_npu_probe_mm(ctx,M,K,N,A8,B8,raw8);
         printf("  STREAM (baseline, rc=%d):\n",rc1); if(rc1==0) ROWMAP("stream");
         ork_i8_fuzz_clear();
         ork_i8_fuzz_add(0x1001,0x405c,0);                                         /* the batch trigger */
         ork_i8_fuzz_add(0x201,0x1020,0x10000u|(2*M)); ork_i8_fuzz_add(0x201,0x1084,0x10000u|(2*M)); ork_i8_fuzz_add(0x201,0x102c,(uint32_t)(2*M));
         ork_i8_fuzz_add(0x1001,0x4034,(uint32_t)(2*M-1)); ork_i8_fuzz_add(0x801,0x3014,(uint32_t)(2*M-1)<<16);
         setenv("ORK_I8_PROBE_SCHED","0",1);                                       /* no 0x1040 streaming schedule (batch) */
-        int rc2=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        int rc2=ork_i8_npu_probe_mm(ctx,M,K,N,A8,B8,raw8);
         printf("  BATCH (0x405c=0 + mc_phys=2M + NO sched, rc=%d):\n",rc2); if(rc2==0) ROWMAP("batch");
         unsetenv("ORK_I8_PROBE_SCHED");
         printf("[i8batch] done — physrow=m means contiguous(stream); physrow=2m means stride-2(batch); X=not found\n");
@@ -254,14 +254,14 @@ int main(int argc,char**argv){
         if(done==-2){ printf("[i8fuzz] DONE (rm i4_fuzz_state.txt)\n"); return 0; }
         if(inflight>=0 && inflight<nc8){ printf("[i8fuzz] cand %d (reg %x/%x) WEDGED -> blacklist\n",inflight,cs8[inflight].blk,cs8[inflight].reg); blacklist(cs8[inflight].blk,cs8[inflight].reg); if(done<=inflight)done=inflight+1; }
         /* baseline stream */
-        ork_i8_fuzz_clear(); ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+        ork_i8_fuzz_clear(); ork_i8_npu_probe_mm(ctx,M,K,N,A8,B8,raw8);
         int bmoved,bcont; LAYSIG(&bmoved,&bcont);
         printf("[i8fuzz] K=%d M=%d N=%d: baseline stream contig=%d moved=%d; %d candidates from %d — flag LAYOUT CHANGE (moved>0, not garbage)\n",K,M,N,bcont,bmoved,nc8,done);
         for(int i=done;i<nc8;i++){
             if(blacklisted(cs8[i].blk,cs8[i].reg)){ write_state(i+1,-1); continue; }
             write_state(i,i);
             ork_i8_fuzz_clear(); ork_i8_fuzz_add(cs8[i].blk,cs8[i].reg,cs8[i].val);
-            int rc=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+            int rc=ork_i8_npu_probe_mm(ctx,M,K,N,A8,B8,raw8);
             write_state(i+1,-1);
             if(rc==0){ int mv,ct; LAYSIG(&mv,&ct);
                 if(mv>0) printf("  LAYOUT reg %x/%x=0x%x -> contig=%d MOVED=%d  <<< batch-stride candidate\n",cs8[i].blk,cs8[i].reg,cs8[i].val,ct,mv); }
@@ -291,14 +291,14 @@ int main(int argc,char**argv){
         int done,inflight; read_state(&done,&inflight);
         if(done==-2){ printf("[f16fuzz] DONE (rm i4_fuzz_state.txt)\n"); return 0; }
         if(inflight>=0 && inflight<ncf){ printf("[f16fuzz] cand %d (reg %x/%x) WEDGED -> blacklist\n",inflight,csf[inflight].blk,csf[inflight].reg); blacklist(csf[inflight].blk,csf[inflight].reg); if(done<=inflight)done=inflight+1; }
-        ork_f16_fuzz_clear(); ork_npu_probe_f16_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
+        ork_f16_fuzz_clear(); ork_f16_npu_probe_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
         int bmv,bct; LAYSIGF(&bmv,&bct);
         printf("[f16fuzz] K=%d M=%d N=%d: baseline stream contig=%d moved=%d; %d cands from %d\n",K,M,N,bct,bmv,ncf,done);
         for(int i=done;i<ncf;i++){
             if(blacklisted(csf[i].blk,csf[i].reg)){ write_state(i+1,-1); continue; }
             write_state(i,i);
             ork_f16_fuzz_clear(); ork_f16_fuzz_add(csf[i].blk,csf[i].reg,csf[i].val);
-            int rc=ork_npu_probe_f16_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
+            int rc=ork_f16_npu_probe_mm(ctx,M,K,N,(unsigned short*)A16,(unsigned short*)B16,rawf);
             write_state(i+1,-1);
             if(rc==0){ int mv,ct; LAYSIGF(&mv,&ct); if(mv>0) printf("  LAYOUT reg %x/%x=0x%x -> contig=%d MOVED=%d  <<< batch-stride candidate\n",csf[i].blk,csf[i].reg,csf[i].val,ct,mv); }
             if((i%64)==0) printf("  [..%d/%d]\n",i,ncf);
@@ -318,7 +318,7 @@ int main(int argc,char**argv){
         uint32_t vals[]={0,1,2,3,4,8};
         for(unsigned vi=0; vi<sizeof vals/sizeof*vals; vi++){
             ork_i8_fuzz_clear(); if(vals[vi]) ork_i8_fuzz_add(0x201,vr,vals[vi]);
-            int rc=ork_npu_probe_i8_mm(ctx,M,K,N,A8,B8,raw8);
+            int rc=ork_i8_npu_probe_mm(ctx,M,K,N,A8,B8,raw8);
             printf("  0x%x=0x%x (rc=%d) row->physrow:",vr,vals[vi],rc);
             if(rc==0) for(int m=0;m<M;m++){ long at=-1;
                 for(size_t off=0; off+N<=(size_t)2*M*N; off++){ int ok=1; for(int n=0;n<N&&ok;n++) if(raw8[off+n]!=ref8[(size_t)m*N+n]) ok=0; if(ok){at=(long)off;break;} }
@@ -338,14 +338,14 @@ int main(int argc,char**argv){
         for(int m=0;m<M;m++)for(int n=0;n<WN;n++){int s=0;for(int k=0;k<K;k++)s+=A[(size_t)m*K+k]*B2[(size_t)k*WN+n];ref2[(size_t)m*WN+n]=s;}
         int32_t blk1[64]; for(int c=0;c<64;c++) blk1[c]=ref2[64+c];   /* row0, block1 (n=64..127) */
         setenv("ORK_I4_ALAY","1",1);
-        ork_i4_fuzz_clear(); ork_npu_probe_i4_mm(ctx,M,K,WN,A,B2,raw2);
+        ork_i4_fuzz_clear(); ork_i4_npu_probe_mm(ctx,M,K,WN,A,B2,raw2);
         int base_b1=vec_in_raw(raw2,(size_t)2*M*WN,blk1);
         printf("[wtest] reg %x/%x @ K=%d M=%d WN=128: baseline blk1 present=%d (hunting lift to 1)\n",vb,vr,K,M,base_b1);
         uint32_t vals[]={0,1,2,4,8,16,32,64,128,256,512,(uint32_t)(K/16),(uint32_t)(K/8),(uint32_t)(K/4),
                          (uint32_t)(K*WN/2),(uint32_t)(K*WN),0xff,0x100,0x200,0x400};
         for(unsigned i=0;i<sizeof vals/sizeof*vals;i++){
             ork_i4_fuzz_clear(); ork_i4_fuzz_add(vb,vr,vals[i]);
-            ork_npu_probe_i4_mm(ctx,M,K,WN,A,B2,raw2);
+            ork_i4_npu_probe_mm(ctx,M,K,WN,A,B2,raw2);
             int b1=vec_in_raw(raw2,(size_t)2*M*WN,blk1);
             if(b1>base_b1) printf("  0x%-6x -> blk1=%d  <<< WEIGHT-BANK LEVER\n",vals[i],b1);
         }
@@ -359,7 +359,7 @@ int main(int argc,char**argv){
         printf("[vsweep] reg %x/%x @ K=%d M=%d (base rows %d):\n",vb,vr,K,M,base);
         for(uint32_t v=0; v<=0x200; v++){
             ork_i4_fuzz_clear(); ork_i4_fuzz_add(vb,vr,v);
-            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
             int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
             if(rows>base||rows<0||(v%64)==0) printf("  0x%03x -> rows %d%s\n",v,rows,rows>base?"  <<":"");
         }
@@ -381,7 +381,7 @@ int main(int argc,char**argv){
         for(int i=done;i<nb;i++){
             write_state(i,i); fflush(stdout);
             ork_i4_fuzz_clear(); ork_i4_fuzz_add(bb,br,bvals[i]);
-            int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+            int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
             int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
             write_state(i+1,-1);
             printf("  0x%-4x -> rows %d%s\n",bvals[i],rows,rows>base?"  <<< BANK LEVER":"");
@@ -412,7 +412,7 @@ int main(int argc,char**argv){
         write_state(i,i); fflush(stdout);                       /* in-flight BEFORE submit (wedge trace) */
         ork_i4_fuzz_clear(); ork_i4_fuzz_add(cs[i].blk,cs[i].reg,cs[i].val);
         if(cs[i].blk2) ork_i4_fuzz_add(cs[i].blk2,cs[i].reg2,cs[i].val2);
-        int rc=ork_npu_probe_i4_mm(ctx,M,K,N,A,B,raw);
+        int rc=ork_i4_npu_probe_mm(ctx,M,K,N,A,B,raw);
         int rows=(rc==0)?score_rows(raw,ref,M,N):-1;
         write_state(i+1,-1);
         if(rows>base){ printf("  HIT  reg %x/%x=0x%x %s -> rows %d (base %d) %s\n",

@@ -1,5 +1,5 @@
 /* examples/test_ewmul_f16.c — validate the on-NPU fp16 element-wise MULTIPLY vs a CPU reference.
- * ork_npu_ewmul_f16 computes out[m][n] = up[m][n]*silu[m][n] in fp16 on the NPU (standalone SDP fp16 op,
+ * ork_f16_npu_ewmul computes out[m][n] = up[m][n]*silu[m][n] in fp16 on the NPU (standalone SDP fp16 op,
  * NVDLA feature-cube marshaled internally). Each case checks vs the CPU fp16 product; exits nonzero on error.
  * Runs several (M,N) shapes to exercise the generalized geometry (N must be a multiple of 8 for fp16 atom-8).
  * Skips gracefully (exit 0) off-board / on a non-PPU SoC.
@@ -16,7 +16,7 @@
 static int run_case(ork_npu *c, const char *name, int M, int N, const ork_f16 *up, const ork_f16 *si){
     static ork_f16 out[MAXE];
     double us = 0;
-    int r = ork_npu_ewmul_f16(c, up, si, M, N, out, &us);
+    int r = ork_f16_npu_ewmul(c, up, si, M, N, out, &us);
     if (r) { printf("  %-12s [%dx%-4d] FAIL (rc=%d)\n", name, M, N, r); return 1; }
     int bad = 0; float mx = 0;
     for (int i = 0; i < M*N; i++) {

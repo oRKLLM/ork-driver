@@ -25,14 +25,14 @@ static ork_w *norm_reduce_w(ork_npu *c,int n){
     if(orki_ones_w){ ork_mm_free(orki_ones_ctx,orki_ones_w); orki_ones_w=NULL; }
     f16 *ones=malloc((size_t)n*16*sizeof(f16)); if(!ones) return NULL;
     for(size_t i=0;i<(size_t)n*16;i++) ones[i]=(f16)1.0f;
-    orki_ones_w=ork_mm_pack(c,n,16,ones); free(ones);
+    orki_ones_w=ork_f16_mm_pack(c,n,16,ones); free(ones);
     if(orki_ones_w){ orki_ones_n=n; orki_ones_ctx=c; }
     return orki_ones_w;
 }
 
 /* rmsnorm/l2norm: reduction sum(x^2) on the NPU (ork_norm_reduce_npu, any n via K-split) when ORK_NORM_NPU
  * is set; rsqrt + scale on CPU. Validated 0.0005 vs the CPU ref. (The fully-fused single-submit reduce+rsqrt
- * — ork_mm_build_f16_rsqrt_lut, validated 0.0012 standalone for n<=2048 in test_bmm's rsqrt test — is the
+ * — ork_f16_mm_build_rsqrt_lut, validated 0.0012 standalone for n<=2048 in test_bmm's rsqrt test — is the
  * building block for a one-submit on-NPU norm; wiring it into the general path needs LUT pre-calibration, so
  * the shipped norm keeps rsqrt on CPU for robustness across all n.) The ork_norm_rsqrt_npu helper above is
  * the decoupled K=32 rsqrt op, kept for that follow-up. */
@@ -43,7 +43,7 @@ int ork_norm_reduce_npu(ork_npu *c,int M,int n,const f16 *x,float *ss_out){
     int rc=-1;
     if(sq&&ss16){
         for(size_t i=0;i<(size_t)M*n;i++){ float v=(float)x[i]; sq[i]=(f16)(v*v); }
-        if(ork_mm_run(c,ow,M,sq,ss16)==0){ for(int m=0;m<M;m++) ss_out[m]=ss16[(size_t)m*16]; rc=0; }
+        if(ork_f16_mm_run(c,ow,M,sq,ss16)==0){ for(int m=0;m<M;m++) ss_out[m]=ss16[(size_t)m*16]; rc=0; }
     }
     free(sq); free(ss16); return rc;
 }
@@ -55,10 +55,10 @@ static int rsqrt_lut_ensure(ork_npu *c,int nf,double eps,double ss_lo,double ss_
     double lo=ss_lo*0.9, hi=ss_hi*1.15; if(hi<=0) return -1;
     double fl=(double)nf*eps; if(lo<fl) lo=fl; if(lo>=hi) lo=hi*0.5;
     double S,R,osc; int16_t lut[1030];
-    if(ork_mm_build_f16_rsqrt_lut(c,nf,eps,lo,hi,lut,&S,&R,&osc)) return -1;
+    if(ork_f16_mm_build_rsqrt_lut(c,nf,eps,lo,hi,lut,&S,&R,&osc)) return -1;
     f16 *B=malloc((size_t)ORK_RSQRT_KD*16*sizeof(f16)); if(!B) return -1;
     for(int i=0;i<ORK_RSQRT_KD*16;i++) B[i]=(f16)(-S*hi/(double)ORK_RSQRT_KD);   /* acc = sum_k (ss/hi)*(-S*hi/Kd) = -S*ss */
-    ork_w *wS=ork_mm_pack(c,ORK_RSQRT_KD,16,B); free(B); if(!wS) return -1;
+    ork_w *wS=ork_f16_mm_pack(c,ORK_RSQRT_KD,16,B); free(B); if(!wS) return -1;
     if(orki_rs.wS) ork_mm_free(orki_rs.c,orki_rs.wS);
     memcpy(orki_rs.lut,lut,sizeof lut); orki_rs.wS=wS; orki_rs.c=c; orki_rs.nf=nf; orki_rs.eps=eps; orki_rs.lo=lo; orki_rs.hi=hi; orki_rs.osc=osc; orki_rs.valid=1;
     return 0;
@@ -71,7 +71,7 @@ int ork_norm_rsqrt_npu(ork_npu *c,int M,int nf,double eps,const float *ss,float 
     f16 *A=malloc((size_t)M*ORK_RSQRT_KD*sizeof(f16)); float *C=malloc((size_t)M*16*sizeof(float));
     int rc=-1;
     if(A&&C){ for(int m=0;m<M;m++){ f16 v=(f16)(ss[m]/G); for(int k=0;k<ORK_RSQRT_KD;k++) A[(size_t)m*ORK_RSQRT_KD+k]=v; } /* dense ss/G */
-        if(ork_mm_run_f16_silu(c,orki_rs.wS,M,A,C,0,0xffffc000u,0x56391100u,orki_rs.lut,1030)==0){
+        if(ork_f16_mm_run_silu(c,orki_rs.wS,M,A,C,0,0xffffc000u,0x56391100u,orki_rs.lut,1030)==0){
             for(int m=0;m<M;m++) scale[m]=(float)((double)C[(size_t)m*16]*orki_rs.osc); rc=0; } }
     free(A); free(C); return rc;
 }
@@ -83,7 +83,7 @@ void ork_fwht_norm(float *v, int n){
     float s=1.0f/sqrtf((float)n);
     for(int i=0;i<n;i++) v[i]*=s;
 }
-int ork_npu_rmsnorm_f16(ork_npu *c,int M,int n,const f16 *x,const f16 *w,float eps,f16 *out){
+int ork_f16_npu_rmsnorm(ork_npu *c,int M,int n,const f16 *x,const f16 *w,float eps,f16 *out){
     if(!c||!x||!w||!out||M<1||n<1) return -2;
     float *ss=malloc((size_t)M*sizeof(float)), *sc=malloc((size_t)M*sizeof(float)); int have_ss=0, have_sc=0;
     if(ss && ork_norm_reduce_npu(c,M,n,x,ss)==0) have_ss=1;                 /* sum(x^2) on NPU (any n) */
@@ -96,7 +96,7 @@ int ork_npu_rmsnorm_f16(ork_npu *c,int M,int n,const f16 *x,const f16 *w,float e
     free(ss); free(sc); return 0;
 }
 
-int ork_npu_l2norm_f16(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
+int ork_f16_npu_l2norm(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
     if(!c||!x||!out||M<1||n<1) return -2;
     float *ss=malloc((size_t)M*sizeof(float)), *sc=malloc((size_t)M*sizeof(float)); int have_ss=0, have_sc=0;
     if(ss && ork_norm_reduce_npu(c,M,n,x,ss)==0) have_ss=1;
@@ -108,7 +108,7 @@ int ork_npu_l2norm_f16(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
         for(int i=0;i<n;i++) o[i]=(f16)((float)xr[i]*s); }
     free(ss); free(sc); return 0;
 }
-int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out){
+int ork_f16_npu_rope_neox(ork_npu *c, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out){
     if(!c||!x||!pos||!out||hd<2||(hd&7)||nrow<1) return -2;
     int hd2=hd/2; size_t sz=(size_t)nrow*hd*sizeof(ork_f16);
     ork_f16 *cosT=malloc(sz),*sinT=malloc(sz),*xr=malloc(sz),*t1=malloc(sz),*t2=malloc(sz);
@@ -119,20 +119,20 @@ int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const 
             sinT[(size_t)r*hd+i]=(ork_f16)(-ss); sinT[(size_t)r*hd+i+hd2]=(ork_f16)ss; }
         for(int i=0;i<hd2;i++){ xr[(size_t)r*hd+i]=x[(size_t)r*hd+i+hd2]; xr[(size_t)r*hd+i+hd2]=x[(size_t)r*hd+i]; } }
     int rc=0;
-    if(ork_npu_ewmul_f16(c,x,cosT,nrow,hd,t1,NULL)) rc=-1;
-    else if(ork_npu_ewmul_f16(c,xr,sinT,nrow,hd,t2,NULL)) rc=-1;
-    else if(ork_npu_add_f16(c,t1,t2,nrow,hd,out,NULL)) rc=-1;
+    if(ork_f16_npu_ewmul(c,x,cosT,nrow,hd,t1,NULL)) rc=-1;
+    else if(ork_f16_npu_ewmul(c,xr,sinT,nrow,hd,t2,NULL)) rc=-1;
+    else if(ork_f16_npu_add(c,t1,t2,nrow,hd,out,NULL)) rc=-1;
     free(cosT);free(sinT);free(xr);free(t1);free(t2);
     return rc;
 }
 
 /* On-NPU composed softmax over each row of [M][n]: y = exp(x-max)/Σexp(x-max). Gated ORK_SOFTMAX_NPU.
  * The per-row max and the final normalize (÷Σ) are CPU (cheap per-row scalars); the heavy parts run on the
- * NPU: exp via ork_npu_exp_i16 (int16 SDP LUT; x-max quantized to a shared in_scale so exp maps in*in_scale
+ * NPU: exp via ork_i16_npu_exp (int16 SDP LUT; x-max quantized to a shared in_scale so exp maps in*in_scale
  * -> exp(x-max)), Σ via the reduction-as-matmul (e·ones[n,16], reusing the norm reduce weight). Like the
  * norm this is submit-floor-bound standalone (gated off; the win is fusing into the attention chain). Any
  * NPU-path failure (PPU-fuse off, n%32!=0, exp/reduce error) falls back to the full CPU softmax. 0/ok,-2. */
-int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
+int ork_f16_npu_softmax(ork_npu *c,int M,int n,const f16 *x,f16 *out){
     if(!c||!x||!out||M<1||n<1) return -2;
     float *mx=malloc((size_t)M*sizeof(float)), *e=malloc((size_t)M*n*sizeof(float)), *s=malloc((size_t)M*sizeof(float));
     if(!mx||!e||!s){ free(mx);free(e);free(s); return -1; }
@@ -149,7 +149,7 @@ int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
         int16_t *xi=malloc((size_t)M*n*2), *ei=malloc((size_t)M*n*2);
         if(xi&&ei){
             for(int m=0;m<M;m++) for(int j=0;j<n;j++){ long q=lround(((double)((float)x[(size_t)m*n+j]-mx[m]))/in_scale); if(q<-32768)q=-32768; if(q>32767)q=32767; xi[(size_t)m*n+j]=(int16_t)q; }
-            if(ork_npu_exp_i16(c,xi,M,n,in_scale,out_scale,ei,NULL)==0){                 /* exp(x-max) on NPU */
+            if(ork_i16_npu_exp(c,xi,M,n,in_scale,out_scale,ei,NULL)==0){                 /* exp(x-max) on NPU */
                 for(int m=0;m<M;m++){ double sm=0; for(int j=0;j<n;j++){ double d=(double)ei[(size_t)m*n+j]*out_scale; e[(size_t)m*n+j]=(float)d; sm+=d; } s[m]=(float)sm; }
                 have_npu=1;
             }

@@ -32,7 +32,7 @@ typedef struct { ork_w *w; int K, N; int8_t *B; int32_t *ref; int32_t *C; } WT;
 static void mk(ork_npu *c, WT *t, int K, int N, const int8_t *A){
     t->K=K; t->N=N; t->B=malloc((size_t)K*N);
     for (size_t i=0;i<(size_t)K*N;i++) t->B[i]=(int8_t)((i*131u+7u)&0x7f);
-    t->w=ork_mm_pack_i8(c,K,N,t->B); if(!t->w){ fprintf(stderr,"pack failed K=%d N=%d\n",K,N); exit(1);}
+    t->w=ork_i8_mm_pack(c,K,N,t->B); if(!t->w){ fprintf(stderr,"pack failed K=%d N=%d\n",K,N); exit(1);}
     t->C=calloc((size_t)N,4); t->ref=calloc((size_t)N,4);
     for (int n=0;n<N;n++){ int64_t s=0; for(int k=0;k<K;k++) s+=(int)A[k]*(int)t->B[(size_t)k*N+n]; t->ref[n]=(int32_t)s; }
 }
@@ -58,10 +58,10 @@ int main(void){
     int bad=0; double t0=now_us();
     for (int it=0; it<total; it++){
         g_iter=it;
-        g_phase="run_i8(singleton)";  if(ork_mm_run_i8(c,o.w,1,A,o.C)){ fprintf(stderr,"run_i8 rc!=0 @%d\n",it); bad=1; }  bad|=check(&o,"o",it);
-        g_phase="run_stream(QKV)";    { int rc=ork_mm_run_stream_i8(c,3,qkv); if(rc){ fprintf(stderr,"stream qkv rc=%d @%d\n",rc,it); bad=1; } } bad|=check(&q,"q",it)|check(&k,"k",it)|check(&v,"v",it);
-        g_phase="run_i8(singleton2)"; if(ork_mm_run_i8(c,o.w,1,A,o.C)){ fprintf(stderr,"run_i8 rc!=0 @%d\n",it); bad=1; }  bad|=check(&o,"o2",it);
-        g_phase="run_stream(gate/up)";{ int rc=ork_mm_run_stream_i8(c,2,gu);  if(rc){ fprintf(stderr,"stream gu rc=%d @%d\n",rc,it); bad=1; } } bad|=check(&g,"g",it)|check(&u,"u",it);
+        g_phase="run_i8(singleton)";  if(ork_i8_mm_run(c,o.w,1,A,o.C)){ fprintf(stderr,"run_i8 rc!=0 @%d\n",it); bad=1; }  bad|=check(&o,"o",it);
+        g_phase="run_stream(QKV)";    { int rc=ork_i8_mm_run_stream(c,3,qkv); if(rc){ fprintf(stderr,"stream qkv rc=%d @%d\n",rc,it); bad=1; } } bad|=check(&q,"q",it)|check(&k,"k",it)|check(&v,"v",it);
+        g_phase="run_i8(singleton2)"; if(ork_i8_mm_run(c,o.w,1,A,o.C)){ fprintf(stderr,"run_i8 rc!=0 @%d\n",it); bad=1; }  bad|=check(&o,"o2",it);
+        g_phase="run_stream(gate/up)";{ int rc=ork_i8_mm_run_stream(c,2,gu);  if(rc){ fprintf(stderr,"stream gu rc=%d @%d\n",rc,it); bad=1; } } bad|=check(&g,"g",it)|check(&u,"u",it);
         alarm(60);
         if(bad){ fprintf(stderr,"FAIL: mismatch/error at iter %d\n",it); ork_npu_free(c); return 1; }
     }

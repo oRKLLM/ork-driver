@@ -21,8 +21,8 @@ int main(int argc,char**argv){
         for(int i=0;i<K*N;i++){st=st*1103515245+12345;B[i]=(ork_f16)((st>>16)&1);}
         for(int n=0;n<N;n++) sc[n]=(ork_f16)(n%3);
         double us1=0,us2=0;
-        int rc1=ork_npu_mm_perchan_f16(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)o1,&us1);
-        int rc2=ork_npu_mm_perchan_f16_diag(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)o2,&us2);
+        int rc1=ork_f16_npu_mm_perchan(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)o1,&us1);
+        int rc2=ork_f16_npu_mm_perchan_diag(c,M,K,N,(unsigned short*)A,(unsigned short*)B,(unsigned short*)sc,(unsigned short*)o2,&us2);
         /* bit-exact vs CPU (verify a few rows to bound cost at large N*K) */
         int bad1=0,bad2=0; int MR=M<8?M:8;
         for(int m=0;m<MR;m++)for(int n=0;n<N;n++){ float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];

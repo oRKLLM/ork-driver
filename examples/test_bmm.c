@@ -2,11 +2,11 @@
  * `make test` suite (the examples ARE the tests: each self-validates vs a CPU reference and exits 0/nonzero).
  *
  * Covers:
- *   ork_bmm_i8 / ork_bmm_i4 / ork_bmm_fp16  — batched dynamic GEMM (the attention / GDN-chunk primitive:
+ *   ork_i8_bmm / ork_i4_bmm / ork_bmm_fp16  — batched dynamic GEMM (the attention / GDN-chunk primitive:
  *                                             C[b] = A[b][M,K]·B[b][K,N], BOTH operands dynamic). Per dtype
  *                                             it builds random per-batch A,B, computes a CPU reference, and
  *                                             asserts: i8/i4 EXACT (integer matmul), fp16 within tolerance.
- *   ork_npu_rmsnorm_f16 / ork_npu_l2norm_f16 — gated NPU norm entrypoints (CPU-correct today; the NPU-native
+ *   ork_f16_npu_rmsnorm / ork_f16_npu_l2norm — gated NPU norm entrypoints (CPU-correct today; the NPU-native
  *                                             SDP path is gated off until the LRN-template RE lands). Checked
  *                                             vs a double-precision reference.
  * Exits 0 on all-pass, 1 on any mismatch, 2 if the NPU is unavailable. */
@@ -38,7 +38,7 @@ static int test_int(ork_npu *npu, int is_i4, int nbatch, int M, int K, int N){
             int32_t acc=0; for(int k=0;k<K;k++) acc += (int32_t)A[((size_t)b*M+m)*K+k]*(int32_t)B[((size_t)b*K+k)*N+n];
             Cref[((size_t)b*M+m)*N+n]=acc;
         }
-    int rc = is_i4 ? ork_bmm_i4(npu,nbatch,M,K,N,A,B,C) : ork_bmm_i8(npu,nbatch,M,K,N,A,B,C);
+    int rc = is_i4 ? ork_i4_bmm(npu,nbatch,M,K,N,A,B,C) : ork_i8_bmm(npu,nbatch,M,K,N,A,B,C);
     int fail = 0;
     if(rc){ fprintf(stderr,"[%s] ork_bmm rc=%d (nbatch=%d M=%d K=%d N=%d)\n",nm,rc,nbatch,M,K,N); fail=1; }
     else { size_t bad=0, first=(size_t)-1;
@@ -76,13 +76,13 @@ static int test_norm(ork_npu *npu, int M, int n){
     for(int i=0;i<n;i++) w[i]=f2h(0.5f+(rand()/(float)RAND_MAX));
     int fail=0;
     /* rmsnorm */
-    if(ork_npu_rmsnorm_f16(npu,M,n,x,w,1e-6f,o)){ fprintf(stderr,"[rmsnorm] rc!=0\n"); fail=1; }
+    if(ork_f16_npu_rmsnorm(npu,M,n,x,w,1e-6f,o)){ fprintf(stderr,"[rmsnorm] rc!=0\n"); fail=1; }
     else { double maxrel=0;
         for(int m=0;m<M;m++){ double ss=0; for(int i=0;i<n;i++){double v=h2f(x[m*n+i]);ss+=v*v;} double s=1.0/sqrt(ss/n+1e-6);
             for(int i=0;i<n;i++){ double ref=h2f(x[m*n+i])*s*h2f(w[i]); double r=fabs(h2f(o[m*n+i])-ref)/(fabs(ref)+1e-3); if(r>maxrel)maxrel=r; } }
         if(maxrel>0.03){ fprintf(stderr,"[rmsnorm] MISMATCH maxrel=%.4f\n",maxrel); fail=1; } else fprintf(stderr,"[rmsnorm] OK M=%d n=%d (maxrel=%.4f)\n",M,n,maxrel); }
     /* l2norm */
-    if(ork_npu_l2norm_f16(npu,M,n,x,1e-6f,o)){ fprintf(stderr,"[l2norm] rc!=0\n"); fail=1; }
+    if(ork_f16_npu_l2norm(npu,M,n,x,1e-6f,o)){ fprintf(stderr,"[l2norm] rc!=0\n"); fail=1; }
     else { double maxrel=0;
         for(int m=0;m<M;m++){ double ss=0; for(int i=0;i<n;i++){double v=h2f(x[m*n+i]);ss+=v*v;} double s=1.0/sqrt(ss+1e-6);
             for(int i=0;i<n;i++){ double ref=h2f(x[m*n+i])*s; double r=fabs(h2f(o[m*n+i])-ref)/(fabs(ref)+1e-3); if(r>maxrel)maxrel=r; } }
@@ -102,7 +102,7 @@ static int test_l2norm_f32(int n){
     fprintf(stderr,"[l2norm_f32] OK n=%d (maxrel=%.6f)\n",n,maxrel); return 0;
 }
 
-/* Fused on-NPU reduce+rsqrt (ork_mm_build_f16_rsqrt_lut): a reduce-matmul emits scale=1/sqrt(ss/n+eps)
+/* Fused on-NPU reduce+rsqrt (ork_f16_mm_build_rsqrt_lut): a reduce-matmul emits scale=1/sqrt(ss/n+eps)
  * directly. SKIPs (returns 0) if the PPU fused-output path is unavailable (non-rk3588) — keeps make test
  * portable. n<=2048 (fp16 single-tile). Compares NPU-emitted scale to CPU 1/sqrt. */
 static int test_rsqrt(ork_npu *npu, int M, int n){
@@ -112,7 +112,7 @@ static int test_rsqrt(ork_npu *npu, int M, int n){
     for(int m=0;m<M;m++){ double s=0; for(int i=0;i<n;i++){double v=x[(size_t)m*n+i];s+=v*v;} ss[m]=s;
         if(s<ssmin)ssmin=s; if(s>ssmax)ssmax=s; sref[m]=(float)(1.0/sqrt(s/n+eps)); }
     int16_t lut[1030]; double S=0,R=0,osc=0;
-    int brc=ork_mm_build_f16_rsqrt_lut(npu,n,eps,ssmin*0.95,ssmax*1.05,lut,&S,&R,&osc);
+    int brc=ork_f16_mm_build_rsqrt_lut(npu,n,eps,ssmin*0.95,ssmax*1.05,lut,&S,&R,&osc);
     if(brc==-2){ fprintf(stderr,"[rsqrt-lut] SKIP (PPU fused-output unavailable)\n"); free(x);free(sref);free(ss); return 0; }
     int fail=0;
     if(brc){ fprintf(stderr,"[rsqrt-lut] build rc=%d\n",brc); fail=1; }
@@ -120,8 +120,8 @@ static int test_rsqrt(ork_npu *npu, int M, int n){
         ork_f16 *B=malloc((size_t)n*16*2), *sq=malloc((size_t)M*n*2); float *C=malloc((size_t)M*16*4);
         for(size_t i=0;i<(size_t)n*16;i++) B[i]=(ork_f16)(-S);
         for(size_t i=0;i<(size_t)M*n;i++){ float v=x[i]; sq[i]=(ork_f16)(v*v); }
-        ork_w *w=ork_mm_pack(npu,n,16,B);
-        if(!w || ork_mm_run_f16_silu(npu,w,M,sq,C,0,0xffffc000u,0x56391100u,lut,1030)){ fprintf(stderr,"[rsqrt-lut] run failed\n"); fail=1; }
+        ork_w *w=ork_f16_mm_pack(npu,n,16,B);
+        if(!w || ork_f16_mm_run_silu(npu,w,M,sq,C,0,0xffffc000u,0x56391100u,lut,1030)){ fprintf(stderr,"[rsqrt-lut] run failed\n"); fail=1; }
         else { double maxrel=0; for(int m=0;m<M;m++){ double snpu=(double)C[(size_t)m*16]*osc; double r=fabs(snpu-sref[m])/(fabs(sref[m])+1e-6); if(r>maxrel)maxrel=r; }
             if(maxrel>0.03){ fprintf(stderr,"[rsqrt-lut fused] MISMATCH maxrel=%.4f\n",maxrel); fail=1; } else fprintf(stderr,"[rsqrt-lut fused] OK M=%d n=%d (maxrel=%.4f)\n",M,n,maxrel); }
         if(w) ork_mm_free(npu,w); free(B);free(sq);free(C);
@@ -130,8 +130,8 @@ static int test_rsqrt(ork_npu *npu, int M, int n){
         ork_f16 *Bd=malloc((size_t)Kd*16*2), *Ad=malloc((size_t)M*Kd*2); float *Cd=malloc((size_t)M*16*4);
         for(int i=0;i<Kd*16;i++) Bd[i]=(ork_f16)(-S*Gd/(double)Kd);
         for(int m=0;m<M;m++){ ork_f16 v=(ork_f16)(ss[m]/Gd); for(int k=0;k<Kd;k++) Ad[(size_t)m*Kd+k]=v; }
-        ork_w *wd=ork_mm_pack(npu,Kd,16,Bd);
-        if(!wd || ork_mm_run_f16_silu(npu,wd,M,Ad,Cd,0,0xffffc000u,0x56391100u,lut,1030)){ fprintf(stderr,"[rsqrt-lut decoupled] run failed\n"); fail=1; }
+        ork_w *wd=ork_f16_mm_pack(npu,Kd,16,Bd);
+        if(!wd || ork_f16_mm_run_silu(npu,wd,M,Ad,Cd,0,0xffffc000u,0x56391100u,lut,1030)){ fprintf(stderr,"[rsqrt-lut decoupled] run failed\n"); fail=1; }
         else { double dmax=0; for(int m=0;m<M;m++){ double snpu=(double)Cd[(size_t)m*16]*osc; double r=fabs(snpu-sref[m])/(fabs(sref[m])+1e-6); if(r>dmax)dmax=r; }
             if(dmax>0.03){ fprintf(stderr,"[rsqrt-lut decoupled] MISMATCH maxrel=%.4f\n",dmax); fail=1; } else fprintf(stderr,"[rsqrt-lut decoupled] OK K=512 (maxrel=%.4f)\n",dmax); }
         if(wd) ork_mm_free(npu,wd); free(Bd);free(Ad);free(Cd);
@@ -144,7 +144,7 @@ static int test_rsqrt(ork_npu *npu, int M, int n){
 static int test_softmax(ork_npu *npu, int M, int n){
     ork_f16 *x=malloc((size_t)M*n*2), *o=malloc((size_t)M*n*2);
     for(size_t i=0;i<(size_t)M*n;i++) x[i]=f2h((rand()/(float)RAND_MAX)*8.f-4.f);   /* ~[-4,4] */
-    if(ork_npu_softmax_f16(npu,M,n,x,o)){ fprintf(stderr,"[softmax] rc!=0\n"); free(x);free(o); return 1; }
+    if(ork_f16_npu_softmax(npu,M,n,x,o)){ fprintf(stderr,"[softmax] rc!=0\n"); free(x);free(o); return 1; }
     double maxrel=0;
     for(int m=0;m<M;m++){ double mx=h2f(x[(size_t)m*n]); for(int j=1;j<n;j++){ double v=h2f(x[(size_t)m*n+j]); if(v>mx)mx=v; }
         double sm=0; for(int j=0;j<n;j++) sm+=exp(h2f(x[(size_t)m*n+j])-mx);
@@ -173,7 +173,7 @@ static int test_attn_strided(ork_npu *npu, int is_i8, int H, int T, int D, int T
         for(int b=0;b<H;b++)for(int m=0;m<T;m++)for(int n=0;n<Tkv;n++){ int32_t acc=0;
             for(int k=0;k<D;k++) acc+=(int32_t)Q[(long)b*D+(long)m*tok_stride+k]*(int32_t)Kc[(long)b*D+(long)n*tok_stride+k];
             Cref[((size_t)b*T+m)*Tkv+n]=acc; }
-        int rc=ork_bmm_i8_strided(npu,H,T,D,Tkv,Q,Kc,C,&s);
+        int rc=ork_i8_bmm_strided(npu,H,T,D,Tkv,Q,Kc,C,&s);
         if(rc){ fprintf(stderr,"[%s] rc=%d\n",nm,rc); fail=1; }
         else { size_t bad=0,first=(size_t)-1; for(size_t i=0;i<cn;i++) if(C[i]!=Cref[i]){ if(first==(size_t)-1)first=i; bad++; }
             if(bad){ fprintf(stderr,"[%s] MISMATCH %zu/%zu (first %zu: got %d want %d)\n",nm,bad,cn,first,C[first],Cref[first]); fail=1; }
@@ -196,11 +196,11 @@ static int test_attn_strided(ork_npu *npu, int is_i8, int H, int T, int D, int T
     return fail;
 }
 
-/* fused matmul+activation reference fns (ork_mm_run_f16_act signature: double fn(double,void*)) */
+/* fused matmul+activation reference fns (ork_f16_mm_run_act signature: double fn(double,void*)) */
 static double fa_exp (double x,void*c){ (void)c; return exp(x); }
 static double fa_silu(double x,void*c){ (void)c; return x/(1.0+exp(-x)); }
 static double fa_gelu(double x,void*c){ (void)c; return 0.5*x*(1.0+erf(x/1.4142135623730951)); }
-extern int ork_mm_run_f16_act(ork_npu*,int,int,const ork_f16*,int,const ork_f16*,float*,double(*)(double,void*),void*,double,double);
+extern int ork_f16_mm_run_act(ork_npu*,int,int,const ork_f16*,int,const ork_f16*,float*,double(*)(double,void*),void*,double,double);
 
 /* Fused matmul + output-stage activation: C = fn(A·B) in ONE submit (no CPU<->NPU crossing). Validates the
  * no-crossing chain — the fused-output mechanism that makes on-NPU softmax(exp)/RMSNorm(rsqrt)/SwiGLU(silu)
@@ -218,7 +218,7 @@ static int test_fused_act(ork_npu *npu, int M, int K, int N, int which){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double s=0; for(int k=0;k<K;k++) s+=h2f(A[(size_t)m*K+k])*h2f(B[(size_t)k*N+n]);
         acc[(size_t)m*N+n]=s; if(s<lo)lo=s; if(s>hi)hi=s; }
     for(size_t i=0;i<(size_t)M*N;i++) ref[i]=(float)fn(acc[i],NULL);
-    int rc=ork_mm_run_f16_act(npu,K,N,B,M,A,C,fn,NULL,lo,hi);
+    int rc=ork_f16_mm_run_act(npu,K,N,B,M,A,C,fn,NULL,lo,hi);
     int fail=0;
     if(rc==-2){ fprintf(stderr,"[%s] SKIP (PPU fuse off / shape)\n",nm); }
     else if(rc){ fprintf(stderr,"[%s] rc=%d\n",nm,rc); fail=1; }

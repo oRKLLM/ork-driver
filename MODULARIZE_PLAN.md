@@ -29,8 +29,8 @@ the doorbell path replaced it, which lowers the round-2 floor considerably):
 
 ```
 420  run_chain_i8_impl        329  ork_dyn_begin_colsplit   273  ork_dyn_begin_mc
-230  run_multicore            175  ork_npu_replay_softmax_f16  174  run
-173  ork_csub_worker          160  ork_ssm_scan_f32         159  ork_mm_run_chain_i4
+230  run_multicore            175  ork_f16_npu_replay_softmax  174  run
+173  ork_csub_worker          160  ork_ssm_scan_f32         159  ork_i4_mm_run_chain
 159  ork_dyn_end              149  ork_dyn_begin            149  ork_npu_benchmark_chain
 ```
 
@@ -126,7 +126,7 @@ move, so the move diffs stay pure.
 
 **Cross-boundary edges are pre-catalogued** — `npu.c:4655–4660` is a forward-decl block naming exactly
 the statics that jump between the future `npu/i4.c` and the scaffold (`run_i4_bchain_db`,
-`ork_dyn_begin_mc_i4[_grouped]`, `i4_submit_tmo_ms`, `ork_dyn_grouped_end`, `ork_dyn_end`).
+`ork_i4_dyn_begin_mc[_grouped]`, `i4_submit_tmo_ms`, `ork_dyn_grouped_end`, `ork_dyn_end`).
 
 ---
 
@@ -149,26 +149,26 @@ src/
 
 **Why `i8` is a folder immediately.** On the current tree the int8 surface totals **~5,500 lines** —
 the `fold` subsystem alone (`synth_i8_mfold`, `ork_npu_mfold_chain{,_cap,_multi,_v}`,
-`ork_npu_fold_{batch,run_i8,op_i8,run_w,batch_w}`, the `fold_*` helpers, `ork_mm_load_fold_i8` /
-`ork_w_attach_fold_i8` / `ork_w_dump_fold_i8_cpu`) is ~750 lines, and the dynamic API is ~1,900. A
+`ork_npu_fold_{batch,run_i8,op_i8,run_w,batch_w}`, the `fold_*` helpers, `ork_i8_mm_load_fold` /
+`ork_i8_w_attach_fold` / `ork_i8_w_dump_fold_cpu`) is ~750 lines, and the dynamic API is ~1,900. A
 single `npu/i8.c` would be a third of the monolith and defeat the purpose. Splitting it now costs
 nothing extra — the folder is where round 2 would have put it anyway.
 
 | file | contents | est. lines |
 |---|---|---:|
 | `src/npu/internal.h` | private ABI (§4) | ~280 |
-| `src/npu.c` *(scaffold)* | env knobs; IOVA guard; import registry (`imp_reg`/`imp_unreg`, `bimport_f`, `bscratch`, `reimport_inplace`, `ork_ctx_fd_reap`); live-buffer registry + SIGTERM teardown; `bcreate`/`bdestroy`/`bsync`/warena; dma-heap + `ork_dma_*`; domains (`dom_activate`, `dom_prime`, `dom_reserve`, `ork_dom_flush_if_dirty`, `ork_dom_reanchor`, `ork_npu_set_ndomains`, pack-domain, alloc/free); `dump_submit`/`trace_submit`/`rknpu_submit_ioctl`/`submit1[_db]`; device lifecycle (`ork_npu_init[_orkd]`/`free`/`soft_reset`/`recover`/`reap_stuck`/`force_fault`/`dump_state`/`ork_kmsg`, SRAM, governor warn, version); pool + `pin_big/little_core` + `ork_parallel_for` + `mc_ensure` + `run_multicore`; **mode-transition layer** (`XSPEC`, `ork_npu_enter`, xprof); generic `pack()`/`run()` + `ork_mm_run`/`ork_mm_run_i8`; slice **dispatch** (`ork_mm_pack_sliced`/`run_sliced`/`free_sliced`, `slice_acc_worker`, `slice_rescue_or_refuse`); `ork_w_free`/`ork_mm_free`/`ork_w_*`; stage + stream-pool; async submit; `ork_submit_seq` + dispatch shims; `ork_bmm_*` dispatch; norm/softmax/fwht; CPU pack helpers; profiling globals | **~3,900** |
+| `src/npu.c` *(scaffold)* | env knobs; IOVA guard; import registry (`imp_reg`/`imp_unreg`, `bimport_f`, `bscratch`, `reimport_inplace`, `ork_ctx_fd_reap`); live-buffer registry + SIGTERM teardown; `bcreate`/`bdestroy`/`bsync`/warena; dma-heap + `ork_dma_*`; domains (`dom_activate`, `dom_prime`, `dom_reserve`, `ork_dom_flush_if_dirty`, `ork_dom_reanchor`, `ork_npu_set_ndomains`, pack-domain, alloc/free); `dump_submit`/`trace_submit`/`rknpu_submit_ioctl`/`submit1[_db]`; device lifecycle (`ork_npu_init[_orkd]`/`free`/`soft_reset`/`recover`/`reap_stuck`/`force_fault`/`dump_state`/`ork_kmsg`, SRAM, governor warn, version); pool + `pin_big/little_core` + `ork_parallel_for` + `mc_ensure` + `run_multicore`; **mode-transition layer** (`XSPEC`, `ork_npu_enter`, xprof); generic `pack()`/`run()` + `ork_f16_mm_run`/`ork_i8_mm_run`; slice **dispatch** (`ork_mm_pack_sliced`/`run_sliced`/`free_sliced`, `slice_acc_worker`, `slice_rescue_or_refuse`); `ork_w_free`/`ork_mm_free`/`ork_w_*`; stage + stream-pool; async submit; `ork_submit_seq` + dispatch shims; `ork_bmm_*` dispatch; norm/softmax/fwht; CPU pack helpers; profiling globals | **~3,900** |
 | `src/npu/sdp.c` | shared SDP/LUT substrate: `silu_f`/`gelu_f`/`rsqrt_f`/`exp_f`, `chain_build_lut_fn`, `silu_build_curve[_biased]`, `silu_calibrate_idx`/`_idx16`, `build_act_lut16`, `ork_mm_silu_build_lut`, `ork_mm_chain_build_exp_lut`, `sdp_canon`, `ork_npu_sdp_stamp` | ~300 |
-| `src/npu/i8/regcmd.c` | `synth_i8`, `synth_i8_mfold`, `set_i8_out8`, `set_i8_silu[32]`, `set_i8_ewmul`, `splice_ew_lane`, `set_mul_geom`, `apply_ork_geom`, i8 fuzz hooks, `int8_ks`, `fused_mtile`, `ork_npu_synth_i8_dump` | ~500 |
+| `src/npu/i8/regcmd.c` | `synth_i8`, `synth_i8_mfold`, `set_i8_out8`, `set_i8_silu[32]`, `set_i8_ewmul`, `splice_ew_lane`, `set_mul_geom`, `apply_ork_geom`, i8 fuzz hooks, `int8_ks`, `fused_mtile`, `ork_i8_npu_synth_dump` | ~500 |
 | `src/npu/i8/pack.c` | `pack_i8[_f32/_dequant/_import]`, `load_i8[_import/_flags]`, `mm_import_i8`, `adopt_imported_i8`, `repack_i8*`, `w_dump_i8*`, resident KV (`ork_kv_*`), int8→fp16 JIT inflate, `slice_pack_i8` | ~750 |
-| `src/npu/i8/fold.c` | `ork_npu_mfold_chain{,_cap,_multi,_v}`, `ork_fbc_thread`, `ork_fold_submit_all`, `ork_npu_fold_batch[_w]`, `fold_ref_for`/`fold_pidx`/`fold_setv`/`fold_build_tile`/`fold_nc16`/`fold_woff`/`fold_c4`, `fold_A_ensure`/`fold_fill_A`/`fold_scr_get`/`fold_run_one`/`fold_scratch_free*`, `ork_npu_fold_run_i8`/`fold_op_i8`/`fold_run_w`, `ork_mm_load_fold_i8`, `ork_w_attach_fold_i8`, `ork_w_dump_fold_i8_cpu` | ~750 |
-| `src/npu/i8/run.c` | `ork_mm_run_i8_silu[32]`, `_ewmul`, `_out8`, `_out16`, i8 activations (`act_lut_i8[_biased]`, `silu/gelu/rsqrt/exp_i8`), `ewmul_i8`, `add_i8`, `mul_perchan_i8`, `row_max_i8`, `slice_run_i8`, `run_stream_i8[_sk]`, `ork_bmm_i8[_strided]` | ~700 |
-| `src/npu/i8/chain.c` | `run_chain_i8_impl` + all `ork_mm_run_chain_i8*` wrappers (incl. `_ffn_exp_biased`), `chain_fullk_mcap_i8`, `chains_rr[_biased]`, `ork_npu_chain_progs`, `chain_selftest`, orkd chain wrappers (`ork_mm_ffn_orkd`, `ork_mm_attn_orkd`, `ork_mm_attn_rr_orkd`, `layer_mm`, `ork_mm_layer_i8`) | ~1,000 |
+| `src/npu/i8/fold.c` | `ork_npu_mfold_chain{,_cap,_multi,_v}`, `ork_fbc_thread`, `ork_fold_submit_all`, `ork_npu_fold_batch[_w]`, `fold_ref_for`/`fold_pidx`/`fold_setv`/`fold_build_tile`/`fold_nc16`/`fold_woff`/`fold_c4`, `fold_A_ensure`/`fold_fill_A`/`fold_scr_get`/`fold_run_one`/`fold_scratch_free*`, `ork_i8_npu_fold_run`/`fold_op_i8`/`fold_run_w`, `ork_i8_mm_load_fold`, `ork_i8_w_attach_fold`, `ork_i8_w_dump_fold_cpu` | ~750 |
+| `src/npu/i8/run.c` | `ork_i8_mm_run_silu[32]`, `_ewmul`, `_out8`, `_out16`, i8 activations (`act_lut_i8[_biased]`, `silu/gelu/rsqrt/exp_i8`), `ewmul_i8`, `add_i8`, `mul_perchan_i8`, `row_max_i8`, `slice_run_i8`, `run_stream_i8[_sk]`, `ork_i8_bmm[_strided]` | ~700 |
+| `src/npu/i8/chain.c` | `run_chain_i8_impl` + all `ork_i8_mm_run_chain*` wrappers (incl. `_ffn_exp_biased`), `chain_fullk_mcap_i8`, `chains_rr[_biased]`, `ork_npu_chain_progs`, `chain_selftest`, orkd chain wrappers (`ork_mm_ffn_orkd`, `ork_mm_attn_orkd`, `ork_mm_attn_rr_orkd`, `layer_mm`, `ork_i8_mm_layer`) | ~1,000 |
 | `src/npu/i8/dyn.c` | the dynamic steered API: `ork_dyn_begin[_mc/_colsplit/_seq_i8[_mc]]`, `ork_csub_worker`, `ork_dyn_{progress,append,halt,end,dump,steps,remaining,spin_probe}`, `mc_recover_resubmit`, `mtile_cap`, term handler, submit queue (`ork_dyn_queue_*`), precompiled cache (`ork_pc_*`) | ~1,900 |
-| `src/npu/i8/probe.c` | `probe_mtile_i8`, `probe_single_i8`, `probe_i8_out8`, `probe_i8_mm`, `probe_i8_ewmul*`, `probe_i8_mul`, `probe_add_i8`, `probe_bs_scale`, `probe_i8_silu*`, `probe_silu_std`, `probe_chain_i8`, `benchmark_chain`, `probe_seq_hetero`, `probe_sdp_chain_fwd`, `probe_batch`, doorbell/overlap prof, `ork_npu_replay_i8[_amap/_sweep]` | ~900 |
-| `src/npu/f16.c` | `synth`, `set_f16_out[_fp16in]`, f16 fuzz, `f16_mtile`, fp16 `ork_mm_pack`; `ork_mm_run_f16_silu`, `set_f16_silu`, `ork_mm_build_f16_{lut,silu_lut,rsqrt_lut}`, `pack_f16_fused_act`/`run_f16_fused_act`/`run_f16_act`, `ork_mm_run_f16_f16out`; f16 probes (`probe_f16_mm[_f16out]`, `_stridedA`, `probe_slice_f16`, `f16_gap_probe`, `f16_percore_probe` + `ork_pcfd_thread`, `ork_f16_colsplit`); `mm_perchan_f16[_diag/_fused]`, `mul_perchan_f16[_contig]`, `ewmul_f16`, `add_f16`, `chain_mm_perchan_f16`; f16 streams (`run_stream_f16[_chain]`); `ork_bmm_fp16[_fused/_stream/_strided]`; RE replays (`replay_full_f16`, `replay_softmax_f16`, `replay_reshape_f16`, `reshape_probe_f16`, `probe_silu_std_f16`); `ork_mm_f16_scratch`, `inflate_i8_to_f16`, `repack_f16` | ~1,900 |
+| `src/npu/i8/probe.c` | `probe_mtile_i8`, `probe_single_i8`, `probe_i8_out8`, `probe_i8_mm`, `probe_i8_ewmul*`, `probe_i8_mul`, `probe_add_i8`, `probe_bs_scale`, `probe_i8_silu*`, `probe_silu_std`, `probe_chain_i8`, `benchmark_chain`, `probe_seq_hetero`, `probe_sdp_chain_fwd`, `probe_batch`, doorbell/overlap prof, `ork_i8_npu_replay[_amap/_sweep]` | ~900 |
+| `src/npu/f16.c` | `synth`, `set_f16_out[_fp16in]`, f16 fuzz, `f16_mtile`, fp16 `ork_f16_mm_pack`; `ork_f16_mm_run_silu`, `set_f16_silu`, `ork_mm_build_f16_{lut,silu_lut,rsqrt_lut}`, `pack_f16_fused_act`/`run_f16_fused_act`/`run_f16_act`, `ork_f16_mm_run_f16out`; f16 probes (`probe_f16_mm[_f16out]`, `_stridedA`, `probe_slice_f16`, `f16_gap_probe`, `f16_percore_probe` + `ork_pcfd_thread`, `ork_f16_colsplit`); `mm_perchan_f16[_diag/_fused]`, `mul_perchan_f16[_contig]`, `ewmul_f16`, `add_f16`, `chain_mm_perchan_f16`; f16 streams (`run_stream_f16[_chain]`); `ork_bmm_fp16[_fused/_stream/_strided]`; RE replays (`replay_full_f16`, `replay_softmax_f16`, `replay_reshape_f16`, `reshape_probe_f16`, `probe_silu_std_f16`); `ork_f16_mm_scratch`, `inflate_i8_to_f16`, `repack_f16` | ~1,900 |
 | `src/npu/i16.c` | `synth_i16`, `set_i16_out`; `act_lut_i16`, `silu/gelu/rsqrt/exp_i16`; `chain_mm_silu_i16`, `chain_gatesilu_i16`, `chain_mm_perchan_i16`; `ewmul_i16`, `add_i16`, `mul_perchan_i16`, `requant_perchan_i32`; `probe_silu_std_i16`, `replay_lut_i16`; `ssd_probe_mixchain` | ~950 |
-| `src/npu/i4.c` | `synth_i4`, i4 fuzz, `tile_i4_*`; int4 quantization (`quant_chan_i4`, NF4 codebook + `quant_chan_nf4`, `expand_chan_i4_*`, `inflate_chan_nf4_*`, imatrix `wq_err_chan`/`wq_best_absmax`); packs/loads (`pack_i4[_grouped/_to_i8]`, `pack_i4a8[_im]`, `load_i4[_arena/_import]`, `load_i4a8[_import]`, `w_dump_i4a8`, `pack_i4a8_cpu_blob`, slice-inflate diagnostics, `slice_pack_i4`); runs (`ork_mm_run_i4`, `run_i4_mc_db`, `run_i4_grouped`, `slice_run_i4`); the bchain-doorbell path (`bch_db_cells[_off]`, `bch_db_worker`, `run_i4_bchain_db`, `i4_submit_tmo_ms`); MoE experts (`bch_mw_worker`, `run_i4_experts_bchain_db`, `ork_mm_run_i4_experts`); `ork_mm_run_chain_i4`, `ork_dyn_i4_probe`, `ork_dyn_begin_mc_i4[_grouped]`, `ork_dyn_grouped_end`; `run_stream_i4`; `probe_i4[_mm]`; `ork_bmm_i4[_strided]` | ~2,100 |
+| `src/npu/i4.c` | `synth_i4`, i4 fuzz, `tile_i4_*`; int4 quantization (`quant_chan_i4`, NF4 codebook + `quant_chan_nf4`, `expand_chan_i4_*`, `inflate_chan_nf4_*`, imatrix `wq_err_chan`/`wq_best_absmax`); packs/loads (`pack_i4[_grouped/_to_i8]`, `pack_i4a8[_im]`, `load_i4[_arena/_import]`, `load_i4a8[_import]`, `w_dump_i4a8`, `pack_i4a8_cpu_blob`, slice-inflate diagnostics, `slice_pack_i4`); runs (`ork_i4_mm_run`, `run_i4_mc_db`, `run_i4_grouped`, `slice_run_i4`); the bchain-doorbell path (`bch_db_cells[_off]`, `bch_db_worker`, `run_i4_bchain_db`, `i4_submit_tmo_ms`); MoE experts (`bch_mw_worker`, `run_i4_experts_bchain_db`, `ork_i4_mm_run_experts`); `ork_i4_mm_run_chain`, `ork_i4_dyn_probe`, `ork_i4_dyn_begin_mc[_grouped]`, `ork_dyn_grouped_end`; `run_stream_i4`; `probe_i4[_mm]`; `ork_i4_bmm[_strided]` | ~2,100 |
 | `src/npu/ssm.c` | `ork_ssm_scan_f32` + pool (`ssm_pool_ensure/free`, `ssm_stg_i8`), little-core helper (`ssm_helper_*`, `ssm_marshal_gi`), `ork_ssm_prof_dump`, `ork_softplus`, SSM knobs, `ork_ssd_fused_scan_bench`, `ssd_probe_rawmm/fusedmm_f16` | ~330 |
 
 **Result:** largest file **~3,900** (scaffold), down from 15,313; every precision module ≤ ~2,100 and
@@ -248,7 +248,7 @@ Capture the (b)/(e)/(f)/(g) baselines **before commit A** and store them in `MOD
    **15 untracked files**, all dated 2026-08-18, that exist in no commit anywhere:
    - `src/ork_gptq.c` (129 lines) + `examples/test_gptq.c` — a dependency-free GPTQ int4 quantizer
      (Frantar et al. 2022), gated `ORK_GPTQ`, UNVALIDATED pending an AutoGPTQ cross-check (task #56).
-     **`origin/main`'s `include/ork_npu.h:376` already declares `ork_gptq_i4()`** — main ships a public
+     **`origin/main`'s `include/ork_npu.h:376` already declares `ork_i4_gptq()`** — main ships a public
      declaration whose only implementation is unpushed. A byte-identical copy also sits on the board, so
      it is two-copy, not one — but neither is in git.
    - 9 more untracked probes: `test_bimport_dom`, `test_i4_2import`, `test_i4_domains`, `test_moe_par`,
@@ -310,7 +310,7 @@ all 60 of its commits have upstream equivalents. Nothing pending to land.)*
 - [ ] Fork builds against the bumped submodule.
 - [x] **Board reconciled (risk 7) — DONE 2026-08-19.** Stale shadowing headers + a stale Aug-8
       `src/ork_gptq.o` deleted, worktree stashed, submodule HEAD fast-forwarded to `main` @ `f968b56`,
-      clean rebuild + `make test` ALL PASS. `ork_gptq_i4` stubbed and landed (`61ccb48`); the real
+      clean rebuild + `make test` ALL PASS. `ork_i4_gptq` stubbed and landed (`61ccb48`); the real
       implementation and the 9 probes stay parked on `origin/wip/moe-saga-2026-08-18`.
 - [ ] Use `tools/util/sync_daemon.sh` for the duration (sync all of `src/`, never a single file).
 - [ ] `AGENTS.md` §4 layout, `README.md`, `OPS_REGISTRY.md`, `tools/re/README.md` updated.
@@ -385,7 +385,7 @@ Round 3 left `ork/ops.h` at 451 lines because production SDP ops and their RE pr
 **Classified by evidence, not by name.** The rule is *who calls it*: a declaration is production if it has
 a caller in `src/` (excluding its own defining file), in `examples/` (which are the test suite), or in the
 fork's `ggml-ork`. Otherwise it is reached only from `tools/` and is RE surface. Naming would have been the
-wrong instrument — `ork_npu_mul_perchan_f16_contig` sounds production and has no caller; `ork_npu_chain_progs`
+wrong instrument — `ork_f16_npu_mul_perchan_contig` sounds production and has no caller; `ork_npu_chain_progs`
 sounds like a probe and has six library callers.
 
 Result: **46 production / 53 RE — 53% of what shipped in the public header has no production consumer.**
@@ -454,7 +454,7 @@ stranded blocks was 66, not 69.
 
 Two more were not deletions but round 1's `orki_` prefixing (`set_f16_out_fp16in`, `splice_ew_lane`), and
 one subject became a `static inline` in `internal.h` (`ork_softmax_npu_enabled`) while the op it gates
-(`ork_npu_softmax_f16`, undocumented) lives in `norm.c` — that is where its doc went.
+(`ork_f16_npu_softmax`, undocumented) lives in `norm.c` — that is where its doc went.
 
 ### Still in `npu.c`: 26 blocks / ~130 lines
 
@@ -688,7 +688,7 @@ Cut thematically, since nothing constrained where:
 | file | lines | holds |
 |---|--:|---|
 | `i8/dyn.c` | 491 | the doorbell BEGIN paths — `ork_dyn_begin`, `ork_dyn_begin_mc`, and the shared drain/completion helpers |
-| `i8/dyn_seq.c` | 165 | the heterogeneous single-core chain — `ork_dyn_begin_seq_i8{,_mc}`, `ork_dyn_seq_end` |
+| `i8/dyn_seq.c` | 165 | the heterogeneous single-core chain — `ork_i8_dyn_begin_seq{,_mc}`, `ork_dyn_seq_end` |
 | `i8/dyn_ctl.c` | 405 | the control surface — spin probe, anomaly dump, step accounting, append, mid-flight halt, multi-core resubmit recovery |
 
 Verified by the tree-wide code-multiset invariant: **zero removals**, and all 50 additions are replicated
@@ -790,7 +790,7 @@ moved a great deal since. Two things had changed:
   the raw grep I would have wrongly spared it; had I trusted round 4 blindly I would have deleted without
   noticing the reference at all.
 - `ork_mm_chain_build_exp_lut` is **named in a PROVEN OPS_REGISTRY row**. That looked like a blocker, but
-  `chainexp_probe` calls only `ork_mm_run_chain_i8_ffn_exp`, and that builds its curve internally via
+  `chainexp_probe` calls only `ork_i8_mm_run_chain_ffn_exp`, and that builds its curve internally via
   `orki_silu_build_curve_biased(orki_exp_f,…)`. The registry row simply over-claimed. Citation corrected in
   the same commit per AGENTS; **status untouched** — still PROVEN, same probe, same evidence.
 

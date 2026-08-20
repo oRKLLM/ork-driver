@@ -29,8 +29,8 @@ static void bench(ork_npu*c,int M,int K,int N){
     for(int i=0;i<M*K;i++)A[i]=(signed char)((i*7)%5-2);
     for(int i=0;i<K*N;i++)B[i]=(signed char)((i*3)%5-2);
     double usf=0,usl=0;
-    ork_npu_probe_i8_silu_cfg(c,M,K,N,A,B,0x4000,0x10,0u,0xffffc000u,0x56391300u,lut,1030,C8,&usf);
-    ork_npu_probe_i8_out8(c,M,K,N,A,B,0x4000,14,C8,&usl);
+    ork_i8_npu_probe_silu_cfg(c,M,K,N,A,B,0x4000,0x10,0u,0xffffc000u,0x56391300u,lut,1030,C8,&usf);
+    ork_i8_npu_probe_out8(c,M,K,N,A,B,0x4000,14,C8,&usl);
     static float tmp[64*512]; int MN=M*N; if(MN>64*512)MN=64*512;
     double t0=now_us(); volatile float s=0;
     for(int r=0;r<50;r++){ for(int i=0;i<MN;i++) tmp[i]=(float)silu((C8[i])*0.02); s+=tmp[0]; }

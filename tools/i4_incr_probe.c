@@ -24,7 +24,7 @@ int main(int argc,char**argv){
 
     int8_t *B=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int8_t)r4();
     int8_t *A=malloc((size_t)M*K); for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)r4();
-    ork_w *w=ork_mm_pack_i4(c,K,N,B); if(!w){ fprintf(stderr,"pack_i4 failed\n"); return 1; }
+    ork_w *w=ork_i4_mm_pack(c,K,N,B); if(!w){ fprintf(stderr,"pack_i4 failed\n"); return 1; }
 
     int32_t *Ci=calloc((size_t)M*N,4), *Cb=calloc((size_t)M*N,4), *Cs=calloc((size_t)M*N,4);
 
@@ -44,11 +44,11 @@ int main(int argc,char**argv){
     ork_mm_run_i4_incr(c,w,M,A,Ci);                                    /* warm */
     double t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_i4_incr(c,w,M,A,Ci); double t_incr=(now_us()-t0)/iters;
 
-    ork_mm_run_i4(c,w,M,A,Cb);                                          /* warm STRATEGY A */
-    t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_i4(c,w,M,A,Cb); double t_batch=(now_us()-t0)/iters;
+    ork_i4_mm_run(c,w,M,A,Cb);                                          /* warm STRATEGY A */
+    t0=now_us(); for(int it=0;it<iters;it++) ork_i4_mm_run(c,w,M,A,Cb); double t_batch=(now_us()-t0)/iters;
 
-    for(int m=0;m<M;m++) ork_mm_run_i4(c,w,1,A+(size_t)m*K,Cs+(size_t)m*N);   /* warm per-row */
-    t0=now_us(); for(int it=0;it<iters;it++) for(int m=0;m<M;m++) ork_mm_run_i4(c,w,1,A+(size_t)m*K,Cs+(size_t)m*N); double t_sep=(now_us()-t0)/iters;
+    for(int m=0;m<M;m++) ork_i4_mm_run(c,w,1,A+(size_t)m*K,Cs+(size_t)m*N);   /* warm per-row */
+    t0=now_us(); for(int it=0;it<iters;it++) for(int m=0;m<M;m++) ork_i4_mm_run(c,w,1,A+(size_t)m*K,Cs+(size_t)m*N); double t_sep=(now_us()-t0)/iters;
 
     printf("M=%d K=%d N=%d iters=%d\n",M,K,N,iters);
     printf("  incr (1 submit, %d incremental tasks) : %8.1f us  (%.1f us/row)\n", M, t_incr, t_incr/M);

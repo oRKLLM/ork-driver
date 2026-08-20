@@ -27,9 +27,9 @@ int main(int argc,char**argv){
         int8_t*A=malloc((size_t)M*K),*B=malloc((size_t)K*N); int32_t*C=malloc((size_t)M*N*4);
         for(size_t i=0;i<(size_t)M*K;i++)A[i]=(int8_t)(rnd()-128);
         for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)(rnd()-128);
-        ork_w*w=ork_mm_pack_i8(c,K,N,B);
+        ork_w*w=ork_i8_mm_pack(c,K,N,B);
         if(!w){printf("pack failed %d,%d,%d\n",M,K,N);return 1;}
-        if(ork_mm_run_i8(c,w,M,A,C)){printf("run failed %d,%d,%d\n",M,K,N);return 1;}
+        if(ork_i8_mm_run(c,w,M,A,C)){printf("run failed %d,%d,%d\n",M,K,N);return 1;}
         /* CPU ref: only spot-check a stride of rows/cols to stay fast but cover all M-tiles/N-subtiles */
         long bad=0;
         int rstep = M>32?(M/32):1, cstep = N>64?(N/64):1;

@@ -26,23 +26,23 @@ int main(int argc,char**argv){
     for(int i=0;i<Nq;i++)for(int k=0;k<d;k++) Qp[(size_t)i*Kp+k]=Q[(size_t)i*d+k];
     for(int k=0;k<d;k++)for(int j=0;j<Nk;j++) KTp[(size_t)k*Nk+j]=K[(size_t)j*d+k];
     int r_mult=0x4000, r_shift=16; double in_scale=0.0625, out_scale=1.0/127.0;
-    ork_w *w_kt=ork_mm_pack_i8(c,Kp,Nk,KTp), *w_ones, *w_v;
-    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,ones); free(ones); }
-    w_v=ork_mm_pack_i8(c,Nk,dv,V);
+    ork_w *w_kt=ork_i8_mm_pack(c,Kp,Nk,KTp), *w_ones, *w_v;
+    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,ones); free(ones); }
+    w_v=ork_i8_mm_pack(c,Nk,dv,V);
     if(!w_kt||!w_ones||!w_v){ printf("pack fail\n"); return 2; }
     int32_t *scb=calloc((size_t)Nq*Nk,4), *eb=calloc((size_t)Nq*Nk,4), *ss=calloc((size_t)Nq*32,4), *avb=calloc((size_t)Nq*dv,4);
     ork_mm_task_i8 tasks[4] = { { w_kt,Nq,Qp,scb }, { w_kt,Nq,(int8_t*)scb,eb }, { w_ones,Nq,(int8_t*)eb,ss }, { w_v,Nq,(int8_t*)eb,avb } };
     ork_chain_op ops[4] = { {1,-1,0,r_mult,r_shift}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
 
     /* warm */
-    if(ork_mm_run_chain_i8_ffn_exp(c,4,tasks,ops,in_scale,out_scale)){ printf("chain warm FAIL\n"); return 1; }
+    if(ork_i8_mm_run_chain_ffn_exp(c,4,tasks,ops,in_scale,out_scale)){ printf("chain warm FAIL\n"); return 1; }
     /* time the coalesced 4-op HW chain (ONE submit) */
-    double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_chain_i8_ffn_exp(c,4,tasks,ops,in_scale,out_scale);
+    double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run_chain_ffn_exp(c,4,tasks,ops,in_scale,out_scale);
     double chain_us=(now_us()-t0)/iters;
     /* per-submit floor: a single int8 matmul submit (QK^T alone) via run_chain S=1 -> run_i8 */
     ork_mm_task_i8 one[1] = { { w_kt, Nq, Qp, scb } };
-    ork_mm_run_chain_i8(c,1,one);   /* warm */
-    t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_chain_i8(c,1,one);
+    ork_i8_mm_run_chain(c,1,one);   /* warm */
+    t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run_chain(c,1,one);
     double one_us=(now_us()-t0)/iters;
 
     printf("  HW chain [QK^T->exp->reduce,e.V] (4 ops, ONE submit): %.1f us/iter (%.0f iter/s)\n", chain_us, 1e6/chain_us);

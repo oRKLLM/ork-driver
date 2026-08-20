@@ -1,4 +1,4 @@
-/* examples/test_gelu.c — validate the on-NPU GELU (ork_npu_gelu_i8/_i16) vs a CPU reference. GELU reuses the
+/* examples/test_gelu.c — validate the on-NPU GELU (ork_i8_npu_gelu/_i16) vs a CPU reference. GELU reuses the
  * same standalone SDP activation-LUT op as SiLU (the LUT holds the GELU curve), so int8 is bit-exact-class and
  * int16 is RKNN-class (few-LSB, scored vs output full-scale). Skips gracefully off-board / non-PPU SoC.
  *   make test_gelu && sudo ./test_gelu            (board only)
@@ -19,7 +19,7 @@ static int run_rsqrt_i8(ork_npu *c, int M, int N, double is, double os, int tol)
     static signed char in[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++) in[i]=(signed char)(1+(i%126));   /* positive domain */
     double us=0;
-    int r=ork_npu_rsqrt_i8(c,in,M,N,is,os,out,&us);
+    int r=ork_i8_npu_rsqrt(c,in,M,N,is,os,out,&us);
     if(r){ printf("  rsqrt i8 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
     int mism=0,mx=0;
     for(int i=0;i<M*N;i++){ int ref=clampi8(lround(rsqrtf_(in[i]*is)/os)); int d=abs((int)out[i]-ref);
@@ -32,7 +32,7 @@ static int run_i8(ork_npu *c, int M, int N, double is, double os, int tol){
     static signed char in[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++) in[i]=(signed char)(((i*7)%256)-128);
     double us=0;
-    int r=ork_npu_gelu_i8(c,in,M,N,is,os,out,&us);
+    int r=ork_i8_npu_gelu(c,in,M,N,is,os,out,&us);
     if(r){ printf("  i8  [%dx%-4d] is=%.4f FAIL (rc=%d)\n",M,N,is,r); return 1; }
     int mism=0,mx=0;
     for(int i=0;i<M*N;i++){ int ref=clampi8(lround(geluf(in[i]*is)/os)); int d=abs((int)out[i]-ref);
@@ -44,7 +44,7 @@ static int run_i16(ork_npu *c, int M, int N, double is, double os, double fs_tol
     static short in[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++) in[i]=(short)(-32768 + (int)((65535LL*((i*97)%(M*N)))/(M*N)));
     double us=0;
-    int r=ork_npu_gelu_i16(c,in,M,N,is,os,out,&us);
+    int r=ork_i16_npu_gelu(c,in,M,N,is,os,out,&us);
     if(r){ printf("  i16 [%dx%-4d] FAIL (rc=%d)\n",M,N,r); return 1; }
     long mx=0,maxref=1;
     for(int i=0;i<M*N;i++){ long v=lround(geluf(in[i]*is)/os); if(labs(v)>maxref)maxref=labs(v); }
@@ -72,7 +72,7 @@ int main(void){
     fail |= run_rsqrt_i8(c, 16, 64, 0.25, 0.0625, 3);
     printf("on-NPU exp (int8, softmax building block) vs CPU ref:\n");
     { static signed char in[512], out[512]; for(int i=0;i<512;i++) in[i]=(signed char)(-(i%64));  /* <=0, softmax domain */
-      double us=0; int r=ork_npu_exp_i8(c,in,8,64,0.05,0.008,out,&us); int mism=0,mx=0;
+      double us=0; int r=ork_i8_npu_exp(c,in,8,64,0.05,0.008,out,&us); int mism=0,mx=0;
       if(r) { printf("  exp i8 FAIL rc=%d\n",r); fail|=1; } else {
         for(int i=0;i<512;i++){ int ref=clampi8(lround(exp(in[i]*0.05)/0.008)); int d=abs((int)out[i]-ref); if(d>3){mism++;if(d>mx)mx=d;} }
         printf("  exp i8   [8x64  ] %s mism=%d/512 max|err|=%d  (%.1f us)\n",mism?"FAIL":"ok  ",mism,mx,us); fail|=mism?1:0; } }

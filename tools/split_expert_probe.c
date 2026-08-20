@@ -46,8 +46,8 @@ static void* npu_w(void*p){ npw*w=p;
     cpu_set_t s; CPU_ZERO(&s); CPU_SET(w->core,&s); pthread_setaffinity_np(pthread_self(),sizeof s,&s);
     for(;;){ pthread_mutex_lock(&w->mu); while(!w->has&&!w->stop) pthread_cond_wait(&w->go,&w->mu);
         if(w->stop){ pthread_mutex_unlock(&w->mu); return NULL; } w->has=0; int lo=w->lo,hi=w->hi; pthread_mutex_unlock(&w->mu);
-        for(int e=lo;e<hi;e++){ if(gi4) ork_mm_run_i4_grouped(w->c,gW[e],1,gA,gaS,gbS,gCf[e]);
-                                else       ork_mm_run_i8(w->c,gW[e],1,gA,gC[e]); }
+        for(int e=lo;e<hi;e++){ if(gi4) ork_i4_mm_run_grouped(w->c,gW[e],1,gA,gaS,gbS,gCf[e]);
+                                else       ork_i8_mm_run(w->c,gW[e],1,gA,gC[e]); }
         pthread_mutex_lock(&w->mu); w->done=1; pthread_cond_signal(&w->dn); pthread_mutex_unlock(&w->mu); } }
 static void np_submit(npw*w,int lo,int hi){ pthread_mutex_lock(&w->mu); w->lo=lo; w->hi=hi; w->done=0; w->has=1; pthread_cond_signal(&w->go); pthread_mutex_unlock(&w->mu); }
 static void np_wait(npw*w){ pthread_mutex_lock(&w->mu); while(!w->done) pthread_cond_wait(&w->dn,&w->mu); pthread_mutex_unlock(&w->mu); }
@@ -76,7 +76,7 @@ int main(int argc,char**argv){
     if(gi4){ gaS=malloc((size_t)gSk*4); for(int i=0;i<gSk;i++)gaS[i]=1;
              gbS=malloc((size_t)gSk*N*4); for(int i=0;i<gSk*N;i++)gbS[i]=1; }
     for(int e=0;e<E;e++){ ork_npu_set_pack_domain(c,0);
-        gW[e]= gi4 ? ork_mm_pack_i4_grouped(c,K,N,Bpk,G) : ork_mm_pack_i8(c,K,N,Bpk);
+        gW[e]= gi4 ? ork_i4_mm_pack_grouped(c,K,N,Bpk,G) : ork_i8_mm_pack(c,K,N,Bpk);
         if(!gW[e]){printf("pack e%d failed\n",e);return 1;}
         gBt[e]=malloc((size_t)N*K); memset(gBt[e],1,(size_t)N*K);
         gC[e]=malloc((size_t)N*4); gCf[e]=malloc((size_t)N*4); }

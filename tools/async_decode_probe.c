@@ -9,7 +9,7 @@
  * 3-core (the ORK_DECODE_MC config). A "token" = run all 7. Between matmuls run a REAL representative
  * CPU-prep workload (activation requant of the K-row + an RMSNorm pass — genuine float work, not a
  * sleep), sized by a sweepable multiplier. Compare:
- *   SYNC  : for each m: cpu_prep(m); ork_mm_run_i8(m)            -> wall ≈ Σ(t_cpu + t_npu)
+ *   SYNC  : for each m: cpu_prep(m); ork_i8_mm_run(m)            -> wall ≈ Σ(t_cpu + t_npu)
  *   ASYNC : pipeline — launch run(m) async; cpu_prep(m+1) overlaps; wait(m) -> wall ≈ Σ max(t_cpu,t_npu)
  * Sweep the CPU/NPU ratio (multiplier) and print sync/async/speedup vs the sum→max ceiling, so the
  * curve shows what async buys at decode's measured ratio (~1.9). Bit-exact gate: async C == sync C.
@@ -61,7 +61,7 @@ static void* aworker(void*p){ awork*a=(awork*)p;
         while(!a->has_job && !a->stop) pthread_cond_wait(&a->go,&a->mu);
         if(a->stop){ pthread_mutex_unlock(&a->mu); return NULL; }
         a->has_job=0; pthread_mutex_unlock(&a->mu);
-        ork_mm_run_i8(a->c,a->w,a->M,a->A,a->C);
+        ork_i8_mm_run(a->c,a->w,a->M,a->A,a->C);
         pthread_mutex_lock(&a->mu); a->done=1; pthread_cond_signal(&a->dn); pthread_mutex_unlock(&a->mu); }
 }
 static void aw_submit(awork*a, ork_w*w, int M, const int8_t*A, int32_t*C){
@@ -106,7 +106,7 @@ int main(int argc,char**argv){
         int K=KN[m][0],N=KN[m][1];
         int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
         ork_npu_set_pack_domain(c,0);
-        w[m]=ork_mm_pack_i8(c,K,N,B); free(B);
+        w[m]=ork_i8_mm_pack(c,K,N,B); free(B);
         if(!w[m]){printf("pack %s (K%d N%d) failed\n",nm[m],K,N);return 1;}
         A[m]=malloc((size_t)M*K); memset(A[m],1,(size_t)M*K);
         Cs[m]=malloc((size_t)M*N*4); Ca[m]=malloc((size_t)M*N*4);
@@ -115,17 +115,17 @@ int main(int argc,char**argv){
     }
 
     /* warm + per-matmul NPU time (sync) */
-    for(int m=0;m<7;m++) ork_mm_run_i8(c,w[m],M,A[m],Cs[m]);
+    for(int m=0;m<7;m++) ork_i8_mm_run(c,w[m],M,A[m],Cs[m]);
     double t_npu_tok=0;
     for(int m=0;m<7;m++){
-        double t0=now_us(); for(int it=0;it<iters;it++) ork_mm_run_i8(c,w[m],M,A[m],Cs[m]);
+        double t0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run(c,w[m],M,A[m],Cs[m]);
         double tm=(now_us()-t0)/iters; t_npu_tok+=tm;
         printf("  NPU %-4s K%-5d N%-5d : %7.1f us\n", nm[m],KN[m][0],KN[m][1],tm);
     }
     printf("  -> NPU per-token (7 matmuls): %.1f us\n\n", t_npu_tok);
 
     /* bit-exact gate: async result == sync result (Q) */
-    ork_async*h=ork_mm_run_i8_async(c,w[0],M,A[0],Ca[0]); cpu_prep(X[0],prep[0],KN[0][0],4); ork_async_wait(h);
+    ork_async*h=ork_i8_mm_run_async(c,w[0],M,A[0],Ca[0]); cpu_prep(X[0],prep[0],KN[0][0],4); ork_async_wait(h);
     int mism=0; for(int j=0;j<KN[0][1];j++) if(Cs[0][j]!=Ca[0][j]) mism++;
     printf("async-vs-sync bit-exact: mism=%d %s\n\n", mism, mism?"FAIL":"OK");
 
@@ -138,7 +138,7 @@ int main(int argc,char**argv){
 
         /* SYNC: cpu_prep then blocking run, summed */
         double s0=now_us();
-        for(int it=0;it<iters;it++) for(int m=0;m<7;m++){ cpu_prep(X[m],prep[m],KN[m][0],reps); ork_mm_run_i8(c,w[m],M,A[m],Cs[m]); }
+        for(int it=0;it<iters;it++) for(int m=0;m<7;m++){ cpu_prep(X[m],prep[m],KN[m][0],reps); ork_i8_mm_run(c,w[m],M,A[m],Cs[m]); }
         double t_sync=(now_us()-s0)/iters;
 
         /* ASYNC: pipeline cpu_prep(m+1) behind NPU compute(m). pin_lo>=0 → persistent pinned worker
@@ -152,7 +152,7 @@ int main(int argc,char**argv){
                     if(m<6) cpu_prep(X[m+1],prep[m+1],KN[m+1][0],reps);
                     aw_wait(&aw);
                 } else {
-                    ork_async*hh=ork_mm_run_i8_async(c,w[m],M,A[m],Ca[m]);
+                    ork_async*hh=ork_i8_mm_run_async(c,w[m],M,A[m],Ca[m]);
                     if(m<6) cpu_prep(X[m+1],prep[m+1],KN[m+1][0],reps);
                     ork_async_wait(hh);
                 }

@@ -22,7 +22,7 @@ int main(int argc,char**argv){
     printf("ork_dyn_test: S=%d ops (K=%d,N=%d), halt at H=%d\n",S,K,N,H);
     int8_t*A=(int8_t*)malloc(K); memset(A,1,K);   /* malloc (NOT ork_dma_alloc): zero-copy DMA-A miscomputes at M=1 */
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!O){printf("dma_alloc fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(ork_mm_task_i8)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }
@@ -58,7 +58,7 @@ int main(int argc,char**argv){
      *    sums). Feeding ork_dma_alloc A here was the sole cause of the old fp16-doorbell "flakiness". */
     { int MM=getenv("ORK_E_M")?atoi(getenv("ORK_E_M")):2, Kf=getenv("ORK_E_K")?atoi(getenv("ORK_E_K")):512, Nf=getenv("ORK_E_N")?atoi(getenv("ORK_E_N")):256; ork_f16 one=(ork_f16)1.0f;
       ork_f16*Bf=(ork_f16*)malloc((size_t)Kf*Nf*sizeof(ork_f16)); for(size_t i=0;i<(size_t)Kf*Nf;i++) Bf[i]=one;
-      ork_w*wf=ork_mm_pack(c,Kf,Nf,Bf);
+      ork_w*wf=ork_f16_mm_pack(c,Kf,Nf,Bf);
       ork_f16*Af=wf?(ork_f16*)malloc((size_t)MM*Kf*sizeof(ork_f16)):NULL; if(Af) for(int i=0;i<MM*Kf;i++) Af[i]=one;   /* host A */
       float*Of=Af?(float*)ork_dma_alloc(c,(size_t)S*MM*Nf*sizeof(float)):NULL;   /* C = resident DMA (zero-copy direct output) */
       ork_mm_task_i8*tf=malloc(sizeof(ork_mm_task_i8)*S);

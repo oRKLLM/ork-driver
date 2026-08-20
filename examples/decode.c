@@ -58,8 +58,8 @@ static int attn_decode_npu(ork_npu*ctx,const Cfg*c,const float*q,const kv_t*kv,f
         /* NPU pass 1 — QK^T: W=K^T[Kp,L] int8 (head_dim zero-padded to Kp), A=Q[1,Kp] int8 -> scores[1,L] int32 */
         for(int e=0;e<HD;e++)for(int j=0;j<L;j++) KTp[(size_t)e*L+j]=(int8_t)lrintf(kv->Kc[(size_t)j*KVd+kvh*HD+e]*ks);
         memset(Qp,0,Kp); for(int e=0;e<HD;e++) Qp[e]=(int8_t)lrintf(q[(size_t)hh*HD+e]*qs);
-        ork_w *wkt=ork_mm_pack_i8(ctx,Kp,L,KTp); if(!wkt){ rc=-2; break; }
-        ork_mm_task_i8 t1={ wkt,1,Qp,scores }; rc=ork_mm_run_chain_i8(ctx,1,&t1); ork_w_free(wkt); if(rc) break;
+        ork_w *wkt=ork_i8_mm_pack(ctx,Kp,L,KTp); if(!wkt){ rc=-2; break; }
+        ork_mm_task_i8 t1={ wkt,1,Qp,scores }; rc=ork_i8_mm_run_chain(ctx,1,&t1); ork_w_free(wkt); if(rc) break;
         /* HOST softmax (fp, REAL per-head max-subtraction) — the piece the fused chain can't do */
         double mx=-1e300; for(int j=0;j<L;j++){ sc[j]=(double)scores[j]/((double)qs*ks)*scale; if(sc[j]>mx)mx=sc[j]; }
         double Z=0; for(int j=0;j<L;j++){ sc[j]=exp(sc[j]-mx); Z+=sc[j]; } if(Z<=0)Z=1;
@@ -70,8 +70,8 @@ static int attn_decode_npu(ork_npu*ctx,const Cfg*c,const float*q,const kv_t*kv,f
         for(int j=0;j<L;j++){ int wi=(int)lrint(sc[j]*ws); w8[j]=(int8_t)(wi>127?127:(wi<0?0:wi)); }
         /* NPU pass 2 — e.V: W=V[L,HD] int8, A=weights[1,L] int8 -> att[1,HD] int32 */
         for(int j=0;j<L;j++)for(int e=0;e<HD;e++) Vp[(size_t)j*HD+e]=(int8_t)lrintf(kv->Vc[(size_t)j*KVd+kvh*HD+e]*vs);
-        ork_w *wv=ork_mm_pack_i8(ctx,L,HD,Vp); if(!wv){ rc=-2; break; }
-        ork_mm_task_i8 t2={ wv,1,w8,attv }; rc=ork_mm_run_chain_i8(ctx,1,&t2); ork_w_free(wv); if(rc) break;
+        ork_w *wv=ork_i8_mm_pack(ctx,L,HD,Vp); if(!wv){ rc=-2; break; }
+        ork_mm_task_i8 t2={ wv,1,w8,attv }; rc=ork_i8_mm_run_chain(ctx,1,&t2); ork_w_free(wv); if(rc) break;
         for(int e=0;e<HD;e++) att[(size_t)hh*HD+e]=(float)((double)attv[e]/(ws*vs));  /* de-quant: weight-scale ws * V-scale vs */
     }
 done:
@@ -82,11 +82,11 @@ done:
 typedef struct { int K,N; f16 *Brow; ork_w *w; } weight;
 static weight mkw(ork_npu*ctx,int K,int N,unsigned seed){weight wt={K,N,malloc((size_t)K*N*2),NULL};
     unsigned s=seed; for(size_t i=0;i<(size_t)K*N;i++){s=s*1103515245+12345;wt.Brow[i]=(f16)((((int)((s>>16)%9))-4)*(0.5f/sqrtf((float)K)));}
-    wt.w=ork_mm_pack(ctx,K,N,wt.Brow); return wt;}
+    wt.w=ork_f16_mm_pack(ctx,K,N,wt.Brow); return wt;}
 static void mm1(ork_npu*ctx,weight*wt,const float*Af32,float*C,int useNPU){   /* M=1 */
     int K=wt->K,N=wt->N; f16*A=malloc((size_t)K*2);
     for(int i=0;i<K;i++)A[i]=(f16)Af32[i];
-    if(useNPU) ork_mm_run(ctx,wt->w,1,A,C);
+    if(useNPU) ork_f16_mm_run(ctx,wt->w,1,A,C);
     else for(int n=0;n<N;n++){float acc=0;for(int k=0;k<K;k++)acc+=(float)A[k]*(float)wt->Brow[(size_t)k*N+n];C[n]=acc;}
     free(A);
 }

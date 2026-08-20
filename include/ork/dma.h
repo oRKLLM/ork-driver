@@ -13,7 +13,7 @@
  * @brief Allocate an NPU-coherent, CPU-mapped buffer for zero-copy activations/outputs.
  *
  * Put the activation A and/or output C here and the matmul reads/writes them in place — no host
- * gather/writeout memcpy (the ~33% prefill residual vs the closed runtime). ork_mm_run* detects
+ * gather/writeout memcpy (the ~33% prefill residual vs the closed runtime). ork_f16_mm_run* detects
  * residency automatically: pass the returned pointer as A/C exactly like a malloc'd one.
  * @param size Bytes to allocate.
  * @return CPU-visible pointer, or NULL on failure / zero-copy table full (fall back to malloc).
@@ -30,7 +30,7 @@ void         ork_dma_free (ork_npu *ctx, void *ptr);
  * EXISTING pages into the NPU — no second allocation, no copy. Caller fills the returned pointer with
  * the (pre-tiled) bytes, then calls ork_dma_import_sync once to flush them to the device; the NPU then
  * reads them in place across all submits (write-once-read-many weights). Returns the CPU pointer (pass
- * it as A/C to ork_mm_run exactly like an ork_dma_alloc one — it is registered in the same zero-copy
+ * it as A/C to ork_f16_mm_run exactly like an ork_dma_alloc one — it is registered in the same zero-copy
  * table), or NULL on failure (dma-heap absent / IOVA full) so the caller can fall back to ork_dma_alloc.
  * Still 32-bit-IOVA-capped (does not escape the ~4 GiB window); it eliminates the COPY, not the cap. */
 void        *ork_dma_import(ork_npu *ctx, size_t size);
@@ -38,7 +38,7 @@ void         ork_dma_import_sync(ork_npu *ctx, void *ptr, size_t size);  /* clea
 void         ork_dma_import_free(ork_npu *ctx, void *ptr);
 /* Import an EXTERNAL dma-buf fd (e.g. received over SCM_RIGHTS from another process) into the NPU's IOMMU
  * domain and register it for zero-copy — the returned CPU pointer maps the shared buffer, and passing a ptr
- * into it as A/C to ork_mm_run* makes the NPU read/write it IN PLACE (no copy). Takes ownership of the fd
+ * into it as A/C to ork_f16_mm_run* makes the NPU read/write it IN PLACE (no copy). Takes ownership of the fd
  * (closed by ork_dma_free/ork_dma_import_free). NULL on failure. Enables the orkd daemon to run a matmul
  * directly against a client's shared buffer. Same 32-bit IOVA cap as ork_dma_import. */
 void        *ork_dma_import_fd(ork_npu *ctx, int dmabuf_fd, size_t size);

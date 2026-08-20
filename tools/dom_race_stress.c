@@ -35,14 +35,14 @@ int main(int argc,char**argv){
     g_s=0x5678u; for(int i=0;i<M*K;i++) A[i]=rnd8();
 
     ork_npu_set_pack_domain(c, d1);
-    ork_w *w1 = ork_mm_pack_i8(c, K, N, B);   /* resident weight in d1 to RUN against */
+    ork_w *w1 = ork_i8_mm_pack(c, K, N, B);   /* resident weight in d1 to RUN against */
     if(!w1){ fprintf(stderr,"pack w1 failed — already wedged?\n"); return 1; }
 
     printf("dom_race_stress: d1=%d d2=%d, %d iters of [run d1 -> xdom pack d2] (M=%d K=%d N=%d)\n", d1,d2,iters,M,K,N);
     for(int i=0;i<iters;i++){
-        if(ork_mm_run_i8(c, w1, M, A, C) != 0){ printf("*** WEDGE at RUN(d1) iter %d ***\n", i); fflush(stdout); return 1; }
+        if(ork_i8_mm_run(c, w1, M, A, C) != 0){ printf("*** WEDGE at RUN(d1) iter %d ***\n", i); fflush(stdout); return 1; }
         ork_npu_set_pack_domain(c, d2);
-        ork_w *w2 = ork_mm_pack_i8(c, K, N, B);   /* cross-domain MEM_CREATE right after the run's submit — the race */
+        ork_w *w2 = ork_i8_mm_pack(c, K, N, B);   /* cross-domain MEM_CREATE right after the run's submit — the race */
         if(!w2){ printf("*** WEDGE at XDOM-PACK(d2) iter %d — retirement race (run d1 -> bcreate d2) ***\n", i); fflush(stdout); return 1; }
         ork_mm_free(c, w2);
         ork_npu_set_pack_domain(c, d1);           /* (run below re-selects w1 in d1 anyway) */

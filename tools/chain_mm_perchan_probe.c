@@ -15,7 +15,7 @@ int main(void){
     for(int i=0;i<K*N;i++){ s=s*1103515245+12345; B[i]=(int8_t)((s>>16)&1); }        /* 0/1 */
     for(int n=0;n<N;n++) scale[n]=(short)(n%3);                                        /* 0..2 per channel */
     double us=0;
-    int rc=ork_npu_chain_mm_perchan_i16(c,M,K,N,A,B,scale,0x4000,14,0x4000,14,out,&us);
+    int rc=ork_i16_npu_chain_mm_perchan(c,M,K,N,A,B,scale,0x4000,14,0x4000,14,out,&us);
     int bad=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int acc=0; for(int k=0;k<K;k++) acc+=(int)A[(size_t)m*K+k]*(int)B[(size_t)k*N+n];
         int ref=acc*(int)scale[n]; if(out[(size_t)m*N+n]!=ref){ if(bad<4)printf("  [%d][%d] NPU=%d ref=%d (acc=%d scale=%d)\n",m,n,out[(size_t)m*N+n],ref,acc,scale[n]); bad++; } }

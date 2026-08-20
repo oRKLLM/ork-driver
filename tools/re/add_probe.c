@@ -15,7 +15,7 @@ int main(int argc,char**argv){
     const int M=8,N=64; static signed char a[512],b[512],out[512];
     for(int i=0;i<M*N;i++){ a[i]=(signed char)((i%61)-30); b[i]=(signed char)((i%37)-18); }
     double us=0;
-    int r=ork_npu_probe_add_i8(c,a,b,M,N,mult,shift,bscale,0,0,0,out,&us);
+    int r=ork_i8_npu_probe_add(c,a,b,M,N,mult,shift,bscale,0,0,0,out,&us);
     printf("add mult=0x%x shift=%d bscale=0x%x rc=%d (%.1f us)\n",mult,shift,bscale,r,us);
     if(r){ ork_npu_free(c); return 1; }
     int mism=0,mx=0;

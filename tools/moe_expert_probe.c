@@ -5,9 +5,9 @@
  * For representative fine-grained-MoE expert FFN shapes (gate/up K=2048 N=768; down K=768 N=2048;
  * and a 2nd hidden size K=4096 N=1408 / K=1408 N=4096), sweep M in {8,16,32,64,128} and measure
  * median warm latency of:
- *   NPU-new single : int4-NF4 weight loaded via DIRECT inflate (cacheable tiled buf), one ork_mm_run_i8
+ *   NPU-new single : int4-NF4 weight loaded via DIRECT inflate (cacheable tiled buf), one ork_i8_mm_run
  *   NPU-new chained: CHAIN experts (run_chain_i8) sharing the M activation -> per-expert amortized
- *   NPU-old        : f32->int8 repack each call (the prior expert path: ork_mm_pack_i8_f32) THEN run_i8
+ *   NPU-old        : f32->int8 repack each call (the prior expert path: ork_i8_mm_pack_f32) THEN run_i8
  *   CPU            : a tight NEON int8 GEMM of the same (M,K,N) on the A76 (run under taskset -c 4-7)
  *
  * Correctness: every NPU run is checked vs a CPU int8 reference over the SAME weights (PASS/FAIL);
@@ -111,12 +111,12 @@ int main(int argc, char**argv){
         ork_w **wnew = malloc(CHAIN_DEPTH*sizeof(ork_w*));
         int build_ok = 1;
         for(int e=0;e<CHAIN_DEPTH;e++){
-            ork_w *wp = ork_mm_pack_i4a8(c,K,N,f32[e],NULL);
+            ork_w *wp = ork_i4a8_mm_pack(c,K,N,f32[e],NULL);
             if(!wp){ build_ok=0; break; }
-            size_t bn = ork_w_dump_i4a8(wp,NULL,0); void*blob=malloc(bn); ork_w_dump_i4a8(wp,blob,bn);
+            size_t bn = ork_i4a8_w_dump(wp,NULL,0); void*blob=malloc(bn); ork_i4a8_w_dump(wp,blob,bn);
             ork_mm_free(c,wp);
             setenv("ORK_DIRECT_I4","1",1);
-            wnew[e] = ork_mm_load_i4a8(c,K,N,blob,bn);
+            wnew[e] = ork_i4a8_mm_load(c,K,N,blob,bn);
             unsetenv("ORK_DIRECT_I4");
             free(blob);
             if(!wnew[e]){ build_ok=0; break; }
@@ -152,7 +152,7 @@ int main(int argc, char**argv){
         /* correctness once (M=8) for expert 0: NPU-new vs CPU ref */
         {
             int M=8;
-            int crc = ork_mm_run_i8(c,wnew[0],M,A,Cnpu);
+            int crc = ork_i8_mm_run(c,wnew[0],M,A,Cnpu);
             cpu_gemm_i8(M,K,N,A,B8[0],Cref);
             int bad = crc || memcmp(Cnpu,Cref,(size_t)M*N*4);
             printf("  correctness (M=8, expert0): %s\n", bad?"FAIL":"PASS");
@@ -165,37 +165,37 @@ int main(int argc, char**argv){
             double sm[REPS];
 
             /* --- NPU-new single: weight resident, one run_i8 --- */
-            for(int i=0;i<WARM;i++) ork_mm_run_i8(c,wnew[0],M,A,Cnpu);
-            for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_run_i8(c,wnew[0],M,A,Cnpu); sm[i]=now_us()-t; }
+            for(int i=0;i<WARM;i++) ork_i8_mm_run(c,wnew[0],M,A,Cnpu);
+            for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_run(c,wnew[0],M,A,Cnpu); sm[i]=now_us()-t; }
             double npu_new = median(sm,REPS);
 
             /* --- NPU-new chained: CHAIN_DEPTH experts in one submit, report per-expert --- */
             double npu_chain = -1;
             ork_mm_task_i8 tasks[CHAIN_DEPTH];
             for(int e=0;e<CHAIN_DEPTH;e++){ tasks[e].w=wnew[e]; tasks[e].M=M; tasks[e].A=A; tasks[e].C=Cchain[e]; }
-            int cr = ork_mm_run_chain_i8(c,CHAIN_DEPTH,tasks);   /* warm + probe support */
+            int cr = ork_i8_mm_run_chain(c,CHAIN_DEPTH,tasks);   /* warm + probe support */
             if(cr==0){
-                for(int i=0;i<WARM;i++) ork_mm_run_chain_i8(c,CHAIN_DEPTH,tasks);
-                for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_run_chain_i8(c,CHAIN_DEPTH,tasks); sm[i]=now_us()-t; }
+                for(int i=0;i<WARM;i++) ork_i8_mm_run_chain(c,CHAIN_DEPTH,tasks);
+                for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_run_chain(c,CHAIN_DEPTH,tasks); sm[i]=now_us()-t; }
                 npu_chain = median(sm,REPS)/CHAIN_DEPTH;   /* per-expert amortized */
                 /* chain correctness: expert0 result must match ref */
                 cpu_gemm_i8(M,K,N,A,B8[0],Cref);
                 if(memcmp(Cchain[0],Cref,(size_t)M*N*4)){ printf("    [chain correctness FAIL at M=%d]\n",M); overall_ok=0; }
                 /* run_i8 leaves NPU in a different mode than chain — re-warm run_i8 path after */
-                ork_mm_run_i8(c,wnew[0],M,A,Cnpu);
+                ork_i8_mm_run(c,wnew[0],M,A,Cnpu);
             }
 
             /* --- NPU-new stream: CHAIN_DEPTH experts via async round-robin cross-core, per-expert --- */
             double npu_stream = -1;
             {
-                int sr = ork_mm_run_stream_i8(c,CHAIN_DEPTH,tasks);
+                int sr = ork_i8_mm_run_stream(c,CHAIN_DEPTH,tasks);
                 if(sr==0){
-                    for(int i=0;i<WARM;i++) ork_mm_run_stream_i8(c,CHAIN_DEPTH,tasks);
-                    for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_run_stream_i8(c,CHAIN_DEPTH,tasks); sm[i]=now_us()-t; }
+                    for(int i=0;i<WARM;i++) ork_i8_mm_run_stream(c,CHAIN_DEPTH,tasks);
+                    for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_run_stream(c,CHAIN_DEPTH,tasks); sm[i]=now_us()-t; }
                     npu_stream = median(sm,REPS)/CHAIN_DEPTH;
                     cpu_gemm_i8(M,K,N,A,B8[0],Cref);
                     if(memcmp(Cchain[0],Cref,(size_t)M*N*4)){ printf("    [stream correctness FAIL at M=%d]\n",M); overall_ok=0; }
-                    ork_mm_run_i8(c,wnew[0],M,A,Cnpu);
+                    ork_i8_mm_run(c,wnew[0],M,A,Cnpu);
                 }
             }
 
@@ -205,10 +205,10 @@ int main(int argc, char**argv){
             double npu_old = -1;
             {
                 float *bsc = malloc((size_t)N*sizeof(float));
-                ork_w *wo = ork_mm_pack_i8_f32(c,K,N,f32[0],bsc);
+                ork_w *wo = ork_i8_mm_pack_f32(c,K,N,f32[0],bsc);
                 if(wo){
-                    for(int i=0;i<WARM;i++){ ork_mm_repack_i8_f32(c,wo,K,N,f32[0],bsc); ork_mm_run_i8(c,wo,M,A,Cnpu); }
-                    for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_repack_i8_f32(c,wo,K,N,f32[0],bsc); ork_mm_run_i8(c,wo,M,A,Cnpu); sm[i]=now_us()-t; }
+                    for(int i=0;i<WARM;i++){ ork_i8_mm_repack_f32(c,wo,K,N,f32[0],bsc); ork_i8_mm_run(c,wo,M,A,Cnpu); }
+                    for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_repack_f32(c,wo,K,N,f32[0],bsc); ork_i8_mm_run(c,wo,M,A,Cnpu); sm[i]=now_us()-t; }
                     npu_old = median(sm,REPS);
                     ork_mm_free(c,wo);
                 }

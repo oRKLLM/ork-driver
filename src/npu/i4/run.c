@@ -36,7 +36,7 @@ int orki_i4_submit_tmo_ms(void){
  * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
  * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the
  * weight every row (the W4A4 submit-bound the int8 0x1040 M-scheduler avoids). Default ON (bit-exact
- * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + orki_run_i4_mc_db (per-row doorbell)
+ * validated ./i4; per-row fallback where the batch doesn't fit). Implemented in synth_i4 mc>1 + orki_i4_run_mc_db (per-row doorbell)
  * + stream_worker_i4; NVDLA D_BATCH_NUMBER/D_*_STRIDE analogy.
  *   PRESERVED as a distinct, named strategy — the multi-task-submit batch (many 1-row tasks per submit, the
  *   vendor's int4 approach; task_number=rows) is a SEPARATE path and must NOT overwrite/conflate with this.
@@ -45,7 +45,7 @@ int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSC
 
 static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=(e&&atoi(e))?1:0;} return v; }  /* default OFF: under pinned-DDR benchmarking N-subslice is ~neutral (submit overhead cancels the weight-DMA saving); the "1.1-1.2x" seen earlier was an unpinned-governor artifact. Kept opt-in. */
 
-void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */
@@ -105,17 +105,17 @@ void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
     for(int i=0;i<orki_i4_fovr_n;i++) orki_setr(rc,REGCMD_I4_N,orki_i4_fovr[i].blk,orki_i4_fovr[i].reg,orki_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
-void orki_tile_direct_i4_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
+void orki_i4_tile_direct_to_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
     if (kind == ORK_QK_CODEBOOK_NF4) {
         int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
-        for (int n = 0; n < N; n++) orki_inflate_chan_nf4_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
+        for (int n = 0; n < N; n++) orki_nf4_inflate_chan_to_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
     } else {
-        for (int n = 0; n < N; n++) orki_expand_chan_i4_i8(w->Bi4 + (size_t)n*(K/2), K, i8scratch + (size_t)n*K);
+        for (int n = 0; n < N; n++) orki_i4_expand_chan_to_i8(w->Bi4 + (size_t)n*(K/2), K, i8scratch + (size_t)n*K);
     }
-    orki_tile_i8_to_tiles(c, w, K, N, i8scratch);
+    orki_i8_tile_to_tiles(c, w, K, N, i8scratch);
 }
 
-void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind) {
+void ork_i4a8_slice_inflate_kind(const ork_w *w, float *qf32, int kind) {
     if (!w || !w->Bi4) return;
     int K = w->K, N = w->N;
     if (kind == ORK_QK_CODEBOOK_NF4) {
@@ -125,21 +125,21 @@ void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind) {
             for (int k = 0; k < K; k++) { uint8_t idx = (k&1) ? (nibp[k>>1]>>4) : (nibp[k>>1]&0xf); qf[k] = (float)lut[idx]; }
         }
     } else {
-        for (int nn = 0; nn < N; nn++) orki_expand_chan_i4_f32(w->Bi4 + (size_t)nn*(K/2), K, qf32 + (size_t)nn*K);
+        for (int nn = 0; nn < N; nn++) orki_i4_expand_chan_f32(w->Bi4 + (size_t)nn*(K/2), K, qf32 + (size_t)nn*K);
     }
 }
 
-void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a8_kind(w, qf32, w ? w->quant_kind : 0); }
+void ork_i4a8_slice_inflate(const ork_w *w, float *qf32) { ork_i4a8_slice_inflate_kind(w, qf32, w ? w->quant_kind : 0); }
 
 /* DIRECT path microbench: inflate w's nibbles STRAIGHT to int8-tiled (no f32, no re-quant) into the
  * resident DMA tiles. i8scratch is caller-provided (size N*K); kind forces UNIFORM/NF4. Bit-identical
- * to ork_slice_inflate_i4a8_kind + ork_slice_tile_i8, but in one pass with no float round-trip. */
-void ork_slice_direct_i4a8_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
+ * to ork_i4a8_slice_inflate_kind + ork_i8_slice_tile, but in one pass with no float round-trip. */
+void ork_i4a8_slice_direct_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
     if (!w || !w->Bi4) return;
-    orki_tile_direct_i4_i8(c, w, w->K, w->N, kind, i8scratch);
+    orki_i4_tile_direct_to_i8(c, w, w->K, w->N, kind, i8scratch);
 }
 
-int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w && w->is_orkd){   /* Path B: int4 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op */
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I4,A,C); if(r!=-2) return r; }
@@ -150,7 +150,7 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * in domain N submits against the stale dom_active (e.g. 0) -> RKNPU_SUBMIT EINVAL(22) -> self-heal reset ->
      * retry (correctness held via the reset, but every cross-domain expert submit thrashed -> very slow). */
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
-    if(orki_check_overlap("ork_mm_run_i4", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_i4_mm_run", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     int NB=w->N/64;                            /* total 64-wide N-blocks (column-split granularity) */
     int nc=orki_budget(c, M); if(nc>NB)nc=NB; if(nc<1)nc=1;   /* ≥1 N-block/core; nc==1 = serial */
     /* DEFAULT int4 M>1 prefill: BCHAIN batch-chain on the NONBLOCK doorbell (run_i4_bchain_db) — H-row native
@@ -165,31 +165,31 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     /* #54: DEFAULT int4 M>1 prefill = BCHAIN (M-batched, the perf path) — now PORTED to ride the SHARED ork_dyn_end
      * drain (poll + orki_mc_recover_resubmit + reap-at-boundary), so it is multi-domain-safe like int8 colsplit AND
      * keeps its M-batching. bch_db_worker builds+submits only; ork_dyn_end owns the drain (i4batch hooks). Falls
-     * through (-4) to the per-row doorbell (orki_run_i4_mc_db) for decode (M=1) / non-qualifying shapes. */
-    if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=orki_run_i4_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
+     * through (-4) to the per-row doorbell (orki_i4_run_mc_db) for decode (M=1) / non-qualifying shapes. */
+    if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=orki_i4_run_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
     /* Wide refuse-prone int4 PREFILL (Sn>1 or K>8192 — the shapes pack built w->sliced for): the per-row
-     * orki_run_i4_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled
+     * orki_i4_run_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled
      * rescue (measured 663ms -> 107ms at M=128 N=16384). Decode (M==1) stays on the per-row path (cheap). */
     if(M>=2 && w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
-    /* decode (M=1) + non-batch shapes ride the per-row doorbell chain (ork_dyn_begin_mc_i4): Sk>1/Sn>1 via
+    /* decode (M=1) + non-batch shapes ride the per-row doorbell chain (ork_i4_dyn_begin_mc): Sk>1/Sn>1 via
      * chained column/K-slice programs. -4 (over-large chain / unsupported int4 shape) => refuse (rescue-eligible).
      * All blocking int4 paths (i4_mcworker / INCR / CBATCH / blocking BCHAIN) are removed (#45/#52). */
-    if(!orki_ork_prof){ int r=orki_run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;
+    if(!orki_ork_prof){ int r=orki_i4_run_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;
         if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue the refused shape via BCHAIN sub-tiles, else refuse */
         return ORK_RC_WEDGE_PRONE; }
-    double t0=ork_now_us(); int r=orki_run_i4_mc_db(c,w,M,A,C,nc); orki_prof_i4_us+=ork_now_us()-t0; orki_prof_i4_calls++;
+    double t0=ork_now_us(); int r=orki_i4_run_mc_db(c,w,M,A,C,nc); orki_prof_i4_us+=ork_now_us()-t0; orki_prof_i4_calls++;
     if(r!=-4) return r;
     if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue */
     return ORK_RC_WEDGE_PRONE;
 }
 
-int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
+int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
-    if(orki_check_overlap("ork_mm_run_i4_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    if(orki_check_overlap("ork_i4_mm_run_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* Grouped int4 runs on the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float scale-accumulate
      * drain). NULL (chain/scratch too big / ineligible) => refuse (rescue-eligible); the blocking
      * i4_mcworker_g path is removed (#45). */
-    ork_dyn_chain *hg=ork_dyn_begin_mc_i4_grouped(c,M,w,A,aScale,bScale,C,0);
+    ork_dyn_chain *hg=ork_i4_dyn_begin_mc_grouped(c,M,w,A,aScale,bScale,C,0);
     if(hg) return ork_dyn_grouped_end(hg)?-1:0;
     /* #33 GROUPED RESCUE (M-chunk): the doorbell refused because the per-core program count
      * (rows/core)*Sn*Sk exceeds the regcmd-buffer cap (~70). Rows are INDEPENDENT, so M-CHUNK the rows —
@@ -204,13 +204,13 @@ int ork_mm_run_i4_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
         int Msub=rpc*nc; if(Msub>=M) Msub=M-1; if(Msub<1) Msub=1;
         int ok=1;
         for(int m0=0;m0<M && ok;m0+=Msub){ int mm=(M-m0<Msub)?(M-m0):Msub;
-            if(ork_mm_run_i4_grouped(c,w,mm, A+(size_t)m0*w->K, aScale+(size_t)m0*Sk, bScale, C+(size_t)m0*w->N)) ok=0; }
+            if(ork_i4_mm_run_grouped(c,w,mm, A+(size_t)m0*w->K, aScale+(size_t)m0*Sk, bScale, C+(size_t)m0*w->N)) ok=0; }
         if(ok) return 0;
     }
     return ORK_RC_WEDGE_PRONE;
 }
 
-int orki_slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
+int orki_i4_slice_run(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc) {
     if (!c || !w || !A || !C || M < 1) return -1;
     int ks = w->ks, ns = w->ns, nks = w->nks, nnt = w->nnt, S = nks * nnt, K = w->K, N = w->N, Kpad = w->Kpad;
     int8_t  *Aslc = malloc((size_t) M * Kpad);
@@ -228,8 +228,8 @@ int orki_slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32
             int32_t *ptile = part + poff; poff += (size_t) M * Nw;
             tasks[ki*nnt + ni] = (ork_mm_task_i8){ w->sub[ki*nnt + ni], M, aptr, ptile };
             int nct = nc>0 ? nc : c->soc->cores; int nb = Nw/64; if (nct > nb) nct = nb; if (nct < 1) nct = 1;
-            int r = (M >= 2) ? orki_run_i4_bchain_db(c, w->sub[ki*nnt + ni], M, aptr, ptile, nct)   /* BCHAIN batch on the doorbell */
-                             : orki_run_i4_mc_db    (c, w->sub[ki*nnt + ni], M, aptr, ptile, nct);  /* M==1 per-row doorbell */
+            int r = (M >= 2) ? orki_i4_run_bchain_db(c, w->sub[ki*nnt + ni], M, aptr, ptile, nct)   /* BCHAIN batch on the doorbell */
+                             : orki_i4_run_mc_db    (c, w->sub[ki*nnt + ni], M, aptr, ptile, nct);  /* M==1 per-row doorbell */
             if (r < 0) rc = -1; } }
     if (!rc) {   /* per-core PARALLEL ks-outer int32 accumulate + N scatter (same worker as int8) */
         int anc = nc>0 ? nc : c->soc->cores; if(anc>ORK_MAXCORE) anc=ORK_MAXCORE; if(anc<1) anc=1;
@@ -250,7 +250,7 @@ int orki_slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32
     free(Aslc); free(part); free(tasks); return rc;
 }
 
-int ork_bmm_i4_strided(ork_npu *c, int nbatch, int M, int K, int N,
+int ork_i4_bmm_strided(ork_npu *c, int nbatch, int M, int K, int N,
                        const int8_t *A, const int8_t *B, int32_t *C, const ork_bmm_strides *s){
     if(!c||!A||!B||!C||!s) return -1;
     if(nbatch<1||M<1||K<1||N<1) return -2;
@@ -260,11 +260,11 @@ int ork_bmm_i4_strided(ork_npu *c, int nbatch, int M, int K, int N,
     if(!Ac||!Bc||(!cdense&&!Cc)){ free(Ac);free(Bc);free(Cc); return -3; }
     int rc=0;
     for(int b=0;b<nbatch;b++){
-        orki_bmm_gather_i8(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
-        orki_bmm_gather_i8(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
-        ork_w *w=ork_mm_pack_i4(c,K,N,Bc); if(!w){ rc=-3; break; }
+        orki_i8_bmm_gather(Bc,B+(long)b*s->bbs,K,N,s->bs_k,s->bs_n);
+        orki_i8_bmm_gather(Ac,A+(long)b*s->abs,M,K,s->as_m,s->as_k);
+        ork_w *w=ork_i4_mm_pack(c,K,N,Bc); if(!w){ rc=-3; break; }
         int32_t *Cout = cdense ? C+(long)b*s->cbs : Cc;
-        int r=ork_mm_run_i4(c,w,M,Ac,Cout);
+        int r=ork_i4_mm_run(c,w,M,Ac,Cout);
         ork_mm_free(c,w);
         if(r){ rc=-5; break; }
         if(!cdense) orki_bmm_scatter_i32(C+(long)b*s->cbs,Cc,M,N,s->cs_m,s->cs_n);
@@ -273,14 +273,14 @@ int ork_bmm_i4_strided(ork_npu *c, int nbatch, int M, int K, int N,
     return rc;
 }
 
-int ork_bmm_i4(ork_npu *c, int nbatch, int M, int K, int N,
+int ork_i4_bmm(ork_npu *c, int nbatch, int M, int K, int N,
                const int8_t *A, const int8_t *B, int32_t *C){
-    ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_bmm_i4_strided(c,nbatch,M,K,N,A,B,C,&s);
+    ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_i4_bmm_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
-int orki_run_i4_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+int orki_i4_run_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     ork_mm_task_i8 *tk = malloc((size_t)M * sizeof *tk); if(!tk) return -4;
     for(int m=0;m<M;m++) tk[m]=(ork_mm_task_i8){ w, 1, A + (size_t)m*w->K, C + (size_t)m*w->N };
-    ork_dyn_chain *h = ork_dyn_begin_mc_i4(c, M, tk, nc);
+    ork_dyn_chain *h = ork_i4_dyn_begin_mc(c, M, tk, nc);
     free(tk);
     if(!h) return -4;   /* shape/buffer limit -> caller refuses (ORK_RC_WEDGE_PRONE) */
     int d = ork_dyn_end(h);

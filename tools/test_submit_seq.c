@@ -37,8 +37,8 @@ int main(int argc,char**argv){
     /* all-ones operands: int8 dot == K, fp16 dot == (float)K */
     int8_t  *Bi=(int8_t*)malloc((size_t)K*N); memset(Bi,1,(size_t)K*N);
     ork_f16 *Bf=(ork_f16*)malloc((size_t)K*N*sizeof(ork_f16)); for(size_t i=0;i<(size_t)K*N;i++) Bf[i]=(ork_f16)1.0f;
-    ork_w *wi=ork_mm_pack_i8(c,K,N,Bi); if(!wi){ printf("pack_i8 fail\n"); return 2; }
-    ork_w *wf=ork_mm_pack   (c,K,N,Bf); if(!wf){ printf("pack fp16 fail\n"); return 2; }
+    ork_w *wi=ork_i8_mm_pack(c,K,N,Bi); if(!wi){ printf("pack_i8 fail\n"); return 2; }
+    ork_w *wf=ork_f16_mm_pack   (c,K,N,Bf); if(!wf){ printf("pack fp16 fail\n"); return 2; }
     int8_t  *Ai=(int8_t*)malloc((size_t)M*K); memset(Ai,1,(size_t)M*K);
     ork_f16 *Af=(ork_f16*)malloc((size_t)M*K*sizeof(ork_f16)); for(size_t i=0;i<(size_t)M*K;i++) Af[i]=(ork_f16)1.0f;
 
@@ -85,7 +85,7 @@ int main(int argc,char**argv){
         int Knc=768;                          /* K%32==0 (fp16 pack ok) but K%512!=0 (doorbell-ineligible) */
         ork_f16 *Bnc=(ork_f16*)malloc((size_t)Knc*N); for(size_t i=0;i<(size_t)Knc*N;i++) Bnc[i]=(ork_f16)1.0f;
         ork_f16 *Anc=(ork_f16*)malloc((size_t)M*Knc*sizeof(ork_f16)); for(size_t i=0;i<(size_t)M*Knc;i++) Anc[i]=(ork_f16)1.0f;
-        ork_w *wnc=ork_mm_pack(c,Knc,N,Bnc);
+        ork_w *wnc=ork_f16_mm_pack(c,Knc,N,Bnc);
         float *Fnc=malloc(ei*4);
         int sub=0;
         if(!wnc){ printf("  non-conforming fp16 pack fail\n"); fail=1; }
@@ -112,7 +112,7 @@ int main(int argc,char**argv){
     {
         int8_t *Bi4=(int8_t*)malloc((size_t)K*N); memset(Bi4,1,(size_t)K*N);   /* int4 nibble value 1 */
         int8_t *Ai4=(int8_t*)malloc((size_t)K);   memset(Ai4,1,(size_t)K);
-        ork_w *wi4=ork_mm_pack_i4(c,K,N,Bi4);
+        ork_w *wi4=ork_i4_mm_pack(c,K,N,Bi4);
         int32_t *M0=malloc((size_t)N*4), *M3=malloc((size_t)N*4), *M2i=malloc((size_t)N*4); float *M1f=malloc((size_t)N*4);
         int i4_fail=0;
         if(!wi4){ printf("  pack_i4 fail\n"); fail=1; }

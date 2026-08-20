@@ -1,6 +1,6 @@
 /* replay_tile — (A) MVP: replay rkllm's CAPTURED fold regcmd for ONE full-K/full-N tile, bit-exact.
  * Feeds rkllm's EXACT regcmd (/tmp/mm_regcmd.txt) + rkllm's EXACT operand bytes (/tmp/mm_A.bin C2-16,
- * /tmp/mm_weight.bin ork_woff) through ork_npu_replay_i8 (patches A/B/C addrs, submits task_number=1),
+ * /tmp/mm_weight.bin ork_woff) through ork_i8_npu_replay (patches A/B/C addrs, submits task_number=1),
  * then de-tiles the C2-4 output and compares to a CPU reference computed from the SAME input bytes
  * (de-tiled via the confirmed fold layouts). If bit-exact + no wedge => ork can execute rkllm's proven
  * schedule verbatim (capture-replay viable); if it wedges => even rkllm's exact regcmd won't run rebased.
@@ -11,7 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "ork_npu.h"
-extern int ork_npu_replay_i8(ork_npu*,const unsigned*,int,int,int,int,const signed char*,int,const signed char*,int,int*,int,double*);
+extern int ork_i8_npu_replay(ork_npu*,const unsigned*,int,int,int,int,const signed char*,int,const signed char*,int,int*,int,double*);
 
 /* confirmed fold layouts (width w = M) */
 static size_t nc16(int m,int k,int w){ return (size_t)(k/16)*((size_t)w*16)+(size_t)m*16+(k%16); }        /* C2-16 input  */
@@ -54,11 +54,11 @@ int main(int argc,char**argv){
     ork_npu_set_core_budget(c,1);
     /* warm the proven int8 path first (like validate_mfold): pack a dummy weight + run M=8 */
     { int8_t*wd=calloc(wsz,1); int32_t*td=calloc((size_t)8*N,4); int8_t*ad=calloc((size_t)8*K,1);
-      ork_w*w=ork_mm_pack_i8(c,K,N,wd); if(w){ ork_mm_run_i8(c,w,8,ad,td); ork_mm_free(c,w); }
+      ork_w*w=ork_i8_mm_pack(c,K,N,wd); if(w){ ork_i8_mm_run(c,w,8,ad,td); ork_mm_free(c,w); }
       free(wd);free(td);free(ad); }
 
     int32_t*Craw=calloc((size_t)M*N,4); double us=0;
-    int r=ork_npu_replay_i8(c,rc,rn,M,K,N,A,(int)asz,W,(int)wsz,Craw,5,&us);
+    int r=ork_i8_npu_replay(c,rc,rn,M,K,N,A,(int)asz,W,(int)wsz,Craw,5,&us);
     if(r){ printf("replay rc=%d (STALL/err — even rkllm's exact regcmd won't run rebased)\n",r); ork_npu_free(c); return 1; }
 
     /* GROUND TRUTH: ork's raw output buffer vs rkllm's raw output buffer (mm_C.bin). Same regcmd + same

@@ -26,10 +26,10 @@ int main(int argc,char**argv){
     /* W = Q^T padded: [512, Nq] with rows k<d = Q[i][k], i.e. QTp[k][i]=Q[i][k]; k>=d zero */
     int8_t *QTp=calloc((size_t)512*Nq,1);
     for(int k=0;k<d;k++)for(int i=0;i<Nq;i++) QTp[(size_t)k*Nq+i]=Q[(size_t)i*d+k];
-    ork_w *w_qt=ork_mm_pack_i8(c,512,Nq,QTp); if(!w_qt){ printf("pack Q^T fail\n"); return 2; }
+    ork_w *w_qt=ork_i8_mm_pack(c,512,Nq,QTp); if(!w_qt){ printf("pack Q^T fail\n"); return 2; }
     int32_t *st=calloc((size_t)Nk*Nq,4);
     ork_mm_task_i8 t={ w_qt, Nk, Ka, st };   /* M=Nk (keys), K=512, N=Nq -> scores^T[Nk,Nq] */
-    int rc=ork_mm_run_chain_i8(c,1,&t);      /* single int8 matmul (multi-core auto-tuner) */
+    int rc=ork_i8_mm_run_chain(c,1,&t);      /* single int8 matmul (multi-core auto-tuner) */
     printf("  matmul(A=K_pad, W=Q^T) rc=%d  st[0]=%d\n", rc, st[0]);
     if(rc){ printf("FAIL rc=%d\n",rc); return 1; }
     int bad=0; long me=0;

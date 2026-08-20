@@ -2,7 +2,7 @@
  * N independent int8 matmuls (M=1), the NPU's decode share. Compares NPU-only wall time for:
  *   T_sc     : single-core queue   (ork_dyn_queue ncore=1  -> ork_dyn_begin, chained, 1 core)
  *   T_mc     : multi-core  queue   (ork_dyn_queue ncore=3  -> ork_dyn_begin_mc, NONBLOCK, 3 cores)
- *   T_stream : blocking 3-core stream (ork_mm_run_stream_i8 — the current #14 decode dispatch)
+ *   T_stream : blocking 3-core stream (ork_i8_mm_run_stream — the current #14 decode dispatch)
  * then the overlap that matters: T_mc_over = mc-queue flush ‖ CPU bulk, vs T_seq = mc then CPU.
  *   make ork_dyn_queue_bench && sudo ./ork_dyn_queue_bench [N=32]
  * (NPU op; run alone.)
@@ -26,7 +26,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     int8_t*A=(int8_t*)malloc(K); memset(A,1,K);
     int8_t*B=malloc((size_t)K*Nn); memset(B,1,(size_t)K*Nn);
-    ork_w*w=ork_mm_pack_i8(c,K,Nn,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,Nn,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)N*Nn*sizeof(int32_t)); if(!O){printf("dma fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*N);
     for(int i=0;i<N;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*Nn; }
@@ -46,8 +46,8 @@ int main(int argc,char**argv){
     double T_mc=now_us()-t; int ok_mc=check(O,N,Nn,K);
 
     /* ---- blocking 3-core stream (current #14 decode dispatch) ---- */
-    ork_mm_run_stream_i8(c,N,tk); /*warm*/
-    reseed(O,N,Nn); t=now_us(); int src=ork_mm_run_stream_i8(c,N,tk); double T_stream=now_us()-t; int ok_st=check(O,N,Nn,K);
+    ork_i8_mm_run_stream(c,N,tk); /*warm*/
+    reseed(O,N,Nn); t=now_us(); int src=ork_i8_mm_run_stream(c,N,tk); double T_stream=now_us()-t; int ok_st=check(O,N,Nn,K);
 
     /* ---- overlap: mc-queue flush ‖ CPU bulk, vs serialized ---- */
     double one; { double t1=now_us(); cpu_bulk(bulk,bulk_sz,1); one=now_us()-t1; }

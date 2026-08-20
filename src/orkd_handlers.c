@@ -35,7 +35,7 @@ int orkd_handle_import(struct client *cl, ork_npu *npu, int bb_fd, int bf_fd, ui
         if (pdom >= ORKD_NDOM || !(cl->owned_dom & (1ull << pdom))){ close(bb_fd); if (bf_fd >= 0) close(bf_fd); orkd_send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
     } else pdom = cl->domain;
     ork_npu_set_pack_domain(npu, pdom);
-    ork_w *w = ork_mm_adopt_imported_i8(npu, (int)im.K, (int)im.N, bb_fd, bf_fd, (size_t)im.bb_bytes, (size_t)im.bf_bytes);
+    ork_w *w = ork_i8_mm_adopt_imported(npu, (int)im.K, (int)im.N, bb_fd, bf_fd, (size_t)im.bb_bytes, (size_t)im.bf_bytes);
     ork_npu_set_pack_domain(npu, 0);            /* restore default */
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
     if (w && cl->nw < ORKD_MAX_WEIGHTS){ hh.id = ++cl->next_wid; hh.rc = 0; cl->wt[cl->nw++] = (struct cweight){ hh.id, w, (int)im.K, (int)im.N, (int)ORKD_DT_I8 }; }
@@ -43,10 +43,10 @@ int orkd_handle_import(struct client *cl, ork_npu *npu, int bb_fd, int bf_fd, ui
     orkd_send_msg(cl->fd, ORKD_IMPORT_OK, tag, &hh, sizeof hh);
     return 0;
 }
-/* ORKD_FFN: the whole SwiGLU FFN inner as ONE coalesced on-NPU chain (ork_mm_run_chain_i8_ffn, SDP-op
+/* ORKD_FFN: the whole SwiGLU FFN inner as ONE coalesced on-NPU chain (ork_i8_mm_run_chain_ffn, SDP-op
  * address-aliasing) against 3 resident weights. Fixed op-list: gate MM8(x,Wg) -> silu -> up MM8(x,Wu) ->
  * glu ewmul -> down MM32(glu,Wd). One socket round-trip + one submit for the entire inner; intermediates
- * never leave the NPU. Reply = the down output (M*Kd int32). ork_mm_run_chain_i8_ffn stages A/C internally
+ * never leave the NPU. Reply = the down output (M*Kd int32). ork_i8_mm_run_chain_ffn stages A/C internally
  * and dom_activates the weights' domain, so no domain setup here. Runs INLINE (single-stream serialized). */
 int orkd_handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_ffn f;
@@ -61,7 +61,7 @@ int orkd_handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
     int M = (int)f.M, K = (int)f.K, Nff = (int)f.Nff, Kd = (int)f.Kd;
     if (!cg || !cu || !cd || M < 1 || K < 1 || Nff < 1 || Kd < 1 || f.abytes != (uint32_t)((size_t)M * K)){
         free(A); orkd_send_error(cl->fd, tag, (cg && cu && cd) ? ORKD_EPROTO : ORKD_EBADH, "ffn weight/dim"); return 0; }
-    /* int8 intermediates ride in the low bytes of int32 slots (matches ork_mm_run_chain_i8_ffn's C usage); down is int32 */
+    /* int8 intermediates ride in the low bytes of int32 slots (matches ork_i8_mm_run_chain_ffn's C usage); down is int32 */
     size_t isz = (size_t)M * Nff * 4, dsz = (size_t)M * Kd * 4;
     int32_t *Cg = malloc(isz), *Cs = malloc(isz), *Cu = malloc(isz), *Ch = malloc(isz), *Cd = malloc(dsz);
     if (!Cg || !Cs || !Cu || !Ch || !Cd){ free(A); free(Cg); free(Cs); free(Cu); free(Ch); free(Cd); orkd_send_error(cl->fd, tag, ORKD_EOOM, "ffn scratch"); return 0; }
@@ -73,7 +73,7 @@ int orkd_handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
         { 1, -1, 0, f.up_mult, f.up_shift },       /* up MM8 (reads A)                 */
         { 3,  1, 2, f.glu_mult, f.glu_shift },     /* glu = silu(t1) * up(t2)          */
         { 0,  3, 0, 0, 0 } };                      /* down MM32 (reads glu = t3)       */
-    int rc = ork_mm_run_chain_i8_ffn(npu, 5, t, ops, f.in_scale, f.out_scale);
+    int rc = ork_i8_mm_run_chain_ffn(npu, 5, t, ops, f.in_scale, f.out_scale);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
     int payload = (rc == 0);
     struct orkd_hdr rh = { ORKD_FFN_OK, (uint32_t)(sizeof hh + (payload ? dsz : 0)), tag };
@@ -83,7 +83,7 @@ int orkd_handle_ffn(struct client *cl, ork_npu *npu, uint64_t tag){
     return werr ? -1 : 0;
 }
 /* ORKD_ATTN: the fused attention core [QK^T->exp->reduce,e.V] as ONE coalesced on-NPU chain (chainav pattern,
- * ork_mm_run_chain_i8_ffn_exp). Fixed op-list built daemon-side against 3 resident weights: K^T[Kp,Nk], ones[Nk,32],
+ * ork_i8_mm_run_chain_ffn_exp). Fixed op-list built daemon-side against 3 resident weights: K^T[Kp,Nk], ones[Nk,32],
  * V[Nk,dv]. Q (Nq*Kp int8) follows. Reply = Sigma(Nq*32 int32) then av(Nq*dv int32). e never leaves the NPU. */
 int orkd_handle_attn(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_attn a;
@@ -112,7 +112,7 @@ int orkd_handle_attn(struct client *cl, ork_npu *npu, uint64_t tag){
         { 2,  0, 0, 0, 0 },                  /* exp(t0)                             */
         { 0,  1, 0, 0, 0 },                  /* reduce e(t1) -> Sigma               */
         { 0,  1, 0, 0, 0 } };                /* e(t1).V -> av                       */
-    int rc = ork_mm_run_chain_i8_ffn_exp_biased(npu, 4, t, ops, a.in_scale, a.out_scale, a.max_bias);
+    int rc = ork_i8_mm_run_chain_ffn_exp_biased(npu, 4, t, ops, a.in_scale, a.out_scale, a.max_bias);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
     int payload = (rc == 0);
     struct orkd_hdr rh = { ORKD_ATTN_OK, (uint32_t)(sizeof hh + (payload ? sb + ab : 0)), tag };
@@ -173,9 +173,9 @@ int orkd_handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
 }
 /* ORKD_LAYER: the daemon runs a WHOLE decode layer in ONE round-trip. This handler is now a THIN transport
  * shim: deserialize the request + payload, resolve weight ids -> resident ork_w*, then run the layer via the
- * shared lib core ork_mm_layer_i8 (npu->daemon is NULL on the daemon's own ctx, so it takes the LOCAL path —
+ * shared lib core ork_i8_mm_layer (npu->daemon is NULL on the daemon's own ctx, so it takes the LOCAL path —
  * the exact same compute a direct-NPU client runs; that is the lib<->orkd parity guarantee). Reply = x_out[D].
- * All compute/warm/coherence lives in ork_mm_layer_i8 (src/npu.c). NOTE: decode-on-NPU is a measured perf loss;
+ * All compute/warm/coherence lives in ork_i8_mm_layer (src/npu.c). NOTE: decode-on-NPU is a measured perf loss;
  * this path exists for parity/correctness, not speed. */
 static ork_w *layer_find_w(struct client *cl, uint64_t id){ for (int j=0;j<cl->nw;j++) if (cl->wt[j].id==id) return cl->wt[j].w; return NULL; }
 int orkd_handle_layer(struct client *cl, ork_npu *npu, uint64_t tag){
@@ -195,7 +195,7 @@ int orkd_handle_layer(struct client *cl, ork_npu *npu, uint64_t tag){
     if (!pWq||!pWk||!pWv||!pWo||!pWg||!pWu||!pWd){ free(pl); orkd_send_error(cl->fd,tag,ORKD_EBADH,"layer weight id"); return 0; }
     float *xo=malloc((size_t)D*4);
     struct ork_layer_dims dd={ a.D,a.H,a.Hkv,a.dk,a.dv,a.Nff,a.nkv,a.pos, a.attn_scale,a.rope_base };
-    int rc = xo ? ork_mm_layer_i8(npu,&dd,pWq,pWk,pWv,pWo,pWg,pWu,pWd,attn_norm,q_norm,ffn_norm,x,Kc,Vc,xo) : -1;
+    int rc = xo ? ork_i8_mm_layer(npu,&dd,pWq,pWk,pWv,pWo,pWg,pWu,pWd,attn_norm,q_norm,ffn_norm,x,Kc,Vc,xo) : -1;
     struct orkd_handle hh; memset(&hh,0,sizeof hh); hh.rc=rc;
     struct orkd_hdr rh = { ORKD_LAYER_OK, (uint32_t)(sizeof hh + (rc==0 ? (size_t)D*4 : 0)), tag };
     int werr = orkd_writen(cl->fd,&rh,sizeof rh) || orkd_writen(cl->fd,&hh,sizeof hh);
@@ -238,7 +238,7 @@ int orkd_handle_kv_append(struct client *cl, ork_npu *npu, uint64_t tag){
     return 0;
 }
 /* #2b-1 submit RPC (int8, socket-transfer; dma-buf zero-copy is #2b-2). Handlers read their own payload from
- * the fd and reply; return <0 to drop the client. The NPU op (ork_mm_run_i8) rides the interruptible doorbell,
+ * the fd and reply; return <0 to drop the client. The NPU op (ork_i8_mm_run) rides the interruptible doorbell,
  * so a RUN in flight never puts orkd in D-state -> orkd stays SIGTERM-clean and never blocks system shutdown. */
 int orkd_handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_pack pk;
@@ -256,9 +256,9 @@ int orkd_handle_pack(struct client *cl, ork_npu *npu, uint64_t tag){
         if (pdom >= ORKD_NDOM || !(cl->owned_dom & (1ull << pdom))){ free(wbuf); orkd_send_error(cl->fd, tag, ORKD_EBADH, "domain not owned by client"); return 0; }
     } else pdom = cl->domain;
     ork_npu_set_pack_domain(npu, pdom);
-    ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
-             : (pk.dtype == ORKD_DT_I4)  ? ork_mm_pack_i4(npu, (int)pk.K, (int)pk.N, wbuf)
-                                         : ork_mm_pack_i8(npu, (int)pk.K, (int)pk.N, wbuf);
+    ork_w *w = (pk.dtype == ORKD_DT_F16) ? ork_f16_mm_pack(npu, (int)pk.K, (int)pk.N, (const ork_f16 *)wbuf)
+             : (pk.dtype == ORKD_DT_I4)  ? ork_i4_mm_pack(npu, (int)pk.K, (int)pk.N, wbuf)
+                                         : ork_i8_mm_pack(npu, (int)pk.K, (int)pk.N, wbuf);
     ork_npu_set_pack_domain(npu, 0);            /* restore default for any non-client-scoped pack */
     free(wbuf);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh);
@@ -309,20 +309,20 @@ int orkd_handle_sdp(struct client *cl, ork_npu *npu, uint64_t tag){
     const uint8_t *a = in, *b = in + half;   /* binary: second operand is the second half */
     int rc;
     switch (sp.op){
-        case ORKD_SDP_SILU_I8:   rc = ork_npu_silu_i8 (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
-        case ORKD_SDP_GELU_I8:   rc = ork_npu_gelu_i8 (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
-        case ORKD_SDP_EWMUL_I8:  rc = ork_npu_ewmul_i8(npu, (const int8_t *)a, (const int8_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int8_t *)out, NULL); break;
-        case ORKD_SDP_EWMUL_F16: rc = ork_npu_ewmul_f16(npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
-        case ORKD_SDP_ADD_I8:    rc = ork_npu_add_i8  (npu, (const signed char *)a, (const signed char *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (signed char *)out, NULL); break;
-        case ORKD_SDP_ADD_F16:   rc = ork_npu_add_f16 (npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
-        case ORKD_SDP_RSQRT_I8:  rc = ork_npu_rsqrt_i8(npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
-        case ORKD_SDP_EXP_I8:    rc = ork_npu_exp_i8  (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
-        case ORKD_SDP_SILU_I16:  rc = ork_npu_silu_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
-        case ORKD_SDP_GELU_I16:  rc = ork_npu_gelu_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
-        case ORKD_SDP_RSQRT_I16: rc = ork_npu_rsqrt_i16(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
-        case ORKD_SDP_EXP_I16:   rc = ork_npu_exp_i16 (npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
-        case ORKD_SDP_EWMUL_I16: rc = ork_npu_ewmul_i16(npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int16_t *)out, NULL); break;
-        case ORKD_SDP_ADD_I16:   rc = ork_npu_add_i16 (npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_SILU_I8:   rc = ork_i8_npu_silu (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_GELU_I8:   rc = ork_i8_npu_gelu (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_EWMUL_I8:  rc = ork_i8_npu_ewmul(npu, (const int8_t *)a, (const int8_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int8_t *)out, NULL); break;
+        case ORKD_SDP_EWMUL_F16: rc = ork_f16_npu_ewmul(npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
+        case ORKD_SDP_ADD_I8:    rc = ork_i8_npu_add  (npu, (const signed char *)a, (const signed char *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_ADD_F16:   rc = ork_f16_npu_add (npu, (const ork_f16 *)a, (const ork_f16 *)b, sp.M, sp.N, (ork_f16 *)out, NULL); break;
+        case ORKD_SDP_RSQRT_I8:  rc = ork_i8_npu_rsqrt(npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_EXP_I8:    rc = ork_i8_npu_exp  (npu, (const signed char *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (signed char *)out, NULL); break;
+        case ORKD_SDP_SILU_I16:  rc = ork_i16_npu_silu(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_GELU_I16:  rc = ork_i16_npu_gelu(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_RSQRT_I16: rc = ork_i16_npu_rsqrt(npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_EXP_I16:   rc = ork_i16_npu_exp (npu, (const int16_t *)a, sp.M, sp.N, sp.in_scale, sp.out_scale, (int16_t *)out, NULL); break;
+        case ORKD_SDP_EWMUL_I16: rc = ork_i16_npu_ewmul(npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.mult, sp.shift, (int16_t *)out, NULL); break;
+        case ORKD_SDP_ADD_I16:   rc = ork_i16_npu_add (npu, (const int16_t *)a, (const int16_t *)b, sp.M, sp.N, sp.a_scale, sp.b_scale, sp.out_scale, (int16_t *)out, NULL); break;
         default: rc = -100;
     }
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = rc;
@@ -332,7 +332,7 @@ int orkd_handle_sdp(struct client *cl, ork_npu *npu, uint64_t tag){
     free(in); free(out);
     return 0;
 }
-/* Fused int8 matmul chain: S resident weights run as one PC-chained submit (ork_mm_run_chain_i8). Each task's
+/* Fused int8 matmul chain: S resident weights run as one PC-chained submit (ork_i8_mm_run_chain). Each task's
  * weight is resolved by id in THIS client's table; A payloads arrive concatenated (task order), C payloads are
  * returned concatenated. Run INLINE (a chain is one bounded submit; the single-threaded daemon serializes it). */
 int orkd_handle_chain(struct client *cl, ork_npu *npu, uint64_t tag){
@@ -362,7 +362,7 @@ int orkd_handle_chain(struct client *cl, ork_npu *npu, uint64_t tag){
         mt[i].w = cw->w; mt[i].M = (int)ts[i].M; mt[i].A = (const int8_t *)(ablob + aoff); mt[i].C = Cs[i];
         aoff += ts[i].abytes; ctot += cb[i];
     }
-    if (ok) rc = ork_mm_run_chain_i8(npu, S, mt);
+    if (ok) rc = ork_i8_mm_run_chain(npu, S, mt);
     struct orkd_handle hh; memset(&hh, 0, sizeof hh); hh.rc = ok ? rc : -1;
     int payload = (ok && rc == 0);
     struct orkd_hdr rh = { ORKD_CHAIN_OK, (uint32_t)(sizeof hh + (payload ? ctot : 0)), tag };
@@ -473,7 +473,7 @@ int orkd_handle_run_zc2(struct client *cl, ork_npu *npu, int a_fd, int c_fd, uin
     return 0;
 }
 /* #2b-2 step 3: ZERO-COPY RUN (input A by reference). The client shares A as a dma-buf fd (SCM_RIGHTS);
- * orkd PRIME-imports it into the NPU's IOMMU domain and ork_mm_run_i8 reads A IN PLACE (dma_find hit =
+ * orkd PRIME-imports it into the NPU's IOMMU domain and ork_i8_mm_run reads A IN PLACE (dma_find hit =
  * validated input zero-copy) — no A byte-transfer over the socket. C is still returned over the socket here
  * (output zero-copy is the next sub-step: needs ORK_ZC_OUT + a cross-process invalidate). */
 int orkd_handle_run_zc(struct client *cl, ork_npu *npu, int a_fd, uint64_t tag){

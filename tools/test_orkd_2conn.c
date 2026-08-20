@@ -22,7 +22,7 @@ static int run_verify(ork_npu *c, ork_w *w, const int8_t *A, const int8_t *B, ch
     int32_t C[M*N], R[M*N];
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long a=0; for(int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; R[m*N+n]=(int)a; }
     memset(C,0,sizeof C);
-    if(ork_mm_run_i8(c, w, M, A, C)){ fprintf(stderr,"[%c] it=%d run FAIL\n", tag, it); return 1; }
+    if(ork_i8_mm_run(c, w, M, A, C)){ fprintf(stderr,"[%c] it=%d run FAIL\n", tag, it); return 1; }
     for(int i=0;i<M*N;i++) if(C[i]!=R[i]){ fprintf(stderr,"[%c] it=%d MISMATCH [%d] %d!=%d\n", tag, it, i, C[i], R[i]); return 1; }
     return 0;
 }
@@ -39,8 +39,8 @@ int main(int argc, char **argv){
     #define R8() ((int8_t)(((g=g*1103515245u+12345u)>>18&0x1f)-16))
     for(int i=0;i<K*N;i++) BA[i]=R8();
     for(int i=0;i<K*N;i++) BB[i]=R8();
-    ork_w *wA = ork_mm_pack_i8(cA, K, N, BA);
-    ork_w *wB = ork_mm_pack_i8(cB, K, N, BB);
+    ork_w *wA = ork_i8_mm_pack(cA, K, N, BA);
+    ork_w *wB = ork_i8_mm_pack(cB, K, N, BB);
     int bad=0;
     for(int it=0; it<iters && !bad; it++){
         for(int i=0;i<M*K;i++) AA[i]=R8();

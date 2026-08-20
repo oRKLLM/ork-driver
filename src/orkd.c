@@ -160,7 +160,7 @@ static struct work *wk_pick(void){
 
 /* ORKD_IMPORT: the client passed a PRE-TILED weight dma-buf fd (SCM_RIGHTS). Import it into the client's
  * domain as a resident weight whose Bb/Bf tiles are VIEWS into it — no tiling, no daemon-owned buffer, the
- * bytes stay in the client's dma-buf (client manages its own IOVA). ork_mm_adopt_imported_i8 ALWAYS consumes
+ * bytes stay in the client's dma-buf (client manages its own IOVA). ork_i8_mm_adopt_imported ALWAYS consumes
  * `dbuf` (stored in own_buf on success, closed on failure), so this handler never closes it after the call. */
 static int32_t g_ring_c[ORKD_RING_SLOT_DATA / 4];   /* daemon-side C scratch (single-threaded; one reused buffer) */
 /* Consume ready requests from every attached ring (SPSC: this daemon is the sole consumer; ring_tail is its
@@ -180,9 +180,9 @@ static int ring_service(ork_npu *npu, struct client *cl, int nc){
             if (!w || cbytes > sizeof g_ring_c || s->abytes > r->slot_data) rc = -1;
             else {
                 int8_t *A = (int8_t *)s->data;   /* A read in place; C into the reused scratch, then copied back */
-                rc = (s->dtype == ORKD_DT_F16) ? ork_mm_run(npu, w, M, (const ork_f16 *)A, (float *)g_ring_c)
-                   : (s->dtype == ORKD_DT_I4)  ? ork_mm_run_i4(npu, w, M, A, g_ring_c)
-                                               : ork_mm_run_i8(npu, w, M, A, g_ring_c);
+                rc = (s->dtype == ORKD_DT_F16) ? ork_f16_mm_run(npu, w, M, (const ork_f16 *)A, (float *)g_ring_c)
+                   : (s->dtype == ORKD_DT_I4)  ? ork_i4_mm_run(npu, w, M, A, g_ring_c)
+                                               : ork_i8_mm_run(npu, w, M, A, g_ring_c);
                 if (rc == 0) memcpy(s->data, g_ring_c, cbytes);
             }
             s->rc = rc; s->cbytes = (uint32_t)cbytes;
@@ -220,9 +220,9 @@ static void dispatch_one(ork_npu *npu, struct client *cl, int nc){
     int esz = orkd_esz_a(w->dtype);
     const void *Aoff = (const char *)w->A + (size_t)w->m0 * w->K * esz;   /* A byte-offset (int8=1B, fp16=2B/elem) */
     int32_t *Coff = w->C + (size_t)w->m0 * w->N;                          /* C elem-offset (int32/fp32 both 4B) */
-    int r = (w->dtype == ORKD_DT_F16) ? ork_mm_run(npu, ow, q, (const ork_f16 *)Aoff, (float *)Coff)
-          : (w->dtype == ORKD_DT_I4)  ? ork_mm_run_i4(npu, ow, q, (const int8_t *)Aoff, Coff)
-                                      : ork_mm_run_i8(npu, ow, q, (const int8_t *)Aoff, Coff);
+    int r = (w->dtype == ORKD_DT_F16) ? ork_f16_mm_run(npu, ow, q, (const ork_f16 *)Aoff, (float *)Coff)
+          : (w->dtype == ORKD_DT_I4)  ? ork_i4_mm_run(npu, ow, q, (const int8_t *)Aoff, Coff)
+                                      : ork_i8_mm_run(npu, ow, q, (const int8_t *)Aoff, Coff);
     if (zc2) ork_npu_set_core_budget(npu, 0);
     if (r && !w->rc) w->rc = r;
     w->m0 += q;
@@ -267,7 +267,7 @@ static void orkd_warmup(ork_npu *npu){
     ork_f16 bf[WN*WN]; for (int i = 0; i < WN*WN; i++) bf[i] = (ork_f16)1.0f;
     ork_f16 af[WN];    for (int i = 0; i < WN; i++)    af[i] = (ork_f16)1.0f;
     float cf[WN];
-    ork_w *wf = ork_mm_pack(npu, WN, WN, bf);
+    ork_w *wf = ork_f16_mm_pack(npu, WN, WN, bf);
     ork_seq_op ops[2] = {
         { .kind = ORK_OP_EXP_I16, .M = 1, .N = WN, .A = ein, .C = eout, .in_scale = 1.0/1024.0, .out_scale = 1.0/32000.0 },
         { .kind = ORK_OP_MM_F16,  .w = wf, .M = 1, .A = af, .C = cf },
@@ -282,8 +282,8 @@ static void orkd_warmup(ork_npu *npu){
     { int WK=512, WN=512, WM=32;
       int8_t *wb=malloc((size_t)WK*WN), *wa=malloc((size_t)WM*WK); int32_t *wc=malloc((size_t)WM*WN*4);
       if (wb && wa && wc){ memset(wb,1,(size_t)WK*WN); memset(wa,1,(size_t)WM*WK);
-          ork_w *wi=ork_mm_pack_i8(npu,WK,WN,wb);
-          if (wi){ ork_mm_task_i8 wt={wi,WM,wa,wc}; int mrc=ork_mm_run_chain_i8(npu,1,&wt); ork_mm_free(npu,wi);
+          ork_w *wi=ork_i8_mm_pack(npu,WK,WN,wb);
+          if (wi){ ork_mm_task_i8 wt={wi,WM,wa,wc}; int mrc=ork_i8_mm_run_chain(npu,1,&wt); ork_mm_free(npu,wi);
               fprintf(stderr, "[orkd] warmup multicore-i8 rc=%d (all cores primed for RR)\n", mrc); } }
       free(wb); free(wa); free(wc); }
 }

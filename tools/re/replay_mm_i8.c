@@ -38,9 +38,9 @@ int main(int argc,char**argv){
     double us_o=0;
     int8_t *Ao=malloc((size_t)M*K),*Bo=malloc((size_t)K*N); int32_t*Co=malloc((size_t)M*N*4);
     memset(Ao,1,(size_t)M*K); memset(Bo,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,Bo);
-    if(w && ork_mm_run_i8(c,w,M,Ao,Co)==0){
-        double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,w,M,Ao,Co); us_o=(now_us()-t0)/iters;
+    ork_w*w=ork_i8_mm_pack(c,K,N,Bo);
+    if(w && ork_i8_mm_run(c,w,M,Ao,Co)==0){
+        double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,Ao,Co); us_o=(now_us()-t0)/iters;
         printf("ork 1-core kernel:   %.1f us/matmul  %.1f GMAC/s  (warmed int8)\n",us_o, us_o>0?gmac_num/us_o:0);
         ork_mm_free(c,w);
     } else printf("ork kernel pack/run failed\n");
@@ -48,7 +48,7 @@ int main(int argc,char**argv){
     /* (2) replay rkllm's regcmd with its REAL weight + A; verify vs captured C */
     printf("submitting rkllm regcmd...\n");
     int32_t *Cout=calloc((size_t)M*N,4); double us_r=0;
-    int rr=ork_npu_replay_i8(c,rc,rn,M,K,N,A,(int)an,B,(int)wn,Cout,iters,&us_r);
+    int rr=ork_i8_npu_replay(c,rc,rn,M,K,N,A,(int)an,B,(int)wn,Cout,iters,&us_r);
     if(rr){ printf("REPLAY FAILED rc=%d\n",rr); }
     else {
         int bad=0,first=-1; long maxe=0;

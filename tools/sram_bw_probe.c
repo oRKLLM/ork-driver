@@ -36,7 +36,7 @@ static void *cpu_dram_hog(void *arg){
 
 /* NPU int8 matmul rate (submits/sec) over ITER iterations of run_i8 on a resident weight. */
 static double npu_rate(ork_npu*c, ork_w*w, int M, int8_t*A, int32_t*C, int iter){
-    double t0=now_us(); for(int i=0;i<iter;i++) ork_mm_run_i8(c,w,M,A,C); return iter/((now_us()-t0)/1e6);
+    double t0=now_us(); for(int i=0;i<iter;i++) ork_i8_mm_run(c,w,M,A,C); return iter/((now_us()-t0)/1e6);
 }
 
 int main(int argc,char**argv){
@@ -47,14 +47,14 @@ int main(int argc,char**argv){
     printf("sram_bw_probe: K=%d N=%d M=%d iter=%d | SRAM total=%zuKiB free=%zuKiB (weight tile=%zuKiB, ORK_WEIGHT_SRAM=%s)\n",
            K,N,M,ITER, total>>10, free0>>10, ((size_t)K*N)>>10, getenv("ORK_WEIGHT_SRAM")?"1":"0");
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     size_t free1=ork_npu_sram_free(c);
     printf("  after pack: SRAM free=%zuKiB (consumed %zdKiB -> weight %s SRAM)\n",
            free1>>10, ((ssize_t)free0-(ssize_t)free1)>>10, (free0-free1)>=(size_t)K*N ? "IN" : "NOT in (DRAM)");
     int8_t*A=(int8_t*)ork_dma_alloc(c,(size_t)M*K); memset(A,1,(size_t)M*K);
     int32_t*C=(int32_t*)ork_dma_alloc(c,(size_t)M*N*4);
 
-    ork_mm_run_i8(c,w,M,A,C);   /* warm */
+    ork_i8_mm_run(c,w,M,A,C);   /* warm */
     double npu_solo = npu_rate(c,w,M,A,C,ITER);
     printf("  [1] NPU solo:            %.0f submits/s\n", npu_solo);
 

@@ -34,42 +34,42 @@ typedef enum {
     ORK_OP_MM_F16,      /* fp16 matmul:  w=DT_F16 weight, A fp16[M,K] (HOST mem), C fp32[M,N]  (HW doorbell if K conforms & M*K<=32768, else SW run_stream_f16) */
     ORK_OP_MM_I4,       /* int4 matmul:  w=DT_I4 weight, A int8[M,K] (HOST mem), C int32[M,N]  (HW doorbell if M==1 & single-slice, else SW run_stream_i4) */
     ORK_OP_SILU_F16,    /* fp16 SiLU activation (SDP): A fp16[M,N] -> C fp16[M,N]   (SW SDP; needs LUT — TODO row) */
-    ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_npu_ewmul_f16) */
-    ORK_OP_SILU_I8,     /* int8 SiLU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_npu_silu_i8) */
-    ORK_OP_GELU_I8,     /* int8 GELU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_npu_gelu_i8) */
-    ORK_OP_EWMUL_I8,    /* int8 elementwise mul (SDP): A*B i8[M,N] -> C i8[M,N] (mult,shift; SW: ork_npu_ewmul_i8) */
-    ORK_OP_ADD_I8,      /* int8 elementwise add (SDP): A+B i8[M,N] -> C i8[M,N] (a_scale=in,b_scale,out_scale; SW: ork_npu_add_i8) */
-    ORK_OP_ADD_F16,     /* fp16 elementwise add (SDP): A+B f16[M,N] -> C f16[M,N] (SW: ork_npu_add_f16) */
-    ORK_OP_SILU_I16,    /* int16 SiLU (SDP): A i16[M,N] -> C i16[M,N] (in_scale,out_scale; SW: ork_npu_silu_i16) — the ACCURATE higher-precision SiLU (fp16 SiLU is not viable on this NPU: fused=garbage-PPL, standalone SDP=broken) */
+    ORK_OP_EWMUL_F16,   /* fp16 elementwise mul (SDP): A*B fp16[M,N] -> C fp16[M,N] (SW: ork_f16_npu_ewmul) */
+    ORK_OP_SILU_I8,     /* int8 SiLU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_i8_npu_silu) */
+    ORK_OP_GELU_I8,     /* int8 GELU (SDP): A i8[M,N] -> C i8[M,N] (in_scale,out_scale; SW: ork_i8_npu_gelu) */
+    ORK_OP_EWMUL_I8,    /* int8 elementwise mul (SDP): A*B i8[M,N] -> C i8[M,N] (mult,shift; SW: ork_i8_npu_ewmul) */
+    ORK_OP_ADD_I8,      /* int8 elementwise add (SDP): A+B i8[M,N] -> C i8[M,N] (a_scale=in,b_scale,out_scale; SW: ork_i8_npu_add) */
+    ORK_OP_ADD_F16,     /* fp16 elementwise add (SDP): A+B f16[M,N] -> C f16[M,N] (SW: ork_f16_npu_add) */
+    ORK_OP_SILU_I16,    /* int16 SiLU (SDP): A i16[M,N] -> C i16[M,N] (in_scale,out_scale; SW: ork_i16_npu_silu) — the ACCURATE higher-precision SiLU (fp16 SiLU is not viable on this NPU: fused=garbage-PPL, standalone SDP=broken) */
     /* --- ops beyond the seq-scheduler subset (values >=11 append-only, ABI-stable). These are supported,
      * PROVEN ops (each backed by a working probe/example — see OPS_REGISTRY.md) that the SDK addresses by
      * enum + industry name (ork_op_name / ork_op_from_name); not all are seq-dispatchable (their SEQ_CLASS
      * row has fn=NULL). "op = the meaning"; the regcmd impl is chosen by ork_impl_mode. --- */
-    ORK_OP_MM_I4_GROUPED,          /* float-grouped int4 matmul (ork_mm_run_i4_grouped)             example: i4 / int4_bench */
-    ORK_OP_GELU_I16,               /* int16 GELU (SDP; ork_npu_gelu_i16)                            example: test_gelu */
-    ORK_OP_RSQRT_I8,               /* int8 rsqrt (SDP; ork_npu_rsqrt_i8)                            example: test_gelu / op_profile */
-    ORK_OP_EXP_I8,                 /* int8 exp (SDP; ork_npu_exp_i8)                                example: test_gelu / op_profile */
-    ORK_OP_EXP_I16,                /* int16 exp (SDP; ork_npu_exp_i16)                              example: test_ssd_chunk_npu / mode_probe */
-    ORK_OP_MUL_I16,                /* int16 elementwise mul (SDP; ork_npu_ewmul_i16) — EXPERIMENTAL example: test_ewmul_i16 */
-    ORK_OP_ADD_I16,                /* int16 elementwise add (SDP; ork_npu_add_i16) — EXPERIMENTAL   example: test_add / add16_probe */
-    ORK_OP_MUL_PERCHANNEL_I8,      /* per-channel scale int8 (SDP; ork_npu_mul_perchan_i8)          example: bs_scale_probe */
-    ORK_OP_MUL_PERCHANNEL_F16,     /* per-channel scale fp16 (SDP; ork_npu_mul_perchan_f16)         example: bs_scale_probe */
-    ORK_OP_MUL_PERCHANNEL_I16,     /* per-channel scale int16 (SDP; ork_npu_mul_perchan_i16)        example: bs_scale_probe */
-    ORK_OP_MATMUL_PERCHANNEL_F16,  /* fp16 matmul -> per-channel scale (ork_npu_mm_perchan_f16)     example: mm_perchan_f16_probe */
+    ORK_OP_MM_I4_GROUPED,          /* float-grouped int4 matmul (ork_i4_mm_run_grouped)             example: i4 / int4_bench */
+    ORK_OP_GELU_I16,               /* int16 GELU (SDP; ork_i16_npu_gelu)                            example: test_gelu */
+    ORK_OP_RSQRT_I8,               /* int8 rsqrt (SDP; ork_i8_npu_rsqrt)                            example: test_gelu / op_profile */
+    ORK_OP_EXP_I8,                 /* int8 exp (SDP; ork_i8_npu_exp)                                example: test_gelu / op_profile */
+    ORK_OP_EXP_I16,                /* int16 exp (SDP; ork_i16_npu_exp)                              example: test_ssd_chunk_npu / mode_probe */
+    ORK_OP_MUL_I16,                /* int16 elementwise mul (SDP; ork_i16_npu_ewmul) — EXPERIMENTAL example: test_ewmul_i16 */
+    ORK_OP_ADD_I16,                /* int16 elementwise add (SDP; ork_i16_npu_add) — EXPERIMENTAL   example: test_add / add16_probe */
+    ORK_OP_MUL_PERCHANNEL_I8,      /* per-channel scale int8 (SDP; ork_i8_npu_mul_perchan)          example: bs_scale_probe */
+    ORK_OP_MUL_PERCHANNEL_F16,     /* per-channel scale fp16 (SDP; ork_f16_npu_mul_perchan)         example: bs_scale_probe */
+    ORK_OP_MUL_PERCHANNEL_I16,     /* per-channel scale int16 (SDP; ork_i16_npu_mul_perchan)        example: bs_scale_probe */
+    ORK_OP_MATMUL_PERCHANNEL_F16,  /* fp16 matmul -> per-channel scale (ork_f16_npu_mm_perchan)     example: mm_perchan_f16_probe */
     ORK_OP_REQUANTIZE_PERCHANNEL_I32,/* int32->int16 per-channel requant (ork_npu_requant_perchan_i32) — PARTIAL  example: requant_i32_probe */
-    ORK_OP_SOFTMAX_F16,            /* fp16 softmax (replay; ork_npu_replay_softmax_f16)             example: softmax_probe / softmax_replay */
-    ORK_OP_REDUCEMAX_I8,           /* int8 row-max reduction (ork_npu_row_max_i8)                   example: max_reduce_probe */
-    ORK_OP_RESHAPE_F16,            /* fp16 reshape/permute (ork_npu_replay_reshape_f16)             example: reshape_probe */
-    ORK_OP_ROPE_NEOX_F16,          /* fp16 NEOX RoPE (ork_npu_rope_neox_f16)                        example: rope_probe */
-    ORK_OP_MATMUL_SILU_I8,         /* int8 matmul + fused SiLU output stage (ork_mm_run_i8_silu)    example: fused_silu_test */
-    ORK_OP_MATMUL_REQUANT_I8,      /* int8 matmul + int8 requant output stage (ork_mm_run_i8_out8)  example: fused_ffn_probe */
+    ORK_OP_SOFTMAX_F16,            /* fp16 softmax (replay; ork_f16_npu_replay_softmax)             example: softmax_probe / softmax_replay */
+    ORK_OP_REDUCEMAX_I8,           /* int8 row-max reduction (ork_i8_npu_row_max)                   example: max_reduce_probe */
+    ORK_OP_RESHAPE_F16,            /* fp16 reshape/permute (ork_f16_npu_replay_reshape)             example: reshape_probe */
+    ORK_OP_ROPE_NEOX_F16,          /* fp16 NEOX RoPE (ork_f16_npu_rope_neox)                        example: rope_probe */
+    ORK_OP_MATMUL_SILU_I8,         /* int8 matmul + fused SiLU output stage (ork_i8_mm_run_silu)    example: fused_silu_test */
+    ORK_OP_MATMUL_REQUANT_I8,      /* int8 matmul + int8 requant output stage (ork_i8_mm_run_out8)  example: fused_ffn_probe */
     /* --- primitive ops the initial derivation missed (found by the 2026-07-22 completeness sweep) --- */
-    ORK_OP_MATMUL_SILU_I32,        /* int8 matmul + fused SiLU, INT32 output (un-requantized; ork_mm_run_i8_silu32) example: silu32_check */
-    ORK_OP_RMSNORM_F16,            /* fp16 RMSNorm — every transformer layer (ork_npu_rmsnorm_f16)  example: test_bmm */
-    ORK_OP_L2NORM_F16,             /* fp16 L2 normalize (ork_npu_l2norm_f16)                        example: test_bmm */
-    ORK_OP_RSQRT_I16,              /* int16 rsqrt (SDP; ork_npu_rsqrt_i16) — RMSNorm 1/√ + softmax 1/Σ  example: silu_i16 family (rsqrt/exp/gelu/silu int16 LUT) */
-    ORK_OP_MM_F16_F16OUT,          /* fp16 matmul with CONTIGUOUS fp16 output (ork_mm_run_f16_f16out) — A1 bridge: feeds an fp16 SDP op with no f32→f16 narrow  example: f16out_probe */
-    ORK_OP_MATMUL_I16OUT_I8,       /* int8 matmul with INT16 compact-linear output (ork_mm_run_i8_out16) — feeds an int16 SDP op resident, no PC-chain  example: i16out_seq_probe */
+    ORK_OP_MATMUL_SILU_I32,        /* int8 matmul + fused SiLU, INT32 output (un-requantized; ork_i8_mm_run_silu32) example: silu32_check */
+    ORK_OP_RMSNORM_F16,            /* fp16 RMSNorm — every transformer layer (ork_f16_npu_rmsnorm)  example: test_bmm */
+    ORK_OP_L2NORM_F16,             /* fp16 L2 normalize (ork_f16_npu_l2norm)                        example: test_bmm */
+    ORK_OP_RSQRT_I16,              /* int16 rsqrt (SDP; ork_i16_npu_rsqrt) — RMSNorm 1/√ + softmax 1/Σ  example: silu_i16 family (rsqrt/exp/gelu/silu int16 LUT) */
+    ORK_OP_MM_F16_F16OUT,          /* fp16 matmul with CONTIGUOUS fp16 output (ork_f16_mm_run_f16out) — A1 bridge: feeds an fp16 SDP op with no f32→f16 narrow  example: f16out_probe */
+    ORK_OP_MATMUL_I16OUT_I8,       /* int8 matmul with INT16 compact-linear output (ork_i8_mm_run_out16) — feeds an int16 SDP op resident, no PC-chain  example: i16out_seq_probe */
     ORK_OP_NKIND
 } ork_seq_kind;
 typedef ork_seq_kind ork_op;       /* canonical SDK op enum; ork_seq_kind is the historical name (the seq scheduler is one consumer) */
@@ -104,11 +104,11 @@ const char  *ork_impl_mode_name(ork_impl_mode m);/* enum -> "hw_chained"; NULL i
  *   - SDP / elementwise ops (no weights): WxAy does not apply → keep the dtype suffix (_i8/_i16/_f16).
  *   - Non-op mechanisms named for what they do (graph_replay), not the internal fn (was "replay"/"bmm"). */
 typedef enum {
-    ORK_COMPOSITE_CHAIN_MATMUL_W8A8 = 0,      /* batch of independent int8 matmuls (ork_mm_run_chain_i8)              example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_SWIGLU_W8A8,            /* int8 SwiGLU FFN inner (ork_mm_run_chain_i8_ffn)                     example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_GATE_SILU_W8A8,         /* FFN, fused gate-SiLU output stage (ork_mm_run_chain_i8_gsilu)       example: chain_gu_silu_probe */
-    ORK_COMPOSITE_FFN_GATE_SDPSILU_W8A8,      /* FFN, gate matmul + standalone SDP SiLU (ork_mm_run_chain_i8_sdpsilu) example: chain_gu_silu_probe */
-    ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_W16A16,/* fp16 matmul -> per-channel scale chain (ork_npu_chain_mm_perchan_f16) example: chain_mm_perchan_f16_probe */
+    ORK_COMPOSITE_CHAIN_MATMUL_W8A8 = 0,      /* batch of independent int8 matmuls (ork_i8_mm_run_chain)              example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_SWIGLU_W8A8,            /* int8 SwiGLU FFN inner (ork_i8_mm_run_chain_ffn)                     example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SILU_W8A8,         /* FFN, fused gate-SiLU output stage (ork_i8_mm_run_chain_gsilu)       example: chain_gu_silu_probe */
+    ORK_COMPOSITE_FFN_GATE_SDPSILU_W8A8,      /* FFN, gate matmul + standalone SDP SiLU (ork_i8_mm_run_chain_sdpsilu) example: chain_gu_silu_probe */
+    ORK_COMPOSITE_CHAIN_MATMUL_PERCHANNEL_W16A16,/* fp16 matmul -> per-channel scale chain (ork_f16_npu_chain_mm_perchan) example: chain_mm_perchan_f16_probe */
     ORK_COMPOSITE_SEQ,                        /* heterogeneous op sequence, any precision (ork_submit_seq)           example: test_submit_seq / sdp_chain_probe */
     /* --- mixed-precision / batched composites (added 2026-07-22) --- */
     ORK_COMPOSITE_MATMUL_SILU_W16A16_I16SILU, /* MIXED: fp16 matmul (w16a16) + int16 SiLU (_i16silu) fused in ONE
@@ -116,7 +116,7 @@ typedef enum {
                                                * gate matmul, int16 SiLU). (ork_ssd_probe_mixchain)  example: mixchain_probe */
     ORK_COMPOSITE_MATMUL_BATCHED_FUSED_W16A16,/* fp16 fused batched matmul (attention / SSD A.V)
                                                * (ork_bmm_fp16_fused)               example: test_bmm_fused / ssd_fusedchain_probe */
-    ORK_COMPOSITE_GRAPH_REPLAY_F16,           /* fp16 op-graph replay mechanism (ork_npu_replay_full_f16) example: replay_f16_full_test */
+    ORK_COMPOSITE_GRAPH_REPLAY_F16,           /* fp16 op-graph replay mechanism (ork_f16_npu_replay_full) example: replay_f16_full_test */
     ORK_COMPOSITE_NKIND
 } ork_composite;
 const char   *ork_composite_name(ork_composite k);              /* enum -> "ffn_swiglu_w8a8"; NULL if out of range */
@@ -246,7 +246,7 @@ typedef struct {
     int         group;                /* dependency grouping (default 0 = ungrouped, legacy per-op scheduling).
                                        * >0: CONTIGUOUS ops sharing a group id form ONE sequential chain (kept on
                                        * one core, in order); a group-id change starts a new INDEPENDENT chain.
-                                       * A contiguous run of group>0 ops rides ork_dyn_begin_seq_i8_mc — SDP ops
+                                       * A contiguous run of group>0 ops rides ork_i8_dyn_begin_seq_mc — SDP ops
                                        * stay in the doorbell chain instead of forcing a blocking SW break. The
                                        * run's terminal op (each group's last) must be a matmul (sentinel). */
 } ork_seq_op;

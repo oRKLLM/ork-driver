@@ -21,7 +21,7 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++)B[i]=(int8_t)r8();
     for(size_t i=0;i<(size_t)M*N;i++)C[i]=-128;
     int mult=0x4000, shift=18;   /* coeff = mult/2^shift = 2^14/2^18 = 1/16 (keep A·W in int8 range) */
-    ork_w *w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
+    ork_w *w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 2;}
     ork_seq_op op={ .kind=ORK_OP_MATMUL_REQUANT_I8, .w=w, .M=M, .A=A, .C=C, .mult=mult, .shift=shift };
     int rc=ork_submit_seq(c,&op,1);
     printf("  rc=%d C[0]=%d\n",rc,C[0]);

@@ -34,7 +34,7 @@ int main(int argc,char**argv){
     for(int i=1;i+1<argc && nov<4;i+=2){regs[nov]=(uint32_t)strtoul(argv[i],0,0);vals[nov]=(uint32_t)strtoul(argv[i+1],0,0);nov++;}
     printf("Kfull=%d N=%d Kp=%d (KTfull=%d op-KT=%d, %d N-tiles)  overrides:",Kfull,N,Kp,Kfull/32,Kp/32,N/16);
     for(int i=0;i<nov;i++)printf(" 0x%x=0x%x",regs[i],vals[i]); printf("\n");
-    int rc=ork_npu_probe_slice_f16(c,Kfull,N,Kp,nov,regs,vals,A,B,C);
+    int rc=ork_f16_npu_probe_slice(c,Kfull,N,Kp,nov,regs,vals,A,B,C);
     if(rc){printf("submit failed/wedged (rc=%d)\n",rc);ork_npu_free(c);return 1;}
     int allpart=1;
     for(int nt=0;nt<N/16;nt++){int p=0,f=0;

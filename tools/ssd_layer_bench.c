@@ -3,14 +3,14 @@
  *
  * The chunked-SSD scan's matmul stages (group-batched where B/C are shared; HG=H/G heads per group
  * stacked along head_dim). Both operands are per-chunk ACTIVATIONS, so the NPU primitive is
- * ork_bmm_i8 (dynamic·dynamic, per-batch repack+run) — NOT run_stream (needs a resident weight).
+ * ork_i8_bmm (dynamic·dynamic, per-batch repack+run) — NOT run_stream (needs a resident weight).
  *   scores  C·B^T      nbatch=G·NC   [CS, Nst]·[Nst, CS]     (K=Nst, N=CS)
  *   cstate  Xt·B        nbatch=G·NC   [HG*P, CS]·[CS, Nst]    (K=CS,  N=Nst)   <- dominant
  *   Y_off   SI·C^T      nbatch=G·NC   [HG*P, Nst]·[Nst, CS]   (K=Nst, N=CS)    <- dominant
  *   Y_diag  M·xbar      nbatch=H·NC   [CS, CS]·[CS, P]        (K=CS,  N=P)     <- many tiny
  *
  * THROUGHPUT bench (dummy int8 data, no correctness — like mc_prof/rknn_vs_ork). Reports per-stage and
- * per-layer wall + effective GMAC/s for NPU (ork_bmm_i8) and a pthread int8 GEMM on the 4 big cores,
+ * per-layer wall + effective GMAC/s for NPU (ork_i8_bmm) and a pthread int8 GEMM on the 4 big cores,
  * then extrapolates a full-model prefill SSD-scan time (× n_layers) and tok/s for both.
  *
  *   make ssd_layer_bench && sudo ./ssd_layer_bench [preset 0=130m 1=7b] [L]      (board only)
@@ -63,21 +63,21 @@ static double cpu_gemm(const int8_t*A,const int8_t*B,int32_t*C,int32_t*scratch_u
 
 typedef struct { const char*name; int H,P,Nst,G,CS,layers; } model;
 
-/* one stage: nbatch matmuls of [M,K]·[K,N]; time NPU (ork_bmm_i8) + CPU; return macs, fill wall/gmac */
+/* one stage: nbatch matmuls of [M,K]·[K,N]; time NPU (ork_i8_bmm) + CPU; return macs, fill wall/gmac */
 static double bench_stage(ork_npu*c,const char*tag,int nbatch,int M,int K,int N,
                           double*npu_ms,double*npu_g,double*cpu_ms,double*cpu_g){
     size_t szA=(size_t)nbatch*M*K, szB=(size_t)nbatch*K*N, szC=(size_t)nbatch*M*N;
     int8_t*A=malloc(szA),*B=malloc(szB),*Bt=malloc(szB); int32_t*C=malloc(szC*4);
     for(size_t i=0;i<szA;i++)A[i]=(int8_t)(i&3)-1; for(size_t i=0;i<szB;i++)B[i]=(int8_t)(i&3)-1;
     double macs=(double)nbatch*M*K*N;
-    /* NPU via ork_bmm_i8 (real dynamic·dynamic primitive: per-batch repack of B + gather of A + run) */
-    ork_bmm_i8(c,nbatch,M,K,N,A,B,C);                      /* warm */
-    double n0=now_us(); ork_bmm_i8(c,nbatch,M,K,N,A,B,C); double nus=now_us()-n0;
+    /* NPU via ork_i8_bmm (real dynamic·dynamic primitive: per-batch repack of B + gather of A + run) */
+    ork_i8_bmm(c,nbatch,M,K,N,A,B,C);                      /* warm */
+    double n0=now_us(); ork_i8_bmm(c,nbatch,M,K,N,A,B,C); double nus=now_us()-n0;
     /* NPU-IDEAL: pack B[0] as a RESIDENT weight ONCE, reuse across all batches (no repack/gather).
      * Not correct math — isolates the NPU's raw matmul ceiling at this shape from ork_bmm overhead. */
-    double rus=0; ork_w*w=ork_mm_pack_i8(c,K,N,B);
-    if(w){ ork_mm_run_i8(c,w,M,A,C);                        /* warm */
-        double r0=now_us(); for(int b=0;b<nbatch;b++) ork_mm_run_i8(c,w,M,A+(size_t)b*M*K,C); rus=now_us()-r0;
+    double rus=0; ork_w*w=ork_i8_mm_pack(c,K,N,B);
+    if(w){ ork_i8_mm_run(c,w,M,A,C);                        /* warm */
+        double r0=now_us(); for(int b=0;b<nbatch;b++) ork_i8_mm_run(c,w,M,A+(size_t)b*M*K,C); rus=now_us()-r0;
         ork_mm_free(c,w); }
     /* CPU */
     double c0=cpu_gemm(A,B,C,NULL,Bt,nbatch,M,K,N);        /* warm */
@@ -99,7 +99,7 @@ int main(int argc,char**argv){
     int NC=(L+m.CS-1)/m.CS, HG=m.H/m.G; if(HG<1)HG=1;
     ork_npu*c=ork_npu_init(); if(!c){printf("no NPU\n");return 0;}
     printf("=== SSD LAYER SCAN BENCH — %s, one layer, prefill L=%d (NC=%d, HG=%d) ===\n",m.name,L,NC,NC>0?HG:HG);
-    printf("(dummy int8, throughput only. NPU=ork_bmm_i8 real primitive; CPU=int8 GEMM on 4 big cores.)\n");
+    printf("(dummy int8, throughput only. NPU=ork_i8_bmm real primitive; CPU=int8 GEMM on 4 big cores.)\n");
 
     double npu_tot=0,cpu_tot=0,macs_tot=0,nms,ng,cms,cg;
     double cpu_sc,cpu_cs,cpu_yo;   /* grouped-stage CPU ms, to compare against the fused chain */
@@ -150,8 +150,8 @@ int main(int argc,char**argv){
     int8_t *win_w=calloc((size_t)dmodel*dinproj,1), *wout_w=calloc((size_t)dinner*dmodel,1);
     for(size_t i=0;i<(size_t)dmodel*dinproj;i++)win_w[i]=(int8_t)(i&3)-1;
     for(size_t i=0;i<(size_t)dinner*dmodel;i++)wout_w[i]=(int8_t)(i&3)-1;
-    ork_w *w_in = ork_mm_pack_i8(c, dmodel, dinproj, win_w);
-    ork_w *w_out= ork_mm_pack_i8(c, dinner, dmodel, wout_w);
+    ork_w *w_in = ork_i8_mm_pack(c, dmodel, dinproj, win_w);
+    ork_w *w_out= ork_i8_mm_pack(c, dinner, dmodel, wout_w);
     if(w_in && w_out){
         int8_t *act_in=malloc((size_t)L*dmodel), *act_mid=malloc((size_t)L*dinner);
         int32_t *proj_in_out=malloc((size_t)L*dinproj*4), *proj_out_out=malloc((size_t)L*dmodel*4);
@@ -164,21 +164,21 @@ int main(int argc,char**argv){
         int8_t *sA=malloc(maxA),*sB=malloc(maxB),*sBt=malloc(maxB); int32_t*sC=malloc(maxC*4);
         for(size_t i=0;i<maxA;i++)sA[i]=1; for(size_t i=0;i<maxB;i++)sB[i]=1;
         #define SCAN_NPU() do{ \
-            ork_bmm_i8(c,nbG,m.CS,m.Nst,m.CS,sA,sB,sC); ork_bmm_i8(c,nbG,Mbig,m.CS,m.Nst,sA,sB,sC); \
-            ork_bmm_i8(c,nbG,Mbig,m.Nst,m.CS,sA,sB,sC); ork_bmm_i8(c,nbH,m.CS,m.CS,m.P,sA,sB,sC); }while(0)
+            ork_i8_bmm(c,nbG,m.CS,m.Nst,m.CS,sA,sB,sC); ork_i8_bmm(c,nbG,Mbig,m.CS,m.Nst,sA,sB,sC); \
+            ork_i8_bmm(c,nbG,Mbig,m.Nst,m.CS,sA,sB,sC); ork_i8_bmm(c,nbH,m.CS,m.CS,m.P,sA,sB,sC); }while(0)
         #define SCAN_CPU() do{ \
             cpu_gemm(sA,sB,sC,NULL,sBt,nbG,m.CS,m.Nst,m.CS); cpu_gemm(sA,sB,sC,NULL,sBt,nbG,Mbig,m.CS,m.Nst); \
             cpu_gemm(sA,sB,sC,NULL,sBt,nbG,Mbig,m.Nst,m.CS); cpu_gemm(sA,sB,sC,NULL,sBt,nbH,m.CS,m.CS,m.P); }while(0)
         int IT=20;
-        /* warm */ ork_mm_run_i8(c,w_in,L,act_in,proj_in_out); SCAN_CPU(); ork_mm_run_i8(c,w_out,L,act_mid,proj_out_out); SCAN_NPU();
+        /* warm */ ork_i8_mm_run(c,w_in,L,act_in,proj_in_out); SCAN_CPU(); ork_i8_mm_run(c,w_out,L,act_mid,proj_out_out); SCAN_NPU();
         double h0=now_us();
-        for(int it=0;it<IT;it++){ ork_mm_run_i8(c,w_in,L,act_in,proj_in_out); SCAN_CPU(); ork_mm_run_i8(c,w_out,L,act_mid,proj_out_out); }
+        for(int it=0;it<IT;it++){ ork_i8_mm_run(c,w_in,L,act_in,proj_in_out); SCAN_CPU(); ork_i8_mm_run(c,w_out,L,act_mid,proj_out_out); }
         double thyb=(now_us()-h0)/IT/1000;
         double a0=now_us();
-        for(int it=0;it<IT;it++){ ork_mm_run_i8(c,w_in,L,act_in,proj_in_out); SCAN_NPU(); ork_mm_run_i8(c,w_out,L,act_mid,proj_out_out); }
+        for(int it=0;it<IT;it++){ ork_i8_mm_run(c,w_in,L,act_in,proj_in_out); SCAN_NPU(); ork_i8_mm_run(c,w_out,L,act_mid,proj_out_out); }
         double tall=(now_us()-a0)/IT/1000;
         /* isolate the projections alone to derive the transition overhead in the hybrid */
-        double p0=now_us(); for(int it=0;it<IT;it++){ ork_mm_run_i8(c,w_in,L,act_in,proj_in_out); ork_mm_run_i8(c,w_out,L,act_mid,proj_out_out); } double tproj=(now_us()-p0)/IT/1000;
+        double p0=now_us(); for(int it=0;it<IT;it++){ ork_i8_mm_run(c,w_in,L,act_in,proj_in_out); ork_i8_mm_run(c,w_out,L,act_mid,proj_out_out); } double tproj=(now_us()-p0)/IT/1000;
         printf("\n  === END-TO-END LAYER (in_proj NPU + scan + out_proj NPU), L=%d ===\n",L);
         printf("  projections alone (NPU, K=%d/%d): %.2f ms | scan_cpu(isolated) %.2f | scan_npu(isolated) %.2f\n",
                dmodel,dinner,tproj,layer_cpu_ms,layer_npu_ms);
@@ -192,7 +192,7 @@ int main(int argc,char**argv){
 
     /* ================= fp16 REALITY CHECK: the scan needs fp16 (int8 is numerically incoherent,
      * ssd_coherence.c: maxrel 1e2-1e4). fp16 is the 2-byte datapath (~3.3x int8). Measure the grouped
-     * scan matmuls in fp16 (ork_bmm_fp16) vs int8 (ork_bmm_i8) vs CPU to get the REAL fp16-scan cost. */
+     * scan matmuls in fp16 (ork_bmm_fp16) vs int8 (ork_i8_bmm) vs CPU to get the REAL fp16-scan cost. */
     printf("\n  === fp16 SCAN (REQUIRED for coherence) vs int8 vs CPU, grouped shapes ===\n");
     { struct { const char*t; int nb,M,K,N; } gs[4] = {
         {"scores", m.G*NC, m.CS, m.Nst, m.CS}, {"Ydiag_g",m.G*NC, m.CS, m.CS, HG*m.P},
@@ -205,9 +205,9 @@ int main(int argc,char**argv){
         for(size_t i=0;i<szA;i++){A8[i]=1; Af[i]=(ork_f16)1.0f;} for(size_t i=0;i<szB;i++){B8[i]=1; Bf[i]=(ork_f16)1.0f;}
         /* RESIDENT weight (no repack) — pack once, run per batch — matching the NPU-ideal methodology,
          * isolating the pure fp16-vs-int8 NPU COMPUTE ratio at this shape (the fused-chain regime). */
-        ork_w*wi=ork_mm_pack_i8(c,K,N,B8); ork_w*wf=ork_mm_pack(c,K,N,Bf); double i8=1e9,f16=1e9;
-        if(wi){ ork_mm_run_i8(c,wi,M,A8,C8); double a0=now_us(); for(int b=0;b<nb;b++) ork_mm_run_i8(c,wi,M,A8,C8); i8=(now_us()-a0)/1000; ork_mm_free(c,wi); }
-        if(wf){ ork_mm_run(c,wf,M,Af,Cf); double b0=now_us(); for(int b=0;b<nb;b++) ork_mm_run(c,wf,M,Af,Cf); f16=(now_us()-b0)/1000; ork_mm_free(c,wf); }
+        ork_w*wi=ork_i8_mm_pack(c,K,N,B8); ork_w*wf=ork_f16_mm_pack(c,K,N,Bf); double i8=1e9,f16=1e9;
+        if(wi){ ork_i8_mm_run(c,wi,M,A8,C8); double a0=now_us(); for(int b=0;b<nb;b++) ork_i8_mm_run(c,wi,M,A8,C8); i8=(now_us()-a0)/1000; ork_mm_free(c,wi); }
+        if(wf){ ork_f16_mm_run(c,wf,M,Af,Cf); double b0=now_us(); for(int b=0;b<nb;b++) ork_f16_mm_run(c,wf,M,Af,Cf); f16=(now_us()-b0)/1000; ork_mm_free(c,wf); }
         double *B8t=(double*)0; (void)B8t;
         double cpu=cpu_gemm(A8,B8,C8,NULL,Bt,1,M,K,N)*nb; cpu=cpu_gemm(A8,B8,C8,NULL,Bt,1,M,K,N)/1000*nb;
         printf("  %-8s int8 %6.2fms | fp16 %6.2fms (%.2fx int8) | CPU %6.2fms\n",gs[s].t,i8,f16,f16/i8,cpu);

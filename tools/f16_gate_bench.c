@@ -2,7 +2,7 @@
  * baseline's int8 gate + CPU SiLU. Fused fp16-gate cost ~= the fp16 matmul time (silu rides the output stage
  * ~free). Baseline gate cost = int8 matmul + CPU transcendental silu over M*N. If t_fp16 < t_i8 + t_cpu_silu,
  * the fused fp16-gate wins (recovering the int8-silu PPL loss); else it can't. No new/untested regcmd (uses
- * ork_mm_run / ork_mm_run_i8), so no wedge risk.
+ * ork_f16_mm_run / ork_i8_mm_run), so no wedge risk.
  *   make f16_gate_bench && sudo ./f16_gate_bench [M] [K] [N] [iters]     (board only)
  */
 #define _GNU_SOURCE
@@ -26,14 +26,14 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++)Bi[i]=(int8_t)((i*7)%13-6);
     for(size_t i=0;i<(size_t)M*K;i++)Ai[i]=(int8_t)((i*11)%17-8);
 
-    ork_w*wf=ork_mm_pack(c,K,N,Bf), *wi=ork_mm_pack_i8(c,K,N,Bi);
+    ork_w*wf=ork_f16_mm_pack(c,K,N,Bf), *wi=ork_i8_mm_pack(c,K,N,Bi);
     if(!wf||!wi){ printf("pack failed (wf=%p wi=%p)\n",(void*)wf,(void*)wi); return 2; }
     float*Cf=malloc((size_t)M*N*4); int32_t*Ci=malloc((size_t)M*N*4);
 
     /* warm */
-    for(int w=0;w<3;w++){ ork_mm_run(c,wf,M,Af,Cf); ork_mm_run_i8(c,wi,M,Ai,Ci); }
-    double t0=now_us(); for(int i=0;i<it;i++) ork_mm_run(c,wf,M,Af,Cf);   double t_f16=(now_us()-t0)/it;
-    t0=now_us();        for(int i=0;i<it;i++) ork_mm_run_i8(c,wi,M,Ai,Ci); double t_i8 =(now_us()-t0)/it;
+    for(int w=0;w<3;w++){ ork_f16_mm_run(c,wf,M,Af,Cf); ork_i8_mm_run(c,wi,M,Ai,Ci); }
+    double t0=now_us(); for(int i=0;i<it;i++) ork_f16_mm_run(c,wf,M,Af,Cf);   double t_f16=(now_us()-t0)/it;
+    t0=now_us();        for(int i=0;i<it;i++) ork_i8_mm_run(c,wi,M,Ai,Ci); double t_i8 =(now_us()-t0)/it;
     /* CPU transcendental silu over M*N (what baseline pays for the gate) — 4 threads via OpenMP if built with it */
     float*g=malloc((size_t)M*N*4); for(size_t i=0;i<(size_t)M*N;i++)g[i]=(float)(Ci[i%((size_t)M*N)]*1e-4);
     volatile float sink=0; t0=now_us();

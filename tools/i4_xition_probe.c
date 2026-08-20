@@ -30,7 +30,7 @@ static void contaminate_f16(ork_npu *c){
 static void contaminate_i8(ork_npu *c){
     static int8_t *A=NULL,*B=NULL; static int32_t *C=NULL;
     if(!A){ A=malloc(64*64); B=malloc(64*64); C=malloc(64*64*4); memset(A,1,64*64); memset(B,1,64*64); }
-    ork_bmm_i8(c,1,64,64,64,A,B,C);
+    ork_i8_bmm(c,1,64,64,64,A,B,C);
 }
 
 /* run int4 `mech` once; C must be all K. mech: 0=run_i4 1=run_i4_incr 2=chain_i4 3=stream_i4 */
@@ -40,10 +40,10 @@ static double run_mech(ork_npu *c,int mech,ork_w *w,int M,int N,int K,int8_t *A,
     for(int i=0;i<S;i++) memset(tasks[i].C,0,(size_t)tasks[i].M*N*4);
     double t0=now_us(); int rc;
     switch(mech){
-        case 0: rc=ork_mm_run_i4(c,w,M,A,C); break;
+        case 0: rc=ork_i4_mm_run(c,w,M,A,C); break;
         case 1: rc=ork_mm_run_i4_incr(c,w,M,A,C); break;
-        case 2: rc=ork_mm_run_chain_i4(c,S,tasks); break;   /* M=1 tasks */
-        default:rc=ork_mm_run_stream_i4(c,S,tasks); break;
+        case 2: rc=ork_i4_mm_run_chain(c,S,tasks); break;   /* M=1 tasks */
+        default:rc=ork_i4_mm_run_stream(c,S,tasks); break;
     }
     double us=now_us()-t0;
     *bad=0;
@@ -56,7 +56,7 @@ static double run_mech(ork_npu *c,int mech,ork_w *w,int M,int N,int K,int8_t *A,
 static const char *MECH[4]={"run_i4    ","run_i4_incr","chain_i4  ","stream_i4 "};
 static int probe_shape(ork_npu *c,int K,int N,int M){
     int8_t *B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);      /* int4 value 1 */
-    ork_w *w=ork_mm_pack_i4(c,K,N,B);
+    ork_w *w=ork_i4_mm_pack(c,K,N,B);
     if(!w){ printf("  K=%-5d N=%-5d M=%-4d  pack_i4 FAILED (unsupported shape) — skip\n",K,N,M); free(B); return 0; }
     int8_t *A=malloc((size_t)M*K); memset(A,1,(size_t)M*K);
     int32_t *C=malloc((size_t)M*N*4);

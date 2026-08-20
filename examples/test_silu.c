@@ -1,5 +1,5 @@
-/* examples/test_silu.c — validate the on-NPU standalone SiLU (ork_npu_silu_i8) vs a CPU reference.
- * ork_npu_silu_i8 computes out[m][n] = clamp_i8(round( silu(in*in_scale)/out_scale )) on the NPU via the
+/* examples/test_silu.c — validate the on-NPU standalone SiLU (ork_i8_npu_silu) vs a CPU reference.
+ * ork_i8_npu_silu computes out[m][n] = clamp_i8(round( silu(in*in_scale)/out_scale )) on the NPU via the
  * standalone SDP activation-LUT op (index map calibrated once per ctx, silu curve built per scale). Each
  * case self-checks vs the CPU model over several (M,N) shapes and scales; exits nonzero on any mismatch.
  * Skips gracefully (exit 0) off-board / on a non-PPU SoC.
@@ -21,7 +21,7 @@ static int run_case(ork_npu *c, int M, int N, double in_scale, double out_scale,
     static signed char in[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++) in[i]=(signed char)(((i*7)%256)-128);   /* spread across the int8 range */
     double us=0;
-    int r = ork_npu_silu_i8(c, in, M, N, in_scale, out_scale, out, &us);
+    int r = ork_i8_npu_silu(c, in, M, N, in_scale, out_scale, out, &us);
     if(r){ printf("  [%dx%-4d] is=%.4f os=%.4f FAIL (rc=%d)\n", M, N, in_scale, out_scale, r); return 1; }
     int mism=0, mx=0;
     for(int i=0;i<M*N;i++){
@@ -40,7 +40,7 @@ static int run_case_i16(ork_npu *c, int M, int N, double in_scale, double out_sc
     static short in[MAXE], out[MAXE];
     for(int i=0;i<M*N;i++) in[i]=(short)(-32768 + (int)((65535LL*((i*97)%(M*N)))/(M*N)));  /* spread full int16 range */
     double us=0;
-    int r = ork_npu_silu_i16(c, in, M, N, in_scale, out_scale, out, &us);
+    int r = ork_i16_npu_silu(c, in, M, N, in_scale, out_scale, out, &us);
     if(r){ printf("  i16 [%dx%-4d] is=%.5f os=%.5f FAIL (rc=%d)\n", M, N, in_scale, out_scale, r); return 1; }
     /* int16 activation LUT accuracy is measured vs the output FULL-SCALE range (RKNN's is too); a few LSB from
      * the 6-bit interpolation near the knee is expected. tol = fs_tol * (max |ref| in the batch). */

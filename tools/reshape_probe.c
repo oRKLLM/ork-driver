@@ -14,7 +14,7 @@ int main(void){
     if(!ork_ppu_fuse_enabled(c)){printf("PPU fuse not enabled — SKIP\n");ork_npu_free(c);return 0;}
     int M=8,N=64;
     unsigned short *g=calloc(M*N,2), *r=calloc(4096,2); double us=0;
-    int rc=ork_npu_replay_reshape_f16(c,g,M*N,r,4096,&us);
+    int rc=ork_f16_npu_replay_reshape(c,g,M*N,r,4096,&us);
     printf("replay_reshape rc=%d  %.0fus\n",rc,us);
     int ginj=getenv("ORK_RESHAPE_GINJ")!=0;
     if(!ginj){ printf("  (set ORK_RESHAPE_T0=2 ORK_RESHAPE_GINJ=1 to derive the permutation)\n"); free(g);free(r);ork_npu_free(c);return rc?1:0; }

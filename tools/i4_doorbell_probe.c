@@ -4,11 +4,11 @@
  * polling a 4-byte ORK_DYN_SENT sentinel. int4 is different at the HARDWARE level: it writes an int16
  * (2-byte) accumulator that the driver widens to int32 on the host, and its HW chain is M=1-only. So there
  * is no "free flip" onto begin_mc. This probe isolates the ONE remaining question: with everything else held
- * identical to the WORKING ork_mm_run_chain_i4 (same synth_i4 regcmd, same chain descriptor, host A), does a
+ * identical to the WORKING ork_i4_mm_run_chain (same synth_i4 regcmd, same chain descriptor, host A), does a
  * NONBLOCK submit + int16-sentinel poll compute the SAME result as the blocking reference?
  *
- *   reference = ork_mm_run_chain_i4  (blocking int4 PC-chain, passes make test via test_chain_i4)
- *   probe     = ork_dyn_i4_probe     (identical build, submit flipped to NONBLOCK 0x2 + int16-sentinel poll)
+ *   reference = ork_i4_mm_run_chain  (blocking int4 PC-chain, passes make test via test_chain_i4)
+ *   probe     = ork_i4_dyn_probe     (identical build, submit flipped to NONBLOCK 0x2 + int16-sentinel poll)
  *
  * Bit-exact probe==reference across many runs + 2 shapes + cold run 0 => the int4 int16-output datapath
  * DOES survive a non-blocking doorbell (path viable, worth wiring). A mismatch/hang => it does not (int4
@@ -39,7 +39,7 @@ int main(int argc,char**argv){
         A[t]=malloc((size_t)K); B[t]=malloc((size_t)K*N);
         for(int i=0;i<K;i++){ sd=sd*1103515245+12345; A[t][i]=(int8_t)((int)((sd>>17)%15)-7); }
         for(size_t i=0;i<(size_t)K*N;i++){ sd=sd*1103515245+12345; B[t][i]=(int8_t)((int)((sd>>17)%15)-7); }
-        w[t]=ork_mm_pack_i4(c,K,N,B[t]); if(!w[t]){ printf("pack_i4 fail t=%d\n",t); return 2; }
+        w[t]=ork_i4_mm_pack(c,K,N,B[t]); if(!w[t]){ printf("pack_i4 fail t=%d\n",t); return 2; }
         Cref[t]=malloc((size_t)N*4); Cprb[t]=malloc((size_t)N*4); Cpu[t]=malloc((size_t)N*sizeof(long));
         for(int n=0;n<N;n++){ long s=0; for(int k=0;k<K;k++) s+=(long)A[t][k]*B[t][(size_t)k*N+n]; Cpu[t][n]=s; }
     }
@@ -47,20 +47,20 @@ int main(int argc,char**argv){
     ork_mm_task_i4 tref[S], tprb[S];
     for(int t=0;t<S;t++){ tref[t]=(ork_mm_task_i4){w[t],1,A[t],Cref[t]}; tprb[t]=(ork_mm_task_i4){w[t],1,A[t],Cprb[t]}; }
 
-    /* PHASE A — reference (ork_mm_run_chain_i4) ALONE, R runs vs CPU: establishes the reference is clean and
+    /* PHASE A — reference (ork_i4_mm_run_chain) ALONE, R runs vs CPU: establishes the reference is clean and
      * deterministic in isolation (no interleaving with the experimental path). */
     int ref_bad=0, ref_rc=0;
     for(int r=0;r<runs;r++){
         for(int t=0;t<S;t++) for(int n=0;n<N;n++) Cref[t][n]=POISON;
-        if(ork_mm_run_chain_i4(c,S,tref)){ ref_rc++; continue; }
+        if(ork_i4_mm_run_chain(c,S,tref)){ ref_rc++; continue; }
         int e=0; for(int t=0;t<S;t++) for(int n=0;n<N;n++) if(Cref[t][n]!=(int32_t)Cpu[t][n]) e++;
         if(e){ ref_bad++; if(ref_bad<=3) printf("  [A] run %d: ref!=cpu %d/%d (ref[0]=%d cpu[0]=%ld)\n",r,e,S*N,Cref[0][0],Cpu[0][0]); }
     }
-    /* PHASE B — probe (ork_dyn_i4_probe: NONBLOCK + full-surface int16-sentinel) ALONE, R runs vs CPU. */
+    /* PHASE B — probe (ork_i4_dyn_probe: NONBLOCK + full-surface int16-sentinel) ALONE, R runs vs CPU. */
     int prb_bad=0, prb_rc=0, prb_zero=0;
     for(int r=0;r<runs;r++){
         for(int t=0;t<S;t++) for(int n=0;n<N;n++) Cprb[t][n]=POISON;
-        if(ork_dyn_i4_probe(c,S,tprb)){ prb_rc++; continue; }
+        if(ork_i4_dyn_probe(c,S,tprb)){ prb_rc++; continue; }
         int e=0,z=0; for(int t=0;t<S;t++) for(int n=0;n<N;n++){ if(Cprb[t][n]!=(int32_t)Cpu[t][n]) e++; if(Cprb[t][n]==0) z++; }
         if(e){ prb_bad++; if(prb_bad<=3) printf("  [B] run %d: probe!=cpu %d/%d (%d zeros) (probe[0]=%d cpu[0]=%ld)\n",r,e,S*N,z,Cprb[0][0],Cpu[0][0]); }
         prb_zero += z;
@@ -69,13 +69,13 @@ int main(int argc,char**argv){
     int poll_bad=0;
     for(int r=0;r<runs;r++){
         for(int t=0;t<S;t++) for(int n=0;n<N;n++){ Cprb[t][n]=POISON; Cref[t][n]=POISON; }
-        ork_dyn_i4_probe(c,S,tprb);
-        if(ork_mm_run_chain_i4(c,S,tref)) continue;
+        ork_i4_dyn_probe(c,S,tprb);
+        if(ork_i4_mm_run_chain(c,S,tref)) continue;
         int e=0; for(int t=0;t<S;t++) for(int n=0;n<N;n++) if(Cref[t][n]!=(int32_t)Cpu[t][n]) e++;
         if(e){ poll_bad++; if(poll_bad<=3) printf("  [C] run %d: post-probe ref!=cpu %d/%d (probe corrupts next blocking submit)\n",r,e,S*N); }
     }
     /* The DOORBELL question is Phase B ALONE (probe vs an independent CPU int reference). Phases A and C
-     * measure the BLOCKING reference (ork_mm_run_chain_i4); if A (which runs NO probe) is also bad, that is a
+     * measure the BLOCKING reference (ork_i4_mm_run_chain); if A (which runs NO probe) is also bad, that is a
      * PRE-EXISTING run_chain_i4 warm-reuse coherency bug — NOT a probe/pollution problem — so C's failure is
      * then just the reference being broken warm, not the probe corrupting it. Verdict keys on B. */
     int doorbell_ok = (prb_bad==0 && prb_rc==0);

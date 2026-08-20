@@ -35,7 +35,7 @@ void ork_f16_fuzz_clear(void){ orki_f16_fovr_n=0; }
 
 void ork_f16_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(orki_f16_fovr_n<16){ orki_f16_fovr[orki_f16_fovr_n].blk=blk; orki_f16_fovr[orki_f16_fovr_n].reg=reg; orki_f16_fovr[orki_f16_fovr_n].val=val; orki_f16_fovr_n++; } }
 
-void orki_set_f16_out(uint32_t*rc,int N,int stride){
+void orki_f16_set_out(uint32_t*rc,int N,int stride){
     int s=stride>0?stride:N; (void)s;
     unsigned r04=getenv("ORK_F16OUT_4004")?strtoul(getenv("ORK_F16OUT_4004"),0,0):0x0000000e;
     /* 0x4010 DATA_FORMAT fields (rocket registers.xml, confirmed by our ewmul fp16=0x48000002):
@@ -61,10 +61,10 @@ void orki_set_f16_out(uint32_t*rc,int N,int stride){
 
 /* fp16-IN fp16-OUT DPU output stage, reconstructed from the VENDOR conv task[0] (conv_mul.rknn, decoded against
  * rocket_registers.h) — the config that actually emits fp16 to memory AND hands off cleanly to a chained fp16 SDP.
- * orki_set_f16_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
+ * orki_f16_set_out (int8-tuned) hangs the fp16 matmul: it leaves the BS/BN/EW ALU stages active and — critically —
  * writes 0x4084=1 WITHOUT DPU_OUT_CVT_SCALE.FP32TOFP16_EN (bit16), so the fp16 CVT is never enabled. Here we take
  * the vendor's mode/bypass/CVT registers verbatim and keep only the matmul-shaped output GEOMETRY (N channels). */
-void orki_set_f16_out_fp16in(uint32_t*rc,int M,int N){
+void orki_f16_set_out_fp16in(uint32_t*rc,int M,int N){
     /* fp16-in fp16-out DPU output stage. Precision/bypass/CVT regs from a captured VENDOR fp16->fp16 MATMUL
      * (~/rknn_sdk/cap_fp16f16.dec): 0x4040=0x53 (BS FULLY bypassed — a MATMUL, not the conv's BS-active 0x20150
      * that hung it), 0x4010 OUT=fp16, 0x4084 FP32TOFP16_EN(bit16). The vendor's own capture was CONTIGUOUS
@@ -89,7 +89,7 @@ void orki_set_f16_out_fp16in(uint32_t*rc,int M,int N){
         /* ATOM-8 fp16 output — geometry taken EXACTLY from the bit-exact atom-8 SDP (REGCMD_MUL_F16 / orki_set_mul_geom):
          * surface stride M*16, 0x4050 BS_OW_CFG=0x2 (OD_BYPASS, SIZE_E=0 — NOT the contiguous 0x126 or the int16
          * 0x248 that hung), 0x4038=0. This makes the fp16 matmul emit the PC16 atom-8 layout the SDP reads, so
-         * ork_npu_mul_perchan_f16 can consume it directly (no reshape, no notch). */
+         * ork_f16_npu_mul_perchan can consume it directly (no reshape, no notch). */
         uint32_t s=(uint32_t)(M*16);
         orki_setrn(rc,REGCMD_N,RK_DPU_DST_SURF_STRIDE,s);                            /* DST_SURF_STRIDE = M*16 */
         orki_setrn(rc,REGCMD_N,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
@@ -114,16 +114,16 @@ inline int orki_f16_mtile(int K,int M){
     if(chunk<1)chunk=1; if(chunk>M)chunk=M; return chunk;
 }
 
-/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_synth(). Inert by default. */
-/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (orki_synth() uses scale=K/256, vs int8's K/512
+/* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_f16_synth(). Inert by default. */
+/* fp16 twin of fused_mtile: the fp16 0x1040 K-reduction schedule (orki_f16_synth() uses scale=K/256, vs int8's K/512
  * since int8 packs 2 rows per CBUF slot) gives the SAME bit-exact M-tile ceiling mg_max*64. The old
- * ork_mm_run_f16_silu chunk=16 was a stale over-conservative cap far below this (64 @K2048, 320 @K512) —
+ * ork_f16_mm_run_silu chunk=16 was a stale over-conservative cap far below this (64 @K2048, 320 @K512) —
  * bit-exact validated (tools/silu_f16_check: M-tile 16==32==64 @K2048, 16==320 @K512, 384>ceil DIFFERS).
  * ORK_F16_MTILE overrides (validation / probing above the ceiling). */
-/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via orki_synth(). Weight tile [NT][KT][16][32]
+/* RE (fp16 batch-mode mapping): raw fp32 output of one fp16 matmul via orki_f16_synth(). Weight tile [NT][KT][16][32]
  * (N-tile=16), A raw-copied [M][K] fp16, output fp32 (2*M*N floats, room for a batch layout). A/B are fp16
- * bit patterns (uint16). ork_f16_fuzz overrides apply inside orki_synth(). 0/ok -1 wedged -2 dims. */
-void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
+ * bit patterns (uint16). ork_f16_fuzz overrides apply inside orki_f16_synth(). 0/ok -1 wedged -2 dims. */
+void orki_f16_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf){
     memcpy(rc,REGCMD,REGCMD_N*4);
     orki_setrn(rc,REGCMD_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE0,K*N*2);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE1,K*2);
     orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON1,K/32);orki_setrn(rc,REGCMD_N,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,REGCMD_N,RK_CNA_DMA_CON1,K/8);
@@ -133,7 +133,7 @@ void orki_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t 
     orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,REGCMD_N,RK_PDP_OUT_N,N-1);
     if(sched){
         int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int rows=(mc+1<R)?(mc+1):R; orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*rows);
-        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see orki_synth_i8 (65..127-row tile needs the next K-schedule) */
+        double scale=(double)K/256.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;  /* ceil: see orki_i8_synth (65..127-row tile needs the next K-schedule) */
         int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,v);
     } else { orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*(mc+1)); }
     orki_setrn(rc,REGCMD_N,RK_CNA_FEATURE_DATA_ADDR,aA);orki_setrn(rc,REGCMD_N,RK_CNA_WEIGHT_DATA_ADDR,aB);orki_setrn(rc,REGCMD_N,RK_DPU_DST_BASE_ADDR,aC);

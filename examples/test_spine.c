@@ -23,13 +23,13 @@ static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t
 
 static ork_npu *g_c;
 /* The NPU-unit op: run ntk int8 matmuls (BLOCKING) on the unit's own thread, then flush the output for a
- * cross-thread consumer. Uses ork_mm_run_i8 (M=1 -> robust multi-core) rather than the ork_dyn doorbell so this
+ * cross-thread consumer. Uses ork_i8_mm_run (M=1 -> robust multi-core) rather than the ork_dyn doorbell so this
  * GATING test is deterministic — the nonblock doorbell miss-fires intermittently on this board (tasks #13/#21),
  * which spine_sched_probe exercises separately. The dispatcher is agnostic to what the op does; the overlap is
  * thread-level (NPU-unit thread || CPU-unit thread), NOT dependent on the doorbell's nonblock nature. */
 struct npu_arg { ork_mm_task_i8 *tk; int ntk; const void *out; size_t outbytes; };
 static long npu_fn(void *p){ struct npu_arg *a = p;
-    for (int s = 0; s < a->ntk; s++) if (ork_mm_run_i8(g_c, a->tk[s].w, a->tk[s].M, a->tk[s].A, a->tk[s].C)) return -1;
+    for (int s = 0; s < a->ntk; s++) if (ork_i8_mm_run(g_c, a->tk[s].w, a->tk[s].M, a->tk[s].A, a->tk[s].C)) return -1;
     ork_spine_civac_range(a->out, a->outbytes);   /* producer flush: push the NPU output to DRAM for a cross-thread consumer */
     return 0; }
 struct glue_arg { const int8_t *x; size_t n; long out; };
@@ -49,7 +49,7 @@ int main(void){
     int8_t *A = malloc((size_t)M * K), *Wb = malloc((size_t)K * N);
     for (int i = 0; i < M * K; i++) A[i] = (int8_t)s3();
     for (size_t i = 0; i < (size_t)K * N; i++) Wb[i] = (int8_t)s3();
-    ork_w *W = ork_mm_pack_i8(c, K, N, Wb); if (!W){ printf("pack fail\n"); return 2; }
+    ork_w *W = ork_i8_mm_pack(c, K, N, Wb); if (!W){ printf("pack fail\n"); return 2; }
     int32_t *C0 = ork_dma_alloc(c, (size_t)S * N * 4), *C3 = ork_dma_alloc(c, (size_t)S * N * 4);
     if (!C0 || !C3){ printf("dma fail\n"); return 2; }
     ork_mm_task_i8 *tk0 = malloc((size_t)S * sizeof *tk0), *tk3 = malloc((size_t)S * sizeof *tk3);

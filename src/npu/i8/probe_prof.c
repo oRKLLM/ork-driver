@@ -38,7 +38,7 @@ int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_u
     struct buf O=orki_bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}   /* int32 out */
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);  /* act all-1 -> out=K */
     orki_act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    uint32_t rc[REGCMD_I8_N]; orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
     t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -83,7 +83,7 @@ int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
     struct buf O=orki_bcreate(fd,(size_t)M*N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=1; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    uint32_t rc[REGCMD_I8_N]; orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;
     t->regcfg_amount=108; t->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -170,7 +170,7 @@ int ork_npu_probe_batch(ork_npu*c,int ntask,int K,int N,double*us_unbatched,doub
     struct buf O=orki_bcreate(fd,(size_t)N*4,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}
     int8_t*ad=c->Af.cpu; memset(ad,1,K); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
-    uint32_t rc[REGCMD_I8_N]; orki_synth_i8(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    uint32_t rc[REGCMD_I8_N]; orki_i8_synth(rc,1,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
     orki_setrn(rc,REGCMD_I8_N,RK_CNA_CBUF_CON0,0xb1);
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_batch", c, rc, REGCMD_I8_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }

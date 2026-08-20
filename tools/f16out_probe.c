@@ -42,7 +42,7 @@ int main(int argc,char**argv){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ double s=0; for(int k=0;k<K;k++) s+=(double)h2f(((uint16_t*)A)[(size_t)m*K+k])*h2f(((uint16_t*)Wf)[(size_t)k*N+n]);
         float tf=h2f(f2h((float)s)); tref[(size_t)m*N+n]=tf; oref[(size_t)m*N+n]=tf*h2f(((uint16_t*)scale)[n]); }
 
-    ork_w *w=ork_mm_pack(c,K,N,Wf); if(!w){ printf("pack fail\n"); return 2; }
+    ork_w *w=ork_f16_mm_pack(c,K,N,Wf); if(!w){ printf("pack fail\n"); return 2; }
 
     /* Stage 1: f16-out matmul alone */
     ork_f16 *t=malloc((size_t)M*N*2); for(size_t i=0;i<(size_t)M*N;i++) t[i]=(ork_f16)f2h(-1e3f);

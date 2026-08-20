@@ -26,7 +26,7 @@ int main(int argc,char**argv){
     static short in[1024],out[1024];
     for(int i=0;i<M*N;i++){ long q=(long)(-32000 + (64000L*i)/(M*N-1)); in[i]=(short)q; }
     double us=0;
-    int r=ork_npu_replay_lut_i16(c, REGCMD_SILU_I16, REGCMD_SILU_I16_N, LUT_SILU_I16, LUT_SILU_I16_N, in, M, N, out, &us);
+    int r=ork_i16_npu_replay_lut(c, REGCMD_SILU_I16, REGCMD_SILU_I16_N, LUT_SILU_I16, LUT_SILU_I16_N, in, M, N, out, &us);
     if(r){ printf("replay rc=%d\n",r); ork_npu_free(c); return 1; }
     int bad=0; long mx=0;
     for(int i=0;i<M*N;i++){

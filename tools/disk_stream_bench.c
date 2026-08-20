@@ -2,7 +2,7 @@
  *
  * Sibling of tools/prefetch_headroom.c. That tool answered "can a prefetch thread hide the int4
  * inflate+tile behind the NPU?". THIS tool answers the disk-source questions for the PRE-TILED int8
- * fast path (ork_w_dump produces tiled int8 bytes; ork_mm_load_i8 reloads them with NO inflate/retile —
+ * fast path (ork_w_dump produces tiled int8 bytes; ork_i8_mm_load reloads them with NO inflate/retile —
  * the streaming fill is just: copy those bytes into the resident NPU dma_buf + bsync flush):
  *
  *   (A) RAM source          memcpy(RAM_buf -> dma_buf) + bsync.                      [baseline]
@@ -11,8 +11,8 @@
  *   (D) pread direct COLD   drop_caches, then pread(fd, dma_buf, size)+bsync  (read straight into dma).
  *
  * Plus, for the SAME shapes (so it's all one comparable table):
- *   t_npu   = NPU int8 matmul time (ork_mm_run_i8) at a few M.
- *   t_tile  = int4 inflate+tile, the RAM path (ork_slice_inflate_i4a8_kind + ork_slice_tile_i8) — the
+ *   t_npu   = NPU int8 matmul time (ork_i8_mm_run) at a few M.
+ *   t_tile  = int4 inflate+tile, the RAM path (ork_i4a8_slice_inflate_kind + ork_i8_slice_tile) — the
  *             cost the pre-tiled int8 fill SKIPS. The headline lever question: (int4 inflate+tile) vs
  *             (pre-tiled int8 fill A) = how much does persisting the tiled bytes buy.
  *
@@ -41,8 +41,8 @@
 #include "ork_npu.h"
 
 /* internal diagnostic helpers exported from npu.c (not in the public header) */
-void ork_slice_inflate_i4a8_kind(const ork_w *w, float *qf32, int kind);
-void ork_slice_tile_i8(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
+void ork_i4a8_slice_inflate_kind(const ork_w *w, float *qf32, int kind);
+void ork_i8_slice_tile(ork_npu *c, ork_w *w, const float *qf32, float *inv1);
 void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size);
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
@@ -116,7 +116,7 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
         for(int k=0;k<K;k++){ int v=(int)lrintf(f32[(size_t)n*K+k]*sc);
             if(v>127)v=127; if(v<-127)v=-127; Bi8[(size_t)k*N+n]=(int8_t)v; } }
 
-    ork_w *w8 = ork_mm_pack_i8(c,K,N,Bi8);   /* pre-tiled int8 resident weight */
+    ork_w *w8 = ork_i8_mm_pack(c,K,N,Bi8);   /* pre-tiled int8 resident weight */
     if(!w8){ printf("  [%s] pack_i8 failed (K=%d N=%d)\n",label,K,N); free(f32); free(Bi8); return; }
 
     /* the pre-tiled int8 blob (what would live on disk in an .orkpack) */
@@ -196,16 +196,16 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
     /* ---------- int4 inflate+tile (RAM path) on the SAME shape (the cost pre-tiling skips) ---------- */
     statd T = {0,0,0}; int have_t = 0;
     { float *bscale = malloc((size_t)N*sizeof(float));
-      ork_w *w4 = ork_mm_pack_i4a8(c,K,N,f32,bscale);
+      ork_w *w4 = ork_i4a8_mm_pack(c,K,N,f32,bscale);
       if(w4){
         float *qf32 = malloc((size_t)N*K*sizeof(float));
         float *inv1 = malloc((size_t)N*sizeof(float));
         if(qf32 && inv1){
           for(int n=0;n<N;n++) inv1[n]=1.0f;
-          ork_slice_inflate_i4a8_kind(w4,qf32,ORK_QK_UNIFORM);   /* prime codes */
+          ork_i4a8_slice_inflate_kind(w4,qf32,ORK_QK_UNIFORM);   /* prime codes */
           /* t_tile here is inflate(UNIFORM)+tile combined — the full int4->resident prep */
-          for(int i=0;i<WARM;i++){ ork_slice_inflate_i4a8_kind(w4,qf32,ORK_QK_UNIFORM); ork_slice_tile_i8(c,w4,qf32,inv1); }
-          for(int i=0;i<REPS;i++){ double t=now_us(); ork_slice_inflate_i4a8_kind(w4,qf32,ORK_QK_UNIFORM); ork_slice_tile_i8(c,w4,qf32,inv1); samp[i]=now_us()-t; }
+          for(int i=0;i<WARM;i++){ ork_i4a8_slice_inflate_kind(w4,qf32,ORK_QK_UNIFORM); ork_i8_slice_tile(c,w4,qf32,inv1); }
+          for(int i=0;i<REPS;i++){ double t=now_us(); ork_i4a8_slice_inflate_kind(w4,qf32,ORK_QK_UNIFORM); ork_i8_slice_tile(c,w4,qf32,inv1); samp[i]=now_us()-t; }
           T = summarize(samp,REPS); have_t=1;
         }
         free(qf32); free(inv1);
@@ -235,9 +235,9 @@ static void run_shape(ork_npu*c, int K, int N, const int*Ms, int nM, const char*
         int32_t *Cc = malloc((size_t)M*N*4);
         if(!Aa||!Cc){ printf("    M=%d OOM act\n",M); free(Aa); free(Cc); continue; }
         memset(Aa,1,(size_t)M*K);
-        if(ork_mm_run_i8(c,w8,M,Aa,Cc)!=0){ printf("    M=%d ork_mm_run_i8 FAILED\n",M); free(Aa); free(Cc); continue; }
-        for(int i=0;i<WARM;i++) ork_mm_run_i8(c,w8,M,Aa,Cc);
-        for(int i=0;i<REPS;i++){ double t=now_us(); ork_mm_run_i8(c,w8,M,Aa,Cc); samp[i]=now_us()-t; }
+        if(ork_i8_mm_run(c,w8,M,Aa,Cc)!=0){ printf("    M=%d ork_i8_mm_run FAILED\n",M); free(Aa); free(Cc); continue; }
+        for(int i=0;i<WARM;i++) ork_i8_mm_run(c,w8,M,Aa,Cc);
+        for(int i=0;i<REPS;i++){ double t=now_us(); ork_i8_mm_run(c,w8,M,Aa,Cc); samp[i]=now_us()-t; }
         statd npu = summarize(samp,REPS);
         double ratio = npu.med>0 ? A.med/npu.med : 0;
         char verdict[160];

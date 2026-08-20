@@ -1,5 +1,5 @@
 /* doorbell_overlap_probe — increment 2 crux: is the DOORBELL (ork_dyn_*) NPU submit truly async, so CPU glue
- * overlaps the NPU's streaming window "for free"? (Increment 1 showed ork_mm_run_i8 is host-bound and does NOT
+ * overlaps the NPU's streaming window "for free"? (Increment 1 showed ork_i8_mm_run is host-bound and does NOT
  * overlap; the spine's NPU unit must be the doorbell.) Also confirms the doorbell path is coherent.
  *
  *   begin(S tasks)     -> NONBLOCK submit; the NPU runs the chain (kernel-driven), begin returns in ~µs
@@ -33,7 +33,7 @@ int main(void){
     int8_t *Wb=malloc((size_t)K*N);
     for(int i=0;i<M*K;i++) A[i]=(int8_t)s3();
     for(size_t i=0;i<(size_t)K*N;i++) Wb[i]=(int8_t)s3();
-    ork_w *W=ork_mm_pack_i8(c,K,N,Wb); if(!W){ printf("pack failed\n"); return 2; }
+    ork_w *W=ork_i8_mm_pack(c,K,N,Wb); if(!W){ printf("pack failed\n"); return 2; }
     ork_mm_task_i8 *tk=malloc((size_t)S*sizeof *tk);
     for(int s=0;s<S;s++) tk[s]=(ork_mm_task_i8){W,M,A,C+(size_t)s*N};
 

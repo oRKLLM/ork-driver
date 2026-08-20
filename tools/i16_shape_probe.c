@@ -1,5 +1,5 @@
-/* tools/i16_shape_probe.c — reproduce + localize the on-NPU int16 activation op (ork_npu_silu_i16 ->
- * act_lut_i16 -> ork_npu_probe_silu_std_i16) IN-CHAIN wedge, in isolation (no full model load).
+/* tools/i16_shape_probe.c — reproduce + localize the on-NPU int16 activation op (ork_i16_npu_silu ->
+ * act_lut_i16 -> ork_i16_npu_probe_silu_std) IN-CHAIN wedge, in isolation (no full model load).
  *
  * The op is bit-accurate STANDALONE at every shape, but SOFT-RESETS the NPU when run inside the FFN chain
  * (after a matmul, with resident weights). This tool (1) sweeps shapes standalone to confirm they're clean,
@@ -20,7 +20,7 @@ static int try_shape(ork_npu *c, int M, int N){
     int16_t *in = calloc((size_t)M*N, 2), *out = calloc((size_t)M*N, 2);
     if(!in||!out){ free(in); free(out); return -99; }
     for(size_t i=0;i<(size_t)M*N;i++) in[i]=(int16_t)((i%201)-100);   /* small dummy gate values */
-    double us=0; int rc = ork_npu_silu_i16(c, in, M, N, 0.01, 0.01, out, &us);
+    double us=0; int rc = ork_i16_npu_silu(c, in, M, N, 0.01, 0.01, out, &us);
     printf("    silu M=%d N=%d -> rc=%d %s (%.0f us)\n",
            M, N, rc, rc==0?"OK":(rc==-1?"WEDGE":"shape/soc"), us);
     fflush(stdout);
@@ -35,12 +35,12 @@ static int matmul_then_silu_kn(ork_npu *c, int nc, ork_w **keep_w, int Km, int N
     const int Mm=128;
     int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
     for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
-    ork_w *w = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    ork_w *w = ork_i8_mm_pack(c, Km, Nm, B); free(B);
     if(!w){ printf("    pack fail\n"); return -2; }
     int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
     for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
     ork_npu_set_core_budget(c, nc);
-    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    int mrc = ork_i8_mm_run(c, w, Mm, A, C);
     printf("    [matmul K=%d N=%d M=%d nc=%d -> rc=%d]\n", Km, Nm, Mm, nc, mrc);
     free(A); free(C);
     int rc = try_shape(c, 128, 6144);
@@ -56,16 +56,16 @@ static int matmul_then_silu_imported(ork_npu *c, int nc){
     const int Km=2048, Nm=6144, Mm=128;
     int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
     for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
-    ork_w *wp = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    ork_w *wp = ork_i8_mm_pack(c, Km, Nm, B); free(B);
     if(!wp){ printf("    pack fail\n"); return -2; }
     size_t nb = ork_w_dump(wp, NULL, 0); void *blob = malloc(nb); ork_w_dump(wp, blob, nb);
     ork_mm_free(c, wp);
-    ork_w *w = ork_mm_load_i8_import(c, Km, Nm, blob, nb); free(blob);
+    ork_w *w = ork_i8_mm_load_import(c, Km, Nm, blob, nb); free(blob);
     if(!w){ printf("    import fail (no dma-heap?)\n"); return -2; }
     int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
     for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
     ork_npu_set_core_budget(c, nc);
-    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    int mrc = ork_i8_mm_run(c, w, Mm, A, C);
     printf("    [IMPORTED matmul K=%d N=%d M=%d nc=%d -> rc=%d]\n", Km, Nm, Mm, nc, mrc);
     free(A); free(C);
     int rc = try_shape(c, 128, 6144);
@@ -99,14 +99,14 @@ static int matmul_then_silu_dom(ork_npu *c, int wdom){
     int8_t *B = calloc((size_t)Km*Nm, 1); if(!B) return -2;
     for(size_t i=0;i<(size_t)Km*Nm;i++) B[i]=(int8_t)((i%7)-3);
     ork_npu_set_pack_domain(c, wdom);
-    ork_w *w = ork_mm_pack_i8(c, Km, Nm, B); free(B);
+    ork_w *w = ork_i8_mm_pack(c, Km, Nm, B); free(B);
     ork_npu_set_pack_domain(c, -1);
     if(!w){ printf("    pack fail (dom%d)\n", wdom); return -2; }
     printf("    [weight domain = %d]\n", ork_w_domain(w));
     int8_t *A = calloc((size_t)Mm*Km, 1); int32_t *C = malloc((size_t)Mm*Nm*4);
     for(size_t i=0;i<(size_t)Mm*Km;i++) A[i]=(int8_t)((i%5)-2);
     ork_npu_set_core_budget(c, ork_npu_cores(c));
-    int mrc = ork_mm_run_i8(c, w, Mm, A, C);
+    int mrc = ork_i8_mm_run(c, w, Mm, A, C);
     printf("    [matmul in dom%d -> rc=%d]\n", wdom, mrc);
     free(A); free(C);
     int rc = try_shape(c, 128, 6144);   /* silu buffers in dom0 while dom_active=wdom */
@@ -126,11 +126,11 @@ static int attn_ffn_seq_then_silu(ork_npu *c){
         int K=sh[i].K,N=sh[i].N;
         int8_t*B=calloc((size_t)K*N,1); if(!B) continue;
         for(size_t j=0;j<(size_t)K*N;j++) B[j]=(int8_t)((j%7)-3);
-        w[i]=ork_mm_pack_i8(c,K,N,B); free(B);
+        w[i]=ork_i8_mm_pack(c,K,N,B); free(B);
         if(!w[i]){ printf("    pack fail %s\n",sh[i].nm); continue; }
         int8_t*A=calloc((size_t)128*K,1); int32_t*C=malloc((size_t)128*N*4);
         for(size_t j=0;j<(size_t)128*K;j++) A[j]=(int8_t)((j%5)-2);
-        ork_mm_run_i8(c,w[i],128,A,C); free(A); free(C);
+        ork_i8_mm_run(c,w[i],128,A,C); free(A); free(C);
     }
     printf("    [ran q/k/v/o/up/gate matmuls, all resident]\n");
     int rc = try_shape(c,128,6144);

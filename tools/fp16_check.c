@@ -1,4 +1,4 @@
-/* tools/fp16_check.c — reproduce the layer/model FP16 failure at cbuf=57344. layer.c uses ork_mm_run
+/* tools/fp16_check.c — reproduce the layer/model FP16 failure at cbuf=57344. layer.c uses ork_f16_mm_run
  * (fp16), not int8 — so the cbuf-raise breaks the fp16 M-tiling (down @ K=2048 grows 8->14 rows at
  * M=16). Multi-core fp16 matmul + fp32 CPU reference (fp16 inputs, fp32 accumulate = the NPU's math).
  *   make fp16_check && sudo ./fp16_check [M] [K] [N]
@@ -18,8 +18,8 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=(ork_f16)(0.05f*((i%7)+1));   /* positive: no cancellation */
     for(size_t i=0;i<(size_t)M*K;i++) A[i]=(ork_f16)(0.05f*((i%5)+1));
     float*C=malloc((size_t)M*N*4);
-    ork_w*w=ork_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
-    ork_mm_run(c,w,M,A,C);
+    ork_w*w=ork_f16_mm_pack(c,K,N,B); if(!w){printf("pack failed\n");return 1;}
+    ork_f16_mm_run(c,w,M,A,C);
     double maxe=0, refmax=0; int nan=0;
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){
         float acc=0; for(int k=0;k<K;k++) acc+=(float)A[(size_t)m*K+k]*(float)B[(size_t)k*N+n];

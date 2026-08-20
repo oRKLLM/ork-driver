@@ -33,7 +33,7 @@ static void contaminate_f16(ork_npu *c){
 static double run_mech(ork_npu *c,int mech,ork_mm_task_i8 *tasks,int K,int N,int *bad){
     for(int i=0;i<S;i++) memset(tasks[i].C,0,(size_t)tasks[i].M*N*4);
     double t0=now_us();
-    int rc = mech ? ork_mm_run_chain_i8(c,S,tasks) : ork_mm_run_stream_i8(c,S,tasks);
+    int rc = mech ? ork_i8_mm_run_chain(c,S,tasks) : ork_i8_mm_run_stream(c,S,tasks);
     double us=now_us()-t0;
     *bad=0;
     if(rc){ *bad=-1; return us; }
@@ -46,7 +46,7 @@ static int probe_shape(ork_npu *c,int K,int N,int M){
     int Ms[S]; for(int i=0;i<S;i++) Ms[i]=M;
     int8_t *A[S]={0},*B=NULL; int32_t *C[S]={0}; ork_w *w=NULL; ork_mm_task_i8 tasks[S];
     B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    w=ork_mm_pack_i8(c,K,N,B);
+    w=ork_i8_mm_pack(c,K,N,B);
     if(!w){ printf("  K=%-5d N=%-5d M=%-4d  pack FAILED\n",K,N,M); free(B); return 0; }  /* shape unsupported: skip */
     for(int i=0;i<S;i++){ A[i]=malloc((size_t)M*K); memset(A[i],1,(size_t)M*K); C[i]=malloc((size_t)M*N*4);
         tasks[i]=(ork_mm_task_i8){w,M,A[i],C[i]}; }

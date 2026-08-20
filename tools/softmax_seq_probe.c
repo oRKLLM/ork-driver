@@ -120,7 +120,7 @@ int main(int argc,char**argv){
 
         /* (e) Sigma = e . ones[n,16] reduce-matmul on the NPU via seq (sum lands in col 0) */
         ork_f16 *ones=malloc((size_t)n*16*sizeof(ork_f16)); for(size_t i=0;i<(size_t)n*16;i++) ones[i]=(ork_f16)1.0f;
-        ork_w *w_ones=ork_mm_pack(c,n,16,ones);
+        ork_w *w_ones=ork_f16_mm_pack(c,n,16,ones);
         float *ss=malloc((size_t)M*16*sizeof(float));
         int rc_red=-1;
         if(w_ones){ ork_seq_op o_red={ .kind=ORK_OP_MM_F16, .w=w_ones, .M=M, .A=ef, .C=ss }; rc_red=ork_submit_seq(c,&o_red,1); }

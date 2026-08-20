@@ -20,7 +20,7 @@
 #include "npu/core.h"
 #include "npu/i16/i16.h"
 
-int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
+int ork_i16_npu_probe_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,
                           int mult,int shift,int16_t *C,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64) return -2;
@@ -36,10 +36,10 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     int8_t*ad=c->Af.cpu; for(int j=0;j<M*K;j++)ad[j]=A[j]; orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I8_N];
-    orki_synth_i8(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
-    if(getenv("ORK_MM_F16OUT")) orki_set_f16_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
+    orki_i8_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,1,CBUF,0);
+    if(getenv("ORK_MM_F16OUT")) orki_f16_set_out(rc,N,0);          /* SHIM test: int8 matmul -> fp16 OUT_CVT (2-byte) */
     else if(getenv("ORK_MM_I32OUT")) { /* CONTROL: skip set_i16_out -> synth_i8's default int32 output (works standalone) */ }
-    else                        orki_set_i16_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
+    else                        orki_i16_set_out(rc,N,0,mult,shift); /* rewrite output stage: int32 -> int16 requantize */
     /* TOGGLE SWEEP: restore individual output-stage regs to their int32 (completing) values to isolate the
      * WDMA terminal-count stall. Each ORK_MM_R<reg>=<hex> overrides one reg AFTER set_i16_out. */
     { const char*e;
@@ -78,7 +78,7 @@ int ork_npu_probe_i16_out(ork_npu *c,int M,int K,int N,const int8_t *A,const int
     return ok;
 }
 
-int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
+int ork_i16_npu_replay_lut(ork_npu *c,const uint32_t *regcmd,int rn,const int16_t *lut,int nlut,
                            const int16_t *in,int M,int N,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -111,7 +111,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
       /* ping-pong OFF (0x1, NOT ork_ppflags's 0x5) for the LUT-load: ping-pong swaps register banks the
        * instant the task's config completes, racing the LUT's SRAM-commit side effect. Standalone there's
        * nothing to race, but IN A CHAIN (after a preceding matmul) the race soft-resets the NPU (#35 int16
-       * silu in-chain wedge). Matches ork_mm_run_i8_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
+       * silu in-chain wedge). Matches ork_i8_mm_run_silu's LUT-load + AGENTS.md "ping-pong OFF for LUT chains". */
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=0x1;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
       if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
     }
@@ -142,7 +142,7 @@ int ork_npu_replay_lut_i16(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
     return ok;
 }
 
-int ork_npu_probe_silu_std_i16(ork_npu *c,const int16_t *in,int M,int N,
+int ork_i16_npu_probe_silu_std(ork_npu *c,const int16_t *in,int M,int N,
                                int r_mult,int r_shift,uint32_t out_bias,uint32_t idx_off,
                                uint32_t cfg4064,uint32_t cfg4068,const int16_t *lut,int nlut,
                                int16_t *out,double *us){

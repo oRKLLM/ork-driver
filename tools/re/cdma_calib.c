@@ -8,7 +8,7 @@
  *   1. A parameterized feature-address model feat_off(spec, m, c, M, K).
  *   2. STANDARD mode (atom-16 NC1HWC2, GROUP_LINE_OFF=0) must reproduce ork's KNOWN-GOOD packing
  *      BYTE-FOR-BYTE — the same EWCUBE(m,c) ork submits to the real NPU and gets bit-exact results from
- *      (src/npu.c ork_npu_ewmul_i8), and the ork_woff weight layout. This anchors the model on silicon-truth
+ *      (src/npu.c ork_i8_npu_ewmul), and the ork_woff weight layout. This anchors the model on silicon-truth
  *      WITHOUT a single board submit.
  *   3. A self-consistency int8 matmul through the modeled offsets == CPU reference (bijection + reduction sane).
  *
@@ -135,7 +135,7 @@ static void report_fold_scaffold(void) {
            DATA_BANK, bank_cap, fold_reduced_channels(DATA_BANK, bank_cap));
     printf("    OPEN: the (m,k)->byte-offset UNDER GROUP_LINE_OFF+C2=64 is unpublished; seed = NVDLA\n"
            "          super_normal_ratio(2)*atom(32)=64.  Search perturbs {surf_stride, atom/line grouping}\n"
-           "          from the seed; each survivor confirmed by ONE ork_npu_replay_i8_sweep submit (wedge-safe).\n");
+           "          from the seed; each survivor confirmed by ONE ork_i8_npu_replay_sweep submit (wedge-safe).\n");
 }
 
 /* ======================= FOLD SEARCH (phase 1: constrain the layout family, offline) ==================== */
@@ -295,7 +295,7 @@ static int fold_search(void) {
     printf("    OFFLINE is now underdetermined by the reg dump alone (stride fixes the FRAME, not the\n"
            "    intra-surface permutation). NEXT INPUT to finish: the actual A bytes rkllm staged for a\n"
            "    known input -> read the permutation directly from ~/rkllm_ffn_capture_2026-07-27.dump\n"
-           "    (board), OR a single one-hot ork_npu_replay_i8_sweep confirm of the line-grouped candidate.\n");
+           "    (board), OR a single one-hot ork_i8_npu_replay_sweep confirm of the line-grouped candidate.\n");
     return 0;   /* research readout, not a pass/fail gate */
 }
 

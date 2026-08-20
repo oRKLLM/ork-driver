@@ -1,5 +1,5 @@
 /* exp_biased_probe — task #20 (resident int8 softmax): scalar GLOBAL-max-subtract baked into exp_i8.
- * ork_npu_exp_i8_biased computes clamp_i8(exp((x-max)*in_scale)/out_scale) with max = the scalar global max.
+ * ork_i8_npu_exp_biased computes clamp_i8(exp((x-max)*in_scale)/out_scale) with max = the scalar global max.
  * This is the numerically-stable softmax numerator WITHOUT a per-row op (per-row max would need the dead
  * per-channel-add): a global scalar max is >= every row max so every argument (x-max)<=0 (exp in (0,1], no int8
  * overflow), and the constant cancels in P=e/Sum. Proves (1) biased exp coherent vs CPU, (2) plain exp_i8
@@ -25,11 +25,11 @@ int main(int argc,char**argv){
     printf("  int8 scores in [-40,40], global max=%d\n",gmax);
 
     /* pre-calibrate the int-LUT idx in a clean context (documented first-op-after-matmul trap; harmless here) */
-    { int8_t wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(int8_t)(i-16); ork_npu_exp_i8(c,wi,1,32,in_scale,out_scale,wo,NULL); }
+    { int8_t wi[32],wo[32]; for(int i=0;i<32;i++) wi[i]=(int8_t)(i-16); ork_i8_npu_exp(c,wi,1,32,in_scale,out_scale,wo,NULL); }
 
     /* (1) biased exp vs CPU */
     int8_t *e=malloc((size_t)M*n); for(size_t i=0;i<(size_t)M*n;i++)e[i]=-128;
-    int rc=ork_npu_exp_i8_biased(c,X,M,n,in_scale,out_scale,(double)gmax,e,NULL);
+    int rc=ork_i8_npu_exp_biased(c,X,M,n,in_scale,out_scale,(double)gmax,e,NULL);
     printf("  exp_i8_biased rc=%d e[0]=%d (want %d)\n",rc,e[0],(int)lround(exp((X[0]-(double)gmax)*in_scale)/out_scale));
     if(rc){ printf("FAIL rc=%d\n",rc); ork_npu_free(c); return 1; }
     double me=0;   /* int8 PWL-LUT + banker's-round error is a few LSB (documented class) — informational, not a gate */
@@ -38,7 +38,7 @@ int main(int argc,char**argv){
     printf("  (1) biased exp vs CPU: max|err|=%.1f LSB (int8-LUT class, informational)\n",me);
 
     /* (2) plain exp_i8 (no bias) on the SAME scores — saturates (positive args overflow int8) */
-    int8_t *ep=malloc((size_t)M*n); ork_npu_exp_i8(c,X,M,n,in_scale,out_scale,ep,NULL);
+    int8_t *ep=malloc((size_t)M*n); ork_i8_npu_exp(c,X,M,n,in_scale,out_scale,ep,NULL);
     int sat=0; for(size_t i=0;i<(size_t)M*n;i++) if(ep[i]==127) sat++;
     printf("  (2) plain exp_i8 (no bias): %d/%d saturated at 127 (why the max-subtract is needed)\n",sat,M*n);
 

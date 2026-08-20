@@ -52,7 +52,7 @@ int main(int argc,char**argv){
     printf("  shared calib: maxabs_raw=%ld r_mult=%d -> global score_max=%ld (=max_bias), in_scale=%.5f\n", maxabs, r_mult, smax, in_scale);
 
     /* per-chain CPU ref (biased) + pack weights */
-    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,ones); free(ones); }
+    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,ones); free(ones); }
     double *cS[8], *cav[8];
     for(int n=0;n<NC;n++){
         int8_t *ce=malloc((size_t)Nq*Nk); cS[n]=malloc((size_t)Nq*8); cav[n]=malloc((size_t)Nq*dv*sizeof(double));
@@ -61,13 +61,13 @@ int main(int argc,char**argv){
             double e=exp(((double)s-max_bias)*in_scale)/out_scale; if(e>127)e=127; int ei=(int)lround(e); ce[(size_t)i*Nk+j]=(int8_t)ei; S+=ei; }
           cS[n][i]=S; for(int x=0;x<dv;x++){ double av=0; for(int j=0;j<Nk;j++) av+=(double)ce[(size_t)i*Nk+j]*V[n][(size_t)j*dv+x]; cav[n][(size_t)i*dv+x]=av; } }
         free(ce);
-        w_kt[n]=ork_mm_pack_i8(c,Kp,Nk,KTp[n]); w_v[n]=ork_mm_pack_i8(c,Nk,dv,V[n]);
+        w_kt[n]=ork_i8_mm_pack(c,Kp,Nk,KTp[n]); w_v[n]=ork_i8_mm_pack(c,Nk,dv,V[n]);
         if(!w_kt[n]||!w_v[n]||!w_ones){ printf("pack fail chain %d\n",n); return 2; }
         scb[n]=calloc((size_t)Nq*Nk,4); eb[n]=calloc((size_t)Nq*Nk,4); ss[n]=calloc((size_t)Nq*32,4); avb[n]=calloc((size_t)Nq*dv,4);
     }
     /* BRING UP ALL CORES (RR precondition): a multi-core matmul warms cores 0..nc-1 */
     { int32_t *wc=calloc((size_t)Nq*Nk,4); ork_mm_task_i8 wt={ w_kt[0], Nq, Qp[0], wc };
-      int wrc=ork_mm_run_chain_i8(c,1,&wt); free(wc); printf("  [warm] multi-core matmul rc=%d\n", wrc); }
+      int wrc=ork_i8_mm_run_chain(c,1,&wt); free(wc); printf("  [warm] multi-core matmul rc=%d\n", wrc); }
 
     /* build the N chains + shared op graph, then dispatch RR (concurrent across cores) */
     ork_mm_task_i8 tk[8][4]; const ork_mm_task_i8 *chains[8]; int S[8];

@@ -36,7 +36,7 @@ int main(int argc,char**argv){
     for(int i=0;i<N;i++) for(int o=0;o<d;o++){ double acc=0; for(int k=0;k<d;k++) acc+=(double)(float)attn[(size_t)i*d+k]*(float)Wo[(size_t)k*d+o];
         ry[(size_t)i*d+o]=(float)x[(size_t)i*d+o]+(float)acc; }
 
-    ork_w *wo=ork_mm_pack(c,d,d,Wo); if(!wo){ printf("pack fail\n"); return 2; }
+    ork_w *wo=ork_f16_mm_pack(c,d,d,Wo); if(!wo){ printf("pack fail\n"); return 2; }
     ork_seq_op ops[2] = {
         { .kind=ORK_OP_MM_F16_F16OUT, .w=wo, .M=N, .A=attn, .C=O },
         { .kind=ORK_OP_ADD_F16, .M=N, .N=d, .A=x, .B=O, .C=y },   /* B==op0.C (O) -> resident */

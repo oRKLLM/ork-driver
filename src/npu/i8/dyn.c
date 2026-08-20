@@ -39,7 +39,7 @@ int orki_slice_rescue_or_refuse(ork_npu *c,ork_w *w,int M,const void *A,void *C,
 int ork_dyn_grouped_end(ork_dyn_chain *h);  /* B: grouped-int4 float scale-accumulate drain */
 int ork_dyn_end(ork_dyn_chain *h);
 /* TASK #4: multi-M int4 onto the NONBLOCK doorbell spine. Decompose the M rows of one int4 weight into a chain
- * of M=1 int4 programs distributed across cores via ork_dyn_begin_mc_i4 (the validated M=1 int4 doorbell: full-
+ * of M=1 int4 programs distributed across cores via ork_i4_dyn_begin_mc (the validated M=1 int4 doorbell: full-
  * surface int16 seed+poll, int16->int32 widen, and — task #4 — the same drop-recover as int8). Bit-identical to
  * per-row. Single-slice only (the doorbell's envelope); returns -4 (caller refuses — ORK_RC_WEDGE_PRONE) for
  * wide-N/K or when the M-program chain doesn't fit the per-core regcmd/task buffers. */
@@ -114,7 +114,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
         uint32_t cdma = (uint32_t)(cb->dma + ((const char*)tasks[i].C - (const char*)cb->cpu));
         uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
         memset(rc, 0, sizeof rc);
-        orki_synth_i8(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
+        orki_i8_synth(rc, 1, K, N, adma, bdma, cdma, 1, CBUF, 0);
         if (orki_validate_regcmd("ork_dyn", c, rc, REGCMD_I8_N, w, h->ascr, h->nascr)) { for (int j=0;j<h->nascr;j++) orki_bdestroy(fd,&h->ascr[j]); free(h); return NULL; }
         if (i < P - 1) { uint64_t nx = c->regcmd.dma + (size_t)(i+1) * REGCMD_I8_N * 4;
             rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -186,7 +186,7 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
             memset(spinA.cpu, 0, (size_t)lK); orki_bsync(fd, &spinA, RKNPU_MEM_SYNC_TO_DEVICE);
             h->ascr[h->nascr++] = spinA; h->ascr[h->nascr++] = spinC;
             uint32_t rcs[REGCMD_I8_N + 4]; memset(rcs, 0, sizeof rcs);
-            orki_synth_i8(rcs, 1, lK, lN, (uint32_t)spinA.dma, lB, (uint32_t)spinC.dma, 1, CBUF, 0);
+            orki_i8_synth(rcs, 1, lK, lN, (uint32_t)spinA.dma, lB, (uint32_t)spinC.dma, 1, CBUF, 0);
             for (int p = P; p < reserve; p++) {
                 uint32_t *slot = (uint32_t*)((char*)c->regcmd.cpu + (size_t)p * REGCMD_I8_N * 4);
                 memcpy(slot, rcs, REGCMD_I8_N * 4);
@@ -235,7 +235,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
        * direct ork_dyn_begin_mc callers (e.g. the SSM stream/pool fp16 path) keep their pre-Stage-1 behavior. */
     if (nc > S) nc = S;
     int dt = tasks[0].w->dtype;
-    if (dt == DT_I4) return ork_dyn_begin_mc_i4(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
+    if (dt == DT_I4) return ork_i4_dyn_begin_mc(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
     if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
     /* fp16 doorbell: bit-exact and enabled by default (was WIP-gated). The prior "residual ~10-20% all-16
      * cold-race" that kept it gated was NOT a chaining/coherency defect — it was the TEST feeding the A
@@ -258,7 +258,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
          * (a 2D/3D program grid) is a follow-up; those stay M<=64. */
         if (tasks[i].M > 64 && (dt != DT_I8 || w->Sn != 1 || w->K > 4096 || !w->Bf)) return NULL;
         /* G1 N-tiling: int8 accepts Sn>1 (each N-slice = one strided-output sub-op, synth_i8 stride arg).
-         * fp16 stays Sn==1 — the fp16 `orki_synth()` has no output-stride arg, so a strided column-slice can't be
+         * fp16 stays Sn==1 — the fp16 `orki_f16_synth()` has no output-stride arg, so a strided column-slice can't be
          * expressed there yet (fp16 N-tiling is a follow-up). */
         if (w->Sn != 1 && dt != DT_I8) return NULL;
         if (dt == DT_I8 ? (w->K % 512) : (w->K % 32)) return NULL;   /* int8: full-K Bf schedule needs K%512. fp16: single-slice small-K (the SSM scan, K%32) allowed — uses Bb + the K-dependent sched below. */
@@ -338,7 +338,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                     for (int r = 0; r < M; r++) memcpy((char*)AF->cpu + astage + (size_t)r*Kp, (const char*)t->A + (size_t)r*K + k0, Kp);   /* gather [M,Kp] */
                     uint32_t aks = (uint32_t)(AF->dma + astage); astage += (size_t)M * Kp;
                     memset(rc, 0, sizeof rc);
-                    orki_synth_i8(rc, M, Kp, N, aks, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * M * N * 4), sched, CBUF, 0);   /* [M,N] partial ks */
+                    orki_i8_synth(rc, M, Kp, N, aks, (uint32_t)w->Bb[ks].dma, cbase + (uint32_t)((size_t)ks * M * N * 4), sched, CBUF, 0);   /* [M,N] partial ks */
                     if (orki_validate_regcmd("ork_dyn_mc_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -363,7 +363,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                 uint32_t cbase = (uint32_t)(CC->dma + coff);   /* scratch (direct forced off for M>1) */
                 for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                     memset(rc, 0, sizeof rc);
-                    orki_synth_i8(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+                    orki_i8_synth(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
                     if (orki_validate_regcmd("ork_dyn_mc_mt", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -395,8 +395,8 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
                                      : cbase + (uint32_t)((size_t)n0 * 4);                                 /* column offset into [M,N] output */
                 memset(rc, 0, sizeof rc);
                 if (dt == DT_F16) { int schedf = ((K & (K-1)) == 0 && K >= 128);                            /* fp16 0x1040 sched: on for pow2 K>=128 (the doorbell's original always-on covered K512/1024/2048), off only for small/non-pow2 K (the SSM scan). NO <2048 upper bound — K=2048 (test_bmm) MUST stay sched=1 or the job hangs. */
-                                    orki_synth   (rc, M, K, Nc, adma, bdma, cdma, schedf, CBUF); }               /* fp16: Sn==1 only (no stride arg) — guarded above */
-                else              orki_synth_i8(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
+                                    orki_f16_synth   (rc, M, K, Nc, adma, bdma, cdma, schedf, CBUF); }               /* fp16: Sn==1 only (no stride arg) — guarded above */
+                else              orki_i8_synth(rc, M, K, Nc, adma, bdma, cdma, 1, CBUF, scat ? 0 : ((Sn > 1) ? N : 0));  /* scatter=contiguous; else strided column-slice / single */
                 if (orki_validate_regcmd("ork_dyn_mc", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                 if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                     rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);

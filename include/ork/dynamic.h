@@ -27,10 +27,10 @@ typedef struct {
     int32_t *C;
 } ork_mm_task_i4;
 
-int          ork_mm_run_chain_i8(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
+int          ork_i8_mm_run_chain(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks);
 /* #54: run MANY int4 experts (each M>=1) COALESCED through one nonblock doorbell (rows chained across cores,
  * ~nc submits total). All experts must share one iommu domain. 0 ok / -4 refuse (too big) / <0 err. */
-int          ork_mm_run_i4_experts(ork_npu *ctx, const ork_mm_task_i4 *ex, int ntask, int nc);
+int          ork_i4_mm_run_experts(ork_npu *ctx, const ork_mm_task_i4 *ex, int ntask, int nc);
 
 /* ---- Dynamic steered submission (NONBLOCK chain + per-op doorbell progress + mid-flight halt) ----
  * Submit an S-task int8 OR fp16 chain NONBLOCK, then watch/steer it from the host. v1: M=1/task (mc: M<=64),
@@ -59,11 +59,11 @@ int          ork_dyn_steps(ork_dyn_chain *h);                                   
 int          ork_dyn_remaining(ork_dyn_chain *h);                                 /* steps not yet completed (budget left before the chain ends) */
 int          ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);        /* extend a running chain in-flight (wrap); 1=too late, 0=ok, <0=err */
 int          ork_dyn_spin_probe(ork_npu *ctx, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive); /* circular-spin keep-alive + redirect probe */
-/* EXPERIMENTAL int4 NONBLOCK-doorbell probe: mirrors ork_mm_run_chain_i4 (M=1 int4 PC-chain, host A) but
+/* EXPERIMENTAL int4 NONBLOCK-doorbell probe: mirrors ork_i4_mm_run_chain (M=1 int4 PC-chain, host A) but
  * flips the submit to NONBLOCK (0x2) + polls an int16 output-sentinel to completion, then de-tiles int16->
  * int32 into each task->C. Answers the load-bearing question of whether the int4 (int16-output) datapath
  * survives the doorbell's non-blocking sentinel poll. Returns 0/ok, <0 err. (Not a production path.) */
-int          ork_dyn_i4_probe(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
+int          ork_i4_dyn_probe(ork_npu *ctx, int S, const ork_mm_task_i4 *tasks);
 /* Submit QUEUE: chunk-pipeline over the dynamic API — accumulate tasks, run a chunk NONBLOCK while the
  * caller does other work (CPU‖NPU decode split), auto-split work > chunk_max into successive clean chunks. */
 typedef struct ork_dyn_queue ork_dyn_queue;

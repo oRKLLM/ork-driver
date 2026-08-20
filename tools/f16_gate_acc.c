@@ -3,8 +3,8 @@
  * The all-fp16 FFN chain gives garbage PPL (9072 vs int8 9.15). Localized to the fp16 GATE + fused-silu-LUT
  * path. This isolates WHY, off-model (no wedge risk — just matmuls):
  *   REF   : CPU fp32  silu(gate),  gate = A.Wg
- *   FUSED : ork_mm_run_f16_silu (gate packed -S*Wg, per-gmax LUT) -> C*out_scale     [what the model does]
- *   PLAIN : ork_mm_run (gate packed raw Wg) -> fp16 gate -> CPU silu                 [the proposed fix]
+ *   FUSED : ork_f16_mm_run_silu (gate packed -S*Wg, per-gmax LUT) -> C*out_scale     [what the model does]
+ *   PLAIN : ork_f16_mm_run (gate packed raw Wg) -> fp16 gate -> CPU silu                 [the proposed fix]
  * A=1 (every row identical) so gate_n = sum_k Wg[k,n]; sweep gate_n across [-gmax,gmax] over N columns.
  * Reports max/mean abs error of FUSED and PLAIN vs REF, at several gmax (incl blk.2's ~132) and M.
  *   make f16_gate_acc && sudo ./f16_gate_acc [K] [M]     (board only)
@@ -27,15 +27,15 @@ static void run_gmax(ork_npu*c,int K,int M,double gmax){
 
     /* ---- build the model's LUT for this gmax (also yields S, out_scale) ---- */
     int16_t lut[1030]; double S=0,R=0,os=0;
-    if(ork_mm_build_f16_silu_lut(c,gmax,lut,&S,&R,&os)){ printf("  gmax=%.0f: LUT build FAIL\n",gmax); return; }
+    if(ork_f16_mm_build_silu_lut(c,gmax,lut,&S,&R,&os)){ printf("  gmax=%.0f: LUT build FAIL\n",gmax); return; }
 
     /* PLAIN: raw Wg = gate_n/K ; FUSED: -S*Wg */
     for(int k=0;k<K;k++)for(int n=0;n<N;n++){ double w=gate[n]/(double)K; Bp[(size_t)k*N+n]=(f16)w; Bf[(size_t)k*N+n]=(f16)(-S*w); }
 
-    ork_w*wp=ork_mm_pack(c,K,N,Bp), *wf=ork_mm_pack(c,K,N,Bf);
+    ork_w*wp=ork_f16_mm_pack(c,K,N,Bp), *wf=ork_f16_mm_pack(c,K,N,Bf);
     if(!wp||!wf){ printf("  pack fail\n"); return; }
-    int rp=ork_mm_run(c,wp,M,A,Cp);                                                    /* plain gate matmul */
-    int rf=ork_mm_run_f16_silu(c,wf,M,A,Cf,0,0xffffc000u,0x56391100u,lut,1030);         /* fused silu */
+    int rp=ork_f16_mm_run(c,wp,M,A,Cp);                                                    /* plain gate matmul */
+    int rf=ork_f16_mm_run_silu(c,wf,M,A,Cf,0,0xffffc000u,0x56391100u,lut,1030);         /* fused silu */
     if(rp||rf){ printf("  gmax=%.0f: run rc plain=%d fused=%d\n",gmax,rp,rf); ork_mm_free(c,wp);ork_mm_free(c,wf); return; }
 
     double ef_max=0,ef_sum=0, ep_max=0,ep_sum=0, gerr=0;
@@ -55,7 +55,7 @@ static void run_gmax(ork_npu*c,int K,int M,double gmax){
 int main(int argc,char**argv){
     int K=argc>1?atoi(argv[1]):2048, M=argc>2?atoi(argv[2]):8;
     ork_npu*c=ork_npu_init(); if(!c){printf("no board\n");return 0;}
-    ork_npu_set_core_budget(c,1);   /* single-core: plain fp16 ork_mm_run EINVALs on the COLD multi-core path */
+    ork_npu_set_core_budget(c,1);   /* single-core: plain fp16 ork_f16_mm_run EINVALs on the COLD multi-core path */
     printf("f16_gate_acc K=%d M=%d  (silu(gate) error vs CPU fp32 ref)\n",K,M);
     double gmaxes[]={8,16,30,64,132}; for(int i=0;i<5;i++) run_gmax(c,K,M,gmaxes[i]);
     printf("VERDICT: PLAIN (fp16 gate + CPU silu) should be ~fp16-precision; FUSED (per-tensor LUT) error grows with gmax.\n");

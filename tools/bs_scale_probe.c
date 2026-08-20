@@ -1,5 +1,5 @@
 /* bs_scale_probe — validate on-NPU per-channel scale out[m][n]=a[m][n]*b[n], b[N] broadcast across rows
- * (ERDMA_DATA_MODE=0). int8 (ork_npu_mul_perchan_i8) + fp16 (ork_npu_mul_perchan_f16) at general geometry
+ * (ERDMA_DATA_MODE=0). int8 (ork_i8_npu_mul_perchan) + fp16 (ork_f16_npu_mul_perchan) at general geometry
  * vs CPU. BOARD: sudo ./bs_scale_probe */
 #include "ork_npu.h"
 #include <stdio.h>
@@ -19,19 +19,19 @@ int main(void){
         int8_t*a=malloc((size_t)M*N),*b=malloc(N),*out=malloc((size_t)M*N);
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) a[(size_t)m*N+n]=(int8_t)(((m+n)%7)-3);
         for(int n=0;n<N;n++) b[n]=(int8_t)(n%4);
-        int rc=ork_npu_mul_perchan_i8(c,a,b,M,N,0x4000,14,out,NULL);
+        int rc=ork_i8_npu_mul_perchan(c,a,b,M,N,0x4000,14,out,NULL);
         int bad=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){int e=clamp8((int)a[(size_t)m*N+n]*(int)b[n]); if(out[(size_t)m*N+n]!=e)bad++;}
         /* fp16 */
         ork_f16*fa=malloc((size_t)M*N*2),*fb=malloc(N*2),*fo=malloc((size_t)M*N*2);
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) fa[(size_t)m*N+n]=(ork_f16)((((m+n)%7)-3)*0.5f);
         for(int n=0;n<N;n++) fb[n]=(ork_f16)((n%4)*0.25f);
-        int rcf=ork_npu_mul_perchan_f16(c,fa,fb,M,N,fo,NULL);
+        int rcf=ork_f16_npu_mul_perchan(c,fa,fb,M,N,fo,NULL);
         double maxerr=0; int badf=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ float e=(float)fa[(size_t)m*N+n]*(float)fb[n]; float g=(float)fo[(size_t)m*N+n]; double er=fabs(g-e); if(er>maxerr)maxerr=er; if(er>0.02)badf++; }
         /* int16 (gain=1: mult=0x4000, shift=14 -> out=a*b) */
         int16_t*ia=malloc((size_t)M*N*2),*ib=malloc(N*2),*io=malloc((size_t)M*N*2);
         for(int m=0;m<M;m++)for(int n=0;n<N;n++) ia[(size_t)m*N+n]=(int16_t)(((m+n)%7)-3);
         for(int n=0;n<N;n++) ib[n]=(int16_t)(n%4);
-        int rci=ork_npu_mul_perchan_i16(c,ia,ib,M,N,0x4000,14,io,NULL);
+        int rci=ork_i16_npu_mul_perchan(c,ia,ib,M,N,0x4000,14,io,NULL);
         int badi=0; for(int m=0;m<M;m++)for(int n=0;n<N;n++){ int e=(int)ia[(size_t)m*N+n]*(int)ib[n]; if(e>32767)e=32767; if(e<-32768)e=-32768; if(io[(size_t)m*N+n]!=e)badi++; }
         printf("M=%-4d N=%-4d : i8 %d/%d | f16 %d/%d (err %.4f) | i16 rc=%d %d/%d  %s\n",
                M,N,M*N-bad,M*N, M*N-badf,M*N,maxerr, rci,M*N-badi,M*N, (!rc&&!bad&&!rcf&&!badf&&!rci&&!badi)?"OK":"FAIL");

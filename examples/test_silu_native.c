@@ -30,7 +30,7 @@ static int check(ork_npu *ctx, double in_s, double out_s, int r_mult, int r_shif
     for (int k=0;k<K;k++) A[k]=1;
     int accmax=(int)(7.0/in_s), step=(2*accmax)/(N-1); if(step<1)step=1;
     for (int n=0;n<N;n++){ int T=-accmax+n*step; int b=T/K; for(int k=0;k<K;k++) B[k*N+n]=(signed char)(b+(k<(T-b*K)?1:0)); }
-    if (ork_npu_probe_i8_silu_cfg(ctx,M,K,N,A,B,r_mult,r_shift,0u,0xffffc000u,cfg4068,lut,1030,C,0)){
+    if (ork_i8_npu_probe_silu_cfg(ctx,M,K,N,A,B,r_mult,r_shift,0u,0xffffc000u,cfg4068,lut,1030,C,0)){
         printf("  fused run FAILED\n"); return 1;
     }
     int mx=0; long s=0;

@@ -36,7 +36,7 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
 };
 
 
-/* MODE-TRANSITION RE hooks (mode_probe.c). The standalone SDP ops (ork_npu_ewmul_*, orki_act_lut_i16 →
+/* MODE-TRANSITION RE hooks (mode_probe.c). The standalone SDP ops (ork_npu_ewmul_*, orki_i16_act_lut →
  * exp/silu/…) reprogram the pipeline (their own ACT_RESET + SDP regcmd) but leave c->last_dt / c->warmed
  * untouched, so a following SAME-dtype matmul sees dt==last_dt and SKIPS its reset/re-warm — running a
  * matmul regcmd on an SDP-configured pipeline. These expose the two candidate fixes so the probe can

@@ -2,7 +2,7 @@
  * chain_import_probe proved the SINGLE-core chain (run_chain_i8) at the down-proj shape works with the
  * size-bounded chunked import. But the 7B prefill uses the MULTI-core wide-K path (mcworker_pref_ksplit,
  * K>4096 → Bb K-slice PC-chain per core), and dmesg shows THAT times out (60s, mask 0x2/0x4, domain 1).
- * This probe drives ork_mm_run_i8 at M>1 (=> multi-core) on a CHUNKED IMPORT in a non-0 domain after a
+ * This probe drives ork_i8_mm_run at M>1 (=> multi-core) on a CHUNKED IMPORT in a non-0 domain after a
  * domain switch — the exact 7B case — to answer: is the fault mapping-count (=> smaller chunk fixes it)
  * or multi-core-specific (=> need a single-core fallback / real mc fix)?
  *   ./mip [M=128] [K=18944] [N=3584] [chunkMB via ORK_IMPORT_CHUNK_MB]
@@ -18,7 +18,7 @@ static int check(ork_npu *c, const char *tag, ork_w *w, int M, int K, int N,
                  const int8_t *A, int32_t *C) {
     if (!w) { printf("%-30s WEIGHT NULL\n", tag); return 1; }
     memset(C, 0, (size_t)M*N*4);
-    int r = ork_mm_run_i8(c, w, M, A, C);
+    int r = ork_i8_mm_run(c, w, M, A, C);
     int ok = (r==0 && C[0]==K && C[(size_t)(M-1)*N+(N-1)]==K);
     printf("%-30s rc=%d C[0]=%d C[last]=%d (expect %d) -> %s\n",
            tag, r, C[0], C[(size_t)(M-1)*N+(N-1)], K, ok ? "OK" : "*** FAULT ***");
@@ -41,7 +41,7 @@ int main(int argc, char **argv) {
 
     /* native pack in dom0, dump to a pre-tiled blob (what a .orkpack holds) */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w0 = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w0 = ork_i8_mm_pack(c, K, N, B);
     int fails = 0;
     fails += check(c, "NATIVE dom0 multi-core", w0, M, K, N, A, C);
     size_t need = ork_w_dump(w0, NULL, 0);
@@ -54,7 +54,7 @@ int main(int argc, char **argv) {
         printf("(ORK_PROBE_IMPORT_FIRST: no prime — first dom1 op is the IMPORT)\n");
     } else {
         ork_npu_set_pack_domain(c, 1);
-        ork_w *wn1 = ork_mm_pack_i8(c, K, N, B);   /* native bcreate in dom1 == establishes the domain */
+        ork_w *wn1 = ork_i8_mm_pack(c, K, N, B);   /* native bcreate in dom1 == establishes the domain */
         if(getenv("ORK_PROBE_PRIME_ALLOC")){
             printf("(prime: native ALLOC only in dom1 — NO submit)\n");   /* does creating a native buf suffice? */
         } else {
@@ -64,7 +64,7 @@ int main(int argc, char **argv) {
 
     /* import (chunked) into domain 1, run multi-core IN-domain */
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wi1 = ork_mm_load_i8_import(c, K, N, blob, need);
+    ork_w *wi1 = ork_i8_mm_load_import(c, K, N, blob, need);
     fails += check(c, "IMPORT dom1 in-domain MC", wi1, M, K, N, A, C);
 
     /* switch away to dom0, then back to the import — the 7B case (job iommu domain id:1 after switch) */

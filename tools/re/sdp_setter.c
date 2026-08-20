@@ -52,7 +52,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){ printf("init (board only)\n"); return 77; }
     ork_npu_set_core_budget(c,1);
     /* pre-warm the shared weight pack path (matches fold_bigm; avoids first-touch alloc in the timed run) */
-    { ork_w*ww=ork_mm_pack_i8(c,K,N,W); if(ww){int32_t*t=calloc((size_t)8*N,4);int8_t*a8=calloc((size_t)8*K,1);ork_mm_run_i8(c,ww,8,a8,t);free(t);free(a8);ork_mm_free(c,ww);} }
+    { ork_w*ww=ork_i8_mm_pack(c,K,N,W); if(ww){int32_t*t=calloc((size_t)8*N,4);int8_t*a8=calloc((size_t)8*K,1);ork_i8_mm_run(c,ww,8,a8,t);free(t);free(a8);ork_mm_free(c,ww);} }
 
     /* (1) CONTROL — captured tile as-is */
     double us0=0; long mx0=0; long mm0=run1(c,cap,wl,K,N,A,W,&us0,&mx0);

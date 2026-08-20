@@ -24,7 +24,7 @@ int main(int argc,char**argv){
         B[d]=malloc((size_t)K*N);
         for(size_t i=0;i<(size_t)K*N;i++) B[d][i]=(int8_t)(rnd() + d);  /* distinct weights per domain */
         ork_npu_set_pack_domain(c, d);          /* place this weight's tiles in domain d */
-        w[d]=ork_mm_pack_i8(c,K,N,B[d]);
+        w[d]=ork_i8_mm_pack(c,K,N,B[d]);
         if(!w[d]){ fprintf(stderr,"pack_i8 dom %d failed\n", d); return 2; }
         dom_of[d]=ork_w_domain(w[d]);
         printf("packed weight %d in domain %d (ork_w_domain reports %d)\n", d, d, dom_of[d]);
@@ -39,7 +39,7 @@ int main(int argc,char**argv){
         int M=Ms[t];
         int d=t%ndom;                           /* round-robin domains -> forces dom_activate swaps */
         for(size_t i=0;i<(size_t)M*K;i++) A[i]=(int8_t)rnd();
-        if(ork_mm_run_i8(c,w[d],M,A,C)){ fprintf(stderr,"run_i8 dom %d failed\n", d); return 1; }
+        if(ork_i8_mm_run(c,w[d],M,A,C)){ fprintf(stderr,"run_i8 dom %d failed\n", d); return 1; }
         for(int m=0;m<M;m++)for(int n=0;n<N;n++){
             int32_t ref=0; for(int k=0;k<K;k++) ref += (int)A[(size_t)m*K+k]*(int)B[d][(size_t)k*N+n];
             total++; if(C[(size_t)m*N+n]!=ref) bad++;

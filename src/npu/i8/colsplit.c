@@ -243,8 +243,8 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
         size_t aesz = (dt == DT_F16) ? 2 : 1;   /* A element bytes: fp16 2, int8 1 */
         if ((size_t)M * K * aesz > AF->size) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
         if (dt == DT_F16) {   /* fp16 colsplit (Stage 1): K-sliced Bb + host f32 accumulate; Sn==1 (gated). Mirrors the
-            * int8 WIDE-K branch with orki_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
-            * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_synth()+Bb+dtype differ). */
+            * int8 WIDE-K branch with orki_f16_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
+            * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_f16_synth()+Bb+dtype differ). */
             int CBUFf = (CBUF > 32768) ? 32768 : CBUF;   /* fp16 M-scheduler is validated only to the 32768-tile; a larger cbuf miscomputes mc>~cap (mcworker applies the same cap) */
             int KS = c->soc->ks, RBf = CBUFf;   /* fp16: RB = cbuf (int8 doubles it) */
             struct rknpu_task *tkf = (struct rknpu_task*)c->mtk[i].cpu;
@@ -309,7 +309,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
                     if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, REGCMD_N * 4);
-                    orki_synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + (goff + (size_t)m0*Kp)*2), wbase,
+                    orki_f16_synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + (goff + (size_t)m0*Kp)*2), wbase,
                           (uint32_t)(CC->dma + ((size_t)ks*M + m0)*Ncore*4), sched, CBUFf);
                     if (orki_validate_regcmd("ork_dyn_colsplit_f16", c, rc, REGCMD_N, w, NULL, 0)) { free(h); return NULL; }
                     memcpy((char*)RC->cpu + (size_t)np2*REGCMD_N*4, rc, REGCMD_N*4);
@@ -379,7 +379,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M - m0 < kcap) ? (M - m0) : kcap;
                     if ((size_t)(np2+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
                     memset(rc, 0, sizeof rc);
-                    orki_synth_i8(rc, mc, Kp, Ncore, (uint32_t)(a_base + goff + (size_t)m0*Kp), wbase,
+                    orki_i8_synth(rc, mc, Kp, Ncore, (uint32_t)(a_base + goff + (size_t)m0*Kp), wbase,
                              (uint32_t)(CC->dma + ((size_t)ks * M + m0) * Ncore * 4), sched, CBUF, 0);   /* [mc,Ncore] rows [m0,+mc) of partial ks */
                     if (orki_validate_regcmd("ork_dyn_colsplit_ks", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     memcpy((char*)RC->cpu + (size_t)np2 * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
@@ -415,7 +415,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
               for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                   if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
                   memset(rc, 0, sizeof rc);
-                  orki_synth_i8(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
+                  orki_i8_synth(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
                            (uint32_t)(CC->dma + (segbase + (size_t)m0 * segw) * 4), 1, CBUF, 0);   /* [mc,segw] contiguous block */
                   if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);

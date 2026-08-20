@@ -1,5 +1,5 @@
 /* examples/test_ewmul_i8.c — validate the on-NPU element-wise MULTIPLY (the SwiGLU inner silu(gate)⊙up)
- * against a CPU reference. ork_npu_ewmul_i8 computes out[m][n] = clamp_i8(round(up*silu * mult/2^shift)) on
+ * against a CPU reference. ork_i8_npu_ewmul computes out[m][n] = clamp_i8(round(up*silu * mult/2^shift)) on
  * the NPU via the standalone SDP element-wise op (NVDLA feature-cube marshaled internally). Each case
  * self-checks vs the CPU model and the program exits nonzero on any mismatch. Runs several (M,N) shapes to
  * exercise the generalized geometry (N must be a multiple of 16 for int8 atom-16).
@@ -24,7 +24,7 @@ static int run_case(ork_npu *c, const char *name, int M, int N, const signed cha
                     int mult, int shift, int tol){
     static int8_t out[MAXE];
     double us = 0;
-    int r = ork_npu_ewmul_i8(c, (const int8_t*)up, (const int8_t*)si, M, N, mult, shift, out, &us);
+    int r = ork_i8_npu_ewmul(c, (const int8_t*)up, (const int8_t*)si, M, N, mult, shift, out, &us);
     if (r) { printf("  %-18s [%dx%-4d] FAIL (rc=%d)\n", name, M, N, r); return 1; }
     int mism = 0, mx = 0;
     for (int i = 0; i < M*N; i++) {

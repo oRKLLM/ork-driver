@@ -1,5 +1,5 @@
 /* ===== DEPRECATED / QUARANTINED 2026-07-21 =====
- * Duplicate of the pre-session probes test_mm_i8_out8 / silu_bench (all drive ork_npu_probe_i8_out8). Not an
+ * Duplicate of the pre-session probes test_mm_i8_out8 / silu_bench (all drive ork_i8_npu_probe_out8). Not an
  * independent-validation source for the SDK supported-op derivation (origin/main examples only). Delete once
  * no longer referenced. Builds as a no-op stub unless ORK_DEPRECATED_PROBES is defined. */
 #ifndef ORK_DEPRECATED_PROBES
@@ -23,7 +23,7 @@ int main(void){
     for(int n=0;n<N;n++){ B[0*N+n]=(int8_t)n; B[1*N+n]=32; }   /* acc(m,n)=n+32m */
     int8_t C[M*N]; for(int i=0;i<M*N;i++) C[i]=-1;
     double us=0;
-    int rc=ork_npu_probe_i8_out8(c,M,K,N,A,B,0x4000,14,C,&us);   /* identity requant: out=acc */
+    int rc=ork_i8_npu_probe_out8(c,M,K,N,A,B,0x4000,14,C,&us);   /* identity requant: out=acc */
     printf("probe_i8_out8 rc=%d %.0fus  M=%d N=%d\n", rc, us, M, N);
     if(rc==0){
         int lin=0, cube=0;

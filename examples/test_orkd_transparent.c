@@ -1,6 +1,6 @@
 /* Path B: the NORMAL ork_npu API must give identical results whether it runs the NPU directly or transparently
  * routes through orkd (ORK_USE_ORKD=1). The example code is unchanged between the two modes — that's the whole
- * point of Path B. Covers int8 (ork_mm_pack_i8/run_i8) AND fp16 (ork_mm_pack/run). Board tool, not in `make test`
+ * point of Path B. Covers int8 (ork_i8_mm_pack/run_i8) AND fp16 (ork_f16_mm_pack/run). Board tool, not in `make test`
  * (orkd would contend with the direct-NPU examples).
  *   make orkd test_orkd_transparent
  *   sudo ./test_orkd_transparent                                        # direct
@@ -22,10 +22,10 @@ static int one_i8(ork_npu *c, int M, int K, int N){
     int32_t *C = malloc((size_t)M*N*4), *ref = malloc((size_t)M*N*4);
     g = 7; for (int i=0;i<M*K;i++) A[i]=r8(); for (int i=0;i<K*N;i++) B[i]=r8();
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; ref[m*N+n]=(int)a; }
-    ork_w *w = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w = ork_i8_mm_pack(c, K, N, B);
     int bad = 0;
     if (!w){ printf("  i8 pack FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
-    else { int rc = ork_mm_run_i8(c, w, M, A, C); ork_mm_free(c, w);
+    else { int rc = ork_i8_mm_run(c, w, M, A, C); ork_mm_free(c, w);
         if (rc){ printf("  i8 run FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rc); bad = 1; }
         else for (int i=0;i<M*N;i++) if (C[i]!=ref[i]){ if (bad<3) printf("  i8 MISMATCH M=%d K=%d N=%d [%d] %d!=%d\n", M,K,N,i,C[i],ref[i]); bad++; } }
     if (!bad) printf("  ok i8  M=%d K=%d N=%d\n", M, K, N);
@@ -37,10 +37,10 @@ static int one_f16(ork_npu *c, int M, int K, int N){
     float *C = malloc((size_t)M*N*4), *ref = malloc((size_t)M*N*4);
     g = 7; for (int i=0;i<M*K;i++) A[i]=rf(); for (int i=0;i<K*N;i++) B[i]=rf();
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ float a=0; for (int k=0;k<K;k++) a+=(float)A[m*K+k]*(float)B[k*N+n]; ref[m*N+n]=a; }
-    ork_w *w = ork_mm_pack(c, K, N, B);
+    ork_w *w = ork_f16_mm_pack(c, K, N, B);
     int bad = 0;
     if (!w){ printf("  f16 pack FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
-    else { int rc = ork_mm_run(c, w, M, A, C); ork_mm_free(c, w);
+    else { int rc = ork_f16_mm_run(c, w, M, A, C); ork_mm_free(c, w);
         if (rc){ printf("  f16 run FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rc); bad = 1; }
         else for (int i=0;i<M*N;i++){ float d = fabsf(C[i]-ref[i]), tol = fabsf(ref[i])*0.03f + 0.5f;
             if (d > tol){ if (bad<3) printf("  f16 MISMATCH M=%d K=%d N=%d [%d] %.3f!=%.3f\n", M,K,N,i,C[i],ref[i]); bad++; } } }
@@ -53,10 +53,10 @@ static int one_i4(ork_npu *c, int M, int K, int N){
     int32_t *C = malloc((size_t)M*N*4), *ref = malloc((size_t)M*N*4);
     g = 7; for (int i=0;i<M*K;i++) A[i]=r4(); for (int i=0;i<K*N;i++) B[i]=r4();
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)A[m*K+k]*B[k*N+n]; ref[m*N+n]=(int)a; }
-    ork_w *w = ork_mm_pack_i4(c, K, N, B);
+    ork_w *w = ork_i4_mm_pack(c, K, N, B);
     int bad = 0;
     if (!w){ printf("  i4 pack FAIL M=%d K=%d N=%d\n", M, K, N); bad = 1; }
-    else { int rc = ork_mm_run_i4(c, w, M, A, C); ork_mm_free(c, w);
+    else { int rc = ork_i4_mm_run(c, w, M, A, C); ork_mm_free(c, w);
         if (rc){ printf("  i4 run FAIL M=%d K=%d N=%d rc=%d\n", M, K, N, rc); bad = 1; }
         else for (int i=0;i<M*N;i++) if (C[i]!=ref[i]){ if (bad<3) printf("  i4 MISMATCH M=%d K=%d N=%d [%d] %d!=%d\n", M,K,N,i,C[i],ref[i]); bad++; } }
     if (!bad) printf("  ok i4  M=%d K=%d N=%d\n", M, K, N);
@@ -78,7 +78,7 @@ static int sdp_silu(ork_npu *c, int gelu){
     int M=8,N=64; int8_t *in=malloc(M*N),*out=malloc(M*N),*ref=malloc(M*N); double is=0.06,os=0.06;
     g=7; for (int i=0;i<M*N;i++) in[i]=r8();
     for (int i=0;i<M*N;i++){ double x=in[i]*is, y = gelu ? 0.5*x*(1.0+erf(x/1.4142135623730951)) : x/(1.0+exp(-x)); ref[i]=clip8(lround(y/os)); }
-    int rc = gelu ? ork_npu_gelu_i8(c,in,M,N,is,os,out,NULL) : ork_npu_silu_i8(c,in,M,N,is,os,out,NULL);
+    int rc = gelu ? ork_i8_npu_gelu(c,in,M,N,is,os,out,NULL) : ork_i8_npu_silu(c,in,M,N,is,os,out,NULL);
     int bad = rc ? (printf("  %s run FAIL rc=%d\n", gelu?"gelu":"silu", rc),1) : chk8(gelu?"gelu_i8":"silu_i8",M,N,out,ref,2);
     free(in); free(out); free(ref); return bad;
 }
@@ -86,7 +86,7 @@ static int sdp_ewmul_i8(ork_npu *c){
     int M=8,N=64,mult=16384,shift=14; int8_t *a=malloc(M*N),*b=malloc(M*N),*out=malloc(M*N),*ref=malloc(M*N);
     g=7; for (int i=0;i<M*N;i++){ a[i]=(int8_t)(((g=g*1103515245u+12345u)>>20)&0x7)-3; b[i]=(int8_t)(((g=g*1103515245u+12345u)>>20)&0x7)-3; }
     for (int i=0;i<M*N;i++) ref[i]=clip8(lround((long)a[i]*b[i]*mult/(double)(1<<shift)));
-    int rc = ork_npu_ewmul_i8(c,a,b,M,N,mult,shift,out,NULL);
+    int rc = ork_i8_npu_ewmul(c,a,b,M,N,mult,shift,out,NULL);
     int bad = rc ? (printf("  ewmul_i8 run FAIL rc=%d\n", rc),1) : chk8("ewmul_i8",M,N,out,ref,1);
     free(a); free(b); free(out); free(ref); return bad;
 }
@@ -94,7 +94,7 @@ static int sdp_add_i8(ork_npu *c){
     int M=8,N=64; int8_t *a=malloc(M*N),*b=malloc(M*N),*out=malloc(M*N),*ref=malloc(M*N);
     g=7; for (int i=0;i<M*N;i++) a[i]=r8(); for (int i=0;i<M*N;i++) b[i]=r8();
     for (int i=0;i<M*N;i++) ref[i]=clip8((long)a[i]+b[i]);
-    int rc = ork_npu_add_i8(c,a,b,M,N,1.0,1.0,1.0,out,NULL);
+    int rc = ork_i8_npu_add(c,a,b,M,N,1.0,1.0,1.0,out,NULL);
     int bad = rc ? (printf("  add_i8 run FAIL rc=%d\n", rc),1) : chk8("add_i8",M,N,out,ref,1);
     free(a); free(b); free(out); free(ref); return bad;
 }
@@ -102,7 +102,7 @@ static int sdp_ewmul_f16(ork_npu *c){
     int M=8,N=64; ork_f16 *a=malloc(M*N*2),*b=malloc(M*N*2),*out=malloc(M*N*2); float *ref=malloc(M*N*4);
     g=7; for (int i=0;i<M*N;i++) a[i]=rf(); for (int i=0;i<M*N;i++) b[i]=rf();
     for (int i=0;i<M*N;i++) ref[i]=(float)a[i]*(float)b[i];
-    int rc = ork_npu_ewmul_f16(c,a,b,M,N,out,NULL);
+    int rc = ork_f16_npu_ewmul(c,a,b,M,N,out,NULL);
     int bad = rc ? (printf("  ewmul_f16 run FAIL rc=%d\n", rc),1) : chkf("ewmul_f16",M,N,out,ref);
     free(a); free(b); free(out); free(ref); return bad;
 }
@@ -110,7 +110,7 @@ static int sdp_add_f16(ork_npu *c){
     int M=8,N=64; ork_f16 *a=malloc(M*N*2),*b=malloc(M*N*2),*out=malloc(M*N*2); float *ref=malloc(M*N*4);
     g=7; for (int i=0;i<M*N;i++) a[i]=rf(); for (int i=0;i<M*N;i++) b[i]=rf();
     for (int i=0;i<M*N;i++) ref[i]=(float)a[i]+(float)b[i];
-    int rc = ork_npu_add_f16(c,a,b,M,N,out,NULL);
+    int rc = ork_f16_npu_add(c,a,b,M,N,out,NULL);
     int bad = rc ? (printf("  add_f16 run FAIL rc=%d\n", rc),1) : chkf("add_f16",M,N,out,ref);
     free(a); free(b); free(out); free(ref); return bad;
 }
@@ -124,9 +124,9 @@ static int one_chain(ork_npu *c){
         A[i]=malloc((size_t)Ms[i]*K); B[i]=malloc((size_t)K*N); C[i]=malloc((size_t)Ms[i]*N*4); ref[i]=malloc((size_t)Ms[i]*N*4);
         for (int j=0;j<Ms[i]*K;j++) A[i][j]=r8(); for (int j=0;j<K*N;j++) B[i][j]=r8();
         for (int m=0;m<Ms[i];m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)A[i][m*K+k]*B[i][k*N+n]; ref[i][m*N+n]=(int)a; }
-        w[i]=ork_mm_pack_i8(c,K,N,B[i]); t[i].w=w[i]; t[i].M=Ms[i]; t[i].A=A[i]; t[i].C=C[i];
+        w[i]=ork_i8_mm_pack(c,K,N,B[i]); t[i].w=w[i]; t[i].M=Ms[i]; t[i].A=A[i]; t[i].C=C[i];
     }
-    int rc = ork_mm_run_chain_i8(c, S, t), bad = 0;
+    int rc = ork_i8_mm_run_chain(c, S, t), bad = 0;
     if (rc){ printf("  chain run FAIL rc=%d\n", rc); bad = 1; }
     else for (int i=0;i<S;i++) for (int j=0;j<Ms[i]*N;j++) if (C[i][j]!=ref[i][j]){ if (bad<3) printf("  chain MISMATCH task %d [%d] %d!=%d\n", i,j,C[i][j],ref[i][j]); bad++; }
     if (!bad) printf("  ok chain     S=%d (varying M)\n", S);
@@ -147,7 +147,7 @@ static int one_seq(ork_npu *c){
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Aa[m*K+k]*Ba[k*N+n]; Ra[m*N+n]=(int)a; }
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Ac[m*K+k]*Bc[k*N+n]; Rc[m*N+n]=(int)a; }
     for (int i=0;i<M*N;i++) er[i]=(float)ea[i]*(float)eb[i];
-    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba), *wc=ork_mm_pack_i8(c,K,N,Bc);
+    ork_w *wa=ork_i8_mm_pack(c,K,N,Ba), *wc=ork_i8_mm_pack(c,K,N,Bc);
     ork_seq_op ops[3]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;        ops[0].A=Aa; ops[0].C=Ca;
     ops[1].kind=ORK_OP_EWMUL_F16;             ops[1].M=M; ops[1].N=N; ops[1].A=ea; ops[1].B=eb; ops[1].C=ec;
@@ -165,7 +165,7 @@ static int one_seq(ork_npu *c){
     return bad ? 1 : 0;
 }
 /* GROUPED int8 chain through the stack (ork_submit_seq with ork_seq_op.group): [mm -> ewmul_i8 -> mm] as ONE
- * dependency group -> rides ork_dyn_begin_seq_i8_mc (SDP stays IN the doorbell chain, no SW break). Same code in
+ * dependency group -> rides ork_i8_dyn_begin_seq_mc (SDP stays IN the doorbell chain, no SW break). Same code in
  * direct + routed (ORK_USE_ORKD) mode, so it validates the 'group' field survives the orkd wire (Path B). */
 static int one_seq_grouped(ork_npu *c){
     int K=512, N=64, M=8, mult=0x4000, shift=14;
@@ -178,7 +178,7 @@ static int one_seq_grouped(ork_npu *c){
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Aa[m*K+k]*Ba[k*N+n]; Ra[m*N+n]=(int)a; }
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Ac[m*K+k]*Ba[k*N+n]; Rc[m*N+n]=(int)a; }
     for (int i=0;i<M*N;i++){ long v=lround((long)ua[i]*va[i]*mult/(double)(1<<shift)); er[i]=(int8_t)(v>127?127:v<-128?-128:v); }
-    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_w *wa=ork_i8_mm_pack(c,K,N,Ba);
     ork_seq_op ops[3]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;              ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
     ops[1].kind=ORK_OP_EWMUL_I8;              ops[1].M=M; ops[1].N=N;  ops[1].A=ua; ops[1].B=va; ops[1].C=eo; ops[1].mult=mult; ops[1].shift=shift; ops[1].group=1;
@@ -208,7 +208,7 @@ static int one_seq_grouped_sdp_term(ork_npu *c){
     for (int i=0;i<M*N;i++) va[i]=(int8_t)((g=g*1103515245u+12345u)>>20&7)-3;
     for (int m=0;m<M;m++) for (int n=0;n<N;n++){ long a=0; for (int k=0;k<K;k++) a+=(long)Aa[m*K+k]*Ba[k*N+n]; Ra[m*N+n]=(int)a; }
     for (int i=0;i<M*N;i++){ long v=lround((long)ua[i]*va[i]*mult/(double)(1<<shift)); er[i]=(int8_t)(v>127?127:v<-128?-128:v); }
-    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_w *wa=ork_i8_mm_pack(c,K,N,Ba);
     ork_seq_op ops[2]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
     ops[1].kind=ORK_OP_EWMUL_I8;              ops[1].M=M; ops[1].N=N; ops[1].A=ua; ops[1].B=va; ops[1].C=eo; ops[1].mult=mult; ops[1].shift=shift; ops[1].group=1;
@@ -237,7 +237,7 @@ static int one_seq_grouped_silu16(ork_npu *c){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Ac[m*K+k]*Ba[k*N+n];Rc[m*N+n]=(int)a;}
     for(int i=0;i<M*N;i++) si[i]=(int16_t)(-20000 + (int)((40000LL*((i*97)%(M*N)))/(M*N)));
     for(int i=0;i<M*N;i++){ double x=si[i]*is,y=x/(1.0+exp(-x)); long q=lround(y/os); if(q>32767)q=32767; if(q<-32768)q=-32768; sr[i]=(int16_t)q; }
-    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_w *wa=ork_i8_mm_pack(c,K,N,Ba);
     ork_seq_op ops[3]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;     ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
     ops[1].kind=ORK_OP_SILU_I16;               ops[1].M=M; ops[1].N=N; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os; ops[1].group=1;
@@ -267,7 +267,7 @@ static int one_seq_grouped_silu8(ork_npu *c){
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){long a=0;for(int k=0;k<K;k++)a+=(long)Ac[m*K+k]*Ba[k*N+n];Rc[m*N+n]=(int)a;}
     for(int i=0;i<M*N;i++) si[i]=(int8_t)(((i*7)%256)-128);
     for(int i=0;i<M*N;i++){ double x=si[i]*is,y=x/(1.0+exp(-x)); long q=lround(y/os); if(q>127)q=127; if(q<-128)q=-128; sr[i]=(int8_t)q; }
-    ork_w *wa=ork_mm_pack_i8(c,K,N,Ba);
+    ork_w *wa=ork_i8_mm_pack(c,K,N,Ba);
     ork_seq_op ops[3]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;    ops[0].w=wa; ops[0].M=M;             ops[0].A=Aa; ops[0].C=Ca; ops[0].group=1;
     ops[1].kind=ORK_OP_SILU_I8;               ops[1].M=M; ops[1].N=N; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os; ops[1].group=1;
@@ -310,7 +310,7 @@ static int one_seq_full(ork_npu *c){
     for(int i=0;i<Ms*Ns;i++)fa[i]=rf(); for(int i=0;i<Ms*Ns;i++)fb[i]=rf(); for(int i=0;i<Ms*Ns;i++)fr[i]=(float)fa[i]+(float)fb[i];
     for(int i=0;i<K4*N4;i++)B4[i]=r4(); for(int i=0;i<K4;i++)A4[i]=r4();
     for(int n=0;n<N4;n++){long a=0;for(int k=0;k<K4;k++)a+=(long)A4[k]*B4[k*N4+n];R4[n]=(int)a;}
-    ork_w *wa=ork_mm_pack_i8(c,Ki,Ni,Ba),*wc=ork_mm_pack_i8(c,Ki,Ni,Bc),*w4=ork_mm_pack_i4(c,K4,N4,B4);
+    ork_w *wa=ork_i8_mm_pack(c,Ki,Ni,Ba),*wc=ork_i8_mm_pack(c,Ki,Ni,Bc),*w4=ork_i4_mm_pack(c,K4,N4,B4);
     ork_seq_op ops[7]; memset(ops,0,sizeof ops);
     ops[0].kind=ORK_OP_MM_I8;   ops[0].w=wa; ops[0].M=Mi; ops[0].A=Aa; ops[0].C=Ca;
     ops[1].kind=ORK_OP_SILU_I8;  ops[1].M=Ms; ops[1].N=Ns; ops[1].A=si; ops[1].C=so; ops[1].in_scale=is; ops[1].out_scale=os;

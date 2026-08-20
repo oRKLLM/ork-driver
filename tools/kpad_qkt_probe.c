@@ -28,7 +28,7 @@ int main(int argc,char**argv){
     for(int k=0;k<d;k++)for(int j=0;j<N;j++) KTp[(size_t)k*N+j]=Kk[(size_t)j*d+k];        /* K^T_pad: k<d filled, k>=d zero */
     int mult=0x4000, shift=18;   /* 1/16 scale, keep scores in int8 range */
     int8_t *C=malloc((size_t)N*N); for(size_t i=0;i<(size_t)N*N;i++)C[i]=-128;
-    ork_w *w=ork_mm_pack_i8(c,Kp,N,KTp); if(!w){printf("pack fail\n");return 2;}
+    ork_w *w=ork_i8_mm_pack(c,Kp,N,KTp); if(!w){printf("pack fail\n");return 2;}
     ork_seq_op op={ .kind=ORK_OP_MATMUL_REQUANT_I8, .w=w, .M=N, .A=Qp, .C=C, .mult=mult, .shift=shift };
     int rc=ork_submit_seq(c,&op,1);
     printf("  K-padded requant rc=%d C[0]=%d\n",rc,C[0]);

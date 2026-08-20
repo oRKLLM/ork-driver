@@ -41,7 +41,7 @@ static const uint32_t REGCMD_EW_LANE[REGCMD_EW_LANE_N]={
  * 5 0x30xx + 51 output-stage 0x40xx/0x41xx + 18 second-input 0x50xx) + the standard 4-write trailer,
  * structurally identical to REGCMD_I8 but with the second DPU lane and EW-mul output mode (0x4070=
  * 0x904002c4) present. Submitted VERBATIM with regcfg_amount=126, enable_mask=0x1d; only the buffer
- * addresses are patched to ork's buffers (see ork_npu_probe_i8_ewmul_tmpl):
+ * addresses are patched to ork's buffers (see ork_i8_npu_probe_ewmul_tmpl):
  *   0x1070 input(x)  0x1110 weights(+0x2300 in the weight buf)  0x4020 output
  *   0x5018 2nd-input silu(gate) (+0x400)  0x5038 (+0x800)  0x5020 param in the weight buf (+0x2480)
  * Captured from a Conv2d(8,8,1x1) SwiGLU (M=64 spatial, K=8, N=8 padded to 32) — RKNN's NHWC channel-

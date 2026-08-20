@@ -231,7 +231,7 @@ int orkd_run_i8(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
 }
 
 /* fp16 pack/run (Path B increment 2). Same PACK/RUN wire as int8 — dtype=ORKD_DT_F16 in the pack tells orkd to
- * ork_mm_pack (fp16 weight) and run ork_mm_run (fp16 A -> fp32 C). B is K*N fp16; A is M*K fp16; C is M*N fp32.
+ * ork_f16_mm_pack (fp16 weight) and run ork_f16_mm_run (fp16 A -> fp32 C). B is K*N fp16; A is M*K fp16; C is M*N fp32.
  * void* operands keep this shim free of the ork_npu.h fp16 typedef (the library casts ork_f16* -> void*). */
 uint64_t orkd_pack_f16(orkd_conn *c, int K, int N, const void *B){
     if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
@@ -270,7 +270,7 @@ int orkd_run_f16(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const vo
 }
 
 /* int4 pack/run (Path B increment 3). int4 values live byte-per-value in int8 ([-8,7]) so the wire is IDENTICAL
- * to int8 (A=M*K bytes, C=M*N*4); only dtype=ORKD_DT_I4 differs, telling orkd to ork_mm_pack_i4 / ork_mm_run_i4. */
+ * to int8 (A=M*K bytes, C=M*N*4); only dtype=ORKD_DT_I4 differs, telling orkd to ork_i4_mm_pack / ork_i4_mm_run. */
 uint64_t orkd_pack_i4(orkd_conn *c, int K, int N, const int8_t *B){
     if (!c || c->fd < 0 || K <= 0 || N <= 0 || !B) return 0;
     uint32_t bytes = (uint32_t)((size_t)K * N);
@@ -308,7 +308,7 @@ int orkd_run_i4(orkd_conn *c, uint64_t weight_id, int M, int K, int N, const int
 }
 
 /* SDP ops (Path B increment 4). One generic wire call (ORKD_SDP) + typed wrappers so the library routes
- * ork_npu_silu_i8 / gelu_i8 / ewmul_i8 / ewmul_f16 / add_i8 / add_f16 without exposing the op enum. */
+ * ork_i8_npu_silu / gelu_i8 / ewmul_i8 / ewmul_f16 / add_i8 / add_f16 without exposing the op enum. */
 static int orkd_sdp_call(orkd_conn *c, uint32_t op, int M, int N, int nin, int in_esz, int out_esz,
                          int mult, int shift, double in_scale, double out_scale, double a_scale, double b_scale,
                          const void *a, const void *b, void *out){

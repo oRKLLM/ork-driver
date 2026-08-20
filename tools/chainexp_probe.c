@@ -32,8 +32,8 @@ int main(int argc,char**argv){
         long s=(a*r_mult)>>r_shift; if(s>127)s=127; if(s<-128)s=-128; csc[(size_t)i*Nk+j]=(int8_t)s;
         double e=exp((double)s*in_scale)/out_scale; if(e>127)e=127; S+=lround(e); } cS[i]=S; }
 
-    ork_w *w_kt=ork_mm_pack_i8(c,Kp,Nk,KTp); ork_w *w_ones;
-    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_mm_pack_i8(c,Nk,32,ones); free(ones); }
+    ork_w *w_kt=ork_i8_mm_pack(c,Kp,Nk,KTp); ork_w *w_ones;
+    { int8_t *ones=malloc((size_t)Nk*32); memset(ones,1,(size_t)Nk*32); w_ones=ork_i8_mm_pack(c,Nk,32,ones); free(ones); }
     if(!w_kt||!w_ones){ printf("pack fail\n"); return 2; }
     /* generously-sized buffers (int32 span) to be safe about the task.C dtype */
     int32_t *scb=calloc((size_t)Nq*Nk,4), *eb=calloc((size_t)Nq*Nk,4), *ss=calloc((size_t)Nq*32,4);
@@ -44,7 +44,7 @@ int main(int argc,char**argv){
     ork_chain_op ops[3] = { { 1, -1, 0, r_mult, r_shift },   /* t0 matmul int8 requant */
                             { 2,  0, 0, 0, 0 },               /* t1 exp-SDP, in0=t0 */
                             { 0,  1, 0, 0, 0 } };             /* t2 matmul int32, in0=t1 (reduce) */
-    int rc=ork_mm_run_chain_i8_ffn_exp(c,3,tasks,ops,in_scale,out_scale);
+    int rc=ork_i8_mm_run_chain_ffn_exp(c,3,tasks,ops,in_scale,out_scale);
     printf("  run_chain_i8_ffn_exp([QK^T->exp->reduce]) rc=%d  scores[0]=%d e[0]=%d ss[0]=%d\n",
            rc,(int)((int8_t*)scb)[0],(int)((int8_t*)eb)[0],ss[0]);
     if(rc){ printf("FAIL rc=%d\n",rc); return 1; }

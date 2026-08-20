@@ -22,7 +22,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 1;}
     int8_t*A=(int8_t*)malloc(K); memset(A,1,K);              /* fixed A source (contents would change per token) */
     int8_t*B=malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     int32_t*O=(int32_t*)ork_dma_alloc(c,(size_t)S*N*sizeof(int32_t)); if(!O){printf("dma fail\n");return 1;}
     ork_mm_task_i8*tk=malloc(sizeof(*tk)*S);
     for(int i=0;i<S;i++){ tk[i].w=w; tk[i].M=1; tk[i].A=A; tk[i].C=O+(size_t)i*N; }

@@ -1,6 +1,6 @@
 /* ork_gptq.c — GPTQ int4 weight quantization: DECLARED, NOT YET IMPLEMENTED.
  *
- * include/ork_npu.h declares ork_gptq_i4() as part of the int4 pack-time API. The real implementation
+ * include/ork_npu.h declares ork_i4_gptq() as part of the int4 pack-time API. The real implementation
  * — error-compensated column-sequential int4 rounding (Frantar, Ashkboos, Hoefler, Alistarh 2022,
  * "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"), a hand-rolled
  * dense Cholesky + error-feedback sweep with no external deps — exists but is PARKED, unvalidated: it
@@ -16,7 +16,7 @@
 #include <stdint.h>
 #include "ork_npu.h"
 
-int ork_gptq_i4(int K, int N, const float *W, float *H, int group,
+int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                 int8_t *codes, float *scales, float damp) {
     (void)K; (void)N; (void)W; (void)H; (void)group; (void)codes; (void)scales; (void)damp;
     return -ENOSYS;   /* not implemented — see the file header (task #56) */

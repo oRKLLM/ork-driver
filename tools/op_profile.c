@@ -65,12 +65,12 @@ int main(int argc,char**argv){
             int rc=(npu_call); double t0=now_us(); for(int i=0;i<iters;i++){ (npu_call); } double np=(now_us()-t0)/iters; \
             double cp=tcpu(cpu_thunk,iters); \
             printf("  %-10s %-8d %10.1f %10.1f %7.2fx  rc=%d\n",name,M,np,cp,cp>0&&np>0?cp/np:0,rc);}while(0)
-        ROW("silu",  FF,  ork_npu_silu_i8 (c,I1,M,N_,0.05,0.05,O8,&us), t_silu);
-        ROW("gelu",  FF,  ork_npu_gelu_i8 (c,I1,M,N_,0.05,0.05,O8,&us), t_gelu);
-        ROW("exp",   NKV, ork_npu_exp_i8  (c,I1,M,N_,0.02,0.02,O8,&us), t_exp);
-        ROW("rsqrt", HID, ork_npu_rsqrt_i8(c,I1,M,N_,0.05,0.05,O8,&us), t_rsqrt);
-        ROW("ewmul", FF,  ork_npu_ewmul_i8(c,I1,I2,M,N_,1,7,O8,&us),    t_ewmul);
-        ROW("add",   HID, ork_npu_add_i8  (c,I1,I2,M,N_,1,1,1,O8,&us),  t_add);
+        ROW("silu",  FF,  ork_i8_npu_silu (c,I1,M,N_,0.05,0.05,O8,&us), t_silu);
+        ROW("gelu",  FF,  ork_i8_npu_gelu (c,I1,M,N_,0.05,0.05,O8,&us), t_gelu);
+        ROW("exp",   NKV, ork_i8_npu_exp  (c,I1,M,N_,0.02,0.02,O8,&us), t_exp);
+        ROW("rsqrt", HID, ork_i8_npu_rsqrt(c,I1,M,N_,0.05,0.05,O8,&us), t_rsqrt);
+        ROW("ewmul", FF,  ork_i8_npu_ewmul(c,I1,I2,M,N_,1,7,O8,&us),    t_ewmul);
+        ROW("add",   HID, ork_i8_npu_add  (c,I1,I2,M,N_,1,1,1,O8,&us),  t_add);
         #undef ROW
     }
     /* matmul: pack once per shape, NPU run vs NEON sdot CPU */
@@ -78,10 +78,10 @@ int main(int argc,char**argv){
     struct{const char*nm;int K,N;}mm[3]={{"mm-proj",HID,HID},{"mm-gate/up",HID,FF},{"mm-down",FF,HID}};
     A_=malloc((size_t)64*FF); memset(A_,1,(size_t)64*FF); Oi=malloc((size_t)64*FF*4);
     for(int s=0;s<3;s++){ int K=mm[s].K,N=mm[s].N; K_=K;
-        ork_npu_set_pack_domain(c,0); W_=ork_mm_pack_i8(c,K,N,Bpk); if(!W_){printf("pack %s fail\n",mm[s].nm);continue;}
+        ork_npu_set_pack_domain(c,0); W_=ork_i8_mm_pack(c,K,N,Bpk); if(!W_){printf("pack %s fail\n",mm[s].nm);continue;}
         Bt_=malloc((size_t)N*K); memset(Bt_,1,(size_t)N*K);
         for(int mi=0;mi<2;mi++){ int M=Ms[mi]; M_=M; N_=N;
-            ork_mm_run_i8(c,W_,M,A_,Oi); double t0=now_us(); for(int i=0;i<iters;i++)ork_mm_run_i8(c,W_,M,A_,Oi); double np=(now_us()-t0)/iters;
+            ork_i8_mm_run(c,W_,M,A_,Oi); double t0=now_us(); for(int i=0;i<iters;i++)ork_i8_mm_run(c,W_,M,A_,Oi); double np=(now_us()-t0)/iters;
             double cp=tcpu(t_mm,iters<5?iters:5);
             printf("  %-10s %-8d %10.1f %10.1f %7.2fx  (K%d N%d)\n",mm[s].nm,M,np,cp,cp>0&&np>0?cp/np:0,K,N); }
         ork_w_free(W_); free(Bt_);

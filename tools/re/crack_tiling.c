@@ -28,8 +28,8 @@ int main(int argc,char**argv){
     /* int8 warm */
     ork_npu_set_core_budget(c,1);
     { int8_t*a=malloc((size_t)M*K),*b=malloc((size_t)K*N); int32_t*cc=malloc((size_t)M*N*4);
-      memset(a,1,(size_t)M*K); memset(b,1,(size_t)K*N); ork_w*w=ork_mm_pack_i8(c,K,N,b);
-      if(w){ ork_mm_run_i8(c,w,M,a,cc); ork_mm_free(c,w);} free(a);free(b);free(cc); }
+      memset(a,1,(size_t)M*K); memset(b,1,(size_t)K*N); ork_w*w=ork_i8_mm_pack(c,K,N,b);
+      if(w){ ork_i8_mm_run(c,w,M,a,cc); ork_mm_free(c,w);} free(a);free(b);free(cc); }
     printf("int8 warmed\n");
 
     int8_t*A=calloc((size_t)M*K,1);
@@ -50,7 +50,7 @@ int main(int argc,char**argv){
         if(p<0||(size_t)p>=WB) continue;
         memset(B,0,WB); B[p]=1;
         memset(C,0,(size_t)M*N*4);
-        double us; int r=ork_npu_replay_i8(c,rc,rn,M,K,N,A,(int)((size_t)M*K),B,(int)WB,C,1,&us);
+        double us; int r=ork_i8_npu_replay(c,rc,rn,M,K,N,A,(int)((size_t)M*K),B,(int)WB,C,1,&us);
         if(r){ printf("  p=%ld replay rc=%d\n",p,r); continue; }
         int ns=-1; for(int n=0;n<N;n++) if(C[0*N+n]!=0){ ns=n; break; }
         if(ns<0){ if(rstart>=0) printf("%ld -1 -1 0\n",p); else printf("  p=%-8ld -> (no output lit; C0 all zero)\n",p); continue; }

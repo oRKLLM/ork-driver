@@ -167,7 +167,7 @@ int ork_dummy_probe(ork_npu *c){
     volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
     __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
     uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
+    orki_i8_synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,1,CBUF,0);
     memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
@@ -202,7 +202,7 @@ int ork_npu_force_fault(ork_npu *c){
     volatile int32_t *db=(volatile int32_t*)((int32_t*)Cc.cpu+(N-1)); *db=0x7fffffff;
     __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); __asm__ volatile("dsb ish":::"memory");
     uint32_t rc[REGCMD_I8_N+4]; memset(rc,0,sizeof rc);
-    orki_synth_i8(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
+    orki_i8_synth(rc,1,K,N,(uint32_t)A.dma, 0x1000u /*BOGUS weight addr -> DMA fault*/, (uint32_t)Cc.dma,1,CBUF,0);
     memcpy(c->regcmd.cpu,rc,REGCMD_I8_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
@@ -231,7 +231,7 @@ ork_npu *ork_npu_init_orkd(void){
     orkd_conn *dc=orkd_connect();
     if(!dc){ fprintf(stderr,"[ork] ERROR: ork_npu_init_orkd() — orkd_connect failed (daemon not reachable/spawnable)\n"); return NULL; }
     ork_npu *c=calloc(1,sizeof *c); c->fd=-1; c->soc=soc; c->daemon=dc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; orki_npu_ctx=c;
-    if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
+    if(getenv("ORK_ORKD_RING")) orkd_ring_setup(dc);   /* low-latency transport: ork_f16_mm_run* + ork_mm_submit ride the ring (daemon busy-polls while attached, so opt-in) */
     if(getenv("ORK_TRACE")) fprintf(stderr,"[ork] client mode: routing through orkd (cores=%u, ring=%d)\n",orkd_soc_cores(dc),orkd_has_ring(dc));
     return c;
 }
@@ -363,7 +363,7 @@ void ork_npu_reap_stuck(ork_npu *c, int nc){
     memset(A.cpu,0,(size_t)K*2); memset(B.cpu,0,(size_t)K*N*2);
     orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
     uint32_t rc[REGCMD_N]; int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    orki_synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); orki_set_f16_out_fp16in(rc,1,N);
+    orki_f16_synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); orki_f16_set_out_fp16in(rc,1,N);
     memcpy(c->regcmd.cpu,rc,(size_t)REGCMD_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
     t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;

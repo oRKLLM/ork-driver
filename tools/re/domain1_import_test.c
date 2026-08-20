@@ -13,7 +13,7 @@ static void run_case(ork_npu *c, const char *tag, ork_w *w, int M, int K, int N,
                      const int8_t *A, int32_t *C) {
     memset(C, 0, (size_t)M*N*4);
     if (!w) { printf("%-22s WEIGHT NULL (pack/load failed)\n", tag); return; }
-    int rc = ork_mm_run_i8(c, w, M, A, C);
+    int rc = ork_i8_mm_run(c, w, M, A, C);
     printf("%-22s rc=%d  C[0]=%d  (expect %d)  -> %s\n",
            tag, rc, C[0], K, (rc==0 && C[0]==K) ? "OK" : "*** FAULT/WRONG ***");
 }
@@ -30,12 +30,12 @@ int main(void) {
      * before the residence manager fills domain 1+. Skipping this and jumping cold to domain 1 is not a valid
      * test of the sliding window. */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w0 = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w0 = ork_i8_mm_pack(c, K, N, B);
     run_case(c, "NATIVE  domain0(warm)", w0, M, K, N, A, C);
 
     /* NATIVE (bcreate) weight in DOMAIN 1 — control: does the sliding-window submit path itself work? */
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wn = ork_mm_pack_i8(c, K, N, B);
+    ork_w *wn = ork_i8_mm_pack(c, K, N, B);
     run_case(c, "NATIVE  domain1", wn, M, K, N, A, C);
 
     /* Build the pre-tiled blob (what a .orkpack holds) from the native weight, then IMPORT it. */
@@ -46,7 +46,7 @@ int main(void) {
 
     /* IMPORT (dma-buf PRIME) weight in DOMAIN 1, accessed while domain 1 is already active (no switch). */
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wi1 = ork_mm_load_i8_import(c, K, N, blob, need);
+    ork_w *wi1 = ork_i8_mm_load_import(c, K, N, blob, need);
     run_case(c, "IMPORT  dom1 in-domain", wi1, M, K, N, A, C);
 
     /* Switch AWAY to domain 0 (native), then... */

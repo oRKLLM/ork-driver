@@ -72,7 +72,7 @@ static ork_w* pack_i4_hadamard(ork_npu* ctx, const float* w_raw, int OUT, int IN
         }
     }
     free(Bf);
-    ork_w* w = ork_mm_pack_i4_grouped(ctx, K_pad, N_pad, (int8_t*)Bi, G);
+    ork_w* w = ork_i4_mm_pack_grouped(ctx, K_pad, N_pad, (int8_t*)Bi, G);
     free(Bi);
     *out_bS = bS;
     return w;
@@ -108,7 +108,7 @@ static void mv(ork_npu* ctx, ork_w* W, const float* bS, const float* wraw, int O
         }
         
         float* C_pad = calloc(N_pad, sizeof(float));
-        ork_mm_run_i4_grouped(ctx, W, 1, (int8_t*)Ai, aS, bS, C_pad);
+        ork_i4_mm_run_grouped(ctx, W, 1, (int8_t*)Ai, aS, bS, C_pad);
 
         for(int n=0; n<OUT; n++) C[n] = C_pad[n];
 

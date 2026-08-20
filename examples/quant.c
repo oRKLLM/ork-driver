@@ -4,7 +4,7 @@
  * quant/dequant pattern a real engine (e.g. a llama.cpp-rockchip backend) uses around it:
  *   weights  B[K,N]:  per-OUTPUT-CHANNEL scale  ws[n] = max|B[:,n]|/127,  Bq = round(B/ws)
  *   activ.   A[M,K]:  per-ROW (per-token) scale as[m] = max|A[m,:]|/127, Aq = round(A/as)
- *   matmul   Ci = Aq · Bq      (ork_mm_run_i8, exact int32)
+ *   matmul   Ci = Aq · Bq      (ork_i8_mm_run, exact int32)
  *   dequant  C[m,n] = Ci[m,n] · as[m] · ws[n]
  * and compares C to the fp32 reference A·B. Per-channel int8 keeps RMS relative error ~<1%.
  *   make quant && sudo ./quant
@@ -35,14 +35,14 @@ static int check(ork_npu*ctx,int M,int K,int N,uint64_t gold){
     float*as=malloc((size_t)M*4); int8_t*Aq=malloc((size_t)M*K);
     for(int m=0;m<M;m++){float mx=0;for(int k=0;k<K;k++){float a=fabsf(A[(size_t)m*K+k]);if(a>mx)mx=a;}
         as[m]=mx>0?mx/127.0f:1.0f; for(int k=0;k<K;k++)Aq[(size_t)m*K+k]=q8(A[(size_t)m*K+k]/as[m]);}
-    ork_w*w=ork_mm_pack_i8(ctx,K,N,Bq); if(!w){printf("pack failed\n");free(A);free(B);free(ws);free(Bq);free(as);free(Aq);return 1;}
-    /* ORK_TEST_DMA: put the activation + output in zero-copy DMA buffers so ork_mm_run_i8 takes the
+    ork_w*w=ork_i8_mm_pack(ctx,K,N,Bq); if(!w){printf("pack failed\n");free(A);free(B);free(ws);free(Bq);free(as);free(Aq);return 1;}
+    /* ORK_TEST_DMA: put the activation + output in zero-copy DMA buffers so ork_i8_mm_run takes the
      * no-host-copy path — validates that path against the same fp32 reference. */
     int dma=getenv("ORK_TEST_DMA")!=NULL; int8_t*Aqd=Aq; int32_t*Ci;
     if(dma){ Aqd=ork_dma_alloc(ctx,(size_t)M*K); if(Aqd)memcpy(Aqd,Aq,(size_t)M*K); else Aqd=Aq;
              Ci=ork_dma_alloc(ctx,(size_t)M*N*4); if(!Ci)Ci=malloc((size_t)M*N*4); }
     else Ci=malloc((size_t)M*N*4);
-    if(ork_mm_run_i8(ctx,w,M,Aqd,Ci)){printf("run failed\n");return 1;}
+    if(ork_i8_mm_run(ctx,w,M,Aqd,Ci)){printf("run failed\n");return 1;}
     uint64_t got=fnv64(Ci,(size_t)M*N*4);
     int regen=getenv("ORK_REGEN")!=NULL, ret;
     if(gold && got==gold && !regen && !getenv("ORK_FULL_REF")){

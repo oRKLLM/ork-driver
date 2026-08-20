@@ -1,5 +1,5 @@
 /* mc_i4a8_probe.c — validate the DOMAIN-ESTABLISHMENT anchor fix for the INT4/W4A8 import path
- * (ork_mm_load_i4a8_import), not just int8. Same quirk class: bimport into a fresh non-0 IOMMU domain.
+ * (ork_i4a8_mm_load_import), not just int8. Same quirk class: bimport into a fresh non-0 IOMMU domain.
  * Method: pack_i4a8 native in dom0 -> run multi-core = reference C_ref (int32); dump the i4a8 blob;
  * load_i4a8_import into dom1 as the FIRST dom1 op (no native prime — exercises the auto-anchor inside
  * the loader) -> run multi-core = C_test. Import is bit-identical to native (same nibbles), so C_test
@@ -26,20 +26,20 @@ int main(int argc, char **argv){
 
     /* reference: native pack_i4a8 in dom0, multi-core run */
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w0 = ork_mm_pack_i4a8(c, K, N, Bf, bscale);
+    ork_w *w0 = ork_i4a8_mm_pack(c, K, N, Bf, bscale);
     if(!w0){ printf("pack_i4a8 failed\n"); return 1; }
-    if(ork_mm_run_i8(c, w0, M, A, Cref)){ printf("native run failed\n"); return 1; }
+    if(ork_i8_mm_run(c, w0, M, A, Cref)){ printf("native run failed\n"); return 1; }
 
-    size_t need = ork_w_dump_i4a8(w0, NULL, 0);
-    void *blob = malloc(need); ork_w_dump_i4a8(w0, blob, need);
+    size_t need = ork_i4a8_w_dump(w0, NULL, 0);
+    void *blob = malloc(need); ork_i4a8_w_dump(w0, blob, need);
 
     /* test: import into dom1 as the FIRST dom1 op (auto-anchor should fire), multi-core run */
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wi = ork_mm_load_i4a8_import(c, K, N, blob, need);
+    ork_w *wi = ork_i4a8_mm_load_import(c, K, N, blob, need);
     if(!wi){ printf("load_i4a8_import failed (NULL)\n"); return 1; }
     /* switch away and back — the 7B sliding-window case */
-    ork_mm_run_i8(c, w0, M, A, Cref);                 /* dom0 */
-    if(ork_mm_run_i8(c, wi, M, A, Ctest)){ printf("import run rc!=0\n"); return 1; }
+    ork_i8_mm_run(c, w0, M, A, Cref);                 /* dom0 */
+    if(ork_i8_mm_run(c, wi, M, A, Ctest)){ printf("import run rc!=0\n"); return 1; }
 
     size_t mism=0, first=(size_t)-1;
     for(size_t i=0;i<(size_t)M*N;i++) if(Cref[i]!=Ctest[i]){ if(first==(size_t)-1)first=i; mism++; }

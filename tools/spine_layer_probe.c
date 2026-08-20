@@ -46,8 +46,8 @@ int main(void){
     for(int i=0;i<D;i++){x[i]=frnd()*3;an[i]=1+0.1f*frnd();fn[i]=1+0.1f*frnd();} for(int i=0;i<dk;i++)qn[i]=1+0.1f*frnd();
     float *Kc=malloc((size_t)Hkv*nkv*dk*4),*Vc=malloc((size_t)Hkv*nkv*dv*4);
     for(size_t i=0;i<(size_t)Hkv*nkv*dk;i++)Kc[i]=frnd(); for(size_t i=0;i<(size_t)Hkv*nkv*dv;i++)Vc[i]=frnd();
-    ork_w *pWq=ork_mm_pack_i8(c,D,Nq,Wq),*pWk=ork_mm_pack_i8(c,D,Nkv,Wk),*pWv=ork_mm_pack_i8(c,D,Nkv,Wv),*pWo=ork_mm_pack_i8(c,Nq,D,Wo);
-    ork_w *pWg=ork_mm_pack_i8(c,D,Nff,Wg),*pWu=ork_mm_pack_i8(c,D,Nff,Wu),*pWd=ork_mm_pack_i8(c,Nff,D,Wd);
+    ork_w *pWq=ork_i8_mm_pack(c,D,Nq,Wq),*pWk=ork_i8_mm_pack(c,D,Nkv,Wk),*pWv=ork_i8_mm_pack(c,D,Nkv,Wv),*pWo=ork_i8_mm_pack(c,Nq,D,Wo);
+    ork_w *pWg=ork_i8_mm_pack(c,D,Nff,Wg),*pWu=ork_i8_mm_pack(c,D,Nff,Wu),*pWd=ork_i8_mm_pack(c,Nff,D,Wd);
     if(!pWq||!pWk||!pWv||!pWo||!pWg||!pWu||!pWd){ printf("pack fail\n"); return 2; }
     float scale=1.0f/sqrtf(dk);
 

@@ -25,7 +25,7 @@ static int one_case_m(ork_npu *c, int K, int N, int M, int nc, int cmode) {
     int Sn = (N + 8191) / 8192;
     int8_t *B = malloc((size_t)K * N);
     for (int k = 0; k < K; k++) for (int n = 0; n < N; n++) B[(size_t)k * N + n] = bval(k, n);
-    ork_w *w = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w = ork_i8_mm_pack(c, K, N, B);
     if (!w) { printf("  [K=%d N=%d M=%d nc=%d] pack fail\n", K, N, M, nc); free(B); return 1; }
 
     int8_t *A = malloc((size_t)M * K);   /* HOST memory (doorbell stages A via memcpy) */

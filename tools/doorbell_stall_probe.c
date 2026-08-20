@@ -4,7 +4,7 @@
  * its chain, but the scheduler's thread goes off to do silu, so the NPU chain STARVES while the CPU is busy.
  *
  * Same int8 matmul as the FFN up-proj (M=256, K=2048, N=6144), tiled 4x64 for the doorbell. Timed:
- *   A) async         : ork_mm_run_i8_async(M=256) + ork_async_wait          (the apipe path)
+ *   A) async         : ork_i8_mm_run_async(M=256) + ork_async_wait          (the apipe path)
  *   B) doorbell NOW  : ork_dyn_begin_mc(4 tasks) + ork_dyn_end immediately   (CPU polls throughout)
  *   C) doorbell DELAY: ork_dyn_begin_mc + busy-spin(D us) + ork_dyn_end      (CPU off "doing silu")
  *
@@ -33,7 +33,7 @@ int main(int argc,char**argv){
     printf("doorbell_stall_probe: M=%d K=%d N=%d  doorbell tiles=%dx%d\n", M,K,N,nt,TS);
     int8_t*A=(int8_t*)malloc((size_t)M*K); memset(A,1,(size_t)M*K);   /* host (malloc): doorbell stages A, DMA-A source miscomputes */
     int8_t*B=(int8_t*)malloc((size_t)K*N); memset(B,1,(size_t)K*N);
-    ork_w*w=ork_mm_pack_i8(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
+    ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){printf("pack fail\n");return 1;}
     long want=(long)K;   /* A=B=1 => each dot == K */
     double a_ms=0;   /* async path skipped (wedged on fresh-pack); focus on the doorbell autonomy question */
 

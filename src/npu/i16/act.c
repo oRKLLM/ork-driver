@@ -20,7 +20,7 @@
 #include "npu/core.h"
 #include "npu/i16/i16.h"
 
-int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
+int ork_i16_npu_mul_perchan(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
@@ -57,7 +57,7 @@ int ork_npu_mul_perchan_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,i
     return ok;
 }
 
-int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
+int ork_i16_npu_add(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
                     double a_scale,double b_scale,double out_scale,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_add_i16(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
@@ -111,30 +111,30 @@ int ork_npu_add_i16(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     return ok;
 }
 
-int orki_act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+int orki_i16_act_lut(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
     int16_t lut[1030];
     if(orki_build_act_lut16(c,f,in_scale,out_scale,lut)) return -1;
-    return ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
+    return ork_i16_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
 }
 
-int ork_npu_gelu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+int ork_i16_npu_gelu(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_gelu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_gelu_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i16_act_lut(c,orki_gelu_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_rsqrt_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+int ork_i16_npu_rsqrt(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_rsqrt_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_rsqrt_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i16_act_lut(c,orki_rsqrt_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_exp_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+int ork_i16_npu_exp(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_exp_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_exp_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i16_act_lut(c,orki_exp_f,in,M,N,in_scale,out_scale,out,us);
 }
 
-int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
+int ork_i16_npu_ewmul(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int N,int mult,int shift,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i16(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -173,9 +173,9 @@ int ork_npu_ewmul_i16(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     return ok;
 }
 
-int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
+int ork_i16_npu_silu(ork_npu *c,const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_silu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
-    return orki_act_lut_i16(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
+    return orki_i16_act_lut(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
 }
 int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;

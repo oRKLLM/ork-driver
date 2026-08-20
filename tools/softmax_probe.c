@@ -1,4 +1,4 @@
-/* 2b: validate ork_npu_softmax_f16 (exp-on-NPU) coherence vs CPU softmax, at attention-ish shapes. */
+/* 2b: validate ork_f16_npu_softmax (exp-on-NPU) coherence vs CPU softmax, at attention-ish shapes. */
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +13,7 @@ int main(void){
         ork_f16 *x=malloc((size_t)M*n*sizeof(ork_f16)), *o=malloc((size_t)M*n*sizeof(ork_f16));
         unsigned seed=1234+i;
         for(int j=0;j<M*n;j++){ seed=seed*1103515245+12345; x[j]=(ork_f16)(((int)((seed>>16)&0xff)-128)/32.0f); }
-        int r=ork_npu_softmax_f16(c,M,n,x,o);
+        int r=ork_f16_npu_softmax(c,M,n,x,o);
         /* CPU ref + max-abs-err + row-sum check */
         double maxerr=0, worstsum=0;
         for(int m=0;m<M;m++){ float mx=h2f(x[m*n]); for(int j=1;j<n;j++){float v=h2f(x[m*n+j]); if(v>mx)mx=v;}

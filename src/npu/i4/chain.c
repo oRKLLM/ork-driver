@@ -25,14 +25,14 @@
 
 int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
 
-int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+int ork_i4_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
 
     /* Single matmul: use the optimized run_i4 path (multi-core column-split) rather than the
      * single-core chain path. Chaining only pays off when batching S>1 independent matmuls. */
-    if (S == 1) return ork_mm_run_i4(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
+    if (S == 1) return ork_i4_mm_run(c, tasks[0].w, tasks[0].M, tasks[0].A, tasks[0].C);
 
     /* chained weights share one submit => one domain; swap in that domain's scratch */
     if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
@@ -42,7 +42,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
         if (!w || w->dtype != DT_I4) return -2;
         if (tasks[i].M != 1) return -2;
         if (w->Sn != 1 || w->Sk != 1) return -2;
-        if (orki_check_overlap("ork_mm_run_chain_i4", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
+        if (orki_check_overlap("ork_i4_mm_run_chain", (uintptr_t)tasks[i].A, (uintptr_t)tasks[i].A + (size_t)tasks[i].M * w->K, (uintptr_t)tasks[i].C, (uintptr_t)tasks[i].C + (size_t)tasks[i].M * w->N * 4)) return -1;
     }
 
     ork_npu_enter(c, 4 /* DT_I4_CHAIN */, XP_I4CHAIN, OCK_HW);
@@ -70,7 +70,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
         uint8_t *A_dst = (uint8_t*)chain_A.cpu + (size_t)i * max_K;
-        orki_tile_i4_Aslice(A_dst, tasks[i].A, 0, w->K);
+        orki_i4_tile_Aslice(A_dst, tasks[i].A, 0, w->K);
         act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
         out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
     }
@@ -80,7 +80,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
      * hand back a recycled DMA region carrying dirty CPU cache lines (from a prior occupant). Those lines
      * evict to DRAM AFTER the NPU writes chain_C, clobbering the NPU output -> "correct run 0, garbage runs
      * 1+" on warm reuse. Dirty the whole surface then clean it to DRAM (TO_DEVICE) so no stale line survives
-     * to evict later -- same full-surface clean-before as ork_dyn_begin_mc_i4's doorbell scratch. */
+     * to evict later -- same full-surface clean-before as ork_i4_dyn_begin_mc's doorbell scratch. */
     memset(chain_C.cpu, 0, (size_t)S * max_N * 2);
     orki_bsync(fd, &chain_C, RKNPU_MEM_SYNC_TO_DEVICE);
 
@@ -89,7 +89,7 @@ int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
 
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        orki_i4_synth(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
         if (orki_validate_regcmd("run_chain_i4", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
 
         if (i < S - 1) {
@@ -175,7 +175,7 @@ cleanup:
     return ok;
 }
 
-int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+int ork_i4_dyn_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;
@@ -201,7 +201,7 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     uint32_t act_dma[1024], out_dma[1024];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        orki_tile_i4_Aslice((uint8_t*)chain_A.cpu + (size_t)i * max_K, tasks[i].A, 0, w->K);
+        orki_i4_tile_Aslice((uint8_t*)chain_A.cpu + (size_t)i * max_K, tasks[i].A, 0, w->K);
         act_dma[i] = (uint32_t)(chain_A.dma + (size_t)i * max_K);
         out_dma[i] = (uint32_t)(chain_C.dma + (size_t)i * max_N * 2);
     }
@@ -210,8 +210,8 @@ int ork_dyn_i4_probe(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     uint32_t rc[REGCMD_I4_N];
     for (int i = 0; i < S; i++) {
         ork_w *w = tasks[i].w;
-        orki_synth_i4(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
-        if (orki_validate_regcmd("ork_dyn_i4_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
+        orki_i4_synth(rc, 1, w->K, w->N, act_dma[i], (uint32_t)w->Bb[0].dma, out_dma[i]);
+        if (orki_validate_regcmd("ork_i4_dyn_probe", c, rc, REGCMD_I4_N, w, extra, 2)) { ok = -1; goto cleanup; }
         if (i < S - 1) { uint64_t next_dma = c->regcmd.dma + (i + 1) * REGCMD_I4_N * 4;
             rc[216] = 0x0010 | ((next_dma & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((next_dma >> 16) & 0xffff);
             rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
@@ -289,7 +289,7 @@ static void *bch_db_worker(void *vp){
     orki_pin_big_core(i);
     uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
     for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-        for(int j=0;j<Hg;j++) orki_tile_i4_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
+        for(int j=0;j<Hg;j++) orki_i4_tile_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
     orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
     int tk=0;
     for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
@@ -297,7 +297,7 @@ static void *bch_db_worker(void *vp){
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
             uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-            memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+            memset(rc,0,sizeof rc); orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
             /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
              * weight-stationary (N-tile outer, M-group g inner sharing wdma), so g==0 loads the N-tile weight and
              * g>0 can REUSE the CBUF-resident weight + skip the re-DMA by setting CNA_CBUF_CON0[13]=WEIGHT_REUSE
@@ -358,7 +358,7 @@ static void *bch_db_worker(void *vp){
     a->rc=-2; return NULL;
 }
 
-int orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
     int fd=c->fd, K=w->K, N=w->N;
     /* accurate wedge telemetry: the BCHAIN worker skips validate_regcmd by default, so orki_last_op would
@@ -442,7 +442,7 @@ static void *bch_mw_worker(void *vp){
     size_t aoff=0;
     for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; int M=t->M, NG=(M+H-1)/H;
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-            for(int j=0;j<Hg;j++) orki_tile_i4_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
+            for(int j=0;j<Hg;j++) orki_i4_tile_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
         aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
     orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
     /* build the chained regcmd across all experts (tk = cumulative program index) */
@@ -453,7 +453,7 @@ static void *bch_mw_worker(void *vp){
             for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
                 uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
                 uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-                memset(rc,0,sizeof rc); orki_synth_i4(rc, 2*Hg, K, Wc, aA, wdma, aC);
+                memset(rc,0,sizeof rc); orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
                 if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
                     if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
                         for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
@@ -494,7 +494,7 @@ static void *bch_mw_worker(void *vp){
     }
 }
 
-int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
+int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
     int H=16384/K; if(H>16)H=16; if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
@@ -534,7 +534,7 @@ int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
     if(bad){   /* a core dropped -> re-run ITS experts serially via the proven per-expert BCHAIN (its first submit's
                 * timeout_clean reaps the dropped coalesced job — bounded i4_submit_tmo_ms made it past-timeout) */
         for(int i=0;i<nc;i++){ if(args[i].rc!=-2) continue;
-            for(int e=args[i].e0;e<args[i].e1;e++) if(orki_run_i4_bchain_db(c, ex[e].w, ex[e].M, ex[e].A, ex[e].C, nc)) return -1; }
+            for(int e=args[i].e0;e<args[i].e1;e++) if(orki_i4_run_bchain_db(c, ex[e].w, ex[e].M, ex[e].A, ex[e].C, nc)) return -1; }
     }
     ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job (from a coalesced drop or the per-expert fallback) BEFORE the mcc bdestroy / next op switches domains. In-domain, post-join, safe. No-op unless a real miss occurred. */
     /* #54 RESIDENT MULTI-DOMAIN: the coalesced OUTPUT scratch (mcc, ~33 MB/core for a whole _exps tensor) is
@@ -548,15 +548,15 @@ int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
     return 0;
 }
 
-int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
+int ork_i4_mm_run_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     if(!c || ntask<1 || !ex) return -1;
     for(int e=0;e<ntask;e++){ ork_w*w=ex[e].w;
         if(!w||w->dtype!=DT_I4||w->Sk!=1||w->Sn!=1||(w->N%64)||ex[e].M<1) return -2;
         if(w->domain!=ex[0].w->domain || w->K!=ex[0].w->K || w->N!=ex[0].w->N) return -2; }  /* one submit => one domain + one shape */
-    return orki_run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
+    return orki_i4_run_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
 }
 /* ============ B: GROUPED int4 (W4A4 per-K-group scales) on the NONBLOCK doorbell ============
- * ork_mm_run_i4_grouped's doorbell path. Row-decomposed (M=1 tasks across cores); each row emits Sn*Sk programs
+ * ork_i4_mm_run_grouped's doorbell path. Row-decomposed (M=1 tasks across cores); each row emits Sn*Sk programs
  * (K-slice = gsize G, Sk = K/G groups). Output = Sk int16 partial blocks of [N] per row. Unlike A2's int-sum,
  * the drain (ork_dyn_grouped_end) FLOAT scale-accumulates: C[m][n] = sum_g aS[m*Sk+g]*bS[g*N+n]*partial_g[n]
  * (matches the grouped drain). NULL if ineligible (chain/scratch too big) -> caller refuses (ORK_RC_WEDGE_PRONE; the blocking i4_mcworker_g path is removed #45). */
@@ -567,22 +567,22 @@ int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int n
  * synth_i4 / REGCMD_I4_N stride / regcfg_amount=116, an int16 per-core output scratch (ALWAYS copy-back — the
  * NPU never writes the caller's int32 C in place), and a FULL-SURFACE int16 sentinel seed that doubles as the
  * clean-before-write the fresh/reused scratch needs (int4's int16 write-order over N is not last-col-last, so
- * both the seed and the completion poll cover the whole row). Proven bit-exact single-core by ork_dyn_i4_probe;
+ * both the seed and the completion poll cover the whole row). Proven bit-exact single-core by ork_i4_dyn_probe;
  * this is the productionised multi-core form the scheduler dispatches. Host (malloc) A only, as for int8/fp16.
  * end() drains via the esz-aware ork_dyn_done_i and widens int16->int32 into the caller's C. */
-ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
+ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
 int orki_i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
-ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
+ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
 /* #54 COALESCE: run MANY int4 experts (each M>=1 rows) through ONE nonblock doorbell. Decompose every expert's
- * M rows into M=1 tasks and hand the WHOLE set to ork_dyn_begin_mc_i4 — the doorbell distributes+chains them
+ * M rows into M=1 tasks and hand the WHOLE set to ork_i4_dyn_begin_mc — the doorbell distributes+chains them
  * across the cores in one submit-set per core (the HW chaining is the doorbell's job; we don't hand-wire it).
  * Collapses the per-expert submit storm (2059 matmuls x 3 cores) to ~nc submits per _exps tensor. All experts
  * MUST share one iommu domain (the doorbell = one submit = one domain); the caller streams a layer's experts
  * into a single domain. Returns 0 ok, -4 refuse (chain/buffer too big -> caller falls back), -1 error. */
-int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
+int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
 /* Async pipelined submit (precision-agnostic) — orkd+ring mode only. Enqueue one matmul for w WITHOUT blocking
  * and get a ticket; ork_mm_collect(ticket) reads C later. Returns <0 if unavailable (no ring, or the op is too
- * big for a ring slot — use the synchronous ork_mm_run* instead). Keeping several ops in flight lets each op's
+ * big for a ring slot — use the synchronous ork_f16_mm_run* instead). Keeping several ops in flight lets each op's
  * transport (memcpy + handshake) overlap the NPU compute of the ones ahead of it — the decode pipeline. */
 int ork_mm_submit(ork_npu *c, ork_w *w, int M, const void *A){
     if(!c || !c->daemon || !w || !w->is_orkd || !orkd_has_ring(c->daemon)) return -1;
@@ -631,7 +631,7 @@ int ork_dyn_grouped_end(ork_dyn_chain *h) {
     if (orki_ork_term) { sigaction(SIGTERM, &orki_prev_sig[0], NULL); raise(SIGTERM); }
     return rc;
 }
-ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
+ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
         if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk > 16) return NULL;   /* int4 HW chain: M=1; A1: Sn>1 N-tiled; A2: Sk>1 K-split (int16 partials summed in end) — Sk bounded (per-row A-slice array) */
@@ -667,7 +667,7 @@ ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *task
             uint32_t aslice[16];
             for (int ks = 0; ks < Sk; ks++) { int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; size_t asz = (size_t)Kp / 2;
                 if (astage + asz > AF->size) { free(h); return NULL; }
-                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
+                orki_i4_tile_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
                 aslice[ks] = (uint32_t)(AF->dma + astage); astage += asz; }
             /* A1 N-tile x A2 K-split: one program per (N-slice ns, K-slice ks). The row's output is Sk blocks
              * of [N] int16 (block ks = the K-slice-ks partial; column-slices write their [Nc] within it); the
@@ -686,7 +686,7 @@ ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *task
                         if(bc) for(int z=0;z<8;z++) fprintf(stderr,"%02x ",bc[z]); else fprintf(stderr,"(null)");
                         fprintf(stderr,"| aslice=0x%x cdma=0x%x\n", aslice[ks], cdma); fflush(stderr); }
                     memset(rc, 0, sizeof rc);
-                    orki_synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
+                    orki_i4_synth(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
                     if (orki_validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
@@ -723,7 +723,7 @@ ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *task
     return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
 }
 
-ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A,
+ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A,
                                                   const float *aScale, const float *bScale, float *Cf, int nc) {
     if (!w || w->dtype != DT_I4 || !w->gsize || M < 1 || M > 1024) return NULL;
     int G = w->gsize, K = w->K, N = w->N, Sn = w->Sn, Sk = w->Sk;   /* grouped: Sk = K/G groups */
@@ -755,14 +755,14 @@ ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const in
             uint32_t aslice[256];                                    /* this row's Sk group A-slices (each G nibbles) */
             for (int g = 0; g < Sk; g++) { size_t asz = (size_t)G / 2;
                 if (astage + asz > AF->size) { free(h); return NULL; }
-                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
+                orki_i4_tile_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
                 aslice[g] = (uint32_t)(AF->dma + astage); astage += asz; }
             for (int ns = 0; ns < Sn; ns++) { int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
                 for (int g = 0; g < Sk; g++) {
                     uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)g * N * 2 + (size_t)n0 * 2);   /* block g, cols [n0,n0+Nc) */
                     uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + g].dma;
                     memset(rc, 0, sizeof rc);
-                    orki_synth_i4(rc, 1, G, Nc, aslice[g], bdma, cdma);
+                    orki_i4_synth(rc, 1, G, Nc, aslice[g], bdma, cdma);
                     if (orki_validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);

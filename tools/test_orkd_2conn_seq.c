@@ -8,7 +8,7 @@
  * ORK_2CONN_G0=1 forces ungrouped ops (isolates the daemon from the doorbell).
  *
  * Extends test_orkd_2conn from plain matmul to ork_submit_seq: each consumer submits a 3-op grouped chain
- * [MM_I8 -> EWMUL_I8(SDP) -> MM_I8] (group=1 => rides ork_dyn_begin_seq_i8_mc on the daemon). Interleaving the
+ * [MM_I8 -> EWMUL_I8(SDP) -> MM_I8] (group=1 => rides ork_i8_dyn_begin_seq_mc on the daemon). Interleaving the
  * two consumers' ork_submit_seq calls exercises the daemon's SEQ handler (handle_seq) serializing two live
  * consumers, the grouped-chain routing, and the Path-B group wire-forwarding — all under contention on the
  * single NPU. Distinct per-consumer+per-iter data; every op verified bit-exact vs the CPU reference.
@@ -58,7 +58,7 @@ int main(int argc, char **argv){
     #define RSDP() ((int8_t)(((g=g*1103515245u+12345u)>>20&7)-3))
     for(int i=0;i<NC;i++){ ctx[i]=ork_npu_init();                    /* sequential init: conn 0 auto-spawns orkd, rest connect */
         if(!ctx[i]){ fprintf(stderr,"conn %d init failed\n",i); for(int j=0;j<i;j++) ork_npu_free(ctx[j]); return 2; } }
-    for(int i=0;i<NC;i++){ for(int k=0;k<TK*TN;k++) B[i][k]=R8(); w[i]=ork_mm_pack_i8(ctx[i], TK, TN, B[i]); }   /* distinct resident weight per consumer */
+    for(int i=0;i<NC;i++){ for(int k=0;k<TK*TN;k++) B[i][k]=R8(); w[i]=ork_i8_mm_pack(ctx[i], TK, TN, B[i]); }   /* distinct resident weight per consumer */
     int bad=0;
     for(int it=0; it<iters && !bad; it++){
         for(int i=0;i<NC && !bad;i++){                              /* round-robin the NC consumers each iter */

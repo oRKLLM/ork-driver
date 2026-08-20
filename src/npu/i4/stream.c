@@ -42,10 +42,10 @@ static void *stream_worker_i4(void *vp) {
             for (int m0 = 0; m0 < M; m0 += Hcap) {
                 int H = (M - m0 < Hcap) ? (M - m0) : Hcap;
                 for (int j = 0; j < H; j++)                   /* real row j at A-slot 2j (stride-2 input) */
-                    orki_tile_i4_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
+                    orki_i4_tile_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
                 orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
                 memset(rc, 0, sizeof rc);
-                orki_synth_i4(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
+                orki_i4_synth(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
                 rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;   /* single task */
                 memcpy(c->mrc[i].cpu, rc, REGCMD_I4_N * 4);
                 orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -70,11 +70,11 @@ static void *stream_worker_i4(void *vp) {
             }
             continue;   /* task done via batch; skip the per-row path below */
         }
-        for (int m = 0; m < M; m++) orki_tile_i4_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
+        for (int m = 0; m < M; m++) orki_i4_tile_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
         for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
             memset(rc, 0, sizeof rc);
-            orki_synth_i4(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
+            orki_i4_synth(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
                      (uint32_t)(c->mcc[i].dma + (size_t)m * N * 2));
             if (m < M - 1) {
                 uint64_t nd = c->mrc[i].dma + (size_t)(m + 1) * REGCMD_I4_N * 4;
@@ -115,7 +115,7 @@ static void *stream_worker_i4(void *vp) {
     return NULL;
 }
 
-int ork_mm_run_stream_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+int ork_i4_mm_run_stream(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
     if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);
@@ -165,26 +165,26 @@ void ork_i4_fuzz_clear(void){ orki_i4_fovr_n=0; }
 
 void ork_i4_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val){ if(orki_i4_fovr_n<16){ orki_i4_fovr[orki_i4_fovr_n].blk=blk; orki_i4_fovr[orki_i4_fovr_n].reg=reg; orki_i4_fovr[orki_i4_fovr_n].val=val; orki_i4_fovr_n++; } }
 
-int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
+int ork_i4_npu_probe(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
                      const uint32_t *ovr_reg,const uint32_t *ovr_val,
                      const int8_t *A,const int8_t *B,int16_t *C){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;        /* B int4: half bytes */
-    orki_tile_i4_B(W.cpu,B,K,N,nibB);
+    orki_i4_tile_B(W.cpu,B,K,N,nibB);
     orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
     struct buf O=orki_bcreate(fd,(size_t)M*N*2,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* int16 C, M rows */
     /* M-tiling: the captured W4A4 program runs M=1 per task; we replicate it per row. Each row's A is
      * its own native (K/32,1,32) block (contiguous K/2 bytes); each row's C is (N/8,1,8) = N int16. */
     uint8_t*ad=c->Af.cpu;
-    for(int m=0;m<M;m++) orki_tile_i4_A(ad+(size_t)m*(K/2), A+(size_t)m*K, 1, K, nibA);
+    for(int m=0;m<M;m++) orki_i4_tile_A(ad+(size_t)m*(K/2), A+(size_t)m*K, 1, K, nibA);
     orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
     int ok=0;
     for(int m=0;m<M && ok==0;m++){
         orki_act(fd,RKNPU_ACT_RESET,0);
         uint32_t rc[REGCMD_I4_N];
-        orki_synth_i4(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
+        orki_i4_synth(rc,1,K,N,(uint32_t)(c->Af.dma+(size_t)m*(K/2)),(uint32_t)W.dma,(uint32_t)(O.dma+(size_t)m*N*2));
         for(int i=0;i<nov && i<4;i++) orki_setr(rc,REGCMD_I4_N,0x201,ovr_reg[i],ovr_val[i]);
         struct buf extra[2] = {W, O};
         if (orki_validate_regcmd("probe_i4", c, rc, REGCMD_I4_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
@@ -199,22 +199,22 @@ int ork_npu_probe_i4(ork_npu *c,int M,int K,int N,int nibB,int nibA,int nov,
     return ok;
 }
 
-int ork_npu_probe_i4_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int16_t *raw){
+int ork_i4_npu_probe_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_t *B,int16_t *raw){
     int fd=c->fd;
     if(K%32||N%64||N>c->soc->nmax||M<1) return -2;
     struct buf W=orki_bcreate(fd,(size_t)K*N/2,0x403,-1); if(!W.cpu) return -2;
-    orki_tile_i4_B(W.cpu,B,K,N,0);
+    orki_i4_tile_B(W.cpu,B,K,N,0);
     orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);orki_bsync(fd,&W,RKNPU_MEM_SYNC_TO_DEVICE);
     struct buf O=orki_bcreate(fd,(size_t)2*M*N*2,0x403,-1); if(!O.cpu){orki_bdestroy(fd,&W);return -2;}  /* 2x: stride-2 multi-M writes physical rows 0..2(M-1) */
     /* A layout selector via ORK_I4_ALAY: 0=(K/32,M,32) interleaved, 1=per-row contiguous (K/32,1,32)
      * x M (what the captured M=1 program reads). Lets the probe tell whether the program is single-row. */
     { int alay=getenv("ORK_I4_ALAY")?atoi(getenv("ORK_I4_ALAY")):0;
-      if(alay) for(int m=0;m<M;m++) orki_tile_i4_A((uint8_t*)c->Af.cpu+(size_t)m*(K/2),A+(size_t)m*K,1,K,0);
-      else orki_tile_i4_A(c->Af.cpu,A,M,K,0); }
+      if(alay) for(int m=0;m<M;m++) orki_i4_tile_A((uint8_t*)c->Af.cpu+(size_t)m*(K/2),A+(size_t)m*K,1,K,0);
+      else orki_i4_tile_A(c->Af.cpu,A,M,K,0); }
     orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
     uint32_t rc[REGCMD_I4_N];
-    orki_synth_i4(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
+    orki_i4_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma);
     struct buf extra[2] = {W, O};
     if (orki_validate_regcmd("probe_i4_mm", c, rc, REGCMD_I4_N, NULL, extra, 2)) { orki_bdestroy(fd,&W); orki_bdestroy(fd,&O); return -1; }
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);

@@ -46,16 +46,16 @@ int main(int argc,char**argv){
            K,N,(double)K*N/1e6,nt,c0);
 
     int8_t*A=malloc(K); memset(A,1,K);
-    int8_t*Bpk=malloc((size_t)K*N); memset(Bpk,1,(size_t)K*N);     /* for ork_mm_pack_i8 (K*N row-major) */
+    int8_t*Bpk=malloc((size_t)K*N); memset(Bpk,1,(size_t)K*N);     /* for ork_i8_mm_pack (K*N row-major) */
     int8_t*Bt=malloc((size_t)N*K); memset(Bt,1,(size_t)N*K);       /* transposed [N][K] for the CPU GEMV */
     int32_t*C=malloc((size_t)N*4);
 
     ork_npu_set_pack_domain(c,0);
-    ork_w*wfull=ork_mm_pack_i8(c,K,N,Bpk); if(!wfull){printf("pack full failed\n");return 1;}
+    ork_w*wfull=ork_i8_mm_pack(c,K,N,Bpk); if(!wfull){printf("pack full failed\n");return 1;}
 
     /* ---- NPU-alone (full N) ---- */
-    for(int i=0;i<3;i++) ork_mm_run_i8(c,wfull,1,A,C);
-    double t0=now_us(); for(int i=0;i<iters;i++) ork_mm_run_i8(c,wfull,1,A,C); double t_npu=(now_us()-t0)/iters;
+    for(int i=0;i<3;i++) ork_i8_mm_run(c,wfull,1,A,C);
+    double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,wfull,1,A,C); double t_npu=(now_us()-t0)/iters;
     int okn=1; for(int n=0;n<N;n++) if(C[n]!=K){okn=0;break;}
     printf("  NPU-alone : %8.1f us  %6.1f GB/s  %s\n", t_npu, (double)K*N/t_npu/1e3, okn?"ok":"BAD");
 
@@ -72,12 +72,12 @@ int main(int argc,char**argv){
     double fr[]={0.2,0.3,0.4,0.5,0.6};
     for(unsigned fi=0; fi<sizeof(fr)/sizeof(double); fi++){
         int Nn=((int)(fr[fi]*N))/16*16; if(Nn<16)Nn=16; if(Nn>=N)Nn=N-16;   /* NPU N-tile %16 */
-        ork_w*wnpu=ork_mm_pack_i8(c,K,Nn,Bpk); if(!wnpu){printf("  pack Nn=%d failed\n",Nn);continue;}
+        ork_w*wnpu=ork_i8_mm_pack(c,K,Nn,Bpk); if(!wnpu){printf("  pack Nn=%d failed\n",Nn);continue;}
         int32_t*Cn=malloc((size_t)Nn*4);
-        ork_mm_run_i8(c,wnpu,1,A,Cn);                              /* warm */
+        ork_i8_mm_run(c,wnpu,1,A,Cn);                              /* warm */
         double s0=now_us();
         for(int i=0;i<iters;i++){
-            ork_async*h=ork_mm_run_i8_async(c,wnpu,1,A,Cn);        /* NPU half async */
+            ork_async*h=ork_i8_mm_run_async(c,wnpu,1,A,Cn);        /* NPU half async */
             cpu_gemv(A,Bt,C,K,Nn,N,nt,c0);                         /* CPU half concurrent (big cores) */
             ork_async_wait(h);
         }

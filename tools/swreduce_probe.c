@@ -32,7 +32,7 @@ int main(int argc,char**argv){
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
     printf("swreduce_probe: M=%d K=%d N=%d (DIRECT; reduce alone vs reduce-after-exp_i8)\n",M,K,N);
     int8_t *ones=malloc((size_t)K*N); memset(ones,1,(size_t)K*N);
-    ork_w *w=ork_mm_pack_i8(c,K,N,ones); if(!w){printf("pack fail\n");return 2;}
+    ork_w *w=ork_i8_mm_pack(c,K,N,ones); if(!w){printf("pack fail\n");return 2;}
     int fail=0;
 
     /* T1: reduce alone (fresh context) */

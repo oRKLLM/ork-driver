@@ -28,7 +28,7 @@ int main(int argc,char**argv){
     for(int i=0;i<iters;i++){
         int d = (i&1) ? d2 : d1;
         ork_npu_set_pack_domain(c, d);
-        ork_w *w = ork_mm_pack_i8(c, K, N, B);   /* cross-domain MEM_CREATE (switches from the previous pack's domain) */
+        ork_w *w = ork_i8_mm_pack(c, K, N, B);   /* cross-domain MEM_CREATE (switches from the previous pack's domain) */
         if(!w){ printf("*** WEDGE at pack %d (dom %d) — bcreate failed ***\n", i, d); fflush(stdout); return 1; }
         ork_mm_free(c, w);
         if(i && i%10000==0){ printf("  %d packs ok\n", i); fflush(stdout); }

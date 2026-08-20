@@ -1,5 +1,5 @@
 /* tools/f16_gmax_sweep.c — validate the bounded-Gmax fp16 fused-SiLU builder across the in-model gate range.
- * For each Gmax, build the LUT via ork_mm_build_f16_silu_lut (which caps the effective Gmax, ORK_F16_GCAP),
+ * For each Gmax, build the LUT via ork_f16_mm_build_silu_lut (which caps the effective Gmax, ORK_F16_GCAP),
  * pack a fresh -S*W probe whose gates span [-Gmax,Gmax], run the fp16 gate, and compare to CPU silu. Reports
  * BULK error (|gate|<=8, the mass of the distribution) separately from FULL (incl. the rare large tail that
  * clamps by design). This is the decisive test for picking the cap: bulk error must stay small at large Gmax.
@@ -25,12 +25,12 @@ int main(void){
     for(unsigned gi=0; gi<sizeof gmaxes/sizeof*gmaxes; gi++){
         double Gmax=gmaxes[gi];
         int16_t lut[1030]; double S=0,R=0,out=0;
-        if(ork_mm_build_f16_silu_lut(c,Gmax,lut,&S,&R,&out)){ printf("%-6.1f build FAIL\n",Gmax); continue; }
+        if(ork_f16_mm_build_silu_lut(c,Gmax,lut,&S,&R,&out)){ printf("%-6.1f build FAIL\n",Gmax); continue; }
         /* fresh probe: gates span [-Gmax,Gmax]; weight is -S*gate/K so acc=-S*gate (matches the builder's bake) */
         double tru[N]; for(int n=0;n<N;n++){ tru[n]=Gmax*(n-32)/32.0; double b=(-S*tru[n])/(double)K;
             for(int k=0;k<K;k++)B[(size_t)k*N+n]=(ork_f16)b; }
-        ork_w *w=ork_mm_pack(c,K,N,B); if(!w){ printf("%-6.1f pack FAIL\n",Gmax); continue; }
-        if(ork_mm_run_f16_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)){ printf("%-6.1f run FAIL\n",Gmax); ork_mm_free(c,w); continue; }
+        ork_w *w=ork_f16_mm_pack(c,K,N,B); if(!w){ printf("%-6.1f pack FAIL\n",Gmax); continue; }
+        if(ork_f16_mm_run_silu(c,w,8,A,C,0,0xffffc000u,0x56391100u,lut,1030)){ printf("%-6.1f run FAIL\n",Gmax); ork_mm_free(c,w); continue; }
         double bse=0,fse=0,brel=0; int bn=0;
         for(int n=0;n<N;n++){ double ref=silu(tru[n]), got=C[n]*out, e=fabs(got-ref); fse+=e;
             if(fabs(tru[n])<=8.0){ bse+=e; bn++; if(fabs(ref)>0.1) brel+=e/fabs(ref); } }

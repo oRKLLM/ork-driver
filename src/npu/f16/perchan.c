@@ -29,7 +29,7 @@
 #include "npu/core.h"
 #include "npu/f16/f16.h"
 
-int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+int ork_f16_npu_mm_perchan_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                                  const uint16_t *scale,uint16_t *out){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -47,8 +47,8 @@ int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                  /* prime fp16 pipeline (layer owns the reset) */
     uint32_t base[REGCMD_N], rc[REGCMD_I8_EW_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);
-    orki_synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
-    orki_set_f16_out_fp16in(base,M,N);                                   /* main lane: fp16 CONTIGUOUS out */
+    orki_f16_synth(base,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)O.dma,sched,CBUF);
+    orki_f16_set_out_fp16in(base,M,N);                                   /* main lane: fp16 CONTIGUOUS out */
     orki_splice_ew_lane(rc,base);                                        /* add the 0x50xx EW-operand lane */
     /* EW-mul: multiply the on-chip fp16 accumulator by the per-channel operand. fp16 EW config + per-channel ERDMA. */
     uint32_t ewcfg=getenv("ORK_F16EW_CFG")?strtoul(getenv("ORK_F16EW_CFG"),0,0):0x108003c4;   /* vendor fp16 EW mul */
@@ -82,7 +82,7 @@ int ork_npu_mm_perchan_f16_fused(ork_npu *c,int M,int K,int N,const uint16_t *A,
     return ok;
 }
 
-int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
+int ork_f16_npu_ewmul(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int N,ork_f16 *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_f16(c->daemon,up,silu,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -127,19 +127,19 @@ int ork_npu_ewmul_f16(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
 }
 
 /* PUBLIC per-channel-scaled fp16 matmul, on NPU: out[m][n] = (Σ_k A[m][k]B[k][n]) * scale[n]. Composes the two
- * bit-exact primitives — the fp16 matmul with fp16 CONTIGUOUS output (ork_npu_probe_f16_mm_f16out, 512/512) and
- * the atom-8 per-channel EW-mul SDP (ork_npu_mul_perchan_f16, which takes a CONTIGUOUS input and repacks to
+ * bit-exact primitives — the fp16 matmul with fp16 CONTIGUOUS output (ork_f16_npu_probe_mm_f16out, 512/512) and
+ * the atom-8 per-channel EW-mul SDP (ork_f16_npu_mul_perchan, which takes a CONTIGUOUS input and repacks to
  * atom-8 internally). This is the vendor's own structure (plain fp16 matmul → separate fp16 per-channel SDP);
  * the contiguous↔atom-8 reshape is the SDP's internal O(M·N) repack (on CPU; the vendor does it as small on-NPU
  * CNA copies — a follow-on optimization, see ATTN_REDERIVE_WIP.md). A/B/scale/out fp16 bit patterns. 0/ok, <0. */
-int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+int ork_f16_npu_mm_perchan(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                            const uint16_t *scale,uint16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(K%32||N<1||N>c->soc->nmax||M<1||M>64) return -2;
     if(N%32==0){                                                    /* fast path: N is a valid tile width */
         uint16_t *G=malloc((size_t)M*N*2); if(!G) return -1;
-        int rc=ork_npu_probe_f16_mm_f16out(c,M,K,N,A,B,G);          /* fp16 matmul -> CONTIGUOUS fp16 G (512/512) */
-        if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scale,M,N,(ork_f16*)out,us); /* per-channel scale */
+        int rc=ork_f16_npu_probe_mm_f16out(c,M,K,N,A,B,G);          /* fp16 matmul -> CONTIGUOUS fp16 G (512/512) */
+        if(rc==0) rc=ork_f16_npu_mul_perchan(c,(const ork_f16*)G,(const ork_f16*)scale,M,N,(ork_f16*)out,us); /* per-channel scale */
         free(G);
         return rc;
     }
@@ -152,14 +152,14 @@ int ork_npu_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const 
     for(int k=0;k<K;k++){ const uint16_t*br=B+(size_t)k*N; uint16_t*pr=Bp+(size_t)k*Np;
         for(int n=0;n<N;n++)pr[n]=br[n]; for(int n=N;n<Np;n++)pr[n]=0; }
     for(int n=0;n<N;n++)scp[n]=scale[n]; for(int n=N;n<Np;n++)scp[n]=0;
-    int rc=ork_npu_probe_f16_mm_f16out(c,M,K,Np,A,Bp,G);
-    if(rc==0) rc=ork_npu_mul_perchan_f16(c,(const ork_f16*)G,(const ork_f16*)scp,M,Np,(ork_f16*)op,us);
+    int rc=ork_f16_npu_probe_mm_f16out(c,M,K,Np,A,Bp,G);
+    if(rc==0) rc=ork_f16_npu_mul_perchan(c,(const ork_f16*)G,(const ork_f16*)scp,M,Np,(ork_f16*)op,us);
     if(rc==0) for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=op[(size_t)m*Np+n];
     free(Bp);free(scp);free(G);free(op);
     return rc;
 }
 
-int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+int ork_f16_npu_mm_perchan_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                                 const uint16_t *scale,uint16_t *out,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -191,8 +191,8 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
         /* SINGLE-SUBMIT: PC-chain matmul1 -> matmul2 (both uniform enable=0xd, like run_chain_i8). G resident. */
         static uint32_t mm1[REGCMD_N], mm2[REGCMD_N];
         int s1=((K&(K-1))==0 && K>=128 && K<2048), s2=((N&(N-1))==0 && N>=128 && N<2048);
-        orki_synth(mm1,M,K,N,pass[0].aA,pass[0].aW,pass[0].aO,s1,CBUF); orki_set_f16_out_fp16in(mm1,M,N);
-        orki_synth(mm2,M,N,N,pass[1].aA,pass[1].aW,pass[1].aO,s2,CBUF); orki_set_f16_out_fp16in(mm2,M,N);
+        orki_f16_synth(mm1,M,K,N,pass[0].aA,pass[0].aW,pass[0].aO,s1,CBUF); orki_f16_set_out_fp16in(mm1,M,N);
+        orki_f16_synth(mm2,M,N,N,pass[1].aA,pass[1].aW,pass[1].aO,s2,CBUF); orki_f16_set_out_fp16in(mm2,M,N);
         ork_chain_prog progs[2]={ {mm1,REGCMD_N,0xd,108,216}, {mm2,REGCMD_N,0xd,108,-1} };
         int crc=ork_npu_chain_progs(c,2,progs,c->dom_active);
         if(!crc){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); if(us)*us=ork_now_us()-t0;
@@ -204,8 +204,8 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     for(int p=0; p<2 && ok==0; p++){
         uint32_t rc[REGCMD_N];
         int sched=((pass[p].K2&(pass[p].K2-1))==0 && pass[p].K2>=128 && pass[p].K2<2048);
-        orki_synth(rc,M,pass[p].K2,pass[p].N2,pass[p].aA,pass[p].aW,pass[p].aO,sched,CBUF);
-        orki_set_f16_out_fp16in(rc,M,pass[p].N2);
+        orki_f16_synth(rc,M,pass[p].K2,pass[p].N2,pass[p].aA,pass[p].aW,pass[p].aO,sched,CBUF);
+        orki_f16_set_out_fp16in(rc,M,pass[p].N2);
         memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         memset(tk,0,sizeof *tk); tk->enable_mask=0xd; tk->int_mask=0x300; tk->int_clear=0x1ffff;
         tk->regcfg_amount=108; tk->regcmd_addr=(uint32_t)c->regcmd.dma; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -220,7 +220,7 @@ int ork_npu_mm_perchan_f16_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
     return ok;
 }
 
-int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+int ork_f16_npu_mul_perchan(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
@@ -255,12 +255,12 @@ int ork_npu_mul_perchan_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,i
     return ok;
 }
 
-/* ork_npu_mul_perchan_f16_contig — per-channel fp16 MUL that reads a CONTIGUOUS [M][N] fp16 input (the native
+/* ork_f16_npu_mul_perchan_contig — per-channel fp16 MUL that reads a CONTIGUOUS [M][N] fp16 input (the native
  * fp16 matmul output layout), via the vendor task13 config (FLYING_MODE + NOTCH addressing, EW_CFG=0x20800384,
  * ERDMA=0x8000000a). This is the SDP that matches the fp16 matmul's contiguous output — closing the chain / a
  * pure-NPU 2-submit without the CPU atom-8 repack. a=[M][N] contiguous fp16, b=[N] scale, out=[M][N]. Captured
  * at M=8,N=64; notch is verbatim for N=64. ORK_MULC_* env for on-board geometry RE. 0/ok,-1,-2,-3. */
-int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+int ork_f16_npu_mul_perchan_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
     if(M<1||M>64||N<8||N>8192||(N&7)) return -2;
@@ -335,7 +335,7 @@ int ork_npu_mul_perchan_f16_contig(ork_npu *c,const ork_f16 *a,const ork_f16 *b,
     return ok;
 }
 
-int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
+int ork_f16_npu_add(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_add_f16(c->daemon,a,b,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -358,7 +358,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
     tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
-    /* NONBLOCK DOORBELL (spine uniformity): ping-pong OFF + full-surface fp16 inf-poison poll — see ork_npu_ewmul_f16. */
+    /* NONBLOCK DOORBELL (spine uniformity): ping-pong OFF + full-surface fp16 inf-poison poll — see ork_f16_npu_ewmul. */
     for(int m=0;m<M;m++)for(int n=0;n<N;n++){ volatile uint16_t*db=(volatile uint16_t*)((char*)O.cpu+EWCUBEH(m,n)); *db=0x7c00; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
     __asm__ volatile("dsb ish":::"memory");
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=(ork_ppflags()&~0x4u)|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
@@ -373,7 +373,7 @@ int ork_npu_add_f16(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     return ok;
 }
 
-int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
+int ork_f16_npu_chain_mm_perchan(ork_npu *c,int M,int K,int N,const uint16_t *A,const uint16_t *B,
                                  const uint16_t *scale,uint16_t *out,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -394,8 +394,8 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     orki_bsync(fd,&SB,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
     static uint32_t mm[REGCMD_N], pc[REGCMD_MUL_F16_CHAIN_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);                                /* run_stream_f16's rule; small K => sched=0 (sched=1 miscomputes small K) */
-    orki_synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,sched,CBUF); /* prog0: FP16 matmul -> G (CONTIGUOUS [M][N]) */
-    orki_set_f16_out_fp16in(mm,M,N);                                                   /* fp16-out ATOM-8 stage (matches the SDP's orki_set_mul_geom layout) */
+    orki_f16_synth(mm,M,K,N,(uint32_t)c->Af.dma,(uint32_t)W.dma,(uint32_t)G.dma,sched,CBUF); /* prog0: FP16 matmul -> G (CONTIGUOUS [M][N]) */
+    orki_f16_set_out_fp16in(mm,M,N);                                                   /* fp16-out ATOM-8 stage (matches the SDP's orki_set_mul_geom layout) */
     memcpy(pc,REGCMD_MUL_F16_CHAIN,sizeof pc);
     orki_set_mul_geom(pc,REGCMD_MUL_F16_CHAIN_N,M,N);
     orki_setrn(pc,REGCMD_MUL_F16_CHAIN_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);

@@ -39,11 +39,11 @@ static void softmax(float*x,int n){ ork_softmax_f32(x,n); }
 static ork_w* pack_t(ork_npu*ctx,const float*w,int OUT,int IN){
     f16*B=malloc((size_t)IN*OUT*2);
     for(int k=0;k<IN;k++)for(int n=0;n<OUT;n++)B[(size_t)k*OUT+n]=(f16)w[(size_t)n*IN+k];
-    ork_w*W=ork_mm_pack(ctx,IN,OUT,B); free(B); return W;
+    ork_w*W=ork_f16_mm_pack(ctx,IN,OUT,B); free(B); return W;
 }
 /* C[1,OUT] = x[1,IN] (fp16) x W ; NPU or CPU-fp16 reference from raw w[OUT][IN] */
 static void mv(ork_npu*ctx,ork_w*W,const float*wraw,int OUT,int IN,const float*x,float*C,int useNPU){
-    if(useNPU){ f16*a=malloc((size_t)IN*2); for(int i=0;i<IN;i++)a[i]=(f16)x[i]; ork_mm_run(ctx,W,1,a,C); free(a); }
+    if(useNPU){ f16*a=malloc((size_t)IN*2); for(int i=0;i<IN;i++)a[i]=(f16)x[i]; ork_f16_mm_run(ctx,W,1,a,C); free(a); }
     else for(int n=0;n<OUT;n++){float acc=0;for(int k=0;k<IN;k++)acc+=(float)(f16)x[k]*(float)(f16)wraw[(size_t)n*IN+k];C[n]=acc;}
 }
 

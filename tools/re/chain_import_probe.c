@@ -1,5 +1,5 @@
-/* chain_import_probe.c — the 7B's ACTUAL submit path: ork_mm_run_chain_i8 (PC-chained, "i8 chain tasks=1"),
- * not the plain ork_mm_run_i8 my earlier probes used. Test an IMPORTED weight run via the chain path after a
+/* chain_import_probe.c — the 7B's ACTUAL submit path: ork_i8_mm_run_chain (PC-chained, "i8 chain tasks=1"),
+ * not the plain ork_i8_mm_run my earlier probes used. Test an IMPORTED weight run via the chain path after a
  * dom_activate switch, at a multi-core N. If this faults where run_i8 didn't, the regression is the chained/
  * multi-core regcmd path x imported buffers x domain switch. N=8192 => multi-core; also try K=18944 (K-slice).
  *   ./cip  (K=1024,N=8192)   |   ./cip 18944 3584  (K-sliced down-proj shape) */
@@ -11,7 +11,7 @@
 
 static int run_chain1(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C) {
     ork_mm_task_i8 t; t.w = w; t.M = M; t.A = A; t.C = C;
-    return ork_mm_run_chain_i8(c, 1, &t);
+    return ork_i8_mm_run_chain(c, 1, &t);
 }
 static void rc(ork_npu *c, const char *tag, ork_w *w, int M, int K, int N, const int8_t *A, int32_t *C) {
     memset(C, 0, (size_t)M*N*4);
@@ -33,17 +33,17 @@ int main(int argc, char **argv) {
     printf("K=%d N=%d M=%d (chain path)\n", K, N, M);
 
     ork_npu_set_pack_domain(c, 0);
-    ork_w *w0 = ork_mm_pack_i8(c, K, N, B);
+    ork_w *w0 = ork_i8_mm_pack(c, K, N, B);
     rc(c, "NATIVE dom0 warm", w0, M, K, N, A, C);
 
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wn1 = ork_mm_pack_i8(c, K, N, B);
+    ork_w *wn1 = ork_i8_mm_pack(c, K, N, B);
     rc(c, "NATIVE dom1 (switch)", wn1, M, K, N, A, C);
 
     size_t need = ork_w_dump(wn1, NULL, 0);
     void *blob = malloc(need); ork_w_dump(wn1, blob, need);
     ork_npu_set_pack_domain(c, 1);
-    ork_w *wi1 = ork_mm_load_i8_import(c, K, N, blob, need);
+    ork_w *wi1 = ork_i8_mm_load_import(c, K, N, blob, need);
     rc(c, "IMPORT dom1 in-domain", wi1, M, K, N, A, C);
 
     rc(c, "NATIVE dom0 (switch away)", w0, M, K, N, A, C);

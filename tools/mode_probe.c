@@ -7,12 +7,12 @@
  *
  * Ops (public validated primitives only):
  *   MM_F16   ork_bmm_fp16   (1,M=64,K=64,N=16)   -- the exact CumBA shape that wedges mid-sequence
- *   MM_I8    ork_bmm_i8     (1,M=64,K=64,N=64)
- *   EXP_I16  ork_npu_exp_i16   (SDP LUT, int16)
- *   SILU_I16 ork_npu_silu_i16  (SDP LUT, int16)
- *   EWMUL16  ork_npu_ewmul_i16 (SDP 2-in, int16)
- *   EWMULF16 ork_npu_ewmul_f16 (SDP 2-in, fp16)
- *   ADD_F16  ork_npu_add_f16   (SDP 2-in, fp16)
+ *   MM_I8    ork_i8_bmm     (1,M=64,K=64,N=64)
+ *   EXP_I16  ork_i16_npu_exp   (SDP LUT, int16)
+ *   SILU_I16 ork_i16_npu_silu  (SDP LUT, int16)
+ *   EWMUL16  ork_i16_npu_ewmul (SDP 2-in, int16)
+ *   EWMULF16 ork_f16_npu_ewmul (SDP 2-in, fp16)
+ *   ADD_F16  ork_f16_npu_add   (SDP 2-in, fp16)
  *  (int16 MATMUL is not a public RK3588 primitive — matmul is int8/fp16/int4; the int16 datapath is
  *   SDP-only. Noted, not swept.)
  *
@@ -65,7 +65,7 @@ static int op_mm_i8(ork_npu *c){
     static int8_t *A=NULL,*B=NULL; static int32_t *C=NULL;
     if(!A){ A=malloc((size_t)MM_M*MM_K); B=malloc((size_t)MM_K*MM_NI8); C=malloc((size_t)MM_M*MM_NI8*4);
         memset(A,1,(size_t)MM_M*MM_K); memset(B,1,(size_t)MM_K*MM_NI8); }
-    if(ork_bmm_i8(c,1,MM_M,MM_K,MM_NI8,A,B,C)) return 1;
+    if(ork_i8_bmm(c,1,MM_M,MM_K,MM_NI8,A,B,C)) return 1;
     for(int i=0;i<MM_M*MM_NI8;i++) if(C[i]!=MM_K) return 2;    /* sum_k 1*1 = 64 */
     return 0;
 }
@@ -73,57 +73,57 @@ static int op_exp_i16(ork_npu *c){
     static int16_t *in=NULL,*out=NULL;
     if(!in){ in=malloc((size_t)SDP_M*SDP_N*2); out=malloc((size_t)SDP_M*SDP_N*2);
         for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int16_t)(-1000+i); }
-    return ork_npu_exp_i16(c,in,SDP_M,SDP_N,30.0/30000.0,1.0/30000.0,out,NULL)?1:0;
+    return ork_i16_npu_exp(c,in,SDP_M,SDP_N,30.0/30000.0,1.0/30000.0,out,NULL)?1:0;
 }
 static int op_silu_i16(ork_npu *c){
     static int16_t *in=NULL,*out=NULL;
     if(!in){ in=malloc((size_t)SDP_M*SDP_N*2); out=malloc((size_t)SDP_M*SDP_N*2);
         for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int16_t)(-2000+8*i); }
-    return ork_npu_silu_i16(c,in,SDP_M,SDP_N,4.0/32768.0,1.0/32768.0,out,NULL)?1:0;
+    return ork_i16_npu_silu(c,in,SDP_M,SDP_N,4.0/32768.0,1.0/32768.0,out,NULL)?1:0;
 }
 static int op_ewmul_i16(ork_npu *c){
     static int16_t *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc((size_t)SDP_M*SDP_N*2); b=malloc((size_t)SDP_M*SDP_N*2); o=malloc((size_t)SDP_M*SDP_N*2);
         for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int16_t)(100+i); b[i]=(int16_t)(200-i); } }
-    return ork_npu_ewmul_i16(c,a,b,SDP_M,SDP_N,16384,14,o,NULL)?1:0;
+    return ork_i16_npu_ewmul(c,a,b,SDP_M,SDP_N,16384,14,o,NULL)?1:0;
 }
 static int op_ewmul_f16(ork_npu *c){
     static ork_f16 *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc((size_t)SDP_M*SDP_N*2); b=malloc((size_t)SDP_M*SDP_N*2); o=malloc((size_t)SDP_M*SDP_N*2);
         for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(ork_f16)0.5f; b[i]=(ork_f16)0.25f; } }
-    return ork_npu_ewmul_f16(c,a,b,SDP_M,SDP_N,o,NULL)?1:0;
+    return ork_f16_npu_ewmul(c,a,b,SDP_M,SDP_N,o,NULL)?1:0;
 }
 static int op_add_f16(ork_npu *c){
     static ork_f16 *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc((size_t)SDP_M*SDP_N*2); b=malloc((size_t)SDP_M*SDP_N*2); o=malloc((size_t)SDP_M*SDP_N*2);
         for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(ork_f16)0.5f; b[i]=(ork_f16)0.25f; } }
-    return ork_npu_add_f16(c,a,b,SDP_M,SDP_N,o,NULL)?1:0;
+    return ork_f16_npu_add(c,a,b,SDP_M,SDP_N,o,NULL)?1:0;
 }
 /* --- SDP-family ops added 2026-07-21 (int8 activations + int8/int16 elementwise; same SDP_MxN shape) --- */
 static int op_silu_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
     if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-64+i%128); }
-    return ork_npu_silu_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+    return ork_i8_npu_silu(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
 static int op_gelu_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
     if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-64+i%128); }
-    return ork_npu_gelu_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+    return ork_i8_npu_gelu(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
 static int op_gelu_i16(ork_npu *c){ static int16_t *in=NULL,*out=NULL;
     if(!in){ in=malloc((size_t)SDP_M*SDP_N*2); out=malloc((size_t)SDP_M*SDP_N*2); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int16_t)(-2000+8*i); }
-    return ork_npu_gelu_i16(c,in,SDP_M,SDP_N,4.0/32768.0,1.0/32768.0,out,NULL)?1:0; }
+    return ork_i16_npu_gelu(c,in,SDP_M,SDP_N,4.0/32768.0,1.0/32768.0,out,NULL)?1:0; }
 static int op_rsqrt_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
     if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(1+i%126); }   /* positive for rsqrt */
-    return ork_npu_rsqrt_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+    return ork_i8_npu_rsqrt(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
 static int op_exp_i8(ork_npu *c){ static int8_t *in=NULL,*out=NULL;
     if(!in){ in=malloc(SDP_M*SDP_N); out=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++) in[i]=(int8_t)(-127+i%128); }
-    return ork_npu_exp_i8(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
+    return ork_i8_npu_exp(c,in,SDP_M,SDP_N,4.0/128,1.0/128,out,NULL)?1:0; }
 static int op_ewmul_i8(ork_npu *c){ static int8_t *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc(SDP_M*SDP_N); b=malloc(SDP_M*SDP_N); o=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int8_t)(10+i%100); b[i]=(int8_t)(5+i%50); } }
-    return ork_npu_ewmul_i8(c,a,b,SDP_M,SDP_N,16384,14,o,NULL)?1:0; }
+    return ork_i8_npu_ewmul(c,a,b,SDP_M,SDP_N,16384,14,o,NULL)?1:0; }
 static int op_add_i8(ork_npu *c){ static int8_t *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc(SDP_M*SDP_N); b=malloc(SDP_M*SDP_N); o=malloc(SDP_M*SDP_N); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int8_t)(10+i%100); b[i]=(int8_t)(5+i%50); } }
-    return ork_npu_add_i8(c,a,b,SDP_M,SDP_N,1.0/128,1.0/128,1.0/128,o,NULL)?1:0; }
+    return ork_i8_npu_add(c,a,b,SDP_M,SDP_N,1.0/128,1.0/128,1.0/128,o,NULL)?1:0; }
 static int op_add_i16(ork_npu *c){ static int16_t *a=NULL,*b=NULL,*o=NULL;
     if(!a){ a=malloc((size_t)SDP_M*SDP_N*2); b=malloc((size_t)SDP_M*SDP_N*2); o=malloc((size_t)SDP_M*SDP_N*2); for(int i=0;i<SDP_M*SDP_N;i++){ a[i]=(int16_t)(100+i); b[i]=(int16_t)(200-i); } }
-    return ork_npu_add_i16(c,a,b,SDP_M,SDP_N,1.0/32768.0,1.0/32768.0,1.0/32768.0,o,NULL)?1:0; }
+    return ork_i16_npu_add(c,a,b,SDP_M,SDP_N,1.0/32768.0,1.0/32768.0,1.0/32768.0,o,NULL)?1:0; }
 static int run_op(ork_npu *c,int op){
     switch(op){
         case OP_MM_F16:    return op_mm_f16(c);
