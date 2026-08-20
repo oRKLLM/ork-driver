@@ -98,30 +98,30 @@ static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
 
 /* ORK_PROFILE: per-matmul host-side timing, printed on free. Lets us see how much of decode's
  * per-token wall time is spent inside ork-driver's matmul calls vs the ggml/CPU path around them. */
-static int    g_ork_prof = 0;
+int    orki_ork_prof = 0;
 /* ORK_LOAD_PROF: per-phase breakdown of the .orkpack import path — where load time actually goes.
  * Accumulated across every orki_bimport()/load; dumped (and reset) at teardown by ork_load_prof_dump(). */
-static int    g_load_prof = 0;   /* set from ORK_LOAD_PROF in ork_npu_init, like g_ork_prof */
-static double g_lp_alloc=0, g_lp_mmap=0, g_lp_prime=0, g_lp_create=0, g_lp_memcpy=0, g_lp_bf=0;
-static long   g_lp_nchunk=0; static size_t g_lp_bytes=0;
-static long   g_prof_i8_calls = 0, g_prof_i4_calls = 0;
-static double g_prof_i8_us = 0,    g_prof_i4_us = 0;
-/* RKNPU_SUBMIT ioctl counter (ORK_PROFILE). g_prof_submits = total ioctls; the run path tags each
+int    orki_load_prof = 0;   /* set from ORK_LOAD_PROF in ork_npu_init, like orki_ork_prof */
+double orki_lp_alloc=0, orki_lp_mmap=0, orki_lp_prime=0, orki_lp_create=0, orki_lp_memcpy=0, orki_lp_bf=0;
+long   orki_lp_nchunk=0; size_t orki_lp_bytes=0;
+long   orki_prof_i8_calls = 0, orki_prof_i4_calls = 0;
+double orki_prof_i8_us = 0,    orki_prof_i4_us = 0;
+/* RKNPU_SUBMIT ioctl counter (ORK_PROFILE). orki_prof_submits = total ioctls; the run path tags each
  * via g_prof_submit_class so we can split within-matmul tiling (K/N/M sub-submits) from chained
  * (one ioctl covering >1 program). Printed on free. Pure diagnostic — no effect when prof off. */
-static long   g_prof_submits = 0;       /* total RKNPU_SUBMIT ioctls */
+long   orki_prof_submits = 0;       /* total RKNPU_SUBMIT ioctls */
 static long   g_prof_submit_progs = 0;  /* total PC-chained programs across all submits (>= submits) */
 static long   g_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
 /* FLOOR-DECOMP instrumentation (always-on, ~40ns/submit): decompose the per-submit floor.
- * g_fd_ioctl_us = wall time inside the SUBMIT ioctl (kernel job setup + NPU + completion-wait, blocking).
- * g_fd_hw_us    = SUM of the kernel-reported sub->hw_elapse_time (the HW's own NPU-busy view) — ork never
+ * orki_fd_ioctl_us = wall time inside the SUBMIT ioctl (kernel job setup + NPU + completion-wait, blocking).
+ * orki_fd_hw_us    = SUM of the kernel-reported sub->hw_elapse_time (the HW's own NPU-busy view) — ork never
  * read this field before. Comparing the two splits the ioctl wall into real-NPU vs driver-wait/dispatch.
  * Read via ork_npu_floor_timing(); reset via ork_npu_floor_reset(). Raw units of hw_elapse are captured
  * separately (g_fd_hw_raw) so the probe can infer ns-vs-us. */
-static double g_fd_ioctl_us = 0;   /* sum wall-us inside the SUBMIT ioctl */
-static double g_fd_hw_us = 0;      /* sum of sub->hw_elapse_time (as reported) */
-static long long g_fd_hw_raw_last = 0; /* last raw hw_elapse_time value (for unit inference) */
-static long   g_fd_n = 0;          /* number of SUBMIT ioctls timed */
+double orki_fd_ioctl_us = 0;   /* sum wall-us inside the SUBMIT ioctl */
+double orki_fd_hw_us = 0;      /* sum of sub->hw_elapse_time (as reported) */
+long long orki_fd_hw_raw_last = 0; /* last raw hw_elapse_time value (for unit inference) */
+long   orki_fd_n = 0;          /* number of SUBMIT ioctls timed */
 /* #33 reentrancy guard: slice_pack_i8 packs each sub-tile via ork_mm_pack_i8 -> orki_pack(), which would ITSELF
  * try to build a w->sliced for that sub-tile (harmless for the natural gate — sub-tiles are Sn==1, never
  * refuse-prone — but ORK_SLICE_ALL forces it and RECURSES until IOVA fills). Set while packing sub-tiles so
@@ -438,29 +438,29 @@ struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     size_t sz=orki_pgup(size);
     int dtr=ork_dom(domain);   /* domain id for the trace (final `dom` computed post-mmap, same value) */
     if(tr){ fprintf(stderr,"[IMP] bimport dom=%d sz=%zuKB (imp#%ld, dom_bytes=%zuMB): DMA_HEAP_ALLOC...\n",dtr,sz>>10,g_bimport_n,g_iova_bytes[dtr>=0&&dtr<ORK_IOVA_NDOM?dtr:0]>>20); fflush(stderr); }
-    double _t = g_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
+    double _t = orki_load_prof ? ork_now_us() : 0;   /* ORK_LOAD_PROF: per-phase import timing */
     struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
     if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC"); return (struct buf){0}; }
-    if(g_load_prof){ g_lp_alloc += ork_now_us()-_t; _t=ork_now_us(); }
+    if(orki_load_prof){ orki_lp_alloc += ork_now_us()-_t; _t=ork_now_us(); }
     int dbuf=(int)a.fd;
     if(tr){ fprintf(stderr,"[IMP]   alloc ok (fd=%d) -> mmap...\n",dbuf); fflush(stderr); }
     void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
     if(p==MAP_FAILED){ perror("mmap(dmabuf)"); close(dbuf); return (struct buf){0}; }
-    if(g_load_prof){ g_lp_mmap += ork_now_us()-_t; }
+    if(orki_load_prof){ orki_lp_mmap += ork_now_us()-_t; }
     int dom=ork_dom(domain);
     if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
-    if(g_load_prof) _t=ork_now_us();
+    if(orki_load_prof) _t=ork_now_us();
     if(tr){ fprintf(stderr,"[IMP]   mmap ok -> PRIME_FD_TO_HANDLE...\n"); fflush(stderr); }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    if(g_load_prof){ g_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
+    if(orki_load_prof){ orki_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
     if(tr){ fprintf(stderr,"[IMP]   prime ok (handle=%u) -> MEM_CREATE...\n",ph.handle); fflush(stderr); }
     /* memflags: normally 0 (weights are NPU-DMA'd, need no kernel vmap). SCRATCH task/descriptor buffers pass
      * RKNPU_MEM_KERNEL_MAPPING so the kernel can READ the rknpu_task structs — dropping it (the old flags=0)
      * gave a malformed task and WEDGED the NPU. Only the kernel-read task buffers need it; data buffers pass 0. */
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=memflags; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
-    if(g_load_prof){ g_lp_create += ork_now_us()-_t; g_lp_nchunk++; g_lp_bytes+=sz; }
+    if(orki_load_prof){ orki_lp_create += ork_now_us()-_t; orki_lp_nchunk++; orki_lp_bytes+=sz; }
     struct buf b; memset(&b,0,sizeof b);
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     live_add(fd,b.handle,b.obj);
@@ -758,7 +758,7 @@ void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki
 
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
-    if (g_ork_prof) { g_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
+    if (orki_ork_prof) { orki_prof_submits++; g_prof_submit_progs += sub->task_number; if (sub->task_number > 1) g_prof_submit_chained++; }
     orki_trace_submit(sub);
     /* PRE-SUBMIT fsync'd trace (ORK_PRESUBMIT_TRACE=<path>): write this submit's full context to disk AND
      * fsync it BEFORE the ioctl — so if the ioctl HARD-WEDGES the NPU/board (no self-heal, needs power-cycle),
@@ -779,8 +779,8 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     if(_nb) sub->flags |= 0x2;
     double _fd_t0 = ork_now_us();
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
-    { double _fd_dt = ork_now_us() - _fd_t0; g_fd_ioctl_us += _fd_dt; g_fd_hw_raw_last = (long long)sub->hw_elapse_time;
-      g_fd_hw_us += (double)sub->hw_elapse_time; g_fd_n++;
+    { double _fd_dt = ork_now_us() - _fd_t0; orki_fd_ioctl_us += _fd_dt; orki_fd_hw_raw_last = (long long)sub->hw_elapse_time;
+      orki_fd_hw_us += (double)sub->hw_elapse_time; orki_fd_n++;
       if(_nb){ int async=(rc==0 && _fd_dt<50.0);  /* returned in <50us => before the HW could run => async */
                fprintf(stderr,"[nonblock] flags=0x%x rc=%d ioctl-return=%.0fus hw_elapse=%lldus%s\n",
                    sub->flags, rc, _fd_dt, (long long)sub->hw_elapse_time,
@@ -2039,13 +2039,13 @@ void ork_npu_dump_state(ork_npu *c, const char *label){
     ORK_Q(RKNPU_GET_IOMMU_EN,iommu); ORK_Q(RKNPU_GET_FREE_SRAM_SIZE,sram);
     #undef ORK_Q
     /* The LIVE signals (established by floor_decomp / slice_replay — NOT the RKNPU_GET_*_AMOUNT DMA counters,
-     * which read 0 on this kernel): (1) g_fd_hw_raw_last = the kernel's per-submit NPU-busy time (hw_elapse),
+     * which read 0 on this kernel): (1) orki_fd_hw_raw_last = the kernel's per-submit NPU-busy time (hw_elapse),
      * captured after EVERY submit; 0 => the last job did NO work (faulted/never ran). (2) per-task int_status
      * from the shared task buffer (read after a FROM_DEVICE sync). */
     struct rknpu_task *t=(struct rknpu_task*)c->task.cpu;   /* NULL after an fd-reap (task buffer died with the fd, re-created lazily on the next run) — guard the deref */
     if(t) orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_FROM_DEVICE);
     fprintf(stderr,"[NPU-DUMP %s] hw=0x%llx freq=%llu volt=%llu iommu=%llu freeSRAM=%lluKiB | last-submit HW-busy(hw_elapse)=%lld (0=>no work) | task int_status[0..3]=%s0x%x 0x%x 0x%x 0x%x\n",
-            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)g_fd_hw_raw_last, t?"":"(no task buf) ",
+            label?label:"", hwv, freq, volt, iommu, sram>>10, (long long)orki_fd_hw_raw_last, t?"":"(no task buf) ",
             t?t[0].int_status:0u, t?t[1].int_status:0u, t?t[2].int_status:0u, t?t[3].int_status:0u);
 }
 /* Soft-reset the NPU (RKNPU_ACT_RESET) and force a re-warm (clear c->warmed). Intended as the recovery step
@@ -2254,8 +2254,8 @@ ork_npu *ork_npu_init(void){
         fprintf(stderr,"[ork] WARNING: ORK_USE_ORKD set but orkd_connect failed — using the local NPU\n"); } }
     if(!soc->validated) fprintf(stderr,"[ork] WARNING: %s params are inherited/untested — validate with the regression suite\n",soc->id);
     orki_warn_if_governor_parked();
-    g_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
-    g_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
+    orki_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
+    orki_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default 50µs): precise short nanosleeps for the doorbell backoffs */
@@ -2287,16 +2287,6 @@ ork_npu *ork_npu_init(void){
     return c;
 }
 /* ORK_LOAD_PROF: print (and reset) the per-phase import breakdown. Called at teardown. No-op unless set. */
-void ork_load_prof_dump(void){
-    if(!g_load_prof) return;
-    double tot=g_lp_alloc+g_lp_mmap+g_lp_prime+g_lp_create+g_lp_memcpy+g_lp_bf; if(tot<=0) tot=1;
-    fprintf(stderr,"[ork LOAD_PROF] %ld chunks, %.2f GiB imported, %.2f s in import path:\n",
-            g_lp_nchunk, g_lp_bytes/(1024.0*1024.0*1024.0), tot/1e6);
-    fprintf(stderr,"  dma_heap_alloc %.2fs (%.0f%%) | mmap %.2fs (%.0f%%) | prime_fd %.2fs (%.0f%%) | mem_create %.2fs (%.0f%%) | memcpy(Bb) %.2fs (%.0f%%) | retile(Bf) %.2fs (%.0f%%)\n",
-            g_lp_alloc/1e6,100*g_lp_alloc/tot, g_lp_mmap/1e6,100*g_lp_mmap/tot, g_lp_prime/1e6,100*g_lp_prime/tot,
-            g_lp_create/1e6,100*g_lp_create/tot, g_lp_memcpy/1e6,100*g_lp_memcpy/tot, g_lp_bf/1e6,100*g_lp_bf/tot);
-    g_lp_alloc=g_lp_mmap=g_lp_prime=g_lp_create=g_lp_memcpy=g_lp_bf=0; g_lp_nchunk=0; g_lp_bytes=0;
-}
 void ork_ssm_prof_dump(void);            /* fwd: ORK_SSM_PROF per-section accounting */
 void ork_ssm_helper_stop(ork_npu *c);    /* fwd: stop the little-core marshalling helper */
 void ork_npu_xprof_dump(void);
@@ -2313,21 +2303,21 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     if(c->seq_witness){ ork_mm_free(c, c->seq_witness); c->seq_witness=NULL; }   /* B2 terminal-SDP witness weight */
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
     orki_ssm_pool_free(c);   /* release the persistent SSM-scan scratch pool (no-op if never used) */
-    if(g_ork_prof){
-        if(g_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
-                                    g_prof_i8_calls, g_prof_i8_us/1e3, g_prof_i8_us/g_prof_i8_calls);
-        if(g_prof_i4_calls) fprintf(stderr,"[ork PROFILE] run_i4: %ld calls, %.1f ms total, %.0f us/call\n",
-                                    g_prof_i4_calls, g_prof_i4_us/1e3, g_prof_i4_us/g_prof_i4_calls);
-        if(g_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
-                                   g_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/g_prof_submits, g_prof_submit_chained,
-                                   g_prof_i8_calls?(double)g_prof_submits/g_prof_i8_calls:0.0);
+    if(orki_ork_prof){
+        if(orki_prof_i8_calls) fprintf(stderr,"[ork PROFILE] run_i8: %ld calls, %.1f ms total, %.0f us/call\n",
+                                    orki_prof_i8_calls, orki_prof_i8_us/1e3, orki_prof_i8_us/orki_prof_i8_calls);
+        if(orki_prof_i4_calls) fprintf(stderr,"[ork PROFILE] run_i4: %ld calls, %.1f ms total, %.0f us/call\n",
+                                    orki_prof_i4_calls, orki_prof_i4_us/1e3, orki_prof_i4_us/orki_prof_i4_calls);
+        if(orki_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
+                                   orki_prof_submits, g_prof_submit_progs, (double)g_prof_submit_progs/orki_prof_submits, g_prof_submit_chained,
+                                   orki_prof_i8_calls?(double)orki_prof_submits/orki_prof_i8_calls:0.0);
         /* HW-vs-poll split (task #19): orki_run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
          * poll/idle = orki_run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
-        if(g_fd_n) fprintf(stderr,"[ork FD-SPLIT] orki_run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
-                                   g_prof_i8_us/1e3, g_fd_n, g_fd_ioctl_us/1e3, 100.0*g_fd_ioctl_us/(g_prof_i8_us+1e-9),
-                                   g_fd_hw_us/1e3, 100.0*g_fd_hw_us/(g_prof_i8_us+1e-9),
-                                   (g_prof_i8_us-g_fd_ioctl_us)/1e3, 100.0*(g_prof_i8_us-g_fd_ioctl_us)/(g_prof_i8_us+1e-9),
-                                   g_fd_ioctl_us/g_fd_n, g_fd_hw_us/g_fd_n);
+        if(orki_fd_n) fprintf(stderr,"[ork FD-SPLIT] orki_run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
+                                   orki_prof_i8_us/1e3, orki_fd_n, orki_fd_ioctl_us/1e3, 100.0*orki_fd_ioctl_us/(orki_prof_i8_us+1e-9),
+                                   orki_fd_hw_us/1e3, 100.0*orki_fd_hw_us/(orki_prof_i8_us+1e-9),
+                                   (orki_prof_i8_us-orki_fd_ioctl_us)/1e3, 100.0*(orki_prof_i8_us-orki_fd_ioctl_us)/(orki_prof_i8_us+1e-9),
+                                   orki_fd_ioctl_us/orki_fd_n, orki_fd_hw_us/orki_fd_n);
     }
     if (g_npu_ctx == c) g_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
@@ -3050,7 +3040,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
             }
             struct buf*b=&w->Bb[(size_t)ns*Sk+ks];
             b->handle=cur.handle; b->obj=cur.obj; b->dma=cur.dma+coff; b->cpu=(char*)cur.cpu+coff; b->size=ts;
-            double _m=g_load_prof?ork_now_us():0; memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); if(g_load_prof) g_lp_memcpy+=ork_now_us()-_m; coff+=ts; boff+=ts;}}
+            double _m=orki_load_prof?ork_now_us():0; memcpy(b->cpu,(const char*)blob+boff,(size_t)Kp*Nc); if(orki_load_prof) orki_lp_memcpy+=ork_now_us()-_m; coff+=ts; boff+=ts;}}
         if(consolidate){ if(cur.cpu) orki_dmabuf_sync(cur.heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); w->owns=0; }
         else { /* alloc failed mid-way: tear down the chunks we grabbed, fall back to per-tile below */
             for(int i=0;i<w->n_own_bufs;i++) orki_bdestroy(c->fd,&w->own_bufs[i]);
@@ -3073,7 +3063,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/32;
             struct buf*bf=&w->Bf[ns]; *bf=orki_bimport(c->fd,(size_t)K*Nc,w->domain);
             if(!bf->cpu){ ok=0; break; }
-            int8_t*fb=bf->cpu; double _bf=g_load_prof?ork_now_us():0;
+            int8_t*fb=bf->cpu; double _bf=orki_load_prof?ork_now_us():0;
             orki_dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32,kf0=k0/32;
                 const int8_t*sb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
@@ -3084,7 +3074,7 @@ ork_w *ork_mm_load_i8_import(ork_npu *c,int K,int N,const void *blob,size_t n){
                     memcpy(fb + ((size_t)nt*KTf + kf0)*32*32,
                            sb + (size_t)nt*KT*32*32,
                            (size_t)KT*32*32);}
-            orki_dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); if(g_load_prof) g_lp_bf+=ork_now_us()-_bf;}
+            orki_dmabuf_sync(bf->heap_fd,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); if(orki_load_prof) orki_lp_bf+=ork_now_us()-_bf;}
         if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
     return w;
 }
@@ -4601,10 +4591,10 @@ int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     /* decode (M=1) + non-batch shapes ride the per-row doorbell chain (ork_dyn_begin_mc_i4): Sk>1/Sn>1 via
      * chained column/K-slice programs. -4 (over-large chain / unsupported int4 shape) => refuse (rescue-eligible).
      * All blocking int4 paths (i4_mcworker / INCR / CBATCH / blocking BCHAIN) are removed (#45/#52). */
-    if(!g_ork_prof){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;
+    if(!orki_ork_prof){ int r=run_i4_mc_db(c,w,M,A,C,nc); if(r!=-4) return r;
         if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue the refused shape via BCHAIN sub-tiles, else refuse */
         return ORK_RC_WEDGE_PRONE; }
-    double t0=ork_now_us(); int r=run_i4_mc_db(c,w,M,A,C,nc); g_prof_i4_us+=ork_now_us()-t0; g_prof_i4_calls++;
+    double t0=ork_now_us(); int r=run_i4_mc_db(c,w,M,A,C,nc); orki_prof_i4_us+=ork_now_us()-t0; orki_prof_i4_calls++;
     if(r!=-4) return r;
     if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }   /* #33: rescue */
     return ORK_RC_WEDGE_PRONE;
@@ -4701,13 +4691,8 @@ int orki_mc_ensure(ork_npu *c,int nc){
 /* ORK_MCPROF diagnostic: per-core phase timing (copy / submit / acc). Populated by the single-core
  * orki_run() path (the multi-core matmul now runs on the doorbell colsplit, which reports via its own
  * poll/backoff timers, not g_mc_*). Read via ork_npu_mc_timing. */
-#define MCPROF_MAX 8
-static double g_mc_copy[MCPROF_MAX], g_mc_sub[MCPROF_MAX], g_mc_acc[MCPROF_MAX]; static long g_mc_n[MCPROF_MAX];
-static double g_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of g_mc_sub (the OVERLAPPABLE part; ioctl/NPU = sub-synth) */
-void ork_npu_mc_reset(void){ for(int i=0;i<MCPROF_MAX;i++){g_mc_copy[i]=g_mc_sub[i]=g_mc_acc[i]=g_mc_synth[i]=0;g_mc_n[i]=0;} }
-void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n){
-    if(copy)*copy=g_mc_copy[core]; if(sub)*sub=g_mc_sub[core]; if(acc)*acc=g_mc_acc[core]; if(n)*n=g_mc_n[core]; }
-double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?g_mc_synth[core]:0; }
+double orki_mc_copy[MCPROF_MAX], orki_mc_sub[MCPROF_MAX], orki_mc_acc[MCPROF_MAX]; long orki_mc_n[MCPROF_MAX];
+double orki_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of orki_mc_sub (the OVERLAPPABLE part; ioctl/NPU = sub-synth) */
 
 void orki_pin_big_core(int id){
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;   /* cached: hot for i4 per-call */
@@ -4758,13 +4743,9 @@ void orki_npu_pool_ensure(ork_npu *c){
 }
 /* run_multicore phase timing (ORK_RT): setup (checks+mc_ensure+cres memset), submit (pool dispatch
  * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
-static double g_rt_setup=0, g_rt_submit=0, g_rt_copy=0; static long g_rt_n=0;
-void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n){ if(setup)*setup=g_rt_setup; if(submit)*submit=g_rt_submit; if(copy)*copy=g_rt_copy; if(n)*n=g_rt_n; }
+double orki_rt_setup=0, orki_rt_submit=0, orki_rt_copy=0; long orki_rt_n=0;
 /* FLOOR-DECOMP accessors: ioctl_us = total wall inside SUBMIT ioctls; hw_us = total sub->hw_elapse_time as
- * reported by the kernel (raw units — see hw_raw_last); n = count. See globals near g_fd_ioctl_us. */
-void ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n){
-    if(ioctl_us)*ioctl_us=g_fd_ioctl_us; if(hw_us)*hw_us=g_fd_hw_us; if(hw_raw_last)*hw_raw_last=g_fd_hw_raw_last; if(n)*n=g_fd_n; }
-void ork_npu_floor_reset(void){ g_fd_ioctl_us=0; g_fd_hw_us=0; g_fd_hw_raw_last=0; g_fd_n=0; }
+ * reported by the kernel (raw units — see hw_raw_last); n = count. See globals near orki_fd_ioctl_us. */
 /* MODE-TRANSITION RE hooks (mode_probe.c). The standalone SDP ops (ork_npu_ewmul_*, act_lut_i16 →
  * exp/silu/…) reprogram the pipeline (their own ACT_RESET + SDP regcmd) but leave c->last_dt / c->warmed
  * untouched, so a following SAME-dtype matmul sees dt==last_dt and SKIPS its reset/re-warm — running a
@@ -4857,16 +4838,10 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
 /* ORK_XPROF diagnostic: count how often each profile is entered from each predecessor mode, to
  * empirically test transition reachability (e.g. is XP_CHAIN_NT ever entered from F16?). Dumped by
  * ork_npu_xprof_dump() at teardown. Zero cost when off (one cached getenv). */
-static long g_xcount[XP_NPROFILE][8]; static int g_xprof=-1;
-static const char *XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
+long orki_xcount[XP_NPROFILE][8]; int orki_xprof=-1;
+const char *orki_XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
     "I4_MC","I4_MWARM","I4_INCR","I4CHAIN","I4_STREAM","SDP"};
-static const char *XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
-void ork_npu_xprof_dump(void){
-    if(g_xprof<=0) return;
-    fprintf(stderr,"[ork XPROF] transition counts (profile <- from):\n");
-    for(int p=0;p<XP_NPROFILE;p++){ long tot=0; for(int f=0;f<8;f++) tot+=g_xcount[p][f]; if(!tot) continue;
-        fprintf(stderr,"  %-11s:",XPNAME[p]); for(int f=0;f<8;f++) if(g_xcount[p][f]) fprintf(stderr," %s=%ld",XFROM[f],g_xcount[p][f]); fprintf(stderr,"\n"); }
-}
+const char *orki_XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
 int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
     const struct ork_xspec *x=&XSPEC[profile];
     int from=c->last_dt, fd=c->fd;
@@ -4876,8 +4851,8 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
      * hook is intentionally explicit even though no entry-transition currently requires it (validated:
      * mode_probe + test_ssd_chunk_npu). See AGENTS.md §"Mode-transition layer". */
     c->last_chain = chain;
-    if(g_xprof<0){ const char*e=getenv("ORK_XPROF"); g_xprof=(e&&atoi(e))?1:0; }
-    if(g_xprof){ int fi=from+1; if(fi<0)fi=0; if(fi>7)fi=7; g_xcount[profile][fi]++; }
+    if(orki_xprof<0){ const char*e=getenv("ORK_XPROF"); orki_xprof=(e&&atoi(e))?1:0; }
+    if(orki_xprof){ int fi=from+1; if(fi<0)fi=0; if(fi>7)fi=7; orki_xcount[profile][fi]++; }
     if(x->setdt && from==to) return 0;                 /* mirrors the old `if(dt!=c->last_dt)` guard */
     int kw=0;
     switch(x->kwp){
@@ -5288,21 +5263,21 @@ static int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
                 if(abuf){ adma=(uint32_t)(abuf->dma + ((const char*)A-(const char*)abuf->cpu) + (size_t)m0*K); }
                 else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=Ai[(size_t)(m0+r)*K+j];
                        orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE); adma=(uint32_t)c->Af.dma; }
-                double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
+                double _ts0=ork_now_us(); orki_mc_copy[0]+=_ts0-_tc0;
                 uint32_t cdma=cbuf?(uint32_t)(cbuf->dma + ((const char*)C-(const char*)cbuf->cpu) + (size_t)m0*N*4):(uint32_t)c->Cc.dma;
                 uint32_t rc[REGCMD_N]; orki_synth_i8(rc,mc,Kp,Nc,adma,(uint32_t)wbase,cdma,sched,CBUF,cbuf?N:Nc);
                 if (orki_validate_regcmd("run_fullk_dec", c, rc, REGCMD_N, w, NULL, 0)) return -1;
                 memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
                 if(cbuf){ if(orki_submit1(c)) return -1; }                       /* ZC-OUT writes user C, not c->Cc -> keep blocking */
                 else    { if(orki_submit1_db(c,(size_t)mc*Nc)) return -1; }      /* P3 #7: c->Cc int32 output rides the doorbell */
-                double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
+                double _ta0=ork_now_us(); orki_mc_sub[0]+=_ta0-_ts0;
                 
                 /* For output zero copy, the NPU writes directly to the user-provided C buffer.
                  * We MUST invalidate the CPU cache here so the host reads the fresh NPU output instead of stale cache lines. */
                 if(cbuf) orki_bsync(fd,cbuf,RKNPU_MEM_SYNC_FROM_DEVICE);
                 
                 if(!cbuf){ int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]=cc[(size_t)r*Nc+n]; }
-                g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
+                orki_mc_acc[0]+=ork_now_us()-_ta0; orki_mc_n[0]++;
             }
         }
         if(cbuf){
@@ -5352,17 +5327,17 @@ static int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j]; }
             else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j]; }
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
-            double _ts0=ork_now_us(); g_mc_copy[0]+=_ts0-_tc0;
+            double _ts0=ork_now_us(); orki_mc_copy[0]+=_ts0-_tc0;
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
             if(dt==DT_F16) orki_synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             else           orki_synth_i8(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
             if (orki_validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             if(orki_submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
-            double _ta0=ork_now_us(); g_mc_sub[0]+=_ta0-_ts0;
+            double _ta0=ork_now_us(); orki_mc_sub[0]+=_ta0-_ts0;
             if(dt==DT_F16){ float  *cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
             else { int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
-            g_mc_acc[0]+=ork_now_us()-_ta0; g_mc_n[0]++;
+            orki_mc_acc[0]+=ork_now_us()-_ta0; orki_mc_n[0]++;
         }
       }
     }
@@ -5404,14 +5379,14 @@ int ork_mm_run_i8(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
      * auto-engage ONLY when Bfold is present (eligible shape), fold_ns is the 2-3 slice winning band, and M is
      * in-envelope. This makes it ubatch-selective for free: small batches fold, large batches take normal. */
     if(w->Bfold && w->fold_ns>=2 && w->fold_ns<=3 && M>=1 && M<=64 && !getenv("ORK_NOFOLD")){
-        double tf = g_ork_prof ? ork_now_us() : 0;
+        double tf = orki_ork_prof ? ork_now_us() : 0;
         int rf = ork_npu_fold_run_w(c,w,M,(const int8_t*)A,C,0,NULL);
-        if(rf==0){ if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-tf; g_prof_i8_calls++; } return 0; }
+        if(rf==0){ if(orki_ork_prof){ orki_prof_i8_us+=ork_now_us()-tf; orki_prof_i8_calls++; } return 0; }
         /* fold declined (alloc/shape) — fall through to the normal path, no behavior change */
     }
-    double t0 = g_ork_prof ? ork_now_us() : 0;
+    double t0 = orki_ork_prof ? ork_now_us() : 0;
     int r = orki_run(c,w,M,A,C);
-    if(g_ork_prof){ g_prof_i8_us+=ork_now_us()-t0; g_prof_i8_calls++; }
+    if(orki_ork_prof){ orki_prof_i8_us+=ork_now_us()-t0; orki_prof_i8_calls++; }
     if(trace){ long cmn=2147483647L,cmx=-2147483648L,cz=0; size_t nc=(size_t)M*w->N;
         for(size_t i=0;i<nc;i++){ int32_t v=C[i]; if(v<cmn)cmn=v; if(v>cmx)cmx=v; if(!v)cz++; }
         fprintf(stderr,"[RUN#%ld]   -> rc=%d C[int32] min=%ld max=%ld zero=%ld/%zu head=[%d %d %d %d]\n",

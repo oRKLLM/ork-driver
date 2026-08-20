@@ -18,7 +18,6 @@
 
 /* ---- core/prof.c — profiling + timing accessors ---- */
 void ork_load_prof_dump(void);
-void ork_ssm_prof_dump(void); /* fwd: ORK_SSM_PROF per-section accounting */ void ork_ssm_helper_stop(ork_npu *c); /* fwd: stop the little-core marshalling helper */ static void ork_npu_xprof_dump(void); void ork_npu_free(ork_npu *c);
 void ork_npu_mc_reset(void);
 void ork_npu_mc_timing(int core,double*copy,double*sub,double*acc,long*n);
 double ork_npu_mc_synth(int core);
@@ -26,8 +25,6 @@ void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n);
 void ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n);
 void ork_npu_floor_reset(void);
 void ork_npu_xprof_dump(void);
-int ork_npu_doorbell_prof(ork_npu *c,int M,int K,int N,int iters,double *block_us,double *nb_us,int *ok_block,int *ok_nb);
-int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters, double *npu_solo,double *cpu_solo,double *overlap_wall,int *ok);
 
 /* ---- core/buf.c — DMA buffer lifecycle, dma-heap import, the weight arena, zero-copy ---- */
 size_t orki_pgup(size_t s);
@@ -123,5 +120,30 @@ int ork_big_core_set(cpu_set_t *s);
 
 /* ---- core/mode.c — the mode-transition layer (XSPEC / ork_npu_enter) ---- */
 int ork_npu_enter(ork_npu *c, int to, int profile, int chain);
+
+/* ---- profiling counters (defined in npu.c; accessors in core/prof.c) ---- */
+#define MCPROF_MAX 8
+extern const char *orki_XFROM[8];
+extern const char *orki_XPNAME[XP_NPROFILE];
+extern double orki_fd_hw_us;
+extern double orki_fd_ioctl_us;
+extern double orki_lp_alloc, orki_lp_mmap, orki_lp_prime, orki_lp_create, orki_lp_memcpy, orki_lp_bf;
+extern double orki_mc_copy[MCPROF_MAX], orki_mc_sub[MCPROF_MAX], orki_mc_acc[MCPROF_MAX];
+extern double orki_mc_synth[MCPROF_MAX];
+extern double orki_prof_i8_us, orki_prof_i4_us;
+extern double orki_rt_setup, orki_rt_submit, orki_rt_copy;
+extern int orki_load_prof;
+extern int orki_ork_prof;
+extern int orki_xprof;
+extern long orki_fd_n;
+extern long orki_lp_nchunk;
+extern long orki_mc_n[MCPROF_MAX];
+extern long orki_prof_i8_calls, orki_prof_i4_calls;
+extern long orki_prof_submits;
+extern long orki_xcount[XP_NPROFILE][8];
+
+extern long long orki_fd_hw_raw_last;
+extern size_t orki_lp_bytes;
+extern long orki_rt_n;
 
 #endif /* ORK_NPU_CORE_H */
