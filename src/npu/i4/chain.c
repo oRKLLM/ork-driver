@@ -616,3 +616,163 @@ int ork_dyn_grouped_end(ork_dyn_chain *h) {
     if (orki_ork_term) { sigaction(SIGTERM, &orki_prev_sig[0], NULL); raise(SIGTERM); }
     return rc;
 }
+ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
+    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
+    for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
+        if (!w || w->dtype != DT_I4 || tasks[i].M != 1 || w->Sk > 16) return NULL;   /* int4 HW chain: M=1; A1: Sn>1 N-tiled; A2: Sk>1 K-split (int16 partials summed in end) — Sk bounded (per-row A-slice array) */
+        if (w->domain != tasks[0].w->domain) return NULL; }   /* one submit => one domain */
+    if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);
+    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
+    if (orki_mc_ensure(c, nc)) return NULL;
+    int fd = c->fd;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = S; h->P = S; h->N = tasks[0].w->N; h->dom = tasks[0].w->domain; h->reserve = S; h->mc = 1; h->esz = 2;
+    unsigned dom = tasks[0].w->domain;
+    /* int4 ALWAYS copy-back: per-core in-domain int16 scratch (M=1 => N int16/op), widened in end() */
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*S/nc), hi=(int)((long)(i+1)*S/nc), P=hi-lo; if (P<1) continue;
+        size_t osz = 0; for (int p = lo; p < hi; p++) osz += (size_t)tasks[p].w->N * tasks[p].w->Sk * 2;   /* Sk int16 partial blocks/row (A2 K-split; Sk==1 => N int16) */
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
+    uint32_t rc[REGCMD_I4_N];
+    int NMAX = c->soc->nmax, KS = ORK_I4_KS;
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    for (int i = 0; i < nc; i++) {
+        int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
+        if (P < 1) { Pc[i] = 0; continue; }
+        /* PROGRAM count decoupled from row-task count: a row emits Sn*Sk programs (N-slices x K-slices). */
+        int Pcore = 0; for (int p = lo; p < hi; p++) Pcore += tasks[p].w->Sn * tasks[p].w->Sk;
+        Pc[i] = Pcore;
+        if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        size_t astage = 0, coff = 0; int pp = 0;
+        for (int p = lo; p < hi; p++) {
+            const ork_mm_task_i8 *t = &tasks[p]; ork_w *w = t->w; int K = w->K, N = w->N, Sn = w->Sn, Sk = w->Sk;
+            /* A2 K-SPLIT: stage this row's Sk activation K-slices (each Kp nibbles, 0.5 B/elem), shared by the
+             * row's N-slices. Sk<=16 (guarded above); each slice reads A[:, ks*KS : ks*KS+Kp]. */
+            uint32_t aslice[16];
+            for (int ks = 0; ks < Sk; ks++) { int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS; size_t asz = (size_t)Kp / 2;
+                if (astage + asz > AF->size) { free(h); return NULL; }
+                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, (const int8_t*)t->A, k0, Kp);
+                aslice[ks] = (uint32_t)(AF->dma + astage); astage += asz; }
+            /* A1 N-tile x A2 K-split: one program per (N-slice ns, K-slice ks). The row's output is Sk blocks
+             * of [N] int16 (block ks = the K-slice-ks partial; column-slices write their [Nc] within it); the
+             * drain SUMS the Sk blocks per column -> int32 C (oSk). Sk==1 => one block = A1's plain widen. */
+            for (int ns = 0; ns < Sn; ns++) {
+                int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                for (int ks = 0; ks < Sk; ks++) {
+                    int k0 = ks * KS, Kp = (K - k0 < KS) ? (K - k0) : KS;
+                    uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)ks * N * 2 + (size_t)n0 * 2);   /* block ks, columns [n0,n0+Nc) */
+                    struct buf *WT = &w->Bb[(size_t)ns * Sk + ks];
+                    uint32_t bdma = (uint32_t)WT->dma;                                                   /* weight N-slice ns, K-slice ks */
+                    if (getenv("ORK_I4_DIAG")) { unsigned char *bc=(unsigned char*)WT->cpu;
+                        fprintf(stderr,"[i4diag] mc_i4 wdom=%d dom_active=%d imported=%d ns=%d ks=%d Kp=%d Nc=%d | bdma=0x%llx obj=0x%llx size=%zu cpu=%p bytes[0..7]=",
+                            w->domain, c->dom_active, (w->own_bufs&&w->n_own_bufs>0)||w->own_buf_valid, ns, ks, Kp, Nc,
+                            (unsigned long long)WT->dma, (unsigned long long)WT->obj, WT->size, WT->cpu);
+                        if(bc) for(int z=0;z<8;z++) fprintf(stderr,"%02x ",bc[z]); else fprintf(stderr,"(null)");
+                        fprintf(stderr,"| aslice=0x%x cdma=0x%x\n", aslice[ks], cdma); fflush(stderr); }
+                    memset(rc, 0, sizeof rc);
+                    orki_synth_i4(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
+                    if (orki_validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */
+                    tk[pp] = tt; pp++;
+                }
+            }
+            int gi = p;
+            h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
+            h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk;   /* Sk int16 partial blocks of [N]; end() sums -> int32 C */
+            coff += (size_t)Sk * N * 2;
+        }
+        memset(&subs[i], 0, sizeof subs[i]);
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj;
+        subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
+    }
+    /* seed the FULL int16 output surface (clean-before-write for fresh/reused scratch; = the probe's fix) */
+    for (int x = 0; x < S; x++) { int N = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+        for (int col = 0; col < N; col++){ o[col] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[col]):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+    for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
+    /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
+     * esz==2 branch of orki_mc_recover_resubmit re-seeds the full int16 surface). */
+    h->mc_nc = nc; h->mc_dt = DT_I4; h->mc_dom = dom;
+    for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
+    return h;   /* async: end() drains via the esz==2 full-surface int16 poll, then widens int16->int32 into C */
+}
+
+ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A,
+                                                  const float *aScale, const float *bScale, float *Cf, int nc) {
+    if (!w || w->dtype != DT_I4 || !w->gsize || M < 1 || M > 1024) return NULL;
+    int G = w->gsize, K = w->K, N = w->N, Sn = w->Sn, Sk = w->Sk;   /* grouped: Sk = K/G groups */
+    (void)K;
+    if (Sk > 256) return NULL;                                       /* bounds the per-row aslice[]/program count */
+    if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > M) nc = M;
+    if (getenv("ORK_GRP_DEBUG")) { fprintf(stderr, "[grp] M=%d K=%d N=%d G=%d Sk=%d Sn=%d nc=%d progs/core~%d\n",
+        M, w->K, N, G, Sk, Sn, nc, (M+nc-1)/nc * Sn * Sk); fflush(stderr); }
+    if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
+    ork_npu_enter(c, 4 /*DT_I4_CHAIN*/, XP_I4CHAIN, OCK_HW);
+    if (orki_mc_ensure(c, nc)) return NULL;
+    int fd = c->fd, NMAX = c->soc->nmax;
+    ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
+    h->c = c; h->S = M; h->P = M; h->N = N; h->dom = w->domain; h->reserve = M; h->mc = 1; h->esz = 2;
+    h->i4g = 1; h->i4g_aS = aScale; h->i4g_bS = bScale; h->i4g_Cf = Cf; h->i4g_N = N; h->i4g_Sk = Sk;
+    unsigned dom = w->domain;
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) continue;
+        size_t osz = (size_t)P * Sk * N * 2;                         /* rows-on-core x Sk int16 blocks of [N] */
+        if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
+            if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
+    uint32_t rc[REGCMD_I4_N];
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) { Pc[i]=0; continue; }
+        int Pcore = P * Sn * Sk; Pc[i] = Pcore;
+        if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
+        struct buf *RC = &c->mrc[i], *AF = &c->maf[i], *CC = &c->mcc[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
+        size_t astage = 0, coff = 0; int pp = 0;
+        for (int m = lo; m < hi; m++) { const int8_t *Arow = A + (size_t)m * w->K;
+            uint32_t aslice[256];                                    /* this row's Sk group A-slices (each G nibbles) */
+            for (int g = 0; g < Sk; g++) { size_t asz = (size_t)G / 2;
+                if (astage + asz > AF->size) { free(h); return NULL; }
+                orki_tile_i4_Aslice((uint8_t*)AF->cpu + astage, Arow, g * G, G);
+                aslice[g] = (uint32_t)(AF->dma + astage); astage += asz; }
+            for (int ns = 0; ns < Sn; ns++) { int n0 = ns * NMAX, Nc = (N - n0 < NMAX) ? (N - n0) : NMAX;
+                for (int g = 0; g < Sk; g++) {
+                    uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)g * N * 2 + (size_t)n0 * 2);   /* block g, cols [n0,n0+Nc) */
+                    uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + g].dma;
+                    memset(rc, 0, sizeof rc);
+                    orki_synth_i4(rc, 1, G, Nc, aslice[g], bdma, cdma);
+                    if (orki_validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
+                    if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
+                        rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);
+                        rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
+                    memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
+                    struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;
+                    tk[pp] = tt; pp++;
+                } }
+            int gi = m; h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = NULL;
+            h->nout[gi] = Sk * N; h->oM[gi] = 1;                     /* Sk int16 partial blocks; grouped_end float-accumulates */
+            coff += (size_t)Sk * N * 2;
+        }
+        memset(&subs[i], 0, sizeof subs[i]);
+        subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj; subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
+        subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
+    }
+    for (int x = 0; x < M; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+        for (int e = 0; e < no; e++) { o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < nc; i++) if (Pc[i]) {
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+    for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
+    ork_install_term();
+    return h;
+}

@@ -1,7 +1,7 @@
 /* rknpu_ioctl.h — userspace UAPI for the Rockchip RKNPU DRM driver.
  *
  * Transcribed from the Rockchip BSP kernel
- *   drivers/rknpu/include/rknpu_ioctl.h  (branch develop-6.1)
+ *   drivers/rknpu/src/rknpu_ioctl.h  (branch develop-6.1)
  * verified against the board's kernel 6.1.115-vendor-rk35xx (RKNPU driver v0.9.8,
  * RK3588). The NPU is a DRM device exposed as render node /dev/dri/renderD129
  * (DRIVER=RKNPU, of_node=npu). Render nodes need no DRM auth/master.

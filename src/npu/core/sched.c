@@ -199,3 +199,39 @@ int ork_big_core_set(cpu_set_t *s){
     (void)s; return 0;
 #endif
 }
+int orki_mc_ensure(ork_npu *c,int nc){
+    int fd=c->fd;
+    if(!c->mtk_all.cpu) {
+        c->mtk_all=orki_bscratch(c, sizeof(struct rknpu_task) * ORK_MAXCORE, 0x40b, c->dom_active);
+        if(!c->mtk_all.cpu) {
+            fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate mtk_all task buffer (IOMMU full?)\n");
+            return -1;
+        }
+    }
+    for(int i=0;i<nc;i++){
+        if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
+        c->mrc[i]=orki_bscratch(c,65536,0x403,c->dom_active); c->mtk[i]=orki_bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=orki_bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
+        if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
+            fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
+            return -1;
+        }
+        struct rknpu_task t;memset(&t,0,sizeof t);t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->mrc[i].dma;
+        memcpy(c->mtk[i].cpu,&t,sizeof t); orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_task *tall = (struct rknpu_task*)c->mtk_all.cpu;
+        tall[i] = t;
+    }
+    int reg_amt = (c->last_dt == DT_I4) ? 116 : 108;
+    struct rknpu_task *tall = (struct rknpu_task*)c->mtk_all.cpu;
+    for(int i=0;i<nc;i++){
+        struct rknpu_task *t = (struct rknpu_task*)c->mtk[i].cpu;
+        if (t->regcfg_amount != reg_amt) {
+            t->regcfg_amount = reg_amt;
+            orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        }
+        if (tall[i].regcfg_amount != reg_amt) {
+            tall[i].regcfg_amount = reg_amt;
+        }
+    }
+    orki_bsync(fd,&c->mtk_all,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    return 0;
+}

@@ -272,3 +272,59 @@ void orki_bstage_unmap(int fd, struct buf*b){
 }
 
 void orki_bstage_free(struct buf*b){ if(!b->cpu) return; munmap(b->cpu,b->size); if(b->heap_fd>0) close(b->heap_fd); memset(b,0,sizeof *b); }
+int orki_is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const struct buf *extra, int extra_n) {
+    if (addr == 0) return 0;
+    if (c->regcmd.cpu && addr >= c->regcmd.dma && addr < c->regcmd.dma + c->regcmd.size) return 1;
+    if (c->task.cpu && addr >= c->task.dma && addr < c->task.dma + c->task.size) return 1;
+    if (c->Af.cpu && addr >= c->Af.dma && addr < c->Af.dma + c->Af.size) return 1;
+    if (c->Cc.cpu && addr >= c->Cc.dma && addr < c->Cc.dma + c->Cc.size) return 1;
+    for (int i = 0; i < ORK_MAXCORE; i++) {
+        if (c->mrc[i].cpu && addr >= c->mrc[i].dma && addr < c->mrc[i].dma + c->mrc[i].size) return 1;
+        if (c->mtk[i].cpu && addr >= c->mtk[i].dma && addr < c->mtk[i].dma + c->mtk[i].size) return 1;
+        if (c->maf[i].cpu && addr >= c->maf[i].dma && addr < c->maf[i].dma + c->maf[i].size) return 1;
+        if (c->mcc[i].cpu && addr >= c->mcc[i].dma && addr < c->mcc[i].dma + c->mcc[i].size) return 1;
+    }
+    if (c->mtk_all.cpu && addr >= c->mtk_all.dma && addr < c->mtk_all.dma + c->mtk_all.size) return 1;
+    for (int i = 0; i < c->dma_n; i++) {
+        if (c->dma_tab[i].cpu && addr >= c->dma_tab[i].dma && addr < c->dma_tab[i].dma + c->dma_tab[i].size) return 1;
+    }
+    if (w) {
+        if (w->Bb) {
+            int num_weights = w->Sn * w->Sk;
+            for (int i = 0; i < num_weights; i++) {
+                if (w->Bb[i].cpu && addr >= w->Bb[i].dma && addr < w->Bb[i].dma + w->Bb[i].size) return 1;
+            }
+        }
+        if (w->Bf) {
+            for (int i = 0; i < w->Sn; i++) {
+                if (w->Bf[i].cpu && addr >= w->Bf[i].dma && addr < w->Bf[i].dma + w->Bf[i].size) return 1;
+            }
+        }
+        /* fp16 CONTIG (Task #50): the contiguous concatenated weight (all K-slices in ONE buffer). Without this
+         * clause a valid Bbc.dma+offset weight base was FALSE-flagged "wild/unallocated" -> validate_regcmd failed
+         * -> CONTIG refused -> fell back to the concurrent per-slice path that wedges. Bbc.cpu==0 when unused. */
+        if (w->Bbc.cpu && addr >= w->Bbc.dma && addr < w->Bbc.dma + w->Bbc.size) return 1;
+        for (int i = 0; i < 3; i++) if (w->Bgap[i].cpu && addr >= w->Bgap[i].dma && addr < w->Bgap[i].dma + w->Bgap[i].size) return 1;   /* CONTIG GAP-stagger filler buffers */
+    }
+    if (extra && extra_n > 0) {
+        for (int i = 0; i < extra_n; i++) {
+            if (extra[i].cpu && addr >= extra[i].dma && addr < extra[i].dma + extra[i].size) return 1;
+        }
+    }
+    return 0;
+}
+
+int ork_dmabuf_alloc(size_t size, void **ptr){
+    int hf=orki_dmaheap_open(); if(hf<0) return -1;
+    size_t sz=orki_pgup(size);
+    struct dma_heap_allocation_data a; memset(&a,0,sizeof a); a.len=sz; a.fd_flags=O_RDWR|O_CLOEXEC;
+    if(ioctl(hf,DMA_HEAP_IOCTL_ALLOC,&a)){ perror("DMA_HEAP_ALLOC(client)"); return -1; }
+    int dbuf=(int)a.fd;
+    void*p=mmap(NULL,sz,PROT_READ|PROT_WRITE,MAP_SHARED,dbuf,0);
+    if(p==MAP_FAILED){ perror("mmap(client dmabuf)"); close(dbuf); return -1; }
+    orki_dmabuf_sync(dbuf,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);
+    if(ptr) *ptr=p;
+    return dbuf;
+}
+
+void ork_dmabuf_seal(int dbuf){ if(dbuf>=0) orki_dmabuf_sync(dbuf,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); }

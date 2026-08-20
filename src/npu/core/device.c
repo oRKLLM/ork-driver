@@ -42,6 +42,7 @@ struct ork_npu *orki_npu_ctx = NULL;
  * the NPU uses a later copy, so a first-match-only patch leaves stale values. */
 #include <stdarg.h>
 #include <sys/prctl.h>
+#include "regcmd_array_4x32x16.h"
 #include "ork_regs.h"
 #include "regcmd_i8.h"
 /* SETRN — named, bounds-checked register write (register-naming layer, task #40). Looks up the (block,
@@ -326,3 +327,26 @@ const char *ork_npu_version(void){
 }
 
 uint32_t ork_pack_format_version(void){ return ORK_PACK_FORMAT_VERSION; }   /* decoupled from the library MAJOR — bump only on a real on-disk format change (see ork_npu.h) */
+void ork_npu_reap_stuck(ork_npu *c, int nc){
+    int fd=c->fd, K=512, N=16, CBUF=c->soc->cbuf_elems;  unsigned dom=c->dom_active;
+    if(nc<1) nc=1; if(nc>c->soc->cores) nc=c->soc->cores;
+    struct buf A=orki_bcreate(fd,(size_t)K*2,0x403,dom), B=orki_bcreate(fd,(size_t)K*N*2,0x403,dom), Cc=orki_bcreate(fd,(size_t)N*2,0x403,dom);
+    if(!A.cpu||!B.cpu||!Cc.cpu){ if(A.cpu)orki_bdestroy(fd,&A); if(B.cpu)orki_bdestroy(fd,&B); if(Cc.cpu)orki_bdestroy(fd,&Cc); return; }
+    memset(A.cpu,0,(size_t)K*2); memset(B.cpu,0,(size_t)K*N*2);
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t rc[REGCMD_N]; int sched=((K&(K-1))==0 && K>=128 && K<2048);
+    orki_synth(rc,1,K,N,(uint32_t)A.dma,(uint32_t)B.dma,(uint32_t)Cc.dma,sched,CBUF); orki_set_f16_out_fp16in(rc,1,N);
+    memcpy(c->regcmd.cpu,rc,(size_t)REGCMD_N*4); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
+    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
+    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    for(int i=0;i<nc;i++){
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        s.flags=0x1|0x2u; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=1u<<i; s.fence_fd=-1; s.timeout=300;
+        s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        orki_rknpu_submit_ioctl(fd,&s,dom);   /* triggers rknpu_job_timeout_clean(core i) -> clean reap of a timed-out stuck job */
+        ork_kmsg("reap-stuck: fp16 nonblock dummy core=%d (trigger timeout_clean)", i);
+        struct timespec ds={0,3000000}; nanosleep(&ds,NULL);   /* let this core's dummy land + the scheduled cleanup_work run */
+    }
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
+}

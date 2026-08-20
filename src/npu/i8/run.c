@@ -672,3 +672,80 @@ int ork_bmm_i8(ork_npu *c, int nbatch, int M, int K, int N,
                const int8_t *A, const int8_t *B, int32_t *C){
     ork_bmm_strides s=orki_bmm_natural(M,K,N); return ork_bmm_i8_strided(c,nbatch,M,K,N,A,B,C,&s);
 }
+static void *stream_worker(void *vp) {
+    struct streamw *a = vp; ork_npu *c = a->c; int fd = c->fd, i = a->core, CBUF = c->soc->cbuf_elems;
+    orki_pin_big_core(i);
+    int k;
+    a->rc = 0;
+    uint32_t rc[REGCMD_I8_N + 4];
+    while ((k = __atomic_fetch_add(a->ctr, 1, __ATOMIC_SEQ_CST)) < a->S) {
+        const ork_mm_task_i8 *t = &a->tasks[k];
+        ork_w *w = t->w; int M = t->M, K = w->K, N = w->N, mcap = orki_chain_fullk_mcap_i8(c, K);
+        uint32_t bdma = w->Bf ? (uint32_t)w->Bf[0].dma : (uint32_t)w->Bb[0].dma;
+        memcpy(c->maf[i].cpu, t->A, (size_t)M * K);
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        int ntiles = (M + mcap - 1) / mcap, p = 0;
+        for (int m0 = 0; m0 < M; m0 += mcap, p++) {
+            int mc = (M - m0 < mcap) ? (M - m0) : mcap;
+            memset(rc, 0, sizeof rc);
+            orki_synth_i8(rc, mc, K, N, (uint32_t)(c->maf[i].dma + (size_t)m0 * K), bdma,
+                     (uint32_t)(c->mcc[i].dma + (size_t)m0 * N * 4), 1, CBUF, 0);
+            if (p < ntiles - 1) {
+                uint64_t nd = c->mrc[i].dma + (size_t)(p + 1) * REGCMD_I8_N * 4;
+                rc[216] = 0x0010 | ((nd & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nd >> 16) & 0xffff);
+                rc[218] = 0x0014 | (0x0037 << 16); rc[219] = (0x0101 << 16) | (0);
+            }
+            memcpy((char *)c->mrc[i].cpu + (size_t)p * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
+        }
+        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt = c->mtk[i].cpu; memset(mt, 0, (size_t)ntiles * sizeof *mt);
+        for (int q = 0; q < ntiles; q++) {
+            mt[q].enable_mask = 0xd; mt[q].int_mask = 0x300; mt[q].int_clear = 0x1ffff;
+            mt[q].regcfg_amount = 108; mt[q].regcmd_addr = c->mrc[i].dma + (size_t)q * REGCMD_I8_N * 4;
+        }
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
+        sub.flags = ork_ppflags(); sub.task_number = ntiles; sub.task_obj_addr = c->mtk[i].obj; sub.core_mask = 1u << i; sub.fence_fd = -1;
+        sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)ntiles};
+        sub.timeout = orki_mm_timeout_ms();
+        /* A freshly-allocated NPU output buffer returns stale on its FIRST write, so prime THIS core's
+         * output buffer with a throwaway submit on its first use (mirror mcworker's reps=c->mwarm[i]?1:2).
+         * Per-core + deterministic: the old coarse whole-stream 2-pass could miss a core whose buffer the
+         * dynamic task counter left idle on the warmup pass, yielding a flaky stale (zero) result. */
+        int reps = c->mwarm[i] ? 1 : 2;
+        for (int rep = 0; rep < reps; rep++) {
+            if (orki_rknpu_submit_ioctl(fd, &sub, w->domain)) { if (rep == reps - 1) a->rc = -1; continue; }
+            orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        }
+        c->mwarm[i] = 1;   /* this core's buffer index is disjoint per worker — no cross-thread race */
+        memcpy(t->C, c->mcc[i].cpu, (size_t)M * N * 4);
+    }
+    return NULL;
+}
+
+void *orki_stream_worker_i8sk(void *vp){
+    struct streamw_i8sk *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core, CBUF=c->soc->cbuf_elems;
+    orki_pin_big_core(i);
+    int k; a->rc=0;
+    uint32_t rc[REGCMD_I8_N];
+    while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->S){
+        const ork_mm_task_i8 *t=&a->tasks[k]; ork_w *w=t->w; int M=t->M, K=w->K, N=w->N;
+        int sched=(K&(K-1))==0 && K>=256 && K<2048;   /* int8 0x1040 sched zeros output for K<256 -> off at small K */
+        memcpy(c->maf[i].cpu, t->A, (size_t)M*K); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        memset(rc,0,REGCMD_I8_N*4);
+        orki_synth_i8(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF, N);
+        memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+        struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
+        mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
+        orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+        struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+        sub.flags=ork_ppflags(); sub.task_number=1; sub.task_obj_addr=c->mtk[i].obj; sub.core_mask=1u<<i; sub.fence_fd=-1;
+        sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        sub.timeout=orki_mm_timeout_ms();
+        int reps=c->mwarm[i]?1:2;
+        for(int rep=0;rep<reps;rep++){ if(orki_rknpu_submit_ioctl(fd,&sub,w->domain)){ if(rep==reps-1)a->rc=-1; continue; } orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE); }
+        c->mwarm[i]=1;
+        memcpy(t->C, c->mcc[i].cpu, (size_t)M*N*4);   /* int32 output */
+    }
+    return NULL;
+}

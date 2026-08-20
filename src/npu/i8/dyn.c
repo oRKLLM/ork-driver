@@ -947,3 +947,29 @@ void orki_mc_recover_resubmit(ork_dyn_chain *h);   /* shared doorbell recover (d
 double orki_f16_slice_us;   /* running max of a SUCCESSFULLY-landed fp16 K-slice completion (us). Drives the AUTO sentinel detect timeout = 1.5x this (adaptive per shape, vs a flat 800ms). Benign cross-core race — a heuristic, not correctness. */
 
 
+void orki_mc_recover_resubmit(ork_dyn_chain *h){
+    ork_npu *c = h->c; int fd = c->fd;
+    if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[mc-recover] doorbell MISS -> ACT_RESET + resubmit | dom=%d S=%d nc=%d esz=%d\n", h->mc_dom, h->S, h->mc_nc, h->esz);
+    struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+    { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }   /* let the reset fully settle before resubmit — a resubmit into a not-yet-quiesced NPU re-drops (sticky miss) */
+    /* #54 MULTI-DOMAIN: the ACT_RESET above DROPS the NPU's IOMMU domain state. Resubmitting into a non-0
+     * mc_dom then triggers a domain switch that TIMES OUT ("switch iommu domain time out, id: N") and poisons
+     * all subsequent switches (dmesg-confirmed cascade). Re-establish mc_dom's page table with a fresh native
+     * anchor BEFORE the resubmit so the switch lands cleanly. No-op for domain 0 (always established). */
+    if(h->mc_dom > 0) ork_dom_reanchor(c, h->mc_dom);
+    struct buf *cl[1024]; int ncl = 0;                                    /* re-clean output surfaces to DRAM */
+    for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
+        for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
+        if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
+    if (h->esz == 2) {   /* int4: int16 output, full-surface SENT16 (write-order not last-col-last) */
+        for (int x = 0; x < h->S; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
+            for (int e = 0; e < no; e++){ o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
+    } else for (int x = 0; x < h->S; x++) { int Mx = h->oM[x]?h->oM[x]:1, Nx = h->nout[x]?h->nout[x]/Mx:h->N;   /* re-seed sentinels */
+        if (h->mc_seed_all) for (int m=0;m<Mx;m++) for (int n=0;n<Nx;n++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+n); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); }
+        else for (int m=0;m<Mx;m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[x]+(size_t)m*Nx+(Nx-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } }
+    __asm__ volatile("dsb ish":::"memory");
+    for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        h->mc_subs[i].timeout = (h->esz==2) ? orki_i4_submit_tmo_ms() : orki_mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
+}

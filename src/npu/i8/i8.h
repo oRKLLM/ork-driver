@@ -131,4 +131,6 @@ void orki_synth_i8_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,
 
 struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
 
+struct streamw { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
+
 #endif /* ORK_NPU_I8_H */

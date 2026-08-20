@@ -31,4 +31,6 @@ void ork_pool_init(void);
 void *orki_npu_pool_worker(void *vp);
 extern struct ork_npu *orki_npu_ctx;
 
+int orki_is_valid_dma_addr(ork_npu *c, uint32_t addr, const ork_w *w, const struct buf *extra, int extra_n);
+
 #endif /* ORK_NPU_CORE_PRIVATE_H */

@@ -28,6 +28,17 @@
 #include "npu/internal.h"
 #include "npu/core.h"
 #include "npu/i8/i8.h"
+
+struct chainrr_w { ork_npu *c; int core; int nchains; const ork_mm_task_i8 *const *chains; const int *S; const struct chain_silu_spec *ss; int *ctr; int rc; };
+void *orki_chainrr_worker(void *vp){
+    struct chainrr_w *a=vp; orki_pin_big_core(a->core); a->rc=0; int k;
+    while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->nchains){
+        int r=orki_run_chain_i8_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
+        if(r) a->rc=r;
+    }
+    return NULL;
+}
+
 #include "spine_kernels.h"
 
 
@@ -676,3 +687,110 @@ cleanup:
 ork_async *ork_mm_run_chain_i8_async (ork_npu *c, int S, const ork_mm_task_i8 *tasks){
     if (!c || S < 1 || !tasks) return NULL;
     return ork_async_launch((struct ork_async){ .kind=OAK_CHAIN_I8, .c=c, .S=S, .tasks=tasks }); }
+int ork_mm_ffn_orkd(ork_npu *c, ork_w *wg, ork_w *wu, ork_w *wd,
+                    int M, int K, int Nff, int Kd,
+                    int gate_mult, int gate_shift, int up_mult, int up_shift, int glu_mult, int glu_shift,
+                    double in_scale, double out_scale, const int8_t *A, int32_t *out){
+    if (!c || !c->daemon || !wg || !wu || !wd) return -3;
+    if (!wg->is_orkd || !wu->is_orkd || !wd->is_orkd) return -3;   /* weights must be daemon-resident */
+    return orkd_ffn_i8(c->daemon, wg->orkd_id, wu->orkd_id, wd->orkd_id, M, K, Nff, Kd,
+                       gate_mult, gate_shift, up_mult, up_shift, glu_mult, glu_shift, in_scale, out_scale, A, out);
+}
+
+int ork_mm_attn_orkd(ork_npu *c, ork_w *wkt, ork_w *wones, ork_w *wv,
+                     int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                     double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || !c->daemon || !wkt || !wones || !wv) return -3;
+    if (!wkt->is_orkd || !wones->is_orkd || !wv->is_orkd) return -3;   /* weights must be daemon-resident */
+    return orkd_attn_i8(c->daemon, wkt->orkd_id, wones->orkd_id, wv->orkd_id, Nq, Nk, Kp, dv,
+                        r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av);
+}
+
+int ork_mm_attn_rr_orkd(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
+                        int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                        double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || !c->daemon || nchains < 1 || nchains > ORKD_ATTN_RR_MAX || !wkt || !wones || !wv) return -3;
+    if (!wones->is_orkd) return -3;
+    uint64_t *kt = malloc((size_t)nchains*8), *on = malloc((size_t)nchains*8), *v = malloc((size_t)nchains*8);
+    if (!kt || !on || !v){ free(kt); free(on); free(v); return -3; }
+    int ok = 1;
+    for (int n = 0; n < nchains; n++){
+        if (!wkt[n] || !wv[n] || !wkt[n]->is_orkd || !wv[n]->is_orkd){ ok = 0; break; }
+        kt[n] = wkt[n]->orkd_id; on[n] = wones->orkd_id; v[n] = wv[n]->orkd_id;
+    }
+    int rc = ok ? orkd_attn_rr_i8(c->daemon, nchains, kt, on, v, Nq, Nk, Kp, dv,
+                                  r_mult, r_shift, in_scale, out_scale, max_bias, Q, Sigma, av) : -3;
+    free(kt); free(on); free(v);
+    return rc;
+}
+
+int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t *C){
+    /* DEFAULT run_i8: the whole-layer op is a parity/correctness path, not a perf path (decode-on-NPU is a
+     * measured loss), and the M=1 doorbell MISSES at layer dims on RK3588 (a pre-existing doorbell-fragility
+     * issue — see tasks #13/#21 — that returns garbage, rel=1.0). run_i8 is bit-exact + robust here, so it is
+     * the default; ORK_LAYER_DOORBELL=1 opts back into the doorbell for doorbell-miss debugging only. */
+    static int runi8 = -1; if (runi8 < 0) runi8 = getenv("ORK_LAYER_DOORBELL") ? 0 : 1;
+    if (!runi8 && K % 512 == 0 && K <= 4096) {
+        for (int t=0;t<4;t++){ ork_mm_task_i8 tk={W,1,(int8_t*)A,C}; ork_dyn_chain *h=ork_dyn_begin(npu,1,&tk);
+            if (!h) break; if (ork_dyn_end(h)==0){ spine_civac_range(C,(size_t)N*4); return 0; } }
+    }
+    if (ork_mm_run_i8(npu,W,1,A,C)==0){ spine_civac_range(C,(size_t)N*4); return 0; }   /* wide-K (down proj K>4096) or doorbell-failed fallback */
+    return -1; }
+
+int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                         const ork_chain_op *ops, double in_scale, double out_scale){
+    if(!c || nchains<1 || !chains || !S || !ops) return -2;
+    if(c->daemon) return -3;                     /* local NPU only (the daemon owns its own scheduler) */
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(orki_silu_calibrate_idx(c)) return -1;
+    for(int i=0;i<nchains;i++){ if(S[i]<1 || !chains[i]) return -2; }
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1;   /* stable contents -> pointer-keyed per-core LUT cache stays valid */
+    if(in_scale!=c_is || out_scale!=c_os){ orki_silu_build_curve(c, orki_exp_f, in_scale, out_scale, lut); c_is=in_scale; c_os=out_scale; }
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
+    /* establish SHARED state ONCE single-threaded (workers skip via force_core>=0): domain + int8-chain mode */
+    if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
+        orki_dom_activate(c, chains[0][0].w->domain);
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
+    orki_npu_pool_ensure(c);
+    struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=orki_chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    orki_chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
+    return rc;
+}
+
+int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
+                                const ork_chain_op *ops, double in_scale, double out_scale, double max_bias){
+    if(!c || nchains<1 || !chains || !S || !ops) return -2;
+    if(c->daemon) return -3;                     /* local NPU only (the daemon owns its own scheduler) */
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(orki_silu_calibrate_idx(c)) return -1;
+    for(int i=0;i<nchains;i++){ if(S[i]<1 || !chains[i]) return -2; }
+    static int16_t lut[1030]; static double c_is=-1, c_os=-1, c_bias=-1e300;
+    if(in_scale!=c_is || out_scale!=c_os || max_bias!=c_bias){
+        orki_silu_build_curve_biased(c, orki_exp_f, in_scale, out_scale, max_bias, lut); c_is=in_scale; c_os=out_scale; c_bias=max_bias;
+        for(int i=0;i<ORK_MAXCORE;i++) c->chain_lut_p[i]=NULL;   /* in-place LUT rebuild -> force each core to reload */
+    }
+    struct chain_silu_spec ss = { ops, -1, -1, 0x4000, 14, 0, 0, 0, ORK_SILU_IDXOFF, ORK_SILU_C4064, ORK_SILU_C4068, lut, 1030 };
+    int nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE; if(nc>nchains)nc=nchains; if(nc<1)nc=1;
+    if(chains[0][0].w && (chains[0][0].w->domain!=c->dom_active || (chains[0][0].w->domain!=0 && !c->dom_save)))
+        orki_dom_activate(c, chains[0][0].w->domain);
+    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_FUSED);
+    orki_npu_pool_ensure(c);
+    struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
+    for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
+    pthread_mutex_lock(&c->pmu);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=orki_chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
+    pthread_mutex_unlock(&c->pmu);
+    orki_chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
+    int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
+    return rc;
+}

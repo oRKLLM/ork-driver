@@ -209,3 +209,35 @@ void orki_set_i8_silu32(uint32_t*rc,int N,int r_mult,int r_shift,uint32_t out_bi
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_R4128,0x40320000);
     orki_setrn(rc,REGCMD_I8_N,RK_DPU_R412C,0x000001a0);
 }
+void orki_set_mul_geom(uint32_t *rc,int n,int M,int N){
+    uint32_t sstride=(uint32_t)(M*16);
+    orki_setrn(rc,n,RK_SDP_500C,(uint32_t)(M-1));          /* RDMA_DATA_CUBE_WIDTH  = M-1 */
+    orki_setrn(rc,n,RK_SDP_5010,0);                        /* RDMA_DATA_CUBE_HEIGHT = 0 (H=1) */
+    orki_setrn(rc,n,RK_SDP_5014,(uint32_t)(N-1));          /* RDMA_DATA_CUBE_CHANNEL= N-1 */
+    orki_setrn(rc,n,RK_SDP_5040,sstride);                  /* RDMA_EW_SURF_STRIDE = M*16 */
+    orki_setrn(rc,n,RK_DPU_DST_SURF_STRIDE,sstride);                  /* output surface stride */
+    orki_setrn(rc,n,RK_DPU_DATA_CUBE_WIDTH,(uint32_t)(M-1));
+    orki_setrn(rc,n,RK_DPU_DST_N_DIMS,(uint32_t)(((N-1)<<16)|(N-1)));
+    orki_setrn(rc,n,RK_DPU_DST_N2,(uint32_t)(N-1));
+    orki_setrn(rc,n,RK_DPU_WDMA_SIZE_1,(uint32_t)(M-1));
+    orki_setrn(rc,n,RK_DPU_SURFACE_ADD,sstride);                  /* SURFACE_ADD = M*16 */
+}
+
+void orki_apply_ork_geom(uint32_t*rc,int n,int mc,int K,int N,int cbuf){
+    orki_setrn(rc,n,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE0,K*N);orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE1,K);
+    orki_setrn(rc,n,RK_CNA_CBUF_CON1,(K+63)/64);orki_setrn(rc,n,RK_CNA_FC_DATA_SIZE1,K);orki_setrn(rc,n,RK_CNA_DMA_CON1,K/16);
+    orki_setrn(rc,n,RK_CNA_DATA_SIZE0,0x10000|mc);orki_setrn(rc,n,RK_CNA_DATA_SIZE0_MIR,0x10000|mc);orki_setrn(rc,n,RK_CNA_DATA_SIZE3,mc);
+    orki_setrn(rc,n,RK_DPU_DATA_CUBE_HEIGHT,mc-1);orki_setrn(rc,n,RK_DPU_WDMA_SIZE_1,(mc-1)<<16);orki_setrn(rc,n,RK_PDP_OUT_M,(mc-1)<<16);
+    orki_setrn(rc,n,RK_DPU_DST_N_DIMS,((N-1)<<16)|(N-1));orki_setrn(rc,n,RK_DPU_DST_N2,N-1);orki_setrn(rc,n,RK_DPU_DATA_CUBE_NOTCH,(((N/4)-1)<<16)|((N/4)-1));
+    orki_setrn(rc,n,RK_CNA_WEIGHT_SIZE2,0x1010000|N);orki_setrn(rc,n,RK_PDP_OUT_N,N-1);
+    int R=(2*cbuf)/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+    int rows=(mc+1<R)?(mc+1):R; orki_setrn(rc,n,RK_CNA_CONV_CON2,16*rows);
+    double scale=(double)K/512.0; int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale),mg=(mc+63)/64; if(mg<1)mg=1;
+    int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,n,RK_CNA_CBUF_CON0,v);
+}
+
+void orki_splice_ew_lane(uint32_t*rc,const uint32_t*base){
+    memcpy(rc,               base,             216*4);                 /* 108 register entries (0x10xx/0x30xx/0x40xx) */
+    memcpy(rc+216,           REGCMD_EW_LANE,   REGCMD_EW_LANE_N*4);    /* 18 second-lane entries (0x50xx) */
+    memcpy(rc+216+REGCMD_EW_LANE_N, base+216,  8*4);                   /* the original end-of-regcmd trailer, now last */
+}

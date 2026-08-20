@@ -247,3 +247,44 @@ int orki_submit1_db(ork_npu *c, size_t nout){
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
     c->warmed=1; return 0;
 }
+int orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
+    if (a_start < c_end && c_start < a_end) {
+        fprintf(stderr, "[ork] ERROR [%s]: memory overlap detected! A [%p, %p) overlaps with C [%p, %p).\n",
+                name, (void*)a_start, (void*)a_end, (void*)c_start, (void*)c_end);
+        return 1;
+    }
+    return 0;
+}
+
+int orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
+    /* stash context so a later submit failure can name the exact weight/op/domain/import-status that faulted */
+    orki_last_op = op ? op : "?";
+    if (w) { orki_last_K = w->K; orki_last_N = w->N; orki_last_wdom = w->domain;
+             orki_last_import = (w->own_buf_valid && w->own_buf.heap_fd > 0) ||
+                             (w->own_bufs && w->n_own_bufs > 0 && w->own_bufs[0].heap_fd > 0) ||
+                             (w->Bb && w->Bb[0].heap_fd > 0) || (w->Bf && w->Bf[0].heap_fd > 0); }
+    for (int k = 0; k + 1 < n; k += 2) {
+        uint32_t offset = rc[k] & 0xffff;
+        uint32_t block_id = rc[k+1] >> 16;
+        uint32_t val = (rc[k] >> 16) | ((rc[k+1] & 0xffff) << 16);
+        const char *reg_name = NULL;
+        if (offset == 0x1070 && block_id == 0x201) reg_name = "adma";
+        else if (offset == 0x1110 && block_id == 0x201) reg_name = "bdma";
+        else if (offset == 0x4020 && block_id == 0x1001) reg_name = "cdma";
+        if (reg_name) {
+            if (val == 0) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s is NULL (0x00000000).\n", op, reg_name);
+                return -1;
+            }
+            if ((val & 15) != 0) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s address 0x%08x is not 16-byte aligned.\n", op, reg_name, val);
+                return -1;
+            }
+            if (!orki_is_valid_dma_addr(c, val, w, extra, extra_n)) {
+                fprintf(stderr, "[ork] ERROR [%s]: regcmd sanity assertion failed! %s address 0x%08x is wild/unallocated (outside all valid buffers).\n", op, reg_name, val);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}

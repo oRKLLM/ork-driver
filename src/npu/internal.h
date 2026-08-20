@@ -6,7 +6,7 @@
  * across the split — lives here. NOT a public header: include/ork_npu.h is the API; this is internals,
  * and nothing outside src/ may include it.
  *
- * Include it the same way from every depth (-Isrc makes this resolve from src/npu.c, src/npu/i8.c and
+ * Include it the same way from every depth (-Isrc makes this resolve from src/npu.c, src/npu/i8/ and
  * src/npu/i8/pack.c alike):   #include "npu/internal.h"
  */
 #ifndef ORK_NPU_INTERNAL_H
@@ -254,7 +254,7 @@ void     orki_tile_i4_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
 extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_wdom, orki_last_import;
 extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;
 
-/* ---- provided BY src/npu/i4.c to the scaffold ---- */
+/* ---- provided BY src/npu/i4/ to the scaffold ---- */
 int  orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);
 int  orki_i4_submit_tmo_ms(void);
 int  orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);

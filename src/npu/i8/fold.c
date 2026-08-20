@@ -549,3 +549,12 @@ int ork_w_attach_fold_i8(ork_npu *c, ork_w *w, const void *blob, size_t n){
         orki_bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); orki_bsync(c->fd,&bf[s],RKNPU_MEM_SYNC_TO_DEVICE); }
     w->Bfold=bf; w->fold_ns=nslice; return 0;
 }
+void *ork_fbc_thread(void *vp){
+    struct ork_fbc_arg *a=vp; struct rknpu_submit sub; memset(&sub,0,sizeof sub);
+    sub.flags=ork_ppflags(); sub.task_number=(uint32_t)a->P; sub.task_obj_addr=a->tk->obj; sub.fence_fd=-1;
+    sub.core_mask=1u<<a->core;
+    sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)a->P};
+    sub.timeout=orki_mm_timeout_ms();
+    a->rc = orki_rknpu_submit_ioctl(a->fd,&sub,a->dom);
+    return NULL;
+}
