@@ -32,7 +32,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  * meaning changes (tile layout/geometry or quant rule); it stays at the MAJOR of the last format-changing
  * release. The 1.0.0 release did NOT change the format, so it stays 0 (existing .orkpacks remain valid). */
 #define ORK_PACK_FORMAT_VERSION 0u
-/* The API is split across ork/*.h purely for readability; this umbrella is the entry point
+/* The API is split across the ork/ headers purely for readability; this umbrella is the entry point
  * and every consumer keeps including <ork_npu.h> unchanged. Order matters: the base typedefs
  * and version macros above must precede the parts, and the parts are included in their
  * original file order so no declaration moves ahead of a type it needs. */
@@ -40,7 +40,8 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 #include "ork/dma.h"
 #include "ork/weights.h"
 #include "ork/run.h"
-#include "ork/ops.h"
+#include "ork/sdp.h"      /* production SDP/activation ops — has real callers */
+#include "ork/probe.h"    /* RE probes/replays/fuzz — tools-only, not the supported API */
 #include "ork/dynamic.h"
 #include "ork/seq.h"
 #include "ork/chain.h"

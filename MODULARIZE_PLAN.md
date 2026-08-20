@@ -376,3 +376,45 @@ and it wants a human read, not a rule.
 
 Worth noting for whoever does it: roughly a third of the "public" header is RE probe surface that no
 production consumer calls. Separating it would make the actual supported API legible for the first time.
+
+## Round 4 — separating the supported API from the RE surface (2026-08-20)
+
+Round 3 left `ork/ops.h` at 451 lines because production SDP ops and their RE probes alternate every
+20–60 lines. This splits it into `ork/sdp.h` (239) and `ork/probe.h` (225).
+
+**Classified by evidence, not by name.** The rule is *who calls it*: a declaration is production if it has
+a caller in `src/` (excluding its own defining file), in `examples/` (which are the test suite), or in the
+fork's `ggml-ork`. Otherwise it is reached only from `tools/` and is RE surface. Naming would have been the
+wrong instrument — `ork_npu_mul_perchan_f16_contig` sounds production and has no caller; `ork_npu_chain_progs`
+sounds like a probe and has six library callers.
+
+Result: **46 production / 53 RE — 53% of what shipped in the public header has no production consumer.**
+That is the headline. `ork_npu.h` was presenting the reverse-engineering apparatus and the supported API as
+one undifferentiated surface, and no reader could tell which was which.
+
+Because this REORDERS declarations (unlike round 3's contiguous cut), three things were checked:
+- every content line of `ops.h` appears exactly once across the two new headers (396 = 396, sorted compare);
+- the whole-header declaration set is unchanged (296 = 296);
+- a from-scratch board build.
+
+`ork_chain_prog`, the one type declared in `ops.h`, goes to `sdp.h`, which the umbrella includes first.
+
+### Dead declarations — found, NOT removed
+
+Eight exported declarations have no reference anywhere in the repo, the examples, the tools, or the fork:
+
+| symbol | defined in |
+|---|---|
+| `ork_mm_chain_build_exp_lut` | `src/npu.c` |
+| `ork_npu_benchmark_chain` | `src/npu/i8/probe.c` |
+| `ork_npu_chain_selftest` | `src/npu/i8/probe.c` |
+| `ork_npu_mfold_chain_cap` | `src/npu/i8/fold.c` |
+| `ork_npu_mfold_chain_multi` | `src/npu/i8/fold.c` |
+| `ork_npu_probe_chain_i8` | `src/npu/i8/chain.c` |
+| `ork_npu_replay_i8_amap` | `src/npu/i8/probe.c` |
+| `ork_npu_reshape_probe_f16` | `src/npu/f16/replay.c` |
+
+These are NOT deleted. Several are `#39`/`#54` RE apparatus whose probe driver may live outside this repo or
+have been folded into a tool since, and AGENTS is explicit that experimental code is not discarded on an
+agent's own judgement. They are listed here so the decision can be made deliberately, per symbol, by someone
+who knows whether the experiment is finished.
