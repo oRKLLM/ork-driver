@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 void ork_ssm_prof_dump(void);
 void ork_ssm_helper_stop(ork_npu *c);
 

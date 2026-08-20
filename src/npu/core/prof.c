@@ -10,6 +10,7 @@
 #include "regcmd_i8.h"
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 
 void ork_load_prof_dump(void){
     if(!orki_load_prof) return;

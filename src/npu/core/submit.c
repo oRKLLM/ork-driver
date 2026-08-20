@@ -20,6 +20,7 @@
 #include <dlfcn.h>
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 
 void orki_setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
     const ork_reg_desc *d=&ORK_REGS[id];

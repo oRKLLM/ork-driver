@@ -19,6 +19,7 @@
 #include "regcmd_i8.h"
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 
 size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
 

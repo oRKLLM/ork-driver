@@ -19,6 +19,7 @@
 #include "regcmd_i8.h"
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 
 static const struct ork_xspec XSPEC[XP_NPROFILE] = {
   /* XP_MC_MM      3596  run_multicore   */ { KWP_MC,  RC_I8ENTRY,       TG_PERCORE, WC_NOTKW,         TG_PERCORE, WC_NT_NOTKW, 1 },

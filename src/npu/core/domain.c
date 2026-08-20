@@ -19,6 +19,7 @@
 #include "regcmd_i8.h"
 #include "npu/internal.h"
 #include "npu/core.h"
+#include "npu/core/core.h"
 
 int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_IOMMU_DOMAIN"); v=e?atoi(e):0;} return v; }
 
