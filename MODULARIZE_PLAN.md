@@ -670,3 +670,27 @@ four compile lines. Adding a second TU would have meant nine edits, and missing 
 worse, silently omits code). They now all go through `ORKD_CLIENT_SRC` / `ORKD_CLIENT_HDR`, so the next file
 added to this split is a one-line change. This is round 8's `$<` trap generalized: a build system that
 repeats a file list will eventually disagree with itself.
+
+## Round 10 — `i8/dyn.c`, the free split (2026-08-20)
+
+`i8/dyn.c` 1,000 → **`dyn.c` 491 + `dyn_seq.c` 165 + `dyn_ctl.c` 405**. It was the largest non-scaffold
+file left; the `regcmd_*.h` above it in a size listing are captured data tables, not code.
+
+**The interface cost is zero.** `dyn.c` had **no file-scope statics at all** — every one of its 20
+definitions is an extern `ork_dyn_*`/`orki_*`, and it defines no macros, structs or typedefs beyond
+`_GNU_SOURCE`. Measuring six candidate cuts returned 0 forward and 0 backward at every one. That is the
+opposite extreme from round 8's `orkd.c` (28 symbols, no cheap seam), and it is worth recording that the
+range exists: two files of comparable size can differ completely in how expensive they are to split. The
+cost is a property of the call graph and the use of internal linkage, not of the line count.
+
+Cut thematically, since nothing constrained where:
+
+| file | lines | holds |
+|---|--:|---|
+| `i8/dyn.c` | 491 | the doorbell BEGIN paths — `ork_dyn_begin`, `ork_dyn_begin_mc`, and the shared drain/completion helpers |
+| `i8/dyn_seq.c` | 165 | the heterogeneous single-core chain — `ork_dyn_begin_seq_i8{,_mc}`, `ork_dyn_seq_end` |
+| `i8/dyn_ctl.c` | 405 | the control surface — spin probe, anomaly dump, step accounting, append, mid-flight halt, multi-core resubmit recovery |
+
+Verified by the tree-wide code-multiset invariant: **zero removals**, and all 50 additions are replicated
+`#include`/`#define` preamble (2 new files × 25 lines). `CORE` gained both new TUs — that is checked, not
+assumed, because omitting it does not fail the build; the objects simply never compile.
