@@ -670,8 +670,9 @@ chain_xition_probe: tools/chain_xition_probe.c $(COBJ)
 # orkd — the NPU daemon (single owner + submit queue for many client processes). First increment is the
 # lifecycle skeleton (flock single-instance, accept loop, ref-count, idle-reap); NPU stubbed, so it needs no
 # COBJ yet. When the submit path is wired it will link $(COBJ). Not in `all`/`test` until it has a client.
-orkd: src/orkd.c src/orkd_proto.h $(COBJ)
-	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+orkd: src/orkd.c src/orkd_handlers.c src/orkd_internal.h src/orkd_proto.h $(COBJ)
+	# both TUs explicitly — $< is only the FIRST prerequisite, so it would silently omit orkd_handlers.c
+	$(CC) $(CFLAGS) -o $@ src/orkd.c src/orkd_handlers.c $(COBJ) -lm -lpthread
 
 # orkd_probe — daemon lifecycle validation (auto-spawn + connect + core count + ping); board tool, not in test.
 orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h

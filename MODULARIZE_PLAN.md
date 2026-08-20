@@ -561,3 +561,60 @@ exit while a daemon still owned the NPU. On a shared board that is not cosmetic.
 **Round 8 can now split `orkd.c`** with the same safety as rounds 1-6: cut before the handlers, 22
 de-statics with `orkd_` prefixes (AGENTS requires a prefix once a symbol crosses a TU), ~6 of them as
 `static inline` in a private `src/orkd_internal.h`.
+
+## Round 8 — splitting `orkd.c`, now that the daemon has a test (2026-08-20)
+
+`orkd.c` 1,003 → **`orkd.c` 469 + `orkd_handlers.c` 561 + `orkd_internal.h` 51**. The cut puts the 19
+per-opcode request handlers in their own TU; the dispatch loop, socket accept, ring service and `main()`
+stay in `orkd.c`.
+
+**The cost is 28 de-statics, not the 22 I quoted in round 7.** That earlier figure came from a looser
+`statics()` regex, and re-measuring properly gave 31 — which then came *down* to 28 for two reasons worth
+recording, because both are the same mistake in different clothes:
+
+- `g_dom_inuse` appeared to cross the boundary. It doesn't: the only mention inside the handler block is in
+  a **comment**. Handlers reach the pool through `dom_alloc_explicit`/`dom_release`.
+- `ring_service` likewise — comment-only.
+
+Text matching over comments inflated the count by 3. Stripping comments before measuring is the fix, and it
+is the same lesson that produced round 2's 31/88 misplacement and check 7's false alarm on
+`ORK_F16_FORCE_WEDGE`.
+
+**No mutable global crosses the split.** `g_ring_c` (the daemon-side A-ring scratch) would have, so the cut
+is placed 4 lines earlier, leaving it with `ring_service` — the only code that touches it. A shared mutable
+global across a new TU boundary is a worse smell than a shared function, and here it was avoidable for free.
+
+I said in round 7 that ~6 small I/O helpers would become `static inline` in the private header. They did
+not. For per-message syscall wrappers the inlining is worth nothing, and moving function bodies into a
+header costs discoverability; with the `orkd_` prefix the namespace concern is already handled. All 28 are
+plain external declarations — one mechanism, not two.
+
+Verified by a **rename-aware code-multiset** invariant: apply the identical 27 renames and de-statics to the
+baseline `orkd.c`, strip comments, normalise whitespace, sort, compare. **Zero lines lost**; the 20
+additions are all the replicated `#include` block plus `orkd_internal.h`.
+
+Renames touched **code positions only** — comment spans were computed and excluded — because `drain` also
+appears as an English verb ("drain n bytes into the void"). The one genuine symbol reference living inside a
+comment (`dom_alloc_explicit` in the domain-pool note) was patched by hand.
+
+### The interface was bigger than the function list
+My cut analysis counted only static FUNCTIONS and VARIABLES. The first build failed because the handlers
+also need **3 macros** (`ORKD_MAX_WEIGHTS`, `ORKD_MAX_BYTES`, `ORKD_NDOM`) and the **full definitions of 4
+structs** (`cweight`, `ckv`, `client`, `work`) — they touch `cl->fd`, the weight table and the KV table, so
+a forward declaration is not enough. Those moved into `orkd_internal.h` as well (moved, not duplicated).
+
+Splitting a translation unit shares **types and macros**, not just symbols. A de-static count is a lower
+bound on the interface, never the whole of it.
+
+Also caught on the way: the generated header initially contained four *definitions* rather than
+declarations, because the prototype extractor only stripped a trailing `{` and four of the helpers are
+one-liners with their body on the same line. The stray `{` opened a scope inside the header, which is why
+gcc reported "invalid storage class for function" against `spine_kernels.h` and "defined but not used" for
+non-static functions — both symptoms of the file nesting inside a function. The extractor now truncates at
+the first brace.
+
+### The Makefile trap this round
+`orkd:`'s recipe was `$(CC) ... -o $@ $< $(COBJ)`. `$<` is only the FIRST prerequisite, so adding
+`orkd_handlers.c` to the dependency list would NOT have compiled it — the link fails on all 19 handlers.
+The recipe now names both TUs explicitly. Prerequisite lists and compile lines are separate things; adding
+to one is not adding to the other.
