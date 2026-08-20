@@ -1,15 +1,15 @@
 # ork-driver — userspace regcmd matmul library for the Rockchip NPU.
 # Build on a Rockchip board (needs /dev/dri/cardN + the in-tree rknpu DRM driver), or
 # cross-compile for aarch64. No external dependencies (libc + the kernel DRM uABI only).
-CC      ?= cc
+CC ?= cc
 # Use ccache when present: CORE is compiled once into shared .o objects (below), so ccache
 # content-hashes them — clean builds, branch switches, and the board's several ork-driver
 # checkouts all hit the cache instead of recompiling the ~9.7k-line npu.c. Disable: NO_CCACHE=1.
 ifndef NO_CCACHE
 CC := $(strip $(shell command -v ccache 2>/dev/null) $(CC))
 endif
-AR      ?= ar
-CFLAGS  ?= -O2 -Wall -Iinclude -Isrc -pthread   # -pthread: multi-core path uses worker threads
+AR ?= ar
+CFLAGS ?= -O2 -Wall -Iinclude -Isrc -pthread # -pthread: multi-core path uses worker threads
 
 # Stamp the build with a short git hash WHEN git + a repo are present (workstation builds). On the
 # board (no git) this is empty and ork_npu_version() returns the bare semver — no failure either way.
@@ -17,12 +17,12 @@ GIT_HASH := $(shell git rev-parse --short=7 HEAD 2>/dev/null)
 ifneq ($(GIT_HASH),)
 CFLAGS += -DORK_GIT_HASH=\"$(GIT_HASH)\"
 endif
-PREFIX  ?= /usr/local
-CORE    := src/npu.c src/npu/core/buf.c src/npu/core/device.c src/npu/core/domain.c src/npu/core/mode.c src/npu/core/prof.c src/npu/core/sched.c src/npu/core/submit.c src/npu/f16.c src/npu/i8/chain.c src/npu/i8/dyn.c src/npu/i8/fold.c src/npu/i8/pack.c src/npu/i8/probe.c src/npu/i8/regcmd.c src/npu/i8/run.c src/npu/sdp.c src/npu/i16.c src/npu/i4.c src/npu/ssm.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c src/ork_ops.c
+PREFIX ?= /usr/local
+CORE := src/npu.c src/npu/core/buf.c src/npu/core/device.c src/npu/core/domain.c src/npu/core/mode.c src/npu/core/prof.c src/npu/core/sched.c src/npu/core/submit.c src/npu/f16/perchan.c src/npu/f16/probe.c src/npu/f16/regcmd.c src/npu/f16/replay.c src/npu/f16/run.c src/npu/f16/stream.c src/npu/i16/act.c src/npu/i16/chain.c src/npu/i16/probe.c src/npu/i16/regcmd.c src/npu/i4/chain.c src/npu/i4/pack.c src/npu/i4/quant.c src/npu/i4/run.c src/npu/i4/stream.c src/npu/i8/chain.c src/npu/i8/dyn.c src/npu/i8/fold.c src/npu/i8/pack.c src/npu/i8/probe.c src/npu/i8/regcmd.c src/npu/i8/run.c src/npu/sdp.c src/npu/ssm.c src/soc.c src/soc/rk3588.c src/soc/rk3576.c src/neon_activations.c src/ork_ops.c
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
-COBJ    := $(CORE:.c=.o) src/orkd_client.o src/ork_gptq.o   # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
+COBJ := $(CORE:.c=.o) src/orkd_client.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
 # Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
@@ -30,7 +30,7 @@ COBJ    := $(CORE:.c=.o) src/orkd_client.o src/ork_gptq.o   # orkd client shim (
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch
-TESTS    :=
+TESTS :=
 
 all: check-registry $(EXAMPLES) $(TESTS)
 
@@ -66,11 +66,11 @@ test_ppu_lut: examples/test_ppu_lut.c $(COBJ)
 # --- library for embedding in other projects (e.g. llama.cpp-rockchip, FFI bindings) ---
 lib: libork_npu.a libork_npu.so
 
-libork_npu.a: $(COBJ)                    # static — link directly, no runtime .so dependency
+libork_npu.a: $(COBJ) # static — link directly, no runtime .so dependency
 	$(AR) rcs $@ $^
-libork_npu.so: $(COBJ)                   # shared — dynamic link / FFI from Python, Node, Rust, ...
+libork_npu.so: $(COBJ) # shared — dynamic link / FFI from Python, Node, Rust, ...
 	$(CC) $(CFLAGS) -shared -o $@ $^
-%.o: %.c                                 # CORE objects are -fPIC so one set serves executables + the .so
+%.o: %.c # CORE objects are -fPIC so one set serves executables + the .so
 	$(CC) $(CFLAGS) -fPIC -c -o $@ $<
 
 # comparison tool: benchmark the closed librkllmrt (dlopen'd at runtime, no build dep).
@@ -80,7 +80,7 @@ rknpu_bench: tools/rknpu_bench.c
 
 # RE tool: decode a captured/synth regcmd word-dump into NAMED registers + NAMED values (ork_regs.h-driven,
 # flags unknown registers/values). Pure host, no NPU, no COBJ — only the ork_regs.h header.
-# Use:  ./regcmd_decode /tmp/mm_regcmd.txt   (or)   cat dump | ./regcmd_decode
+# Use: ./regcmd_decode /tmp/mm_regcmd.txt (or) cat dump | ./regcmd_decode
 regcmd_decode: tools/re/regcmd_decode.c src/ork_regs.h
 	$(CC) $(CFLAGS) -o $@ $<
 
@@ -101,7 +101,7 @@ fold_resident_probe: tools/re/fold_resident_probe.c $(COBJ)
 
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
-# Use:  make cdma_calib && ./cdma_calib   (exit 0 iff the standard model reproduces ork's layouts bit-exact)
+# Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)
 cdma_calib: tools/re/cdma_calib.c
 	$(CC) $(CFLAGS) -o $@ $<
 
@@ -121,20 +121,20 @@ attn_chain_probe: tools/attn_chain_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # task #20: validate the attention SDP ops routing through ORKD_SEQ Path B (six ops, one round-trip).
-# direct:  sudo env ORK_MM_TIMEOUT=3000 ./orkd_seq_probe
-# daemon:  sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./orkd_seq_probe
+# direct: sudo env ORK_MM_TIMEOUT=3000 ./orkd_seq_probe
+# daemon: sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./orkd_seq_probe
 orkd_seq_probe: tools/orkd_seq_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # task #20 (A2): on-device intermediate residency via back-reference. rmsnorm->QKV, xn aliased+resident.
-# direct:  sudo env ORK_MM_TIMEOUT=3000 ./orkd_resident_probe
-# orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./orkd_resident_probe
+# direct: sudo env ORK_MM_TIMEOUT=3000 ./orkd_resident_probe
+# orkd: sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./orkd_resident_probe
 orkd_resident_probe: tools/orkd_resident_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # task #20 (A1): fp16 matmul with contiguous fp16 output (ORK_OP_MM_F16_F16OUT) — bridge-free matmul->SDP.
-# direct:  sudo env ORK_MM_TIMEOUT=3000 ./f16out_probe
-# orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./f16out_probe
+# direct: sudo env ORK_MM_TIMEOUT=3000 ./f16out_probe
+# orkd: sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./f16out_probe
 f16out_probe: tools/f16out_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
@@ -302,7 +302,7 @@ batch_probe: tools/batch_probe.c $(COBJ)
 
 # apples-to-apples: SAME int8 matmul via ork-driver vs the closed RKNN matmul API (librknnrt).
 # Not in `all`/`test` — needs librknnrt.so + rknn_matmul_api.h present. Point RKNN_DIR at them.
-#   make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters]
+# make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters]
 RKNN_DIR ?= /tmp/rknn
 rknn_vs_ork: tools/rknn_vs_ork.c $(COBJ)
 	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< $(COBJ) -L$(RKNN_DIR) -lrknnrt -lm
@@ -425,15 +425,15 @@ SUDO ?= sudo -E
 test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe
 	@fail=0; \
 	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
-	  echo "== $$t"; timeout $(TEST_TIMEOUT) $(SUDO) ./$$t || fail=1; done; \
+	 echo "== $$t"; timeout $(TEST_TIMEOUT) $(SUDO) ./$$t || fail=1; done; \
 	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) $(SUDO) ./llama2 "$(MODEL)" 6 || fail=1; \
-	  else echo "== llama2 SKIP (no $(MODEL))"; fi; \
+	 else echo "== llama2 SKIP (no $(MODEL))"; fi; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; \
-	  { echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
-	    echo "# CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file."; \
-	    echo "CORE_SHA=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64)"; } > $(ATTEST_FILE); \
-	  echo "wrote $(ATTEST_FILE)"; \
-	  else echo "TESTS FAILED"; exit 1; fi
+	 { echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
+	 echo "# CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file."; \
+	 echo "CORE_SHA=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64)"; } > $(ATTEST_FILE); \
+	 echo "wrote $(ATTEST_FILE)"; \
+	 else echo "TESTS FAILED"; exit 1; fi
 
 # CI gate (no NPU): prove the commit was board-validated. `make test` on the SBC writes tests/sbc_attest.txt
 # with a hash of ATTEST_SRCS; this recomputes it and fails on a mismatch — i.e. the NPU-output-determining
@@ -443,9 +443,9 @@ check-attest:
 	want=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64); \
 	if [ -z "$$have" ]; then echo "check-attest: no $(ATTEST_FILE) — run 'make test' on the SBC + commit it"; exit 1; fi; \
 	if [ "$$have" != "$$want" ]; then \
-	  echo "check-attest: FAIL — NPU-output sources/goldens changed since the last board-validated 'make test'."; \
-	  echo "  committed CORE_SHA=$$have"; echo "  working-tree =$$want"; \
-	  echo "  => run 'make test' on the SBC (RK3588) and commit $(ATTEST_FILE)."; exit 1; fi; \
+	 echo "check-attest: FAIL — NPU-output sources/goldens changed since the last board-validated 'make test'."; \
+	 echo " committed CORE_SHA=$$have"; echo " working-tree =$$want"; \
+	 echo " => run 'make test' on the SBC (RK3588) and commit $(ATTEST_FILE)."; exit 1; fi; \
 	echo "check-attest: attest OK ($$have)"; \
 	ph=0; \
 	if grep -nE '(check|check_i8|one)\(c[^)]*, *0\)' examples/test_matmul.c examples/quant.c examples/test_sn3.c 2>/dev/null; then ph=1; fi; \
@@ -454,7 +454,7 @@ check-attest:
 	echo "check-attest: no placeholder goldens — OK"
 
 # Quick subset via the same pass/fail harness — builds and runs only the named examples:
-#   make test-only T="test_ewmul_i8 test_ewmul_f16 test_ewmul_i16"     (a name may carry args, e.g. T="model 1")
+# make test-only T="test_ewmul_i8 test_ewmul_f16 test_ewmul_i16" (a name may carry args, e.g. T="model 1")
 # Prereqs (bare example names) build via the EXAMPLES pattern rule; then each is run under sudo+timeout.
 test-only: $(filter $(EXAMPLES) $(TESTS),$(T))
 	@if [ -z "$(T)" ]; then echo 'usage: make test-only T="test_ewmul_i8 test_ewmul_f16 test_ewmul_i16"'; exit 2; fi; \
@@ -466,14 +466,14 @@ test-only: $(filter $(EXAMPLES) $(TESTS),$(T))
 # (direct ioctl -> orkd RPC) via ORK_USE_ORKD=1. ONE daemon is spun up, survives the whole run (a large
 # ORKD_IDLE_MS bridges the inter-test gaps so it does NOT idle-reap between examples), and is torn down after;
 # the daemon's PID is asserted stable across the run to prove a single persistent daemon serviced every test.
-#   ROUTABLE = every NPU op the example issues is on the orkd RPC surface: matmul (int8 quant/test_speed,
-#   fp16 layer/decode/model) + the full SDP/activation family (ewmul i8/f16/i16, add i8/f16/i16, silu/gelu i8/i16,
-#   rsqrt/exp i8/i16). CPU-only test_activations rides along.
-#   OUT OF SCOPE (stay under plain `make test`, direct NPU): internal entrypoints not yet on the RPC surface —
-#   run_stream_* (test_matmul/test_stream_interleave/test_affinity), int4 chain/stream/grouped/i4a8
-#   (test_chain_i4/i4/perplexity_i4/test_matmul), bmm + ssm (test_bmm*/test_ssd_chunk_npu/test_mode_transition),
-#   and the probe/perf tools. Extending to those is the next RPC-surface increment.
-# Run on the SBC, one at a time, no concurrent make: sudo make test-orkd  (or via ssh run_in_background).
+# ROUTABLE = every NPU op the example issues is on the orkd RPC surface: matmul (int8 quant/test_speed,
+# fp16 layer/decode/model) + the full SDP/activation family (ewmul i8/f16/i16, add i8/f16/i16, silu/gelu i8/i16,
+# rsqrt/exp i8/i16). CPU-only test_activations rides along.
+# OUT OF SCOPE (stay under plain `make test`, direct NPU): internal entrypoints not yet on the RPC surface —
+# run_stream_* (test_matmul/test_stream_interleave/test_affinity), int4 chain/stream/grouped/i4a8
+# (test_chain_i4/i4/perplexity_i4/test_matmul), bmm + ssm (test_bmm*/test_ssd_chunk_npu/test_mode_transition),
+# and the probe/perf tools. Extending to those is the next RPC-surface increment.
+# Run on the SBC, one at a time, no concurrent make: sudo make test-orkd (or via ssh run_in_background).
 ORKD_SUITE := test_activations quant layer decode model test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_gelu test_add
 test-orkd: $(ORKD_SUITE) orkd
 	@echo "== A-suite: routable test subset through ONE orkd (first-client milestone) =="; \
@@ -485,14 +485,14 @@ test-orkd: $(ORKD_SUITE) orkd
 	echo "-- orkd up, pid=$$pid0"; \
 	fail=0; \
 	for t in "test_activations" "quant" "layer" "decode" "model 1" "model 12" "test_ewmul_i8" "test_ewmul_f16"; do \
-	  echo "== [orkd] $$t"; timeout $(TEST_TIMEOUT) sudo env ORK_USE_ORKD=1 ORKD_BIN=$$PWD/orkd ./$$t || fail=1; \
-	  pidn=$$(pgrep -x orkd | head -1); \
-	  if [ "$$pidn" != "$$pid0" ]; then echo "FAIL: orkd pid changed ($$pid0 -> $$pidn) — daemon did not persist across the run"; fail=1; fi; \
+	 echo "== [orkd] $$t"; timeout $(TEST_TIMEOUT) sudo env ORK_USE_ORKD=1 ORKD_BIN=$$PWD/orkd ./$$t || fail=1; \
+	 pidn=$$(pgrep -x orkd | head -1); \
+	 if [ "$$pidn" != "$$pid0" ]; then echo "FAIL: orkd pid changed ($$pid0 -> $$pidn) — daemon did not persist across the run"; fail=1; fi; \
 	done; \
 	echo "-- tearing down orkd (SIGTERM)"; sudo pkill -TERM -x orkd 2>/dev/null; sleep 2; \
 	if pgrep -x orkd >/dev/null; then echo "WARN: orkd survived SIGTERM — forcing"; sudo pkill -x orkd; fi; \
 	if [ $$fail -eq 0 ]; then echo "A-SUITE (orkd) PASSED — routable subset self-validated through one persistent daemon"; \
-	  else echo "A-SUITE (orkd) FAILED"; exit 1; fi
+	 else echo "A-SUITE (orkd) FAILED"; exit 1; fi
 
 bench-llama:
 	@echo "== Running two-turn conversation integration benchmark via llama-server =="
@@ -624,8 +624,8 @@ i16_shape_probe: tools/i16_shape_probe.c $(COBJ)
 
 # CHAIN ASSEMBLER increment 1 (corrected): [gate*silu -> up] one submit via run_chain_i8 + set_i8_silu.
 # (The ABANDONED set_i16_out/chain_progs PC-chain probes — chain_probe, chain_gatesilu_probe, i16out_probe —
-#  were removed: that path wedges the NPU. The working chain assembler is the doorbell seq (ork_submit_seq).
-#  See CHAIN_ASSEMBLER_WIP.md's superseded banner.)
+# were removed: that path wedges the NPU. The working chain assembler is the doorbell seq (ork_submit_seq).
+# See CHAIN_ASSEMBLER_WIP.md's superseded banner.)
 chain_gu_silu_probe: tools/chain_gu_silu_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
@@ -714,7 +714,7 @@ test_orkd_2conn_seq: tools/test_orkd_2conn_seq.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
 # orkd_dom_api — validate client-managed IOMMU domains (ork_npu_domain_alloc/free + set_pack_domain), direct or
-# routed: sudo ./orkd_dom_api  |  sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./orkd_dom_api
+# routed: sudo ./orkd_dom_api | sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./orkd_dom_api
 orkd_dom_api: tools/orkd_dom_api.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
@@ -918,8 +918,8 @@ i8out_map_probe: tools/i8out_map_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # task #20 (A1 path B): symmetric int8 softmax reduce (exp_i8 -> MM_I8) — no mixed-precision bridge.
-# direct:  sudo env ORK_MM_TIMEOUT=3000 ./int8reduce_probe
-# orkd:    sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./int8reduce_probe
+# direct: sudo env ORK_MM_TIMEOUT=3000 ./int8reduce_probe
+# orkd: sudo env ORK_USE_ORKD=1 ORKD_BIN=./orkd ORK_MM_TIMEOUT=3000 ./int8reduce_probe
 int8reduce_probe: tools/int8reduce_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
