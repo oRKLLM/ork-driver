@@ -30,7 +30,7 @@
 #include "npu/i8/i8.h"
 
 struct chainrr_w { ork_npu *c; int core; int nchains; const ork_mm_task_i8 *const *chains; const int *S; const struct chain_silu_spec *ss; int *ctr; int rc; };
-void *orki_chainrr_worker(void *vp){
+static void *chainrr_worker(void *vp){
     struct chainrr_w *a=vp; orki_pin_big_core(a->core); a->rc=0; int k;
     while((k=__atomic_fetch_add(a->ctr,1,__ATOMIC_SEQ_CST))<a->nchains){
         int r=orki_run_chain_i8_impl(a->c, a->S[k], a->chains[k], a->ss, a->core);   /* force_core=this core; skips ork_npu_enter */
@@ -772,10 +772,10 @@ int ork_mm_run_chains_rr(ork_npu *c, int nchains, const ork_mm_task_i8 *const *c
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
     pthread_mutex_lock(&c->pmu);
-    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=orki_chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
     c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
     pthread_mutex_unlock(&c->pmu);
-    orki_chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
     return rc;
@@ -802,10 +802,10 @@ int ork_mm_run_chains_rr_biased(ork_npu *c, int nchains, const ork_mm_task_i8 *c
     struct chainrr_w w[ORK_MAXCORE]; int ctr=0;
     for(int i=0;i<nc;i++) w[i]=(struct chainrr_w){c,i,nchains,chains,S,&ss,&ctr,0};
     pthread_mutex_lock(&c->pmu);
-    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=orki_chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
+    c->pjob=w; c->pjob_nc=nc; c->pjob_fn=chainrr_worker; c->pjob_stride=sizeof(struct chainrr_w);
     c->pdone=0; c->pgen++; pthread_cond_broadcast(&c->pgo);
     pthread_mutex_unlock(&c->pmu);
-    orki_chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
+    chainrr_worker(&w[0]);                        /* core 0 on the calling thread */
     pthread_mutex_lock(&c->pmu); while(c->pdone<nc-1) pthread_cond_wait(&c->pdn,&c->pmu); pthread_mutex_unlock(&c->pmu);
     int rc=0; for(int i=0;i<nc;i++) if(w[i].rc) rc=w[i].rc;
     return rc;

@@ -418,6 +418,10 @@ MODEL ?= stories15M.bin
 # per-test wall timeout (s) — catches an NPU hang. Tests are golden-checksum'd now (full `make test`
 # ~33s), but the wall must still exceed a cold model/regen run; bounds a genuine hang. Override: TEST_TIMEOUT=120
 TEST_TIMEOUT ?= 360
+# ORDER MATTERS: $(SUDO) wraps timeout, never the reverse. `timeout N sudo ./t` SIGTERMs *sudo*, which
+# does not forward it — a hung NPU test then outlives its own timeout indefinitely (observed: test_speed
+# stuck 452s against TEST_TIMEOUT=360, stalling the whole gate). `sudo timeout N ./t` signals the test
+# itself; -k escalates to SIGKILL for a test that ignores SIGTERM.
 # Tests run under sudo (the NPU needs it). Plain `sudo` STRIPS the environment, so a knob set on the make
 # line (`ORK_SSM_KEEPWARM=0 make test`) silently never reached the binaries and the run looked like a pass
 # of a config it never exercised. `sudo -E` preserves it. Override if a sudoers policy forbids -E.
@@ -425,8 +429,8 @@ SUDO ?= sudo -E
 test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe
 	@fail=0; \
 	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
-	 echo "== $$t"; timeout $(TEST_TIMEOUT) $(SUDO) ./$$t || fail=1; done; \
-	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; timeout $(TEST_TIMEOUT) $(SUDO) ./llama2 "$(MODEL)" 6 || fail=1; \
+	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
+	if [ -f "$(MODEL)" ]; then echo "== llama2 $(MODEL)"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./llama2 "$(MODEL)" 6 || fail=1; \
 	 else echo "== llama2 SKIP (no $(MODEL))"; fi; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; \
 	 { echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
