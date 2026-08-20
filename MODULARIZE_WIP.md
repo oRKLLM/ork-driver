@@ -7,129 +7,66 @@ stays, siblings `npu/{sdp,f16,i16,i4,ssm}.c` + folder `npu/i8/{regcmd,pack,fold,
 
 ---
 
-## Current state
+## Current state — ROUND 1 COMPLETE
 
-| commit | what | status |
-|---|---|---|
-| 0 | this doc + `MODULARIZE_PLAN.md` | ✅ `189553a` |
-| A | `check_registry.sh` globs all lib sources; `clean:` → `$(COBJ)`; `$(SUDO)` = `sudo -E` | ✅ `b83269e` (+ AGENTS fix `1824466`) |
-| B | rename 43 generic internals to `orki_*` (one TU, no moves) | ✅ `c4541c2` |
-| C | `src/npu/internal.h` (types, macros, `ork_now_us` inline, externs) | ✅ `b685614` |
-| D | `src/npu/ssm.c` — first real TU off the monolith (317 lines) | ✅ `ae1fc70` |
-| — | `check-registry` check 5: fixed a 24% blind spot (wrapped prototypes) | ✅ `468a11f` |
-| E | `src/npu/i4.c` — int4 chain/doorbell/stream (728 lines) | ✅ `38e16e9` |
-| — | `src/npu/core.h` — substrate interface declared up front (no moves) | ✅ `b46b036` |
-| F | `src/npu/core/*.c` — the 7 pure-move commits | ⬜ UNBLOCKED (end-to-end flat) |
-| G–I | `i8/*` → `i16.c` → `sdp.c` (+ the i4 pack/quant sweep) | ⬜ |
-| J | docs (AGENTS §4 tree, README, OPS_REGISTRY, tools/re/README) | ⬜ |
-| K | attest refresh (if CORE moved) + fork CMake file list | ⬜ |
+`src/npu.c`: **15,313 → 5,316** (−9,997, 65%). Largest file in the repo is now the scaffold at 5,316;
+largest module file is `i8/dyn.c` at 1,046.
 
-**Working tree:** on `refactor/modularize-precision`. **Board** synced to the branch, governors pinned.
-**`src/npu.c`: 15,313 → 14,088 lines (−1,225).** internal.h 274, i4.c 728, ssm.c 335.
+```
+src/
+  npu.c              5,316   scaffold: orki_run, run_multicore, seq scheduler, bmm dispatch,
+                             norm/softmax, async, CPU pack helpers, ork_npu_init
+  npu/
+    internal.h         449   types, dtype predicates, env knobs, hot static inlines
+    core.h             180   the substrate interface
+    core/            1,326   device buf submit sched domain mode prof            (7)
+    i8/              4,572   regcmd pack fold run chain dyn probe      + i8.h    (7)
+    f16/             1,948   regcmd run perchan stream probe replay    + f16.h   (6)
+    i4/              1,745   quant pack run chain stream               + i4.h    (5)
+    i16/               774   regcmd act chain probe                    + i16.h   (4)
+    sdp.c              151   shared activation curves + LUT machinery
+    ssm.c              337   Mamba-2 / SSD scan
+```
 
-### Order changed from the plan: D is `ssm.c`, not `sdp.c`
+Every precision is a folder with its own subtree header; `core/` is the dtype-agnostic substrate;
+`sdp.c`/`ssm.c` are single files because neither is a precision.
 
-The plan ordered `sdp.c` first as "self-contained math". It is not — the SDP substrate is **scattered
-across 8 sites from line 1542 to 9443** (`sdp_canon`/`ork_npu_sdp_stamp` up in the fold neighbourhood,
-the curve builders down among the i8 activations), and `silu_calibrate_idx` reaches into
-`ork_npu_probe_silu_std`. `ssm` by contrast is **one contiguous block** with a 3-in/3-out boundary, so it
-is the better first proof of the recipe. SDP moves later, when the i8 activations it interleaves with
-have been lifted and the split is obvious. **Lesson for the remaining lifts: pick the block by measured
-contiguity, not by the plan's guess at cohesion.**
+| commit | what |
+|---|---|
+| `189553a` | plan + WIP doc |
+| `b83269e` `1824466` | build gates unhardcoded, `clean`→`$(COBJ)`, `sudo -E`, AGENTS fix |
+| `c4541c2` | 43 internals → `orki_*` (3,104 sites) |
+| `b685614` | `npu/internal.h` — the private ABI |
+| `ae1fc70` | `npu/ssm.c` — first TU off the monolith |
+| `468a11f` | check-registry: fixed a 24% blind spot |
+| `38e16e9` | `npu/i4.c` — int4 chain/doorbell/stream |
+| `b46b036` | `npu/core.h` — substrate interface declared up front |
+| `88c7a6f` `0ed026a` | `npu/core/*.c` — all 7 substrate modules |
+| `d196d95` | `npu/f16.c` — the fp16 datapath |
+| `a544942` | `npu/i8/` — 7 modules |
+| `824e8da` | `npu/i16.c` |
+| `3f50ac5` | `npu/sdp.c` + the i4 pack/quant remnant |
+| `cd1bd72` | f16/i4/i16 → folders, one layout for every precision |
 
-### Remaining lifts, ordered by MEASURED contiguity (not the plan's guess)
+**Invariants held at every commit:** `make test` ALL PASS, 0 watchdog, ACT_RESET 50 / 18 sites,
+check-registry clean, every exported symbol `ork_`/`orki_`/`orkd_` prefixed. End-to-end flat
+(`ork_bench` 220.0 vs 220.8 prefill, `7a8152f`).
 
-`src/npu.c` after commit D, functions bucketed by name/dtype, "runs" = clusters separated by >400 lines:
+### What round 1 taught, for round 2
 
-| module | fns | span | runs | largest contiguous runs |
-|---|---:|---:|---:|---|
-| i16 | 21 | 861–14252 | 7 | **8290–9474 (1184)**, 7071–7427, 14222–14252 |
-| f16 | 63 | 74–14700 | 11 | 6505–8115 (1610), 14218–14700, 5669–6071 |
-| i4 | 70 | 92–14829 | 9 | 13378–14829 (1451), 3397–4571, 5175–5593 |
-| i8 | 157 | 869–14762 | 10 | 2584–4529 (1945), 10746–12653 (1907), 5385–7160 (1775) |
-| core (scaffold) | 250 | 62–14730 | 8 | 62–3392 (3330), 3884–5947, 8695–9991 |
-
-**The plan's order was backwards.** It put i16 first for having the fewest functions (21). But function
-count is not the effort — the number of disjoint **splice sites** is, and i16 is the *most* fragmented
-bucket in the file (1.6 fns/site). Lines moved per splice:
-
-| module | lines | sites | lines per splice |
-|---|---:|---:|---:|
-| i8 | ~5,500 | 37 | **148** |
-| i4 | ~2,100 | 17 | 123 |
-| f16 | ~1,900 | 21 | 90 |
-| i16 | ~950 | 14 | **67** |
-
-And fragmentation is not fixed — a module's sites **coalesce as its neighbours vacate**. Simulated for
-i16: **14 sites now → 11 after i8 → 5 if it goes last.** Same 950 lines for a third of the splices.
-
-**Revised order: i4 → f16 → i8 → i16.** i4 next (biggest contiguous run, 1,451 lines, moderate risk);
-i8 third rather than second so the private ABI is proven across three modules before the dyn-API
-entanglement; i16 last, when it has collapsed to ~5 sites. Within each lift: dominant run first,
-stragglers second.
-
-## What each lift actually costs (measured, updated per lift)
-
-| lift | lines moved | boundary in | boundary out | internal.h after |
-|---|---:|---:|---:|---:|
-| D `ssm.c` | 317 | 3 | 3 | 165 |
-| E `i4.c` | 728 | 21 + 4 types/enums | 4 | 274 |
-
-The boundary grows because the monolith is **layer**-organised, so a precision module lifted from the
-middle of a layer reaches back into everything around it. Expect internal.h to keep growing; that is the
-private ABI becoming explicit, not a defect. Every de-static must carry an `ork_`/`orki_` prefix — after
-commit E all 413 exported symbols do, which is cleaner than the pre-split baseline.
-
-**Validation cadence (revised after the wedge):** build + `nm` symbol diff + `check-registry` per lift
-(~40 s, no NPU); full `make test` once per module. **Never cap `make test` from outside** — the board's
-own per-test `timeout 360` is the bound. An outer `timeout 540 make test` killed make mid-test, orphaned
-`test_silu_native` on an in-flight submit, and wedged the NPU into a reboot.
-
-## RESOLVED: the +28% copy-phase regression is real but does NOT surface end-to-end
-
-**Verdict: not a blocker.** AGENTS §6 makes end-to-end the standard a perf claim must meet (`mc_prof`
-runs on dummy data). Measured with `ork_bench` on qwen2.5-1.5B-instruct-Q8_0, P=256 G=32, governors
-pinned, fork rebuilt against each tree:
-
-| tree | prefill tok/s | decode tok/s |
-|---|---|---|
-| pre-split (`b83269e`) | 218.16, 221.85 → **220.0** | 11.83, 11.72 → 11.78 |
-| HEAD (`b46b036`) | 224.44, 217.11 → **220.8** | 11.75, 11.85 → 11.80 |
-
-0.4% apart on prefill, inside the ±3.7/±7.3 run spread. Decode identical. **Flat.**
-
-That is consistent with the micro-benchmark: the regression is confined to the 1-core activation-gather
-phase, and **3-core — the path prefill actually uses — was already flat (1429 → 1438).**
-
-### The micro-regression itself, characterised (keep for the record)
-`mc_prof 256 2048 2048 20`, one boot: copy 185.6 → 237.5 µs/sub (+28%), submit FLAT (725 → 729), 1-core
-total +3.5%. Enters at the i4 lift. In a single-TU harness, de-staticing **`orki_bsync` alone** or
-**`orki_dma_find` alone** reproduces it exactly (control `orki_budget`: clean) — escape analysis, an
-extern call bracketing the gather loop kills the non-aliasing assumption. At HEAD, `static inline`,
-`always_inline`, and re-staticing 32 internal-only core symbols all fail to fix it, so a second
-mechanism (most likely cross-TU code motion) is also in play. **Not chased further — end-to-end is flat.**
-Revisit only if an end-to-end number moves.
-
-### The honest framing
-A TU split is NOT binary-equivalent and cannot be. Losing `static` costs inlining, cloning, and — the one
-that bit here — alias analysis. The refactor is *semantically* equivalent (static goldens prove bit-exact
-NPU output); it is not codegen-equivalent. If codegen equivalence is ever required, the options are LTO
-(with the flag applied at LINK time, which the earlier test missed) or a unity build where `npu.c`
-`#include`s the split files.
-
-## Board gotchas learned the hard way (add to the list before the next lift)
-
-- **`/tmp` is wiped on reboot.** A saved `cp -a src /tmp/save_src` did not survive; the local git checkout
-  is the only authoritative copy. Never park the only copy of anything in `/tmp`.
-- **`rsync -a` preserves mtimes**, so syncing an OLDER local file over a newer board object leaves CMake/make
-  thinking the object is current — it linked a stale pre-split `npu.c.o` and failed with "multiple
-  definition". `touch` the synced sources, or `make clean`, after any sync that moves a tree backwards.
-- **IOVA domains exhaust after ~2 model runs** — `CREATE FAIL: errno=14 dom=2 dom_iova=121MB ceil=3900MB`
-  with 30 GB RAM free, and `drop_caches` does NOT clear it. Only a reboot does. Pre-existing (it hit the
-  pre-split build too), matches the known multi-domain leak. Budget a reboot between benchmark samples.
-- **The fork's CMake listed ork-driver sources by NAME** and knew nothing of `src/npu/*.c`. Now globs with
-  `CONFIGURE_DEPENDS` so future lifts need no lockstep edit. Patched on the board AND in the local fork
-  checkout (`~/Dev/llama.cpp`), uncommitted there — **must land with the submodule bump**.
+1. **Boundary size is the cost, not contiguity.** The mover works by name, so a scattered module costs
+   the same as a contiguous one. The "order lifts by contiguity" heuristic was measuring the wrong thing.
+2. **Declare the shared interface FIRST.** Once `core.h` existed, lifts stopped rediscovering the same
+   substrate. ~90% of every precision's inbound boundary was that substrate.
+3. **Functions move by name; STATE does not.** Every lift's real work was the structs, tables and
+   globals that live outside any function. Losing them is how the f16/i4/i16 folder pass broke.
+4. **De-static exports.** Prefix at the point of de-static; a sweep afterwards needs two rounds because
+   exporting one symbol reveals the next.
+5. **Two C traps, each hit twice:** de-staticing a `static inline` leaves a bare `inline` (no external
+   definition, links fail); an anonymous-struct global cannot be extern-declared (name the type, or move
+   its only reader beside it).
+6. **Never suppress the mover's brace-balance report.** It caught every structural corruption; the one
+   time it was swallowed by `subprocess`, a truncated struct reached the build.
 
 ---
 
