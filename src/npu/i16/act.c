@@ -177,3 +177,56 @@ int ork_npu_silu_i16(ork_npu *c,const int16_t *in,int M,int N,double in_scale,do
     if(c && c->daemon){ if(us)*us=0; return orkd_silu_i16(c->daemon,in,M,N,in_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     return orki_act_lut_i16(c,orki_silu_f,in,M,N,in_scale,out_scale,out,us);
 }
+int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
+    int fd=c->fd;
+    if(!ork_ppu_fuse_enabled(c)) return -3;
+    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
+    #define PC32(m,n) (((n)/8)*(M*32) + (m)*32 + ((n)%8)*4)          /* 4-byte atom=8 cube (int32 in) */
+    #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)          /* 2-byte atom=8 cube (int16 out) */
+    size_t sza=(size_t)M*N*4; if(sza<4096)sza=4096;
+    size_t szo=(size_t)M*N*2; if(szo<4096)szo=4096;
+    struct buf A=orki_bcreate(fd,sza,0x403,-1), O=orki_bcreate(fd,szo,0x403,-1), B=orki_bcreate(fd,4096,0x403,-1);
+    if(!A.cpu||!O.cpu||!B.cpu){ orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&B); return -2; }
+    memset(A.cpu,0,sza); memset(O.cpu,0,szo); memset(B.cpu,0,4096);
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++) *(int32_t*)((char*)A.cpu+PC32(m,n))=a[(size_t)m*N+n];
+    for(int n=0;n<N;n++) ((int16_t*)B.cpu)[n]=b[n];                  /* per-channel vector CONTIGUOUS [N] int16 */
+    orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd,&B,RKNPU_MEM_SYNC_TO_DEVICE);
+    ork_npu_enter(c,c->last_dt,XP_SDP,OCK_NONE);   /* transient SDP entry via the layer (keep-warm-aware) */
+    uint32_t rc[REGCMD_MUL_I16_N]; memcpy(rc,REGCMD_MUL_I16,sizeof rc);
+    orki_set_mul_geom(rc,REGCMD_MUL_I16_N,M,N);
+    #define RQENV(nm,def) (getenv(nm)?(uint32_t)strtoul(getenv(nm),0,0):(uint32_t)(def))
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_PRECISION,RQENV("ORK_RQ_4010",0x30000001)); /* OUT int16 | IN int32 | PROC int16 */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5040,RQENV("ORK_RQ_MSTRIDE",(uint32_t)(M*32))); /* main int32 surf stride */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_DST_BASE_ADDR,(uint32_t)O.dma);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5018,(uint32_t)A.dma);        /* main input = int32 G */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5038,(uint32_t)B.dma);        /* per-channel scale vector */
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5034,RQENV("ORK_RQ_5034",0x08)); /* operand per-channel, DATA_SIZE=2 (int16 b) */
+    { const char*e=getenv("ORK_RQ_5044"); if(e) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5044,(uint32_t)strtoul(e,0,0)); } /* main-RDMA FEATURE_MODE: IN_PRECISION[17:15] */
+    /* OVER-FETCH hack: RDMA input dims (0x500c width / 0x5014 channel) are DECOUPLED from the DPU output dims
+     * (0x4058/0x405c). If the RDMA is stuck 2-byte fetching 2E but the DPU consumes 4E (int32) -> 50% starve,
+     * INFLATE the RDMA element count so it fetches 4E bytes -> both terminal counts hit together -> clean. */
+    { const char*e;
+      if((e=getenv("ORK_RQ_5014"))) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_5014,(uint32_t)strtoul(e,0,0)); /* RDMA cube CHANNEL */
+      if((e=getenv("ORK_RQ_500C"))) orki_setrn(rc,REGCMD_MUL_I16_N,RK_SDP_500C,(uint32_t)strtoul(e,0,0)); /* RDMA cube WIDTH  */ }
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SCALE,(uint32_t)mult); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_SHIFT,(uint32_t)shift);
+    orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_OUT_CVT_OFFSET,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_BS_ALU_CFG,0); orki_setrn(rc,REGCMD_MUL_I16_N,RK_DPU_EW_CVT_OFFSET,0);
+    #undef RQENV
+    if(getenv("ORK_RQ_DUMP")){ for(int k=0;k+1<REGCMD_MUL_I16_N;k+=2){ unsigned rg=rc[k]&0xffff; uint32_t v=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16);
+        if(rg==0x4010||rg==0x4020||rg==0x4024||rg==0x40c0||rg==0x5018||rg==0x5034||rg==0x5038||rg==0x5040||rg==0x5044||rg==0x4084||rg==0x4088) fprintf(stderr,"  [rq] reg=%04x val=%08x\n",rg,v);} }
+    memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *tk=(struct rknpu_task*)c->task.cpu; uint32_t saa=tk->regcfg_amount,see=tk->enable_mask;
+    tk->regcfg_amount=69; tk->enable_mask=0x18; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_submit sub; memset(&sub,0,sizeof sub); sub.flags=ork_ppflags(); sub.task_number=1;
+    sub.task_obj_addr=c->task.obj; sub.core_mask=RKNPU_CORE0_MASK; sub.fence_fd=-1;
+    sub.subcore_task[0]=(struct rknpu_subcore_task){0,1}; sub.timeout=orki_ew_timeout_ms();
+    int ok=-1; double t0=ork_now_us();
+    if(!orki_rknpu_submit_ioctl(fd,&sub,-1)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; if(us)*us=ork_now_us()-t0; }
+    tk->regcfg_amount=saa; tk->enable_mask=see; orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE);
+    if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[(size_t)m*N+n]=*(int16_t*)((char*)O.cpu+PC16(m,n)); }
+    else if(getenv("ORK_RQ_DUMP")){ int nz=0; int16_t*oc=O.cpu; for(size_t i=0;i<(size_t)M*N;i++) if(oc[i])nz++; fprintf(stderr,"  [rq] submit FAILED (errno path); O nonzero=%d/%d\n",nz,M*N); }
+    orki_bdestroy(fd,&A); orki_bdestroy(fd,&O); orki_bdestroy(fd,&B);
+    #undef PC32
+    #undef PC16
+    return ok;
+}

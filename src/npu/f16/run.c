@@ -326,49 +326,4 @@ int ork_mm_run_f16_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
     return ok;
 }
 
-int ork_npu_rope_neox_f16(ork_npu *c, const ork_f16 *x, int hd, int nrow, const int *pos, double freq_base, ork_f16 *out){
-    if(!c||!x||!pos||!out||hd<2||(hd&7)||nrow<1) return -2;
-    int hd2=hd/2; size_t sz=(size_t)nrow*hd*sizeof(ork_f16);
-    ork_f16 *cosT=malloc(sz),*sinT=malloc(sz),*xr=malloc(sz),*t1=malloc(sz),*t2=malloc(sz);
-    if(!cosT||!sinT||!xr||!t1||!t2){ free(cosT);free(sinT);free(xr);free(t1);free(t2); return -1; }
-    for(int r=0;r<nrow;r++){ double p=(double)pos[r];
-        for(int i=0;i<hd2;i++){ double th=p*pow(freq_base,-2.0*(double)i/(double)hd); float cc=(float)cos(th), ss=(float)sin(th);
-            cosT[(size_t)r*hd+i]=(ork_f16)cc; cosT[(size_t)r*hd+i+hd2]=(ork_f16)cc;
-            sinT[(size_t)r*hd+i]=(ork_f16)(-ss); sinT[(size_t)r*hd+i+hd2]=(ork_f16)ss; }
-        for(int i=0;i<hd2;i++){ xr[(size_t)r*hd+i]=x[(size_t)r*hd+i+hd2]; xr[(size_t)r*hd+i+hd2]=x[(size_t)r*hd+i]; } }
-    int rc=0;
-    if(ork_npu_ewmul_f16(c,x,cosT,nrow,hd,t1,NULL)) rc=-1;
-    else if(ork_npu_ewmul_f16(c,xr,sinT,nrow,hd,t2,NULL)) rc=-1;
-    else if(ork_npu_add_f16(c,t1,t2,nrow,hd,out,NULL)) rc=-1;
-    free(cosT);free(sinT);free(xr);free(t1);free(t2);
-    return rc;
-}
 
-int ork_npu_softmax_f16(ork_npu *c,int M,int n,const f16 *x,f16 *out){
-    if(!c||!x||!out||M<1||n<1) return -2;
-    float *mx=malloc((size_t)M*sizeof(float)), *e=malloc((size_t)M*n*sizeof(float)), *s=malloc((size_t)M*sizeof(float));
-    if(!mx||!e||!s){ free(mx);free(e);free(s); return -1; }
-    for(int m=0;m<M;m++){ float mv=(float)x[(size_t)m*n]; for(int j=1;j<n;j++){ float v=(float)x[(size_t)m*n+j]; if(v>mv)mv=v; } mx[m]=mv; }
-    int have_npu=0;
-    /* Composition: max (CPU) -> exp(x-max) on the NPU (SDP act-LUT, int16) -> Sum + scale on CPU.
-     * The Sum is intentionally NOT a reduce-matmul here: an activation(exp)->matmul(reduce) submit
-     * reliably ETIMEDOUTs on the stateful activation->matmul mode-switch (the reverse order,
-     * matmul->activation, is fine — cf. the rsqrt path), and self-healing per row-batch just discards
-     * the good NPU exp. So exp rides the NPU (the transcendental win) and the cheap Sigma stays on CPU. */
-    if(ork_softmax_npu_enabled() && n%32==0){
-        float lo=0; for(int m=0;m<M;m++){ float mv=mx[m]; for(int j=0;j<n;j++){ float d=(float)x[(size_t)m*n+j]-mv; if(d<lo)lo=d; } }
-        double in_scale=(-lo)/32000.0; if(in_scale<=0) in_scale=1e-6; double out_scale=1.0/32000.0;
-        int16_t *xi=malloc((size_t)M*n*2), *ei=malloc((size_t)M*n*2);
-        if(xi&&ei){
-            for(int m=0;m<M;m++) for(int j=0;j<n;j++){ long q=lround(((double)((float)x[(size_t)m*n+j]-mx[m]))/in_scale); if(q<-32768)q=-32768; if(q>32767)q=32767; xi[(size_t)m*n+j]=(int16_t)q; }
-            if(ork_npu_exp_i16(c,xi,M,n,in_scale,out_scale,ei,NULL)==0){                 /* exp(x-max) on NPU */
-                for(int m=0;m<M;m++){ double sm=0; for(int j=0;j<n;j++){ double d=(double)ei[(size_t)m*n+j]*out_scale; e[(size_t)m*n+j]=(float)d; sm+=d; } s[m]=(float)sm; }
-                have_npu=1;
-            }
-        }
-        free(xi);free(ei);
-    }
-    if(!have_npu){ for(int m=0;m<M;m++){ double sm=0; for(int j=0;j<n;j++){ float d=expf((float)x[(size_t)m*n+j]-mx[m]); e[(size_t)m*n+j]=d; sm+=d; } s[m]=(float)sm; } }
-    for(int m=0;m<M;m++){ float inv=1.0f/s[m]; for(int j=0;j<n;j++) out[(size_t)m*n+j]=(f16)(e[(size_t)m*n+j]*inv); }
-    free(mx);free(e);free(s); return 0;
-}

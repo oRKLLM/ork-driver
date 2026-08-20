@@ -131,7 +131,7 @@ ork_w *ork_mm_load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n){
     if(getenv("ORK_DIRECT_I4")){
         int8_t *i8=malloc((size_t)N*K);
         if(!i8){ ork_mm_free(c,w); return NULL; }
-        tile_direct_i4_i8(c, w, K, N, w->quant_kind, i8);
+        orki_tile_direct_i4_i8(c, w, K, N, w->quant_kind, i8);
         free(i8);
         return w;
     }

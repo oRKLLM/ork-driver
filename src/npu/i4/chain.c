@@ -23,7 +23,7 @@
 #include "regcmd_i4.h"
 #include "npu/i4/i4.h"
 
-int g_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
+int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
 
 int ork_mm_run_chain_i4(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
@@ -308,7 +308,7 @@ static void *bch_db_worker(void *vp){
                 if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
                     for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
                     orki_setr(rc,REGCMD_I4_N,0x201,0x1040,v1040|bits); } }
-            if(g_i4_validate && orki_validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
+            if(orki_i4_validate && orki_validate_regcmd("bch_db_worker", c, rc, REGCMD_I4_N, a->w, NULL, 0)){ a->rc=-1; c->mc_error=1; return NULL; }   /* per-program validate is a DEBUG check (ORK_I4_VALIDATE); off by default — it scales with program count and blk never had it */
             if(tk<NT-1){ uint32_t nd=(uint32_t)(c->mrc[i].dma+(size_t)(tk+1)*REGCMD_I4_N*4);
                 rc[216]=0x0010|((nd&0xffff)<<16); rc[217]=(0x0101<<16)|((nd>>16)&0xffff);
                 rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
@@ -381,7 +381,7 @@ int orki_run_i4_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] scratch dom=%d | W[0x%llx,+0x%llx) mtk_all=0x%llx mrc0=0x%llx maf0=0x%llx mcc0=0x%llx | overlap-check vs W\n",
         c->dom_active, (unsigned long long)w->Bb[0].dma, (unsigned long long)((size_t)K*N/2),
         (unsigned long long)c->mtk_all.dma, (unsigned long long)c->mrc[0].dma, (unsigned long long)c->maf[0].dma, (unsigned long long)c->mcc[0].dma);
-    if(g_i4_validate<0) g_i4_validate=getenv("ORK_I4_VALIDATE")?1:0;   /* init once on the calling thread (before dispatch) */
+    if(orki_i4_validate<0) orki_i4_validate=getenv("ORK_I4_VALIDATE")?1:0;   /* init once on the calling thread (before dispatch) */
     /* pre-size every core's buffers SINGLE-THREADED (no concurrent bcreate in the workers) */
     struct bchdbw args[ORK_MAXCORE];
     for(int i=0;i<nc;i++){
@@ -554,4 +554,65 @@ int ork_mm_run_i4_experts(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int n
         if(!w||w->dtype!=DT_I4||w->Sk!=1||w->Sn!=1||(w->N%64)||ex[e].M<1) return -2;
         if(w->domain!=ex[0].w->domain || w->K!=ex[0].w->K || w->N!=ex[0].w->N) return -2; }  /* one submit => one domain + one shape */
     return orki_run_i4_experts_bchain_db(c, ex, ntask, nc);   /* M-batched BCHAIN programs chained across experts */
+}
+ork_dyn_chain *ork_dyn_begin_mc_i4(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);  /* int4 M=1 doorbell (defined below) */
+int orki_i4_submit_tmo_ms(void);   /* #54 bounded int4 doorbell submit timeout (TCLEAN reap precondition); defined near the int4 workers */
+ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);  /* B: grouped-int4 doorbell */
+/* #54 COALESCE: run MANY int4 experts (each M>=1 rows) through ONE nonblock doorbell. Decompose every expert's
+ * M rows into M=1 tasks and hand the WHOLE set to ork_dyn_begin_mc_i4 — the doorbell distributes+chains them
+ * across the cores in one submit-set per core (the HW chaining is the doorbell's job; we don't hand-wire it).
+ * Collapses the per-expert submit storm (2059 matmuls x 3 cores) to ~nc submits per _exps tensor. All experts
+ * MUST share one iommu domain (the doorbell = one submit = one domain); the caller streams a layer's experts
+ * into a single domain. Returns 0 ok, -4 refuse (chain/buffer too big -> caller falls back), -1 error. */
+int orki_run_i4_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);   /* multi-expert BCHAIN (defined below) */
+/* Async pipelined submit (precision-agnostic) — orkd+ring mode only. Enqueue one matmul for w WITHOUT blocking
+ * and get a ticket; ork_mm_collect(ticket) reads C later. Returns <0 if unavailable (no ring, or the op is too
+ * big for a ring slot — use the synchronous ork_mm_run* instead). Keeping several ops in flight lets each op's
+ * transport (memcpy + handshake) overlap the NPU compute of the ones ahead of it — the decode pipeline. */
+int ork_mm_submit(ork_npu *c, ork_w *w, int M, const void *A){
+    if(!c || !c->daemon || !w || !w->is_orkd || !orkd_has_ring(c->daemon)) return -1;
+    uint32_t dt = w->dtype==DT_F16 ? ORKD_DT_F16 : w->dtype==DT_I4 ? ORKD_DT_I4 : ORKD_DT_I8;
+    return orkd_ring_submit(c->daemon, w->orkd_id, M, w->K, w->N, dt, A);
+}
+
+int ork_dyn_grouped_end(ork_dyn_chain *h) {
+    if (!h || !h->i4g) return -2;
+    ork_npu *c = h->c; int fd = c->fd, rc = 0;
+    /* Drain on the SHARED doorbell recover loop (mirrors ork_dyn_end@12140): poll all rows; on a dropped round
+     * (mc int4 output never landed) orki_mc_recover_resubmit (RESET + re-seed SENT16 via its esz==2 branch + resubmit
+     * each core) and re-poll, up to recov_max; auto-dump only a TRUE stall (recover exhausted). The grouped begin
+     * already stashed mc_nc/mc_dt=DT_I4/mc_dom/mc_subs/mc_Pc, so this self-heals exactly like the int8 mc path. */
+    orki_in_doorbell = 1;
+    int recov_max = (h->mc_nc > 0 && h->mc_dt == DT_I4) ? 6 : 0;
+    int landed = 0, edone[1024];
+    for (int recov = 0; ; recov++) {
+        double t0 = ork_now_us();
+        for (int i = 0; i < h->S && i < 1024; i++) edone[i] = 0;
+        double miss_to = (recov < recov_max) ? 300000.0 : 3e6;   /* fast miss-detect while retries remain, else full completion wait */
+        for (;;) { int n = 0; for (int x = 0; x < h->S; x++) { if (!edone[x]) edone[x] = ork_dyn_done_i(h, x); n += edone[x]; }
+            if (n >= h->S) { landed = 1; break; }
+            if (orki_ork_term) break;
+            double el = ork_now_us() - t0; if (el > miss_to) break;
+            if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        if (landed || orki_ork_term) break;
+        if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
+            h->c->dom_dirty = 1;   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty) */
+            orki_mc_recover_resubmit(h); continue; }
+        break;
+    }
+    orki_in_doorbell = 0;
+    if (!landed) { rc = -1; ork_dyn_dump(h, "grouped-i4 doorbell miss (recover exhausted)"); }
+    struct buf *done[1024]; int nd = 0;
+    for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
+        for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
+        if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    int N = h->i4g_N, Sk = h->i4g_Sk; const float *aS = h->i4g_aS, *bS = h->i4g_bS; float *Cf = h->i4g_Cf;
+    for (int m = 0; m < h->S; m++) { const int16_t *blk = (const int16_t*)h->outptr[m]; float *cr = Cf + (size_t)m * N;
+        for (int n = 0; n < N; n++) { float acc = 0;
+            for (int g = 0; g < Sk; g++) acc += aS[(size_t)m*Sk+g] * bS[(size_t)g*N+n] * (float)blk[(size_t)g*N+n];
+            cr[n] = acc; } }
+    __asm__ volatile("dsb ish":::"memory");
+    free(h);
+    if (orki_ork_term) { sigaction(SIGTERM, &orki_prev_sig[0], NULL); raise(SIGTERM); }
+    return rc;
 }

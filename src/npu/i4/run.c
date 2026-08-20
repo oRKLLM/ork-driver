@@ -96,7 +96,7 @@ void orki_synth_i4(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
     for(int i=0;i<orki_i4_fovr_n;i++) orki_setr(rc,REGCMD_I4_N,orki_i4_fovr[i].blk,orki_i4_fovr[i].reg,orki_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
-void tile_direct_i4_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
+void orki_tile_direct_i4_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
     if (kind == ORK_QK_CODEBOOK_NF4) {
         int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
         for (int n = 0; n < N; n++) orki_inflate_chan_nf4_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
@@ -124,7 +124,7 @@ void ork_slice_inflate_i4a8(const ork_w *w, float *qf32) { ork_slice_inflate_i4a
 
 void ork_slice_direct_i4a8_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
     if (!w || !w->Bi4) return;
-    tile_direct_i4_i8(c, w, w->K, w->N, kind, i8scratch);
+    orki_tile_direct_i4_i8(c, w, w->K, w->N, kind, i8scratch);
 }
 
 int ork_mm_run_i4(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){

@@ -401,28 +401,4 @@ int ork_npu_chain_mm_perchan_f16(ork_npu *c,int M,int K,int N,const uint16_t *A,
     return crc;
 }
 
-int ork_npu_rmsnorm_f16(ork_npu *c,int M,int n,const f16 *x,const f16 *w,float eps,f16 *out){
-    if(!c||!x||!w||!out||M<1||n<1) return -2;
-    float *ss=malloc((size_t)M*sizeof(float)), *sc=malloc((size_t)M*sizeof(float)); int have_ss=0, have_sc=0;
-    if(ss && ork_norm_reduce_npu(c,M,n,x,ss)==0) have_ss=1;                 /* sum(x^2) on NPU (any n) */
-    if(have_ss && sc && ork_norm_rsqrt_npu(c,M,n,(double)eps,ss,sc)==0) have_sc=1; /* rsqrt on NPU (K=512) */
-    for(int m=0;m<M;m++){ const f16 *xr=x+(size_t)m*n; f16 *o=out+(size_t)m*n; float s;
-        if(have_sc) s=sc[m];
-        else { double sumsq; if(have_ss) sumsq=(double)ss[m]; else { sumsq=0; for(int i=0;i<n;i++){ double v=(double)xr[i]; sumsq+=v*v; } }
-               s=(float)(1.0/sqrt(sumsq/(double)n+(double)eps)); }
-        for(int i=0;i<n;i++) o[i]=(f16)((float)xr[i]*s*(float)w[i]); }
-    free(ss); free(sc); return 0;
-}
 
-int ork_npu_l2norm_f16(ork_npu *c,int M,int n,const f16 *x,float eps,f16 *out){
-    if(!c||!x||!out||M<1||n<1) return -2;
-    float *ss=malloc((size_t)M*sizeof(float)), *sc=malloc((size_t)M*sizeof(float)); int have_ss=0, have_sc=0;
-    if(ss && ork_norm_reduce_npu(c,M,n,x,ss)==0) have_ss=1;
-    if(have_ss && sc && ork_norm_rsqrt_npu(c,M,1,(double)eps,ss,sc)==0) have_sc=1; /* nf=1: 1/sqrt(ss+eps) */
-    for(int m=0;m<M;m++){ const f16 *xr=x+(size_t)m*n; f16 *o=out+(size_t)m*n; float s;
-        if(have_sc) s=sc[m];
-        else { double sumsq; if(have_ss) sumsq=(double)ss[m]; else { sumsq=0; for(int i=0;i<n;i++){ double v=(double)xr[i]; sumsq+=v*v; } }
-               s=(float)(1.0/sqrt(sumsq+(double)eps)); }
-        for(int i=0;i<n;i++) o[i]=(f16)((float)xr[i]*s); }
-    free(ss); free(sc); return 0;
-}
