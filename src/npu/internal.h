@@ -429,4 +429,21 @@ int orki_act_lut_i16(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N
 void *orki_stream_worker_i8sk(void *vp);
 int orki_act_lut_i8(ork_npu *c,double(*f)(double),const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us);
 
+#define ORK_I4A8_MAGIC  0x4F344E31u           /* 'O','4','N','1' */
+#define ORK_I4A8_VER    ork_pack_format_version()  /* int4 blob compat = library MAJOR (see ork_npu.h) */
+#define ORK_I4_KS 10752       /* int4 single-submit K ceiling (validated == int8's) */
+
+/* xorshift PRNG for stochastic int4 rounding — tiny and hot, header-inline so every module gets it */
+static inline uint32_t ork_xs32(uint32_t *s){ uint32_t x=*s; x^=x<<13; x^=x>>17; x^=x<<5; *s=x; return x; }
+ork_dyn_chain *ork_dyn_begin_mc_i4_grouped(ork_npu *c, int M, ork_w *w, const int8_t *A, const float *aScale, const float *bScale, float *Cf, int nc);
+
+extern struct ork_regovr orki_i4_fovr[16]; extern int orki_i4_fovr_n;
+
+ork_w_sliced *orki_slice_pack_i4(ork_npu *c, int K, int N, const int8_t *B);
+int orki_slice_run_i4(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
+
+struct ork_i4a8_hdr { uint32_t magic, version; int32_t K, N; uint32_t quant_kind; };
+
+void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src);
+
 #endif /* ORK_NPU_INTERNAL_H */

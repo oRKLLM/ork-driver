@@ -532,32 +532,8 @@ int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
     return orki_chain_build_lut_fn(c, orki_silu_f, in_scale, out_scale, r_mult, r_shift, cfg4068, lut);
 }
 
-int orki_silu_calibrate_idx(ork_npu *c){
-    if(c->silu_idx_ok) return 0;
-    const int M=4,N=64;                       /* 256 elems = each int8 value exactly once */
-    int8_t in[256],out[256]; int16_t lut[1030];
-    for(int i=0;i<256;i++) in[i]=(int8_t)(i-128);
-    for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
-    if(ork_npu_probe_silu_std(c,in,M,N,0x2000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,0)) return -1;
-    for(int v=0;v<256;v++) c->silu_idx[v]=-1;
-    for(int i=0;i<M*N;i++){ int v=(uint8_t)in[i]; int o=out[i]; if(o>-127&&o<127) c->silu_idx[v]=(short)(2*o+512); }
-    c->silu_idx_ok=1; return 0;
-}
 
-void orki_silu_build_curve_biased(ork_npu *c,double(*f)(double),double in_scale,double out_scale,double bias,int16_t *lut){
-    int set[1030]; for(int i=0;i<1030;i++){lut[i]=0;set[i]=0;}
-    for(int vv=-128;vv<128;vv++){ int idx=c->silu_idx[(uint8_t)vv]; if(idx<0||idx>1029)continue;
-        double val=f((vv-bias)*in_scale)/out_scale; long q=lround(val); if(q>32767)q=32767; if(q<-32768)q=-32768;
-        lut[idx]=(int16_t)q; set[idx]=1; }
-    int lo=-1,hi=-1; for(int i=0;i<1030;i++)if(set[i]){lo=i;break;} for(int i=1029;i>=0;i--)if(set[i]){hi=i;break;}
-    if(lo<0)return; for(int i=0;i<lo;i++)lut[i]=lut[lo]; for(int i=hi+1;i<1030;i++)lut[i]=lut[hi];
-    for(int i=lo;i<=hi;i++){ if(set[i])continue; int a=i,b=i; while(a>lo&&!set[a])a--; while(b<hi&&!set[b])b++;
-        lut[i]=(int16_t)(lut[a]+(lut[b]-lut[a])*(i-a)/(b-a)); }
-}
 
-void orki_silu_build_curve(ork_npu *c,double(*f)(double),double in_scale,double out_scale,int16_t *lut){
-    orki_silu_build_curve_biased(c,f,in_scale,out_scale,0.0,lut);   /* plain curve = no bias */
-}
 
 static int act_lut_i8_biased(ork_npu *c,double(*f)(double),double bias,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
@@ -595,19 +571,6 @@ int ork_npu_exp_i8_biased(ork_npu *c,const int8_t *in,int M,int N,double in_scal
     return act_lut_i8_biased(c,orki_exp_f,max,in,M,N,in_scale,out_scale,out,us);
 }
 
-int orki_silu_calibrate_idx16(ork_npu *c){
-    if(c->silu_idx16_ok) return 0;
-    const int M=64,N=64;                      /* 4096 samples across the full int16 range (step 16) */
-    static int16_t in[SILU16_NS],out[SILU16_NS]; int16_t lut[1030];
-    for(int s=0;s<SILU16_NS;s++) in[s]=(int16_t)(-32768 + s*SILU16_QSTEP);
-    for(int i=0;i<1030;i++){ int v=i-512; if(v>32767)v=32767; if(v<-32768)v=-32768; lut[i]=(int16_t)v; }
-    /* NB: runs LAZILY on the first silu call — in the FFN chain that's right after a MULTI-CORE matmul,
-     * so this pure-SDP probe hits the chain-context wedge (retry does NOT help — it wedges every attempt
-     * even after soft-resets). See ork_npu_probe_silu_std_i16 (#35). Standalone it's clean. */
-    if(ork_npu_probe_silu_std_i16(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,0)) return -1;
-    for(int s=0;s<SILU16_NS;s++){ int o=out[s]; c->silu_idx16[s]=(o>-490&&o<510)?(short)(o+512):(short)-32768; }
-    c->silu_idx16_ok=1; return 0;
-}
 
 
 int ork_mm_run_stream_i8(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
