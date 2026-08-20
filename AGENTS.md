@@ -259,8 +259,7 @@ capability matrix in README.md.
 
 Exemptions are catalogued in `tools/naming_exempt.txt` as CONVERSION (names two dtypes; prefix is the
 source, destination explicit as `_to_<dst>`), AGNOSTIC, or MULTI (one implementation serving several
-precisions — the matrix's dagger cases). `include/ork/compat.h` holds deprecated pre-rename spellings for
-the fork and states its own removal condition.
+precisions — the matrix's dagger cases).
 
 Full old→new table and rationale: [`docs/NAMING_MIGRATION.md`](docs/NAMING_MIGRATION.md).
 

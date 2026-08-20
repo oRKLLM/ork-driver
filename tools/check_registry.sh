@@ -287,10 +287,9 @@ fi
 # --- 11) naming convention: dtype-first ------------------------------------------------------------
 # ork_<dtype>_<family>_<verb>[_<mechanism>][_<modifier>] — see AGENTS "Naming convention" and
 # docs/NAMING_MIGRATION.md. A symbol that names a dtype anywhere OTHER than immediately after the
-# ork_/orki_ prefix is drift. Exemptions (CONVERSION / AGNOSTIC / MULTI) live in tools/naming_exempt.txt;
-# include/ork/compat.h is skipped wholesale since it exists to hold the deprecated pre-rename spellings.
+# ork_/orki_ prefix is drift. Exemptions (CONVERSION / AGNOSTIC / MULTI) live in tools/naming_exempt.txt.
 NEX=tools/naming_exempt.txt
-namesyms=$(cat include/ork_npu.h $(ls include/ork/*.h | grep -v compat.h) 2>/dev/null \
+namesyms=$(cat include/ork_npu.h include/ork/*.h 2>/dev/null \
            | perl -0777 -pe 's{/\*.*?\*/}{}gs' | sed 's://.*::' | tr '\n' ' ' | tr ';' '\n' \
            | grep -oE '\b(ork|orki)_[A-Za-z0-9_]+[[:space:]]*\(' | tr -d ' (' | sort -u)
 namebad=$(for sym in $namesyms; do

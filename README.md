@@ -279,8 +279,8 @@ vs the earlier conservative tile). See AGENTS.md *"Weight-DMA amortization"* for
 ## Capability × precision matrix
 
 > Symbol names are **dtype-first** (`ork_i8_mm_run`). If you are updating from an older revision, see
-> [`docs/NAMING_MIGRATION.md`](docs/NAMING_MIGRATION.md) for the full old→new table; `include/ork/compat.h`
-> keeps the previous spellings working for the ggml-ork fork in the meantime.
+> [`docs/NAMING_MIGRATION.md`](docs/NAMING_MIGRATION.md) for the full old→new table. This is a clean
+> break — there are no compatibility shims, and every rename is a pure token substitution.
 
 Which datapath implements what. Regenerate with `make matrix` (`tools/precision_matrix.sh` derives it
 from the source tree, so it cannot drift from the code). A dagger means the capability is provided by a

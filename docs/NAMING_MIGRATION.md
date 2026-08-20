@@ -30,20 +30,29 @@ orki_tile_direct_i4_i8 ->  orki_i4_tile_direct_to_i8
 
 ## Are my calls broken?
 
-`include/ork/compat.h` provides deprecated inline forwards for the **51 symbols the ggml-ork
-fork calls**, so existing fork branches keep building unchanged. They are exact forwards with no
-behaviour; new code must not use them, and the header states its own removal condition.
+**Yes — this is a clean break.** There are no compatibility shims. Every renamed symbol changed name with
+no alias left behind, which is why the commit is marked `refactor!`.
 
-Everything else renamed without a shim. Mechanical fix:
+That was deliberate: a shim layer would have added ~51 deprecated symbols to a public header that a prior
+audit already found to be 53% surface with no production caller. Paying down that surface was the point of
+the exercise; growing it to soften a rename would have undone it.
+
+Fixing a consumer is mechanical — the full table below is the complete list, and every rename is a pure
+token substitution with no signature or behaviour change:
 
 ```sh
-# from docs/NAMING_MIGRATION.md, apply the table to your tree
-sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
+# apply the table to a tree, longest names first so prefixes do not shadow
+sed -i 's/\bork_mm_run_chain_i8_ffn\b/ork_i8_mm_run_chain_ffn/g;
+        s/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c
 ```
+
+Nothing else moved: signatures, argument order, return values and semantics are unchanged. If it compiled
+before and the name resolves now, it behaves identically — verified by a code-multiset invariant over the
+whole tree and by `make matrix` reproducing the capability table unchanged.
 
 ## Full map (193 renames)
 
-`†` = a deprecated forward exists in `ork/compat.h`. `(internal)` = not part of the public API.
+`(internal)` = not part of the public API; external consumers will not have called it.
 
 | old | new | |
 |---|---|---|
@@ -60,39 +69,39 @@ sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
 | `ork_mm_adopt_imported_i8` | `ork_i8_mm_adopt_imported` | (internal) |
 | `ork_mm_build_f16_lut` | `ork_f16_mm_build_lut` | (internal) |
 | `ork_mm_build_f16_rsqrt_lut` | `ork_f16_mm_build_rsqrt_lut` | (internal) |
-| `ork_mm_build_f16_silu_lut` | `ork_f16_mm_build_silu_lut` | † |
-| `ork_mm_f16_scratch` | `ork_f16_mm_scratch` | † |
-| `ork_mm_import_i8` | `ork_i8_mm_import` | † |
-| `ork_mm_inflate_i8_to_f16` | `ork_i8_mm_inflate_to_f16` | † |
+| `ork_mm_build_f16_silu_lut` | `ork_f16_mm_build_silu_lut` |  |
+| `ork_mm_f16_scratch` | `ork_f16_mm_scratch` |  |
+| `ork_mm_import_i8` | `ork_i8_mm_import` |  |
+| `ork_mm_inflate_i8_to_f16` | `ork_i8_mm_inflate_to_f16` |  |
 | `ork_mm_layer_i8` | `ork_i8_mm_layer` | (internal) |
 | `ork_mm_load_fold_i8` | `ork_i8_mm_load_fold` | (internal) |
-| `ork_mm_load_i4` | `ork_i4_mm_load` | † |
+| `ork_mm_load_i4` | `ork_i4_mm_load` |  |
 | `ork_mm_load_i4_arena` | `ork_i4_mm_load_arena` | (internal) |
-| `ork_mm_load_i4_import` | `ork_i4_mm_load_import` | † |
-| `ork_mm_load_i4a8` | `ork_i4a8_mm_load` | † |
-| `ork_mm_load_i4a8_import` | `ork_i4a8_mm_load_import` | † |
-| `ork_mm_load_i8` | `ork_i8_mm_load` | † |
+| `ork_mm_load_i4_import` | `ork_i4_mm_load_import` |  |
+| `ork_mm_load_i4a8` | `ork_i4a8_mm_load` |  |
+| `ork_mm_load_i4a8_import` | `ork_i4a8_mm_load_import` |  |
+| `ork_mm_load_i8` | `ork_i8_mm_load` |  |
 | `ork_mm_load_i8_flags` | `ork_i8_mm_load_flags` | (internal) |
-| `ork_mm_load_i8_import` | `ork_i8_mm_load_import` | † |
-| `ork_mm_pack` | `ork_f16_mm_pack` | † |
+| `ork_mm_load_i8_import` | `ork_i8_mm_load_import` |  |
+| `ork_mm_pack` | `ork_f16_mm_pack` |  |
 | `ork_mm_pack_f16_fused_act` | `ork_f16_mm_pack_fused_act` | (internal) |
-| `ork_mm_pack_i4` | `ork_i4_mm_pack` | † |
-| `ork_mm_pack_i4_grouped` | `ork_i4_mm_pack_grouped` | † |
+| `ork_mm_pack_i4` | `ork_i4_mm_pack` |  |
+| `ork_mm_pack_i4_grouped` | `ork_i4_mm_pack_grouped` |  |
 | `ork_mm_pack_i4_to_i8` | `ork_i4_mm_pack_to_i8` | (internal) |
-| `ork_mm_pack_i4a8` | `ork_i4a8_mm_pack` | † |
-| `ork_mm_pack_i4a8_im` | `ork_i4a8_mm_pack_im` | † |
-| `ork_mm_pack_i8` | `ork_i8_mm_pack` | † |
-| `ork_mm_pack_i8_dequant` | `ork_i8_mm_pack_dequant` | † |
+| `ork_mm_pack_i4a8` | `ork_i4a8_mm_pack` |  |
+| `ork_mm_pack_i4a8_im` | `ork_i4a8_mm_pack_im` |  |
+| `ork_mm_pack_i8` | `ork_i8_mm_pack` |  |
+| `ork_mm_pack_i8_dequant` | `ork_i8_mm_pack_dequant` |  |
 | `ork_mm_pack_i8_f32` | `ork_i8_mm_pack_f32` | (internal) |
-| `ork_mm_pack_i8_import` | `ork_i8_mm_pack_import` | † |
-| `ork_mm_repack_f16` | `ork_f16_mm_repack` | † |
-| `ork_mm_repack_i8` | `ork_i8_mm_repack` | † |
+| `ork_mm_pack_i8_import` | `ork_i8_mm_pack_import` |  |
+| `ork_mm_repack_f16` | `ork_f16_mm_repack` |  |
+| `ork_mm_repack_i8` | `ork_i8_mm_repack` |  |
 | `ork_mm_repack_i8_dequant` | `ork_i8_mm_repack_dequant` | (internal) |
 | `ork_mm_repack_i8_f32` | `ork_i8_mm_repack_f32` | (internal) |
-| `ork_mm_run` | `ork_f16_mm_run` | † |
-| `ork_mm_run_chain_i4` | `ork_i4_mm_run_chain` | † |
+| `ork_mm_run` | `ork_f16_mm_run` |  |
+| `ork_mm_run_chain_i4` | `ork_i4_mm_run_chain` |  |
 | `ork_mm_run_chain_i4_async` | `ork_i4_mm_run_chain_async` | (internal) |
-| `ork_mm_run_chain_i8` | `ork_i8_mm_run_chain` | † |
+| `ork_mm_run_chain_i8` | `ork_i8_mm_run_chain` |  |
 | `ork_mm_run_chain_i8_async` | `ork_i8_mm_run_chain_async` | (internal) |
 | `ork_mm_run_chain_i8_ffn` | `ork_i8_mm_run_chain_ffn` | (internal) |
 | `ork_mm_run_chain_i8_ffn_exp` | `ork_i8_mm_run_chain_ffn_exp` | (internal) |
@@ -102,36 +111,36 @@ sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
 | `ork_mm_run_f16_act` | `ork_f16_mm_run_act` | (internal) |
 | `ork_mm_run_f16_f16out` | `ork_f16_mm_run_f16out` | (internal) |
 | `ork_mm_run_f16_fused_act` | `ork_f16_mm_run_fused_act` | (internal) |
-| `ork_mm_run_f16_silu` | `ork_f16_mm_run_silu` | † |
-| `ork_mm_run_i4` | `ork_i4_mm_run` | † |
+| `ork_mm_run_f16_silu` | `ork_f16_mm_run_silu` |  |
+| `ork_mm_run_i4` | `ork_i4_mm_run` |  |
 | `ork_mm_run_i4_async` | `ork_i4_mm_run_async` | (internal) |
 | `ork_mm_run_i4_experts` | `ork_i4_mm_run_experts` | (internal) |
-| `ork_mm_run_i4_grouped` | `ork_i4_mm_run_grouped` | † |
-| `ork_mm_run_i8` | `ork_i8_mm_run` | † |
+| `ork_mm_run_i4_grouped` | `ork_i4_mm_run_grouped` |  |
+| `ork_mm_run_i8` | `ork_i8_mm_run` |  |
 | `ork_mm_run_i8_async` | `ork_i8_mm_run_async` | (internal) |
 | `ork_mm_run_i8_ewmul` | `ork_i8_mm_run_ewmul` | (internal) |
-| `ork_mm_run_i8_out16` | `ork_i8_mm_run_out16` | † |
-| `ork_mm_run_i8_out8` | `ork_i8_mm_run_out8` | † |
-| `ork_mm_run_i8_silu` | `ork_i8_mm_run_silu` | † |
+| `ork_mm_run_i8_out16` | `ork_i8_mm_run_out16` |  |
+| `ork_mm_run_i8_out8` | `ork_i8_mm_run_out8` |  |
+| `ork_mm_run_i8_silu` | `ork_i8_mm_run_silu` |  |
 | `ork_mm_run_i8_silu32` | `ork_i8_mm_run_silu32` | (internal) |
-| `ork_mm_run_stream_f16` | `ork_f16_mm_run_stream` | † |
-| `ork_mm_run_stream_f16_chain` | `ork_f16_mm_run_stream_chain` | † |
+| `ork_mm_run_stream_f16` | `ork_f16_mm_run_stream` |  |
+| `ork_mm_run_stream_f16_chain` | `ork_f16_mm_run_stream_chain` |  |
 | `ork_mm_run_stream_i4` | `ork_i4_mm_run_stream` | (internal) |
 | `ork_mm_run_stream_i4_async` | `ork_i4_mm_run_stream_async` | (internal) |
-| `ork_mm_run_stream_i8` | `ork_i8_mm_run_stream` | † |
+| `ork_mm_run_stream_i8` | `ork_i8_mm_run_stream` |  |
 | `ork_mm_run_stream_i8_async` | `ork_i8_mm_run_stream_async` | (internal) |
 | `ork_mm_run_stream_i8_sk` | `ork_i8_mm_run_stream_sk` | (internal) |
-| `ork_npu_add_f16` | `ork_f16_npu_add` | † |
+| `ork_npu_add_f16` | `ork_f16_npu_add` |  |
 | `ork_npu_add_i16` | `ork_i16_npu_add` | (internal) |
 | `ork_npu_add_i8` | `ork_i8_npu_add` | (internal) |
 | `ork_npu_chain_gatesilu_i16` | `ork_i16_npu_chain_gatesilu` | (internal) |
 | `ork_npu_chain_mm_perchan_f16` | `ork_f16_npu_chain_mm_perchan` | (internal) |
 | `ork_npu_chain_mm_perchan_i16` | `ork_i16_npu_chain_mm_perchan` | (internal) |
 | `ork_npu_chain_mm_silu_i16` | `ork_i16_npu_chain_mm_silu` | (internal) |
-| `ork_npu_ewmul_f16` | `ork_f16_npu_ewmul` | † |
+| `ork_npu_ewmul_f16` | `ork_f16_npu_ewmul` |  |
 | `ork_npu_ewmul_i16` | `ork_i16_npu_ewmul` | (internal) |
-| `ork_npu_ewmul_i8` | `ork_i8_npu_ewmul` | † |
-| `ork_npu_exp_i16` | `ork_i16_npu_exp` | † |
+| `ork_npu_ewmul_i8` | `ork_i8_npu_ewmul` |  |
+| `ork_npu_exp_i16` | `ork_i16_npu_exp` |  |
 | `ork_npu_exp_i8` | `ork_i8_npu_exp` | (internal) |
 | `ork_npu_exp_i8_biased` | `ork_i8_npu_exp_biased` | (internal) |
 | `ork_npu_f16_gap_probe` | `ork_f16_npu_gap_probe` | (internal) |
@@ -139,12 +148,12 @@ sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
 | `ork_npu_fold_op_i8` | `ork_i8_npu_fold_op` | (internal) |
 | `ork_npu_fold_run_i8` | `ork_i8_npu_fold_run` | (internal) |
 | `ork_npu_gelu_i16` | `ork_i16_npu_gelu` | (internal) |
-| `ork_npu_gelu_i8` | `ork_i8_npu_gelu` | † |
+| `ork_npu_gelu_i8` | `ork_i8_npu_gelu` |  |
 | `ork_npu_l2norm_f16` | `ork_f16_npu_l2norm` | (internal) |
 | `ork_npu_mm_perchan_f16` | `ork_f16_npu_mm_perchan` | (internal) |
 | `ork_npu_mm_perchan_f16_diag` | `ork_f16_npu_mm_perchan_diag` | (internal) |
 | `ork_npu_mm_perchan_f16_fused` | `ork_f16_npu_mm_perchan_fused` | (internal) |
-| `ork_npu_mul_perchan_f16` | `ork_f16_npu_mul_perchan` | † |
+| `ork_npu_mul_perchan_f16` | `ork_f16_npu_mul_perchan` |  |
 | `ork_npu_mul_perchan_f16_contig` | `ork_f16_npu_mul_perchan_contig` | (internal) |
 | `ork_npu_mul_perchan_i16` | `ork_i16_npu_mul_perchan` | (internal) |
 | `ork_npu_mul_perchan_i8` | `ork_i8_npu_mul_perchan` | (internal) |
@@ -175,16 +184,16 @@ sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
 | `ork_npu_replay_lut_i16` | `ork_i16_npu_replay_lut` | (internal) |
 | `ork_npu_replay_reshape_f16` | `ork_f16_npu_replay_reshape` | (internal) |
 | `ork_npu_replay_softmax_f16` | `ork_f16_npu_replay_softmax` | (internal) |
-| `ork_npu_rmsnorm_f16` | `ork_f16_npu_rmsnorm` | † |
-| `ork_npu_rope_neox_f16` | `ork_f16_npu_rope_neox` | † |
-| `ork_npu_row_max_i8` | `ork_i8_npu_row_max` | † |
+| `ork_npu_rmsnorm_f16` | `ork_f16_npu_rmsnorm` |  |
+| `ork_npu_rope_neox_f16` | `ork_f16_npu_rope_neox` |  |
+| `ork_npu_row_max_i8` | `ork_i8_npu_row_max` |  |
 | `ork_npu_rsqrt_i16` | `ork_i16_npu_rsqrt` | (internal) |
 | `ork_npu_rsqrt_i8` | `ork_i8_npu_rsqrt` | (internal) |
-| `ork_npu_silu_i16` | `ork_i16_npu_silu` | † |
-| `ork_npu_silu_i8` | `ork_i8_npu_silu` | † |
-| `ork_npu_softmax_f16` | `ork_f16_npu_softmax` | † |
+| `ork_npu_silu_i16` | `ork_i16_npu_silu` |  |
+| `ork_npu_silu_i8` | `ork_i8_npu_silu` |  |
+| `ork_npu_softmax_f16` | `ork_f16_npu_softmax` |  |
 | `ork_npu_synth_i8_dump` | `ork_i8_npu_synth_dump` | (internal) |
-| `ork_pack_i4a8_cpu_blob` | `ork_i4a8_pack_cpu_blob` | † |
+| `ork_pack_i4a8_cpu_blob` | `ork_i4a8_pack_cpu_blob` |  |
 | `ork_slice_direct_i4a8_kind` | `ork_i4a8_slice_direct_kind` | (internal) |
 | `ork_slice_direct_inflate_i8` | `ork_i8_slice_direct_inflate` | (internal) |
 | `ork_slice_inflate_i4a8` | `ork_i4a8_slice_inflate` | (internal) |
@@ -194,14 +203,14 @@ sed -i 's/\bork_mm_run_i8\b/ork_i8_mm_run/g' your_file.c   # ...and so on
 | `ork_ssd_probe_rawmm_f16` | `ork_f16_ssd_probe_rawmm` | (internal) |
 | `ork_stage_fill_i8` | `ork_i8_stage_fill` | (internal) |
 | `ork_stream_pool_add_i4a8` | `ork_i4a8_stream_pool_add` | (internal) |
-| `ork_stream_pool_add_i8` | `ork_i8_stream_pool_add` | † |
+| `ork_stream_pool_add_i8` | `ork_i8_stream_pool_add` |  |
 | `ork_stream_pool_add_i8_raw` | `ork_i8_stream_pool_add_raw` | (internal) |
 | `ork_w_attach_fold_i8` | `ork_i8_w_attach_fold` | (internal) |
-| `ork_w_dump_bf_i8_cpu` | `ork_i8_w_dump_bf_cpu` | † |
+| `ork_w_dump_bf_i8_cpu` | `ork_i8_w_dump_bf_cpu` |  |
 | `ork_w_dump_fold_i8_cpu` | `ork_i8_w_dump_fold_cpu` | (internal) |
-| `ork_w_dump_i4a8` | `ork_i4a8_w_dump` | † |
-| `ork_w_dump_i8_cpu` | `ork_i8_w_dump_cpu` | † |
-| `ork_w_dump_i8_cpu_st` | `ork_i8_w_dump_cpu_st` | † |
+| `ork_w_dump_i4a8` | `ork_i4a8_w_dump` |  |
+| `ork_w_dump_i8_cpu` | `ork_i8_w_dump_cpu` |  |
+| `ork_w_dump_i8_cpu_st` | `ork_i8_w_dump_cpu_st` |  |
 | `orki_act_lut_i16` | `orki_i16_act_lut` | (internal) |
 | `orki_act_lut_i8` | `orki_i8_act_lut` | (internal) |
 | `orki_bmm_gather_f16` | `orki_f16_bmm_gather` | (internal) |

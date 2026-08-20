@@ -46,6 +46,5 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
 #include "ork/seq.h"
 #include "ork/chain.h"
 #include "ork/bmm.h"
-#include "ork/compat.h"   /* DEPRECATED pre-rename spellings for the fork; see docs/NAMING_MIGRATION.md */
 
 #endif

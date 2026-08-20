@@ -9,8 +9,6 @@
 #   MULTI      — ONE implementation genuinely serving several precisions, so no single tag is truthful.
 #                These are the same cases the capability matrix marks with a dagger.
 #
-# include/ork/compat.h is skipped wholesale: it exists to hold the deprecated pre-rename spellings.
-#
 # <symbol>                      <kind>       <note>
 ork_i8_mm_inflate_to_f16        CONVERSION   int8 source -> fp16 destination
 ork_i4_mm_pack_to_i8            CONVERSION   int4 source -> int8 tiles
