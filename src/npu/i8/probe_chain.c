@@ -179,66 +179,6 @@ int ork_npu_benchmark_chain(ork_npu *c, int S, int K, int N, int iters) {
     return 0;
 }
 
-/* CHAIN ASSEMBLER self-test: chain TWO plain int8 matmuls via ork_npu_chain_progs and verify BOTH tasks
- * EXECUTE + produce output -- the exact thing Phase-0 could not (an early task0 that actually runs). Uses
- * WORKING primitives only (synth_i8 native int32 output; no set_i16_out). Layout-agnostic: A=all-1, W0=all-1,
- * W1=all-2 -> every C0 element == K, every C1 element == 2K, regardless of output tiling. Fills *t0_cnt/
- * *t1_cnt = count of the M*N int32 slots matching K / 2K (near M*N => that task ran; 0 => it didn't).
- * 0/ok, -1 wedge, -2 dims/alloc. rk3588. */
-int ork_npu_chain_progs(ork_npu *c, int n, const ork_chain_prog *progs, int dom){
-    if(!c||!progs||n<1||n>1024) return -2;
-    int fd=c->fd;
-    /* warm-state management (mirror run_chain_i8): entering a chain from a non-int8-live mode resets +
-     * unwarms so the WARM-UP reps below fire; DT_I8<->DT_I8_CHAIN is not a real mode change (keepwarm). */
-    ork_npu_enter(c, 3 /* DT_I8_CHAIN */, XP_CHAIN_NT, OCK_HW);
-    size_t off[1024], total=0;
-    /* Each task's regcmd MUST start on a 64-byte (16-word) boundary — the HW chain-walk hangs "entering" a
-     * misaligned successor task (vendor RE: tight packing landed a task at +80 mod 128 and hung; the vendor
-     * lays every task 64B-aligned). Matmul-only chains never tripped this (REGCMD_I8_N=224w=896B is 64B-aligned,
-     * so contiguous packing stays aligned), but a 146-word SDP task (584B) knocks every following task off the
-     * boundary. Round each task's start up to 16 words. */
-    for(int i=0;i<n;i++){ if(!progs[i].rc||progs[i].nwords<2) return -2; total=(total+15)&~(size_t)15; off[i]=total; total+=(size_t)progs[i].nwords; }
-    if(total*4 > c->regcmd.size || (size_t)n*sizeof(struct rknpu_task) > c->task.size) return -2;
-    uint32_t *base=(uint32_t*)c->regcmd.cpu;
-    for(int i=0;i<n;i++){
-        memcpy(base+off[i], progs[i].rc, (size_t)progs[i].nwords*4);
-        if(i<n-1){
-            /* WRITE this program's PC next-descriptor at its designated slot (like run_chain_i8's word 216).
-             * The slot is not a pre-existing pattern in the template -- the chaining code creates it. */
-            int slot=progs[i].desc_slot;
-            if(slot<0 || slot+3>=progs[i].nwords) return -2;   /* this op can't be a MIDDLE program */
-            uint32_t *rc=base+off[i];
-            uint64_t nx=(uint64_t)c->regcmd.dma + off[i+1]*4; int nreg=(progs[i+1].regcfg_amount+3)/2;
-            rc[slot]  =0x0010 | ((uint32_t)(nx&0xffff)<<16);
-            rc[slot+1]=(0x0101u<<16) | (uint32_t)((nx>>16)&0xffff);
-            rc[slot+2]=0x0014 | ((uint32_t)nreg<<16);
-            rc[slot+3]=(0x0101u<<16);
-        }
-    }
-    orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-    struct rknpu_task *t=c->task.cpu; memset(t,0,(size_t)n*sizeof(struct rknpu_task));
-    for(int i=0;i<n;i++){ t[i].enable_mask=progs[i].enable_mask; t[i].int_mask=0x300; t[i].int_clear=0x1ffff;
-        t[i].regcfg_amount=progs[i].regcfg_amount; t[i].regcmd_addr=(uint32_t)((uint64_t)c->regcmd.dma + off[i]*4); }
-    orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
-    /* ping-pong (ork_ppflags, typically 0x5) is safe ONLY for register-config-only chains (all int8 matmul
-     * tasks, like run_chain_i8); ANY SDP/LUT task (enable != 0xd) needs ping-pong OFF (0x1) so a bank swap
-     * doesn't race a LUT SRAM commit (AGENTS.md "ping-pong OFF for LUT chains"). */
-    int has_sdp=0; for(int i=0;i<n;i++) if(progs[i].enable_mask!=0xd) has_sdp=1;
-    struct rknpu_submit s; memset(&s,0,sizeof s);
-    s.flags = has_sdp ? 0x1 : ork_ppflags(); s.task_number=(uint32_t)n; s.task_obj_addr=c->task.obj;
-    s.core_mask=RKNPU_CORE0_MASK; s.fence_fd=-1; s.timeout=orki_ew_timeout_ms();
-    s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)n};
-    /* WARM-UP: a COLD int8-matmul chain submit yields EMPTY output (run_chain_i8 reps=2 cold). Submit reps
-     * times; the last produces the result. c->warmed is managed by the DT_I8_CHAIN block at entry. */
-    int reps = c->warmed ? 1 : 2, rr=0;
-    if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] n=%d dom=%d flags=0x%x warmed(pre)=%d reps=%d regcmd.dma=0x%llx task.obj=0x%llx | "
-        "t0{en=0x%x rcfg=%d addr=0x%x} t%d{en=0x%x rcfg=%d addr=0x%x}\n", n,dom,s.flags,reps,reps,(unsigned long long)c->regcmd.dma,(unsigned long long)c->task.obj,
-        t[0].enable_mask,t[0].regcfg_amount,t[0].regcmd_addr, n-1,t[n-1].enable_mask,t[n-1].regcfg_amount,t[n-1].regcmd_addr);
-    for(int rep=0; rep<reps; rep++){ int e=orki_rknpu_submit_ioctl(fd,&s,dom); rr = e?-1:0;
-        if(getenv("ORK_CHAIN_DBG")) fprintf(stderr,"[chain_progs] submit rep %d -> %d (errno=%d)\n",rep,e,errno); }
-    c->warmed = 1;
-    return rr;
-}
 
 int ork_npu_probe_seq_hetero(ork_npu *c, int *ok){
     if(ok)*ok=0;
@@ -392,6 +332,12 @@ int ork_npu_probe_sdp_chain_fwd(ork_npu *c, int *t0_ok, int *t1_ok){
     return rc;
 }
 
+/* CHAIN ASSEMBLER self-test: chain TWO plain int8 matmuls via ork_npu_chain_progs and verify BOTH tasks
+ * EXECUTE + produce output -- the exact thing Phase-0 could not (an early task0 that actually runs). Uses
+ * WORKING primitives only (synth_i8 native int32 output; no set_i16_out). Layout-agnostic: A=all-1, W0=all-1,
+ * W1=all-2 -> every C0 element == K, every C1 element == 2K, regardless of output tiling. Fills *t0_cnt/
+ * *t1_cnt = count of the M*N int32 slots matching K / 2K (near M*N => that task ran; 0 => it didn't).
+ * 0/ok, -1 wedge, -2 dims/alloc. rk3588. */
 int ork_npu_chain_selftest(ork_npu *c, int *t0_cnt, int *t1_cnt){
     /* dom=-1 (default domain) to match the WORKING raw-submit paths (probe_i8_mm, softmax_replay); the init
      * buffers c->Af/c->regcmd/c->task live in the default domain, so a domain-0 submit mismatches them. */

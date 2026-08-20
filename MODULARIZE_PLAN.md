@@ -507,7 +507,16 @@ board and an exported-symbol diff over `libork_npu.so`.
 `CORE` in the Makefile gained the four new TUs. Forgetting that would not fail the build — the objects
 simply would never be compiled and the symbols would go missing at link, so it is checked, not assumed.
 
-### Follow-up this exposed
-`ork_npu_chain_progs` has **six library callers** (round 4 classified it production) yet lives in
-`probe_chain.c`. The contiguous split preserves that misplacement rather than fixing it, because moving one
-function out is a separate, non-contiguous change. It belongs in `i8/chain.c`.
+### Follow-up this exposed — since fixed
+`ork_npu_chain_progs` had **six library callers** (round 4 classified it production) yet lived in
+`probe_chain.c`. The contiguous split preserved that misplacement rather than fixing it. Now moved to
+`i8/chain.c`, where the heterogeneous chain paths that depend on it live.
+
+Moving it turned up a second defect in the same place: the comment sitting above it was **not its doc**. It
+described a self-test filling `*t0_cnt/*t1_cnt` — i.e. `ork_npu_chain_selftest`, which was itself
+undocumented 200 lines further down. `chain_progs`' real contract was in `include/ork/sdp.h` all along. So
+the move both relocated the function and returned the doc to the function it describes.
+
+Verified by the code-multiset invariant being **exactly neutral** (17,656 lines both sides — a pure
+relocation adds and loses nothing, unlike the probe split which legitimately added replicated preamble),
+literal-aware brace balance 0 in both files, and a board build + `make test`.
