@@ -395,7 +395,10 @@ one undifferentiated surface, and no reader could tell which was which.
 Because this REORDERS declarations (unlike round 3's contiguous cut), three things were checked:
 - every content line of `ops.h` appears exactly once across the two new headers (396 = 396, sorted compare);
 - the whole-header declaration set is unchanged (296 = 296);
-- a from-scratch board build.
+- a board check, completed after the fact (the board was tied up by another session's suite when
+  round 4 was committed, so the commit message says "board build still pending" — it no longer is):
+  all 41 library translation units pass `gcc -std=c11 -fsyntax-only` on the RK3588 with zero output,
+  and a C++17 TU including <ork_npu.h> is clean, which is the path ggml-ork.cpp actually uses.
 
 `ork_chain_prog`, the one type declared in `ops.h`, goes to `sdp.h`, which the umbrella includes first.
 
