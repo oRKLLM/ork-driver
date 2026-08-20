@@ -32,7 +32,11 @@ fail=0
 # All library sources — globbed, NOT a hardcoded src/npu.c, so these gates keep working as the monolith
 # is split into src/npu/*.c (and deeper). Unmatched globs expand to themselves; the greps just miss them.
 LIBSRC=$(ls src/*.c src/*/*.c src/*/*/*.c 2>/dev/null || true)   # || true: set -e, and the deeper globs may not match yet
-SRC="$LIBSRC include/ork_npu.h"
+# SRCLOCAL = THIS repo only. SRC additionally covers the ggml-ork fork when a sibling checkout exists.
+# The two are NOT interchangeable: existence is judged against SRC (a registry symbol may legitimately
+# live in the fork), but exemption-staleness must be judged against SRCLOCAL — see check 2.
+SRCLOCAL="$LIBSRC include/ork_npu.h"
+SRC="$SRCLOCAL"
 GGML="../llama.cpp/ggml/src/ggml-ork/ggml-ork.cpp"
 [ -f "$GGML" ] && SRC="$SRC $GGML"
 
@@ -78,8 +82,14 @@ for o in $ops; do
   for f in $SRC; do grep -qE "\b$o\b" "$f" 2>/dev/null && { hit=1; break; }; done
   if printf '%s\n' $rex | grep -qx "$o" 2>/dev/null; then
     # Exempted as fork-side. If it now resolves HERE, the exemption outlived its reason: drop it, do
-    # not let it keep a real symbol unchecked.
-    [ "$hit" = 1 ] && { echo "check-registry: FAIL — '$o' is exempt in $REX but DOES exist in sources; remove the stale exemption"; fail=1; }
+    # not let it keep a real symbol unchecked. "HERE" means $SRCLOCAL — this repo — NOT $SRC: when a
+    # sibling ../llama.cpp checkout exists $SRC also spans the fork, and a hit THERE is the exemption
+    # doing its job, not rotting. Judging staleness against $SRC made the gate self-contradictory
+    # (it flagged ork_f16_mtile, which is exempt precisely BECAUSE it is fork-side) and it failed for
+    # every developer with the fork checked out while passing in CI, which has no fork.
+    hitl=0
+    for f in $SRCLOCAL; do grep -qE "\b$o\b" "$f" 2>/dev/null && { hitl=1; break; }; done
+    [ "$hitl" = 1 ] && { echo "check-registry: FAIL — '$o' is exempt in $REX but DOES exist in this repo's sources; remove the stale exemption"; fail=1; }
     continue
   fi
   [ "$hit" = 1 ] || { echo "check-registry: FAIL — op '$o' named in registry not found in sources"; fail=1; }
