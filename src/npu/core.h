@@ -11,7 +11,18 @@
  * ONCE turns each remaining precision lift into a pure move against a stable header.
  *
  * internal.h holds the TYPES (what things are) and the hot static inlines; this holds the API (what you
- * can call). Include as "npu/core.h" from any depth (-Isrc). */
+ * can call). Include as "npu/core.h" from any depth (-Isrc).
+ *
+ * HEADER PLACEMENT RULE (src/npu/):
+ *   npu/<name>.h        — tree-wide. Included from outside its own subsystem. internal.h (types the
+ *                         whole driver shares) and core.h (the substrate's outward interface).
+ *   npu/<mod>/<mod>.h   — PRIVATE to that folder. Only npu/<mod>/*.c may include it; if the scaffold
+ *                         needs one of a module's symbols, the declaration goes in internal.h instead.
+ * So core.h sits BESIDE core/ rather than inside it because it is consumed by npu.c and by every
+ * precision module — putting it in core/ would make the most widely included header in the tree look
+ * private. i8.h / f16.h / i4.h / i16.h are inside their folders because nothing outside them includes
+ * them (verified: each is included only by its own *.c).
+ */
 #ifndef ORK_NPU_CORE_H
 #define ORK_NPU_CORE_H
 #include "npu/internal.h"

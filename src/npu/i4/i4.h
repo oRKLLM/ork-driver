@@ -2,7 +2,9 @@
  *
  * The i4 sub-modules (quant/pack/run/chain/stream) are one datapath split for readability, not
  * independent components; they call each other freely. This declares what they share plus the types the
- * datapath owns. Same role npu/i8/i8.h plays for int8. Nothing outside src/npu/i4/ should include it. */
+ * datapath owns. Same role npu/i8/i8.h plays for int8. Nothing outside src/npu/i4/ should include it —
+ * that is why it lives INSIDE the folder, where npu/core.h and npu/internal.h (tree-wide) sit beside
+ * their subsystems. If the scaffold needs a symbol from here, declare it in internal.h instead. */
 #ifndef ORK_NPU_I4_H
 #define ORK_NPU_I4_H
 #include "npu/internal.h"

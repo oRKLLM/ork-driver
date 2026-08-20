@@ -3,7 +3,9 @@
  * The seven i8 sub-modules (regcmd/pack/fold/run/chain/dyn/probe) are one datapath split for
  * readability, not seven independent components -- they call each other freely. This declares what
  * they share, the same declare-then-move discipline npu/core.h applies to the substrate, one level
- * down. Nothing outside src/npu/i8/ should include it. */
+ * down. Nothing outside src/npu/i8/ should include it —
+ * that is why it lives INSIDE the folder, where npu/core.h and npu/internal.h (tree-wide) sit beside
+ * their subsystems. If the scaffold needs a symbol from here, declare it in internal.h instead. */
 #ifndef ORK_NPU_I8_H
 #define ORK_NPU_I8_H
 #include "npu/internal.h"

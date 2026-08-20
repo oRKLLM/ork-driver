@@ -12,6 +12,8 @@
 #      evidence — the name of a real probe/test file, a `make test`/`replay`/`gtest`/`ppl`
 #      reference, or an explicit `(no ... probe)` acknowledgment. A hard status backed by
 #      nothing fails. WIP / diagnostic / legend rows are exempt.
+#   6. HEADER PLACEMENT: npu/<mod>/<mod>.h is private to its folder; only npu/<mod>/*.c may include
+#      it. Keeps the "inside the folder = private, beside it = interface" rule from eroding.
 #   5. NO DANGLING DECLARATIONS: every ork_*/orkd_* function PROTOTYPED in a header must have
 #      an implementation. A header can promise a symbol nothing defines — the caller gets a
 #      link error, and if nothing in-tree calls it the gap is invisible. That is exactly how
@@ -132,5 +134,20 @@ for d in $dvd_decl; do
   fail=1
 done
 
-[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations"
+# --- 6) header placement: a subtree header must stay PRIVATE to its folder ------------------------
+# npu/<mod>/<mod>.h is private (only npu/<mod>/*.c may include it); npu/*.h is tree-wide. If the
+# scaffold needs a module symbol the declaration belongs in internal.h, not an include of the module's
+# private header — that is what keeps core.h beside core/ meaningful rather than arbitrary.
+for h in src/npu/*/*.h; do
+  mod=$(basename "$(dirname "$h")"); base=$(basename "$h" .h)
+  [ "$mod" = "$base" ] || continue
+  bad=$(grep -rl "include \"npu/$mod/$base.h\"" src 2>/dev/null | grep -v "^src/npu/$mod/" || true)
+  if [ -n "$bad" ]; then
+    echo "check-registry: FAIL — private subtree header npu/$mod/$base.h included from outside its folder:"
+    echo "$bad" | sed 's/^/    /'
+    fail=1
+  fi
+done
+
+[ "$fail" = 0 ] && echo "check-registry: OK — status probe-anchored; probes/ops exist; every regcmd bound to an op; no dangling declarations; subtree headers private"
 exit $fail
