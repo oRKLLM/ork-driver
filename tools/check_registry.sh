@@ -158,29 +158,36 @@ done
 # named in a comment must EITHER be read by the code (getenv / a real identifier) OR be explicitly
 # marked as history — "removed", "historical", "retired", "deprecated", "not wired yet". Prefix
 # references (ORK_SSM_*, or a name that is a prefix of a real identifier) are exempt.
-py=$(command -v python3 || true)
-if [ -n "$py" ] && [ -z "${ORK_SKIP_KNOB_CHECK:-}" ]; then
-  knobbad=$("$py" - <<'PYEOF'
-import re,glob
-files=sorted(set(glob.glob('src/*.c')+glob.glob('src/*/*.c')+glob.glob('src/*/*/*.c')
-                +glob.glob('src/*.h')+glob.glob('src/*/*.h')+glob.glob('src/*/*/*.h')+glob.glob('include/*.h')))
-code=re.sub(r'/\*.*?\*/|//[^\n]*','',''.join(open(f,errors='ignore').read() for f in files),flags=re.S)
-live=set(re.findall(r'getenv\("(ORK_[A-Z0-9_]+)"\)',code)); ident=set(re.findall(r'\bORK_[A-Z0-9_]+\b',code))
-MARK=re.compile(r'\b(removed|historical|retired|deprecated|not wired yet)\b',re.I)
-for f in files:
-    t=open(f,errors='ignore').read()
-    for m in re.finditer(r'/\*.*?\*/',t,re.S):
-        blk=m.group(0)
-        for k in sorted(set(re.findall(r'\bORK_[A-Z0-9_]{3,}\b',blk))):
-            if k in live or k in ident or k.endswith('_'): continue
-            if any(i.startswith(k) and i!=k for i in ident): continue
-            i=blk.find(k)
-            if not MARK.search(blk[max(0,i-140):i+140]):
-                print(f"{f}:{t[:m.start()].count(chr(10))+1}: {k}")
-PYEOF
-)
-  if [ -n "$knobbad" ]; then
-    echo "$knobbad" | while IFS= read -r l; do
+# Pure awk (AGENTS section 2: no Python/Node in repo tooling). Design note: rather than STRIP comments
+# (fragile — a comment that opens on a line of real code will swallow it, which produced a false alarm
+# on ORK_F16_FORCE_WEDGE), this COUNTS each ORK_* token twice: total occurrences, and occurrences
+# inside comment blocks. total > in-comments  =>  the token exists in code  =>  exempt. Any error in
+# comment detection therefore biases toward exempting, never toward a false failure.
+knobbad=$(cat $LIBSRC include/*.h src/*.h src/*/*.h src/*/*/*.h 2>/dev/null | awk '
+  function tally(str, arr,   n,w,i,k) { n=split(str, w, /[^A-Za-z0-9_]+/)
+    for (i=1;i<=n;i++) { k=w[i]; if (k ~ /^ORK_[A-Z0-9_]+$/) arr[k]++ } }
+  { tally($0, total)
+    line=$0
+    if (incmt) { if (match(line, /\*\//)) { tally(substr(line,1,RSTART+1), incom); line=substr(line,RSTART+2); incmt=0 }
+                 else { tally(line, incom); next } }
+    while (match(line, /\/\*/)) { rest=substr(line, RSTART)
+      if (match(rest, /\*\//)) { tally(substr(rest,1,RSTART+1), incom); line=substr(line,1,index(line,"/*")-1) substr(rest,RSTART+2) }
+      else { tally(rest, incom); incmt=1; break } } }
+  END { for (k in incom) {
+           if (k in total && total[k] > incom[k]) continue                # exists in code
+           if (k ~ /_$/) continue                                         # prose prefix: "the ORK_SSM_ knobs"
+           pref=0; for (x in total) if (x != k && index(x,k)==1) pref=1    # prefix of a real identifier
+           if (pref) continue
+           print k } }' | sort -u)
+# second pass: report file:line for the offenders, unless the block marks them as history
+if [ -n "$knobbad" ]; then
+  rep=$(for k in $knobbad; do
+          grep -n "\b$k\b" $LIBSRC include/*.h src/*.h src/*/*.h src/*/*/*.h 2>/dev/null \
+            | grep -viE 'removed|historical|retired|deprecated|not wired yet' \
+            | head -1 | awk -v K="$k" -F: '{print $1":"$2": "K}'
+        done | sed '/^$/d')
+  if [ -n "$rep" ]; then
+    echo "$rep" | while IFS= read -r l; do
       echo "check-registry: FAIL — comment names env knob the code never reads (mark it removed/historical): $l"
     done
     fail=1

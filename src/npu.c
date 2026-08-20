@@ -1393,7 +1393,7 @@ double orki_mc_synth[MCPROF_MAX];   /* host regcmd-synth+bsync portion of orki_m
  * IO-bound / memory-bound work (e.g. the SSM double-buffer marshalling helper) that should run on the
  * idle little cluster WHILE the big cores are saturated by ggml's threadpool + the NPU pool. The A55 is
  * ~2x slower but it's free time overlapped with the NPU submit. Honors ORK_NO_AFFINITY. */
-/* run_multicore phase timing (ORK_RT): setup (checks+mc_ensure+cres memset), submit (pool dispatch
+/* run_multicore phase timing (read via ork_npu_run_timing; the ORK_RT env gate is removed): setup (checks+mc_ensure+cres memset), submit (pool dispatch
  * + workers + NPU), copy (cres->C). Pin where the integration's per-matmul time goes vs the kernel. */
 double orki_rt_setup=0, orki_rt_submit=0, orki_rt_copy=0; long orki_rt_n=0;
 /* FLOOR-DECOMP accessors: ioctl_us = total wall inside SUBMIT ioctls; hw_us = total sub->hw_elapse_time as
