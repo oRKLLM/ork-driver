@@ -18,7 +18,8 @@ stays, siblings `npu/{sdp,f16,i16,i4,ssm}.c` + folder `npu/i8/{regcmd,pack,fold,
 | D | `src/npu/ssm.c` — first real TU off the monolith (317 lines) | ✅ `ae1fc70` |
 | — | `check-registry` check 5: fixed a 24% blind spot (wrapped prototypes) | ✅ `468a11f` |
 | E | `src/npu/i4.c` — int4 chain/doorbell/stream (728 lines) | ✅ `38e16e9` |
-| F | `src/npu/f16.c` | ⬜ next |
+| — | `src/npu/core.h` — substrate interface declared up front (no moves) | ✅ `b46b036` |
+| F | `src/npu/core/*.c` — the 7 pure-move commits | ⛔ BLOCKED on the perf question above |
 | G–I | `i8/*` → `i16.c` → `sdp.c` (+ the i4 pack/quant sweep) | ⬜ |
 | J | docs (AGENTS §4 tree, README, OPS_REGISTRY, tools/re/README) | ⬜ |
 | K | attest refresh (if CORE moved) + fork CMake file list | ⬜ |
@@ -83,6 +84,54 @@ commit E all 413 exported symbols do, which is cleaner than the pre-split baseli
 (~40 s, no NPU); full `make test` once per module. **Never cap `make test` from outside** — the board's
 own per-test `timeout 360` is the bound. An outer `timeout 540 make test` killed make mid-test, orphaned
 `test_silu_native` on an in-flight submit, and wedged the NPU into a reboot.
+
+## ⚠️ OPEN: a real +28% copy-phase regression, introduced at commit E, not yet root-caused
+
+`mc_prof 256 2048 2048 20`, all measured on ONE boot with governors pinned, 2-3 runs each:
+
+| tree | copy µs/sub | submit µs/sub | 1-core µs/matmul |
+|---|---:|---:|---:|
+| pre-split (`b83269e`) | **185.6** | 725.4 | 2376.7 |
+| `c4541c2` rename | 183.9 | — | — |
+| `b685614` internal.h | 186.8 | — | — |
+| `ae1fc70` ssm lift | 186.3 | — | — |
+| `38e16e9` i4 lift | **237.7** | — | — |
+| HEAD (`b46b036`) | **237.5** | 728.8 | 2461 |
+
+**Submit is flat throughout (725 → 729)** — the submit path lost nothing, so risk 1 as originally framed
+did not fire. The cost is entirely in the activation-gather phase, and it is worth **+3.5% on 1-core** at
+this shape. **3-core is flat-to-faster (1429 → 1438, within spread)** — and 3-core is the production
+prefill path.
+
+### What is established
+- Real, not noise (spread ±1.5%, regression +28%) and not boot state: the pre-split tree rebuilt on the
+  SAME boot reads 185.6, and HEAD built in the same `/tmp` location reads 237.
+- Enters at the i4 lift. Everything before it is clean.
+- In a **single-TU harness** (`ae1fc70` + de-statics only, no code motion), de-staticing **`orki_bsync`
+  alone** OR **`orki_dma_find` alone** reproduces it exactly (237.2 / 238.1). `orki_budget` as a control
+  is clean (188.0). Keeping just those two `static` while de-staticing 22 others is **clean (183.4)**.
+  Mechanism there is escape analysis: an extern call bracketing the gather loop kills the non-aliasing
+  assumption and the memcpy-shaped loop de-optimises.
+- Individually harmless: `orki_setr`, `orki_validate_regcmd`, `orki_rknpu_submit_ioctl`, `orki_synth_i8`.
+
+### What does NOT fix it at HEAD (all measured)
+- `orki_dma_find` + `orki_bsync` as `static inline` — still 237.
+- Same two with `__attribute__((always_inline))` — still 237.
+- Re-staticing the 32 internal-only core symbols `i4.c`/`ssm.c` never call — still 237.
+- `-flto` — still 240, **but this test is suspect**: `make` would not have carried `-flto` into the link
+  step, so LTO was probably never actually applied. Re-test properly before ruling it out.
+
+### Leading hypothesis
+Cross-TU **code motion** (i4 compiled as its own object), not linkage of any single symbol. The clean
+control for this — folding `i4.c`/`ssm.c` back into `npu.c` with every other HEAD change identical —
+was attempted twice and both times failed on mechanical include/`#if` stripping, not on the idea. Finish
+that control first; it is one build.
+
+### Recommendation
+AGENTS §6 is explicit that `mc_prof` uses dummy data and that **end-to-end** (`ork_bench` /
+`make bench-llama`) is the standard a perf claim must meet. 3-core — the path prefill actually uses — is
+flat. So: measure end-to-end ONCE before deciding whether this blocks. If end-to-end is flat, track it
+and continue; if not, finish the single-TU control and root-cause before lifting anything else.
 
 ---
 
