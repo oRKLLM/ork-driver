@@ -618,3 +618,55 @@ the first brace.
 `orkd_handlers.c` to the dependency list would NOT have compiled it — the link fails on all 19 handlers.
 The recipe now names both TUs explicitly. Prerequisite lists and compile lines are separate things; adding
 to one is not adding to the other.
+
+## Round 9 — `orkd_client.c`, and the case where `static inline` is right (2026-08-20)
+
+`orkd_client.c` 757 → **`orkd_client.c` 219 + `orkd_client_ops.c` 548 + `orkd_client_internal.h` 29**. The
+cut separates the connection/spawn/atexit machinery, the A-ring fast path and the domain calls from the
+per-opcode RPC wrappers.
+
+**This split adds ZERO external symbols**, which is the interesting part. Measuring the interface at five
+candidate cuts (comments stripped, and counting macros and types as well as statics — both lessons from
+round 8) showed `orkd_client.c` is far more loosely coupled than `orkd.c`:
+
+| cut | interface size |
+|---|--:|
+| before `cdrain` | 5 |
+| **before `orkd_pack_i8`** | **3** (all forward, zero backward) |
+| before `orkd_sdp_call` | 3 |
+| before `orkd_run_chain_i8` | 3 |
+| before `orkd_dmabuf_probe` | 3 |
+
+The three are `wn`, `rn`, `cdrain` — 1-to-5-line loops around a single `read()`/`write()`. Those became
+`static inline` in a private header, so each TU keeps its own internal-linkage copy and nothing new is
+exported.
+
+**This is the option I rejected in round 8, and rejecting it there was right.** The rule that separates the
+two cases is size, not principle: a 5-line syscall wrapper belongs in a header, a 40-line request handler
+does not. Round 8's 19 handlers had to become extern; round 9's 3 wrappers had to not. Same question,
+opposite answers, and the deciding factor is whether a reader would expect to find the body there.
+
+One line was deliberately dropped rather than moved: `static void cdrain(int fd, size_t n);`, a forward
+declaration that existed only because `orkd_ring_setup` used `cdrain` above its definition. With `cdrain`
+now defined in a header included at the top, it is obsolete. The multiset invariant flagged it as the single
+"lost" line, which is exactly what that check is for — it forced the removal to be justified rather than
+unnoticed.
+
+### The typedef blind spot
+The build still failed once. `orkd_client_ops.c` dereferences `c->fd`, so it needs the full
+`struct orkd_conn` — but my interface analysis looked for the literal string `struct orkd_conn` in the ops
+half, and that half only ever writes the TYPEDEF ALIAS (`orkd_conn *c`). The public `orkd_client.h` keeps
+the type opaque (`typedef struct orkd_conn orkd_conn;`) with the definition in the .c, which is good design
+and exactly what hid it.
+
+**A typedef'd struct crosses a TU boundary under a name the `struct` keyword never appears in.** Round 8
+taught that the interface includes types and macros, not just symbols; round 9 adds that detecting a type's
+use means searching for its alias too. The definition now lives in the private header, so both halves see
+it while callers outside still cannot.
+
+### Nine recipes, one variable
+`src/orkd_client.c` was named in **nine** Makefile places — one `COBJ` entry, four prerequisite lists and
+four compile lines. Adding a second TU would have meant nine edits, and missing any one fails at link (or,
+worse, silently omits code). They now all go through `ORKD_CLIENT_SRC` / `ORKD_CLIENT_HDR`, so the next file
+added to this split is a one-line change. This is round 8's `$<` trap generalized: a build system that
+repeats a file list will eventually disagree with itself.

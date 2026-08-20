@@ -22,7 +22,9 @@ CORE := src/npu.c src/npu/core/buf.c src/npu/core/device.c src/npu/core/domain.c
 # Compile CORE ONCE into shared objects, so an npu.c edit recompiles it once (not per-example).
 # The make-test build path (examples/tests/chain_xition_probe) and the libs link these; the
 # special-flag perf tools (-fopenmp / -march=native / RKNN) keep compiling CORE inline.
-COBJ := $(CORE:.c=.o) src/orkd_client.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
+ORKD_CLIENT_SRC := src/orkd_client.c src/orkd_client_ops.c  # transport + RPC op wrappers; nine targets compile these, so keep them in ONE variable — adding a file to the split must not mean editing nine recipes
+ORKD_CLIENT_HDR := src/orkd_client.h src/orkd_client_internal.h src/orkd_proto.h
+COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
 # Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
@@ -675,26 +677,26 @@ orkd: src/orkd.c src/orkd_handlers.c src/orkd_internal.h src/orkd_proto.h $(COBJ
 	$(CC) $(CFLAGS) -o $@ src/orkd.c src/orkd_handlers.c $(COBJ) -lm -lpthread
 
 # orkd_probe — daemon lifecycle validation (auto-spawn + connect + core count + ping); board tool, not in test.
-orkd_probe: tools/orkd_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+orkd_probe: tools/orkd_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread
 
 # orkd_ffn_probe — coalesced FFN inner routed THROUGH orkd (ORKD_FFN). Pure client (daemon has the chain). Board tool.
-orkd_ffn_probe: tools/orkd_ffn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+orkd_ffn_probe: tools/orkd_ffn_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread -lm
 
 # orkd_attn_probe — fused attention core [QK^T->exp->reduce,e.V] routed THROUGH orkd (ORKD_ATTN). Pure client. Board tool.
-orkd_attn_probe: tools/orkd_attn_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+orkd_attn_probe: tools/orkd_attn_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread -lm
 
-orkd_attn_rr_probe: tools/orkd_attn_rr_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+orkd_attn_rr_probe: tools/orkd_attn_rr_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread -lm
 
-orkd_layer_probe: tools/orkd_layer_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/spine_kernels.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+orkd_layer_probe: tools/orkd_layer_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR) src/spine_kernels.h
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread -lm
 
 # orkd_layer_bench — times ORKD_LAYER at real qwen3-1.7B decode dims (the decode-perf verdict). Board tool.
-orkd_layer_bench: tools/orkd_layer_bench.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/spine_kernels.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread -lm
+orkd_layer_bench: tools/orkd_layer_bench.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR) src/spine_kernels.h
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread -lm
 
 # i16out_fix_probe — DEPRECATED/QUARANTINED (dup of i16out_probe; validates unmerged set_i16_out). Stub unless -DORK_DEPRECATED_PROBES.
 i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
@@ -702,13 +704,13 @@ i16out_fix_probe: tools/i16out_fix_probe.c $(COBJ)
 
 # test_orkd — first orkd client: int8 matmuls THROUGH the daemon, self-validated vs CPU ref. Pure client
 # (links orkd_client, not COBJ). Standalone, NOT in `make test` (would contend with direct-NPU examples).
-test_orkd: examples/test_orkd.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+test_orkd: examples/test_orkd.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR)
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread
 
 # orkd_ring_probe — A-ring validation + latency bench (socket RPC vs the shared-memory ring, bit-exact + us/op).
 # Pure client (links orkd_client, not COBJ). Board tool, not in `make test`.
-orkd_ring_probe: tools/orkd_ring_probe.c src/orkd_client.c src/orkd_client.h src/orkd_proto.h src/orkd_ring.h src/orkd_shm.h
-	$(CC) $(CFLAGS) -o $@ $< src/orkd_client.c -lpthread
+orkd_ring_probe: tools/orkd_ring_probe.c $(ORKD_CLIENT_SRC) $(ORKD_CLIENT_HDR) src/orkd_ring.h src/orkd_shm.h
+	$(CC) $(CFLAGS) -o $@ $< $(ORKD_CLIENT_SRC) -lpthread
 
 # orkd_2proc — genuine TWO-PROCESS orkd proof: fork()+exec()s N separate client binaries (default ./test_orkd)
 # concurrently against one daemon. Plain launcher (no orkd libs; execs the children). Board tool, not in `make test`.
