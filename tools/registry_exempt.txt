@@ -1,0 +1,16 @@
+# registry_exempt.txt — symbols OPS_REGISTRY.md legitimately NAMES that do not live in this repo.
+#
+# The registry documents the whole NPU path, and that path spans a submodule boundary: some of it is
+# implemented in the ggml-ork backend (llama.cpp's ggml/src/ggml-ork/ggml-ork.cpp), not here. Check 2
+# resolves every op symbol the registry names against THIS repo's sources, so a row that credits a
+# fork-side function fails a lookup it can never satisfy.
+#
+# Listing a symbol here says "this is implemented in the fork, on purpose" — it does not weaken check 2
+# for anything else. The list is itself gated: if an entry BECOMES resolvable here (the code moved into
+# the driver), check 2 fails with "stale exemption", so this file cannot quietly rot into a blanket
+# suppression.
+#
+# <symbol>            <kind>   <note>
+ork_f16_mtile         FORK     ggml-ork.cpp — fp16 M-tile envelope helper for the attention offload;
+#                              cited by the FLASH_ATTN_EXT row as part of the M-ENVELOPE fix, together
+#                              with ork_attn_chain_mtiled (which check 2's regex does not extract).

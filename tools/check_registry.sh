@@ -7,7 +7,9 @@
 #   1. Every probe/test the registry cites must exist (a tools/ or examples/ source, an
 #      npu.c probe function, or a Makefile target) — no fabricated/renamed/stale evidence.
 #   2. Every op symbol the registry names must exist in the sources — no stale rows for
-#      renamed/removed ops.
+#      renamed/removed ops. Symbols implemented in the ggml-ork FORK rather than here are
+#      listed in tools/registry_exempt.txt with a reason; an exemption that has become
+#      resolvable in-tree fails as stale, so that list cannot rot into a suppression.
 #   3. THE RED FLAG: every table row with a hard status (PROVEN/PARTIAL/DEAD) must carry
 #      evidence — the name of a real probe/test file, a `make test`/`replay`/`gtest`/`ppl`
 #      reference, or an explicit `(no ... probe)` acknowledgment. A hard status backed by
@@ -63,11 +65,23 @@ done
 # alternative must come FIRST here — otherwise this regex silently matches almost nothing and check 2
 # degrades to a no-op instead of failing. It did exactly that during the migration: 17 ops extracted
 # where the old naming yielded far more. A gate that stops looking is worse than one that breaks.
+# Widening that regex to try the dtype alternative first (the dtype-first migration) also made it reach
+# symbols the registry only MENTIONS in prose, including ones implemented in the ggml-ork fork rather than
+# here — ork_f16_mtile is credited to ggml-ork.cpp by the FLASH_ATTN_EXT row and can never resolve against
+# $SRC. Those live in tools/registry_exempt.txt; everything else must still exist.
+REX=tools/registry_exempt.txt
+rex=$( [ -f "$REX" ] && grep -vE '^[[:space:]]*(#|$)' "$REX" | awk '{print $1}' || echo "" )
 ops=$(grep -oE '(ork|orki)_(i8|i4a8|i4|nf4|f16|i16)_[a-z0-9_]+|(ork|orki)_(npu|mm|dyn|submit|ppu|bmm|w)_[a-z0-9_]+' "$REG" \
       | grep -vE '_(probe|test|check|stress|bench)$' | sort -u)
 for o in $ops; do
   hit=0
   for f in $SRC; do grep -qE "\b$o\b" "$f" 2>/dev/null && { hit=1; break; }; done
+  if printf '%s\n' $rex | grep -qx "$o" 2>/dev/null; then
+    # Exempted as fork-side. If it now resolves HERE, the exemption outlived its reason: drop it, do
+    # not let it keep a real symbol unchecked.
+    [ "$hit" = 1 ] && { echo "check-registry: FAIL — '$o' is exempt in $REX but DOES exist in sources; remove the stale exemption"; fail=1; }
+    continue
+  fi
   [ "$hit" = 1 ] || { echo "check-registry: FAIL — op '$o' named in registry not found in sources"; fail=1; }
 done
 
