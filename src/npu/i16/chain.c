@@ -124,7 +124,7 @@ int ork_i16_npu_chain_mm_silu(ork_npu *c,const int16_t *in,int M,int N,double in
                               int16_t *out,int *mm_ran,double *us){
     int fd=c->fd, CBUF=c->soc->cbuf_elems, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;
     if(orki_silu_calibrate_idx16(c)) return -1;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     /* build the int16 silu LUT curve for (in_scale,out_scale) — same as orki_i16_act_lut */

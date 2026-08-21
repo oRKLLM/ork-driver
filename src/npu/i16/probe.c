@@ -82,7 +82,7 @@ int ork_i16_npu_replay_lut(ork_npu *c,const uint32_t *regcmd,int rn,const int16_
                            const int16_t *in,int M,int N,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)||rn>REGCMD_SILU_STD_I16_N) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)||rn>REGCMD_SILU_STD_I16_N) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
      * A standalone SDP LUT-op runs right after a matmul that may have orki_dom_activate()'d a NON-0 domain
@@ -148,7 +148,7 @@ int ork_i16_npu_probe_silu_std(ork_npu *c,const int16_t *in,int M,int N,
                                int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
     orki_last_op="silu_i16_op"; orki_last_K=M; orki_last_N=N; orki_last_wdom=0; orki_last_import=0;   /* accurate wedge telemetry (no validate_regcmd here) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* int16 atom-8, 2-byte, surf_stride=M*16 */

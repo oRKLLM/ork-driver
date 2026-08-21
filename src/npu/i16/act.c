@@ -23,7 +23,7 @@
 int ork_i16_npu_mul_perchan(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* 2-byte atom=8 cube */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
@@ -62,7 +62,7 @@ int ork_i16_npu_add(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
     if(c && c->daemon){ if(us)*us=0; return orkd_add_i16(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)||out_scale<=0) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)||out_scale<=0) return -2;
     double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
     int S=14; while(S>0 && cmax*(double)(1u<<S) > 0x4000) S--;
     while(S<30 && cmax*(double)(1u<<(S+1)) <= 0x4000) S++;
@@ -113,7 +113,7 @@ int ork_i16_npu_add(ork_npu *c,const int16_t *a,const int16_t *b,int M,int N,
 
 int orki_i16_act_lut(ork_npu *c,double(*f)(double),const int16_t *in,int M,int N,double in_scale,double out_scale,int16_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;
     int16_t lut[1030];
     if(orki_build_act_lut16(c,f,in_scale,out_scale,lut)) return -1;
     return ork_i16_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU16_IDXOFF,ORK_SILU16_C4064,ORK_SILU16_C4068,lut,1030,out,us);
@@ -138,7 +138,7 @@ int ork_i16_npu_ewmul(ork_npu *c,const int16_t *up,const int16_t *silu,int M,int
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i16(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;               /* N multiple of the int16 atom (8) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* 2-byte atom=8 cube (fp16/int16), surf_stride=M*16 */
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* int16 cube = M*N*2 bytes */
@@ -180,7 +180,7 @@ int ork_i16_npu_silu(ork_npu *c,const int16_t *in,int M,int N,double in_scale,do
 int ork_npu_requant_perchan_i32(ork_npu *c,const int32_t *a,const int16_t *b,int M,int N,int mult,int shift,int16_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<8||N>8192||(N&7)) return -2;
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define PC32(m,n) (((n)/8)*(M*32) + (m)*32 + ((n)%8)*4)          /* 4-byte atom=8 cube (int32 in) */
     #define PC16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)          /* 2-byte atom=8 cube (int16 out) */

@@ -131,6 +131,12 @@ f16_k128_probe: tools/re/f16_k128_probe.c $(COBJ)
 i8_mcap_probe: tools/re/i8_mcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: map the int16 SDP activation envelope (Tier 14 A #2). The shared orki_i16_act_lut path
+# accepts M<=8192 but NRMSE blows up at some smaller M; scans upward (never bisects) and keeps
+# walking past a failure so a non-monotonic envelope is visible.
+i16_mcap_probe: tools/re/i16_mcap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)
