@@ -371,17 +371,23 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
      * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
     /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
-     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H*K <= 16384
-     * int4 elements, confirmed at FOUR K by checksum-vs-a-known-good-H (H only changes M-tiling, so a
-     * valid H must reproduce the result bit-for-bit):
-     *     K=256  -> 64 OK, 128 differs      K=512  -> 32 OK, 64 differs
-     *     K=2048 ->  8 OK,  16 differs      K=4096 ->  4 OK,   8 differs
+     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H_max = CEIL(16384/K),
+     * pinned at SIX K at FULL INTEGER resolution by checksum-vs-a-known-good-H (H only changes
+     * M-tiling, so a valid H must reproduce the result bit-for-bit):
+     *     K=256  -> 64 OK, 65 bad     K=512  -> 32 OK, 33 bad     K=768  -> 22 OK, 23 bad
+     *     K=1536 -> 11 OK, 12 bad     K=2048 ->  8 OK,  9 bad     K=4096 ->  4 OK,  5 bad
+     * CEIL, not floor: plain 16384/K is right only when K DIVIDES 16384. At K=768 the true ceiling
+     * is 22 (21.33 rounded UP) and at K=1536 it is 11 (10.67), so integer division silently loses a
+     * row at every non-dividing K — including K=768, a real int4 down-proj shape.
+     * Resolution matters: an earlier power-of-2-only sweep (2,4,8,16,32,64) was consistent with floor
+     * and missed this — the same ladder-steps-over-the-boundary error that hid the fp16 352 ceiling
+     * behind a 320/384 probe
      * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
      * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
      * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
-    int H=16384/K; if(H>64)H=64;
+    int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
@@ -518,17 +524,23 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
      * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
     /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
-     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H*K <= 16384
-     * int4 elements, confirmed at FOUR K by checksum-vs-a-known-good-H (H only changes M-tiling, so a
-     * valid H must reproduce the result bit-for-bit):
-     *     K=256  -> 64 OK, 128 differs      K=512  -> 32 OK, 64 differs
-     *     K=2048 ->  8 OK,  16 differs      K=4096 ->  4 OK,   8 differs
+     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H_max = CEIL(16384/K),
+     * pinned at SIX K at FULL INTEGER resolution by checksum-vs-a-known-good-H (H only changes
+     * M-tiling, so a valid H must reproduce the result bit-for-bit):
+     *     K=256  -> 64 OK, 65 bad     K=512  -> 32 OK, 33 bad     K=768  -> 22 OK, 23 bad
+     *     K=1536 -> 11 OK, 12 bad     K=2048 ->  8 OK,  9 bad     K=4096 ->  4 OK,  5 bad
+     * CEIL, not floor: plain 16384/K is right only when K DIVIDES 16384. At K=768 the true ceiling
+     * is 22 (21.33 rounded UP) and at K=1536 it is 11 (10.67), so integer division silently loses a
+     * row at every non-dividing K — including K=768, a real int4 down-proj shape.
+     * Resolution matters: an earlier power-of-2-only sweep (2,4,8,16,32,64) was consistent with floor
+     * and missed this — the same ladder-steps-over-the-boundary error that hid the fp16 352 ceiling
+     * behind a 320/384 probe
      * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
      * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
      * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
-    int H=16384/K; if(H>64)H=64;
+    int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
