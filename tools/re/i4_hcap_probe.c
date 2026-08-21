@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static unsigned long long fnv64(const void *p,size_t n){
     const unsigned char *b=p; unsigned long long h=1469598103934665603ULL;
@@ -55,10 +56,22 @@ int main(int argc,char**argv){
     if(!w){ printf("pack fail (K=%d N=%d)\n",K,N); return 2; }
     memset(C,0,(size_t)M*N*4);
     int rc=ork_i4_mm_run(c,w,M,A,C);
+    /* TIMED repeat: Wb trades submit count against core count (BCHAIN parallelises over N-blocks
+     * only, and nc is clamped to NC=ceil(N/Wb)), so correctness alone cannot pick a Wb. */
+    double us=0; int iters=getenv("ORK_ITERS")?atoi(getenv("ORK_ITERS")):0;
+    if(!rc && iters>0){
+        for(int i=0;i<3;i++) ork_i4_mm_run(c,w,M,A,C);            /* warm */
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        for(int i=0;i<iters;i++) ork_i4_mm_run(c,w,M,A,C);
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+        us=((t1.tv_sec-t0.tv_sec)*1e6+(t1.tv_nsec-t0.tv_nsec)/1e3)/iters; }
 
     const char *h=getenv("ORK_I4_H");
-    printf("K=%-6d N=%-5d M=%-5d ORK_I4_H=%-4s rc=%-3d cksum=%016llx\n",
-           K,N,M,h?h:"(default)",rc, rc?0ULL:fnv64(C,(size_t)M*N*4));
+    const char *wv=getenv("ORK_I4_WB");
+    printf("K=%-5d N=%-5d M=%-4d Wb=%-5s H=%-4s rc=%-3d cksum=%016llx",
+           K,N,M,wv?wv:"(def)",h?h:"(def)",rc, rc?0ULL:fnv64(C,(size_t)M*N*4));
+    if(us>0) printf("  %8.1f us", us);
+    printf("\n");
 
     ork_mm_free(c,w); free(A);free(B);free(C); ork_npu_free(c);
     return rc?1:0;

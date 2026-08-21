@@ -396,11 +396,21 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
      *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
      *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
-     * DELIBERATELY NOT RAISED YET — it is not a pure win. Wb sets NC=ceil(N/Wb), and nc (cores) is
-     * capped at NC, so a bigger Wb cuts the submit count but can STARVE MULTI-CORE: at K=768/N=1024
-     * the measured max Wb=896 gives NC=2 (<=2 cores) where today's 128 gives NC=8 (3 cores). The
-     * right value trades dispatch overhead against parallelism and needs a BENCHMARK, not just this
-     * correctness bound. See the wiki entry.
+     * !! THAT BOUND IS M=64-ONLY. A timed sweep at the PRODUCTION shape contradicts it: at
+     * K=2048 N=1024 M=128, every Wb above the current default TIMES OUT --
+     *     Wb= 64 -> correct,   2176 us   (the default; genuinely fast)
+     *     Wb=128 -> WRONG,     2001 ms      Wb=192 -> "correct", 1801 ms
+     *     Wb=256 -> "correct", 1701 ms      Wb=320 -> WRONG,     1001 ms
+     * The quoted "correct" ones are the driver's SELF-HEAL re-running a timed-out job, not a valid
+     * config. So the envelope depends on M (and/or the resulting NG/chain length), not on K alone.
+     * At M=64 the same Wb values are all ~950 us and correct, so the 11-bank number is real THERE
+     * and only there.
+     * METHOD LESSON: a checksum alone CANNOT validate a Wb — a self-healed timeout also returns the
+     * right answer. Time every point; treat >10x the fast case as a failure regardless of checksum.
+     * => KEEP THE DEFAULT. Raising Wb is not merely "not a pure win", it is actively catastrophic at
+     * the shape that matters. Any future attempt must sweep (K, M, Wb) WITH timing, and must also
+     * account for nc being clamped to NC=ceil(N/Wb) — BCHAIN parallelises over N-blocks only, so a
+     * large Wb starves cores as well. See the wiki entry.
      * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
      * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
     { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
@@ -563,11 +573,21 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
      *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
      *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
-     * DELIBERATELY NOT RAISED YET — it is not a pure win. Wb sets NC=ceil(N/Wb), and nc (cores) is
-     * capped at NC, so a bigger Wb cuts the submit count but can STARVE MULTI-CORE: at K=768/N=1024
-     * the measured max Wb=896 gives NC=2 (<=2 cores) where today's 128 gives NC=8 (3 cores). The
-     * right value trades dispatch overhead against parallelism and needs a BENCHMARK, not just this
-     * correctness bound. See the wiki entry.
+     * !! THAT BOUND IS M=64-ONLY. A timed sweep at the PRODUCTION shape contradicts it: at
+     * K=2048 N=1024 M=128, every Wb above the current default TIMES OUT --
+     *     Wb= 64 -> correct,   2176 us   (the default; genuinely fast)
+     *     Wb=128 -> WRONG,     2001 ms      Wb=192 -> "correct", 1801 ms
+     *     Wb=256 -> "correct", 1701 ms      Wb=320 -> WRONG,     1001 ms
+     * The quoted "correct" ones are the driver's SELF-HEAL re-running a timed-out job, not a valid
+     * config. So the envelope depends on M (and/or the resulting NG/chain length), not on K alone.
+     * At M=64 the same Wb values are all ~950 us and correct, so the 11-bank number is real THERE
+     * and only there.
+     * METHOD LESSON: a checksum alone CANNOT validate a Wb — a self-healed timeout also returns the
+     * right answer. Time every point; treat >10x the fast case as a failure regardless of checksum.
+     * => KEEP THE DEFAULT. Raising Wb is not merely "not a pure win", it is actively catastrophic at
+     * the shape that matters. Any future attempt must sweep (K, M, Wb) WITH timing, and must also
+     * account for nc being clamped to NC=ceil(N/Wb) — BCHAIN parallelises over N-blocks only, so a
+     * large Wb starves cores as well. See the wiki entry.
      * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
      * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
     { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
