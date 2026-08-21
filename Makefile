@@ -142,6 +142,12 @@ i16_mcap_probe: tools/re/i16_mcap_probe.c $(COBJ)
 sdp_mcap_probe: tools/re/sdp_mcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: is int4's rows-per-batch H (16384/K, capped 16 — both inherited, not measured) leaving
+# throughput on the table? Compares checksums across ORK_I4_H values; H only changes M-tiling, so a
+# valid H must reproduce the reference bit-for-bit. One H per process (getenv is cached).
+i4_hcap_probe: tools/re/i4_hcap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)

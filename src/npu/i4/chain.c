@@ -366,7 +366,24 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     orki_last_op="run_i4_bchain_db"; orki_last_K=K; orki_last_N=N; orki_last_wdom=w->domain;
     orki_last_import=(w->own_buf_valid && w->own_buf.heap_fd>0) || (w->own_bufs && w->n_own_bufs>0 && w->own_bufs[0].heap_fd>0)
                   || (w->Bb && w->Bb[0].heap_fd>0);
-    int H=16384/K; if(H>16)H=16; if(H<2) return -4;
+    /* H = rows per batched submit. 16384 = the int4 CBUF activation budget in ELEMENTS
+     * (Exp-2026-07-07); the 16 cap is likewise inherited, not measured. ORK_I4_H overrides both so an
+     * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
+     * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
+    /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
+     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H*K <= 16384
+     * int4 elements, confirmed at FOUR K by checksum-vs-a-known-good-H (H only changes M-tiling, so a
+     * valid H must reproduce the result bit-for-bit):
+     *     K=256  -> 64 OK, 128 differs      K=512  -> 32 OK, 64 differs
+     *     K=2048 ->  8 OK,  16 differs      K=4096 ->  4 OK,   8 differs
+     * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
+     * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
+     * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
+     * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
+     * ORK_I4_H overrides for RE — without it a probe only measures this line. */
+    int H=16384/K; if(H>64)H=64;
+    { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
+    if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
@@ -496,7 +513,24 @@ static void *bch_mw_worker(void *vp){
 
 int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
-    int H=16384/K; if(H>16)H=16; if(H<2) return -4;
+    /* H = rows per batched submit. 16384 = the int4 CBUF activation budget in ELEMENTS
+     * (Exp-2026-07-07); the 16 cap is likewise inherited, not measured. ORK_I4_H overrides both so an
+     * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
+     * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
+    /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
+     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H*K <= 16384
+     * int4 elements, confirmed at FOUR K by checksum-vs-a-known-good-H (H only changes M-tiling, so a
+     * valid H must reproduce the result bit-for-bit):
+     *     K=256  -> 64 OK, 128 differs      K=512  -> 32 OK, 64 differs
+     *     K=2048 ->  8 OK,  16 differs      K=4096 ->  4 OK,   8 differs
+     * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
+     * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
+     * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
+     * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
+     * ORK_I4_H overrides for RE — without it a probe only measures this line. */
+    int H=16384/K; if(H>64)H=64;
+    { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
+    if(H<2) return -4;
     int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
