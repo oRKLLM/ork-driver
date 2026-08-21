@@ -391,28 +391,21 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
-    /* N-tile width. The 131072 here is MEASURED-WRONG: the real weight budget is 720896 int4
-     * elements = 360448 B = 11 CBUF banks — the SAME 11-bank ceiling the fp16 M-envelope work
-     * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
-     *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
-     *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
-     * !! THAT BOUND IS M=64-ONLY. A timed sweep at the PRODUCTION shape contradicts it: at
-     * K=2048 N=1024 M=128, every Wb above the current default TIMES OUT --
-     *     Wb= 64 -> correct,   2176 us   (the default; genuinely fast)
-     *     Wb=128 -> WRONG,     2001 ms      Wb=192 -> "correct", 1801 ms
-     *     Wb=256 -> "correct", 1701 ms      Wb=320 -> WRONG,     1001 ms
-     * The quoted "correct" ones are the driver's SELF-HEAL re-running a timed-out job, not a valid
-     * config. So the envelope depends on M (and/or the resulting NG/chain length), not on K alone.
-     * At M=64 the same Wb values are all ~950 us and correct, so the 11-bank number is real THERE
-     * and only there.
-     * METHOD LESSON: a checksum alone CANNOT validate a Wb — a self-healed timeout also returns the
-     * right answer. Time every point; treat >10x the fast case as a failure regardless of checksum.
-     * => KEEP THE DEFAULT. Raising Wb is not merely "not a pure win", it is actively catastrophic at
-     * the shape that matters. Any future attempt must sweep (K, M, Wb) WITH timing, and must also
-     * account for nc being clamped to NC=ceil(N/Wb) — BCHAIN parallelises over N-blocks only, so a
-     * large Wb starves cores as well. See the wiki entry.
-     * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
-     * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
+    /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
+     * This is a CONTAINMENT requirement, not a budget: a native multi-M batch is valid only WITHIN
+     * one weight bank (there is no D_BANK to hold a second), so a chunk that straddles banks hits the
+     * 0x1040 "poison pill" and computes row 0 only. Derived + pass/fail-matched in the wiki entry
+     * Exp-2026-07-08-INT4-BChain-Batch-Chain. DO NOT RAISE IT.
+     * Confirmed the hard way 2026-08-21: sweeping ORK_I4_WB above this at K=2048 N=1024 M=128 gives
+     * 1-2 SECOND submits (vs 2176 us at the correct Wb=64) — the driver self-healing a straddled
+     * batch, which can even return a correct checksum. An earlier reading of that sweep as "the
+     * budget is 5.5x too small" was wrong on both counts: it is not a budget, and checksum-only
+     * probing cannot distinguish a valid config from a self-healed timeout.
+     * STILL OPEN (small): the `&~63` discards up to 63 columns of real bank capacity at K that do not
+     * divide 131072 — e.g. K=768 allows 170 columns/bank but rounds to 128. Capturing that needs the
+     * de-tile below generalised off its exact Wmax=Wb/64 block count; keep any probe a multiple of 64
+     * until then, or a host-arithmetic break reads as a hardware failure.
+     * ORK_I4_WB overrides for RE. */
     { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
@@ -568,28 +561,21 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
-    /* N-tile width. The 131072 here is MEASURED-WRONG: the real weight budget is 720896 int4
-     * elements = 360448 B = 11 CBUF banks — the SAME 11-bank ceiling the fp16 M-envelope work
-     * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
-     *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
-     *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
-     * !! THAT BOUND IS M=64-ONLY. A timed sweep at the PRODUCTION shape contradicts it: at
-     * K=2048 N=1024 M=128, every Wb above the current default TIMES OUT --
-     *     Wb= 64 -> correct,   2176 us   (the default; genuinely fast)
-     *     Wb=128 -> WRONG,     2001 ms      Wb=192 -> "correct", 1801 ms
-     *     Wb=256 -> "correct", 1701 ms      Wb=320 -> WRONG,     1001 ms
-     * The quoted "correct" ones are the driver's SELF-HEAL re-running a timed-out job, not a valid
-     * config. So the envelope depends on M (and/or the resulting NG/chain length), not on K alone.
-     * At M=64 the same Wb values are all ~950 us and correct, so the 11-bank number is real THERE
-     * and only there.
-     * METHOD LESSON: a checksum alone CANNOT validate a Wb — a self-healed timeout also returns the
-     * right answer. Time every point; treat >10x the fast case as a failure regardless of checksum.
-     * => KEEP THE DEFAULT. Raising Wb is not merely "not a pure win", it is actively catastrophic at
-     * the shape that matters. Any future attempt must sweep (K, M, Wb) WITH timing, and must also
-     * account for nc being clamped to NC=ceil(N/Wb) — BCHAIN parallelises over N-blocks only, so a
-     * large Wb starves cores as well. See the wiki entry.
-     * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
-     * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
+    /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
+     * This is a CONTAINMENT requirement, not a budget: a native multi-M batch is valid only WITHIN
+     * one weight bank (there is no D_BANK to hold a second), so a chunk that straddles banks hits the
+     * 0x1040 "poison pill" and computes row 0 only. Derived + pass/fail-matched in the wiki entry
+     * Exp-2026-07-08-INT4-BChain-Batch-Chain. DO NOT RAISE IT.
+     * Confirmed the hard way 2026-08-21: sweeping ORK_I4_WB above this at K=2048 N=1024 M=128 gives
+     * 1-2 SECOND submits (vs 2176 us at the correct Wb=64) — the driver self-healing a straddled
+     * batch, which can even return a correct checksum. An earlier reading of that sweep as "the
+     * budget is 5.5x too small" was wrong on both counts: it is not a budget, and checksum-only
+     * probing cannot distinguish a valid config from a self-healed timeout.
+     * STILL OPEN (small): the `&~63` discards up to 63 columns of real bank capacity at K that do not
+     * divide 131072 — e.g. K=768 allows 170 columns/bank but rounds to 128. Capturing that needs the
+     * de-tile below generalised off its exact Wmax=Wb/64 block count; keep any probe a multiple of 64
+     * until then, or a host-arithmetic break reads as a hardware failure.
+     * ORK_I4_WB overrides for RE. */
     { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
