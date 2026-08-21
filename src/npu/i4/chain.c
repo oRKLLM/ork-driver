@@ -388,6 +388,9 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
+    /* ORK_I4_DBNK=n: H_max scales with the DATA_BANK count (measured H_max = DBNK*16384/K), so this
+     * must move together with the 0x1040 split written in i4/run.c. */
+    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=(n*16384+K-1)/K; if(H>64)H=64; } } }
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
@@ -558,6 +561,9 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
+    /* ORK_I4_DBNK=n: H_max scales with the DATA_BANK count (measured H_max = DBNK*16384/K), so this
+     * must move together with the 0x1040 split written in i4/run.c. */
+    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=(n*16384+K-1)/K; if(H>64)H=64; } } }
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;

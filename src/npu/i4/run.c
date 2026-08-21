@@ -96,6 +96,13 @@ void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
             int v=base-slope*(mg-1); if(v<0x1b)v=0x1b; orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,v); }
         /* ORK_I4_1040: direct override of the K-reduction schedule reg (RE: find the int4 multi-row value —
          * the int8 formula corrupts, omitting it leaves only row0 for K>64). Applied last, wins over mregs&0x20. */
+        /* ORK_I4_DBNK=n: set the CBUF split to n DATA banks / (12-n) WEIGHT banks, i.e.
+         * 0x1040 = ((12-n)<<4)|n. Measured (tools/re/i4_bank_sweep.c): the activation ceiling is
+         * H_max = DBNK*16384/K, so raising DBNK raises rows-per-weight-stream proportionally. Paired
+         * with the matching H in i4/chain.c so ONE knob keeps the split and the tiling consistent —
+         * ORK_I4_H alone cannot, since the right H is per-K and a model has many K. */
+        { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11)
+              orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,(uint32_t)(((12-n)<<4)|n)); } }
         { const char*e=getenv("ORK_I4_1040"); if(e) orki_setrn(rc,REGCMD_I4_N,RK_CNA_CBUF_CON0,(uint32_t)strtoul(e,0,0)); }
         /* ORK_I4_1010: override CNA row/activation-cube reg (RE: multi-M computes rows_computed*K=256 elems —
          * a fixed activation-cube budget; find the reg that enlarges it so K=2048 gets >1 row). */
