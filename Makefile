@@ -148,6 +148,12 @@ sdp_mcap_probe: tools/re/sdp_mcap_probe.c $(COBJ)
 i4_hcap_probe: tools/re/i4_hcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: TIMED model test for the int4 BCHAIN bank budgets. Classifies every point as
+# ok / SELFHEAL / WRONG — a checksum alone cannot validate a config, because the driver self-heals a
+# timed-out submit and returns the right answer ~800x slower.
+i4_bank_sweep: tools/re/i4_bank_sweep.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)

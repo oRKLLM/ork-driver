@@ -388,7 +388,7 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
-    { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
+    { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
     /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
@@ -406,7 +406,7 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * de-tile below generalised off its exact Wmax=Wb/64 block count; keep any probe a multiple of 64
      * until then, or a host-arithmetic break reads as a hardware failure.
      * ORK_I4_WB overrides for RE. */
-    { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
+    { const char*e=getenv("ORK_I4_WB"); if(e){int v=atoi(e); if(v>0) Wb=v;} }   /* re-read: lets one probe process sweep */
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
@@ -558,7 +558,7 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
      * ORK_I4_H overrides for RE — without it a probe only measures this line. */
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
-    { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
+    { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
     /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
@@ -576,7 +576,7 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * de-tile below generalised off its exact Wmax=Wb/64 block count; keep any probe a multiple of 64
      * until then, or a host-arithmetic break reads as a hardware failure.
      * ORK_I4_WB overrides for RE. */
-    { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
+    { const char*e=getenv("ORK_I4_WB"); if(e){int v=atoi(e); if(v>0) Wb=v;} }   /* re-read: lets one probe process sweep */
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
