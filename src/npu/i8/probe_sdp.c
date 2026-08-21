@@ -254,7 +254,7 @@ int ork_i8_npu_probe_add(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                          int mult,int shift,uint32_t bscale,int za,int zb,int zo,int8_t *out,double *us){
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
     struct buf A=orki_bcreate(fd,sz,0x403,dom); if(!A.cpu)return -2;
@@ -305,7 +305,7 @@ int ork_i8_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
                            int8_t *out,double *us){
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     if(r_mult<0||r_mult>0x7fff||r_shift<0||r_shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* int8 atom-16 cube, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;

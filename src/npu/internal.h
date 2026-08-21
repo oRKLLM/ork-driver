@@ -307,18 +307,32 @@ void orki_f16_bmm_gather(f16 *dst, const f16 *src, int rows, int cols, long sr, 
 #define ORK_DYN_HEADROOM 2
 #define ORK_DYN_SENT 0x7fffffff
 #define ORK_SEQCUBE(m,n,MM) (((n)/16)*((MM)*16) + (m)*16 + ((n)%16))   /* NVDLA atom-16 SDP cube */
-/* SDP-family M ceiling — MEASURED (tools/re/i16_mcap_probe.c, 2026-08-20), NOT the 8192 that these
- * guards used to carry. 8192 was inferred from RK_DPU_DATA_CUBE_WIDTH's 13-bit field (mask 0x1fff =>
- * M-1 <= 8191), but the hardware gives up first: on the int16 activation path M=8176 is bit-exact and
- * M=8184 returns errno=110 (submit TIMEOUT) plus a self-healing reset. So the old bound let a
- * FAULT-GENERATING shape through instead of refusing it.
- * It is a ROW limit, not a size limit: 8176 is bit-exact at N=64 and at N=128 (twice the bytes), and
- * the op is bit-exact at all 37 probed points from M=8 to 8176 across N=8..2048.
- * MEASURED ON THE int16 ACTIVATION PATH ONLY. The f16 perchan/replay and i8 SDP ops share the same
- * geometry patcher (orki_set_mul_geom) and are LIKELY subject to the same ceiling, but that is
- * UNMEASURED — do not widen this to them without probing, which is exactly the mistake that put an
- * int8 constant on the fp16 datapath (see orki_f16_mcap). */
-#define ORK_SDP_MAXM 8176
+/* SDP-family M ceilings — MEASURED, per dtype (tools/re/sdp_mcap_probe.c + i16_mcap_probe.c,
+ * 2026-08-20). These replaced a copy-pasted `M<=8192` at 21 sites. 8192 was never measured: it is
+ * RK_DPU_DATA_CUBE_WIDTH's 13-bit field (mask 0x1fff => M-1 <= 8191) read as a CAPABILITY. A field
+ * width bounds what you can ENCODE, never what the hardware COMPLETES — and here the hardware quits
+ * well before the field does, so the old bound admitted FAULT-GENERATING shapes.
+ *
+ *   int16 act (exp)        : 8176 OK · 8177 TIMEOUT(errno 110)      -> 8176 is EXACT
+ *   int8  SDP (ewmul, add) : 8176 OK · 8177/8180/8182/8183 TIMEOUT  -> 8176 is EXACT
+ *   fp16  SDP (ewmul, add) : 8188 OK · 8189 MISCOMPUTE              -> 8188
+ *
+ * fp16 goes 12 rows further than int8/int16, hence two constants rather than one conservative bound:
+ * capping fp16 at 8176 would leave real (if small) headroom unused.
+ *
+ * fp16 FRAYS rather than cliffs — its top end is NON-MONOTONIC: 8188 OK, 8189 BAD, **8190 OK**,
+ * 8191 BAD, 8192 BAD. 8190 is an isolated island, so the usable bound is the CONTIGUOUS maximum
+ * 8188; a guard at 8190 would admit the broken 8189. Same shape as the fp16 K=128 matmul envelope.
+ * => when re-measuring any of these, SCAN UPWARD and take the contiguous max. Never bisect.
+ *
+ * Every over-ceiling int8/int16 submit wedges core 0 at 100% and costs a reboot (fp16 miscomputes
+ * instead, which is survivable). Probe only points expected to pass, bounded below a known-bad one. */
+#ifndef ORK_SDP_MAXM          /* -DORK_SDP_MAXM=<n> lets an RE probe measure ABOVE the cap */
+#define ORK_SDP_MAXM 8176     /* int8 SDP + int16 activations */
+#endif
+#ifndef ORK_SDP_MAXM_F16
+#define ORK_SDP_MAXM_F16 8188 /* fp16 SDP — contiguous max; 8190 works but 8189 does not */
+#endif
 #define ORK_SILU16_C4064  0xff43770au
 #define ORK_SILU16_C4068  0x7eae1100u
 #define ORK_SILU16_IDXOFF 0xffffc000u

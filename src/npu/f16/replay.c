@@ -150,7 +150,7 @@ int ork_f16_npu_probe_silu_std(ork_npu *c,const ork_f16 *in,int M,int N,
                                const int16_t *lut,int nlut,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM_F16||N<8||N>8192||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* fp16 atom-8, 2-byte, surf_stride=M*16 */
     const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
     /* #35 FIX: allocate this op's buffers + submit in the CURRENTLY-ACTIVE domain, NOT a hardcoded dom0.
@@ -217,7 +217,7 @@ int ork_f16_npu_probe_silu_std(ork_npu *c,const ork_f16 *in,int M,int N,
 int ork_f16_npu_replay_full(ork_npu *c,const uint32_t *loader,int ln,const ork_f16 *in,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)||ln<2200||ln>2300) return -2;
+    if(M<1||M>ORK_SDP_MAXM_F16||N<8||N>8192||(N&7)||ln<2200||ln>2300) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *i16=(const uint16_t*)in; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;

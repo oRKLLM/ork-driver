@@ -125,7 +125,7 @@ int ork_npu_overlap_prof(ork_npu *c,int M,int K,int N,int cpu_reps,int iters,
 int ork_npu_probe_bs_scale(ork_npu *c,const int8_t *a,const int8_t *scale,int M,int N,int8_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     #define BSCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
     struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), S=orki_bcreate(fd,4096,0x403,-1);

@@ -137,6 +137,11 @@ i8_mcap_probe: tools/re/i8_mcap_probe.c $(COBJ)
 i16_mcap_probe: tools/re/i16_mcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: measure the M ceiling of the int8 and fp16 SDP ops (the 13 guards still on the INFERRED
+# 8192 after b351c14 moved int16 to a measured 8176). Upward scan, chunked reference, never bisects.
+sdp_mcap_probe: tools/re/sdp_mcap_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)

@@ -86,7 +86,7 @@ int ork_f16_npu_ewmul(ork_npu *c,const ork_f16 *up,const ork_f16 *silu,int M,int
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_f16(c->daemon,up,silu,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;               /* N multiple of the fp16 atom (8) */
+    if(M<1||M>ORK_SDP_MAXM_F16||N<8||N>8192||(N&7)) return -2;               /* N multiple of the fp16 atom (8) */
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)   /* BYTE offset, fp16 atom=8, surf_stride=M*16 */
     const uint16_t *u16=(const uint16_t*)up,*s16=(const uint16_t*)silu; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;                  /* fp16 cube = M*N*2 bytes */
@@ -223,7 +223,7 @@ int ork_f16_npu_mm_perchan_diag(ork_npu *c,int M,int K,int N,const uint16_t *A,c
 int ork_f16_npu_mul_perchan(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork_f16 *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM_F16||N<8||N>8192||(N&7)) return -2;
     #define PCH16(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)         /* fp16 cube byte offset, atom=8, surf=M*16 */
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;
@@ -339,7 +339,7 @@ int ork_f16_npu_add(ork_npu *c,const ork_f16 *a,const ork_f16 *b,int M,int N,ork
     if(c && c->daemon){ if(us)*us=0; return orkd_add_f16(c->daemon,a,b,M,N,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<8||N>8192||(N&7)) return -2;
+    if(M<1||M>ORK_SDP_MAXM_F16||N<8||N>8192||(N&7)) return -2;
     #define EWCUBEH(m,n) (((n)/8)*(M*16) + (m)*16 + ((n)%8)*2)
     const uint16_t *a16=(const uint16_t*)a,*b16=(const uint16_t*)b; uint16_t *o16=(uint16_t*)out;
     size_t sz=(size_t)M*N*2; if(sz<4096)sz=4096;

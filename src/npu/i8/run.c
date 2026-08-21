@@ -409,7 +409,7 @@ int ork_i8_npu_ewmul(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
     if(c && c->daemon){ if(us)*us=0; return orkd_ewmul_i8(c->daemon,up,silu,M,N,mult,shift,out); }   /* Path B: SDP on the daemon */
     int fd=c->fd, dom=c->dom_active;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;             /* N multiple of the int8 atom (16) */
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;             /* N multiple of the int8 atom (16) */
     if(mult<0||mult>0x7fff||shift<0||shift>31) return -2;
     #define EWCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))    /* NVDLA cube, atom=16, surf_stride=M*16 */
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;                    /* int8 cube = M*N bytes */
@@ -449,7 +449,7 @@ int ork_i8_npu_ewmul(ork_npu *c,const int8_t *up,const int8_t *silu,int M,int N,
 int ork_i8_npu_row_max(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     #define RMCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
     struct buf W0=orki_bcreate(fd,sz,0x403,-1), W1=orki_bcreate(fd,sz,0x403,-1);
@@ -494,7 +494,7 @@ int ork_i8_npu_row_max(ork_npu *c, const int8_t *a, int M, int N, int8_t *out, d
 int ork_i8_npu_mul_perchan(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,int mult,int shift,int8_t *out,double *us){
     int fd=c->fd;
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     #define PCCUBE(m,n) (((n)/16)*(M*16) + (m)*16 + ((n)%16))
     size_t sz=(size_t)M*N; if(sz<4096)sz=4096;
     struct buf A=orki_bcreate(fd,sz,0x403,-1), O=orki_bcreate(fd,sz,0x403,-1), B=orki_bcreate(fd,sz,0x403,-1);
@@ -531,7 +531,7 @@ int ork_i8_npu_add(ork_npu *c,const int8_t *a,const int8_t *b,int M,int N,
                    double a_scale,double b_scale,double out_scale,int8_t *out,double *us){
     if(c && c->daemon){ if(us)*us=0; return orkd_add_i8(c->daemon,a,b,M,N,a_scale,b_scale,out_scale,out); }   /* Path B: SDP on the daemon */
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)||out_scale<=0) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)||out_scale<=0) return -2;
     double ca=a_scale/out_scale, cb=b_scale/out_scale, cmax=(ca>cb?ca:cb); if(cmax<=0) return -2;
     /* mults are Q(S) with headroom: keep <=0x4000 (validated safe range; 0x4000 == coeff 1 at S=14). */
     int S=14; while(S>0 && cmax*(double)(1u<<S) > 0x4000) S--;
@@ -560,7 +560,7 @@ int ork_mm_silu_build_lut(ork_npu*c, double in_scale, double out_scale,
 
 static int act_lut_i8_biased(ork_npu *c,double(*f)(double),double bias,const int8_t *in,int M,int N,double in_scale,double out_scale,int8_t *out,double *us){
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    if(M<1||M>8192||N<16||N>8192||(N&15)) return -2;
+    if(M<1||M>ORK_SDP_MAXM||N<16||N>8192||(N&15)) return -2;
     if(orki_silu_calibrate_idx(c)) return -1;
     int16_t lut[1030]; orki_silu_build_curve_biased(c,f,in_scale,out_scale,bias,lut);
     return ork_i8_npu_probe_silu_std(c,in,M,N,0x4000,14,0,ORK_SILU_IDXOFF,ORK_SILU_C4064,ORK_SILU_C4068,lut,1030,out,us);
