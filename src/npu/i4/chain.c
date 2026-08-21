@@ -390,7 +390,21 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
-    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
+    int Wb=(131072/K)&~63;
+    /* N-tile width. The 131072 here is MEASURED-WRONG: the real weight budget is 720896 int4
+     * elements = 360448 B = 11 CBUF banks — the SAME 11-bank ceiling the fp16 M-envelope work
+     * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
+     *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
+     *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
+     * DELIBERATELY NOT RAISED YET — it is not a pure win. Wb sets NC=ceil(N/Wb), and nc (cores) is
+     * capped at NC, so a bigger Wb cuts the submit count but can STARVE MULTI-CORE: at K=768/N=1024
+     * the measured max Wb=896 gives NC=2 (<=2 cores) where today's 128 gives NC=8 (3 cores). The
+     * right value trades dispatch overhead against parallelism and needs a BENCHMARK, not just this
+     * correctness bound. See the wiki entry.
+     * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
+     * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
+    { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
+    if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
     if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
@@ -543,7 +557,21 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
     int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
     { static int ho=-2; if(ho==-2){const char*e=getenv("ORK_I4_H"); ho=e?atoi(e):-1;} if(ho>0) H=ho; }
     if(H<2) return -4;
-    int Wb=(131072/K)&~63; if(Wb<64)Wb=64; if(Wb>N)Wb=N;
+    int Wb=(131072/K)&~63;
+    /* N-tile width. The 131072 here is MEASURED-WRONG: the real weight budget is 720896 int4
+     * elements = 360448 B = 11 CBUF banks — the SAME 11-bank ceiling the fp16 M-envelope work
+     * measured (2026-08-20). So this constant is 5.5x too small. Measured with ORK_I4_WB:
+     *     K=768  N=1024: Wb 832/896 OK, 960 BAD   (896*768 =688128 <= 720896 < 737280)
+     *     K=2048 N=1024: Wb 320     OK, 384 BAD   (320*2048=655360 <= 720896 < 786432)
+     * DELIBERATELY NOT RAISED YET — it is not a pure win. Wb sets NC=ceil(N/Wb), and nc (cores) is
+     * capped at NC, so a bigger Wb cuts the submit count but can STARVE MULTI-CORE: at K=768/N=1024
+     * the measured max Wb=896 gives NC=2 (<=2 cores) where today's 128 gives NC=8 (3 cores). The
+     * right value trades dispatch overhead against parallelism and needs a BENCHMARK, not just this
+     * correctness bound. See the wiki entry.
+     * Keep any probe value a MULTIPLE OF 64: the de-tile below uses Wmax=Wb/64 as an exact block
+     * count, so a non-multiple breaks HOST arithmetic and reads as a false hardware failure. */
+    { static int wo=-2; if(wo==-2){const char*e=getenv("ORK_I4_WB"); wo=e?atoi(e):-1;} if(wo>0) Wb=wo; }
+    if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>ntask)nc=ntask; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
     unsigned dom=ex[0].w->domain;
