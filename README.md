@@ -360,8 +360,7 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 ### Quantization / precision
 | var | effect |
 |---|---|
-| `ORK_QUANT=4` | int4 W4A4 instead of int8 W8A8 |
-| `ORK_HADAMARD` | int4 per-channel + block-Hadamard (FWHT) rotation |
+| `ORK_QUANT=4` | int4 W4A4 instead of int8 W8A8 (a ggml-ork **build-time** override; a built `.orkpack` records its own tier and selects it on load) |
 | `ORK_HYBRID` | hybrid: FFN 4-bit, attention 8-bit |
 | `ORK_MIXED_DISPATCH`, `ORK_MIXED_W4A4` | per-tensor tier dispatch from the GGUF's own precision; opt the 4-bit tier into native W4A4 |
 | `ORK_NF4`, `ORK_SR` | NF4 codebook; stochastic rounding |

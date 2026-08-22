@@ -43,7 +43,24 @@ int          ork_i8_bmm_strided  (ork_npu *ctx, int nbatch, int M, int K, int N,
 int          ork_i4_bmm_strided  (ork_npu *ctx, int nbatch, int M, int K, int N, const int8_t  *A, const int8_t  *B, int32_t *C, const ork_bmm_strides *s);
 int          ork_bmm_fp16_strided(ork_npu *ctx, int nbatch, int M, int K, int N, const ork_f16 *A, const ork_f16 *B, float   *C, const ork_bmm_strides *s);
 
-/* Math utilities for caller-driven quantization/transformations */
+/* Math utilities for caller-driven quantization/transformations.
+ *
+ * ork_fwht_norm applies a normalized fast Walsh-Hadamard transform in place over n (a power of two)
+ * elements. It exists for one job in particular: the int4 datapath REQUIRES it.
+ *
+ * RK3588's 4-bit MAC is symmetric W4A4 with per-channel scales, which is incoherent on real weights
+ * unless the operands are rotated first (measured PPL ~104 unrotated vs ~24 rotated). So a caller using
+ * ork_i4_mm_pack / ork_i4_mm_run MUST rotate BOTH operands at the SAME block size b (b | K): each
+ * length-b slice of every weight column at pack time, and each length-b slice of every activation row at
+ * run time. A block-Hadamard is orthogonal, so (R*A)·(R*B) == A*B — the rotation cancels in the product
+ * and the matmul result is unchanged; what changes is that the values being QUANTIZED have their outliers
+ * spread, which is the whole point.
+ *
+ * That orthogonality is also why this is the caller's job and not the library's: the driver's matmul is
+ * rotation-invariant by construction and literally cannot observe whether you rotated. It cannot check
+ * this for you, cannot warn, and cannot do it on your behalf without silently transforming your data (and
+ * breaking the bit-exact checksum comparisons the int4 RE probes depend on). Rotate both sides, or expect
+ * garbage. ggml-ork does this unconditionally on its int4 tier — there is deliberately no knob there. */
 void         ork_fwht_norm(float *v, int n);
 
 /* ---- FLOOR-DECOMP diagnostics (submit-floor RE) --------------------------------------------------
