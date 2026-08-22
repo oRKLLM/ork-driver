@@ -28,33 +28,50 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
 /* BCHAIN rows-per-weight-stream ceiling. MEASURED, not derived. Full write-up: wiki
  * "Exp-2026-08-21 Native W4A4 Prefill Hang".
  *
- *     K       32   64   96  128  160  192  224  256  512  768 1024 1536 2048 2560 3072 3584 4096 5120 6144 8192
- *     Hmax   128  128  128  128   64   64   64   64   32   22   16   11    8    7    4    4    4    3    3    2
- *     16384/K 512  256  171  128  103   86   74   64   32   22   16   11    8    7  [ 6    5 ]   4  [ 4 ]  3    2
+ *   K      32   64   96  128  160  192  224  256  512  768 1024 1280 1536
+ *   Hmax  128  128  128  128   64   64   64   64   32   22   16   13   11
+ *   K    1792 2048 2304 2560 2816 3072 3584 4096 4608 5120 6144 8192
+ *   Hmax    9    8    7    7    4    4    4    4    4    3    3    2
  *
- * Below K=256 the envelope goes FLAT — 128 for K<=128, 64 for 128<K<256 — with no relation to
- * 16384/K (which wants 512 at K=32). So the naive rule is wrong at BOTH ends of the range.
+ * THE TABLE IS THE RULE — no closed form fits these twenty-five points and interpolation is unsafe
+ * in BOTH directions. ceil(16384/K) overshoots at 3072/3584/5120 (miscompute or hang) and under-
+ * shoots at 6144; below K=256 the envelope goes FLAT (128, then 64) with no relation to 16384/K at
+ * all, which wants 512 at K=32. The fractional part does not decide it either — K=768 and K=3072
+ * both have frac .33 and round OPPOSITE ways (22 vs 4). floor, next_pow2 and CBUF bank-containment
+ * each die on a specific point (see the wiki). An unmeasured K falls back to floor(12288/K) = 0.75x
+ * the naive 16384/K, 0.75 being the largest margin any measured point needed (K=3072: 4 vs 5.33) —
+ * an empirical safety factor, NOT a guarantee. Measure before trusting a new K.
  *
- * THE TABLE IS THE RULE. No closed form fits these thirteen points and interpolation is unsafe in
- * BOTH directions: ceil overshoots at 3072/3584/5120 (miscompute or hang) and undershoots at 6144.
- * The fractional part does not decide it either — K=768 and K=3072 both have frac .33 and round
- * OPPOSITE ways (22 vs 4). floor, next_pow2 and CBUF bank-containment each die on a specific point
- * (see the wiki page). An unmeasured K falls back to floor(12288/K) = 0.75x the naive 16384/K, 0.75
- * being the largest margin any measured point needed (K=3072: 4 vs 5.33) — an empirical safety
- * factor, NOT a guarantee. Measure before trusting a new K.
  * Exceeding the ceiling does one of two things, and only the second shows up in rc:
  *     rc=0, DIFFERENT checksum -> SILENT MISCOMPUTE     (K=2048 H>=9; K=1024 H=5..8)
  *     rc=-1 after ~15 s        -> doorbell never lands  (K=3072 H>=5; K=1024 H<=4)
  * The latter is "native W4A4 hangs at prefill": ACCEPTED on every core (submit_rc=0) but the NPU
  * never starts it (hw_elapse=0, int_status=0), so the recover loop resets 6x then fails — determin-
  * istic per (K,H), 5/5. So rc is not a validity test and neither is timing; only a checksum compare
- * is (H merely re-tiles M, so every valid H must be BIT-IDENTICAL). Measured N=1024 M=32, and K=768
- * re-measured at M=64 gives the same 22 => M-independent. An UNMEASURED K is a known risk with a
- * silent failure mode: pin it with i4_hcap_probe first (method on the wiki page). H<2 is refused by
- * the callers (-4), routing the shape to the proven per-row doorbell. */
+ * is (H merely re-tiles M, so every valid H must be BIT-IDENTICAL). Measured N=1024 M=32 (K<256 at
+ * M=256, where H is genuinely exercised); K=768 re-measured at M=64 gives 22 again => M-independent.
+ * H<2 is refused by the callers (-4), routing the shape to the proven per-row doorbell.
+ *
+ * Above K=8192 there is NO H regime: pack.c K-slices at 8192, so every such shape arrives as <=8192
+ * sub-tiles and this table answers it (K=18944 -> {8192,8192,2560}). The residual risk is the SLICE
+ * REMAINDER, which can be any K — so a new entry must be checked BOTH standalone AND as a remainder
+ * (at K=8192+rem). Those are separate checks, as the hazard below shows.
+ *
+ * KNOWN BUG, pre-existing, NOT fixed here: a K=2560 slice REMAINDER is non-deterministic at its
+ * (standalone-correct, 6-way-verified) H=7. K=18944 — the real 7B ffn_down — is 2x8192+2560 and
+ * returns a different result on ~40% of runs; 10752 and 27136 too (same remainder at 2 and 4 slices,
+ * so it tracks the remainder, not the slice count). ORK_I4_H=2 makes all of them 6/6 stable on the
+ * majority (correct) value, so it is H=7, and only inside the slice accumulate. NOT a partial-group
+ * effect: K=18944 at M=28 (7|28) still fails and K=9728 (rem 1536, H=11 which does not divide 32) is
+ * fine. Not H=7 in general either: K=10496 (rem 2304, H=7) is stable. Remainders 1024/1536/2048/
+ * 4096/5120/8192 are 8/8 stable. Same ~40% rate at 105438e as here (10 runs each) => not a regression
+ * from this work. Root cause is the slice int32 K-accumulate; a table workaround would pessimise
+ * standalone K=2560, which is provably correct at 7. */
 static int orki_i4_hcap(int K){
-    static const short KT[] = {32,64,96,128,160,192,224,256,512,768,1024,1536,2048,2560,3072,3584,4096,5120,6144,8192};
-    static const short HT[] = {128,128,128,128, 64, 64, 64, 64, 32,  22,   16,   11,    8,    7,    4,    4,    4,    3,    3,    2};
+    static const short KT[] = { 32, 64, 96,128,160,192,224,256,512,768,1024,1280,1536,1792,
+                               2048,2304,2560,2816,3072,3584,4096,4608,5120,6144,8192};
+    static const short HT[] = {128,128,128,128, 64, 64, 64, 64, 32, 22,  16,  13,  11,   9,
+                                  8,   7,   7,   4,   4,   4,   4,   4,   3,   3,   2};
     for (unsigned i = 0; i < sizeof KT / sizeof *KT; i++) if (KT[i] == K) return HT[i];
     int H = 12288 / K;        /* unmeasured: conservative fallback, see above */
     return H > 64 ? 64 : H;   /* fallback stays clamped at 64 even though table K reach 128: 128 is
