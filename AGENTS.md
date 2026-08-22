@@ -518,7 +518,7 @@ Q4_K gguf costs only +0.6% PPL, so the zero-config derived pack needs no f16 sou
   (separate vs `run_chain_i4` vs `run_i4_experts` vs one big program.) It does: 3.4× decode / 3.67× prefill.
 
 ### Perplexity (quality) — use `ork_ppl`, NOT `llama-perplexity`
-`make ork_ppl && sudo ./ork_ppl <model.gguf> <text> [window] [ubatch]` — teacher-forced PPL through the
+`sudo ./build/bin/ork_ppl <model.gguf> <text> [window=512] [ubatch=512]` (a cmake target in the fork build, alongside `ork_bench`; source is `tools/re/ork_ppl.cpp` here) — teacher-forced PPL through the
 same backend/env path as `ork_bench`, one clock. **Pin `ubatch` (e.g. 512)**: `llama-perplexity` defaults to
 `n_batch=2048, n_seq=4` → M=2048 → wide colsplit → `RKNPU_SUBMIT` timeouts + self-heal thrash that can wedge
 the kernel NPU driver (recover with `sudo reboot`; re-pin governors afterwards, they reset).
