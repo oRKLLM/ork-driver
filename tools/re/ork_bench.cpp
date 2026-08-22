@@ -191,7 +191,21 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
     // Convert pass = a small prefill (M=nb). A few tokens through the full graph touch every layer's matmul
     // weights + the output proj; the pack is pure-CPU weight tiling (M-independent) so it is valid for the full-P
     // timed run. nb kept small (4) so it is fast and stays well under any large-M submit hazard.
+    //
+    // EXCEPT under ORK_GPTQ, which breaks the M-independence this default rests on: GPTQ derives a calibration
+    // Hessian H = A^T A from THIS batch, so rank(H) <= nb and nb=4 leaves H rank-4 against a K of 1024..3584 —
+    // damping then swamps the null space and GPTQ collapses to plain round-to-nearest. ORK_GPTQ_CALIB sets the
+    // calibration batch (default 512 when ORK_GPTQ is on). Note even that is rank-deficient for large K: one
+    // batch can never exceed rank nb, so full-strength GPTQ needs H ACCUMULATED ACROSS BATCHES, which the
+    // single-shot quantize-on-first-use pack path cannot express yet. Raise with care — a large prefill is the
+    // wide-colsplit submit hazard AGENTS warns about.
     int nb = nt<4 ? nt : 4;
+    if (getenv("ORK_GPTQ")) {
+        int cal = getenv("ORK_GPTQ_CALIB") ? atoi(getenv("ORK_GPTQ_CALIB")) : 512;
+        if (cal < 1) cal = 1;
+        nb = nt < cal ? nt : cal;
+        fprintf(stderr, "[ork_bench] ORK_GPTQ: calibration batch M=%d (rank(H) <= %d)\n", nb, nb);
+    }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = nb+8; cp.n_batch = nb; cp.n_ubatch = nb; cp.n_threads = 4; cp.n_threads_batch = 4;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
