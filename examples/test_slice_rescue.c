@@ -27,8 +27,8 @@ static int8_t r4(void){ g ^= g<<13; g ^= g>>17; g ^= g<<5; return (int8_t)(((int
  * runs ONLY under ORK_REGEN (print goldens) or ORK_FULL_REF (diagnose a mismatch). */
 static uint64_t fnv64(const int32_t *x, size_t n){ uint64_t h=1469598103934665603ULL; const uint8_t *p=(const uint8_t*)x;
     for(size_t i=0;i<n*4;i++){ h^=p[i]; h*=1099511628211ULL; } return h; }
-static const uint64_t GI4[] = {   /* [i4-base, i4-wideN, i4-wideK, i4-refuse] — regen: sudo env ORK_REGEN=1 ./test_slice_rescue */
-    0x42a675c1a3080462ULL, 0x0166d951dfb84ba9ULL, 0xf1e54fbd3c9abce5ULL, 0x928fbeeca9293205ULL };
+static const uint64_t GI4[] = {   /* [i4-base, i4-wideN, i4-wideK, i4-refuse, i4-rem2560] — regen: sudo env ORK_REGEN=1 ./test_slice_rescue */
+    0x42a675c1a3080462ULL, 0x0166d951dfb84ba9ULL, 0xf1e54fbd3c9abce5ULL, 0x928fbeeca9293205ULL, 0x863a03e9e53066ecULL };
 static int gi4 = 0;
 
 static void cpuref(const int8_t *A, const int8_t *B, int M, int K, int N, int32_t *C){
@@ -172,6 +172,51 @@ static int one_i4_natural(ork_npu *c, int K, int N, int M, const char *tag){
     return fail;
 }
 
+/* REGRESSION (2026-08-22) — the K=2560 SLICE-REMAINDER non-determinism.
+ *
+ * K=18944 is 2*8192+2560, i.e. the real 7B ffn_down, and 2560 is the K-slice REMAINDER. At the H=7 that
+ * K=2560 measured standalone, this shape returned a DIFFERENT RESULT on ~40-60% of runs. Cause: H>4 pushed
+ * that one sub-tile's submit past the kernel job timeout, so the kernel soft-reset and RETRIED it — and a
+ * retry is not idempotent for BCHAIN's int16 ACCUMULATOR output. H is now 4 there (orki_i4_hcap).
+ *
+ * Why this case runs the shape REPEATEDLY instead of once: a single golden compare passes about half the
+ * time with the bug present, so it would have been a coin-flip, not a test. Every run must be bit-identical
+ * to the first AND match the golden. It is also implicitly a PERF guard — at H=7 a run took 2-7 s (stalled
+ * on the reset+retry) against ~1 ms at H=4, so a reintroduction shows up as a hang long before it shows up
+ * as a wrong answer. Costs one pack of a 19 MB weight plus REPS cheap runs. */
+static int one_i4_rep(ork_npu *c, int K, int N, int M, int reps, const char *tag){
+    int idx = gi4++;
+    printf("  [%-10s] K=%d N=%d M=%d x%d runs, all must be BIT-IDENTICAL (slice remainder K=%d)\n",
+           tag, K, N, M, reps, K - (K/8192)*8192);
+    int8_t *A=malloc((size_t)M*K), *B=malloc((size_t)K*N);
+    int32_t *C0=malloc((size_t)M*N*4), *Cr=malloc((size_t)M*N*4);
+    if(!A||!B||!C0||!Cr){ printf("    OOM\n"); free(A);free(B);free(C0);free(Cr); return 1; }
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=r4();
+    for(size_t i=0;i<(size_t)K*N;i++) B[i]=r4();
+    ork_w *w=ork_i4_mm_pack(c,K,N,B);
+    if(!w){ printf("    pack_i4 FAIL\n"); free(A);free(B);free(C0);free(Cr); return 1; }
+    int fail=0; long f;
+    int rc=ork_i4_mm_run(c,w,M,A,C0);
+    if(rc){ printf("    run 0 rc=%d FAIL\n",rc); fail=1; }
+    for(int r=1; r<reps && !fail; r++){
+        memset(Cr,0,(size_t)M*N*4);
+        int rr=ork_i4_mm_run(c,w,M,A,Cr);
+        if(rr){ printf("    run %d rc=%d FAIL\n",r,rr); fail=1; break; }
+        long b=diff(C0,Cr,(size_t)M*N,&f);
+        if(b){ printf("    run %d differs from run 0: %ld mismatches (first @%ld) — NON-DETERMINISTIC FAIL\n",r,b,f); fail=1; }
+    }
+    if(!fail){
+        uint64_t h=fnv64(C0,(size_t)M*N);
+        if(getenv("ORK_REGEN")) printf("    REGEN GI4[%d]=0x%016llxULL\n", idx, (unsigned long long)h);
+        else if(h!=GI4[idx]){ printf("    fnv64=0x%016llx != golden 0x%016llx FAIL\n",(unsigned long long)h,(unsigned long long)GI4[idx]); fail=1; }
+        if(getenv("ORK_FULL_REF")){ int32_t *Ccpu=malloc((size_t)M*N*4); cpuref(A,B,M,K,N,Ccpu);
+            long b2=diff(C0,Ccpu,(size_t)M*N,&f); printf(b2?"    vs CPU: %ld mism\n":"    vs CPU: bit-exact\n",b2); free(Ccpu); }
+    }
+    if(!fail && !getenv("ORK_REGEN")) printf("    OK (%d runs bit-identical, golden 0x%016llx)\n", reps, (unsigned long long)GI4[idx]);
+    ork_mm_free(c,w); free(A);free(B);free(C0);free(Cr);
+    return fail;
+}
+
 /* GROUPED int4 rescue (float per-group W4A4): a shape whose per-core program count (M/nc)*Sn*Sk exceeds the
  * doorbell cap HARD-refuses (ORK_RC_WEDGE_PRONE) — unlike plain int4. The rescue M-chunks the rows. Validate
  * (gtest convention) the output matches the exact per-group dequant within float rounding (maxe<0.05); rc==0
@@ -238,6 +283,7 @@ int main(void){
     fail |= one_i4(c, 512,   16384, 8, 0, "i4-wideN"); /* int4 NATURAL Sn>1 gate — N-scatter (2 tiles) */
     fail |= one_i4(c, 10240, 128,   8, 0, "i4-wideK"); /* int4 NATURAL K>8192 gate — K-slice int32-accumulate (2 slices) */
     fail |= one_i4_natural(c, 2048, 16384, 128, "i4-refuse"); /* REAL trigger: M=128 + Sn=2 -> run_i4_mc_db -4 -> rescue */
+    fail |= one_i4_rep(c, 18944, 1024, 32, 5, "i4-rem2560");  /* 7B ffn_down: 2x8192+2560 remainder — repeated-run determinism */
     fail |= one_i4g(c, 64, 2048, 256, 128, "i4g-refuse");     /* GROUPED: M=64 Sk=16 -> Pcore~341 > cap -> hard refuse -> M-chunk rescue */
     if(getenv("ORK_TEST_BCH")){   /* P=128 wedge probe: the Qwen3-1.7B int4 down-proj (K=6144,N=2048) at M=64 (works) vs M=128 (wedges) */
         printf("  -- ORK_TEST_BCH: BCHAIN chain-length wedge probe (down-proj K=6144 N=2048) --\n");

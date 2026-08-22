@@ -43,17 +43,17 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
  * point needed — an empirical safety factor, NOT a guarantee. Measure before trusting a new K.
  *
  * VALIDATE A NEW ENTRY TWICE: standalone AND as a slice remainder (at K=8192+rem). They are NOT the
- * same test and standalone is the WEAKER one. K=2560 agreed six ways standalone at H=7 and is
- * genuinely correct there, but as a slice remainder H=7 returned a DIFFERENT RESULT on ~40-60% of
- * runs — K=18944, the real 7B ffn_down, is 2x8192+2560. The slice context differs only in that a
- * submit PRECEDES it, and the corruption tracks that: fixed inputs, no recover fired, no early poll
- * (a 2 ms dwell after the poll does not help), no buffer overrun (padding `part` does not help), and
- * per-sub-tile checksums show the two 8192 tiles bit-identical every run with only the 2560 tile
- * varying. So the NPU itself computes differently depending on what ran before — stale-CBUF-residue
- * behaviour that a marginal H exposes. The rate falls smoothly with H (7: ~50%, 6: 5/8, 5: 4/8,
- * 4: 0/8) and 4 is the largest fully stable value, which is also exactly where 2816..4096 already
- * sit. All 25 entries are now confirmed stable as remainders (6 runs each). H<2 is refused by the
- * callers (-4), routing the shape to the proven per-row doorbell.
+ * same test and standalone is the WEAKER one — a single standalone run of K=2560 agreed six ways at
+ * H=7, yet as a slice remainder H=7 returned a DIFFERENT RESULT on ~40-60% of runs (K=18944, the real
+ * 7B ffn_down, is 2x8192+2560). MECHANISM: H>4 pushes that sub-tile's submit past the KERNEL job
+ * timeout, so the kernel soft-resets and RETRIES it — and a retry is not idempotent for BCHAIN's
+ * int16 ACCUMULATOR. Wrong runs show +2 dmesg soft resets and 5-7 s wall where correct ones show +1
+ * and ~0.95 s; our own MC-RECOVER stays 0 throughout, because the retry is the kernel's, not ours.
+ * So H>4 here is not a throughput/correctness trade — it is strictly worse on BOTH: standalone
+ * K=2560 measures 1954 ms/run at H=7 against 1 ms at H=4. 4 is the largest stable value and is
+ * exactly where 2816..4096 already sit. All 25 entries are confirmed stable as remainders (6 runs
+ * each), and `test_slice_rescue` case i4-rem2560 guards it. H<2 is refused by the callers (-4),
+ * routing the shape to the proven per-row doorbell.
  *
  * Exceeding the ceiling does one of three things, and only the second shows up in rc:
  *     rc=0, DIFFERENT checksum -> SILENT MISCOMPUTE     (K=2048 H>=9; K=1024 H=5..8)
