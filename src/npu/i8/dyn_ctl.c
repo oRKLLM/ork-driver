@@ -97,8 +97,20 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
     return comp;
 }
 
+/* Sequencer FRONTIER: the last CONTIGUOUSLY-landed task, i.e. one before the first that did not land.
+ * It must stop at the first hole, not report the highest landed index — every caller reads it as a
+ * frontier: ork_dyn_end's completion test is `>= S-1`, ork_dyn_dump names the stuck op as `prog+1`,
+ * ork_dyn_remaining computes `P-(p+1)`, and the queue halts at `prog+1+HEADROOM`.
+ *
+ * It used to scan for the highest index (`if (done_i(i)) hi = i;`), which is the same thing for a
+ * single-core chain — tasks retire in order — but NOT for a multi-core one, where the S entries are
+ * per-core and complete out of order. There a hole at task 0 or 1 with the LAST task landed returned
+ * S-1, so ork_dyn_end declared success and de-tiled a buffer one core short: a SILENT wrong answer,
+ * with the recover loop and the auto-dump both skipped because they sit behind the same test. Found
+ * 2026-08-22 via the int4 K=2560 slice remainder (`[dyn_end] done=2/3 last=2 ... INCOMPLETE` on every
+ * corrupt run); wiki "Exp-2026-08-21 Native W4A4 Prefill Hang". Affected int8/fp16/int4 alike. */
 int ork_dyn_progress(ork_dyn_chain *h) { if (!h) return -1; int hi = -1;
-    for (int i = 0; i < h->S; i++) if (ork_dyn_done_i(h, i)) hi = i;   /* per-row: task done = ALL its rows' last cols written */
+    for (int i = 0; i < h->S; i++) { if (!ork_dyn_done_i(h, i)) break; hi = i; }   /* per-row: task done = ALL its rows' last cols written */
     return hi; }
 
 /* Chain-aware anomaly dump. Uses the doorbell DETECTOR (ork_dyn_progress) to name the STUCK descriptor — the
