@@ -32,19 +32,19 @@ NOT_CORE := src/orkd.c src/orkd_handlers.c \
             src/ork_gptq.c
 # orkd.c/orkd_handlers.c   — the DAEMON binary, not linked into the library at all
 # orkd_client*.c           — RPC transport (in COBJ, not CORE): moves bytes, computes nothing
-# ork_gptq.c               — pure-CPU pack-time quantizer, gated off, nothing routed through it
+# ork_gptq.c               — pure-CPU pack-time GPTQ quantizer (implemented 2026-08-22; test_gptq covers it), gated off, nothing routed through it
 # None of these determine NPU output, which is what the attest hash is for.
 
 ORKD_CLIENT_SRC := src/orkd_client.c src/orkd_client_ops.c  # transport + RPC op wrappers; nine targets compile these, so keep them in ONE variable — adding a file to the split must not mean editing nine recipes
 ORKD_CLIENT_HDR := src/orkd_client.h src/orkd_client_internal.h src/orkd_proto.h
-COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_gptq_i4). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
+COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # orkd client shim (Path B: npu.c transparently routes through orkd under ORK_USE_ORKD) + the GPTQ int4 quantizer (ork_i4_gptq). Neither is in CORE/ATTEST — orkd_client is RPC transport and ork_gptq is a pure-CPU pack-time quantizer, gated OFF (ORK_GPTQ) with nothing routed through it, so neither determines NPU output.
 # Board-validation attestation: `make test` (on ALL PASS) records a hash of the sources that determine
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
 # only that header, so it must not invalidate the attest).
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch test_gptq
 TESTS :=
 
 all: check-registry $(EXAMPLES) $(TESTS)
@@ -492,7 +492,7 @@ SUDO ?= sudo -E
 # loop, because orkd_seq_probe needs ORK_USE_ORKD=1 and the loop has one shared environment.
 test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
 	@fail=0; ORKD_BIN=$$PWD/orkd; export ORKD_BIN; \
-	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
+	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
 	for t in "orkd_probe mm" "orkd_ring_probe" "orkd_dom_api"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \

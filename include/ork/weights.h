@@ -193,9 +193,14 @@ size_t       ork_i4a8_pack_cpu_blob(ork_npu *ctx, int K, int N, const float *f32
  * with the calibration Hessian H=X^T X -> uniform symmetric int4 [-8,7] + per-(row,group) scale (native-W4A4
  * form: dequant w=code*scale; composes with Hadamard = QuaRot). W:[N(out)*K(in)] fp32; H:[K*K] (DESTROYED);
  * group<=0 => per-row; codes:[N*K] int8; scales:[N*ceil(K/group)] fp32; damp: Hessian damp (0.01 typical).
- * 0 ok, <0 on error. NOT YET IMPLEMENTED — the current src/ork_gptq.c is a stub returning -ENOSYS; the
- * real quantizer is written but parked until it is cross-checked against AutoGPTQ on a fixed (W,H)
- * golden (task #56). Nothing routes through it; the pack will gate it behind ORK_GPTQ (not wired yet — this is a stub). */
+ * 0 ok, <0 on error. IMPLEMENTED 2026-08-22 (was a -ENOSYS stub). Validated by `test_gptq` in `make test`,
+ * which supersedes task #56's AutoGPTQ byte-compare (that needed a Python dep the repo disallows, and an
+ * analytic identity is the stronger check): H=I makes the factor chain collapse to Hinv=I, so GPTQ must emit
+ * codes+scales BYTE-IDENTICAL to round-to-nearest — it does, 0/8192 and 0/256 — and on a structured H it cuts
+ * the H-weighted error to 0.60x RTN. Cost is O(N*K^2) plus three O(K^3) factorisations: an offline pack step,
+ * not inference. STILL NOT ROUTED: quantizer quality is an end-to-end question, so the pack keeps it behind
+ * the pack gate ORK_GPTQ, which is not wired yet, until a PPL comparison (ork_ppl) shows it beats the
+ * current int4 quantizer on a real model. */
 int          ork_i4_gptq(int K, int N, const float *W, float *H, int group, int8_t *codes, float *scales, float damp);
 ork_w       *ork_i8_mm_pack_import(ork_npu *ctx, int K, int N, const int8_t *B);
 
