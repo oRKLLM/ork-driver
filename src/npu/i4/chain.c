@@ -45,12 +45,14 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
  * VALIDATE A NEW ENTRY TWICE: standalone AND as a slice remainder (at K=8192+rem). They are NOT the
  * same test and standalone is the WEAKER one — a single standalone run of K=2560 agreed six ways at
  * H=7, yet as a slice remainder H=7 returned a DIFFERENT RESULT on ~40-60% of runs (K=18944, the real
- * 7B ffn_down, is 2x8192+2560). MECHANISM: H>4 pushes that sub-tile's submit past the KERNEL job
- * timeout, so the kernel soft-resets and RETRIES it — and a retry is not idempotent for BCHAIN's
- * int16 ACCUMULATOR. Wrong runs show +2 dmesg soft resets and 5-7 s wall where correct ones show +1
- * and ~0.95 s; our own MC-RECOVER stays 0 throughout, because the retry is the kernel's, not ours.
- * So H>4 here is not a throughput/correctness trade — it is strictly worse on BOTH: standalone
- * K=2560 measures 1954 ms/run at H=7 against 1 ms at H=4. 4 is the largest stable value and is
+ * 7B ffn_down, is 2x8192+2560). MECHANISM UNKNOWN — an earlier "kernel job timeout + non-idempotent
+ * retry" note here was WRONG, read out of one sample where resets happened to arrive in the same
+ * block as the corruption; a second sample has corrupt runs at the BASELINE +1 reset. Ruled out, each
+ * by measurement: our recover loop (MC-RECOVER=0), submit rejection (0), an extra soft reset (+1
+ * only), the submit itself (dyn_end done=3/3 in 496 us), our submit timeout (wall flat across
+ * ORK_MM_TIMEOUT 500..4000), an early poll (2 ms dwell no help), an overrun (padding `part` no help).
+ * Per-sub-tile checksums isolate it to the K=2560 BCHAIN call. Solid: H>4 is no trade — also ~2000x
+ * SLOWER (2.1 s/run vs 1.0 ms, the stall host-side). 4 is the largest stable value and is
  * exactly where 2816..4096 already sit. All 25 entries are confirmed stable as remainders (6 runs
  * each), and `test_slice_rescue` case i4-rem2560 guards it. H<2 is refused by the callers (-4),
  * routing the shape to the proven per-row doorbell.
