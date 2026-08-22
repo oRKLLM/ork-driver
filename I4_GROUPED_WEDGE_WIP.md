@@ -1,5 +1,13 @@
 # I4 grouped-W4A4 prefill wedge — WIP recovery doc
 
+> **SUPERSEDED for the prefill hang (2026-08-21).** The hang reported here was diagnosed as a BCHAIN
+> `H`-ceiling overshoot on the PER-CHANNEL path and is FIXED — see the wiki page
+> *Exp-2026-08-21 Native W4A4 Prefill Hang* and `orki_i4_hcap` in `src/npu/i4/chain.c`.
+> The grouped-path analysis below (M-chunk micro-submit swarm, missing recover loop in
+> `ork_dyn_grouped_end`, the closed `XP_SDP.setdt=1` negative) remains accurate for `mul_mat_i4`,
+> but ggml-ork no longer dispatches to it: selecting native W4A4 always takes the rotated
+> per-channel route. Kept for the grouped-persist gap and the closed negatives.
+
 ## CORRECTION (2026-08-07): int4 SHOULD be a dt-branch in ork_dyn_begin_colsplit (the reference)
 Earlier "BCHAIN can't fold — no h" was WRONG. The int8 REFERENCE is `ork_dyn_begin_colsplit`@11118: a
 dt-parametrized doorbell batch-chain that builds per-core chains into an ork_dyn_chain h, runs PARALLEL

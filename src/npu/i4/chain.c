@@ -25,6 +25,30 @@
 
 int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
 
+/* BCHAIN rows-per-weight-stream ceiling. MEASURED, not derived. Full write-up: wiki
+ * "Exp-2026-08-21 Native W4A4 Prefill Hang".
+ *
+ *     K      256  512  768  1024  1536  2048  3072  3584  4096  6144  8192
+ *     Hmax    64   32   22    16    11     8     4     4     4     3     2
+ *     ceil    64   32   22    16    11     8   [ 6     5 ]   4     3     2   <- overshoots in-band
+ *
+ * ceil(16384/K) is exact at 9 of 11, overshooting ONLY inside 2048<K<4096 where measurement pins 4.
+ * No closed form fit all eleven (next_pow2: 16 at K=768, measured 22; 2 at K=6144, measured 3).
+ * Exceeding the ceiling does one of two things, and only the second shows up in rc:
+ *     rc=0, DIFFERENT checksum -> SILENT MISCOMPUTE     (K=2048 H>=9; K=1024 H=5..8)
+ *     rc=-1 after ~15 s        -> doorbell never lands  (K=3072 H>=5; K=1024 H<=4)
+ * The latter is "native W4A4 hangs at prefill": ACCEPTED on every core (submit_rc=0) but the NPU
+ * never starts it (hw_elapse=0, int_status=0), so the recover loop resets 6x then fails — determin-
+ * istic per (K,H), 5/5. So rc is not a validity test and neither is timing; only a checksum compare
+ * is (H merely re-tiles M, so every valid H must be BIT-IDENTICAL). Measured N=1024 M=32, and K=768
+ * re-measured at M=64 gives the same 22 => M-independent. An UNMEASURED K is a known risk with a
+ * silent failure mode: pin it with i4_hcap_probe first (method on the wiki page). H<2 is refused by
+ * the callers (-4), routing the shape to the proven per-row doorbell. */
+static int orki_i4_hcap(int K){
+    int H = (K > 2048 && K < 4096) ? 4 : (16384 + K - 1) / K;   /* measured band, else CEIL */
+    return H > 64 ? 64 : H;   /* 64 = where measurement stops (K<256 unprobed), not a HW bound */
+}
+
 int ork_i4_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
@@ -366,31 +390,13 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     orki_last_op="run_i4_bchain_db"; orki_last_K=K; orki_last_N=N; orki_last_wdom=w->domain;
     orki_last_import=(w->own_buf_valid && w->own_buf.heap_fd>0) || (w->own_bufs && w->n_own_bufs>0 && w->own_bufs[0].heap_fd>0)
                   || (w->Bb && w->Bb[0].heap_fd>0);
-    /* H = rows per batched submit. 16384 = the int4 CBUF activation budget in ELEMENTS
-     * (Exp-2026-07-07); the 16 cap is likewise inherited, not measured. ORK_I4_H overrides both so an
-     * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
-     * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
-    /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
-     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H_max = CEIL(16384/K),
-     * pinned at SIX K at FULL INTEGER resolution by checksum-vs-a-known-good-H (H only changes
-     * M-tiling, so a valid H must reproduce the result bit-for-bit):
-     *     K=256  -> 64 OK, 65 bad     K=512  -> 32 OK, 33 bad     K=768  -> 22 OK, 23 bad
-     *     K=1536 -> 11 OK, 12 bad     K=2048 ->  8 OK,  9 bad     K=4096 ->  4 OK,  5 bad
-     * CEIL, not floor: plain 16384/K is right only when K DIVIDES 16384. At K=768 the true ceiling
-     * is 22 (21.33 rounded UP) and at K=1536 it is 11 (10.67), so integer division silently loses a
-     * row at every non-dividing K — including K=768, a real int4 down-proj shape.
-     * Resolution matters: an earlier power-of-2-only sweep (2,4,8,16,32,64) was consistent with floor
-     * and missed this — the same ladder-steps-over-the-boundary error that hid the fp16 352 ceiling
-     * behind a 320/384 probe
-     * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
-     * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
-     * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
-     * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
-     * ORK_I4_H overrides for RE — without it a probe only measures this line. */
-    int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
+    /* H = rows per batched submit: the weight streams ONCE per H rows, so H IS the int4
+     * prefill weight-reuse factor. Buffers are sized from H at runtime (need_af/need_o below).
+     * ORK_I4_H overrides it for RE — without that a probe can only measure this one value. */
+    int H=orki_i4_hcap(K);   /* MEASURED ceiling — see orki_i4_hcap; exceeding it hangs or miscomputes */
     /* ORK_I4_DBNK=n: H_max scales with the DATA_BANK count (measured H_max = DBNK*16384/K), so this
      * must move together with the 0x1040 split written in i4/run.c. */
-    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=(n*16384+K-1)/K; if(H>64)H=64; } } }
+    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=n*orki_i4_hcap(K); if(H>64)H=64; } } }
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
@@ -539,31 +545,13 @@ static void *bch_mw_worker(void *vp){
 
 int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
-    /* H = rows per batched submit. 16384 = the int4 CBUF activation budget in ELEMENTS
-     * (Exp-2026-07-07); the 16 cap is likewise inherited, not measured. ORK_I4_H overrides both so an
-     * RE probe can test above them — without it a probe only measures this line. See ORK_I4_1040 /
-     * ORK_I4_MREGS for the same pattern on the batch-mode regs. */
-    /* H = rows per batched submit; the weight streams ONCE per H rows, so H is directly the int4
-     * prefill's weight-reuse factor. Rule MEASURED 2026-08-20 (tools/re/i4_hcap_probe.c): H_max = CEIL(16384/K),
-     * pinned at SIX K at FULL INTEGER resolution by checksum-vs-a-known-good-H (H only changes
-     * M-tiling, so a valid H must reproduce the result bit-for-bit):
-     *     K=256  -> 64 OK, 65 bad     K=512  -> 32 OK, 33 bad     K=768  -> 22 OK, 23 bad
-     *     K=1536 -> 11 OK, 12 bad     K=2048 ->  8 OK,  9 bad     K=4096 ->  4 OK,  5 bad
-     * CEIL, not floor: plain 16384/K is right only when K DIVIDES 16384. At K=768 the true ceiling
-     * is 22 (21.33 rounded UP) and at K=1536 it is 11 (10.67), so integer division silently loses a
-     * row at every non-dividing K — including K=768, a real int4 down-proj shape.
-     * Resolution matters: an earlier power-of-2-only sweep (2,4,8,16,32,64) was consistent with floor
-     * and missed this — the same ladder-steps-over-the-boundary error that hid the fp16 352 ceiling
-     * behind a 320/384 probe
-     * The old `if(H>16) H=16` was an inherited constant with no measurement behind it and cost
-     * throughput whenever K<1024 — 2x at K=512, 4x at K=256. Removed in favour of the rule; the 64
-     * clamp is where measurement stops (K<256 would want H>64, which is UNPROBED), not a hardware
-     * bound. Buffers are sized from H at runtime (need_af/need_o below), so a larger H is safe.
-     * ORK_I4_H overrides for RE — without it a probe only measures this line. */
-    int H=(16384+K-1)/K; if(H>64)H=64;   /* CEIL — floor loses a row at non-dividing K */
+    /* H = rows per batched submit: the weight streams ONCE per H rows, so H IS the int4
+     * prefill weight-reuse factor. Buffers are sized from H at runtime (need_af/need_o below).
+     * ORK_I4_H overrides it for RE — without that a probe can only measure this one value. */
+    int H=orki_i4_hcap(K);   /* MEASURED ceiling — see orki_i4_hcap; exceeding it hangs or miscomputes */
     /* ORK_I4_DBNK=n: H_max scales with the DATA_BANK count (measured H_max = DBNK*16384/K), so this
      * must move together with the 0x1040 split written in i4/run.c. */
-    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=(n*16384+K-1)/K; if(H>64)H=64; } } }
+    { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=n*orki_i4_hcap(K); if(H>64)H=64; } } }
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
