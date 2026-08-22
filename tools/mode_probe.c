@@ -26,18 +26,13 @@
  * After every op that may wedge we ork_npu_mode_reset + re-warm + health-check before continuing.
  * argv: [Aidx [Bidx]] runs a single pair (indices below); no args = the scoped sweep.
   *
- * !! BOARD-KILLER — DO NOT USE AS A ROUTINE GATE (2026-08-22) !!
- * This probe triggers a KERNEL OOPS in the rknpu DRM driver and takes the whole board down (no ping,
- * not just SSH); it cost three power cycles to characterise. The pair GELU_I8 -> MM_F16 completes but
- * burns the full ORK_MM_TIMEOUT and emits ~14 `RKNPU: soft reset`; the NEXT transition's buffer
- * realloc then issues a GEM destroy and the driver faults walking a corrupted scatter-gather table:
- *     virt_to_folio <- sg_kfree <- __sg_free_table <- sg_free_table
- *     <- rknpu_gem_object_destroy <- rknpu_gem_free_object <- rknpu_gem_destroy_ioctl
- * Neither pair reproduces alone (`mode_probe 8 0` and `mode_probe 8 1` are both safe); it needs the
- * sequence, so run SINGLE PAIRS (`mode_probe <a> <b>`) rather than a sweep. After the Oops the kernel
- * is tainted and dies on the next activity, even a read-only one. Driver bug, not an ork-driver one —
- * write-up + capture recipe: wiki "Exp-2026-08-22 mode_probe Kernel Oops".
- */
+ * HISTORY: until 2026-08-22 a SWEEP here was a board-killer — it hung and took the box down (no ping),
+ * because the int8 LUT activations left the shared `c->task` descriptor poisoned (regcfg_amount=69 /
+ * enable_mask=0x18), so the next SINGLE-CORE matmul stalled the full ORK_MM_TIMEOUT, reset-stormed, and
+ * eventually Oops'd the kernel in rknpu_gem_object_destroy. Fixed by the save/restore in
+ * ork_i8_npu_probe_silu_std (npu/i8/probe_sdp.c); the full sweep is now 56 pairs in ~48 s, 0 WEDGE.
+ * If a sweep starts hanging again, suspect a new op that does not leave `c->task` as it found it.
+*/
 #include "ork_npu.h"
 #include <stdio.h>
 #include <stdlib.h>

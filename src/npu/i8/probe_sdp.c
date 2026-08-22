@@ -314,6 +314,21 @@ int ork_i8_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     struct buf Lrc=orki_bcreate(fd,(size_t)REGCMD_SILU_LUT_N*4,0x403,dom); if(!Lrc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);return -2;}
     struct buf Lsc=orki_bcreate(fd,4096,0x403,dom); if(!Lsc.cpu){orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);return -2;}
     memset(A.cpu,0,sz);memset(O.cpu,0,sz);
+    /* c->task IS SHARED — snapshot it and put it back on every exit below. This op reprograms the shared
+     * descriptor twice (LUT-load regcfg_amount=1097/enable_mask=0x18, then the activation 69/0x18) and used
+     * to leave it that way. A later SINGLE-CORE matmul does NOT rebuild c->task — it relies on the init
+     * value (108 / 0xd / regcmd_addr) persisting — so it submitted its 108-word matmul regcmd under the
+     * stale 69-reg SDP descriptor, dispatched nothing, and timed out (task counter 0x0 -> soft-reset storm
+     * -> orphaned core). Multi-core matmuls rebuild per-core c->mtk[] and are immune, which is why the trap
+     * looked dtype-specific: mode_probe's MM_F16 is N=16 (single-core) and its MM_I8 is N=64 (multi-core).
+     * ACT_RESET cannot clear it — it is a poisoned SOFTWARE descriptor, not hardware state (measured: the
+     * mode_probe fix ladder none/invalidate/reset gives 2500/5106/5107 ms, all stalled).
+     * The i16 twin (npu/i16/act.c) has had this save/restore since Exp-2026-07-12; the int8 path never got
+     * it. Whole-struct because line ~351 memsets the descriptor. See wiki NPU-Quirks "LUT-activation op
+     * poisons the shared c->task descriptor". */
+    struct rknpu_task tksave = *(struct rknpu_task*)c->task.cpu;
+    #define TK_RESTORE() do{ *(struct rknpu_task*)c->task.cpu = tksave; \
+                             orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE); }while(0)
     int8_t*ac=A.cpu; for(int m=0;m<M;m++)for(int n=0;n<N;n++) ac[EWCUBE(m,n)]=in[m*N+n];
     orki_bsync(fd,&A,RKNPU_MEM_SYNC_TO_DEVICE);orki_bsync(fd,&O,RKNPU_MEM_SYNC_TO_DEVICE);
     orki_act(fd,RKNPU_ACT_RESET,0);
@@ -329,7 +344,7 @@ int ork_i8_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
       t->enable_mask=0x18; t->int_mask=0x300; t->int_clear=0x1ffff; t->regcfg_amount=1097; t->regcmd_addr=Lrc.dma;
       orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
       struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.core_mask=RKNPU_CORE0_MASK;sub.fence_fd=-1;sub.timeout=orki_ew_timeout_ms();sub.subcore_task[0]=(struct rknpu_subcore_task){0,1};
-      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] orki_submit1 (LUT-load) WEDGED\n"); orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
+      if(orki_rknpu_submit_ioctl(fd,&sub,dom)){ if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] orki_submit1 (LUT-load) WEDGED\n"); TK_RESTORE(); orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc); return -1; }
       if(getenv("ORK_SILU_DBG"))fprintf(stderr,"[silu_std] orki_submit1 (LUT-load) ok\n");
     }
 
@@ -355,7 +370,9 @@ int ork_i8_npu_probe_silu_std(ork_npu *c,const int8_t *in,int M,int N,
     int ok=-1; double t1=0; sub.timeout=orki_ew_timeout_ms(); double t0=ork_now_us();
     if(!orki_rknpu_submit_ioctl(fd,&sub,dom)){ orki_bsync(fd,&O,RKNPU_MEM_SYNC_FROM_DEVICE); ok=0; t1=ork_now_us()-t0; }
     if(ok==0){ for(int m=0;m<M;m++)for(int n=0;n<N;n++) out[m*N+n]=*(int8_t*)((char*)O.cpu+EWCUBE(m,n)); if(us)*us=t1; }
+    TK_RESTORE();   /* leave the shared descriptor as we found it (see the snapshot above) */
     orki_bdestroy(fd,&A);orki_bdestroy(fd,&O);orki_bdestroy(fd,&Lrc);orki_bdestroy(fd,&Lsc);
     #undef EWCUBE
+    #undef TK_RESTORE
     return ok;
 }
