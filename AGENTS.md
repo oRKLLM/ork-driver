@@ -404,8 +404,16 @@ mechanism that actually applies at each call site; **don't** default everything 
   the knob never reaches the test and the run silently re-validates the DEFAULT config. Sanity-check that
   propagation works before trusting a knobbed run: `ORK_TRACE=1 make test-only T=test_bmm` must print
   `[ork-trace]` lines.
-- `make mode_probe && sudo env ORK_MM_TIMEOUT=2500 timeout 300 ./mode_probe` — the op→op transition
-  matrix; confirm which pairs reset/wedge is unchanged.
+- `make mode_probe` — the op→op transition matrix. **CURRENTLY A BOARD-KILLER, NOT A USABLE GATE
+  (2026-08-22).** A full sweep triggers a KERNEL OOPS in the rknpu DRM driver
+  (`sg_free_table` ← `rknpu_gem_object_destroy`, on the GEM destroy that a transition's buffer realloc
+  issues after a reset storm) and takes the whole board down — no ping, not just SSH; it cost three
+  power cycles to characterise, and it reproduces with the change under test REVERTED, so it is not
+  yours. Run **single pairs** (`./mode_probe <a> <b>`) if you need it — those are safe; it is the
+  sweep's sequence that kills. Until it is fixed, validate a transition change with `make test`
+  across the keep-warm knobs plus the `ORK_DEBUG_RESET` count diff below, and say in the commit that
+  mode_probe was unavailable. Write-up + kernel-log capture recipe: wiki
+  *Exp-2026-08-22 mode_probe Kernel Oops*.
 - `ORK_DEBUG_RESET=1` — logs every `ACT_RESET` with a counter + caller; diff the count/sites before vs
   after (the "28→1" keep-warm behavior must be intact).
 

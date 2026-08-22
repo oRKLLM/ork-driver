@@ -25,6 +25,18 @@
  *   sudo env ORK_MM_TIMEOUT=2500 ORK_EW_TIMEOUT=2500 ./mode_probe
  * After every op that may wedge we ork_npu_mode_reset + re-warm + health-check before continuing.
  * argv: [Aidx [Bidx]] runs a single pair (indices below); no args = the scoped sweep.
+  *
+ * !! BOARD-KILLER — DO NOT USE AS A ROUTINE GATE (2026-08-22) !!
+ * This probe triggers a KERNEL OOPS in the rknpu DRM driver and takes the whole board down (no ping,
+ * not just SSH); it cost three power cycles to characterise. The pair GELU_I8 -> MM_F16 completes but
+ * burns the full ORK_MM_TIMEOUT and emits ~14 `RKNPU: soft reset`; the NEXT transition's buffer
+ * realloc then issues a GEM destroy and the driver faults walking a corrupted scatter-gather table:
+ *     virt_to_folio <- sg_kfree <- __sg_free_table <- sg_free_table
+ *     <- rknpu_gem_object_destroy <- rknpu_gem_free_object <- rknpu_gem_destroy_ioctl
+ * Neither pair reproduces alone (`mode_probe 8 0` and `mode_probe 8 1` are both safe); it needs the
+ * sequence, so run SINGLE PAIRS (`mode_probe <a> <b>`) rather than a sweep. After the Oops the kernel
+ * is tainted and dies on the next activity, even a read-only one. Driver bug, not an ork-driver one —
+ * write-up + capture recipe: wiki "Exp-2026-08-22 mode_probe Kernel Oops".
  */
 #include "ork_npu.h"
 #include <stdio.h>
