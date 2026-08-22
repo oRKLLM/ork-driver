@@ -28,9 +28,12 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
 /* BCHAIN rows-per-weight-stream ceiling. MEASURED, not derived. Full write-up: wiki
  * "Exp-2026-08-21 Native W4A4 Prefill Hang".
  *
- *     K      256  512  768  1024  1536  2048  2560  3072  3584  4096  5120  6144  8192
- *     Hmax    64   32   22    16    11     8     7     4     4     4     3     3     2
- *     ceil    64   32   22    16    11     8     7   [ 6     5 ]   4   [ 4 ]   3     2
+ *     K       32   64   96  128  160  192  224  256  512  768 1024 1536 2048 2560 3072 3584 4096 5120 6144 8192
+ *     Hmax   128  128  128  128   64   64   64   64   32   22   16   11    8    7    4    4    4    3    3    2
+ *     16384/K 512  256  171  128  103   86   74   64   32   22   16   11    8    7  [ 6    5 ]   4  [ 4 ]  3    2
+ *
+ * Below K=256 the envelope goes FLAT — 128 for K<=128, 64 for 128<K<256 — with no relation to
+ * 16384/K (which wants 512 at K=32). So the naive rule is wrong at BOTH ends of the range.
  *
  * THE TABLE IS THE RULE. No closed form fits these thirteen points and interpolation is unsafe in
  * BOTH directions: ceil overshoots at 3072/3584/5120 (miscompute or hang) and undershoots at 6144.
@@ -50,11 +53,13 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
  * silent failure mode: pin it with i4_hcap_probe first (method on the wiki page). H<2 is refused by
  * the callers (-4), routing the shape to the proven per-row doorbell. */
 static int orki_i4_hcap(int K){
-    static const short KT[] = {256,512,768,1024,1536,2048,2560,3072,3584,4096,5120,6144,8192};
-    static const short HT[] = { 64,  32,  22,   16,   11,    8,    7,    4,    4,    4,    3,    3,    2};
+    static const short KT[] = {32,64,96,128,160,192,224,256,512,768,1024,1536,2048,2560,3072,3584,4096,5120,6144,8192};
+    static const short HT[] = {128,128,128,128, 64, 64, 64, 64, 32,  22,   16,   11,    8,    7,    4,    4,    4,    3,    3,    2};
     for (unsigned i = 0; i < sizeof KT / sizeof *KT; i++) if (KT[i] == K) return HT[i];
     int H = 12288 / K;        /* unmeasured: conservative fallback, see above */
-    return H > 64 ? 64 : H;   /* 64 = where measurement stops (K<256 unprobed), not a HW bound */
+    return H > 64 ? 64 : H;   /* fallback stays clamped at 64 even though table K reach 128: 128 is
+                               * measured only AT those K, and the clamp is load-bearing — at K=160
+                               * the fallback computes 76 where the true ceiling is 64. */
 }
 
 int ork_i4_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
