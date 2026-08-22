@@ -200,11 +200,15 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
     // single-shot quantize-on-first-use pack path cannot express yet. Raise with care — a large prefill is the
     // wide-colsplit submit hazard AGENTS warns about.
     int nb = nt<4 ? nt : 4;
+    int gptq_nb = 1;
     if (getenv("ORK_GPTQ")) {
         int cal = getenv("ORK_GPTQ_CALIB") ? atoi(getenv("ORK_GPTQ_CALIB")) : 512;
         if (cal < 1) cal = 1;
         nb = nt < cal ? nt : cal;
-        fprintf(stderr, "[ork_bench] ORK_GPTQ: calibration batch M=%d (rank(H) <= %d)\n", nb, nb);
+        gptq_nb = getenv("ORK_GPTQ_NBATCH") ? atoi(getenv("ORK_GPTQ_NBATCH")) : 4;
+        if (gptq_nb < 1) gptq_nb = 1;
+        fprintf(stderr, "[ork_bench] ORK_GPTQ two-phase: %d calibration batches of M=%d "
+                        "(rank(H) <= %d total rows)\n", gptq_nb, nb, gptq_nb*nb);
     }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = nb+8; cp.n_batch = nb; cp.n_ubatch = nb; cp.n_threads = 4; cp.n_threads_batch = 4;
@@ -213,6 +217,23 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
     if(!ctx){ llama_model_free(model); fprintf(stderr,"[ork_bench] build: ctx init FAILED\n"); return 1; }
     llama_batch pb = llama_batch_get_one(toks.data(), nb);   // small-M convert forward: packs every weight touched
     int rc = llama_decode(ctx, pb);              // WRITE mode: pack + dump every weight touched
+    /* ORK_GPTQ PHASE 1: the first decode registered every native-W4A4 weight; keep feeding DISTINCT token
+     * windows so H accumulates real rank (rank(H) <= total rows). KV is cleared between windows so each is
+     * an independent sample, and we walk forward through the text rather than repeating the same tokens —
+     * repeating them would add samples without adding rank, which is the whole point of this phase. */
+    if (rc == 0 && getenv("ORK_GPTQ")) {
+        for (int r = 1; r < gptq_nb; r++) {
+            int off = r * nb;
+            if (off + nb > nt) { fprintf(stderr,
+                "[ork_bench] ORK_GPTQ: calibration text exhausted after %d/%d batches (%d tokens) — "
+                "use a longer text for more rank\n", r, gptq_nb, nt); break; }
+            llama_memory_clear(llama_get_memory(ctx), true);
+            llama_batch cb = llama_batch_get_one(toks.data() + off, nb);
+            if (llama_decode(ctx, cb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: calib batch %d FAILED\n", r); break; }
+            fprintf(stderr, "[ork_bench] ORK_GPTQ: calibration batch %d/%d done\n", r+1, gptq_nb);
+        }
+        ggml_backend_ork_gptq_finalize();        // PHASE 2: quantize with the accumulated H, then persist
+    }
     llama_free(ctx); llama_model_free(model);    // teardown -> ork_persist_finalize writes + renames the .orkpack
     if(rc!=0){ fprintf(stderr,"[ork_bench] build: pack-pass decode rc=%d\n",rc); return 1; }
     return 0;

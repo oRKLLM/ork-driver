@@ -31,50 +31,71 @@
 /* Lower Cholesky in place: A (sym PD) -> L lower, A = L·Lᵀ; upper zeroed. 0 ok, -1 not positive-definite. */
 static int gptq_chol_lower(int K, double *A) {
     for (int i = 0; i < K; i++) {
-        for (int j = 0; j <= i; j++) {
-            double s = A[(size_t)i*K + j];
-            for (int k = 0; k < j; k++) s -= A[(size_t)i*K + k] * A[(size_t)j*K + k];
-            if (i == j) { if (s <= 0.0) return -1; A[(size_t)i*K + i] = sqrt(s); }
-            else          A[(size_t)i*K + j] = s / A[(size_t)j*K + j];
+        /* row i, strictly-lower: each j is independent once rows < i are complete (it reads row j and the
+         * already-final A[j][j]). The diagonal is computed after, since it consumes this whole row. */
+        #pragma omp parallel for schedule(static) if (i > 256)
+        for (int j = 0; j < i; j++) {
+            const double *ri = A + (size_t)i*K, *rj = A + (size_t)j*K;
+            double s = ri[j];
+            for (int k = 0; k < j; k++) s -= ri[k] * rj[k];
+            A[(size_t)i*K + j] = s / rj[j];
         }
+        const double *ri = A + (size_t)i*K;
+        double s = ri[i];
+        for (int k = 0; k < i; k++) s -= ri[k] * ri[k];
+        if (s <= 0.0) return -1;                                  /* not positive-definite */
+        A[(size_t)i*K + i] = sqrt(s);
     }
     for (int i = 0; i < K; i++) for (int j = i + 1; j < K; j++) A[(size_t)i*K + j] = 0.0;
     return 0;
 }
 
-/* Given lower L (from gptq_chol_lower), out = (L·Lᵀ)⁻¹ = (L⁻¹)ᵀ·(L⁻¹) (symmetric). */
+/* Given lower L (from gptq_chol_lower), out = (L·Lᵀ)⁻¹ = (L⁻¹)ᵀ·(L⁻¹) (symmetric).
+ *
+ * Works in the TRANSPOSE of L⁻¹ throughout. The obvious formulation indexes Li[k][c] and Li[k][i] with k
+ * varying, i.e. a stride-K column walk on both operands of the O(K³) product — cache-hostile, and it made
+ * this the dominant cost of the whole quantizer (measured 92 s for one K=2048 weight). Storing LiT instead
+ * makes both inner loops unit-stride and vectorisable, and both phases parallelise cleanly: the forward
+ * solves are independent per column, and the product is independent per output row. */
 static int gptq_inv_from_chol(int K, const double *L, double *out) {
-    double *Li = (double*)calloc((size_t)K*K, sizeof(double));   /* Li = L⁻¹ (lower) */
-    if (!Li) return -2;
-    for (int c = 0; c < K; c++) {                                /* forward-solve L·Li[:,c] = e_c */
-        Li[(size_t)c*K + c] = 1.0 / L[(size_t)c*K + c];
+    double *LiT = (double*)calloc((size_t)K*K, sizeof(double));   /* LiT[c][i] = (L⁻¹)[i][c] */
+    if (!LiT) return -2;
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int c = 0; c < K; c++) {                                 /* forward-solve L·Li[:,c] = e_c */
+        double *lic = LiT + (size_t)c*K;
+        lic[c] = 1.0 / L[(size_t)c*K + c];
         for (int i = c + 1; i < K; i++) {
+            const double *lr = L + (size_t)i*K;
             double s = 0.0;
-            for (int k = c; k < i; k++) s -= L[(size_t)i*K + k] * Li[(size_t)k*K + c];
-            Li[(size_t)i*K + c] = s / L[(size_t)i*K + i];
+            for (int k = c; k < i; k++) s -= lr[k] * lic[k];      /* both unit-stride */
+            lic[i] = s / lr[i];
         }
     }
-    for (int i = 0; i < K; i++) for (int j = 0; j < K; j++) {     /* out = Liᵀ·Li ; Li lower -> k >= max(i,j) */
-        double s = 0.0;
-        for (int k = (i > j ? i : j); k < K; k++) s += Li[(size_t)k*K + i] * Li[(size_t)k*K + j];
-        out[(size_t)i*K + j] = s;
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int i = 0; i < K; i++) {                                 /* out[i][j] = Σ_{k≥max(i,j)} LiT[i][k]·LiT[j][k] */
+        const double *ri = LiT + (size_t)i*K;
+        double *orow = out + (size_t)i*K;
+        for (int j = 0; j < K; j++) {
+            const double *rj = LiT + (size_t)j*K;
+            const int k0 = (i > j ? i : j);
+            double s = 0.0;
+            for (int k = k0; k < K; k++) s += ri[k] * rj[k];      /* both unit-stride */
+            orow[j] = s;
+        }
     }
-    free(Li);
+    free(LiT);
     return 0;
 }
 
-/* Upper Cholesky in place: A (sym PD) -> U upper, A = Uᵀ·U; lower zeroed. The GPTQ inverse-Cholesky factor
- * of H⁻¹: U[j][j] is the per-column error scale, U[j][c] (c>=j) the propagation row. 0 ok, -1 not PD. */
+/* Upper Cholesky: A (sym PD) -> U upper with A = Uᵀ·U; lower zeroed. U is exactly the TRANSPOSE of the
+ * lower factor — A = L·Lᵀ = (Lᵀ)ᵀ·(Lᵀ), and the Cholesky factor with positive diagonal is unique — so this
+ * reuses the lower routine and transposes. The hand-written upper variant this replaces indexed
+ * A[k*K+i]*A[k*K+j], i.e. TWO stride-K column walks in its innermost loop, and was the dominant cost of the
+ * quantizer once the inverse product had been fixed. 0 ok, -1 not PD. */
 static int gptq_chol_upper(int K, double *A) {
-    for (int j = 0; j < K; j++) {
-        for (int i = 0; i <= j; i++) {
-            double s = A[(size_t)i*K + j];
-            for (int k = 0; k < i; k++) s -= A[(size_t)k*K + i] * A[(size_t)k*K + j];
-            if (i == j) { if (s <= 0.0) return -1; A[(size_t)i*K + j] = sqrt(s); }
-            else          A[(size_t)i*K + j] = s / A[(size_t)i*K + i];
-        }
-    }
-    for (int j = 0; j < K; j++) for (int i = j + 1; i < K; i++) A[(size_t)i*K + j] = 0.0;
+    if (gptq_chol_lower(K, A) != 0) return -1;
+    for (int i = 0; i < K; i++)
+        for (int j = i + 1; j < K; j++) { A[(size_t)i*K + j] = A[(size_t)j*K + i]; A[(size_t)j*K + i] = 0.0; }
     return 0;
 }
 
@@ -121,7 +142,8 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
             }
         }
         double d = Hin[(size_t)j*K + j]; if (d == 0.0) d = 1e-12;
-        for (int n = 0; n < N; n++) {
+        #pragma omp parallel for schedule(static) if (N > 64)
+        for (int n = 0; n < N; n++) {                             /* rows are independent at a fixed column */
             const double sc = (double)scales[(size_t)n*ng + g];
             const double w  = Wd[(size_t)n*K + j];
             long q = lround(w / sc); if (q > 7) q = 7; if (q < -8) q = -8;
