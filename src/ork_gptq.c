@@ -127,17 +127,44 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
         } else Hd[(size_t)i*K + i] += lam;
     }
 
+    /* MSE-optimal weight clip: on by default (strictly better on the per-group objective), ORK_GPTQ_NOCLIP=1
+     * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
+    const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
+
     if (gptq_chol_lower(K, Hd) != 0)      { free(Hd); free(Wd); free(Hin); return -3; }  /* Hd -> L */
     if (gptq_inv_from_chol(K, Hd, Hin)!=0){ free(Hd); free(Wd); free(Hin); return -2; }  /* Hin = H⁻¹ */
     if (gptq_chol_upper(K, Hin) != 0)     { free(Hd); free(Wd); free(Hin); return -3; }  /* Hin -> U upper */
 
     for (int j = 0; j < K; j++) {
         const int g = j / G;
-        if (j % G == 0) {                                        /* new group: per-row symmetric absmax/7 scale */
+        if (j % G == 0) {                                        /* new group: per-row symmetric scale */
             int j1 = j + G; if (j1 > K) j1 = K;
+            #pragma omp parallel for schedule(static) if (N > 64)
             for (int n = 0; n < N; n++) {
                 double mx = 0; for (int c = j; c < j1; c++) { double a = fabs(Wd[(size_t)n*K + c]); if (a > mx) mx = a; }
                 double sc = mx / 7.0; if (sc <= 0.0) sc = 1e-12;
+                /* absmax/7 spends most of the 16 levels on tails. Search a small grid of clip fractions and
+                 * take the true minimum-squared-error scale instead. alpha=1 is in the grid, so this can never
+                 * be worse than absmax on the group's own objective. The grid stops at 0.78 (vs the activation
+                 * side's 0.56) BECAUSE of the error compensation below: a clipped weight's residual is not
+                 * absorbed locally, it is propagated into the not-yet-quantized columns, so over-tight scales
+                 * are amplified here in a way they are not for activations. Cost is NT extra passes over one
+                 * group — negligible beside the Cholesky and the compensation loop, and pack-time only. */
+                if (clip) {
+                    double best = sc, be = -1.0;
+                    for (int t = 0; t < 8; t++) {
+                        const double a = 1.0 - 0.03125 * (double)t;   /* 1.000 .. 0.781 */
+                        const double s2 = a * mx / 7.0; if (s2 <= 0.0) continue;
+                        double e = 0.0;
+                        for (int c = j; c < j1; c++) {
+                            const double w = Wd[(size_t)n*K + c];
+                            long q = lround(w / s2); if (q > 7) q = 7; if (q < -8) q = -8;
+                            const double dd = w - (double)q * s2; e += dd*dd;
+                        }
+                        if (be < 0.0 || e < be) { be = e; best = s2; }
+                    }
+                    sc = best;
+                }
                 scales[(size_t)n*ng + g] = (float)sc;
             }
         }

@@ -74,6 +74,11 @@ int main(void) {
     /* --- EXACTNESS GATE: H = I  =>  GPTQ == RTN, byte for byte -------------------------------------- */
     memset(H, 0, (size_t)K*K*4);
     for (int i = 0; i < K; i++) H[(size_t)i*K+i] = 1.0f;
+    /* The H=I identity is about the FACTOR CHAIN and the feedback term, not about how the scale is picked.
+     * ork_i4_gptq defaults to an MSE-optimal clipped scale while rtn_i4 above is plain absmax/7, so pin the
+     * scale rule to absmax for this one check — otherwise the identity would "fail" on a difference that is
+     * deliberate. The clip itself is gated separately below. */
+    setenv("ORK_GPTQ_NOCLIP", "1", 1);
     int rc2 = ork_i4_gptq(K, N, W, H, group, cg, sg, 0.0f);   /* damp 0 -> lam floor 1e-6, still ~identity */
     if (rc2) { printf("test_gptq: H=I rc=%d FAIL\n", rc2); return 1; }
     rtn_i4(K, N, group, ng, W, cr, sr);
@@ -85,5 +90,27 @@ int main(void) {
     printf("test_gptq: %s\n", ok2 ? "  OK (H=I reproduces RTN exactly — factor chain + feedback verified)"
                                    : "  FAIL (H=I must collapse to RTN; a nonzero propagation term is a bug)");
 
-    return (ok && ok2) ? 0 : 1;
+    /* (c) the MSE clip must never LOSE to absmax on its own objective. alpha=1 is in the search grid, so
+     * this is a structural guarantee — assert it anyway, because the guarantee is only as good as the grid
+     * actually containing 1.0, and a future edit to the grid could silently drop it. Compare reconstruction
+     * error of the clipped-scale quantization against the absmax one, with H=I so the compensation term is
+     * out of the picture and only the scale rule is under test. */
+    unsetenv("ORK_GPTQ_NOCLIP");
+    int rc3 = ork_i4_gptq(K, N, W, H, group, cg, sg, 0.0f);
+    if (rc3) { printf("test_gptq: clip rc=%d FAIL\n", rc3); return 1; }
+    double e_clip = 0, e_abs = 0;
+    for (int n = 0; n < N; n++)
+        for (int k = 0; k < K; k++) {
+            const int g = k / group;
+            double dc2 = (double)W[(size_t)n*K+k] - (double)cg[(size_t)n*K+k] * (double)sg[(size_t)n*ng+g];
+            double dr2 = (double)W[(size_t)n*K+k] - (double)cr[(size_t)n*K+k] * (double)sr[(size_t)n*ng+g];
+            e_clip += dc2*dc2; e_abs += dr2*dr2;
+        }
+    int ok3 = (e_clip <= e_abs * 1.0000001);   /* tolerance only for fp summation order, not for a real regression */
+    printf("test_gptq: MSE clip vs absmax | clipped %.6g  absmax %.6g  (%+.1f%%)\n", e_clip, e_abs,
+           e_abs > 0 ? 100.0*(e_clip-e_abs)/e_abs : 0.0);
+    printf("test_gptq: %s\n", ok3 ? "  OK (clip never loses — alpha=1.0 is in the grid)"
+                                   : "  FAIL (clip increased squared error; the grid must contain alpha=1.0)");
+
+    return (ok && ok2 && ok3) ? 0 : 1;
 }
