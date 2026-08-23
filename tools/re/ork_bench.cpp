@@ -223,24 +223,58 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
      * an independent sample, and we walk forward through the text rather than repeating the same tokens —
      * repeating them would add samples without adding rank, which is the whole point of this phase. */
     if (rc == 0 && getenv("ORK_GPTQ")) {
-        /* The first decode registered every weight, so the backend can now say how many rows this model
-         * needs: rank(H) <= rows, and below the largest K the Hessian is singular in the directions GPTQ
-         * would otherwise exploit. Feed DISTINCT windows (KV cleared between, walking forward through the
-         * text) until that threshold is met — repeating tokens would add samples without adding rank. */
-        const int need = ggml_backend_ork_gptq_min_rows();
-        const int want = ((need + nb - 1) / nb) * nb;             // whole batches
-        fprintf(stderr, "[ork_bench] ORK_GPTQ: largest K=%d -> need %d rows (%d batches of %d)\n",
-                need, want, want/nb, nb);
-        if ((long)want > (long)nt) fprintf(stderr,
-            "[ork_bench] ORK_GPTQ: calibration text is only %d tokens but %d rows are needed for full rank — "
-            "GPTQ will degrade toward RTN on the largest weights. Supply a longer text.\n", nt, want);
-        for (int off = nb; off + nb <= nt && ggml_backend_ork_gptq_rows() < (long)want; off += nb) {
-            llama_memory_clear(llama_get_memory(ctx), true);
-            llama_batch cb = llama_batch_get_one(toks.data() + off, nb);
-            if (llama_decode(ctx, cb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: calib batch at %d FAILED\n", off); break; }
-            fprintf(stderr, "[ork_bench] ORK_GPTQ: %ld/%d calibration rows\n", ggml_backend_ork_gptq_rows(), want);
+        /* WINDOWED CALIBRATION over layer ranges. One pass per window; each pass replays the corpus, then
+         * finalizes just that window's weights. Sized so the window's Hessians fit ORK_GPTQ_MEM_GB (the
+         * Hessian is K*K doubles and is NOT disk-backed, so it can only be rebuilt by replaying the corpus
+         * -- see ggml_backend_ork_gptq_set_window). ORK_GPTQ_WINDOW forces a layer count; 0 or unset with a
+         * model that fits keeps the single-pass behaviour.
+         *
+         * The passes are not redundant work: finalize writes each quantised weight back into the weight
+         * cache and windowed runs keep it pinned, so window W+1 calibrates against window W's ALREADY
+         * QUANTISED weights. That is sequential GPTQ (each layer compensating for upstream error) rather
+         * than the one-shot variant, and it is the better algorithm, not just the one that fits. */
+        const int nlayer = llama_model_n_layer(model);
+        const double memgb = getenv("ORK_GPTQ_MEM_GB") ? atof(getenv("ORK_GPTQ_MEM_GB")) : 24.0;
+        int win = getenv("ORK_GPTQ_WINDOW") ? atoi(getenv("ORK_GPTQ_WINDOW")) : 0;
+        if (win <= 0) {
+            /* Derive from the largest K actually registered: it is the ffn_down-class weight that dominates
+             * (K=17408 -> 2.42 GiB each), so budget against a per-layer cost of one big H plus the small ones. */
+            const int kmax = ggml_backend_ork_gptq_max_k();             // over ALL registered weights
+            const double per_layer = ggml_backend_ork_gptq_hessian_bytes(kmax) * 1.6;   // big H + the K-small ones
+            win = (int) (memgb * 1073741824.0 / per_layer);
+            if (win < 1) win = 1;
+            if (win > nlayer) win = nlayer;
+            fprintf(stderr, "[ork_bench] ORK_GPTQ: largest K=%d -> %.2f GiB/layer of Hessian; %.0f GiB budget "
+                            "-> window = %d layer(s), %d pass(es) over %d layers\n",
+                    kmax, per_layer/1073741824.0, memgb, win, (nlayer + win - 1)/win, nlayer);
         }
-        ggml_backend_ork_gptq_finalize();        // PHASE 2: quantize with the accumulated H, then persist
+        const int npass = (win >= nlayer) ? 1 : (nlayer + win - 1) / win;
+
+        /* ALWAYS set a window and ALWAYS run its claiming decode -- including the single-pass case, which is
+         * just the window [0,n_layer). The decode above was DISCOVERY: it registered metadata and packed RTN
+         * but claimed nothing, so no Hessian exists yet. Skipping the claim decode for npass==1 would leave
+         * the window with zero claimed weights and quietly calibrate nothing. */
+        for (int w = 0; w < npass; w++) {
+            ggml_backend_ork_gptq_set_window(w * win, (w + 1) * win < nlayer ? (w + 1) * win : nlayer);
+            llama_memory_clear(llama_get_memory(ctx), true);
+            llama_batch wb = llama_batch_get_one(toks.data(), nb);
+            if (llama_decode(ctx, wb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: window %d claim decode FAILED\n", w); break; }
+            const int need = ggml_backend_ork_gptq_min_rows();
+            if (need <= 0) { fprintf(stderr, "[ork_bench] ORK_GPTQ: window %d registered no weights — skipping\n", w); continue; }
+            const int want = ((need + nb - 1) / nb) * nb;             // whole batches
+            fprintf(stderr, "[ork_bench] ORK_GPTQ: window %d/%d: largest K=%d -> need %d rows (%d batches of %d)\n",
+                    w + 1, npass, need, want, want/nb, nb);
+            if ((long)want > (long)nt) fprintf(stderr,
+                "[ork_bench] ORK_GPTQ: calibration text is only %d tokens but %d rows are needed for full rank — "
+                "GPTQ will degrade toward RTN on the largest weights. Supply a longer text.\n", nt, want);
+            for (int off = nb; off + nb <= nt && ggml_backend_ork_gptq_rows() < (long)want; off += nb) {
+                llama_memory_clear(llama_get_memory(ctx), true);
+                llama_batch cb = llama_batch_get_one(toks.data() + off, nb);
+                if (llama_decode(ctx, cb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: calib batch at %d FAILED\n", off); break; }
+                fprintf(stderr, "[ork_bench] ORK_GPTQ: %ld/%d calibration rows\n", ggml_backend_ork_gptq_rows(), want);
+            }
+            ggml_backend_ork_gptq_finalize();    // PHASE 2: quantize this window with its accumulated H, persist
+        }
     }
     llama_free(ctx); llama_model_free(model);    // teardown -> ork_persist_finalize writes + renames the .orkpack
     if(rc!=0){ fprintf(stderr,"[ork_bench] build: pack-pass decode rc=%d\n",rc); return 1; }
