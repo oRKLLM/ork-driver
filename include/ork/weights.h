@@ -150,6 +150,12 @@ size_t       ork_i8_w_dump_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void
 /* CPU Bf (full-K re-tiled) blob for the .orkpack — byte-identical to the load-time Bf rebuild. 0 unless the
  * Bf run envelope (K%512==0 && K<=4096). Pass out=NULL to size. Lets a .orkpack carry Bf (no runtime rebuild). */
 size_t       ork_i8_w_dump_bf_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
+/* CPU-ONLY native-W4A4 (DT_I4) dump: same bytes as ork_i4_mm_pack()+ork_w_dump(), tiled straight into caller
+ * DRAM with no NPU/IOVA buffer and no DMA — the int4 twin of ork_i8_w_dump_cpu, and the piece that lets a
+ * native-W4A4 .orkpack be BUILT off-board (the NPU is then needed only at load time). Reuses the NPU pack's
+ * own tiler so the layouts cannot drift; byte-identity is asserted by test_i4_dump_cpu. out=NULL -> size.
+ * K%32, N%64. */
+size_t       ork_i4_w_dump_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
 ork_w       *ork_i8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* COMPACT int4 PERSIST (the streaming consumer for a mixed .orkpack): dump the COMPACT int4 nibble store
  * + per-channel scales (~half of the int8 ork_w_dump), and reload it straight into NPU DMA, inflating the

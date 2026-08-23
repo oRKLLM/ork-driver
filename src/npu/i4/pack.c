@@ -276,6 +276,34 @@ ork_w *ork_i4_mm_pack(ork_npu *c,int K,int N,const int8_t *B){
     return w;
 }
 
+/* CPU-ONLY native-W4A4 dump: produce the SAME bytes as ork_i4_mm_pack() + ork_w_dump(), tiling straight
+ * into caller DRAM — no NPU, no IOVA buffer, no DMA round-trip. The int8 twin (ork_i8_w_dump_cpu) already
+ * did this; native int4 was the one tier still forced through the NPU just to write a .orkpack, which is
+ * what pinned int4 pack-building to the board.
+ *
+ * It "emulates the NPU" only in the sense of reproducing the CNA's weight TILE LAYOUT — the compute is not
+ * involved. And the layout is not re-derived here: it reuses tile_i4_Bslice, the very function the NPU pack
+ * calls, so the two cannot drift. What remains is the envelope around it: the same Sn-major/Sk-minor order
+ * ork_w_dump walks Bb in, and the same page-padded per-tile stride ork_i4_mm_load expects (a fresh dma-buf
+ * is zeroed by the kernel, so the pad must be zeroed here to match byte-for-byte).
+ *
+ * Correctness has an exact oracle — examples/test_i4_dump_cpu.c packs on the NPU, ork_w_dump's it, and
+ * memcmp's against this. Byte-identical or the test fails; the layout cannot be subtly wrong and pass.
+ * out=NULL -> return the byte size. K%32, N%64. */
+size_t ork_i4_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    if(!c || !B || (K%32) || (N%64)) return 0;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS;
+        size_t tsz=orki_pgup((size_t)Kp*Nc/2);                 /* nibbles: half a byte per weight */
+        if(out){ if(off+tsz>cap) return 0;
+            uint8_t *bb=(uint8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
+            tile_i4_Bslice(bb,B,K,N,k0,Kp,n0,Nc); }
+        off+=tsz; }}
+    return off;
+}
+
 ork_w *ork_i4_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
     if(K%32||N%64) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
