@@ -20,7 +20,7 @@
 static uint32_t g = 987654321u;
 static int8_t r4(void){ g ^= g<<13; g ^= g>>17; g ^= g<<5; return (int8_t)(((int)(g & 0xf)) - 8); }  /* int4 [-8,7] */
 
-static int one(ork_npu *c, int K, int N, const char *tag) {
+static int one(ork_npu *c, ork_npu *off, int K, int N, const char *tag) {
     int8_t *B = malloc((size_t)K*N);
     if (!B) { printf("  [%-10s] OOM\n", tag); return 1; }
     for (size_t i = 0; i < (size_t)K*N; i++) B[i] = r4();
@@ -46,7 +46,27 @@ static int one(ork_npu *c, int K, int N, const char *tag) {
             for (size_t i = 0; i < need; i++) if (cpu[i] != ref[i]) { if (first == (size_t)-1) first = i; bad++; }
             if (bad) { printf("  [%-10s] K=%d N=%d: %zu/%zu bytes differ (first @%zu: cpu=0x%02x npu=0x%02x) FAIL\n",
                               tag, K, N, bad, need, first, cpu[first], ref[first]); fail = 1; }
-            else       printf("  [%-10s] K=%-5d N=%-6d %8zu bytes BYTE-IDENTICAL to pack+dump\n", tag, K, N, need);
+            else {
+                /* OFFLINE arm: the same tiler driven by a context with NO device (ork_npu_init_offline).
+                 * This is the property that lets a .orkpack be built off-board — and it has to be asserted
+                 * against the NPU's own bytes, not merely against the on-board CPU tiler, because the whole
+                 * risk of moving pack builds to another machine is that the caps used there differ. */
+                uint8_t *offb = malloc(need);
+                if (!offb) { printf("  [%-10s] OOM\n", tag); fail = 1; }
+                else {
+                    memset(offb, 0x55, need);
+                    size_t no = ork_i4_w_dump_cpu(off, K, N, B, offb, need);
+                    if (no != need)              { printf("  [%-10s] offline size %zu != %zu FAIL\n", tag, no, need); fail = 1; }
+                    else if (memcmp(offb, ref, need)) {
+                        size_t bo = 0, fo = (size_t)-1;
+                        for (size_t i = 0; i < need; i++) if (offb[i] != ref[i]) { if (fo == (size_t)-1) fo = i; bo++; }
+                        printf("  [%-10s] K=%d N=%d: OFFLINE differs from NPU in %zu/%zu bytes (first @%zu) FAIL\n",
+                               tag, K, N, bo, need, fo); fail = 1;
+                    }
+                    else printf("  [%-10s] K=%-5d N=%-6d %8zu bytes BYTE-IDENTICAL (npu == cpu == offline)\n", tag, K, N, need);
+                    free(offb);
+                }
+            }
         }
     }
     free(ref); free(cpu); free(B);
@@ -57,12 +77,18 @@ int main(void) {
     ork_npu *c = ork_npu_init();
     if (!c) { printf("test_i4_dump_cpu: no NPU — skipping\n"); return 0; }
     printf("test_i4_dump_cpu: ork_i4_w_dump_cpu vs ork_i4_mm_pack+ork_w_dump (SoC=%s)\n", ork_npu_soc(c));
+    /* Same SoC as the live device — an offline context tiled for a DIFFERENT SoC is precisely the silent
+     * mis-pack this test exists to catch, so pin it to what the board actually reports. */
+    ork_npu *off = ork_npu_init_offline(ork_npu_soc(c));
+    if (!off) { printf("test_i4_dump_cpu: ork_npu_init_offline(%s) FAILED\n", ork_npu_soc(c)); ork_npu_free(c); return 1; }
+
     int fail = 0;
-    fail |= one(c, 1024,  1024, "single");    /* one tile */
-    fail |= one(c, 3584,  1024, "ksplit");    /* K > ORK_I4_KS -> Sk>1 */
-    fail |= one(c, 1024, 16384, "widen");     /* N > nmax      -> Sn>1, exercises the walk order */
-    fail |= one(c, 2560,   576, "oddshape");  /* non-pow2 K and N%64 -> page-pad is non-trivial */
-    printf("test_i4_dump_cpu: %s\n", fail ? "FAIL" : "ALL BYTE-IDENTICAL");
+    fail |= one(c, off, 1024,  1024, "single");    /* one tile */
+    fail |= one(c, off, 3584,  1024, "ksplit");    /* K > ORK_I4_KS -> Sk>1 */
+    fail |= one(c, off, 1024, 16384, "widen");     /* N > nmax      -> Sn>1, exercises the walk order */
+    fail |= one(c, off, 2560,   576, "oddshape");  /* non-pow2 K and N%64 -> page-pad is non-trivial */
+    printf("test_i4_dump_cpu: %s\n", fail ? "FAIL" : "ALL BYTE-IDENTICAL (offline packing is safe)");
+    ork_npu_free(off);
     ork_npu_free(c);
     return fail;
 }

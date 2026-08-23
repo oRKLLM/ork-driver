@@ -32,6 +32,7 @@
 
 /* RUN the slot's matmul (must be mapped). Same as ork_i8_mm_run on the slot's view. */
 int ork_i8_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+    if(c && c->fd<0 && w && w->cpu_codes){ orki_cpu_gemm_i32(M,w->K,w->N,A,w->cpu_codes,C); return 0; }   /* OFFLINE: exact CPU MAC */
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op so the daemon zero-copy-swaps to it */
         /* ZERO-COPY transport (ORK_ORKD_ZC): A+C ride SCM_RIGHTS dma-buf fds; the daemon reads A / writes C IN

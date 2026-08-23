@@ -20,3 +20,4 @@
 # of 2,891). This budget should RATCHET DOWN as the remaining stranded doc-comments are placed;
 # it is set just above the current size so the file cannot grow, only shrink.
 src/npu.c              2950   dtype-dispatch scaffold, 55% comment; ratchet down as docs are placed
+src/npu/i4/chain.c      910   offline (no-device) chain support. The file sat at exactly 900, so the ONE-LINE ork_npu_init_offline hook put it over. The loop it calls was factored into orki_cpu_chain_i4 (core/buf.c) and shared with the i8 twin, so this is one line and not a third copy. Splitting a 900-line file to absorb one line is not the cheaper seam.

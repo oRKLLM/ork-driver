@@ -28,76 +28,23 @@
 
 /* --- dense K×K double linear algebra (row-major), self-contained ------------------------------------ */
 
-/* Lower Cholesky in place: A (sym PD) -> L lower, A = L·Lᵀ; upper zeroed. 0 ok, -1 not positive-definite. */
-static int gptq_chol_lower(int K, double *A) {
-    for (int i = 0; i < K; i++) {
-        /* row i, strictly-lower: each j is independent once rows < i are complete (it reads row j and the
-         * already-final A[j][j]). The diagonal is computed after, since it consumes this whole row. */
-        #pragma omp parallel for schedule(static) if (i > 256)
-        for (int j = 0; j < i; j++) {
-            const double *ri = A + (size_t)i*K, *rj = A + (size_t)j*K;
-            double s = ri[j];
-            for (int k = 0; k < j; k++) s -= ri[k] * rj[k];
-            A[(size_t)i*K + j] = s / rj[j];
-        }
-        const double *ri = A + (size_t)i*K;
-        double s = ri[i];
-        for (int k = 0; k < i; k++) s -= ri[k] * ri[k];
-        if (s <= 0.0) return -1;                                  /* not positive-definite */
-        A[(size_t)i*K + i] = sqrt(s);
-    }
-    for (int i = 0; i < K; i++) for (int j = i + 1; j < K; j++) A[(size_t)i*K + j] = 0.0;
-    return 0;
-}
+/* --- precision-templated kernels: one source, two instantiations (see gptq_kernels.inc) ------------- */
+#define GQT double
+#define GQ(n) n##_f64
+#include "gptq_kernels.inc"
+#undef GQT
+#undef GQ
 
-/* Given lower L (from gptq_chol_lower), out = (L·Lᵀ)⁻¹ = (L⁻¹)ᵀ·(L⁻¹) (symmetric).
- *
- * Works in the TRANSPOSE of L⁻¹ throughout. The obvious formulation indexes Li[k][c] and Li[k][i] with k
- * varying, i.e. a stride-K column walk on both operands of the O(K³) product — cache-hostile, and it made
- * this the dominant cost of the whole quantizer (measured 92 s for one K=2048 weight). Storing LiT instead
- * makes both inner loops unit-stride and vectorisable, and both phases parallelise cleanly: the forward
- * solves are independent per column, and the product is independent per output row. */
-static int gptq_inv_from_chol(int K, const double *L, double *out) {
-    double *LiT = (double*)calloc((size_t)K*K, sizeof(double));   /* LiT[c][i] = (L⁻¹)[i][c] */
-    if (!LiT) return -2;
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int c = 0; c < K; c++) {                                 /* forward-solve L·Li[:,c] = e_c */
-        double *lic = LiT + (size_t)c*K;
-        lic[c] = 1.0 / L[(size_t)c*K + c];
-        for (int i = c + 1; i < K; i++) {
-            const double *lr = L + (size_t)i*K;
-            double s = 0.0;
-            for (int k = c; k < i; k++) s -= lr[k] * lic[k];      /* both unit-stride */
-            lic[i] = s / lr[i];
-        }
-    }
-    #pragma omp parallel for schedule(dynamic, 8)
-    for (int i = 0; i < K; i++) {                                 /* out[i][j] = Σ_{k≥max(i,j)} LiT[i][k]·LiT[j][k] */
-        const double *ri = LiT + (size_t)i*K;
-        double *orow = out + (size_t)i*K;
-        for (int j = 0; j < K; j++) {
-            const double *rj = LiT + (size_t)j*K;
-            const int k0 = (i > j ? i : j);
-            double s = 0.0;
-            for (int k = k0; k < K; k++) s += ri[k] * rj[k];      /* both unit-stride */
-            orow[j] = s;
-        }
-    }
-    free(LiT);
-    return 0;
-}
+#define GQT float
+#define GQ(n) n##_f32
+#include "gptq_kernels.inc"
+#undef GQT
+#undef GQ
 
-/* Upper Cholesky: A (sym PD) -> U upper with A = Uᵀ·U; lower zeroed. U is exactly the TRANSPOSE of the
- * lower factor — A = L·Lᵀ = (Lᵀ)ᵀ·(Lᵀ), and the Cholesky factor with positive diagonal is unique — so this
- * reuses the lower routine and transposes. The hand-written upper variant this replaces indexed
- * A[k*K+i]*A[k*K+j], i.e. TWO stride-K column walks in its innermost loop, and was the dominant cost of the
- * quantizer once the inverse product had been fixed. 0 ok, -1 not PD. */
-static int gptq_chol_upper(int K, double *A) {
-    if (gptq_chol_lower(K, A) != 0) return -1;
-    for (int i = 0; i < K; i++)
-        for (int j = i + 1; j < K; j++) { A[(size_t)i*K + j] = A[(size_t)j*K + i]; A[(size_t)j*K + i] = 0.0; }
-    return 0;
-}
+/* The fp64 names the rest of this file uses. */
+#define gptq_chol_lower    chol_lower_f64
+#define gptq_inv_from_chol inv_from_chol_f64
+#define gptq_chol_upper    chol_upper_f64
 
 /* GPTQ int4 quant. W:[N(out)×K(in)] fp32 (W[n*K+k]); H:[K×K] calibration Hessian = XᵀX (destroyed);
  * group: int4 group size along K (<=0 => per-row); codes:[N×K] int8 [-8,7]; scales:[N×ceil(K/group)] fp32
@@ -131,9 +78,37 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
      * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
     const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
 
-    if (gptq_chol_lower(K, Hd) != 0)      { free(Hd); free(Wd); free(Hin); return -3; }  /* Hd -> L */
-    if (gptq_inv_from_chol(K, Hd, Hin)!=0){ free(Hd); free(Wd); free(Hin); return -2; }  /* Hin = H⁻¹ */
-    if (gptq_chol_upper(K, Hin) != 0)     { free(Hd); free(Wd); free(Hin); return -3; }  /* Hin -> U upper */
+    /* WORKING PRECISION for the three O(K^3) factorizations — ~20:1 of this function's arithmetic, so
+     * this is where fp32 would pay: half the memory traffic and twice the NEON lanes. GATED OFF by
+     * default (ORK_GPTQ_FP32=1 to try it) because GPTQ inverts a Hessian that is near-singular BY
+     * CONSTRUCTION — `damp` exists precisely to keep it invertible — and fp32 has ~7 decimal digits
+     * against fp64's ~16. Losing conditioning here does not fail loudly; it silently degrades the error
+     * feedback, which is the whole point of GPTQ.
+     *
+     * MEASURED 2026-08-22 (qwen3.5-0.8B, identical calibration + tokens, fp32 vs fp64 packs built on the
+     * same host with these same kernels): fp64 PPL 17.227, fp32 PPL 18.473 — fp32 costs +7.2%, which is
+     * 35x the screen's own fidelity (~0.2%). It gives back a quarter of what activation+weight clipping
+     * bought (22.82 -> 17.33) to save 0.4 min on a 1.2 min pack. STAYS OFF. It did not fail loudly — 102
+     * weights, 0 failures, a valid pack of exactly the right size — it just quantized worse, which is why
+     * this was gated on a PPL number rather than adopted on a speed number. Do not re-enable without
+     * re-measuring; the answer is not close.
+     * The SWEEP below stays fp64 either way: it is the smaller cost and it accumulates across columns. */
+    if (getenv("ORK_GPTQ_FP32")) {
+        float *Hf = (float*)malloc((size_t)K*K*sizeof(float));
+        float *Hif = (float*)malloc((size_t)K*K*sizeof(float));
+        if (!Hf || !Hif) { free(Hf); free(Hif); free(Hd); free(Wd); free(Hin); return -2; }
+        for (size_t i = 0; i < (size_t)K*K; i++) Hf[i] = (float)Hd[i];
+        int rc = chol_lower_f32(K, Hf);
+        if (!rc) rc = inv_from_chol_f32(K, Hf, Hif);
+        if (!rc) rc = chol_upper_f32(K, Hif);
+        if (rc) { free(Hf); free(Hif); free(Hd); free(Wd); free(Hin); return rc == -2 ? -2 : -3; }
+        for (size_t i = 0; i < (size_t)K*K; i++) Hin[i] = (double)Hif[i];
+        free(Hf); free(Hif);
+    } else {
+        if (gptq_chol_lower(K, Hd) != 0)      { free(Hd); free(Wd); free(Hin); return -3; }  /* Hd -> L */
+        if (gptq_inv_from_chol(K, Hd, Hin)!=0){ free(Hd); free(Wd); free(Hin); return -2; }  /* Hin = H⁻¹ */
+        if (gptq_chol_upper(K, Hin) != 0)     { free(Hd); free(Wd); free(Hin); return -3; }  /* Hin -> U upper */
+    }
 
     for (int j = 0; j < K; j++) {
         const int g = j / G;

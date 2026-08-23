@@ -46,3 +46,27 @@ Without it two sessions can both pass the check and then collide.
 
 Origin: written by a parallel session as `/tmp/npu_guard.sh`; landed here so it survives a reboot and every
 session gates on the same check. The lock wrapper was added on top; the detection logic is unchanged.
+
+## `ppl_screen.sh` — two-tier perplexity comparison (board-side)
+
+Quantization work needs a fast comparator far more often than it needs a publishable number. A full-text
+PPL run is ~15 min per arm here, so a 2x2 experiment costs an hour — and an hour-long loop is one you stop
+running. This splits the question in two:
+
+| tier | config | cost | use |
+|---|---|---|---|
+| `SCREEN` (default) | 1 window x 256 tok | ~30 s/arm | the iteration loop: rank changes, catch breakage |
+| `--full` | whole text, 512-tok windows | ~15 min/arm | the release-candidate gate |
+
+```sh
+sudo tools/util/ppl_screen.sh ~/model.gguf ~/ppl_text.txt fp64=~/a.orkpack fp32=~/b.orkpack
+sudo tools/util/ppl_screen.sh --full ~/model.gguf ~/ppl_text.txt cand=~/rc.orkpack
+```
+
+**Read the screen correctly.** All arms score the identical token sequence with deterministic models, so the
+PAIRED difference between arms is exact — no sampling noise between them. What a 255-token run cannot tell
+you is whether that difference GENERALISES to the full text. So: screen to rank and to catch breakage,
+`--full` before you change a default or quote a number. A screen result is a reason to keep going, never a
+release claim.
+
+Runs one arm at a time under `npu_guard.sh` (the NPU is single-stream and the board is shared).

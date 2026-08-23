@@ -45,6 +45,14 @@ void orki_i8_tile_range(int lo,int hi,void *a){
 }
 
 ork_w *ork_i8_mm_pack(ork_npu *c,int K,int N,const int8_t *B){
+    if(c && c->fd<0){                       /* OFFLINE — see ork_i4_mm_pack; ork_i8_w_dump_cpu is the tiler here */
+        ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+        w->cpu_codes=malloc((size_t)K*N);
+        if(!w->cpu_codes){ free(w); return NULL; }
+        memcpy(w->cpu_codes,B,(size_t)K*N);
+        w->K=K; w->N=N; w->dtype=DT_I8; w->owns=1; w->Sk=1; w->Sn=1; w->off_ctx=c;
+        return w;
+    }
     if(c && c->daemon){ uint64_t id=orkd_pack_i8(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I8; w->domain=ork_dom(c->pack_domain); return w; }   /* Path B: pack resident in the daemon (remember the domain so runs carry it) */
     return orki_pack(c,K,N,B,DT_I8);  }
 

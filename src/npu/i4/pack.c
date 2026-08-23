@@ -250,6 +250,18 @@ static void tile_i4_Aslice_mm(uint8_t*dst,const int8_t*A,int M,int K,int k0,int 
 }
 
 ork_w *ork_i4_mm_pack(ork_npu *c,int K,int N,const int8_t *B){
+    /* OFFLINE: no device, so there is nothing to tile INTO. Keep the raw codes; ork_i4_mm_run does an exact
+     * CPU GEMM on them and ork_w_dump tiles them with ork_i4_w_dump_cpu, which test_i4_dump_cpu asserts is
+     * byte-identical to this function's own output. So an offline pack yields the same .orkpack bytes. */
+    if(c && c->fd<0){
+        if(K%32||N%64) return NULL;
+        ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+        w->cpu_codes=malloc((size_t)K*N);
+        if(!w->cpu_codes){ free(w); return NULL; }
+        memcpy(w->cpu_codes,B,(size_t)K*N);
+        w->K=K; w->N=N; w->dtype=DT_I4; w->owns=1; w->Sk=1; w->Sn=1; w->off_ctx=c;
+        return w;
+    }
     if(c && c->daemon){ if(K%32||N%64) return NULL; uint64_t id=orkd_pack_i4(c->daemon,K,N,B); if(!id) return NULL; ork_w *w=calloc(1,sizeof *w); if(!w) return NULL; w->is_orkd=1; w->orkd_id=id; w->K=K; w->N=N; w->dtype=DT_I4; return w; }   /* Path B: int4 pack in the daemon */
     if(K%32||N%64) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;  /* wide N-slices ≤ nmax */

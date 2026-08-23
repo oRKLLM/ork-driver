@@ -54,6 +54,7 @@ int orki_i8_chain_fullk_mcap(ork_npu *c, int K) {
 }
 
 int ork_i8_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
+    if(c && c->fd<0) return orki_cpu_chain_i8(S,tasks);   /* OFFLINE: no device to chain over */
     if (c && c->daemon){   /* Path B: fused chain on the daemon (all task weights are daemon-resident is_orkd) */
         if (S < 1) return -2;
         orkd_chain_task_c *ct = malloc((size_t)S * sizeof *ct);

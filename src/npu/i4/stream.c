@@ -116,6 +116,7 @@ static void *stream_worker_i4(void *vp) {
 }
 
 int ork_i4_mm_run_stream(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+    if(c && c->fd<0) return orki_cpu_chain_i4(S,tasks);   /* OFFLINE: no device to chain over */
     if (!c || S < 1 || !tasks) return -2;
     /* per-core scratch lives in the active domain; stream tasks share one domain (tasks[0].w) */
     if (tasks[0].w && (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c, tasks[0].w->domain);

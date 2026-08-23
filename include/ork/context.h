@@ -61,6 +61,11 @@ int          ork_npu_busy(ork_npu *ctx);
  *         open /dev/dri/cardN (the process needs access to the DRM render node).
  */
 ork_npu     *ork_npu_init(void);
+/* Offline context: SoC caps only, NO device (fd = -1). Valid ONLY for the CPU-side surfaces — the
+ * *_w_dump_cpu weight tilers — so an .orkpack can be built on any machine instead of on the board.
+ * soc_id must be given explicitly ("rk3588"); there is no device tree to detect from. Any op that
+ * needs hardware fails rather than running. Free with ork_npu_free as usual. */
+ork_npu     *ork_npu_init_offline(const char *soc_id);
 /**
  * @brief Open an orkd CLIENT context: connect (auto-spawn) the orkd daemon and route every ork_mm_* through
  *        it. The daemon owns the single-stream NPU and serializes all submits — the safe way to share it

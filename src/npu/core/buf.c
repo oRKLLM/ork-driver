@@ -359,3 +359,35 @@ int ork_dmabuf_alloc(size_t size, void **ptr){
 }
 
 void ork_dmabuf_seal(int dbuf){ if(dbuf>=0) orki_dmabuf_sync(dbuf,DMA_BUF_SYNC_END|DMA_BUF_SYNC_WRITE); }
+
+/* See the declaration in npu/internal.h. B is [K][N] row-major raw codes (int4 values live in int8 slots,
+ * so one loop serves both dtypes). Parallel over M; each row writes a disjoint slice of C. */
+void orki_cpu_gemm_i32(int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
+    #pragma omp parallel for schedule(static) if(M>1)
+    for(int m=0;m<M;m++){
+        const int8_t *arow=A+(size_t)m*K;
+        int32_t *crow=C+(size_t)m*N;
+        memset(crow,0,(size_t)N*sizeof *crow);
+        for(int k=0;k<K;k++){
+            const int32_t a=arow[k];
+            if(!a) continue;
+            const int8_t *wrow=B+(size_t)k*N;
+            for(int n=0;n<N;n++) crow[n]+=a*(int32_t)wrow[n];
+        }
+    }
+}
+
+/* OFFLINE chain/stream: the chain and stream entry points exist to amortize SUBMITS across several
+ * matmuls. With no device there is nothing to amortize, so run each task exactly on the CPU. Factored
+ * here rather than repeated at each entry point — three copies of the same loop is how the precision
+ * modules drifted apart in the first place. Returns -1 if any task is not an offline weight. */
+int orki_cpu_chain_i4(int S, const ork_mm_task_i4 *t){
+    for(int i=0;i<S;i++){ const ork_w *w=t[i].w; if(!w||!w->cpu_codes) return -1;
+        orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }
+    return 0;
+}
+int orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t){
+    for(int i=0;i<S;i++){ const ork_w *w=t[i].w; if(!w||!w->cpu_codes) return -1;
+        orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }
+    return 0;
+}

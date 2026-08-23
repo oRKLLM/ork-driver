@@ -736,7 +736,14 @@ ork_w *ork_f16_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
  * optimization) into `out` in tile order — the on-disk form for pre-packed (.orkpack) weights. Each
  * tile is its page-padded buffer size, so it round-trips through ork_i8_mm_load. Pass out=NULL to size. */
 size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
-    if(!w || !w->Bb) return 0;
+    if(!w) return 0;
+    /* OFFLINE weight: no Bb was ever allocated. Tile the raw codes with the CPU twin, which is asserted
+     * byte-identical to pack+dump (test_i4_dump_cpu) — so a caller persisting these bytes gets the same
+     * .orkpack it would have got from the NPU. */
+    if(w->cpu_codes)
+        return (w->dtype==DT_I4) ? ork_i4_w_dump_cpu(w->off_ctx, w->K, w->N, w->cpu_codes, out, cap)
+                                 : ork_i8_w_dump_cpu(w->off_ctx, w->K, w->N, w->cpu_codes, out, cap);
+    if(!w->Bb) return 0;
     size_t off=0, nb=(size_t)w->Sk*w->Sn;
     for(size_t i=0;i<nb;i++){ const struct buf *b=&w->Bb[i]; if(!b->cpu) continue;
         if(out){ if(off+b->size>cap) return 0; memcpy((char*)out+off,b->cpu,b->size); }
@@ -1116,6 +1123,7 @@ void ork_w_free(ork_w *w){ if(!w)return; free(w->Bb); free(w->Bf); free(w->Bi4);
 void ork_mm_free(ork_npu *c, ork_w *w){
     if(!w) return;
     if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w->fa_lut); free(w); return; }   /* Path B: free the daemon-resident weight */
+    if(w->cpu_codes){ free(w->cpu_codes); free(w->bscale); free(w->fa_lut); free(w); return; }   /* OFFLINE weight: plain heap, no device buffers */
     if(c) ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before a per-domain bdestroy switches domains ("failed to destroy memory" + switch-timeout cascade) */
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
@@ -1142,6 +1150,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
  * to budget the 4 GiB IOVA window and decide when to evict. */
 size_t ork_w_bytes(const ork_w *w){
     if(!w) return 0; size_t t=0;
+    if(w->cpu_codes) return (size_t)w->K*w->N;   /* OFFLINE: heap codes, no DMA residency to account for */
     if(w->own_bufs) for(int i=0;i<w->n_own_bufs;i++) t+=w->own_bufs[i].size;   /* chunked import: real chunk allocs */
     else if(w->Bb) for(size_t i=0;i<(size_t)w->Sk*w->Sn;i++) t+=w->Bb[i].size;
     if(w->Bf) for(int i=0;i<w->Sn;i++) t+=w->Bf[i].size;

@@ -132,7 +132,11 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * cache of per-(M,N,domain) C/RC/TK+tiles (q's N=3584 and k/v's N=512 coexist without thrash). */
     struct buf fold_A; int fold_A_M, fold_A_dom;
     struct fold_scratch *fold_scr[8]; int fold_scr_n; };
-struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
+struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id;
+    /* OFFLINE weight (ork_npu_init_offline): no DMA buffers exist, so the raw [K*N] codes are held here and
+     * pack/run/dump work on the CPU. off_ctx is the offline context the weight was packed with — ork_w_dump
+     * needs it for the SoC caps the tiler reads, and it takes no ork_npu argument. */
+    int8_t *cpu_codes; struct ork_npu *off_ctx; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
     struct buf Bbc; int Bbc_valid; /* (A) fp16 CONTIGUOUS weight: all Sk K-slice Bb[ks] concatenated into ONE buffer (built lazily on the first colsplit; DEFAULT-ON for Sn==1, disabled by ORK_F16_NO_CONTIG) so the HW chain can walk slice->slice WITHOUT crossing a dma-buf boundary (the cross-buffer CDMA-wild) — enables one chained submit/core like int8. Sn==1 only. */
     struct buf *Bbc_ns; int Bbc_ns_valid; /* (A-wideN) fp16 Sn>1 PER-N-SLICE CONTIGUOUS weights: Sn buffers, Bbc_ns[ns] = that slice's Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated. Each slice is served as a standalone Sn==1 CONTIG colsplit (no cross-buffer wild); built once, resident (reclaimed at ctx teardown like Bbc). */
     struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */
@@ -267,6 +271,13 @@ enum { KWP_NONE, KWP_MC, KWP_SC, KWP_NTI, KWP_NTL, KWP_F16 };
 enum { RC_NEVER, RC_NOTKW, RC_I8ENTRY, RC_NOTLIVE, RC_NOTLIVE_NOTKW, RC_ALWAYS, RC_SDPKW };
 enum { TG_NONE=0, TG_SCALAR=1, TG_PERCORE=2, TG_BOTH=3 };
 enum { WC_NONE, WC_NOTKW, WC_NOTLIVE_NOTKW, WC_ALWAYS, WC_NT, WC_NT_NOTKW };
+
+/* Exact CPU stand-in for the NPU MAC on an OFFLINE weight. The accumulator is int32 and integer addition
+ * is associative, so this is BIT-EXACT with the hardware rather than an approximation — which is what makes
+ * an offline-built .orkpack trustworthy. Declared here because both i4 and i8 run paths use it. */
+void orki_cpu_gemm_i32(int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *C);
+int  orki_cpu_chain_i4(int S, const ork_mm_task_i4 *t);   /* offline chain/stream: run each task exactly */
+int  orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t);
 
 /* ---- dtype predicates ---- */
 #define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)

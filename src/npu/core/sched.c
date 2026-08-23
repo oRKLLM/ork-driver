@@ -82,6 +82,34 @@ ork_npu *ork_npu_init(void){
     return c;
 }
 
+/* ork_npu_init_offline — a context with SoC caps and NO device.
+ *
+ * WHY. Building a native-W4A4 .orkpack is pure CPU work: dequant, rotate, quantize, and TILE. The tiling
+ * was the only step that used to need hardware, and ork_i4_w_dump_cpu removed that (it reads exactly one
+ * thing from the context — c->soc->nmax — and is asserted byte-identical to the NPU's own pack+dump by
+ * test_i4_dump_cpu). What remained was ork_npu_init itself: it opens /dev/dri/cardN and fails on any
+ * machine that is not the board, so a pack build was pinned to the board for no computational reason.
+ * That matters because packing is the SLOW half of every quantization experiment, it is CPU-bound, and
+ * the board is both the weakest machine available and a single shared, wedge-prone resource.
+ *
+ * WHAT YOU GET. Only the CPU-side surfaces: the *_w_dump_cpu tilers and anything else that reads caps
+ * rather than the device. fd is -1, so every ioctl path fails cleanly rather than corrupting state —
+ * there is no partially-live device to get wrong. Nothing is warmed, no buffers exist, no signal handler
+ * is installed (there are no IOMMU mappings to strand).
+ *
+ * The SoC must be named explicitly: there is no device tree to detect from, and silently defaulting would
+ * produce a pack tiled for the wrong nmax — which is exactly the class of error test_i4_dump_cpu exists
+ * to catch, and it would slip through unnoticed on a machine that cannot run that test. */
+ork_npu *ork_npu_init_offline(const char *soc_id){
+    const struct ork_soc *soc=ork_soc_by_id(soc_id);
+    if(!soc){ fprintf(stderr,"[ork] ERROR: ork_npu_init_offline: unknown SoC id \"%s\"\n", soc_id?soc_id:"(null)"); return NULL; }
+    ork_npu *c=calloc(1,sizeof *c);
+    if(!c) return NULL;
+    c->fd=-1; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
+    pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
+    return c;   /* deliberately NOT orki_npu_ctx: an offline context must never become the implicit device */
+}
+
 int ork_all_cores_mask(cpu_set_t *s){
     long n=sysconf(_SC_NPROCESSORS_ONLN); if(n<1) return 0;
     CPU_ZERO(s); for(long i=0;i<n && i<CPU_SETSIZE;i++) CPU_SET((int)i,s);

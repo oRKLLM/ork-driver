@@ -147,6 +147,7 @@ void ork_i4a8_slice_direct_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kin
 }
 
 int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
+    if(c && c->fd<0 && w && w->cpu_codes){ orki_cpu_gemm_i32(M,w->K,w->N,A,w->cpu_codes,C); return 0; }   /* OFFLINE: exact CPU MAC */
     if(w && w->is_orkd){   /* Path B: int4 run on the daemon — ring transport if attached, else socket */
         orkd_set_op_domain(c->daemon, (uint32_t)w->domain);   /* v2: carry this weight's domain with the op */
         if(c && c->daemon && orkd_has_ring(c->daemon)){ int r=orkd_ring_run(c->daemon,w->orkd_id,M,w->K,w->N,ORKD_DT_I4,A,C); if(r!=-2) return r; }

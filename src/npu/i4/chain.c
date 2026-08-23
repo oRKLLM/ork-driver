@@ -83,6 +83,7 @@ static int orki_i4_hcap(int K){
 }
 
 int ork_i4_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
+    if(c && c->fd<0) return orki_cpu_chain_i4(S,tasks);   /* OFFLINE: no device to chain over */
     if (!c) return -1;
     if (S < 1 || S > 1024) return -2;
     if (!tasks) return -2;

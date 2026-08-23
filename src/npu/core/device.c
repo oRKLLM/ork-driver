@@ -237,6 +237,7 @@ ork_npu *ork_npu_init_orkd(void){
 }
 
 void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->daemon); free(c->cres); free(c); return; }   /* Path B: client mode — disconnect from orkd, no local NPU teardown */
+    if(c->fd < 0){ pthread_mutex_destroy(&c->pmu); pthread_cond_destroy(&c->pgo); pthread_cond_destroy(&c->pdn); free(c); return; }   /* offline context (ork_npu_init_offline): no device, no buffers, nothing to tear down */
     int fd=c->fd; ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before teardown's per-domain MEM_DESTROYs switch domains */
     ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
     if(getenv("ORK_DOM_PROFILE") && c->dom_sw_n){   /* domain-swap window telemetry */

@@ -21,5 +21,6 @@ struct ork_soc {
 
 /* Parse /proc/device-tree/compatible and return the matching caps, or NULL if unknown. */
 const struct ork_soc *ork_soc_detect(void);
+const struct ork_soc *ork_soc_by_id(const char *id);   /* by name — for offline (no-device) contexts */
 
 #endif

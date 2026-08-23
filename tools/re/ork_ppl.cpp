@@ -35,17 +35,24 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 int main(int argc, char** argv){
     if (argc < 3){
-        fprintf(stderr,"usage: %s <model.gguf> <text> [window=512] [ubatch=512]\n"
+        fprintf(stderr,"usage: %s <model.gguf> <text> [window=512] [ubatch=512] [maxwin=0]\n"
                        "  window : tokens per scored chunk (KV cleared between chunks)\n"
-                       "  ubatch : PIN THIS. large M wedges the NPU; 512 is the validated default\n", argv[0]);
+                       "  ubatch : PIN THIS. large M wedges the NPU; 512 is the validated default\n"
+                       "  maxwin : cap on scored windows (0 = whole text). BOUND THIS for A/B runs — an\n"
+                       "           unbounded run on a long text outlives its `timeout`, and a reaped\n"
+                       "           ork_ppl can leave a zombie holding the NPU (costs a reboot).\n", argv[0]);
         return 2;
     }
     const char* model_path = argv[1];
     int W  = argc>3 ? atoi(argv[3]) : 512;
     int UB = argc>4 ? atoi(argv[4]) : 512;
+    int MAXW = argc>5 ? atoi(argv[5]) : 0;
     if (W  < 2)  { fprintf(stderr,"window must be >= 2 (position 0 is unscorable)\n"); return 2; }
     if (UB < 1)  UB = W;
     if (UB > W)  UB = W;
@@ -89,7 +96,8 @@ int main(int argc, char** argv){
     if(nt<=0){ fprintf(stderr,"tokenize failed (%d)\n",nt); return 1; }
     toks.resize(nt);
     if (nt < W){ fprintf(stderr,"text is %d tokens, shorter than window %d — lower the window\n", nt, W); return 2; }
-    const int nwin = nt / W;
+    int nwin = nt / W;
+    if (MAXW > 0 && nwin > MAXW) nwin = MAXW;   // paired A/B needs identical, bounded work per arm
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx    = W + 8;
@@ -101,8 +109,8 @@ int main(int argc, char** argv){
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 
-    fprintf(stderr,"[ork_ppl] %d tokens, %d window(s) of %d, ubatch=%d, vocab=%d (logits %.0f MiB/window)\n",
-            nt, nwin, W, UB, n_vocab, (double)W*n_vocab*4/1048576.0);
+    fprintf(stderr,"[ork_ppl] %d tokens, %d window(s) of %d%s, ubatch=%d, vocab=%d (logits %.0f MiB/window)\n",
+            nt, nwin, W, (MAXW > 0 ? " [capped]" : ""), UB, n_vocab, (double)W*n_vocab*4/1048576.0);
 
     llama_batch b = llama_batch_init(W, 0, 1);
     double nll = 0.0; long scored = 0; int64_t t0 = llama_time_us();
@@ -122,18 +130,26 @@ int main(int argc, char** argv){
             fprintf(stderr,"[ork_ppl] decode FAILED on window %d/%d (W=%d ubatch=%d)\n", w+1, nwin, W, UB);
             llama_batch_free(b); llama_free(ctx); llama_model_free(model); llama_backend_free(); return 3;
         }
-        for (int i = 0; i + 1 < W; ++i){
+        /* Scoring is ~250k exp() per position and is a third of a run's wall clock. Positions are
+         * independent, so fan them out; the reduction keeps the sum deterministic ENOUGH for A/B (each
+         * position's own log-sum-exp is computed identically, only the outer accumulation reorders, and
+         * that is fp-associativity noise many orders below the differences under test). */
+        double wnll = 0.0; int wscored = 0; int bad = -1;
+        #pragma omp parallel for schedule(static) reduction(+:wnll,wscored)
+        for (int i = 0; i < W - 1; ++i){
             const float* lg = llama_get_logits_ith(ctx, i);
-            if (!lg){ fprintf(stderr,"[ork_ppl] no logits at %d — batch.logits[i] not honoured?\n", i); return 3; }
+            if (!lg){ bad = i; continue; }
             /* log_softmax in double: subtract the max before exp so a 250k vocab cannot overflow, and
              * the tail still contributes (a float accumulator loses it). */
             double mx = lg[0];
             for (int v = 1; v < n_vocab; ++v) if (lg[v] > mx) mx = lg[v];
             double sum = 0.0;
             for (int v = 0; v < n_vocab; ++v) sum += exp((double)lg[v] - mx);
-            nll += (mx + log(sum)) - (double)lg[chunk[i+1]];   // -log p(next)
-            ++scored;
+            wnll += (mx + log(sum)) - (double)lg[chunk[i+1]];   // -log p(next)
+            ++wscored;
         }
+        if (bad >= 0){ fprintf(stderr,"[ork_ppl] no logits at %d — batch.logits[i] not honoured?\n", bad); return 3; }
+        nll += wnll; scored += wscored;
         if (nwin > 1) fprintf(stderr,"[ork_ppl] window %d/%d  running PPL = %.4f\n", w+1, nwin, exp(nll/scored));
     }
     double secs = (llama_time_us()-t0)/1e6;
