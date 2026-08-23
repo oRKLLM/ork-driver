@@ -200,15 +200,16 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
     // single-shot quantize-on-first-use pack path cannot express yet. Raise with care — a large prefill is the
     // wide-colsplit submit hazard AGENTS warns about.
     int nb = nt<4 ? nt : 4;
-    int gptq_nb = 1;
     if (getenv("ORK_GPTQ")) {
+        /* Per-batch M is a SUBMIT-HAZARD bound (a large prefill is the wide-colsplit trap), not a tuning
+         * preference — so it has a fixed safe default and ORK_GPTQ_CALIB exists only to probe that hazard.
+         * The batch COUNT is not configurable at all: it is derived below from the model's own shapes,
+         * because "enough calibration" means rank(H) >= K and K is a property of the weights. */
         int cal = getenv("ORK_GPTQ_CALIB") ? atoi(getenv("ORK_GPTQ_CALIB")) : 512;
         if (cal < 1) cal = 1;
         nb = nt < cal ? nt : cal;
-        gptq_nb = getenv("ORK_GPTQ_NBATCH") ? atoi(getenv("ORK_GPTQ_NBATCH")) : 4;
-        if (gptq_nb < 1) gptq_nb = 1;
-        fprintf(stderr, "[ork_bench] ORK_GPTQ two-phase: %d calibration batches of M=%d "
-                        "(rank(H) <= %d total rows)\n", gptq_nb, nb, gptq_nb*nb);
+        fprintf(stderr, "[ork_bench] ORK_GPTQ two-phase: calibration batches of M=%d, count derived from "
+                        "the largest weight K after registration\n", nb);
     }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = nb+8; cp.n_batch = nb; cp.n_ubatch = nb; cp.n_threads = 4; cp.n_threads_batch = 4;
@@ -222,15 +223,22 @@ static int build_orkpack(const char* model_path, const char* ptxt, size_t rd){
      * an independent sample, and we walk forward through the text rather than repeating the same tokens —
      * repeating them would add samples without adding rank, which is the whole point of this phase. */
     if (rc == 0 && getenv("ORK_GPTQ")) {
-        for (int r = 1; r < gptq_nb; r++) {
-            int off = r * nb;
-            if (off + nb > nt) { fprintf(stderr,
-                "[ork_bench] ORK_GPTQ: calibration text exhausted after %d/%d batches (%d tokens) — "
-                "use a longer text for more rank\n", r, gptq_nb, nt); break; }
+        /* The first decode registered every weight, so the backend can now say how many rows this model
+         * needs: rank(H) <= rows, and below the largest K the Hessian is singular in the directions GPTQ
+         * would otherwise exploit. Feed DISTINCT windows (KV cleared between, walking forward through the
+         * text) until that threshold is met — repeating tokens would add samples without adding rank. */
+        const int need = ggml_backend_ork_gptq_min_rows();
+        const int want = ((need + nb - 1) / nb) * nb;             // whole batches
+        fprintf(stderr, "[ork_bench] ORK_GPTQ: largest K=%d -> need %d rows (%d batches of %d)\n",
+                need, want, want/nb, nb);
+        if ((long)want > (long)nt) fprintf(stderr,
+            "[ork_bench] ORK_GPTQ: calibration text is only %d tokens but %d rows are needed for full rank — "
+            "GPTQ will degrade toward RTN on the largest weights. Supply a longer text.\n", nt, want);
+        for (int off = nb; off + nb <= nt && ggml_backend_ork_gptq_rows() < (long)want; off += nb) {
             llama_memory_clear(llama_get_memory(ctx), true);
             llama_batch cb = llama_batch_get_one(toks.data() + off, nb);
-            if (llama_decode(ctx, cb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: calib batch %d FAILED\n", r); break; }
-            fprintf(stderr, "[ork_bench] ORK_GPTQ: calibration batch %d/%d done\n", r+1, gptq_nb);
+            if (llama_decode(ctx, cb) != 0) { fprintf(stderr,"[ork_bench] ORK_GPTQ: calib batch at %d FAILED\n", off); break; }
+            fprintf(stderr, "[ork_bench] ORK_GPTQ: %ld/%d calibration rows\n", ggml_backend_ork_gptq_rows(), want);
         }
         ggml_backend_ork_gptq_finalize();        // PHASE 2: quantize with the accumulated H, then persist
     }
