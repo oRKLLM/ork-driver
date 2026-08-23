@@ -175,6 +175,11 @@ size_t       ork_i4a8_w_dump(const ork_w *w, void *out, size_t cap);
  * the rotated-i4a8 tier never loaded. Scales come from the caller (this format carries none). */
 ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n);
 
+/* OFFLINE codes of a CPU-backed weight (NULL when device-resident). For tests that must prove an offline
+ * load recovered exactly the packed values; the un-tilers are index arithmetic and a wrong index still
+ * produces plausible weights. */
+const int8_t *ork_w_codes(const ork_w *w);
+
 ork_w       *ork_i4a8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* Zero-copy IMPORT variant of ork_i4a8_mm_load: resident tiles are dma-bufs the NPU reads in place (PRIME
  * import); the int4 nibbles inflate -> int8 directly into them. Bit-identical to ork_i4a8_mm_load (same

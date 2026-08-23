@@ -120,6 +120,34 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
     struct ork_i4a8_hdr h; memcpy(&h,p,hdr); p+=hdr;
     if(h.magic!=ORK_I4A8_MAGIC || h.version!=ORK_I4A8_VER || h.K!=K || h.N!=N) return NULL;
     if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
+    /* OFFLINE (fd<0): inflate the nibbles to int8 codes on the CPU and stop — no DMA, no tiling. The
+     * container stores channel-major nibbles (Bi4 + nn*(K/2), low nibble for even k), and cpu_codes is
+     * [k*N+n], matching the int4 twin. Its absence was SILENT, not merely unsupported: with no branch the
+     * loader ran on to bcreate(-1), returned NULL, and every DT_I4 weight inline-packed on every no-device
+     * run -- which is what voided a day of offline i4a8 screening. */
+    if(c->fd<0){
+        const float *bsc=(const float*)p; const uint8_t *nibs=(const uint8_t*)(p+sc);
+        int8_t *codes=malloc((size_t)K*N);
+        if(!codes) return NULL;
+        int8_t nf4_lut[16];
+        if(h.quant_kind==ORK_QK_CODEBOOK_NF4) for(int i=0;i<16;i++) nf4_lut[i]=(int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
+        for(int nn=0;nn<N;nn++){ const uint8_t *nb=nibs+(size_t)nn*(K/2);
+            for(int k=0;k<K;k++){ uint8_t ix=(k&1)?(nb[k>>1]>>4):(nb[k>>1]&0xf);
+                codes[(size_t)k*N+nn] = (h.quant_kind==ORK_QK_CODEBOOK_NF4) ? nf4_lut[ix]
+                                                                            : (int8_t)(ix>=8?(int)ix-16:(int)ix); } }
+        ork_w *w=calloc(1,sizeof *w);
+        if(!w){ free(codes); return NULL; }
+        /* CARRY THE SCALES. The caller reads them back with ork_w_bscale() for the DT_I4 tier -- the
+         * container is the only place they live, unlike DT_I8 whose scales sit in the pack index. Leaving
+         * them NULL is not a NULL-check away from working: the caller's `if (bs)` simply skips the assign,
+         * ow.bscale stays empty, and the dequant indexes off the end of it. Segfault, not a wrong number. */
+        w->bscale=malloc(sc);
+        if(!w->bscale){ free(codes); free(w); return NULL; }
+        memcpy(w->bscale,bsc,sc);
+        w->K=K; w->N=N; w->Sk=1; w->Sn=1; w->dtype=DT_I8; w->owns=1; w->cpu_codes=codes; w->off_ctx=c;
+        w->quant_kind=(uint8_t)h.quant_kind;
+        return w;
+    }
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
     w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;

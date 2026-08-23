@@ -163,6 +163,20 @@ size_t ork_i8_w_dump_bf_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
  * the host fill (load is from a disk/RAM blob either way). Same blob format / round-trip as load_i8.
  * Falls through to NULL (caller uses ork_i8_mm_load) if import is unavailable. */
 ork_w *ork_i8_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* OFFLINE (fd<0): no DMA, no device. Un-tile straight to CPU-backed codes, exactly as the int4 twin
+     * does, so a .orkpack can be READ and SCORED on a machine with no NPU. Its absence was not a slow
+     * path but a SILENT one: with no branch here the loader fell through to bcreate(-1), returned NULL,
+     * and every DT_I8 weight quietly inline-packed on every no-device run — which invalidated a day of
+     * offline int8/i4a8 screening before the pack-miss guard made it visible. */
+    if(c && c->fd<0){
+        int8_t *codes=malloc((size_t)K*N);
+        if(!codes) return NULL;
+        if(orki_i8_untile_blob(c,K,N,blob,n,codes)){ free(codes); return NULL; }
+        ork_w *w=calloc(1,sizeof *w);
+        if(!w){ free(codes); return NULL; }
+        w->K=K; w->N=N; w->Sk=1; w->Sn=1; w->dtype=DT_I8; w->owns=1; w->cpu_codes=codes; w->off_ctx=c;
+        return w;
+    }
     if(K%32 || N%32) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
@@ -681,6 +695,26 @@ ork_w_sliced *orki_i8_slice_pack(ork_npu *c, int K, int N, const int8_t *B) {
             w->sub[ki*nnt + ni] = sw; } }
     orki_in_slice_pack = 0;
     free(blk); return w;
+}
+
+/* Un-tile a .orkpack int8 blob back to raw [K][N] codes — the exact inverse of ork_i8_w_dump_cpu's walk
+ * (orki_i8_tile_range: 32x32 blocks, bb[nt*KT*1024 + kt*1024 + nl*32 + kk]), page-padded per tile. FACTORED
+ * for the same reason as the int4 twin: a tiler and un-tiler drifting apart is silent — plausible weights,
+ * a slightly wrong model. `codes` is K*N bytes. */
+int orki_i8_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes){
+    if(!c || !blob || !codes || (K%32) || (N%32)) return -1;
+    int KS=orki_int8_ks(c), NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    const int8_t *src=(const int8_t*)blob; size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32;
+        size_t tsz=orki_pgup((size_t)Kp*Nc);
+        if(off+tsz>n) return -1;
+        const int8_t *bb=src+off;
+        for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+            codes[(size_t)(k0+kt*32+kk)*N+(n0+nt*32+nl)] =
+                bb[(size_t)nt*KT*1024+(size_t)kt*1024+(size_t)nl*32+kk];
+        off+=tsz; }}
+    return (off==n) ? 0 : -1;
 }
 
 size_t ork_i8_w_dump_cpu_st(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){

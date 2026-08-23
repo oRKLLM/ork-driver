@@ -735,6 +735,11 @@ ork_w *ork_f16_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
 /* PERSIST. Serialize a packed weight's resident tile bytes (Bb only; Bf is a regenerable decode-only
  * optimization) into `out` in tile order — the on-disk form for pre-packed (.orkpack) weights. Each
  * tile is its page-padded buffer size, so it round-trips through ork_i8_mm_load. Pass out=NULL to size. */
+/* OFFLINE codes, read-only, or NULL for a device-resident weight. Exists so a test can assert that an
+ * offline load recovered EXACTLY what was packed — the un-tilers are index arithmetic, and index arithmetic
+ * that is subtly wrong still yields plausible weights (see test_offline_load). Not a production accessor. */
+const int8_t *ork_w_codes(const ork_w *w){ return w ? w->cpu_codes : NULL; }
+
 size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
     if(!w) return 0;
     /* OFFLINE weight: no Bb was ever allocated. Tile the raw codes with the CPU twin, which is asserted
