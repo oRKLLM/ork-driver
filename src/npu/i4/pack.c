@@ -317,6 +317,33 @@ size_t ork_i4_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
 }
 
 ork_w *ork_i4_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* OFFLINE: reconstruct the raw [K][N] codes from the tiled blob — the exact inverse of the walk
+     * ork_i4_w_dump_cpu / tile_i4_Bslice perform, written against the same index expression so the two
+     * cannot drift. This is what lets a .orkpack be READ (and so SCORED) on a machine with no NPU; the
+     * device path below rebuilds DMA tiles instead and is untouched. Nibbles are sign-extended back to
+     * [-8,7]: the tiler stored only the low 4 bits. */
+    if(c && c->fd<0){
+        int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+        if(K%32||N%64) return NULL;
+        ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+        w->cpu_codes=calloc((size_t)K*N,1);
+        if(!w->cpu_codes){ free(w); return NULL; }
+        const uint8_t *src=(const uint8_t*)blob; size_t off=0;
+        for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+          for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS;
+            size_t tsz=orki_pgup((size_t)Kp*Nc/2);
+            if(off+tsz>n){ free(w->cpu_codes); free(w); return NULL; }
+            const uint8_t *bb=src+off;
+            int KT=Kp/32, NB=Nc/64;
+            for(int nb=0;nb<NB;nb++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<64;nl++)for(int kk=0;kk<32;kk++){
+                size_t idx=(((size_t)nb*KT+kt)*64+nl)*32+kk;
+                int nib=(bb[idx/2]>>((idx&1)?4:0))&0xf;
+                w->cpu_codes[(size_t)(k0+kt*32+kk)*N+(n0+nb*64+nl)]=(int8_t)(nib>=8?nib-16:nib);
+            }
+            off+=tsz; }}
+        w->K=K; w->N=N; w->dtype=DT_I4; w->owns=1; w->Sk=1; w->Sn=1; w->off_ctx=c;
+        return w;
+    }
     if(K%32||N%64) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
@@ -454,6 +481,14 @@ ork_w *ork_i4_mm_load_import(ork_npu *c,int K,int N,const void *blob,size_t n){
 }
 
 ork_w *ork_i4_mm_pack_grouped(ork_npu *c,int K,int N,const int8_t *B,int G){
+    if(c && c->fd<0){                       /* OFFLINE — keep raw codes + the group size; see ork_i4_mm_pack */
+        ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
+        w->cpu_codes=malloc((size_t)K*N);
+        if(!w->cpu_codes){ free(w); return NULL; }
+        memcpy(w->cpu_codes,B,(size_t)K*N);
+        w->K=K; w->N=N; w->dtype=DT_I4; w->owns=1; w->Sk=1; w->Sn=1; w->gsize=G; w->off_ctx=c;
+        return w;
+    }
     if(K%32||N%64||G%32||K%G||G>ORK_I4_KS) return NULL;
     int NMAX=c->soc->nmax, Sk=K/G, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_I4;w->gsize=G; w->domain=ork_dom(c->pack_domain);

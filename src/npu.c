@@ -1148,6 +1148,13 @@ void ork_mm_free(ork_npu *c, ork_w *w){
 }
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
+int ork_w_set_group(ork_w *w, int G){
+    if(!w || w->dtype!=DT_I4) return -1;
+    if(G>0 && (w->K % G)) return -1;      /* K must divide into whole groups */
+    w->gsize=G;
+    return 0;
+}
+
 size_t ork_w_bytes(const ork_w *w){
     if(!w) return 0; size_t t=0;
     if(w->cpu_codes) return (size_t)w->K*w->N;   /* OFFLINE: heap codes, no DMA residency to account for */

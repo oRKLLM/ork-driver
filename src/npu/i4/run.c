@@ -191,9 +191,83 @@ int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     return ORK_RC_WEDGE_PRONE;
 }
 
+static inline float *Cf_out_row(float *C,int m,int N){ return C + (size_t)m*N; }
 int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
+    /* OFFLINE: the exact per-group accumulate the doorbell drain performs, on the CPU. Per-group scales
+     * cannot factor out of the K-sum, so each group's int32 partial is scaled as it is produced and
+     * summed in fp32 — same arithmetic, no device. aScale[m*Sk+g], bScale[g*N+n] (the shipped layouts). */
+    if(c && c->fd<0 && w && w->cpu_codes && w->gsize>0){
+        const int G=w->gsize, Sk=w->K/G, K=w->K, N=w->N;
+        #pragma omp parallel for schedule(static) if(M>1)
+        for(int m=0;m<M;m++){
+            float *crow=C+(size_t)m*N;
+            for(int n=0;n<N;n++) crow[n]=0.0f;
+            int32_t *acc=malloc((size_t)N*sizeof *acc);
+            if(!acc) continue;
+            for(int g=0;g<Sk;g++){
+                /* int32 WITHIN the group, exactly as the MAC does, then ONE fp32 scale per (row,group,
+                 * channel) — not a per-element float multiply, which would be both slower and a
+                 * different rounding than the hardware. The group product is a [1 x G].[G x N] slice of
+                 * contiguous cpu_codes rows, so it reuses the NEON kernel rather than a second scalar
+                 * copy of the same loop (M=1 there, so its own omp is inert — the parallelism is the
+                 * per-row loop out here). */
+                const float as=aScale[(size_t)m*Sk+g];
+                const float *bs=bScale+(size_t)g*N;
+                orki_cpu_gemm_i32(1,G,N,A+(size_t)m*K+(size_t)g*G,w->cpu_codes+(size_t)g*G*N,acc);
+                for(int n=0;n<N;n++) crow[n]+=(float)acc[n]*as*bs[n];
+            }
+            free(acc);
+        }
+        return 0;
+    }
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(orki_check_overlap("ork_i4_mm_run_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
+    /* BCHAIN FAST PATH (M>=2). The row-decomposed doorbell below predates the int4 BCHAIN work and never
+     * adopted it: it emits M*Sn*Sk single-row programs, overflows the per-core regcmd budget, and falls into
+     * recursive M-chunking — measured 286x a per-channel matmul at M=128,K=3584,G=128.
+     *
+     * But a K-GROUP is structurally an EXPERT: a [G x N] int4 weight with Sk=1, Sn=1, which is exactly what
+     * ork_i4_mm_run's BCHAIN gate wants. Only the FUSED grouped weight (Sk=K/G) fails that gate. So build
+     * zero-copy VIEWS over the per-group tiles this weight already holds (w->Bb[g]) and hand the whole set
+     * to the multi-expert BCHAIN doorbell — one submit, H-row native batch. Measured 23.6x, a 12x win over
+     * the path below, with no new kernels.
+     *
+     * Falls through to the original path on any refusal, so this can only be faster, never a new failure
+     * mode. ORK_I4_GRP_NOBCHAIN=1 forces the old path for A/B. Sn>1 is left to the old path: the views would
+     * need one per (ns,g) and the drain would have to stitch N-tiles, which is not what this shape needs. */
+    if (M >= 2 && w->Sn == 1 && !getenv("ORK_I4_GRP_NOBCHAIN")) {
+        const int G=w->gsize, Sk=w->K/G, N=w->N, K=w->K;
+        ork_w  *views = calloc((size_t)Sk, sizeof *views);
+        int8_t *Aslice = malloc((size_t)M*K);                       /* NG contiguous [M x G] A-slices */
+        int32_t*P      = malloc((size_t)Sk*M*N*sizeof *P);           /* one int32 partial per group */
+        ork_mm_task_i4 *tk = calloc((size_t)Sk, sizeof *tk);
+        if (views && Aslice && P && tk) {
+            for (int g=0; g<Sk; g++) {
+                views[g].K=G; views[g].N=N; views[g].Sk=1; views[g].Sn=1; views[g].dtype=DT_I4;
+                views[g].owns=0;                                     /* VIEW: ork_mm_free must not free Bb */
+                views[g].domain=w->domain; views[g].Bb=&w->Bb[g];
+                int8_t *Ag = Aslice + (size_t)g*M*G;
+                for (int m=0;m<M;m++) memcpy(Ag+(size_t)m*G, A+(size_t)m*K+(size_t)g*G, (size_t)G);
+                tk[g].w=&views[g]; tk[g].M=M; tk[g].A=Ag; tk[g].C=P+(size_t)g*M*N;
+            }
+            if (orki_i4_run_experts_bchain_db(c, tk, Sk, 0) == 0) {
+                #pragma omp parallel for schedule(static) if(M>1)
+                for (int m=0;m<M;m++){
+                    float *cr=Cf_out_row(C,m,N);
+                    for (int n=0;n<N;n++) cr[n]=0.0f;
+                    for (int g=0; g<Sk; g++) {
+                        const int32_t *pg=P+(size_t)g*M*N+(size_t)m*N;
+                        const float as=aScale[(size_t)m*Sk+g]; const float *bs=bScale+(size_t)g*N;
+                        for (int n=0;n<N;n++) cr[n]+=(float)pg[n]*as*bs[n];
+                    }
+                }
+                free(tk); free(P); free(Aslice); free(views);
+                return 0;
+            }
+        }
+        free(tk); free(P); free(Aslice); free(views);               /* refused -> original path below */
+    }
+
     /* Grouped int4 runs on the NONBLOCK doorbell (row-decomposed Sn*Sk chain + float scale-accumulate
      * drain). NULL (chain/scratch too big / ineligible) => refuse (rescue-eligible); the blocking
      * i4_mcworker_g path is removed (#45). */

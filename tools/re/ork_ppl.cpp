@@ -35,9 +35,45 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+
+/* How many threads should the ggml threadpool get?
+ *
+ * NOT a hardcoded 4. That number came from RK3588, where it is right for a specific reason: the SoC is
+ * heterogeneous (4x A76 + 4x A55) and ggml's threadpool is BARRIER-synchronised, so a little core that
+ * takes 3x as long to finish its slice holds every big core waiting at the barrier — using all 8 is
+ * measurably slower than using the 4 fast ones. But the same constant on a homogeneous 16-core host
+ * leaves 12 cores idle, which is what it did here.
+ *
+ * So derive it: group the CPUs by their maximum frequency and take the size of the FASTEST group. On a
+ * heterogeneous part that is the big-core count (4 on RK3588); on a homogeneous one every CPU is in one
+ * group and it degrades to the total, which is the right answer when the cores are interchangeable.
+ * Falls back to the online CPU count where cpufreq is unavailable. ORK_PPL_THREADS overrides. */
+static int ork_ppl_threads(void){
+    if (const char* e = getenv("ORK_PPL_THREADS")) { int v = atoi(e); if (v > 0) return v; }
+    const long n = sysconf(_SC_NPROCESSORS_ONLN);
+    if (n < 1) return 4;
+    long best = -1, count = 0, known = 0;
+    for (long i = 0; i < n; i++) {
+        char path[128];
+        snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
+        FILE* f = fopen(path, "r");
+        if (!f) continue;
+        long khz = 0;
+        if (fscanf(f, "%ld", &khz) == 1 && khz > 0) {
+            known++;
+            if (khz > best) { best = khz; count = 1; }
+            else if (khz == best) count++;
+        }
+        fclose(f);
+    }
+    if (known == n && count > 0) return (int) count;   /* every CPU reported: trust the fastest-group size */
+    return (int) n;                                     /* no cpufreq (VM, container): cores are interchangeable */
+}
 
 int main(int argc, char** argv){
     if (argc < 3){
@@ -103,14 +139,15 @@ int main(int argc, char** argv){
     cp.n_ctx    = W + 8;
     cp.n_batch  = W;
     cp.n_ubatch = UB;
-    cp.n_threads = 4; cp.n_threads_batch = 4;
+    const int nthr = ork_ppl_threads();
+    cp.n_threads = nthr; cp.n_threads_batch = nthr;
     cp.flash_attn_type = getenv("ORK_PPL_FA") ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
     /* No logits_all in this API — per-position output is requested via batch.logits[i] below. */
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 
-    fprintf(stderr,"[ork_ppl] %d tokens, %d window(s) of %d%s, ubatch=%d, vocab=%d (logits %.0f MiB/window)\n",
-            nt, nwin, W, (MAXW > 0 ? " [capped]" : ""), UB, n_vocab, (double)W*n_vocab*4/1048576.0);
+    fprintf(stderr,"[ork_ppl] %d tokens, %d window(s) of %d%s, ubatch=%d, threads=%d, vocab=%d (logits %.0f MiB/window)\n",
+            nt, nwin, W, (MAXW > 0 ? " [capped]" : ""), UB, nthr, n_vocab, (double)W*n_vocab*4/1048576.0);
 
     llama_batch b = llama_batch_init(W, 0, 1);
     double nll = 0.0; long scored = 0; int64_t t0 = llama_time_us();

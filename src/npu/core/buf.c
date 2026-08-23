@@ -17,6 +17,9 @@
 #include <sys/prctl.h>
 #include "ork_regs.h"
 #include "regcmd_i8.h"
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#endif
 #include "npu/internal.h"
 #include "npu/core.h"
 #include "npu/core/core.h"
@@ -363,12 +366,48 @@ void ork_dmabuf_seal(int dbuf){ if(dbuf>=0) orki_dmabuf_sync(dbuf,DMA_BUF_SYNC_E
 /* See the declaration in npu/internal.h. B is [K][N] row-major raw codes (int4 values live in int8 slots,
  * so one loop serves both dtypes). Parallel over M; each row writes a disjoint slice of C. */
 void orki_cpu_gemm_i32(int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
+    /* k-OUTER on purpose: B is then streamed contiguously (row k is N contiguous bytes) while the C row —
+     * N int32, 4 KiB at N=1024 — stays resident in L1 across the whole k loop. The n-blocked alternative
+     * keeps accumulators in registers but re-reads all of B once per n-block, which is far worse.
+     *
+     * The inner loop is an AXPY: crow[n] += a * wrow[n]. Products fit int16 (127*127 = 16129), so widening
+     * multiply-accumulate (vmlal_n_s16) goes straight from int8 lanes to the int32 accumulator with no
+     * intermediate rounding — this stays BIT-EXACT with the scalar version and with the NPU's own int32
+     * MAC, which is the whole reason the offline path can be trusted. k is unrolled by 4 so one
+     * load/store of the accumulators serves four rows of B. */
     #pragma omp parallel for schedule(static) if(M>1)
     for(int m=0;m<M;m++){
         const int8_t *arow=A+(size_t)m*K;
         int32_t *crow=C+(size_t)m*N;
         memset(crow,0,(size_t)N*sizeof *crow);
-        for(int k=0;k<K;k++){
+        int k=0;
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+        for(;k+4<=K;k+=4){
+            const int16_t a0=arow[k],a1=arow[k+1],a2=arow[k+2],a3=arow[k+3];
+            if(!(a0|a1|a2|a3)) continue;
+            const int8_t *w0=B+(size_t)k*N,*w1=w0+N,*w2=w1+N,*w3=w2+N;
+            int n=0;
+            for(;n+16<=N;n+=16){
+                int32x4_t c0=vld1q_s32(crow+n),   c1=vld1q_s32(crow+n+4);
+                int32x4_t c2=vld1q_s32(crow+n+8), c3=vld1q_s32(crow+n+12);
+                #define ORK_AXPY(WP,AV) do{ \
+                    const int8x16_t v=vld1q_s8((WP)+n); \
+                    const int16x8_t lo=vmovl_s8(vget_low_s8(v)), hi=vmovl_s8(vget_high_s8(v)); \
+                    c0=vmlal_n_s16(c0,vget_low_s16(lo),(AV)); c1=vmlal_n_s16(c1,vget_high_s16(lo),(AV)); \
+                    c2=vmlal_n_s16(c2,vget_low_s16(hi),(AV)); c3=vmlal_n_s16(c3,vget_high_s16(hi),(AV)); \
+                }while(0)
+                if(a0) ORK_AXPY(w0,a0);
+                if(a1) ORK_AXPY(w1,a1);
+                if(a2) ORK_AXPY(w2,a2);
+                if(a3) ORK_AXPY(w3,a3);
+                #undef ORK_AXPY
+                vst1q_s32(crow+n,c0);    vst1q_s32(crow+n+4,c1);
+                vst1q_s32(crow+n+8,c2);  vst1q_s32(crow+n+12,c3);
+            }
+            for(;n<N;n++) crow[n]+=a0*(int32_t)w0[n]+a1*(int32_t)w1[n]+a2*(int32_t)w2[n]+a3*(int32_t)w3[n];
+        }
+#endif
+        for(;k<K;k++){                                  /* tail (and the whole loop without NEON) */
             const int32_t a=arow[k];
             if(!a) continue;
             const int8_t *wrow=B+(size_t)k*N;

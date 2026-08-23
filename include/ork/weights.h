@@ -117,6 +117,10 @@ ork_w       *ork_i4_mm_pack(ork_npu *ctx, int K, int N, const int8_t   *B);  /* 
 /* int4 weights with per-group scales: K split into groups of G (G%32, K%G, G<=10752). Pair with
  * ork_i4_mm_run_grouped, which dequantizes per group into fp32. */
 ork_w       *ork_i4_mm_pack_grouped(ork_npu *ctx, int K, int N, const int8_t *B, int G);
+/* Tag a LOADED weight as per-group. The .orkpack entry does not carry the group size — a consumer
+ * recovers it from the scale COUNT (per-channel stores N, per-group stores (K/G)*N) — but
+ * ork_i4_mm_run_grouped needs it on the weight. Returns 0 on success, -1 if w is not int4. */
+int          ork_w_set_group(ork_w *w, int G);
 
 /* int4-Stored / int8-Computed Fallback (Tier 4 Memory Optimization): takes unpacked int4 weights 
  * ([-8,7] in int8 containers) and packs them into an int8 resident weight buffer. This runs on 

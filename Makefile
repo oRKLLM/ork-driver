@@ -44,7 +44,7 @@ COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # o
 # only that header, so it must not invalidate the attest).
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch test_gptq test_i4_dump_cpu
+EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch test_gptq test_i4_dump_cpu test_cpu_gemm
 TESTS :=
 
 all: check-registry $(EXAMPLES) $(TESTS)
@@ -375,6 +375,12 @@ submit_introspect.so: tools/submit_introspect.c
 mc_prof: tools/mc_prof.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# i4_group_probe — cost of a PER-GROUP int4 scale: narrow matmuls + the cross-group reduction, chained vs
+# separate submits. Diagnostic (board only, not in all/test): answers whether the reduction is DRAM-bound
+# (a faster dispatcher cannot help) or dispatch-bound (doorbell/heterogeneous overlap is the lever).
+i4_group_probe: tools/re/i4_group_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # decode-pipeline validator: CPU int4 bulk || NPU int8 share overlapped — aggregate win at M=1? Not in all/test.
 # -march=native: ork_native_cpu.h uses vdotq_s32 (dotprod ISA), which the default CFLAGS march may not enable.
 hybrid_decode_probe: tools/hybrid_decode_probe.c $(COBJ)
@@ -492,7 +498,7 @@ SUDO ?= sudo -E
 # loop, because orkd_seq_probe needs ORK_USE_ORKD=1 and the loop has one shared environment.
 test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
 	@fail=0; ORKD_BIN=$$PWD/orkd; export ORKD_BIN; \
-	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_i4_dump_cpu" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
+	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_i4_dump_cpu" "test_cpu_gemm" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
 	for t in "orkd_probe mm" "orkd_ring_probe" "orkd_dom_api"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
