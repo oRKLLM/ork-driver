@@ -371,6 +371,7 @@ int orki_f16_sched(int K);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);
+int orki_i4_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes);
 ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 void orki_mc_recover_resubmit(ork_dyn_chain *h);
 void ork_install_term(void);

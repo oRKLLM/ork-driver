@@ -169,6 +169,12 @@ ork_w       *ork_i8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t
  * Bi4 (K*N/2 bytes). out=NULL -> required size; returns 0 if `w` has no int4 store. Loaded weight runs
  * via ork_i8_mm_run and re-dumps byte-identically. NULL on a malformed blob / shape mismatch. */
 size_t       ork_i4a8_w_dump(const ork_w *w, void *out, size_t cap);
+/* DT_I4_ROT_A8: load rotated int4 weights stored in the i4-NATIVE TILED blob format (what ork_w_dump
+ * writes) and inflate them into int8 containers for the int8 MAC. ork_i4a8_mm_load handles the COMPACT
+ * container instead (hdr + bscale + nibbles) and rejects this layout on its exact-size gate, which is why
+ * the rotated-i4a8 tier never loaded. Scales come from the caller (this format carries none). */
+ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n);
+
 ork_w       *ork_i4a8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* Zero-copy IMPORT variant of ork_i4a8_mm_load: resident tiles are dma-bufs the NPU reads in place (PRIME
  * import); the int4 nibbles inflate -> int8 directly into them. Bit-identical to ork_i4a8_mm_load (same

@@ -164,6 +164,83 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
     return w;
 }
 
+/* Un-tile a .orkpack int4 blob back to raw [K][N] codes in [-8,7]. This is the exact inverse of
+ * ork_i4_w_dump_cpu / tile_i4_Bslice, and it is FACTORED rather than copied because the tiler and the
+ * un-tiler drifting apart is silent: you get plausible weights and a slightly wrong model. Both the
+ * offline ork_i4_mm_load and the i4a8 inflate path below go through this one walk. `codes` is K*N bytes. */
+int orki_i4_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes){
+    if(!c || !blob || !codes || (K%32) || (N%64)) return -1;
+    int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    const uint8_t *src=(const uint8_t*)blob; size_t off=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS;
+        size_t tsz=orki_pgup((size_t)Kp*Nc/2);
+        if(off+tsz>n) return -1;
+        const uint8_t *bb=src+off;
+        int KT=Kp/32, NB=Nc/64;
+        for(int nb=0;nb<NB;nb++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<64;nl++)for(int kk=0;kk<32;kk++){
+            size_t idx=(((size_t)nb*KT+kt)*64+nl)*32+kk;
+            int nib=(bb[idx/2]>>((idx&1)?4:0))&0xf;
+            codes[(size_t)(k0+kt*32+kk)*N+(n0+nb*64+nl)]=(int8_t)(nib>=8?nib-16:nib);
+        }
+        off+=tsz; }}
+    return (off==n) ? 0 : -1;
+}
+
+/* DT_I4_ROT_A8: rotated int4 weights that RUN on the int8 MAC (RK3588 is W8A8 or W4A4 — int4 weights
+ * against int8 activations is not a hardware mode, so the nibbles must be inflated into int8 containers).
+ *
+ * This exists because the tier stored its blob in the i4-NATIVE TILED format (ork_w_dump: page-padded
+ * Kp*Nc/2 tiles, no header, no scales) while the only inflating loader, ork_i4a8_mm_load, demands the
+ * COMPACT i4a8 container (hdr + bscale[N] + Bi4[K*N/2]) and gates on an exact size match. Those two can
+ * never agree, so DT_I4_ROT_A8 had NEVER loaded at any size — every promoted weight missed the pack and
+ * silently fell back to inline packing. At 27B that is 80 weights inline-packing ~27-89 MB each, which
+ * exhausts IOVA and takes the whole run down; at 0.8B it merely produced a wrong number that looked
+ * plausible enough to publish.
+ *
+ * Fixing it HERE rather than in the writer is deliberate: existing packs keep working, no rebuild.
+ * Scales are not read from the blob — this format does not carry them; the caller supplies them from the
+ * pack index (which is where DT_I4_NATIVE gets them too). */
+ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n){
+    if(!c || (K%32) || (N%64)) return NULL;
+    int8_t *codes=malloc((size_t)K*N);
+    if(!codes) return NULL;
+    if(orki_i4_untile_blob(c,K,N,blob,n,codes)){ free(codes); return NULL; }
+
+    /* OFFLINE: no device. The exact int32 CPU MAC runs straight off the codes, and the int4 values ARE the
+     * int8 values (inflation is a container change, not a value change), so dtype flips to DT_I8 and the
+     * codes carry over untouched. */
+    if(c->fd<0){
+        ork_w *w=calloc(1,sizeof *w); if(!w){ free(codes); return NULL; }
+        w->K=K; w->N=N; w->Sk=1; w->Sn=1; w->dtype=DT_I8; w->owns=1; w->cpu_codes=codes; w->off_ctx=c;
+        return w;
+    }
+    /* DEVICE: inflate to f32 codes and reuse the int8 tiler — the same tail ork_i4a8_mm_load runs, so the
+     * resident bytes are identical to the compact-container path. inv=1 because the codes are exact. */
+    int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    ork_w *w=calloc(1,sizeof *w); if(!w){ free(codes); return NULL; }
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1;
+    w->domain=ork_dom(c->pack_domain); w->quant_kind=ORK_QK_UNIFORM;
+    w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
+    if(!w->Bb){ free(codes); free(w); return NULL; }
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS; (void)k0;
+        struct buf *b=&w->Bb[(size_t)ns*Sk+ks]; *b=orki_bcreate(c->fd,(size_t)Kp*Nc,0x403,w->domain);
+        if(!b->cpu){ for(int i=0;i<ns*Sk+ks;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); free(codes); return NULL; } } }
+    if(K<=10752 && !getenv("ORK_NO_BF")){ w->Bf=calloc(Sn,sizeof(struct buf)); int ok=1;
+        for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            struct buf *b=&w->Bf[ns]; *b=orki_bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
+        if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
+    float *qf32=malloc((size_t)N*K*sizeof(float)), *inv=malloc((size_t)N*sizeof(float));
+    if(!qf32 || !inv){ free(qf32); free(inv); free(codes); ork_mm_free(c,w); return NULL; }
+    for(int nn=0;nn<N;nn++){ float *qf=qf32+(size_t)nn*K;
+        for(int k=0;k<K;k++) qf[k]=(float)codes[(size_t)k*N+nn];
+        inv[nn]=1.0f; }
+    orki_i8_tile_f32(c, w, K, N, qf32, inv);
+    free(qf32); free(inv); free(codes);
+    return w;
+}
+
 ork_w *ork_i4a8_mm_load_import(ork_npu *c, int K, int N, const void *blob, size_t n){
     if(K%32 || N%32 || orki_dmaheap_open()<0) return NULL;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
