@@ -63,7 +63,31 @@ static int one(ork_npu *c, ork_npu *off, int K, int N, const char *tag) {
                         printf("  [%-10s] K=%d N=%d: OFFLINE differs from NPU in %zu/%zu bytes (first @%zu) FAIL\n",
                                tag, K, N, bo, need, fo); fail = 1;
                     }
-                    else printf("  [%-10s] K=%-5d N=%-6d %8zu bytes BYTE-IDENTICAL (npu == cpu == offline)\n", tag, K, N, need);
+                    else {
+                        /* ROUND TRIP the offline LOADER. ork_i4_w_dump_cpu is asserted byte-identical above,
+                         * but ork_i4_mm_load's offline un-tiler — the inverse walk that lets a pack be READ
+                         * without an NPU — had no test at all. An un-tiler that is subtly wrong yields a
+                         * model that still runs and still produces plausible perplexity, which is exactly
+                         * the failure mode that wasted hours here: offline and board disagreed by 54% on
+                         * one pack and the loader was never on the suspect list because it was untested.
+                         * dump -> load -> dump must be a fixed point. */
+                        ork_w *rw = ork_i4_mm_load(off, K, N, offb, need);
+                        if (!rw) { printf("  [%-10s] offline LOAD returned NULL FAIL\n", tag); fail = 1; }
+                        else {
+                            size_t n2 = ork_w_dump(rw, NULL, 0);
+                            uint8_t *b2 = malloc(n2 ? n2 : 1);
+                            if (n2 != need || !b2) { printf("  [%-10s] round-trip size %zu != %zu FAIL\n", tag, n2, need); fail = 1; }
+                            else {
+                                ork_w_dump(rw, b2, n2);
+                                size_t bad2 = 0, f2 = (size_t)-1;
+                                for (size_t i = 0; i < need; i++) if (b2[i] != offb[i]) { if (f2 == (size_t)-1) f2 = i; bad2++; }
+                                if (bad2) { printf("  [%-10s] K=%d N=%d: LOAD round-trip differs in %zu/%zu bytes (first @%zu: %02x vs %02x) FAIL\n",
+                                                   tag, K, N, bad2, need, f2, b2[f2], offb[f2]); fail = 1; }
+                                else printf("  [%-10s] K=%-5d N=%-6d %8zu bytes BYTE-IDENTICAL (npu == cpu == offline, load round-trips)\n", tag, K, N, need);
+                            }
+                            free(b2); ork_mm_free(off, rw);
+                        }
+                    }
                     free(offb);
                 }
             }

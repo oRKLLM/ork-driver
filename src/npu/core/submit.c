@@ -99,6 +99,30 @@ void orki_dump_submit(struct rknpu_submit *sub) {
 void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki_dump_submit(sub); }
 
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+    /* OFFLINE GUARD. ork_npu_init_offline hands out a context with fd = -1 for CPU-side work (pack building
+     * and scoring on a machine with no NPU). The paths that support it intercept BEFORE here and never
+     * reach a submit; anything that arrives HERE with fd < 0 is a path that was never taught about offline.
+     *
+     * It must fail LOUDLY. Measured 2026-08-23: a selective-precision experiment routed six weights through
+     * an int8 dispatch variant with no offline branch; the submit went nowhere, the caller saw success, and
+     * the run produced a PLAUSIBLE-BUT-WRONG perplexity (+15.5% where the board says -0.86%). A silently
+     * wrong number is worse than a crash — it gets believed, and it cost a full round of analysis before
+     * the board contradicted it. So: one clear message naming the op, and a hard error the caller cannot
+     * mistake for a completed submit. */
+    if (fd < 0) {
+        static int warned = 0;
+        if (!warned) { warned = 1;
+            fprintf(stderr,
+                "[ork] ERROR: submit on an OFFLINE context (op=%s K=%d N=%d). This path has no offline\n"
+                "[ork]        implementation — its result would be UNCOMPUTED, not merely slow. Offline\n"
+                "[ork]        supports the CPU-side surfaces only (i4/i8 pack, run, run_chain, run_stream,\n"
+                "[ork]        run_grouped, w_dump, mm_load). Run this on the board, or add an offline\n"
+                "[ork]        branch to the entry point that reached here.\n",
+                orki_last_op ? orki_last_op : "(unset)", orki_last_K, orki_last_N);
+        }
+        errno = ENODEV;
+        return -1;
+    }
     sub->iommu_domain_id = ork_dom(domain);  /* match the domain the weight's resident tiles live in (threaded per-call, not a global) */
     if (orki_ork_prof) { orki_prof_submits++; orki_prof_submit_progs += sub->task_number; if (sub->task_number > 1) orki_prof_submit_chained++; }
     orki_trace_submit(sub);

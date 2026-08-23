@@ -381,6 +381,11 @@ mc_prof: tools/mc_prof.c $(COBJ)
 i4_group_probe: tools/re/i4_group_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# i4_inflate_probe — int4->int8 inflation throughput (scalar vs NEON, cache- and DRAM-resident). Answers
+# whether i4a8's per-domain-swap inflate is affordable against int8's ~1.7x compute advantage. No NPU.
+i4_inflate_probe: tools/re/i4_inflate_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 # decode-pipeline validator: CPU int4 bulk || NPU int8 share overlapped — aggregate win at M=1? Not in all/test.
 # -march=native: ork_native_cpu.h uses vdotq_s32 (dotprod ISA), which the default CFLAGS march may not enable.
 hybrid_decode_probe: tools/hybrid_decode_probe.c $(COBJ)

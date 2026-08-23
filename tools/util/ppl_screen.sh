@@ -24,7 +24,8 @@ set -eu
 # 256 tokens costs ~40 s and tracked the full 6132-token run to within 0.2% on the pack measured here,
 # which is worth the extra seconds over a shorter window. ORK_PPL_SCREEN_W=192 gets ~30 s if you want it.
 W=${ORK_PPL_SCREEN_W:-256}; UB=$W; MAXW=1; TIER="SCREEN"
-if [ "${1:-}" = "--full" ]; then W=512; UB=512; MAXW=0; TIER="FULL"; shift; fi
+TMO=900
+if [ "${1:-}" = "--full" ]; then W=512; UB=512; MAXW=0; TIER="FULL"; TMO=5400; shift; fi
 [ $# -ge 3 ] || { sed -n '2,26p' "$0"; exit 2; }
 
 MODEL=$1; TEXT=$2; shift 2
@@ -36,13 +37,26 @@ BIN=${ORK_PPL_BIN:-$HOMEDIR/llama.cpp/build/bin/ork_ppl}
 GUARD=$(dirname "$0")/npu_guard.sh
 [ -x "$BIN" ] || { echo "no ork_ppl at $BIN (set ORK_PPL_BIN)"; exit 2; }
 
+# PROVENANCE. A stale binary is the single most expensive failure mode this harness has: rsync -a preserves
+# mtimes, cmake then skips the rebuild, and you measure OLD code while believing you changed something —
+# silently, because the build reports success. On 2026-08-23 that produced a phantom regression and three
+# derived results that all had to be retracted. So every run states WHICH binary produced it: build time and
+# a content hash of the backend library. If two runs disagree and these lines differ, the code differs.
+BIN_LIB=$(ls "$(dirname "$BIN")"/libggml-ork.so 2>/dev/null | head -1)
+printf '== BINARY %s  built %s' "$BIN" "$(date -r "$BIN" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo '?')"
+[ -n "$BIN_LIB" ] && printf '  | libggml-ork %s built %s' \
+    "$(sha256sum "$BIN_LIB" 2>/dev/null | cut -c1-12)" "$(date -r "$BIN_LIB" '+%H:%M:%S' 2>/dev/null || echo '?')"
+echo
 echo "== $TIER: window=$W ubatch=$UB maxwin=$MAXW  model=$(basename "$MODEL")  text=$(basename "$TEXT")"
 for spec in "$@"; do
     label=${spec%%=*}; pack=${spec#*=}
     [ -f "$pack" ] || { printf '%-10s : MISSING %s\n' "$label" "$pack"; continue; }
     s=$(date +%s)
     # One arm per invocation: the NPU is single-stream, and the guard serialises against other agents.
-    out=$("$GUARD" -- env ORK_ORKPACK_PATH="$pack" timeout 900 \
+    # Tier-dependent timeout. 900 s was fine for a ~40 s screen and silently killed every --full arm: a
+    # full run on a 42 KB text is 883-920 s, i.e. right at the limit, so both arms died with no output and
+    # no error anyone would read as "too slow". Give --full real headroom.
+    out=$("$GUARD" -- env ORK_ORKPACK_PATH="$pack" timeout "$TMO" \
           "$BIN" "$MODEL" "$TEXT" "$W" "$UB" "$MAXW" 2>&1 | grep -E '^\[ork_ppl\] PPL' || true)
     e=$(date +%s)
     if [ -z "$out" ]; then printf '%-10s : NO RESULT (see the run output)\n' "$label"
