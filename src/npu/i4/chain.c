@@ -181,12 +181,9 @@ int ork_i4_mm_run_chain(ork_npu *c, int S, const ork_mm_task_i4 *tasks) {
     }
     orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
 
-    static int tc = -2;
-    if (tc == -2) { const char* e = getenv("ORK_NPU_TESTCORE"); tc = e ? atoi(e) : 0; if (tc < 0 || tc > 2) tc = 0; }
-
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
     sub.flags = ork_ppflags(); sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.fence_fd = -1;
-    sub.core_mask = 1u << tc;
+    sub.core_mask = 1u << orki_tc();
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, S};
 
     int reps = c->warmed ? 1 : 2;

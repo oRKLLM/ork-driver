@@ -45,6 +45,18 @@ static const struct ork_xspec XSPEC[XP_NPROFILE] = {
  *                matmul then takes its own reset/re-warm path (fp16 entry = warmed=0 re-warm, int8 entry =
  *                ACT_RESET). No explicit HW reset here. Tests whether re-warm alone clears the wedge.
  *   _reset:      an explicit HW ACT_RESET AND invalidate — the heavyweight, always-safe reinit. */
+/* Probe hooks, settable by call OR by env so the ggml consumer can exercise them on a real model:
+ * -1 = not yet resolved, read the env once; 0/1 = explicitly set. */
+int orki_xspec_noreset = -1;
+int orki_xspec_nores(void){ if(orki_xspec_noreset<0){ const char*e=getenv("ORK_XSPEC_NORESET"); orki_xspec_noreset=(e&&atoi(e))?1:0; } return orki_xspec_noreset; }
+int orki_xspec_nocle(void){ if(orki_xspec_noclear<0){ const char*e=getenv("ORK_XSPEC_NOCLEAR"); orki_xspec_noclear=(e&&atoi(e))?1:0; } return orki_xspec_noclear; }
+void ork_npu_set_xspec_noreset(int on){ orki_xspec_noreset = on ? 1 : 0; }
+int orki_xspec_noclear = -1;   /* probe hook: skip the warm/size CLEARS (the OTHER half of what a keep-warm
+                               * predicate suppresses). Separating the two matters: the 27B corruption was
+                               * produced by a kw=1 that turned off reset AND clears together, so which one
+                               * was load-bearing was never established. */
+void ork_npu_set_xspec_noclear(int on){ orki_xspec_noclear = on ? 1 : 0; }
+
 /* ============================ MODE-TRANSITION LAYER (ork_npu_enter) ============================
  * SINGLE owner of "what does moving the NPU's stateful regcmd datapath from mode X to mode Y
  * require" — the ACT_RESET / re-warm (warmed, mwarm[]) / buffer-realloc (ccsz, mccsz[]) policy that
@@ -129,6 +141,9 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
      * ork_npu_enter — useless for deciding WHICH XSPEC row is firing. Name the profile and the transition. */
     if(rst && getenv("ORK_DEBUG_RESET"))
         fprintf(stderr,"[ork XSPEC] reset profile=%d from=%d to=%d chain=%d\n", profile, from, to, chain);
+    /* PROBE HOOK (percore_mode_probe): suppress the ACT_RESET only, leaving every other XSPEC effect
+     * (warm/size clears, last_dt) intact — so the probe isolates "is the reset itself load-bearing?" */
+    if(rst && orki_xspec_nores()) rst=0;
     if(rst){
         /* ORK_DEBUG_RESET prices the transition. MEASURED 2026-08-24 on the 27B mixed-tier run: mean
          * 105 ms per ACT_RESET, 160 of them = 16.8 s of a 161.6 s scored run (10.4%). This is the ioctl
@@ -150,6 +165,7 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case WC_ALWAYS:        wclr=1; break;
       default:               wclr=0;
     }
+    if(orki_xspec_nocle()) wclr=0;
     if(wclr){ if(x->wtg&TG_SCALAR)c->warmed=0; if(x->wtg&TG_PERCORE)for(int i=0;i<ORK_MAXCORE;i++)c->mwarm[i]=0; }
     int sclr=0;
     switch(x->sc){

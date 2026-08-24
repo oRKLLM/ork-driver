@@ -848,6 +848,9 @@ mc_miss_repro: tools/mc_miss_repro.c $(COBJ)
 i4_xition_probe: tools/i4_xition_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+percore_mode_probe: tools/percore_mode_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 ssd_layer_bench: tools/ssd_layer_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -O3 -march=native -o $@ $< $(COBJ) -lm -lpthread
 

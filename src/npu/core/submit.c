@@ -240,11 +240,18 @@ cdone:
     orki_bdestroy(fd,&A);orki_bdestroy(fd,&B);orki_bdestroy(fd,&Cc);orki_bdestroy(fd,&RC); return ret;
 }
 
+/* PROBE HOOKS (percore_mode_probe). ORK_NPU_TESTCORE is cached in a static, so a probe cannot alternate
+ * cores within one process — and "is the precision-mode hazard per-core or device-global?" can only be
+ * asked by interleaving two precisions on two cores in ONE process. Expose the core as settable state.
+ * Default is unchanged: the env var, read once, clamped to 0..2. */
+int orki_testcore = -1;
+int orki_tc(void){ if(orki_testcore<0){ const char*e=getenv("ORK_NPU_TESTCORE"); int t=e?atoi(e):0; if(t<0||t>2)t=0; orki_testcore=t; } return orki_testcore; }
+void ork_npu_set_test_core(int core){ if(core>=0&&core<=2) orki_testcore=core; }
+
 int orki_submit1(ork_npu *c){
     int fd=c->fd;
-    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
-    sub.core_mask=1u<<tc;
+    sub.core_mask=1u<<orki_tc();
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
@@ -257,9 +264,8 @@ int orki_submit1(ork_npu *c){
 
 int orki_submit1_db(ork_npu *c, size_t nout){
     int fd=c->fd;
-    static int tc=-2; if(tc==-2){const char*e=getenv("ORK_NPU_TESTCORE"); tc=e?atoi(e):0; if(tc<0||tc>2)tc=0;}
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags()|0x2u;sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
-    sub.core_mask=1u<<tc;
+    sub.core_mask=1u<<orki_tc();
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     volatile int32_t *o=(volatile int32_t*)c->Cc.cpu; size_t li=nout-1;
     int reps=c->warmed?1:2;

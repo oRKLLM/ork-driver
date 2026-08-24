@@ -159,6 +159,15 @@ extern uint64_t orki_sram_total;
 extern volatile sig_atomic_t orki_sig_busy;
 int orki_imp_trace(void);
 int ork_dom(int dom);
+extern int orki_testcore;        /* probe hook: which NPU core single-core submits target (env ORK_NPU_TESTCORE) */
+int  orki_tc(void);
+void ork_npu_set_test_core(int core);
+extern int orki_xspec_noreset;   /* probe hook: suppress the mode-transition ACT_RESET only */
+void ork_npu_set_xspec_noreset(int on);
+int  orki_xspec_nores(void);
+int  orki_xspec_nocle(void);
+extern int orki_xspec_noclear;   /* probe hook: suppress the mode-transition warm/size clears */
+void ork_npu_set_xspec_noclear(int on);
 void orki_live_reap(int fd);   /* destroy every still-registered buffer before the DRM fd closes (see npu.c) */
 void orki_fold_scratch_free(ork_npu *c);
 void orki_live_add(int fd, uint32_t h, uint64_t o);
