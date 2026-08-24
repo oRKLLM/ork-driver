@@ -52,51 +52,87 @@ int ork_i8_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
      * per-group fp32 combine happens here, because per-group scales cannot factor out of the K-sum.
      * Requires the weight to have been loaded GROUP-TILED (one DMA buffer per group) -- a group's bytes are
      * strided across the normal KS-sliced layout, so the views cannot be formed after the fact. */
-    if(w->dtype!=DT_I8 || w->Sn!=1 || !w->Bb || w->Sk != w->K / w->gsize){
+    /* GROUP SIZE IS CONSTRAINED BY THE K-REDUCTION SCHEDULE, not by anything here. Each group becomes a
+     * full-K chain link, and orki_i8_run_chain_impl emits those with orki_i8_synth(sched=1), whose 0x1040
+     * schedule is only valid for K%512==0 && K<=4096. A group view has K=G, so G must be a multiple of 512
+     * and at most 4096 -- G=32 is rejected with -3, which is correct and was previously collapsed into a
+     * generic -1 that said nothing. Say it plainly instead: the caller's options are a coarser G or the
+     * offline path, and quality-wise that is cheap (measured: G=256 W4A8 13.9494 vs G=32 W4A8 14.0217, i.e.
+     * group size barely matters once activations are int8). */
+    if(w->gsize % 512 || w->gsize > 4096){
+        static int said=0;
+        if(!said++) fprintf(stderr,
+            "[ork] ork_i8_mm_run_grouped: G=%d unsupported on device — the chain's K-reduction schedule\n"
+            "[ork]   requires a group size that is a multiple of 512 and <= 4096 (each group is a full-K\n"
+            "[ork]   link with K=G). Use G in {512,1024,...,4096}, or score offline.\n", w->gsize);
+        return -3;
+    }
+    if(w->dtype!=DT_I8 || !w->Bb || w->gsize<1 || w->Sk != w->K / w->gsize){
         static int said=0;
         if(!said++) fprintf(stderr,
             "[ork] ork_i8_mm_run_grouped: weight is not group-tiled (K=%d N=%d G=%d Sk=%d Sn=%d).\n"
-            "[ork]   Load it with ork_i4a8_mm_load_tiled(..., G) so each K-group is its own tile.\n",
+            "[ork]   Load it with ork_i4a8_mm_load_tiled(..., G) so each (N-slice, K-group) is its own tile.\n",
             w->K, w->N, w->gsize, w->Sk, w->Sn);
         return -1;
     }
+    /* Sn>1 is REQUIRED here, not optional: a 27B's wide-N weights slice to Sn=2..3, so an Sn==1-only grouped
+     * path cannot run the model it exists for. Each (ns,g) is an independent [G x Nc] matmul; the combine
+     * below stitches the N-tiles, which is the only part Sn>1 actually adds. */
     { const int G=w->gsize, SG=w->K/G, N=w->N, K=w->K;
-      ork_w   *views  = calloc((size_t)SG, sizeof *views);
+      const int NMAX=c->soc->nmax, SN=w->Sn<1?1:w->Sn;
+      const size_t NT=(size_t)SG*SN;
+      ork_w   *views  = calloc(NT, sizeof *views);
       int8_t  *Aslice = malloc((size_t)M*K);
-      int32_t *P      = malloc((size_t)SG*M*N*sizeof *P);
+      int32_t *P      = malloc((size_t)SG*M*N*sizeof *P);   /* sum of Nc over ns == N, so this is exact */
       if(!views||!Aslice||!P){ free(views); free(Aslice); free(P); return -1; }
-      ork_mm_task_i8 *tk = calloc((size_t)SG, sizeof *tk);
+      ork_mm_task_i8 *tk = calloc(NT, sizeof *tk);
       if(!tk){ free(views); free(Aslice); free(P); return -1; }
+      /* A-slices are per-GROUP and shared across N-slices -- the same [M x G] rows feed every n-tile. */
       for(int g=0; g<SG; g++){
-          views[g].K=G; views[g].N=N; views[g].Sk=1; views[g].Sn=1; views[g].dtype=DT_I8;
-          views[g].owns=0;                                   /* VIEW: ork_mm_free must not free Bb */
-          views[g].domain=w->domain; views[g].Bb=&w->Bb[g];
           int8_t *Ag=Aslice+(size_t)g*M*G;
           for(int m=0;m<M;m++) memcpy(Ag+(size_t)m*G, A+(size_t)m*K+(size_t)g*G, (size_t)G);
-          tk[g].w=&views[g]; tk[g].M=M; tk[g].A=Ag; tk[g].C=P+(size_t)g*M*N;
       }
+      /* Each task writes its C as CONTIGUOUS [M x Nc] (ork_i8_mm_run's row stride is the view's N, not the
+       * parent's), so every (ns,g) gets its own block and the combine scatters it back into [M x N]. Pointing
+       * a task at a column offset inside a shared [M x N] plane would write with the wrong row stride and
+       * silently interleave the N-tiles. */
+      size_t *Poff = calloc(NT, sizeof *Poff);
+      if(!Poff){ free(views); free(Aslice); free(P); free(tk); return -1; }
+      { size_t off=0;
+        for(int ns=0, t=0; ns<SN; ns++){
+            const int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            for(int g=0; g<SG; g++, t++){
+                views[t].K=G; views[t].N=Nc; views[t].Sk=1; views[t].Sn=1; views[t].dtype=DT_I8;
+                views[t].owns=0;                             /* VIEW: ork_mm_free must not free Bb */
+                views[t].domain=w->domain; views[t].Bb=&w->Bb[(size_t)ns*SG+g];
+                Poff[t]=off; off += (size_t)M*Nc;
+                tk[t].w=&views[t]; tk[t].M=M; tk[t].A=Aslice+(size_t)g*M*G; tk[t].C=P+Poff[t];
+            }
+        } }
       /* ONE submit for all SG groups. Issuing them separately is correct but pays the ~167 us submit floor
        * per group -- 112 of them at K=3584,G=32 is ~18 ms per matmul, which is not a datapath, it is a
        * demonstration. orki_i8_run_chain_impl takes up to 1024 links and wants exactly what a group view
        * already is: DT_I8, K%32==0, Sk==1. So the fusion is the chain call, not a new mechanism. */
-      int rc = orki_i8_run_chain_impl(c, SG, tk, NULL, -1);
+      int rc = orki_i8_run_chain_impl(c, (int)NT, tk, NULL, -1);
       free(tk);
       if(!rc){
           #pragma omp parallel for schedule(static) if(M>1)
           for(int m=0;m<M;m++){
               float *cr=C+(size_t)m*N;
               for(int n=0;n<N;n++) cr[n]=0.0f;
-              for(int g=0; g<SG; g++){
-                  const int32_t *pg=P+(size_t)g*M*N+(size_t)m*N;
-                  const float as=aScale[(size_t)m*SG+g]; const float *bs=bScale+(size_t)g*N;
-                  for(int n=0;n<N;n++) cr[n]+=(float)pg[n]*as*bs[n];
+              for(int ns=0, t=0; ns<SN; ns++){
+                  const int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+                  for(int g=0; g<SG; g++, t++){
+                      const int32_t *pg=P+Poff[t]+(size_t)m*Nc;
+                      const float as=aScale[(size_t)m*SG+g];
+                      const float *bs=bScale+(size_t)g*N+n0;   /* bScale is GLOBAL-N indexed */
+                      for(int nc=0;nc<Nc;nc++) cr[n0+nc]+=(float)pg[nc]*as*bs[nc];
+                  }
               }
           }
       }
-      free(views); free(Aslice); free(P);
-      /* SG submits per matmul -- correctness first. Fusing them into one chained submit (as the int4 path
-       * does via run_experts_bchain_db) is the optimisation, and it is where the grouped overhead lives. */
-      return rc ? -1 : 0;
+      free(Poff); free(views); free(Aslice); free(P);
+      return rc;   /* propagate the chain's code (-2 bad arg, -3 unsupported schedule), never collapse it */
     }
 }
 

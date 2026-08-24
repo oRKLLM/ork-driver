@@ -249,13 +249,13 @@ ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t
      * across the normal KS-sliced layout and cannot be viewed contiguously after the fact.
      * Sn==1 only, same restriction the int4 grouped path carries: with N-tiles the views would need one per
      * (ns,g) and the drain would have to stitch them. */
-    if (G > 0 && (K % G) == 0 && N <= c->soc->nmax) {
-        const int SG = K / G;
+    if (G > 0 && (K % G) == 0) {
+        const int SG = K / G, NMAXg = c->soc->nmax, SN = (N + NMAXg - 1) / NMAXg;
         ork_w *w = calloc(1, sizeof *w);
         if (!w) { free(codes); return NULL; }
-        w->K=K; w->N=N; w->Sk=SG; w->Sn=1; w->dtype=DT_I8; w->owns=1; w->gsize=G;
+        w->K=K; w->N=N; w->Sk=SG; w->Sn=SN; w->dtype=DT_I8; w->owns=1; w->gsize=G;
         w->domain=ork_dom(c->pack_domain); w->quant_kind=ORK_QK_UNIFORM;
-        w->Bb=calloc((size_t)SG, sizeof(struct buf));
+        w->Bb=calloc((size_t)SG*SN, sizeof(struct buf));
         if(!w->Bb){ free(w->Bb); free(w); free(codes); return NULL; }
         int ok=1;
         /* NIBBLE -> INT8 CONTAINER DIRECTLY. orki_i8_tile_range is already an int8->int8 PERMUTATION
@@ -264,15 +264,23 @@ ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t
          * f32 and quantising it back -- pure round-trip, and it dominated load time. Measured on 27B:
          * t_quant was 306 ms/matmul against W4A4's 13.7 ms, i.e. 57% of wall, while t_run was IDENTICAL
          * (233.5 vs 237.4 ms). The inflation was the whole cost of the W4A8 tier, not the extra bytes. */
-        for(int g=0; g<SG && ok; g++){
-            w->Bb[g]=orki_bcreate(c->fd,(size_t)G*N,0x403,w->domain);
-            if(!w->Bb[g].cpu){ ok=0; break; }
-            struct tile_i8_arg ta={ (int8_t*)w->Bb[g].cpu, codes, G/32, g*G, 0, N };
-            ork_parallel_for(N/32, orki_i8_tile_range, &ta);
-            orki_bsync(c->fd,&w->Bb[g],RKNPU_MEM_SYNC_TO_DEVICE);
+        /* One tile per (N-slice, K-group). Sn>1 is what a 27B needs -- its wide-N weights slice to Sn=2..3
+         * -- and it costs nothing here beyond indexing, because tile_i8_arg already carries the n0 offset
+         * and the GLOBAL row stride N, so a [G x Nc] sub-tile is the same permutation with different
+         * bounds. Bb is indexed ns*SG+g, matching the ns-major/ks-minor order the rest of the code uses. */
+        for(int ns=0; ns<SN && ok; ns++){
+            const int n0 = ns*NMAXg, Nc = (N-n0 < NMAXg) ? (N-n0) : NMAXg;
+            for(int g=0; g<SG && ok; g++){
+                struct buf *b=&w->Bb[(size_t)ns*SG+g];
+                *b=orki_bcreate(c->fd,(size_t)G*Nc,0x403,w->domain);
+                if(!b->cpu){ ok=0; break; }
+                struct tile_i8_arg ta={ (int8_t*)b->cpu, codes, G/32, g*G, n0, N };
+                ork_parallel_for(Nc/32, orki_i8_tile_range, &ta);
+                orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);
+            }
         }
         free(codes);
-        if(!ok){ for(int i=0;i<SG;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
+        if(!ok){ for(int i=0;i<SG*SN;i++) orki_bdestroy(c->fd,&w->Bb[i]); free(w->Bb); free(w); return NULL; }
         return w;
     }
     /* DEVICE: inflate to f32 codes and reuse the int8 tiler — the same tail ork_i4a8_mm_load runs, so the
