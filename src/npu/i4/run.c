@@ -169,12 +169,56 @@ int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(w->sliced && getenv("ORK_FORCE_SLICE_RESCUE")){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
     if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] run_i4 K=%d N=%d M=%d Sk=%d Sn=%d dom=%d imported=%d -> %s\n",
         w->K,w->N,M,w->Sk,w->Sn,w->domain,(w->own_bufs&&w->n_own_bufs>0)||w->own_buf_valid,
-        (M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0)?"BCHAIN":(w->sliced&&M>=2)?"SLICE":"mc_i4(per-row)");
+        (M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0)?"BCHAIN":
+        (M>=2 && w->Sk==1 && w->Sn>1 && (w->N%64)==0)?"BCHAIN-NSLICE":(w->sliced&&M>=2)?"SLICE":"mc_i4(per-row)");
     /* #54: DEFAULT int4 M>1 prefill = BCHAIN (M-batched, the perf path) — now PORTED to ride the SHARED ork_dyn_end
      * drain (poll + orki_mc_recover_resubmit + reap-at-boundary), so it is multi-domain-safe like int8 colsplit AND
      * keeps its M-batching. bch_db_worker builds+submits only; ork_dyn_end owns the drain (i4batch hooks). Falls
      * through (-4) to the per-row doorbell (orki_i4_run_mc_db) for decode (M=1) / non-qualifying shapes. */
     if(M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0){ int r=orki_i4_run_bchain_db(c,w,M,A,C,nc); if(r!=-4) return r; }
+    /* Sn>1 PREFILL: run BCHAIN PER N-SLICE over the tiles the weight ALREADY holds.
+     *
+     * BCHAIN above requires Sn==1, so every wide-N shape fell to the per-row doorbell below. On
+     * Qwen3.6-27B that is 192 of 400 matmuls -- and they are the big ones: 128x K=5120 N=17408 (Sn=3,
+     * ffn up/gate) and 64x K=5120 N=10240 (Sn=2, attn qkv). MEASURED consequence: 667 NPU programs per
+     * matmul on average and 205 us per program, i.e. ~6% of the hardware.
+     *
+     * The existing #33 slice rescue does solve this, but only for weights built by ork_i4_mm_pack -- it
+     * needs the raw nibbles, and a pack-LOADED weight keeps none, so w->sliced is NULL for every weight
+     * that came from an .orkpack. Building sub-weights at load instead would repack each tile and roughly
+     * DOUBLE resident IOVA (11.3 -> ~22 GiB on this model), which does not fit.
+     *
+     * With Sk==1 the N-slices are independent, and Bb[ns*Sk+ks] means slice ns IS Bb[ns] -- so a shallow
+     * view (Sn=1, N=Nc, Bb/Bf/bscale rebased) is a legal BCHAIN weight with no new packing and no new
+     * IOVA. Each slice writes a contiguous [M][Nc] block that is scattered into C at the full row stride.
+     * Bit-exactness is unchanged: same tiles, same kernel, just batched instead of per-row. */
+    if(M>=2 && w->Sk==1 && w->Sn>1 && (w->N%64)==0 && !getenv("ORK_I4_NO_NSLICE_BCHAIN")){
+        const int NMAXd = c->soc->nmax;
+        int ok = 1;
+        int32_t *Ct = (int32_t*)malloc((size_t)M*(size_t)NMAXd*sizeof(int32_t));
+        if(Ct){
+            for(int ns=0; ns<w->Sn && ok; ns++){
+                const int n0 = ns*NMAXd;
+                int Nc = w->N - n0; if(Nc > NMAXd) Nc = NMAXd;
+                if(Nc <= 0 || (Nc%64)){ ok = 0; break; }        /* BCHAIN needs 64-wide N-blocks */
+                struct ork_w v = *w;
+                v.N = Nc; v.Sn = 1; v.Sk = 1;
+                v.Bb = &w->Bb[ns];
+                v.Bf = w->Bf ? &w->Bf[ns] : NULL;
+                v.bscale = w->bscale ? w->bscale + n0 : NULL;
+                v.sliced = NULL;                                 /* a view never recurses into the rescue */
+                v.own_buf_valid = 0; v.own_bufs = NULL; v.n_own_bufs = 0;   /* and owns nothing to free */
+                v.Bbc_valid = 0; v.Bbc_ns_valid = 0; v.Bbc_ns = NULL;
+                int nbv = Nc/64, ncv = nc; if(ncv > nbv) ncv = nbv; if(ncv < 1) ncv = 1;
+                if(orki_i4_run_bchain_db(c, &v, M, A, Ct, ncv) != 0){ ok = 0; break; }
+                for(int m=0; m<M; m++)
+                    memcpy(C + (size_t)m*w->N + n0, Ct + (size_t)m*Nc, (size_t)Nc*sizeof(int32_t));
+            }
+            free(Ct);
+            if(ok) return 0;
+            /* a slice refused: C may be partially written, but every path below rewrites all of it */
+        }
+    }
     /* Wide refuse-prone int4 PREFILL (Sn>1 or K>8192 — the shapes pack built w->sliced for): the per-row
      * orki_i4_run_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled
      * rescue (measured 663ms -> 107ms at M=128 N=16384). Decode (M==1) stays on the per-row path (cheap). */
