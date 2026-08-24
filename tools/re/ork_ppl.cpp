@@ -38,7 +38,14 @@
 #include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
+
 #endif
+
+/* ork residence query (Tier 15 stage 3). WEAK + extern "C": a build without ggml-ork links fine and simply
+ * skips the report. These MUST be at file scope with C linkage — declaring them inside a function in C++
+ * mangles the names, the weak symbols resolve to null, and the report silently never prints (observed). */
+extern "C" void ggml_backend_ork_residence(int *, size_t *) __attribute__((weak));
+extern "C" int  ggml_backend_ork_residence_report(void) __attribute__((weak));
 
 
 /* How many threads should the ggml threadpool get?
@@ -150,6 +157,41 @@ int main(int argc, char** argv){
             nt, nwin, W, (MAXW > 0 ? " [capped]" : ""), UB, nthr, n_vocab, (double)W*n_vocab*4/1048576.0);
 
     llama_batch b = llama_batch_init(W, 0, 1);
+
+    /* WARMUP before the clock (Tier 15 stage 3). Weights are materialized on the first graph, and for a
+     * packed >4 GiB model that load -- read, un-tile, int4->int8 inflate -- dwarfs the compute: on 27B a
+     * single-window run reported 220 s "scored" of which ~all was loading (30/30 profiler frames inside
+     * ork_i4a8_mm_load_tiled). Timing through it measures the loader, not the model, and the error grows
+     * with model size. One throwaway decode forces residence (ggml-ork prints "[ork READY]"), then the
+     * timed loop below measures steady state. ORK_PPL_NOWARM=1 restores the old behavior for comparison. */
+    if (!getenv("ORK_PPL_NOWARM")) {
+        const int64_t tw = llama_time_us();
+        /* FULL-WIDTH warmup, not one token. At M==1 the dense backbone is deliberately declined to the CPU
+         * (the NPU submit floor loses at M=1), so a 1-token warmup runs entirely on CPU, materializes NO
+         * NPU weights, and leaves the real load to land inside the scored window — measured: it reported
+         * "resident: 0 weights" while the run clearly had 400. Warm with the same shape the timed loop uses
+         * so the prefill path ork actually serves is the one that gets exercised. */
+        b.n_tokens = W;
+        for (int i = 0; i < W; ++i){ b.token[i] = toks[i]; b.pos[i] = i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 0; }
+        b.logits[W-1] = 1;
+        if (llama_decode(ctx, b) != 0) fprintf(stderr, "[ork_ppl] warmup decode failed (continuing)\n");
+        llama_memory_clear(llama_get_memory(ctx), true);
+        fprintf(stderr, "[ork_ppl] warmup + residence: %.1f s (excluded from the scored time below)\n",
+                (llama_time_us() - tw) / 1e6);
+        /* Ask the backend what is actually resident. A benchmark that cannot answer this is timing an
+         * unknown mixture of load and compute — which is how a 27B run once reported 220 s "scored" that
+         * was almost entirely weight load. Weak symbol: a build without ggml-ork just skips it. */
+        {
+            if (ggml_backend_ork_residence) {
+                int nw = 0; size_t rb = 0;
+                ggml_backend_ork_residence(&nw, &rb);
+                fprintf(stderr, "[ork_ppl] resident: %d weights, %.2f GiB (materialized during the warmup above)\n",
+                        nw, rb / (1024.0*1024.0*1024.0));
+            }
+            if (ggml_backend_ork_residence_report) ggml_backend_ork_residence_report();
+        }
+    }
+
     double nll = 0.0; long scored = 0; int64_t t0 = llama_time_us();
 
     for (int w = 0; w < nwin; ++w){
