@@ -283,6 +283,8 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     for(int i=0;i<c->dma_n;i++) orki_bdestroy(fd,&c->dma_tab[i]);
     if(c->dom_anchor){ for(int d=0;d<c->dom_cap;d++) if(c->dom_anchor[d].cpu) orki_bdestroy(fd,&c->dom_anchor[d]); free(c->dom_anchor); }   /* per-domain native anchors */
     if(c->i4arena){ for(int i=0;i<c->i4arena_n;i++) if(c->i4arena[i].cpu) orki_bdestroy(fd,&c->i4arena[i]); free(c->i4arena); }   /* #54 int4 expert import arena (bdestroy closes each chunk's heap_fd) */
+    for(int i=0;i<c->wchunk_n;i++) if(c->wchunk[i].cpu) orki_bdestroy(fd,&c->wchunk[i]);   /* weight-arena chunks: nothing freed these, so the kernel reaped them at fd close */
+    orki_live_reap(fd);   /* safety net: nothing may survive into drm_gem_release (wrong-domain unmap -> leaked IOVA) */
     free(c->cres); if(fd>=0)close(fd); free(c); }
 
 const char *ork_npu_soc(const ork_npu *c){return c->soc->id;}

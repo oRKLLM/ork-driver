@@ -236,6 +236,28 @@ static void orki_imp_unreg(struct buf*b){ pthread_mutex_lock(&orki_live_mu);
     for(int i=0;i<orki_imp_n;i++) if(orki_imp[i]==b){ orki_imp[i]=orki_imp[--orki_imp_n]; break; }
     pthread_mutex_unlock(&orki_live_mu); }
 volatile sig_atomic_t orki_sig_busy=0;
+/* FINAL REAP — destroy every buffer still registered live, immediately before the DRM fd closes.
+ *
+ * A multi-domain run ends with ~150-360 GEM handles still open (nothing owns them; the weight arena
+ * c->wchunk[] was one such class, now freed above), so the kernel reaps them itself in drm_gem_release.
+ * That is only safe because the rknpu import-domain bug is fixed — an imported object used to be filed
+ * under domain 0 whatever domain its sg was mapped in, so the kernel's reap unmapped from the wrong page
+ * table and stranded the IOVA (wiki: Exp-2026-08-24 Multi-Domain IOVA Leak; kernel patch 03). Freeing them
+ * ourselves is still correct and keeps the invariant simple: nothing survives into drm_gem_release.
+ * orki_bdestroy unregisters, so anything left here genuinely was not freed. ORK_REAP_TRACE=1 prints the
+ * count — the number to drive to zero by giving each class a real owner. */
+void orki_live_reap(int fd){
+    pthread_mutex_lock(&orki_live_mu);
+    int n = orki_live_n;
+    if(n && getenv("ORK_REAP_TRACE")) fprintf(stderr,"[ork REAP] %d buffers still live at fd close — destroying before the kernel does\n", n);
+    for(int i=0;i<n;i++){
+        struct rknpu_mem_destroy d; memset(&d,0,sizeof d);
+        d.handle=orki_live[i].handle; d.obj_addr=orki_live[i].obj;
+        ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    }
+    orki_live_n=0;
+    pthread_mutex_unlock(&orki_live_mu);
+}
 void ork_sig_teardown(int sig){
     if(!orki_sig_busy){ orki_sig_busy=1; int fd=orki_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
         if(fd>=0){ int n=orki_live_n;
@@ -1125,11 +1147,16 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w->fa_lut); free(w); return; }   /* Path B: free the daemon-resident weight */
     if(w->cpu_codes){ free(w->cpu_codes); free(w->bscale); free(w->fa_lut); free(w); return; }   /* OFFLINE weight: plain heap, no device buffers */
     if(c) ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before a per-domain bdestroy switches domains ("failed to destroy memory" + switch-timeout cascade) */
-    /* DO NOT activate the weight's domain here. It looks like the obvious fix for the teardown leak, and it
-     * HANGS THE MACHINE: rknpu_gem_object_destroy already calls rknpu_iommu_domain_get_and_switch itself, so
-     * a caller-side switch makes two, and the pair deadlocks in an uninterruptible D state that `timeout`
-     * cannot kill (observed: 45 min on a 25 min timeout, stack in rknpu_iommu_domain_get_and_switch, dmesg
-     * "switch iommu domain time out, id: 1"). The kernel owns domain selection on destroy; leave it alone.
+    /* DO NOT activate the weight's domain here -- it is REDUNDANT. rknpu_gem_object_destroy already calls
+     * rknpu_iommu_domain_get_and_switch itself, so the kernel owns domain selection on destroy and a
+     * caller-side switch merely adds a second one.
+     *
+     * An earlier revision of this comment claimed the caller-side switch HANGS THE MACHINE. That was a
+     * misattribution: the hang (uninterruptible D state in rknpu_iommu_domain_get_and_switch, dmesg
+     * "failed to destroy dma addr" then "switch iommu domain time out" repeating, unkillable by `timeout`)
+     * reproduces with this code ABSENT -- verified on a binary built from a tree with zero occurrences of
+     * it. The teardown hang is driver-side. Adding a switch here is still pointless, but it was not the
+     * cause.
      *
      * What that timeout DOES tell us is where the leak comes from: when the destroy-path switch times out,
      * the unmap runs against the wrong domain, WARN_ON(unmapped != size) fires, and the IOVA is never

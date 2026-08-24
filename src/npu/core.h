@@ -159,6 +159,7 @@ extern uint64_t orki_sram_total;
 extern volatile sig_atomic_t orki_sig_busy;
 int orki_imp_trace(void);
 int ork_dom(int dom);
+void orki_live_reap(int fd);   /* destroy every still-registered buffer before the DRM fd closes (see npu.c) */
 void orki_fold_scratch_free(ork_npu *c);
 void orki_live_add(int fd, uint32_t h, uint64_t o);
 void orki_live_del(uint32_t h);
