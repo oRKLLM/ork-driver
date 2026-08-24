@@ -36,6 +36,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <sys/stat.h>
 #ifdef _OPENMP
 #include <omp.h>
 
@@ -46,6 +47,7 @@
  * mangles the names, the weak symbols resolve to null, and the report silently never prints (observed). */
 extern "C" void ggml_backend_ork_residence(int *, size_t *) __attribute__((weak));
 extern "C" int  ggml_backend_ork_residence_report(void) __attribute__((weak));
+extern "C" bool ggml_backend_ork_extract_gguf(const char *, const char *) __attribute__((weak));
 
 
 /* How many threads should the ggml threadpool get?
@@ -93,6 +95,30 @@ int main(int argc, char** argv){
         return 2;
     }
     const char* model_path = argv[1];
+    /* A .orkpack is now a complete artifact (Tier 15 stage 2): it embeds the GGUF header/KV and every
+     * tensor the pack does not own. Accept one directly — extract the loadable (sparse) gguf beside it on
+     * first use, and point the backend at the pack. Beats making the caller carry, and keep in sync, two
+     * files that must match. The extracted gguf is a derived cache: delete it and it comes back. */
+    std::string _mp_hold;
+    if (strlen(model_path) > 8 && strcmp(model_path + strlen(model_path) - 8, ".orkpack") == 0) {
+        const std::string pack = model_path, gguf = pack + ".gguf";
+        if (!getenv("ORK_ORKPACK_PATH")) setenv("ORK_ORKPACK_PATH", pack.c_str(), 0);
+        /* The extracted gguf has HOLES where the pack owns tensors, so any op ggml computes itself would
+         * read zeros. Tell the backend, so it refuses to decline a pack-owned matmul. Detecting this in
+         * buffer_set_tensor does NOT work — that hook never fires for model weights (they live in CPU
+         * buffers, not ORK_Weights), which is the same reason the eager-load hook was unreachable. */
+        setenv("ORK_SOURCE_IS_STUB", "1", 1);
+        struct stat st;
+        if (stat(gguf.c_str(), &st) != 0) {
+            if (!ggml_backend_ork_extract_gguf || !ggml_backend_ork_extract_gguf(pack.c_str(), gguf.c_str())) {
+                fprintf(stderr, "[ork_ppl] %s carries no embedded metadata — pass the source .gguf instead\n",
+                        pack.c_str());
+                return 2;
+            }
+        }
+        _mp_hold = gguf; model_path = _mp_hold.c_str();
+        fprintf(stderr, "[ork_ppl] pack-native: %s (+ extracted %s)\n", pack.c_str(), _mp_hold.c_str());
+    }
     int W  = argc>3 ? atoi(argv[3]) : 512;
     int UB = argc>4 ? atoi(argv[4]) : 512;
     int MAXW = argc>5 ? atoi(argv[5]) : 0;
