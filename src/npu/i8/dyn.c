@@ -53,9 +53,26 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         return orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
     }
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
-    if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row */
+    if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row.
+        * ONE civac PER CACHE LINE, not per element. `dc civac` operates on the whole 64-byte line, so the old
+        * per-element walk issued the same line's maintenance 32x (64/sizeof(int16_t)) -- pure waste, and it ran
+        * on EVERY iteration of the completion spin. Measured on Qwen3.6-27B W4A4: a poor-man's profiler put
+        * 16 of 24 stack samples inside this function while the NPU sat at 0-27% utilisation; ffn_down alone
+        * polls no = M*N = 64*5120 = 327,680 elements per pass. This is the same pathology the K-SPLIT branch
+        * below already documents ("a full O(no) civac scan EVERY poll iteration, pathological on the large
+        * wide-K prefill surface"); the int4 path never got the fix. Coverage is unchanged -- every element is
+        * still inspected, only the redundant line maintenance is dropped. Walk by ADDRESS so an unaligned
+        * outptr still invalidates each line exactly once. */
         volatile int16_t *o = (volatile int16_t*)h->outptr[i];
-        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e]==ORK_DYN_SENT16) return 0; }
+        const uintptr_t LINE = 64;
+        uintptr_t p0 = (uintptr_t)o, pend = p0 + (uintptr_t)no * sizeof(int16_t);
+        for (uintptr_t ln = p0 & ~(LINE-1); ln < pend; ln += LINE) {
+            __asm__ volatile("dc civac,%0"::"r"((const void*)ln):"memory");
+            int e0 = ln <= p0 ? 0 : (int)((ln - p0) / sizeof(int16_t));
+            uintptr_t lend = ln + LINE; if (lend > pend) lend = pend;
+            int e1 = (int)((lend - p0) / sizeof(int16_t));
+            for (int e = e0; e < e1; e++) if (o[e] == ORK_DYN_SENT16) return 0;
+        }
         return 1; }
     int NMAXd = h->c->soc->nmax;
     if (h->oSk[i] > 1) {   /* K-SPLIT: oSk partial [M,N] blocks are one PC-chain (programs run sequentially), so the
