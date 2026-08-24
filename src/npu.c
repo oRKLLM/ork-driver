@@ -1154,7 +1154,12 @@ void ork_mm_free(ork_npu *c, ork_w *w){
 /* Resident NPU bytes a packed weight occupies (Bb tiles + optional full-K Bf) — for a streaming cache
  * to budget the 4 GiB IOVA window and decide when to evict. */
 int ork_w_set_group(ork_w *w, int G){
-    if(!w || w->dtype!=DT_I4) return -1;
+    /* DT_I8 is allowed too. Grouping is a property of the SCALE LAYOUT, not of the weight width: a
+     * DT_I4_ROT_A8 weight is int4 values inflated into int8 containers, and it carries per-(channel,
+     * K-group) scales exactly as the int4 tier does. Refusing DT_I8 here left gsize at 0, which made the
+     * grouped run path fall through to its int4-only gate and refuse -- so grouped scales and int8
+     * activations could not be combined at all, and W4A8 could not be measured against W4A4. */
+    if(!w || (w->dtype!=DT_I4 && w->dtype!=DT_I8)) return -1;
     if(G>0 && (w->K % G)) return -1;      /* K must divide into whole groups */
     w->gsize=G;
     return 0;

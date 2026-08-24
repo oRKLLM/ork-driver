@@ -373,6 +373,8 @@ ork_async *ork_async_launch(struct ork_async tmpl);
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);
 int orki_i4_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes);
 int orki_i8_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes);
+int orki_cpu_gemm_grouped(int M,int K,int N,int G,const int8_t *A,const int8_t *codes,
+                          const float *aScale,const float *bScale,float *C);
 ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 void orki_mc_recover_resubmit(ork_dyn_chain *h);
 void ork_install_term(void);

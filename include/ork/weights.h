@@ -180,6 +180,11 @@ ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, 
  * produces plausible weights. */
 const int8_t *ork_w_codes(const ork_w *w);
 
+/* GROUPED int8 run: per-(channel, K-group) scales, int8 weights, int8 activations -- the W4A8 tier.
+ * Offline is exact (shared kernel with the int4 twin); the on-device path is not implemented yet and
+ * refuses loudly. aScale[m*Sk+g], bScale[g*N+n]; C is fp32. */
+int          ork_i8_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C);
+
 ork_w       *ork_i4a8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* Zero-copy IMPORT variant of ork_i4a8_mm_load: resident tiles are dma-bufs the NPU reads in place (PRIME
  * import); the int4 nibbles inflate -> int8 directly into them. Bit-identical to ork_i4a8_mm_load (same

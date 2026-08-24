@@ -31,6 +31,31 @@
 #include "spine_kernels.h"
 
 /* RUN the slot's matmul (must be mapped). Same as ork_i8_mm_run on the slot's view. */
+/* GROUPED int8: per-(channel, K-group) scales against int8-container weights and int8 activations.
+ *
+ * Exists to make W4A8 measurable. The int4 grouped path hardcodes 4-bit activations, so grouped scales and
+ * int8 activations could not be combined, and the second half of the W4A4-vs-Q4_0 quality gap (predicted to
+ * be activation width, since the weight and activation error halves measure at parity) could not be tested.
+ *
+ * OFFLINE is the exact CPU accumulate, shared with the int4 twin -- one kernel, so the two cannot drift.
+ * ON DEVICE this is NOT YET IMPLEMENTED and refuses: per-group accumulation needs K-sliced int8 submits
+ * with an fp32 combine, which the int8 doorbell path does not do today. It refuses LOUDLY rather than
+ * silently falling back, because a fallback here would run the weight at a different effective precision
+ * than the pack specifies and report a plausible number -- the failure mode this codebase keeps hitting. */
+int ork_i8_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C){
+    if(!c||!w||!A||!aScale||!bScale||!C||M<1) return -1;
+    if(w->gsize<1 || (w->K % w->gsize)) return -1;
+    if(c->fd<0 && w->cpu_codes)
+        return orki_cpu_gemm_grouped(M,w->K,w->N,w->gsize,A,w->cpu_codes,aScale,bScale,C);
+    { static int said=0;
+      if(!said++) fprintf(stderr,
+          "[ork] ork_i8_mm_run_grouped: on-device grouped int8 is not implemented (K=%d N=%d G=%d).\n"
+          "[ork]   Offline scoring works; the device path needs K-sliced int8 submits with an fp32\n"
+          "[ork]   per-group combine. Refusing rather than running at the wrong effective precision.\n",
+          w->K, w->N, w->gsize); }
+    return -1;
+}
+
 int ork_i8_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(c && c->fd<0 && w && w->cpu_codes){ orki_cpu_gemm_i32(M,w->K,w->N,A,w->cpu_codes,C); return 0; }   /* OFFLINE: exact CPU MAC */
     if(w && w->is_orkd){   /* Path B: int8 run on the daemon — ring transport if attached, else socket */

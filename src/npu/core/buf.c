@@ -425,6 +425,40 @@ int orki_cpu_chain_i4(int S, const ork_mm_task_i4 *t){
         orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }
     return 0;
 }
+/* Per-group accumulate on the CPU, shared by the int4 and int8 grouped run paths.
+ *
+ * Per-group scales cannot factor out of the K-sum, so each group's int32 partial is scaled as it is
+ * produced and summed in fp32 — the same arithmetic the doorbell drain performs, with no device. The MAC
+ * stays int32 WITHIN a group (exactly as the hardware does) and takes ONE fp32 scale per (row, group,
+ * channel); a per-element float multiply would be both slower and a different rounding.
+ *
+ * DTYPE-AGNOSTIC by construction, and that is the point: the codes are int8 either way. An int4 weight and
+ * an int4 weight inflated into int8 containers hold the SAME values, so grouping is a property of the SCALE
+ * LAYOUT, not of the weight width. Sharing one kernel is what lets W4A8 be measured against W4A4 without a
+ * second copy of this loop drifting from the first.
+ *
+ * aScale[m*Sk+g], bScale[g*N+n] — the shipped layouts. */
+int orki_cpu_gemm_grouped(int M,int K,int N,int G,const int8_t *A,const int8_t *codes,
+                          const float *aScale,const float *bScale,float *C){
+    if(M<1||K<1||N<1||G<1||(K%G)||!A||!codes||!aScale||!bScale||!C) return -1;
+    const int Sk=K/G;
+    #pragma omp parallel for schedule(static) if(M>1)
+    for(int m=0;m<M;m++){
+        float *crow=C+(size_t)m*N;
+        for(int n=0;n<N;n++) crow[n]=0.0f;
+        int32_t *acc=malloc((size_t)N*sizeof *acc);
+        if(!acc) continue;
+        for(int g=0;g<Sk;g++){
+            const float as=aScale[(size_t)m*Sk+g];
+            const float *bs=bScale+(size_t)g*N;
+            orki_cpu_gemm_i32(1,G,N,A+(size_t)m*K+(size_t)g*G,codes+(size_t)g*G*N,acc);
+            for(int n=0;n<N;n++) crow[n]+=(float)acc[n]*as*bs[n];
+        }
+        free(acc);
+    }
+    return 0;
+}
+
 int orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t){
     for(int i=0;i<S;i++){ const ork_w *w=t[i].w; if(!w||!w->cpu_codes) return -1;
         orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }

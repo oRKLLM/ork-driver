@@ -196,30 +196,8 @@ int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
     /* OFFLINE: the exact per-group accumulate the doorbell drain performs, on the CPU. Per-group scales
      * cannot factor out of the K-sum, so each group's int32 partial is scaled as it is produced and
      * summed in fp32 — same arithmetic, no device. aScale[m*Sk+g], bScale[g*N+n] (the shipped layouts). */
-    if(c && c->fd<0 && w && w->cpu_codes && w->gsize>0){
-        const int G=w->gsize, Sk=w->K/G, K=w->K, N=w->N;
-        #pragma omp parallel for schedule(static) if(M>1)
-        for(int m=0;m<M;m++){
-            float *crow=C+(size_t)m*N;
-            for(int n=0;n<N;n++) crow[n]=0.0f;
-            int32_t *acc=malloc((size_t)N*sizeof *acc);
-            if(!acc) continue;
-            for(int g=0;g<Sk;g++){
-                /* int32 WITHIN the group, exactly as the MAC does, then ONE fp32 scale per (row,group,
-                 * channel) — not a per-element float multiply, which would be both slower and a
-                 * different rounding than the hardware. The group product is a [1 x G].[G x N] slice of
-                 * contiguous cpu_codes rows, so it reuses the NEON kernel rather than a second scalar
-                 * copy of the same loop (M=1 there, so its own omp is inert — the parallelism is the
-                 * per-row loop out here). */
-                const float as=aScale[(size_t)m*Sk+g];
-                const float *bs=bScale+(size_t)g*N;
-                orki_cpu_gemm_i32(1,G,N,A+(size_t)m*K+(size_t)g*G,w->cpu_codes+(size_t)g*G*N,acc);
-                for(int n=0;n<N;n++) crow[n]+=(float)acc[n]*as*bs[n];
-            }
-            free(acc);
-        }
-        return 0;
-    }
+    if(c && c->fd<0 && w && w->cpu_codes && w->gsize>0)
+        return orki_cpu_gemm_grouped(M,w->K,w->N,w->gsize,A,w->cpu_codes,aScale,bScale,C);
     if(!w||w->dtype!=DT_I4||!w->gsize) return -1;
     if(orki_check_overlap("ork_i4_mm_run_grouped", (uintptr_t)A, (uintptr_t)A + (size_t)M * w->K, (uintptr_t)C, (uintptr_t)C + (size_t)M * w->N * 4)) return -1;
     /* BCHAIN FAST PATH (M>=2). The row-decomposed doorbell below predates the int4 BCHAIN work and never
