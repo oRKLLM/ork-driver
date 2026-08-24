@@ -196,6 +196,39 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
  * ork_i4_w_dump_cpu / tile_i4_Bslice, and it is FACTORED rather than copied because the tiler and the
  * un-tiler drifting apart is silent: you get plausible weights and a slightly wrong model. Both the
  * offline ork_i4_mm_load and the i4a8 inflate path below go through this one walk. `codes` is K*N bytes. */
+/* Device-tiled int4 blob -> the CPU kernels' per-channel layout (ork_native_cpu.h, ORK_CPU_I4:
+ * "byte j = w[2j] low | w[2j+1] high" per output channel, plane [N][K/2]).
+ *
+ * The two engines want opposite majorness. The NPU blob is k-major and tiled for the regcmd datapath; the
+ * CPU GEMV walks ONE output channel at a time, so it needs n-major nibbles. Without this, a dense weight
+ * simply cannot be computed on the CPU -- which is what forces M=1 decode to read the ORIGINAL gguf
+ * (28.6 GiB of q8 on a 27B) instead of the pack's 11.3 GiB of int4.
+ *
+ * Costs one K*N int8 scratch (52 MB at the largest 27B shape), so convert PER TENSOR, never model-wide.
+ * out=NULL returns the required byte count. The alternative -- storing a second, CPU-layout blob in the
+ * pack -- is cheaper at run time (mmap, zero-copy, no anonymous RAM) but costs disk and a repack; this is
+ * the conversion that makes the pack we already have usable from the CPU. */
+size_t ork_i4_cpu_blob_from_tiled(ork_npu *c, int K, int N, const void *blob, size_t n, uint8_t *out, size_t cap){
+    if(!c || K<=0 || N<=0 || (K&1)) return 0;
+    const size_t need = (size_t)N * (size_t)(K/2);
+    if(!out) return need;
+    if(cap < need) return 0;
+    int8_t *codes = (int8_t*)malloc((size_t)K*(size_t)N);
+    if(!codes) return 0;
+    if(orki_i4_untile_blob(c,K,N,blob,n,codes)){ free(codes); return 0; }
+    const size_t kh = (size_t)(K/2);
+    for(int nn=0; nn<N; nn++){
+        uint8_t *dst = out + (size_t)nn*kh;
+        for(int j=0; j<K/2; j++){
+            const int lo = codes[(size_t)(2*j)  *N + nn] & 0xf;
+            const int hi = codes[(size_t)(2*j+1)*N + nn] & 0xf;
+            dst[j] = (uint8_t)(lo | (hi<<4));
+        }
+    }
+    free(codes);
+    return need;
+}
+
 int orki_i4_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, int8_t *codes){
     if(!c || !blob || !codes || (K%32) || (N%64)) return -1;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;

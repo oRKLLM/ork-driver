@@ -222,6 +222,10 @@ ork_w       *ork_i4_mm_load_arena(ork_npu *ctx, int K, int N, const void *blob, 
  * no native-alloc outlier — for co-resident fused per-tensor weights). K%32,N%32; dump/pack out=NULL ->
  * required byte size. */
 size_t       ork_i8_w_dump_cpu_st(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
+/* Device-tiled int4 blob -> the CPU GEMV's per-channel nibble layout (see ork_native_cpu.h). Lets M=1
+ * decode run on the CPU from the PACK's int4 instead of the source gguf's q8. out=NULL -> required bytes
+ * (N*K/2). Allocates a K*N int8 scratch internally, so call it per tensor. */
+size_t       ork_i4_cpu_blob_from_tiled(ork_npu *ctx, int K, int N, const void *blob, size_t n, unsigned char *out, size_t cap);
 size_t       ork_i4a8_pack_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap);  /* nf4: 1=NF4 codebook, 0=uniform (caller routes by source: full-precision->NF4) */
 /* GPTQ int4 weight quant (ork_gptq.c; in-tree, NO external deps). Error-compensated column-sequential rounding
  * with the calibration Hessian H=X^T X -> uniform symmetric int4 [-8,7] + per-(row,group) scale (native-W4A4
