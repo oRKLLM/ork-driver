@@ -70,3 +70,20 @@ you is whether that difference GENERALISES to the full text. So: screen to rank 
 release claim.
 
 Runs one arm at a time under `npu_guard.sh` (the NPU is single-stream and the board is shared).
+
+## `orkpack_info.sh` — check a pack's format version BEFORE pointing the runtime at it
+
+A pack older than the reader is marked *stale*, and stale means **regenerate**: opening an old pack does not
+fail, it silently **overwrites** it. On 2026-08-24 the validated board held 53 pre-v6 packs totalling
+220 GiB — several 15-17 GiB artifacts costing hours to rebuild — and a run came seconds from destroying one.
+
+```sh
+tools/util/orkpack_info.sh ~/*.orkpack     # survey; exit 1 if any are at risk
+```
+
+Read-only. Prints version, entry count, quant_sig and whether this tree can load each pack. The footer is
+the last 32 bytes with the magic as its LAST field, which is easy to misread from a hex dump — this encodes
+it once so nobody has to.
+
+Packs above `ORK_ORKPACK_MAX_REGEN_MB` (default 2048) now refuse to regenerate; `ORK_ORKPACK_CLOBBER=1`
+overrides when discarding is genuinely intended.
