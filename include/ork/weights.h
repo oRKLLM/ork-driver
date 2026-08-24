@@ -173,7 +173,7 @@ size_t       ork_i4a8_w_dump(const ork_w *w, void *out, size_t cap);
  * writes) and inflate them into int8 containers for the int8 MAC. ork_i4a8_mm_load handles the COMPACT
  * container instead (hdr + bscale + nibbles) and rejects this layout on its exact-size gate, which is why
  * the rotated-i4a8 tier never loaded. Scales come from the caller (this format carries none). */
-ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n);
+ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n, int G);
 
 /* OFFLINE codes of a CPU-backed weight (NULL when device-resident). For tests that must prove an offline
  * load recovered exactly the packed values; the un-tilers are index arithmetic and a wrong index still

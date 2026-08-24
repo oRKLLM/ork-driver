@@ -27,6 +27,7 @@
 #include <cmath>
 #include <vector>
 #include <string>
+#include <algorithm>
 
 static void fwht_norm(float * a, int n) {
     for (int len = 1; len < n; len <<= 1)
@@ -106,7 +107,7 @@ static void quant_row(float * v, int K, int blk, int qmax) {
 
 /* mode: 0 = ggml Q4_0 weights + Q8_0 activations; 1 = ours per-channel W4A4; 2 = ours G=32 W4A4;
  *       3 = ours G=32 rotated W4A4; 4 = ours G=32 rotated W4A8 */
-static double mm_err(const float * W, int K, int N, int M, int mode, int b) {
+static double mm_err(const float * W, int K, int N, int M, int mode, int b, double * tail = nullptr) {
     const int NS = N < 256 ? N : 256;
     std::vector<float> A((size_t) M * K), Aq((size_t) M * K), wref(K), wq(K);
     for (size_t i = 0; i < A.size(); i++) {
@@ -140,7 +141,11 @@ static double mm_err(const float * W, int K, int N, int M, int mode, int b) {
             quant_row(c, K, (mode == 1) ? 0 : 32, 7);
         }
     }
+    /* TAIL, not just RMS. Perplexity is driven by the tokens a model gets badly wrong, not by mean error,
+     * so two schemes with equal RMS can differ a lot in quality if one has a heavier tail. Collect every
+     * per-output absolute error and report percentiles normalised by RMS(ref). */
     double num = 0.0, den = 0.0;
+    std::vector<double> errs; errs.reserve((size_t) NS * M);
     for (int n = 0; n < NS; n++) {
         const float * wr = W + (size_t) n * K;         /* reference: ORIGINAL weights, unrotated */
         const float * wqp = Wq.data() + (size_t) n * K;
@@ -151,7 +156,17 @@ static double mm_err(const float * W, int K, int N, int M, int mode, int b) {
             for (int k = 0; k < K; k++) { ref += (double) ar[k] * (double) wr[k];
                                           got += (double) aq[k] * (double) wqp[k]; }
             num += (got - ref) * (got - ref); den += ref * ref;
+            errs.push_back(fabs(got - ref));
         }
+    }
+    if (tail && !errs.empty()) {
+        std::sort(errs.begin(), errs.end());
+        const double rms_ref = sqrt(den / (double) errs.size());
+        const size_t z = errs.size();
+        tail[0] = errs[(size_t)(0.50 * (z-1))] / rms_ref;
+        tail[1] = errs[(size_t)(0.99 * (z-1))] / rms_ref;
+        tail[2] = errs[(size_t)(0.999 * (z-1))] / rms_ref;
+        tail[3] = errs[z-1] / rms_ref;
     }
     return (den > 0.0) ? sqrt(num / den) : 0.0;
 }
@@ -187,6 +202,7 @@ int main(int argc, char ** argv) {
     int done = 0;
     double sQ = 0, sC = 0, sG = 0, sR = 0;
     double mQ = 0, mC = 0, mG = 0, mR = 0, mA = 0;
+    double TL[5][4] = {{0}};
     for (ggml_tensor * t = ggml_get_first_tensor(mc); t && done < maxt; t = ggml_get_next_tensor(mc, t)) {
         if (ggml_n_dims(t) != 2 || !strstr(t->name, want)) continue;
         const int K = (int) t->ne[0], N = (int) t->ne[1];
@@ -205,11 +221,13 @@ int main(int argc, char ** argv) {
         const double g = ours(W.data(), K, N, 32, false, b);
         const double r = ours(W.data(), K, N, 32, true,  b);
         printf("%-34s %6d %6d | %8.5f %8.5f %8.5f %8.5f\n", t->name, K, N, q, c, g, r);
-        mQ += mm_err(W.data(), K, N, 16, 0, b);
-        mC += mm_err(W.data(), K, N, 16, 1, b);
-        mG += mm_err(W.data(), K, N, 16, 2, b);
-        mR += mm_err(W.data(), K, N, 16, 3, b);
-        mA += mm_err(W.data(), K, N, 16, 4, b);
+        { double tl[5][4];
+          mQ += mm_err(W.data(), K, N, 16, 0, b, tl[0]);
+          mC += mm_err(W.data(), K, N, 16, 1, b, tl[1]);
+          mG += mm_err(W.data(), K, N, 16, 2, b, tl[2]);
+          mR += mm_err(W.data(), K, N, 16, 3, b, tl[3]);
+          mA += mm_err(W.data(), K, N, 16, 4, b, tl[4]);
+          for (int u=0;u<5;u++) for (int v=0;v<4;v++) TL[u][v] += tl[u][v]; }
         sQ += q; sC += c; sG += g; sR += r; done++;
     }
     if (done) {
@@ -221,6 +239,13 @@ int main(int argc, char ** argv) {
         printf("  %-30s %8.5f\n", "ours G=32 (W4A4)",        mG/done);
         printf("  %-30s %8.5f\n", "ours G=32 rotated (W4A4)",mR/done);
         printf("  %-30s %8.5f\n", "ours G=32 rotated (W4A8)",mA/done);
+        static const char * nm[5] = { "ggml Q4_0 (W4 x A8)", "ours per-channel (W4A4)", "ours G=32 (W4A4)",
+                                      "ours G=32 rotated (W4A4)", "ours G=32 rotated (W4A8)" };
+        printf("\nTAIL of the per-output error, normalised by RMS(ref) -- what perplexity actually punishes:\n");
+        printf("  %-30s %8s %8s %8s %8s\n", "", "p50", "p99", "p99.9", "max");
+        for (int u = 0; u < 5; u++)
+            printf("  %-30s %8.4f %8.4f %8.4f %8.4f\n", nm[u],
+                   TL[u][0]/done, TL[u][1]/done, TL[u][2]/done, TL[u][3]/done);
     }
     gguf_free(gg); ggml_free(mc);
     return done ? 0 : 1;

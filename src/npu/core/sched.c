@@ -15,6 +15,7 @@
 #include <sys/ioctl.h>
 #include <stdarg.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include "ork_regs.h"
 #include "regcmd_i8.h"
 #include "npu/internal.h"
@@ -52,6 +53,22 @@ ork_npu *ork_npu_init(void){
     orki_ork_prof = getenv("ORK_PROFILE") ? 1 : 0;
     orki_load_prof = getenv("ORK_LOAD_PROF") ? 1 : 0;
     const char*card=getenv("ORK_NPU_CARD"); if(!card)card=soc->card;
+    /* RAISE RLIMIT_NOFILE to the hard limit. Every resident weight is a dma-buf and every dma-buf import
+     * costs a FILE DESCRIPTOR, so the soft default of 1024 is a real ceiling on how many weights can be
+     * resident -- a 400-weight pack sits close enough to it that the failure shows up as
+     * PRIME_FD_TO_HANDLE ENOMEM followed by the bcreate copy-fallback failing too, which reads like memory
+     * or IOVA exhaustion and is neither. Grouped weights make it acute: one buffer per K-group is
+     * K/G buffers per weight, so 400 weights at G=32 want ~45,000 descriptors.
+     * The hard limit is typically 524288, so this costs nothing and removes a whole class of
+     * misdiagnosis. Best-effort: a failure here is not fatal, the old ceiling simply stays. */
+    { struct rlimit rl;
+      if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+          const rlim_t was = rl.rlim_cur;
+          rl.rlim_cur = rl.rlim_max;
+          if (setrlimit(RLIMIT_NOFILE, &rl) == 0 && getenv("ORK_VERBOSE"))
+              fprintf(stderr, "[ork] RLIMIT_NOFILE %llu -> %llu (dma-buf imports cost one fd each)\n",
+                      (unsigned long long) was, (unsigned long long) rl.rlim_max);
+      } }
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default 50µs): precise short nanosleeps for the doorbell backoffs */
     orki_act(fd,RKNPU_GET_DRV_VERSION,0);orki_act(fd,RKNPU_POWER_ON,0);orki_act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);

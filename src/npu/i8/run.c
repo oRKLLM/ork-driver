@@ -47,13 +47,57 @@ int ork_i8_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
     if(w->gsize<1 || (w->K % w->gsize)) return -1;
     if(c->fd<0 && w->cpu_codes)
         return orki_cpu_gemm_grouped(M,w->K,w->N,w->gsize,A,w->cpu_codes,aScale,bScale,C);
-    { static int said=0;
-      if(!said++) fprintf(stderr,
-          "[ork] ork_i8_mm_run_grouped: on-device grouped int8 is not implemented (K=%d N=%d G=%d).\n"
-          "[ork]   Offline scoring works; the device path needs K-sliced int8 submits with an fp32\n"
-          "[ork]   per-group combine. Refusing rather than running at the wrong effective precision.\n",
-          w->K, w->N, w->gsize); }
-    return -1;
+    /* DEVICE. A K-group is structurally an independent [G x N] matmul -- the same decomposition
+     * ork_i4_mm_run_grouped uses. The hardware needs nothing new: it runs Sk ordinary W8A8 matmuls and the
+     * per-group fp32 combine happens here, because per-group scales cannot factor out of the K-sum.
+     * Requires the weight to have been loaded GROUP-TILED (one DMA buffer per group) -- a group's bytes are
+     * strided across the normal KS-sliced layout, so the views cannot be formed after the fact. */
+    if(w->dtype!=DT_I8 || w->Sn!=1 || !w->Bb || w->Sk != w->K / w->gsize){
+        static int said=0;
+        if(!said++) fprintf(stderr,
+            "[ork] ork_i8_mm_run_grouped: weight is not group-tiled (K=%d N=%d G=%d Sk=%d Sn=%d).\n"
+            "[ork]   Load it with ork_i4a8_mm_load_tiled(..., G) so each K-group is its own tile.\n",
+            w->K, w->N, w->gsize, w->Sk, w->Sn);
+        return -1;
+    }
+    { const int G=w->gsize, SG=w->K/G, N=w->N, K=w->K;
+      ork_w   *views  = calloc((size_t)SG, sizeof *views);
+      int8_t  *Aslice = malloc((size_t)M*K);
+      int32_t *P      = malloc((size_t)SG*M*N*sizeof *P);
+      if(!views||!Aslice||!P){ free(views); free(Aslice); free(P); return -1; }
+      ork_mm_task_i8 *tk = calloc((size_t)SG, sizeof *tk);
+      if(!tk){ free(views); free(Aslice); free(P); return -1; }
+      for(int g=0; g<SG; g++){
+          views[g].K=G; views[g].N=N; views[g].Sk=1; views[g].Sn=1; views[g].dtype=DT_I8;
+          views[g].owns=0;                                   /* VIEW: ork_mm_free must not free Bb */
+          views[g].domain=w->domain; views[g].Bb=&w->Bb[g];
+          int8_t *Ag=Aslice+(size_t)g*M*G;
+          for(int m=0;m<M;m++) memcpy(Ag+(size_t)m*G, A+(size_t)m*K+(size_t)g*G, (size_t)G);
+          tk[g].w=&views[g]; tk[g].M=M; tk[g].A=Ag; tk[g].C=P+(size_t)g*M*N;
+      }
+      /* ONE submit for all SG groups. Issuing them separately is correct but pays the ~167 us submit floor
+       * per group -- 112 of them at K=3584,G=32 is ~18 ms per matmul, which is not a datapath, it is a
+       * demonstration. orki_i8_run_chain_impl takes up to 1024 links and wants exactly what a group view
+       * already is: DT_I8, K%32==0, Sk==1. So the fusion is the chain call, not a new mechanism. */
+      int rc = orki_i8_run_chain_impl(c, SG, tk, NULL, -1);
+      free(tk);
+      if(!rc){
+          #pragma omp parallel for schedule(static) if(M>1)
+          for(int m=0;m<M;m++){
+              float *cr=C+(size_t)m*N;
+              for(int n=0;n<N;n++) cr[n]=0.0f;
+              for(int g=0; g<SG; g++){
+                  const int32_t *pg=P+(size_t)g*M*N+(size_t)m*N;
+                  const float as=aScale[(size_t)m*SG+g]; const float *bs=bScale+(size_t)g*N;
+                  for(int n=0;n<N;n++) cr[n]+=(float)pg[n]*as*bs[n];
+              }
+          }
+      }
+      free(views); free(Aslice); free(P);
+      /* SG submits per matmul -- correctness first. Fusing them into one chained submit (as the int4 path
+       * does via run_experts_bchain_db) is the optimisation, and it is where the grouped overhead lives. */
+      return rc ? -1 : 0;
+    }
 }
 
 int ork_i8_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
