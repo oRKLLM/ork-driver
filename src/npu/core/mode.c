@@ -129,7 +129,20 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
      * ork_npu_enter — useless for deciding WHICH XSPEC row is firing. Name the profile and the transition. */
     if(rst && getenv("ORK_DEBUG_RESET"))
         fprintf(stderr,"[ork XSPEC] reset profile=%d from=%d to=%d chain=%d\n", profile, from, to, chain);
-    if(rst){ orki_act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
+    if(rst){
+        /* ORK_DEBUG_RESET prices the transition. MEASURED 2026-08-24 on the 27B mixed-tier run: mean
+         * 105 ms per ACT_RESET, 160 of them = 16.8 s of a 161.6 s scored run (10.4%). This is the ioctl
+         * alone -- the induced cold re-warm and per-core LUT reload land later in the run path -- so it is
+         * a LOWER bound. 105 ms is also why a standalone SDP op can never live on the NPU: at a few hundred
+         * activations per forward the transitions alone would dwarf the compute, which is what pushed
+         * activations onto CPU/NEON and left in-chain fusion as the only viable on-NPU form. */
+        if(getenv("ORK_DEBUG_RESET")){
+            static double acc=0; static long nn=0;
+            double t0=ork_now_us(); orki_act(fd,RKNPU_ACT_RESET,0); acc+=ork_now_us()-t0; nn++;
+            fprintf(stderr,"[ork XSPEC-COST] n=%ld total=%.1fms mean=%.0fus\n", nn, acc/1000.0, acc/nn);
+        } else orki_act(fd,RKNPU_ACT_RESET,0);
+        for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
+    }
     int wclr=0;
     switch(x->wc){
       case WC_NOTKW:         wclr=!kw; break;
