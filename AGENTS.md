@@ -129,6 +129,15 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 ```
 
 - The validated board is RK3588 (SBC IP: `10.3.0.236`).
+- **THE BOARD DOES NOT RUN A STOCK KERNEL.** It runs `6.1.115-vendor-rk35xx-sram`, carrying two of our
+  changes: the NPU SRAM enabler (dts + `CONFIG_ROCKCHIP_RKNPU_SRAM=y`) and a `rknpu_job.c` IOMMU
+  domain-refcount `put` on job timeout. Both were undocumented for weeks and were therefore a hidden
+  variable in every board measurement — a multi-day IOVA-leak investigation concluded "kernel-side, not
+  ours" while running a patched driver. So: **record `uname -r` with any result that matters, and treat
+  results from different kernels as incomparable.** The patches, rationale, the three kernels available in
+  `/boot` for bisecting, and the revert procedure (`/boot/RESTORE_STOCK_KERNEL.sh`, two symlink flips) are
+  on the wiki: *Kernel-Modifications*. Kernel diffs live THERE, not here — this repo is a userspace library
+  over the stock DRM uABI and should stay one.
 - **RUN `sudo tools/util/npu_guard.sh -- <cmd>` FOR ANYTHING THAT TOUCHES THE NPU.** More than one agent
   may share this board. The guard checks who holds the render node (`/proc/*/fd` → `renderD12[89]`), that
   NPU utilisation is idle, and that no fault storm is in progress; with `--` it holds an flock for the
