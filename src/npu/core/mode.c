@@ -125,6 +125,10 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
       case RC_SDPKW:         rst=!ork_sdp_noreset(); break;   /* transient SDP: reset only if the keep-warm skip is OFF (ORK_SDP_NORESET=0) — byte-identical to the old inline `if(!ork_sdp_noreset())` */
       default:               rst=0;
     }
+    /* ORK_DEBUG_RESET attribution: the generic ACT_RESET log names only a return address, which is always
+     * ork_npu_enter — useless for deciding WHICH XSPEC row is firing. Name the profile and the transition. */
+    if(rst && getenv("ORK_DEBUG_RESET"))
+        fprintf(stderr,"[ork XSPEC] reset profile=%d from=%d to=%d chain=%d\n", profile, from, to, chain);
     if(rst){ orki_act(fd,RKNPU_ACT_RESET,0); for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; } }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
     int wclr=0;
     switch(x->wc){

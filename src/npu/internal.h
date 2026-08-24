@@ -281,7 +281,15 @@ int  orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t);
 
 /* ---- dtype predicates ---- */
 #define ORK_I8_LIVE(dt) ((dt)==DT_I8 || (dt)==3)
-#define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)
+#define ORK_INT_DT(dt) ((dt)==DT_I8 || (dt)==DT_I4 || (dt)==3)   /* 3=I8_CHAIN. I4_CHAIN (4) is DELIBERATELY
+ * ABSENT and must stay that way. It looks like an oversight -- ORK_MIXED_NOTHRASH exists to suppress mixed
+ * int8/int4 mode churn, and the mixed-tier CHAIN ping-pong is the biggest source of it -- but the exclusion
+ * is what makes the knob safe. MEASURED 2026-08-24 on Qwen3.6-27B (q27_ra8: 80 weights promoted to i4a8,
+ * which ride the int8 datapath, interleaved with int4 -> I4_CHAIN<->I8_CHAIN once per promoted weight per
+ * forward, 160 ACT_RESETs): adding (dt)==4 here lets KWP_MC keep warm across 4->3, drops the reset count to
+ * 80 -- and PPL goes 10.4421 -> 5029965.1161. The I4_CHAIN->I8_CHAIN reset is LOAD-BEARING; the datapath
+ * cannot cross that boundary warm. Reduce this churn by avoiding the transition (uniform-tier packs: the
+ * G=512 pack takes the same model from 160 resets to 2), never by widening this macro. */
 #define ORK_KW_DT(dt) (ORK_I8_LIVE(dt) || (dt)==DT_F16)
 
 /* ---- env-knob accessors: one-line cached getenv, static inline so every module can read them
