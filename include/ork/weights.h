@@ -180,6 +180,14 @@ ork_w *      ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, 
  * produces plausible weights. */
 const int8_t *ork_w_codes(const ork_w *w);
 
+/* Resident IOVA bytes a weight of (K,N) will occupy at resident width `wbits` (4 = int4 nibbles, 8 = int8
+ * containers, which is what an int4-on-disk i4a8/rot_a8 weight inflates to). Includes the full-K Bf
+ * companion exactly when the loaders build one, plus per-tile page padding, and honours ORK_NO_BF itself.
+ * want_bf: -1 follows ORK_NO_BF, 0/1 forces (a sizer needs both to test Bf against a RAM budget).
+ * A multi-domain consumer MUST size from this rather than re-deriving it: the two models drift (they have),
+ * and an under-count overflows a domain, whose failed IOVA allocation leaks a mapping until reboot. */
+size_t       ork_w_resident_bytes(ork_npu *c, int K, int N, int wbits, int want_bf);
+
 /* GROUPED int8 run: per-(channel, K-group) scales, int8 weights, int8 activations -- the W4A8 tier.
  * Offline is exact (shared kernel with the int4 twin); the on-device path is not implemented yet and
  * refuses loudly. aScale[m*Sk+g], bScale[g*N+n]; C is fp32. */

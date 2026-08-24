@@ -735,11 +735,6 @@ ork_w *ork_f16_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
 /* PERSIST. Serialize a packed weight's resident tile bytes (Bb only; Bf is a regenerable decode-only
  * optimization) into `out` in tile order — the on-disk form for pre-packed (.orkpack) weights. Each
  * tile is its page-padded buffer size, so it round-trips through ork_i8_mm_load. Pass out=NULL to size. */
-/* OFFLINE codes, read-only, or NULL for a device-resident weight. Exists so a test can assert that an
- * offline load recovered EXACTLY what was packed — the un-tilers are index arithmetic, and index arithmetic
- * that is subtly wrong still yields plausible weights (see test_offline_load). Not a production accessor. */
-const int8_t *ork_w_codes(const ork_w *w){ return w ? w->cpu_codes : NULL; }
-
 size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
     if(!w) return 0;
     /* OFFLINE weight: no Bb was ever allocated. Tile the raw codes with the CPU twin, which is asserted
@@ -1130,6 +1125,18 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     if(w->is_orkd){ if(c && c->daemon) orkd_free_weight(c->daemon, w->orkd_id); free(w->fa_lut); free(w); return; }   /* Path B: free the daemon-resident weight */
     if(w->cpu_codes){ free(w->cpu_codes); free(w->bscale); free(w->fa_lut); free(w); return; }   /* OFFLINE weight: plain heap, no device buffers */
     if(c) ork_dom_flush_if_dirty(c);   /* #54: clear any stuck job before a per-domain bdestroy switches domains ("failed to destroy memory" + switch-timeout cascade) */
+    /* DO NOT activate the weight's domain here. It looks like the obvious fix for the teardown leak, and it
+     * HANGS THE MACHINE: rknpu_gem_object_destroy already calls rknpu_iommu_domain_get_and_switch itself, so
+     * a caller-side switch makes two, and the pair deadlocks in an uninterruptible D state that `timeout`
+     * cannot kill (observed: 45 min on a 25 min timeout, stack in rknpu_iommu_domain_get_and_switch, dmesg
+     * "switch iommu domain time out, id: 1"). The kernel owns domain selection on destroy; leave it alone.
+     *
+     * What that timeout DOES tell us is where the leak comes from: when the destroy-path switch times out,
+     * the unmap runs against the wrong domain, WARN_ON(unmapped != size) fires, and the IOVA is never
+     * reclaimed. So the leak is a consequence of domain-switch timeouts under teardown churn, not of the
+     * caller failing to select a domain. Fixing it means reducing switch pressure / ensuring the NPU is
+     * idle at teardown, not adding switches. */
+
     if(c && w->owns){
         size_t nb=(size_t)w->Sk*w->Sn;
         if(w->Bb) for(size_t i=0;i<nb;i++) if(w->Bb[i].cpu) orki_bdestroy(c->fd,&w->Bb[i]);

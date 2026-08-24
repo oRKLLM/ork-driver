@@ -459,6 +459,44 @@ int orki_cpu_gemm_grouped(int M,int K,int N,int G,const int8_t *A,const int8_t *
     return 0;
 }
 
+/* OFFLINE codes, read-only, or NULL for a device-resident weight. Exists so a test can assert that an
+ * offline load recovered EXACTLY what was packed — the un-tilers are index arithmetic, and index arithmetic
+ * that is subtly wrong still yields plausible weights (see test_offline_load). Not a production accessor. */
+const int8_t *ork_w_codes(const ork_w *w){ return w ? w->cpu_codes : NULL; }
+
+/* RESIDENT IOVA bytes a weight of (K,N) will occupy once loaded at resident width `wbits` — 4 for native
+ * int4 nibbles, 8 for int8 containers (which is what an int4-ON-DISK i4a8 / rot_a8 weight INFLATES to at
+ * load). Includes the full-K Bf companion exactly when the loaders build one, and the per-tile page padding
+ * they actually allocate.
+ *
+ * SINGLE SOURCE OF TRUTH, and it exists because the alternative failed. The consumer (a domain sizer) used
+ * to re-derive this from its own table, which meant two models of the same allocation in two repos with no
+ * gate to catch drift -- and they drifted twice at once: it sized every weight in a MIXED pack at one global
+ * precision (missing the 2x on inflated entries, ~3 GiB on a 27B), and it gated Bf at K<=4096 where the
+ * loaders use K<=10752 (missing a full-K companion on every 4096<K<=10752 weight, which a 27B is full of).
+ * An under-count does not merely mis-plan: the overflowing domain's IOVA allocation fails, and a failed
+ * allocation leaks a mapping the kernel cannot reclaim, degrading the board until reboot.
+ *
+ * So callers must ASK rather than model. want_bf: -1 = follow ORK_NO_BF (the normal case, so a caller
+ * cannot disagree with the loader about it), 0/1 = force, which a sizer needs to compare a with-Bf
+ * footprint against a RAM budget before deciding whether Bf is affordable at all. */
+size_t ork_w_resident_bytes(ork_npu *c, int K, int N, int wbits, int want_bf){
+    if(K<=0 || N<=0) return 0;
+    const int NMAX = (c && c->soc) ? c->soc->nmax : 8192;
+    const int KS   = (wbits==8) ? 1024 : ORK_I4_KS;      /* the loaders' K-slice for each resident form */
+    const int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
+    size_t tot=0;
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS;
+        tot += orki_pgup((size_t)Kp*Nc/(wbits==8?1:2)); } }
+    /* Bf: a full-K rebuild per N-slice, built ONLY on the int8-resident loaders and only for K<=10752. */
+    const int bf = (want_bf < 0) ? (getenv("ORK_NO_BF") ? 0 : 1) : (want_bf ? 1 : 0);
+    if(wbits==8 && K<=10752 && bf)
+        for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            tot += orki_pgup((size_t)K*Nc); }
+    return tot;
+}
+
 int orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t){
     for(int i=0;i<S;i++){ const ork_w *w=t[i].w; if(!w||!w->cpu_codes) return -1;
         orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }
