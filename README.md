@@ -376,6 +376,9 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 | `ORK_I4_MSCHED`, `ORK_I4_INCR`, `ORK_I4_BCHAIN` | int4 batch strategies (in-task batch / incremental+multicore / bank-chain) |
 | `ORK_NPU_MC=<n>`, `ORK_MCAP=<M>`, `ORK_KTILE`, `ORK_RCAP` | core count / M-tile / K-tile / residency caps (override the SoC defaults) |
 | `ORK_NO_BF`, `ORK_KEEP_BF` | drop / keep the full-K `Bf` weight buffer (compact footprint vs fused-silu need) |
+| `ORK_DOM_DRAIN` | retirement barrier before an IOMMU domain switch (**default on**; `=0` restores the old blind sleep). A doorbell op is "done" when its output cell lands, which is *before* the kernel retires the job, so switching domains races the un-retired job and hurts dispatch. Measured 11.47% → 1.99% stalls on `i4_widek_stall_probe`, median unchanged. Single-domain models never reach it. |
+| `ORK_DOM_SETTLE_US` | width of the old blind pre-switch sleep, used only when `ORK_DOM_DRAIN=0` (default 1000) |
+| `ORK_I4_KTMO_MUL` | scale ONLY the submit timeout handed to the kernel (default 1). Diagnostic: the driver's `rknpu_job_timeout_clean` compares µs against a millisecond value, so the real reap threshold is 1000× shorter than intended — and that accidental aggressive reaping is **load-bearing** (making it "correct" measures 2.6× *worse*). See the wiki NPU-Quirks. |
 
 ### orkpack / streaming / multi-domain (ggml-ork)
 | var | effect |
@@ -410,6 +413,24 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 | `ORK_DMA_HEAP`, `ORK_IOMMU_DOMAIN`, `ORK_IOVA_CEIL_MB` | dma-heap name, forced domain id, IOVA ceiling |
 | `ORK_NO_SIGCLEAN` | disable the graceful SIGTERM IOMMU teardown |
 | `ORK_NO_GOV_WARN` | silence the CPU/DDR governor warning |
+
+### Diagnosing NPU doorbell stalls
+
+`make i4_widek_stall_probe` — standalone reproducer for the int4 NONBLOCK-doorbell dispatch failure (no
+model, no `.orkpack`, ~2 min per data point). Detects by wall time, because the recover loop makes the
+*output* correct — a stalled round is invisible to a correctness check.
+
+```sh
+sudo ORK_NPU_LOCK_WAIT=1200 tools/util/npu_guard.sh -- \
+  ./i4_widek_stall_probe <reps> <K> <N> <slow_ms> <ndom> <M>
+sudo ORK_NPU_LOCK_WAIT=1200 tools/util/npu_guard.sh -- \
+  ./i4_widek_stall_probe 4000 17408 5120 400 2 64     # the known-failing shape
+```
+
+Root cause (hardware-confirmed 2026-08-25): the submit is accepted (`rc=0`) and the NPU **never dispatches
+the job** — the PC completed-task counter stays at 0. Needs ≥4000 reps for any rate comparison (at a ~2%
+rate, n=400 is ~10 events, i.e. direction only). Full write-up, including what has already been ruled out:
+[NPU-Quirks](https://github.com/oRKLLM/ork-driver/wiki/NPU-Quirks).
 
 ### Internal RE / calibration register probes (advanced — not for normal use)
 These override individual regcmd registers or op params to sweep hardware behaviour on-board during

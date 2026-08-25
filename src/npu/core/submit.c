@@ -98,7 +98,14 @@ void orki_dump_submit(struct rknpu_submit *sub) {
 
 void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki_dump_submit(sub); }
 
+/* Doorbell DENOMINATOR (diagnostic). The registry records the mc doorbell's dropped round as a
+ * "~1/4000 dispatch-drop"; nothing counted the submits, so that rate was never checkable against a real
+ * workload. Count both submits and PROGRAMS (task_number) -- a chained submit carries many programs, and
+ * the per-program rate is the one comparable to 1/4000. */
+unsigned long orki_submit_n = 0, orki_submit_prog = 0;
+
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+    orki_submit_n++; orki_submit_prog += sub ? (unsigned long)sub->task_number : 0;
     /* OFFLINE GUARD. ork_npu_init_offline hands out a context with fd = -1 for CPU-side work (pack building
      * and scoring on a machine with no NPU). The paths that support it intercept BEFORE here and never
      * reach a submit; anything that arrives HERE with fd < 0 is a path that was never taught about offline.

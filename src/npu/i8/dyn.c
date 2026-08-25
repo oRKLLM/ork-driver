@@ -66,11 +66,28 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         volatile int16_t *o = (volatile int16_t*)h->outptr[i];
         const uintptr_t LINE = 64;
         uintptr_t p0 = (uintptr_t)o, pend = p0 + (uintptr_t)no * sizeof(int16_t);
-        for (uintptr_t ln = p0 & ~(LINE-1); ln < pend; ln += LINE) {
-            __asm__ volatile("dc civac,%0"::"r"((const void*)ln):"memory");
-            int e0 = ln <= p0 ? 0 : (int)((ln - p0) / sizeof(int16_t));
-            uintptr_t lend = ln + LINE; if (lend > pend) lend = pend;
-            int e1 = (int)((lend - p0) / sizeof(int16_t));
+        /* DSB BEFORE READING. `dc civac` is only architecturally COMPLETE after a DSB (ARM ARM D4.4.7) --
+         * interleaving invalidate-then-load per line let the load be serviced from the not-yet-invalidated
+         * line, so the poll read back the SENTINEL WE SEEDED instead of the NPU's output. It presented as a
+         * "dropped round": a contiguous sentinel TAIL (runs=1, always ending at the last element, always
+         * starting on a 64-elem boundary) that never cleared no matter how long we waited, and whose size
+         * tracked CACHE RESIDENCY -- a 20 KB surface read 78-93% stale while a 693 KB one (evicted by
+         * capacity, so fetched fresh from DRAM) read 0.29%. Cost was ~3.6 s per false miss via
+         * orki_mc_recover_resubmit. Invalidate the whole surface, ONE dsb, THEN scan -- also cheaper than
+         * the old interleave. Same fix applied to the other three poll variants below. */
+        /* CHUNKED, so the DSB does not cost the EARLY EXIT. A first cut invalidated the whole surface, then
+         * dsb, then scanned -- correct, but it issued ~22k cache ops per poll iteration on a 1.4 MB output
+         * where the old code returned at the FIRST sentinel (usually within a few lines). That made the poll
+         * loop pathologically slow and is a poll-side regression, not a fix. Walk in chunks: invalidate a
+         * chunk, ONE dsb, scan it, bail on the first sentinel. */
+        const uintptr_t CHUNK = 4096;
+        for (uintptr_t cs = p0 & ~(LINE-1); cs < pend; cs += CHUNK) {
+            uintptr_t ce = cs + CHUNK; if (ce > pend) ce = pend;
+            for (uintptr_t ln = cs; ln < ce; ln += LINE)
+                __asm__ volatile("dc civac,%0"::"r"((const void*)ln):"memory");
+            __asm__ volatile("dsb ish":::"memory");
+            int e0 = cs <= p0 ? 0 : (int)((cs - p0) / sizeof(int16_t));
+            int e1 = (int)((ce - p0) / sizeof(int16_t));
             for (int e = e0; e < e1; e++) if (o[e] == ORK_DYN_SENT16) return 0;
         }
         return 1; }
@@ -80,18 +97,27 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         * full-surface VERIFY (covers any residual per-block lag). Was a full O(no) civac scan EVERY poll iteration,
         * pathological on the large wide-K prefill surface (~524K words -> ~10 t/s ffn_down). */
         volatile int32_t *base = (volatile int32_t*)h->outptr[i];
-        __asm__ volatile("dc civac,%0"::"r"(&base[no-1]):"memory"); if (base[no-1]==ORK_DYN_SENT) return 0;   /* fast gate */
-        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
+        __asm__ volatile("dc civac,%0"::"r"(&base[no-1]):"memory"); __asm__ volatile("dsb ish":::"memory");
+        if (base[no-1]==ORK_DYN_SENT) return 0;   /* fast gate (dsb: see the int4 branch above) */
+        for (int c0 = 0; c0 < no; c0 += 1024) { int c1 = c0 + 1024 > no ? no : c0 + 1024;
+            for (int e = c0; e < c1; e++) __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory");
+            __asm__ volatile("dsb ish":::"memory");
+            for (int e = c0; e < c1; e++) if (base[e]==ORK_DYN_SENT) return 0; }
         return 1; }
     if ((M > 1 && Nx > NMAXd) || h->oscat[i]) {   /* SCATTER layout: scratch is Sn contiguous [M,Nc] blocks. The block (stride=0)
         * output's write-order over N is NOT reliably last-col-last (like the int4 int16 output above), so a
         * per-row-last-col poll fires before the whole block drains -> partial scatter -> non-deterministic
         * zeros. Poll the FULL surface: done only when EVERY scratch word is non-sentinel. */
         volatile int32_t *base = (volatile int32_t*)h->outptr[i];
-        for (int e = 0; e < no; e++){ __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory"); if (base[e]==ORK_DYN_SENT) return 0; }
+        for (int c0 = 0; c0 < no; c0 += 1024) { int c1 = c0 + 1024 > no ? no : c0 + 1024;
+            for (int e = c0; e < c1; e++) __asm__ volatile("dc civac,%0"::"r"(&base[e]):"memory");
+            __asm__ volatile("dsb ish":::"memory");
+            for (int e = c0; e < c1; e++) if (base[e]==ORK_DYN_SENT) return 0; }
         return 1; }
+    for (int m = 0; m < M; m++) __asm__ volatile("dc civac,%0"::"r"((int32_t*)(h->outptr[i]+(size_t)m*Nx+(Nx-1))):"memory");
+    __asm__ volatile("dsb ish":::"memory");
     for (int m = 0; m < M; m++){ volatile int32_t *db=(volatile int32_t*)(h->outptr[i]+(size_t)m*Nx+(Nx-1));
-        __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db==ORK_DYN_SENT) return 0; }
+        if (*db==ORK_DYN_SENT) return 0; }
     return 1; }
 
 /* ================= DYNAMIC STEERED SUBMISSION API (validated by tools/steer_probe + doorbell_id_probe) =====

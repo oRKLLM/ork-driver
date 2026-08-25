@@ -204,6 +204,12 @@ f16out_probe: tools/f16out_probe.c $(COBJ)
 i4_doorbell_probe: tools/i4_doorbell_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# Standalone reproducer for the int4 wide-K doorbell round stall (the 27B ffn_down shape). i4_doorbell_probe
+# cannot reach it — its run_chain_i4 reference is bounded at K<=4096. Board NPU op:
+#   sudo ORK_NPU_LOCK_WAIT=600 tools/util/npu_guard.sh -- env ORK_MC_DIAG=1 ./i4_widek_stall_probe
+i4_widek_stall_probe: tools/re/i4_widek_stall_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # A1: int4 Sn>1 (wide-N N-tiled) on the doorbell — bit-exact vs CPU + blocking ref. Board tool, not in make test.
 i4_sn_probe: tools/i4_sn_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

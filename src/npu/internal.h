@@ -194,6 +194,7 @@ struct ork_dyn_chain {
     struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
     int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
     int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
+    int        oK[1024];        /* per-op K -- diagnostic: lets a stalled round report its SHAPE, to test whether doorbell drops concentrate on a subset of ops rather than being uniformly random */
     int        oM[1024];        /* per-op M (rows); end() copies M*N int32 back to dst for the copy-back path */
     int        oSk[1024];       /* per-op K-split count: >1 => the op's output is oSk partial [M,N] blocks in scratch
                                  * that end() must SUM into dst[M,N] (the NPU has no on-device C+= mode). 0/1 = no K-split. */
@@ -390,6 +391,8 @@ int orki_i8_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, in
 int orki_cpu_gemm_grouped(int M,int K,int N,int G,const int8_t *A,const int8_t *codes,
                           const float *aScale,const float *bScale,float *C);
 ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
+int orki_i4_ktmo_ms(void);   /* kernel-facing int4 submit timeout (ORK_I4_KTMO_MUL); see i4/run.c */
+extern unsigned long orki_submit_n, orki_submit_prog;   /* diagnostic: doorbell submit/program counters (see core/submit.c) */
 void orki_mc_recover_resubmit(ork_dyn_chain *h);
 void ork_install_term(void);
 void orki_i16_set_out(uint32_t*rc,int N,int stride,int mult,int shift);

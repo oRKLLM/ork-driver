@@ -32,6 +32,20 @@ int orki_i4_submit_tmo_ms(void){
     return t;
 }
 
+/* Kernel-facing submit timeout. SEPARATE from orki_i4_submit_tmo_ms() because that value is ALSO used as a
+ * host-side sleep in ork_dom_flush_if_dirty (`orki_i4_submit_tmo_ms() + 200` ms), so scaling it to probe the
+ * kernel's behaviour turns every dirty boundary into a multi-second stall and invalidates the measurement.
+ * ORK_I4_KTMO_MUL scales ONLY the number handed to the driver.
+ * WHY IT EXISTS: rknpu_job_timeout_clean compares `ktime_us_delta(now, job->timestamp) >= args->timeout`,
+ * i.e. MICROseconds against a value every other driver site treats as milliseconds (msecs_to_jiffies,
+ * `args->timeout * 1000`). If that units bug is live, our 1500 "ms" is really a 1.5 ms reap threshold and
+ * any job still running when the next submit lands on that core gets soft-reset mid-flight. MUL=1000
+ * restores the intended deadline without touching the kernel. */
+int orki_i4_ktmo_ms(void){
+    static int m=-1; if(m<0){ const char*e=getenv("ORK_I4_KTMO_MUL"); m=e?atoi(e):1; if(m<1) m=1; }
+    return orki_i4_submit_tmo_ms()*m;
+}
+
 /* ork_i4_batch() — STRATEGY A: int4 stride-2 IN-TASK batch (Exp-2026-06-19). One submit computes a whole
  * M-tile with resident weights (mc_phys=2*H, 0x405c=0, stride-2 output → physical row 2m carries logical
  * row m; NEON int16→int32 de-tile physrow=4j+4H*b), instead of the per-row PC-chain that re-streams the

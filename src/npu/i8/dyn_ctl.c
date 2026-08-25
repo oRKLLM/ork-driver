@@ -226,12 +226,42 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         /* miss-detection timeout: a real mc int8 stream/decode op lands well under 300ms, so a sentinel still
          * stuck at that mark is the dropped-round miss (detect fast, resubmit cheap). Non-recoverable chains
          * (single-core, fp16, exhausted retries) keep the full 3s completion wait. */
-        double miss_to = (recov < recov_max) ? (h->i4batch ? 2000000.0 : 300000.0) : 3e6;   /* #54 i4batch (M-batched BCHAIN): a legit job — esp. the first submit after an iommu-domain switch — can exceed 300ms; use the old bch 2s window so we don't false-recover a completing job. Per-row/int8 keep the fast 300ms detect. */
-        /* PREDICTIVE DRAIN (twin of the one in bch_db_worker; which drain polls depends on prepolled, which
-         * varies by path, so both learn). Sleep through the predictable part, spin the tail -- the tail is
-         * where a stall shows up and where the chain can still be steered. ORK_I4_PREDICT=1 enables (default off: no measurable win yet). */
+        /* MISS-DETECT WINDOW. i4batch was widened to 2 s because "a legit job -- esp. the first submit after an
+         * iommu-domain switch -- can exceed 300ms"; that reasoning is not int4-specific. A 27B runs across 12
+         * domains, and a legitimate int8 round that crosses a switch can pass 300 ms too -- at which point we
+         * declare a miss and pay ACT_RESET + re-anchor + resubmit for a job that was going to land anyway.
+         * MEASURED: such "misses" cost ~3.6 s each (time = 23.0s + 3.6s x misses, R^2 0.967 over 12 runs) and
+         * are the entire source of prefill run-to-run variance. ORK_MISS_TO_US overrides for A/B. */
+        /* Shape key + learned duration first: BOTH the miss window and the (opt-in) predictive sleep
+         * derive from it, so it has to be computed before either. */
         const uint64_t pkey = orki_opkey(h->esz == 2 ? 4 : 1, 2 /*dyn_end*/, h->N, h->b_M ? h->b_M : 1, h->S);
-        const double pred = (recov == 0 && getenv("ORK_I4_PREDICT")) ? orki_op_predict_us(h->c, pkey) : 0.0;
+        const double est = orki_op_predict_us(h->c, pkey);        /* 0 = shape not learned yet */
+
+        /* LEARNED MISS WINDOW: START GENEROUS, TRIM ONCE KNOWN.
+         * A constant is wrong in both directions -- 300 ms spends 290 ms detecting a real drop on a 10 ms
+         * op, and false-positives on a legitimately slow round (the first submit after an iommu-domain
+         * switch), which is exactly why i4batch was widened to 2 s. So do not pick a constant: while the
+         * shape is UNKNOWN use the 2 s catch-all, which cannot false-positive; once the EWMA has learned
+         * it, trim to ORK_MISS_K x the observed duration. Fast ops then detect a drop in ~50 ms instead of
+         * 300 ms, and slow ones keep the room they need.
+         * MEASURED cost of getting this wrong: ~3.6 s per miss (time = 23.0s + 3.6s x misses, R^2 0.967
+         * over 12 runs) -- the entire source of prefill run-to-run variance.
+         * Applies whether or not the predictive SLEEP is on: this is about detecting correctly. */
+        double miss_to;
+        {   static double mt = -1, k = -1;
+            if (mt < 0) { const char *e = getenv("ORK_MISS_TO_US"); mt = e ? atof(e) : 0; }
+            if (k  < 0) { const char *e = getenv("ORK_MISS_K");     k  = e ? atof(e) : 6.0; }
+            const double CATCHALL = 2000000.0;   /* 2 s: a legit round is never mistaken for a miss */
+            const double FLOOR    =   50000.0;   /* 50 ms: never hair-trigger on a tiny estimate */
+            double w = CATCHALL;
+            if (est > 0.0) { w = k * est; if (w < FLOOR) w = FLOOR; if (w > CATCHALL) w = CATCHALL; }
+            if (mt > 0) w = mt;                                   /* explicit override for A/B */
+            miss_to = (recov < recov_max) ? w : 3e6;              /* last attempt: full completion wait */
+        }
+
+        /* PREDICTIVE DRAIN (opt-in). Sleep through the predictable part, spin the tail -- the tail is where
+         * a stall shows up and where the chain can still be steered. ORK_I4_PREDICT=1 enables. */
+        const double pred = (recov == 0 && getenv("ORK_I4_PREDICT")) ? est : 0.0;
         int slept_pred = 0, first_check = 1;
         if (pred > 300.0) { long ns=(long)(pred*750.0); struct timespec ts={ns/1000000000L, ns%1000000000L};
             nanosleep(&ts,NULL); slept_pred=1; }
@@ -257,7 +287,52 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         last = ork_dyn_progress(h);
         if (last >= h->S - 1 || orki_ork_term) break;            /* all done, or interrupted */
         if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */
-            if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER] mc int8 round output never landed (attempt %d) — reset + resubmit\n", recov);
+            if (getenv("ORK_MC_DIAG")) {
+                /* WHICH FAILURE IS THIS? A "miss" is only ever inferred from an output SENTINEL still being
+                 * present -- so a genuine dispatch drop and a computed value that HAPPENS TO EQUAL the sentinel
+                 * are indistinguishable at the call site. They need opposite fixes, so count the survivors:
+                 * a handful of sentinel elements out of thousands = a VALUE COLLISION (the round landed; int4's
+                 * int16 sentinel 0x7fff is reachable by a saturating W4A4 accumulator, unlike int32's INT32_MAX),
+                 * whereas an all-sentinel output = the round really never ran. */
+                int si = ork_dyn_progress(h) + 1; long sent = 0, tot = 0;
+                /* IS THE DATA ACTUALLY ABSENT, OR MERELY UNSEEN? Re-count after the KERNEL's dma sync
+                 * (orki_bsync FROM_DEVICE), which is the architecturally complete invalidate for a DMA
+                 * buffer -- a bare `dc civac` + dsb on the user VA is not equivalent. If the sentinel count
+                 * collapses, the NPU's output was in DRAM all along and the "miss" is a read-visibility bug;
+                 * if it stands, the data really was never written (or was clobbered). */
+                long sent_pre = 0;
+                if (si >= 0 && si < h->S) {
+                    int no = h->nout[si] ? h->nout[si] : h->N; tot = no;
+                    if (h->esz == 2) { int16_t *o = (int16_t*)h->outptr[si];
+                        for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT16) sent++; } }
+                    else { int32_t *o = (int32_t*)h->outptr[si];
+                        for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) sent++; } }
+                }
+                /* WHICH elements survived names the mechanism: one contiguous tail = the write stalled partway;
+                 * a regular stride/period = we are polling cells the NPU never writes (tile-geometry mismatch,
+                 * not a miss at all); scattered singletons = value collisions. Report first/last, run count and
+                 * the two commonest run lengths + the gap period. */
+                long first = -1, last2 = -1, runs = 0; long rl1 = 0, gap1 = 0, prev_start = -1;
+                if (tot) { int in = 0;
+                    for (long e = 0; e < tot; e++) {
+                        int isx = (h->esz == 2) ? (((int16_t*)h->outptr[si])[e] == ORK_DYN_SENT16)
+                                                : (((int32_t*)h->outptr[si])[e] == ORK_DYN_SENT);
+                        if (isx) { if (first < 0) first = e; last2 = e;
+                                   if (!in) { runs++; in = 1; if (prev_start >= 0 && !gap1) gap1 = e - prev_start; prev_start = e; } }
+                        else { if (in) { in = 0; if (!rl1) rl1 = e - prev_start; } } } }
+                sent_pre = sent;   /* ANSWERED 2026-08-25: a kernel orki_bsync(FROM_DEVICE) re-count here
+                 * recovered NOTHING (3904 vs 3904, 2048 vs 2048, ...) -- the missing output is genuinely absent,
+                 * not merely unseen, so the whole read-visibility family is dead. The re-count is removed: it is
+                 * a DMA sync on a buffer whose job is still stuck, immediately before ACT_RESET. */
+                fprintf(stderr, "[MC-RECOVER] attempt %d: op #%d/%d dt=%s esz=%d i4batch=%d | sentinel %ld/%ld (%.2f%%) "
+                        "K=%d M=%d N=%d dom=%u Sk=%d | waited %.0fus/%.0fus submits=%lu progs=%lu | first=%ld last=%ld runs=%ld => %s\n",
+                        recov, si, h->S, h->mc_dt == DT_I4 ? "i4" : "i8", h->esz, h->i4batch, sent, tot,
+                        tot ? 100.0 * sent_pre / tot : 0.0,
+                        (si>=0&&si<h->S)?h->oK[si]:-1, (si>=0&&si<h->S)?(h->oM[si]?h->oM[si]:1):-1,
+                        (si>=0&&si<h->S&&h->oM[si]&&h->oSk[si])?(h->nout[si]/(h->oM[si]*h->oSk[si])):h->N,
+                        h->mc_dom, (si>=0&&si<h->S)?h->oSk[si]:-1, ork_now_us()-t0, miss_to, orki_submit_n, orki_submit_prog, first, last2, runs,
+                        runs == 1 ? "ONE-RUN(stalled write)" : (runs > 1 && rl1 && gap1 > rl1) ? "STRIDED(tile-geometry?)" : "SCATTERED");
+            }
             if (h->mc_dt == DT_I4) h->c->dom_dirty = 1;   /* #54: an int4 doorbell DROP happened -> a stuck job may linger in this domain even after recover (the reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it (ork_dom_flush_if_dirty) BEFORE switching away -> the switch to the next domain won't time out. */
             orki_mc_recover_resubmit(h);
             continue;
@@ -425,5 +500,5 @@ void orki_mc_recover_resubmit(ork_dyn_chain *h){
     for (int i = 0; i < h->mc_nc && i < ORK_MAXCORE; i++) if (h->mc_Pc[i]) {   /* resubmit each core */
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        h->mc_subs[i].timeout = (h->esz==2) ? orki_i4_submit_tmo_ms() : orki_mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
+        h->mc_subs[i].timeout = (h->esz==2) ? orki_i4_ktmo_ms() : orki_mm_timeout_ms(); orki_rknpu_submit_ioctl(fd, &h->mc_subs[i], h->mc_dom); }   /* #54 int4 (esz==2): bounded timeout so a re-dropped recover job stays reapable (TCLEAN) */
 }

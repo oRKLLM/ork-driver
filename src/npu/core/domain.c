@@ -17,6 +17,7 @@
 #include <sys/prctl.h>
 #include "ork_regs.h"
 #include "regcmd_i8.h"
+#include "regcmd_array_4x32x16.h"   /* REGCMD_N — the fp16 barrier job below */
 #include "npu/internal.h"
 #include "npu/core.h"
 #include "npu/core/core.h"
@@ -110,6 +111,69 @@ void ork_dom_flush_if_dirty(ork_npu *c){
     c->dom_dirty=0;
 }
 
+
+/* ============ RETIREMENT DRAIN BARRIER (orki_dom_drain) ============================================
+ * WHY. A nonblock doorbell op is "done" when its output cell lands, which is BEFORE the kernel retires the
+ * job. Switching the IOMMU domain then races the still-in-flight job and permanently wedges that round --
+ * the NPU writes a contiguous PREFIX of the output and stops. MEASURED on tools/re/i4_widek_stall_probe
+ * (K=17408 N=5120, M=64, ndom=2, n=4000/cell): the blind `nanosleep` settle takes the stall rate from
+ * 5.25% (settle=0) to 2.00% (settle=10ms) -- ~7 sigma, so the race is real and is ~60% of the defect.
+ *
+ * But a SLEEP CANNOT BE CORRECT: it never learns when the job actually retired, so it only trades
+ * throughput for probability -- 10 ms costs +33% on the median op, and longer is no better (30ms 2.75%,
+ * 100ms 2.95%; it PLATEAUS, so a residual ~2% is a second, separate defect).
+ *
+ * WHAT THIS DOES INSTEAD. Issue a tiny BLOCKING submit on each core. Jobs are queued per core, so a
+ * blocking job returns only once the core's prior work has retired -- an actual barrier rather than a
+ * guess, at roughly the ~167 us submit floor per core instead of 10 ms.
+ *
+ * NO NEW BUFFERS. Reuses this domain's existing scratch: c->Af (>=256 KB, allocated on first touch) hosts
+ * the tiny A/B/C at offsets, and c->regcmd / c->task are per-domain AND unused by the mc doorbell path
+ * (which owns c->mrc[i] / c->mtk[i]), so overwriting them cannot disturb an in-flight chain. last_dt is
+ * saved/restored so this fp16 job cannot provoke a precision-mode transition in the caller -- the same
+ * class of trap as the c->task poisoning that made mode_probe a board-killer.
+ *
+ * MEASURED (i4_widek_stall_probe, K=17408 N=5120 M=64 ndom=2, order-controlled B-A-B, n=4000/cell):
+ *   drain          159/8000  = 1.99%   median 30.4-30.6 ms   mean 54-62 ms
+ *   1 ms sleep    1376/12000 = 11.47%  median 31.3 ms        mean 178-192 ms
+ * => 5.8x fewer stalls at NO median cost, and 3x better mean. It also lands exactly on the ~2% floor the
+ * settle sweep plateaued at (10/30/100 ms all gave 2-3%), i.e. the barrier removes the race component
+ * ENTIRELY and what remains is the separate second defect. Zero correctness events across 20000 ops.
+ * NOTE the absolute rate DRIFTS between sessions (the same 1 ms default measured 5.25% one session and
+ * ~11% the next), so only same-session adjacent arms are comparable — hence the B-A-B bracket.
+ * DEFAULT ON. `ORK_DOM_DRAIN=0` restores the old blind sleep. Single-domain never reaches here
+ * (dom_activate returns early when dom == dom_active), so it costs single-domain models nothing. */
+void orki_dom_drain(ork_npu *c){
+    if(!c || c->fd < 0) return;
+    if(!c->regcmd.cpu || !c->task.cpu || !c->Af.cpu) return;      /* domain not yet furnished -> nothing in flight */
+    const int K = 512, N = 16;
+    size_t aoff = 0, boff = (size_t)K*2, coff = boff + (size_t)K*N*2;
+    if(c->Af.size < coff + (size_t)N*2) return;                   /* Af too small (should not happen) */
+    int fd = c->fd; unsigned dom = c->dom_active;
+    int saved_dt = c->last_dt;
+    memset((char*)c->Af.cpu + aoff, 0, (size_t)K*2);
+    memset((char*)c->Af.cpu + boff, 0, (size_t)K*N*2);
+    orki_bsync(fd, &c->Af, RKNPU_MEM_SYNC_TO_DEVICE);
+    uint32_t rc[REGCMD_N]; int sched = ((K&(K-1))==0 && K>=128 && K<2048);
+    orki_f16_synth(rc, 1, K, N, (uint32_t)(c->Af.dma+aoff), (uint32_t)(c->Af.dma+boff), (uint32_t)(c->Af.dma+coff), sched, c->soc->cbuf_elems);
+    orki_f16_set_out_fp16in(rc, 1, N);
+    memcpy(c->regcmd.cpu, rc, (size_t)REGCMD_N*4);
+    orki_bsync(fd, &c->regcmd, RKNPU_MEM_SYNC_TO_DEVICE);
+    struct rknpu_task *t = c->task.cpu; memset(t, 0, sizeof *t);
+    t[0].enable_mask=0xd; t[0].int_mask=0x300; t[0].int_clear=0x1ffff; t[0].regcfg_amount=108; t[0].regcmd_addr=(uint32_t)c->regcmd.dma;
+    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    int nc = c->soc->cores; if(nc < 1) nc = 1; if(nc > ORK_MAXCORE) nc = ORK_MAXCORE;
+    for(int i = 0; i < nc; i++){
+        struct rknpu_submit s; memset(&s, 0, sizeof s);
+        s.flags = 0x1;                                            /* BLOCKING (no 0x2) — this IS the barrier */
+        s.task_number = 1; s.task_obj_addr = c->task.obj; s.core_mask = 1u<<i; s.fence_fd = -1;
+        s.timeout = 300;                                          /* bounded: a wedged core must not hang the switch */
+        s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        orki_rknpu_submit_ioctl(fd, &s, dom);
+    }
+    c->last_dt = saved_dt;
+}
+
 void orki_dom_activate(ork_npu *c,int dom){
     if(dom<0) dom=0;
     if(dom==c->dom_active) return;
@@ -119,8 +183,10 @@ void orki_dom_activate(ork_npu *c,int dom){
      * kernel watchdog soft reset -> corrupts the switch (the int4 multi-domain wedge; byte-diff ruled out a
      * malformed descriptor, dom0/dom1 submits are byte-identical + run fine). Let the prior domain's just-landed
      * job retire before switching. Only on a real switch (per-layer, ~tens of times); tunable/off via env. */
-    { static long su=-1; if(su<0){ const char*e=getenv("ORK_DOM_SETTLE_US"); su=e?atol(e):1000; }
-      if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } }
+    { static int drain=-1; if(drain<0) drain = getenv("ORK_DOM_DRAIN") ? atoi(getenv("ORK_DOM_DRAIN")) : 1;   /* DEFAULT ON (5.8x, no median cost) */
+      if(drain){ orki_dom_drain(c); }                            /* real barrier: replaces the sleep below */
+      else { static long su=-1; if(su<0){ const char*e=getenv("ORK_DOM_SETTLE_US"); su=e?atol(e):1000; }
+             if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } } }
     ork_dom_flush_if_dirty(c);   /* #54 THE multi-domain fix: if an int4 doorbell drop left a stuck job in the OUTGOING domain, REAP it now (same-domain timeout_clean, still attached to dom_active) so the switch below finds the domain idle instead of timing out -> cascade. See ork_dom_flush_if_dirty. */
     double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
     if(orki_dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
@@ -151,6 +217,13 @@ void orki_dom_activate(ork_npu *c,int dom){
         if(c->task.cpu){ struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
             memcpy(c->task.cpu,&t,sizeof t); orki_bsync(c->fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     }
+    /* ORK_DOM_DRAIN=2 (EXPERIMENT): also run a dummy in the NEW domain, AFTER the switch. The pre-switch
+     * barrier removes the retirement race (11.47% -> 1.99%) but a residual ~2% survives, and the settle
+     * sweep plateaued at the same ~2% — so a SECOND cause remains. A pre-switch barrier is blind to a
+     * first-submit-into-a-freshly-switched-domain hazard; this tests for one. c->dom_active is already the
+     * NEW domain here, and its scratch was just furnished above, so orki_dom_drain now targets it. */
+    { static int pd=-1; if(pd<0) pd = getenv("ORK_DOM_DRAIN") ? atoi(getenv("ORK_DOM_DRAIN")) : 1;
+      if(pd>=2) orki_dom_drain(c); }
     { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
       if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }

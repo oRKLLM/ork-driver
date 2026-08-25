@@ -583,7 +583,7 @@ static void *bch_mw_worker(void *vp){
      * the stretch where nothing can be decided and spin only the tail -- the tail is where a stall becomes
      * visible and where steering the in-flight chain is still possible. Placed in BOTH drains because
      * whether ork_dyn_end or the per-core worker does the polling depends on prepolled, which varies by
-     * path. ORK_I4_NOPREDICT=1 disables. */
+     * path. ORK_I4_PREDICT=1 enables (default off). */
     const uint64_t pkey = orki_opkey(4 /*DT_I4*/, 1 /*BCHAIN worker*/, K, N, a->ex[a->e1-1].M);
     const double pred = orki_i4_nopredict() ? 0.0 : orki_op_predict_us(c, pkey);
     double t0=ork_now_us();
@@ -773,6 +773,23 @@ int ork_dyn_grouped_end(ork_dyn_chain *h) {
     if (orki_ork_term) { sigaction(SIGTERM, &orki_prev_sig[0], NULL); raise(SIGTERM); }
     return rc;
 }
+/* ORK_DYN_NOCHAIN=1 (DIAGNOSTIC ONLY). Submit each program as its own task_number=1 job ({p,1}) instead of
+ * one HW-chained {0,P} walk, isolating hardware task-CHAINING as the single variable: same NONBLOCK doorbell,
+ * same regcmds, same seeds, same poll. Tests whether the permanent mid-write round stall is a task-boundary
+ * race. Costs one ioctl per program (chaining is worth ~3.4x dispatch), so a run that is NOT markedly slower
+ * means the knob did not take effect -- which is exactly how the first attempt at this test failed silently. */
+static int orki_i4_submit_maybe_nochain(int fd, struct rknpu_submit *s, int dom){
+    static int nochain = -1;
+    if (nochain < 0) { nochain = getenv("ORK_DYN_NOCHAIN") ? 1 : 0;
+        if (nochain) fprintf(stderr, "[ork] ORK_DYN_NOCHAIN=1: int4 mc submits UNCHAINED (task_number=1 per program)\n"); }
+    if (!nochain) return orki_rknpu_submit_ioctl(fd, s, dom);
+    int P = (int)s->task_number, rc = 0;
+    for (int p = 0; p < P; p++) { struct rknpu_submit t = *s; t.task_number = 1;
+        t.subcore_task[0] = t.subcore_task[1] = t.subcore_task[2] = (struct rknpu_subcore_task){(uint32_t)p, 1};
+        int r = orki_rknpu_submit_ioctl(fd, &t, dom); if (r) rc = r; }
+    return rc;
+}
+
 ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores; if (nc > S) nc = S;
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w;
@@ -841,7 +858,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
             }
             int gi = p;
             h->outbuf[gi] = CC; h->outptr[gi] = (int32_t*)((char*)CC->cpu + coff); h->dst[gi] = (int32_t*)t->C;
-            h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk;   /* Sk int16 partial blocks of [N]; end() sums -> int32 C */
+            h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk; h->oK[gi] = K;   /* Sk int16 partial blocks of [N]; end() sums -> int32 C */
             coff += (size_t)Sk * N * 2;
         }
         memset(&subs[i], 0, sizeof subs[i]);
@@ -856,7 +873,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
      * esz==2 branch of orki_mc_recover_resubmit re-seeds the full int16 surface). */
@@ -928,7 +945,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
     for (int i = 0; i < nc; i++) if (Pc[i]) {
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        subs[i].timeout = orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
+        subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     ork_install_term();
     return h;
