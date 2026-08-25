@@ -13,21 +13,6 @@
 
 int ork_i8_bmm(ork_npu *c, int nbatch, int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 int ork_i8_bmm_strided(ork_npu *c, int nbatch, int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C, const ork_bmm_strides *s);
-int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);
-int ork_dyn_end(ork_dyn_chain *h);
-int ork_dyn_halt(ork_dyn_chain *h, int at);
-int ork_dyn_max_steps(void);
-int ork_dyn_progress(ork_dyn_chain *h);
-int ork_dyn_queue_drain(ork_dyn_queue *q);
-int ork_dyn_queue_flush(ork_dyn_queue *q);
-int ork_dyn_queue_idle(ork_dyn_queue *q);
-int ork_dyn_queue_linger_us(ork_dyn_queue *q);
-int ork_dyn_queue_pending(ork_dyn_queue *q);
-int ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task);
-int ork_dyn_remaining(ork_dyn_chain *h);
-int ork_dyn_seq_end(ork_dyn_chain *h);
-int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive);
-int ork_dyn_steps(ork_dyn_chain *h);
 int ork_kv_append(ork_npu *c, ork_kv_resident *kv, int key, const int8_t *kcol, const int8_t *vrow);
 int ork_i8_mm_layer(ork_npu *c, const struct ork_layer_dims *d, ork_w *wq, ork_w *wk, ork_w *wv, ork_w *wo, ork_w *wg, ork_w *wu, ork_w *wd, const float *attn_norm, const float *q_norm, const float *ffn_norm, const float *x, const float *Kc, const float *Vc, float *x_out);
 int ork_i8_mm_repack(ork_npu *c,ork_w *w,int K,int N,const int8_t *B);
@@ -88,11 +73,6 @@ int ork_i8_w_attach_fold(ork_npu *c, ork_w *w, const void *blob, size_t n);
 ork_async *ork_i8_mm_run_chain_async (ork_npu *c, int S, const ork_mm_task_i8 *tasks);
 ork_async *ork_i8_mm_run_async (ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C);
 ork_async *ork_i8_mm_run_stream_async(ork_npu *c, int S, const ork_mm_task_i8 *tasks);
-ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks);
-ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
-ork_dyn_chain *ork_i8_dyn_begin_seq(ork_npu *c, int n, const ork_seq_op *ops);
-ork_dyn_chain *ork_i8_dyn_begin_seq_mc(ork_npu *c, int n, const ork_seq_op *ops, int ngroups, const int *gstart, int nc);
-ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore);
 ork_kv_resident *ork_kv_resident_alloc(ork_npu *c, int HD, int Lmax);
 ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks);
 ork_w *ork_i8_mm_adopt_imported(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_t bb_bytes,size_t bf_bytes);
@@ -111,9 +91,6 @@ size_t ork_i8_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
 size_t ork_i8_w_dump_cpu_st(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap);
 struct ork_stream_entry *ork_i8_stream_pool_add(struct ork_stream_pool *p, int K, int N, const void *blob, size_t n);
 struct ork_stream_entry *ork_i8_stream_pool_add_raw(struct ork_stream_pool *p, int K, int N, const int8_t *B);
-void ork_dyn_dump(ork_dyn_chain *h, const char *label);
-void ork_dyn_queue_destroy(ork_dyn_queue *q);
-void ork_dyn_queue_set_linger(ork_dyn_queue *q, int us);
 void ork_i8_fuzz_add(uint32_t blk,uint32_t reg,uint32_t val);
 void ork_i8_fuzz_clear(void);
 void ork_kv_resident_free(ork_npu *c, ork_kv_resident *kv);
@@ -125,8 +102,10 @@ void orki_fold_scratch_free(ork_npu *c);
 void orki_i8_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int sched,int cbuf,int stride);
 void orki_i8_synth_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
 
-struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
 
 struct streamw { ork_npu *c; int core; int S; const ork_mm_task_i8 *tasks; int *ctr; int rc; };
+
+ork_dyn_chain *ork_i8_dyn_begin_seq(ork_npu *c, int n, const ork_seq_op *ops);
+ork_dyn_chain *ork_i8_dyn_begin_seq_mc(ork_npu *c, int n, const ork_seq_op *ops, int ngroups, const int *gstart, int nc);
 
 #endif /* ORK_NPU_I8_H */

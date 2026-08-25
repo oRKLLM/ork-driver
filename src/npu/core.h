@@ -188,4 +188,32 @@ void orki_setrn(uint32_t *rc, int n, enum ork_reg_id id, uint32_t v);
 
 void orki_i8_synth_mfold(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC,int cbuf);
 
+
+/* ---- NONBLOCK doorbell spine (dtype-agnostic substrate; impl in npu/core/dyn.c, dyn_ctl.c,
+ * colsplit.c). Moved out of npu/i8/i8.h by Tier 19: the spine has no dtype in its contract, so
+ * it is substrate, not int8. Precision-specific program construction stays in the dtype folders
+ * and is reached through internal.h. ---- */
+int ork_dyn_append(ork_dyn_chain *h, const ork_mm_task_i8 *task);
+int ork_dyn_end(ork_dyn_chain *h);
+int ork_dyn_halt(ork_dyn_chain *h, int at);
+int ork_dyn_max_steps(void);
+int ork_dyn_progress(ork_dyn_chain *h);
+int ork_dyn_queue_drain(ork_dyn_queue *q);
+int ork_dyn_queue_flush(ork_dyn_queue *q);
+int ork_dyn_queue_idle(ork_dyn_queue *q);
+int ork_dyn_queue_linger_us(ork_dyn_queue *q);
+int ork_dyn_queue_pending(ork_dyn_queue *q);
+int ork_dyn_queue_push(ork_dyn_queue *q, const ork_mm_task_i8 *task);
+int ork_dyn_remaining(ork_dyn_chain *h);
+int ork_dyn_seq_end(ork_dyn_chain *h);
+int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive);
+int ork_dyn_steps(ork_dyn_chain *h);
+ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks);
+ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
+ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore);
+struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
+void ork_dyn_dump(ork_dyn_chain *h, const char *label);
+void ork_dyn_queue_destroy(ork_dyn_queue *q);
+void ork_dyn_queue_set_linger(ork_dyn_queue *q, int us);
+
 #endif /* ORK_NPU_CORE_H */

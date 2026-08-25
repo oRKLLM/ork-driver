@@ -28,7 +28,6 @@
 #include "regcmd_fold_refs.h"
 #include "npu/internal.h"
 #include "npu/core.h"
-#include "npu/i8/i8.h"
 
 int orki_slice_rescue_or_refuse(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     if(w->sliced){ int rs=ork_mm_run_sliced(c,w->sliced,M,A,C,nc); if(rs>=0) return rs; }
@@ -260,6 +259,15 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
  * chain is M=1-only and writes int16). An op of an hw=1 KIND that fails this downgrades to the SW break path
  * (its SEQ_CLASS fn). Kept in lockstep with begin_mc / begin_mc_i4's per-task guards — change both together. */
+/* DTYPE DISPATCHER. Reads tasks[0].w->dtype and routes: DT_I4 leaves via ork_i4_dyn_begin_mc (i4/chain.c)
+ * near the top, DT_I8/DT_F16 continue into the spine below (one implementation serves both — they share a
+ * 4-byte C).
+ *
+ * ⚠ READ THIS BEFORE INSTRUMENTING ANYTHING BELOW: **int4 NEVER reaches the body of this function.** An
+ * int4 debugging session added a diagnostic to ORK_MC_ROUND further down, ran a full A/B against the 27B,
+ * and got "no effect" from code that never executed — caught only because removing HW chaining failed to
+ * produce the expected slowdown. If you are chasing an int4 doorbell behaviour, the submits you want are
+ * in src/npu/i4/chain.c (ork_i4_dyn_begin_mc / run_i4_bchain_db), not here. */
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     ork_install_term();   /* graceful SIGTERM: make the async poll interruptible (covers colsplit + i4 dispatch too) */
@@ -481,6 +489,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
             *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } \
         else { for (int m=0;m<Mx;m++){ volatile int32_t *db = (volatile int32_t*)(h->outptr[x] + (size_t)m*Nx + (Nx-1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } } __asm__ volatile("dsb ish":::"memory"); } while (0)
+    /* int8/fp16 ONLY — int4 returned above. See the dispatcher banner on ork_dyn_begin_mc. */
     #define ORK_MC_ROUND() do { h->mc_nc = nc; h->dma_rw0 = ork_npu_dma_rw(c); for (int i = 0; i < nc; i++) if (Pc[i]) { \
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); \
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); \

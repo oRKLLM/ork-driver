@@ -212,8 +212,12 @@ src/npu.c              SCAFFOLD: the dtype-dispatching layer only — run()/run_
 src/npu/internal.h     private ABI: ork_npu/ork_w/buf types, dtype predicates, env knobs, hot inlines
 src/npu/core.h         the SUBSTRATE interface (see the header-placement rule below)
 src/npu/core/          dtype-agnostic substrate: device buf submit sched domain mode prof (+ core.h)
-src/npu/i8/            int8 — regcmd pack fold run chain colsplit queue         (+ i8.h)
-                         dyn dyn_seq dyn_ctl        — NONBLOCK doorbell: begin paths / seq chain / control
+                         dyn dyn_ctl colsplit — the NONBLOCK doorbell spine + column-split scheduler.
+                         Moved here from i8/ (roadmap Tier 19): their contracts carry no dtype, so they are
+                         substrate. ork_dyn_begin_mc DISPATCHES on dtype — int4 leaves for i4/chain.c at the
+                         top and never reaches the body (a diagnostic added below that point runs on nothing).
+src/npu/i8/            int8 — regcmd pack fold run chain queue         (+ i8.h)
+                         dyn_seq                    — int8 heterogeneous op-sequence chain (spine is in core/)
                          probe probe_sdp probe_replay probe_prof probe_chain — RE probes by family
 src/npu/f16/           fp16 — regcmd run perchan stream probe replay                (+ f16.h)
 src/npu/i4/            int4 — quant pack run chain stream                           (+ i4.h)

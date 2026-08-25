@@ -27,7 +27,6 @@
 #include "regcmd_fold_refs.h"
 #include "npu/internal.h"
 #include "npu/core.h"
-#include "npu/i8/i8.h"
 
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq);   /* fwd: fp16 colsplit routed from run_multicore */
 #define ORK_RC_F16_SC (-502)   /* internal run_multicore->orki_run() signal: fp16 fallback, retry the single-core fp16 reference (never the blocking mcworker) */

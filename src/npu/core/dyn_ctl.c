@@ -26,7 +26,6 @@
 #include "regcmd_fold_refs.h"
 #include "npu/internal.h"
 #include "npu/core.h"
-#include "npu/i8/i8.h"
 #include "spine_kernels.h"
 
 int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_us, int *spin_alive) {
