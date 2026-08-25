@@ -23,6 +23,27 @@
 #include "regcmd_i4.h"
 #include "npu/i4/i4.h"
 
+/* Doorbell drain backoff. The drain spins for the first ~1 ms, then sleeps between completion checks.
+ * 50 us was the fixed value; it is now tunable because a profile could not distinguish "genuinely waiting
+ * for the NPU" from "finished, but we noticed up to 50 us late" -- clock_nanosleep was 48% of frame-#0
+ * samples in a 27B prefill while the NPU averaged only ~15% busy. ORK_I4_BACKOFF_US=0 spins instead. */
+/* Predictive drain: OPT-IN (ORK_I4_PREDICT=1), not default. It is implemented and self-correcting, but
+ * measured NO effect on 27B prefill -- OFF mean 36.9 s vs ON 36.2 s across 3 interleaved reps, against
+ * ~10 s of within-arm spread. Shipping an unmeasurable change as the default would be guessing. The
+ * blocker is the spread itself: thermals cold (34C), DDR/CPU/NPU governors all pinned, working set in RAM,
+ * and the same binary still swings ~30% run to run. Until that is explained this cannot be validated. */
+static int orki_i4_nopredict(void){
+    static int v = -1;
+    if(v < 0){ const char *e = getenv("ORK_I4_PREDICT"); v = (e && atoi(e)) ? 0 : 1; }
+    return v;
+}
+
+static long orki_i4_backoff_ns(void){
+    static long v = -1;
+    if(v < 0){ const char *e = getenv("ORK_I4_BACKOFF_US"); long us = e ? atol(e) : 50; if(us < 0) us = 0; v = us * 1000L; }
+    return v;
+}
+
 int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DEBUG, off by default) */
 
 /* BCHAIN rows-per-weight-stream ceiling. MEASURED, not derived. Full write-up: wiki
@@ -558,7 +579,17 @@ static void *bch_mw_worker(void *vp){
     orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
     a->sub.timeout=orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
     int NGl=(a->ex[a->e1-1].M+H-1)/H, NTl=NC*NGl, tbl=NTtot-NTl;   /* last program of the whole chain lands last */
+    /* PREDICTIVE DRAIN. Having polled this shape once we know roughly how long it runs, so sleep through
+     * the stretch where nothing can be decided and spin only the tail -- the tail is where a stall becomes
+     * visible and where steering the in-flight chain is still possible. Placed in BOTH drains because
+     * whether ork_dyn_end or the per-core worker does the polling depends on prepolled, which varies by
+     * path. ORK_I4_NOPREDICT=1 disables. */
+    const uint64_t pkey = orki_opkey(4 /*DT_I4*/, 1 /*BCHAIN worker*/, K, N, a->ex[a->e1-1].M);
+    const double pred = orki_i4_nopredict() ? 0.0 : orki_op_predict_us(c, pkey);
     double t0=ork_now_us();
+    int slept_pred = 0, first_check = 1;
+    if(pred > 300.0){ long ns=(long)(pred*750.0); struct timespec ts={ns/1000000000L, ns%1000000000L};
+        nanosleep(&ts,NULL); slept_pred=1; }
     for(;;){
         if(bch_db_cells_off(c,i,0,NC,Wb,N,NGl,a->ex[a->e1-1].M,H,Wmax,NULL,1,NTl-1,tbl)){   /* last-program civac gate */
             orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -567,12 +598,18 @@ static void *bch_mw_worker(void *vp){
                 if(!bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,3,-1,vb)) ok=0; vb+=NC*NG; }
             if(ok){ int db=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;
                     bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,a->ex[e].C,2,-1,db); db+=NC*NG; }
+                /* Done on the FIRST look after sleeping => overslept by an unknown amount; recording this
+                 * elapsed would inflate the estimate and compound. Step it down instead. */
+                if(slept_pred && first_check) orki_op_overslept(c, pkey);
+                else                          orki_op_observe(c, pkey, ork_now_us()-t0);
                 a->rc=0; return NULL; } }
+        first_check = 0;
         if(orki_ork_term){ a->rc=0; return NULL; }
         double el=ork_now_us()-t0; if(el>300000.0){ a->rc=-2; return NULL; }
-        if(el>1000.0){ struct timespec ts={0,50000}; nanosleep(&ts,NULL); }
+        if(el>1000.0){ long bo=orki_i4_backoff_ns(); if(bo){ struct timespec ts={0,bo}; nanosleep(&ts,NULL); } }
     }
 }
+
 
 int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc){
     int fd=c->fd, K=ex[0].w->K, N=ex[0].w->N;
@@ -713,7 +750,7 @@ int ork_dyn_grouped_end(ork_dyn_chain *h) {
             if (n >= h->S) { landed = 1; break; }
             if (orki_ork_term) break;
             double el = ork_now_us() - t0; if (el > miss_to) break;
-            if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+            if (el > 1000.0) { long bo=orki_i4_backoff_ns(); if(bo){ struct timespec ts = {0, bo}; nanosleep(&ts, NULL); } } }
         if (landed || orki_ork_term) break;
         if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
             h->c->dom_dirty = 1;   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty) */

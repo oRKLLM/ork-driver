@@ -227,8 +227,20 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * stuck at that mark is the dropped-round miss (detect fast, resubmit cheap). Non-recoverable chains
          * (single-core, fp16, exhausted retries) keep the full 3s completion wait. */
         double miss_to = (recov < recov_max) ? (h->i4batch ? 2000000.0 : 300000.0) : 3e6;   /* #54 i4batch (M-batched BCHAIN): a legit job — esp. the first submit after an iommu-domain switch — can exceed 300ms; use the old bch 2s window so we don't false-recover a completing job. Per-row/int8 keep the fast 300ms detect. */
+        /* PREDICTIVE DRAIN (twin of the one in bch_db_worker; which drain polls depends on prepolled, which
+         * varies by path, so both learn). Sleep through the predictable part, spin the tail -- the tail is
+         * where a stall shows up and where the chain can still be steered. ORK_I4_PREDICT=1 enables (default off: no measurable win yet). */
+        const uint64_t pkey = orki_opkey(h->esz == 2 ? 4 : 1, 2 /*dyn_end*/, h->N, h->b_M ? h->b_M : 1, h->S);
+        const double pred = (recov == 0 && getenv("ORK_I4_PREDICT")) ? orki_op_predict_us(h->c, pkey) : 0.0;
+        int slept_pred = 0, first_check = 1;
+        if (pred > 300.0) { long ns=(long)(pred*750.0); struct timespec ts={ns/1000000000L, ns%1000000000L};
+            nanosleep(&ts,NULL); slept_pred=1; }
         for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
-            if (n >= h->S) break;                               /* all tasks, all rows */
+            if (n >= h->S) {                                    /* all tasks, all rows */
+                if (slept_pred && first_check) orki_op_overslept(h->c, pkey);
+                else                           orki_op_observe(h->c, pkey, ork_now_us() - t0);
+                break; }
+            first_check = 0;
             if (orki_ork_term) break;                              /* SIGTERM/SIGINT: stop waiting, drain + writeback below, then re-raise */
             /* The 500us-no-progress early break exists ONLY to detect a single-core halt/append that stopped
              * the chain short (ork_dyn_halt/append reject h->mc). For an mc chain there is no halt, so a plateau

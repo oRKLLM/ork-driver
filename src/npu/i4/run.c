@@ -170,7 +170,8 @@ int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
     if(getenv("ORK_I4_DIAG")) fprintf(stderr,"[i4diag] run_i4 K=%d N=%d M=%d Sk=%d Sn=%d dom=%d imported=%d -> %s\n",
         w->K,w->N,M,w->Sk,w->Sn,w->domain,(w->own_bufs&&w->n_own_bufs>0)||w->own_buf_valid,
         (M>=2 && w->Sk==1 && w->Sn==1 && (w->N%64)==0)?"BCHAIN":
-        (M>=2 && w->Sk==1 && w->Sn>1 && (w->N%64)==0)?"BCHAIN-NSLICE":(w->sliced&&M>=2)?"SLICE":"mc_i4(per-row)");
+        (M>=2 && w->Sk==1 && w->Sn>1 && (w->N%64)==0)?"BCHAIN-NSLICE":
+        (M>=2 && w->Sn==1 && w->Sk>1 && (w->N%64)==0)?"BCHAIN-KSLICE":(w->sliced&&M>=2)?"SLICE":"mc_i4(per-row)");
     /* #54: DEFAULT int4 M>1 prefill = BCHAIN (M-batched, the perf path) — now PORTED to ride the SHARED ork_dyn_end
      * drain (poll + orki_mc_recover_resubmit + reap-at-boundary), so it is multi-domain-safe like int8 colsplit AND
      * keeps its M-batching. bch_db_worker builds+submits only; ork_dyn_end owns the drain (i4batch hooks). Falls
@@ -218,6 +219,47 @@ int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){
             if(ok) return 0;
             /* a slice refused: C may be partially written, but every path below rewrites all of it */
         }
+    }
+    /* Sk>1 PREFILL (Sn==1): run BCHAIN PER K-SLICE and accumulate the int32 partials.
+     *
+     * The N-slice path above leaves one family behind: Sk>1 shapes, which on Qwen3.6-27B is 64x
+     * K=17408 N=5120 -- ffn_down, the largest tensor in the model. They were still going per-row.
+     *
+     * Splitting K is a partial-sum decomposition, not an independent one: each slice contributes part of
+     * the K-reduction, so the int32 partials SUM. That is arithmetically exact here because the scales
+     * live outside this call -- bscale is per output channel (unaffected by a K split) and the activation
+     * scale is per row, applied by the caller -- so slicing K only selects columns of an already-quantised
+     * A. Bit-exactness is preserved for the same reason the N-slice path preserves it: same tiles, same
+     * kernel, different grouping.
+     *
+     * With Sn==1 the tile index ns*Sk+ks is just ks, so slice ks IS Bb[ks] -- again a shallow view with no
+     * repack and no new IOVA. A is gathered per slice because BCHAIN wants [M][Kc] contiguous. */
+    if(M>=2 && w->Sn==1 && w->Sk>1 && (w->N%64)==0 && !getenv("ORK_I4_NO_KSLICE_BCHAIN")){
+        const int KS = ORK_I4_KS;
+        int ok = 1;
+        int8_t  *At = (int8_t*) malloc((size_t)M*(size_t)KS);
+        int32_t *Ct = (int32_t*)malloc((size_t)M*(size_t)w->N*sizeof(int32_t));
+        if(At && Ct){
+            for(int ks=0; ks<w->Sk && ok; ks++){
+                const int k0 = ks*KS;
+                int Kc = w->K - k0; if(Kc > KS) Kc = KS;
+                if(Kc <= 0 || (Kc%32)){ ok = 0; break; }         /* the tiler's K granularity */
+                for(int m=0; m<M; m++) memcpy(At + (size_t)m*Kc, A + (size_t)m*w->K + k0, (size_t)Kc);
+                struct ork_w v = *w;
+                v.K = Kc; v.Sk = 1; v.Sn = 1;
+                v.Bb = &w->Bb[ks];
+                v.Bf = NULL;                                     /* full-K companion is meaningless per slice */
+                v.sliced = NULL;
+                v.own_buf_valid = 0; v.own_bufs = NULL; v.n_own_bufs = 0;
+                v.Bbc_valid = 0; v.Bbc_ns_valid = 0; v.Bbc_ns = NULL;
+                if(orki_i4_run_bchain_db(c, &v, M, At, Ct, nc) != 0){ ok = 0; break; }
+                const size_t ne = (size_t)M*(size_t)w->N;
+                if(ks == 0) memcpy(C, Ct, ne*sizeof(int32_t));
+                else for(size_t e=0; e<ne; e++) C[e] += Ct[e];    /* K-split partials SUM */
+            }
+        } else ok = 0;
+        free(At); free(Ct);
+        if(ok) return 0;
     }
     /* Wide refuse-prone int4 PREFILL (Sn>1 or K>8192 — the shapes pack built w->sliced for): the per-row
      * orki_i4_run_mc_db below CAN run these but only per-row (~6x slower); route M>=2 straight to the BCHAIN-tiled

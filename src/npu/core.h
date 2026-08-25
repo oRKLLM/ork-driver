@@ -159,6 +159,10 @@ extern uint64_t orki_sram_total;
 extern volatile sig_atomic_t orki_sig_busy;
 int orki_imp_trace(void);
 int ork_dom(int dom);
+uint64_t orki_opkey(int dt, int mech, int K, int N, int M);   /* op-timing EWMA (predictive drain) */
+double   orki_op_predict_us(ork_npu *c, uint64_t key);        /* 0 = unknown */
+void     orki_op_observe(ork_npu *c, uint64_t key, double us);
+void     orki_op_overslept(ork_npu *c, uint64_t key);
 extern int orki_testcore;        /* probe hook: which NPU core single-core submits target (env ORK_NPU_TESTCORE) */
 int  orki_tc(void);
 void ork_npu_set_test_core(int core);

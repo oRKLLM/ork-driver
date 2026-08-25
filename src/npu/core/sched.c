@@ -289,3 +289,37 @@ int orki_mc_ensure(ork_npu *c,int nc){
     orki_bsync(fd,&c->mtk_all,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     return 0;
 }
+
+/* ---- OP-TIMING EWMA -----------------------------------------------------------------------------
+ * Lets a drain SLEEP through the predictable part of an op instead of polling it, then spin the tail.
+ * The poller has two jobs -- wait for completion, and stay responsive enough to detect a stall or steer
+ * the in-flight chain -- and they want opposite things. Predicting the duration is what lets it do both:
+ * sleep while nothing can be decided, be awake when it can.
+ *
+ * Self-correcting rather than trusting itself: if the gate is ALREADY passed on the first check after
+ * waking, we overslept and cannot know by how much, so nudge the estimate DOWN instead of recording an
+ * inflated sample. That is what stops a too-high estimate from feeding itself (sleep longer -> observe
+ * longer -> sleep longer). Real transitions we actually witness are recorded with a normal EWMA. */
+uint64_t orki_opkey(int dt, int mech, int K, int N, int M){
+    uint64_t h = 1469598103934665603ULL;
+    const uint64_t v[5] = { (uint64_t)dt, (uint64_t)mech, (uint64_t)K, (uint64_t)N, (uint64_t)M };
+    for(int i=0;i<5;i++){ h ^= v[i]; h *= 1099511628211ULL; }
+    return h ? h : 1;
+}
+static inline int orki_opslot(uint64_t key){ return (int)(key & 255u); }
+double orki_op_predict_us(ork_npu *c, uint64_t key){
+    if(!c) return 0.0;
+    const int s = orki_opslot(key);
+    return (c->optab[s].key == key) ? (double)c->optab[s].us : 0.0;   /* 0 = unknown -> caller spins */
+}
+void orki_op_observe(ork_npu *c, uint64_t key, double us){
+    if(!c || us <= 0.0) return;
+    const int s = orki_opslot(key);
+    if(c->optab[s].key != key){ c->optab[s].key = key; c->optab[s].us = (float)us; return; }   /* first sample */
+    c->optab[s].us = (float)(0.75 * (double)c->optab[s].us + 0.25 * us);
+}
+void orki_op_overslept(ork_npu *c, uint64_t key){
+    if(!c) return;
+    const int s = orki_opslot(key);
+    if(c->optab[s].key == key) c->optab[s].us *= 0.9f;   /* we cannot see how early it landed: step down */
+}

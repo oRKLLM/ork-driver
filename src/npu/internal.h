@@ -59,6 +59,12 @@ struct ork_npu { int fd; const struct ork_soc *soc; struct buf regcmd, task, Af,
      * the same domain as the weight. The fields above are the ACTIVE working set; dom_active is which
      * domain they currently belong to. dom_save[d] parks a domain's working set when switching away, so
      * each domain keeps its own (cheap, MB-scale) scratch resident — no realloc on every weight. */
+    /* OP-TIMING EWMA (predictive drain). Observed duration per (dtype, mechanism, K, N, M), learned at
+     * runtime rather than modelled: the same binary has measured 27 s and 42 s for one workload as the DDR
+     * governor, page cache and thermals moved, so any compiled-in constant would be wrong somewhere. Small
+     * open-addressed table; a miss just means "spin as before". NOT persisted and NOT in OPS_REGISTRY.md --
+     * that registry is probe-anchored capability truth and would rot instantly if it carried timings. */
+    struct { uint64_t key; float us; } optab[256];
     int dom_active; int dom_cap;   /* dom_cap = allocated length of dom_anchor[] / dom_save[]; grown on demand by dom_reserve, NO fixed cap (domain count = whatever the auto-sizer / ork_npu_domain_alloc drives) */
     int dom_dirty;   /* #54: a genuine doorbell MISS left an unreaped (dropped) job in dom_active — its completion IRQ never fired, so the kernel's per-job interrupt_count for this domain stays >0 forever. A stuck job makes the NEXT iommu-domain switch time out ("switch iommu domain time out") -> cascade. dom_activate flushes it (ACT_RESET, which aborts+clears stuck jobs, while STILL attached to this domain) before switching away. Set by the int4 doorbell reset-free-resubmit path; single-domain never switches, so it never acts on the flag (matches streaming's safety). */
     /* ORK_DOM_PROFILE: dom_activate cost telemetry (the "domain-swap window"). Steady = pure scratch
