@@ -985,3 +985,47 @@ cleaner but touches `rknpu_gem_create_ioctl` and the map-offset path too.
 **How to prove it when the board frees up:** the window is huge (seconds), so it should be easy —
 add a counter/log in `rknpu_gem_destroy_ioctl` around the wait recording `handle` + whether the
 handle still resolves after the wait, then run the stall probe and SIGTERM it mid-stall.
+
+### ★ REFRAME 2026-08-26 — the stall is NOT doorbell/NONBLOCK-specific
+
+This document, and the wiki pages that grew out of it, frame the problem as "the int4 NONBLOCK
+doorbell miss". That framing named where the symptom was FIRST SEEN, not its cause, and it is now
+contradicted by evidence.
+
+The 1.5B-Q8 `ork_bench` repro stalls on **synchronous (blocking) submits**:
+
+- it fails in `ork_dyn_colsplit`, which issues blocking submits by default ("NO barrier + BLOCKING
+  submit — EXACTLY the mcworker", `src/npu/core/colsplit.c:48`); the `ork_dyn_` prefix is misleading
+- the ~60 s wait is `rknpu_job_wait()`, which ONLY the blocking branch of `rknpu_submit()` enters
+- proof by absence: the watchdog logged `wd_ticks=0` across 8 stalls precisely because its arm site
+  was NONBLOCK-only (fixed in #patch39). Had those submits been NONBLOCK it would have armed.
+- the fast-abort acts only on `!(job->flags & RKNPU_JOB_ASYNC)` and it fired, cutting submit
+  failures 14 -> 2. It could not have touched an async job.
+
+And the signature is IDENTICAL to the async 27B W4A4 case: job committed, `tasks=0/N done`,
+PC completed-task counter stuck at `0x0`, no interrupt, no IOMMU fault, MMU idle.
+
+**So the same dispatch failure occurs on both submit paths, and the doorbell is not implicated.**
+That is consistent with everything else ruled out today (commit registers byte-identical, regcmd
+bytes verified in DRAM, MMU idle, zero faults) and moves the remaining explanation further toward a
+dispatch-level hardware issue that is independent of how the job was submitted.
+
+Consequence for anyone reading the older material: treat "doorbell" in these documents as a
+historical label for the first-observed instance, NOT as a claim about the mechanism. Do not
+restrict future experiments to the NONBLOCK path.
+
+### Measurement note — how coverage is counted WITHOUT circularity
+
+"The watchdog only sees N of M stalls" must not use the watchdog for both numbers. Two
+watchdog-independent denominators exist:
+
+- **userspace**: submit failures returning `-ETIMEDOUT` (errno 110), counted by ork-driver/ork_bench
+  regardless of whether the sampler noticed;
+- **kernel, but not the watchdog**: `rknpu_job_wait()` itself logs
+  `"failed to wait job, task counter: %d, ... elapsed time: %lldus"` on EVERY timed-out wait.
+  `grep -c "failed to wait job"` is therefore a kernel-side count that does not come from the
+  watchdog.
+
+Coverage = `wd_stalls / failed-to-wait-lines`. Residual blind spot, stated honestly: a stall seen by
+NEITHER instrument (never sampled and never timing out). Userspace times out on everything
+eventually, so that class should be empty, but these two instruments cannot prove it is.
