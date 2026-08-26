@@ -924,3 +924,64 @@ inode is evicted:
 2. Add a counter to `rknpu_gem_mmap_buffer()`'s failure path. If it never fires under the probe, the
    candidate is dead.
 3. Only then instrument VMA open/close vs GEM free ordering.
+
+### DESK WORK 2026-08-26 (no board) — candidate killed, stronger one found
+
+**1. The `err_close_vm` double-put candidate is DEAD.** Read `mmap_region()` in this tree
+(`mm/mmap.c`, 6.1.115):
+
+```c
+error = call_mmap(file, vma);
+if (error)
+        goto unmap_and_free_vma;     /* jumps PAST the close label */
+close_and_free_vma:
+        if (vma->vm_ops && vma->vm_ops->close)
+                vma->vm_ops->close(vma);
+unmap_and_free_vma:                  /* <- lands here */
+        fput(vma->vm_file);
+```
+
+`vm_ops->close` is NOT called on the `call_mmap()` failure path, so rknpu's explicit
+`drm_gem_vm_close(vma)` in `err_close_vm` is CORRECT and NECESSARY (it drops the reference
+`drm_gem_mmap()` took). Standard DRM idiom. Not a double drop.
+
+**2. Mechanism of "still mapped when deleted", established.** rknpu inserts the GEM's shmem pages
+into the VMA itself with `vm_insert_page()` (`rknpu_gem.c:983,1122`) and CLEARS `VM_PFNMAP`
+(`:1148`), so they are ordinary mapped pages and raise `page->_mapcount`. But `vma->vm_file` stays
+the DRM node — there is no `get_file(obj->filp)` anywhere. So the shmem inode's `i_mmap` tree has no
+record of these VMAs and truncate/evict CANNOT unmap them; it can only report
+"still mapped when deleted". The ONLY thing preventing that is the GEM refcount
+(`drm_gem_mmap_obj` does `drm_gem_object_get`; `vm_open`/`vm_close` are plain get/put).
+=> the corruption requires a GEM reference imbalance / premature free, nothing else.
+
+**3. ★ LEADING CANDIDATE (code-supported, NOT yet proven): unreferenced pointer held across a
+blocking wait.** `rknpu_gem_object_find()` (`include/rknpu_gem.h`) is the lookup-then-put
+anti-pattern:
+
+```c
+obj = drm_gem_object_lookup(filp, handle);   /* takes a ref */
+if (!obj) return NULL;
+rknpu_gem_object_put(obj);                   /* drops it immediately */
+return to_rknpu_obj(obj);                    /* caller gets an UNREFERENCED pointer */
+```
+
+(Its doc comment claims "gem object reference count would be increased" — that comment is FALSE.
+Do not trust it; it is how this was missed.)
+
+`rknpu_gem_destroy_ioctl()` then holds that unreferenced pointer across
+`rknpu_iommu_domain_get_and_switch()`, which blocks up to **6 s per attempt, 3 attempts = ~18 s**,
+and dereferences `rknpu_obj->iommu_domain_id` inside the loop. If the process dies in that window
+(SIGTERM -> DRM file close -> all handles released -> objects freed) the pointer dangles.
+
+That is EXACTLY the combination this session generated over and over: stalls forcing the 6 s
+switch timeout, plus me SIGTERMing the probe. It also fits `ork_sig_teardown()` firing MEM_DESTROY
+on every live buffer at signal time.
+
+**Proposed fix (untested, needs the board):** hold a real reference for the duration —
+`drm_gem_object_lookup()` at the top of `rknpu_gem_destroy_ioctl` and `drm_gem_object_put()` on
+every exit path — or stop `find()` dropping the ref and make all three callers put. The second is
+cleaner but touches `rknpu_gem_create_ioctl` and the map-offset path too.
+
+**How to prove it when the board frees up:** the window is huge (seconds), so it should be easy —
+add a counter/log in `rknpu_gem_destroy_ioctl` around the wait recording `handle` + whether the
+handle still resolves after the wait, then run the stall probe and SIGTERM it mid-stall.
