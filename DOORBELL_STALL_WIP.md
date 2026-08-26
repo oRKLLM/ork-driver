@@ -323,6 +323,49 @@ driver's cleanup model, which is SUBMIT-TRIGGERED — `timeout_clean` runs only 
 that core. Fewer submits => a wedged job sits unnoticed longer => the D-state teardown cascade. A timer-based
 watchdog is the only cleanup that works for a one-long-chain design.
 
+## Correlated dmesg (ORK_KMSG_SUBMIT=1) + what it ruled out
+
+`ORK_KMSG_SUBMIT=1` stamps every submit into /dev/kmsg (cached fd, one write) so userspace submits and the
+kernel watchdog interleave in ONE stream:
+
+```
+ork: sub#2500 dom=0 cm=0x1 tasks=1   fl=0x1   <- drain-barrier dummies (blocking) in the OUTGOING domain
+ork: sub#2503 dom=1 cm=0x1 tasks=832 fl=0x7   <- first real submits into the NEW domain
+ork: sub#2504 dom=1 cm=0x2 tasks=864 fl=0x7
+ork: sub#2505 dom=1 cm=0x4 tasks=864 fl=0x7
+RKNPU: core 0 NO TASK PROGRESS ... tasks=0/832 done (counter 0x0), cm=0x1 dom=1, job age 115004 us
+```
+
+The watchdog log now prints **completed/submitted** so it is self-interpreting: `0/832` = never started.
+
+**⚠ THE STAMP PERTURBS THE RATE** — 3.25% -> 6.00% with it on (one extra syscall per submit, ~3800/run).
+Use it for LOCALISATION ONLY; never quote a rate from a stamped run.
+
+**Ordering: the domain switch is BEFORE the failing submit** (drain dummies in dom=0, real submits in dom=1,
+watchdog reports dom=1). **But that is NOT discriminating at ndom=2** — the probe alternates domains every
+rep, so EVERY round is "first submit after a switch", failing or not. The discriminating evidence is the
+factorial: `M=64, ndom=1` still fails 3/400, i.e. **failures occur with no domain switch at all**. The
+switch raises the probability; it is not necessary.
+
+### Also ruled out
+
+- **Ping-pong** (A-B-A, n=4000): ON 146 / OFF 111 / ON 116 per 4000. The two ON arms bracket 146 and 116
+  (~1.9 sigma apart on their own), OFF sits inside that spread — ~1.3 sigma vs the bracket mean. No effect.
+  Without the bracket, 146->111 would have looked like a 24% win.
+- **Kernel batch re-commit**: RK3588 `max_submit_number = 4095` and our submits carry 832-864 tasks, so the
+  job is committed **once**, not in batches. `rknpu_job_done`'s re-commit path is not involved.
+- **Counter wrap**: `pc_task_number_mask = 0xfff` (wraps at 4096) and 832 < 4095, so `0x0` cannot be a wrap
+  artifact; healthy jobs advance the same register.
+
+### LANDMINE (latent, not our bug — do not create one)
+
+`rknpu_job_subcore_commit` reads `args->subcore_task[core_index + 2]` when `use_core_num == 3`, i.e. indices
+**2,3,4** — while our code fills only [0],[1],[2]. An all-core submit (`core_mask = 0x7`) would therefore
+commit `task_number = 0` on cores 1 and 2 and the PC would silently never run — exactly the symptom we spent
+this session chasing. Every submit in the tree currently uses a SINGLE-core mask (`1u<<i` /
+`RKNPU_CORE0_MASK`), so `use_core_num == 1` and the safe `case 1:` path is taken. **If you ever add a
+core_mask=0x7 submit, fill `subcore_task[2..4]`.**
+
 ## Open hypotheses
 
 1. **Task-boundary / HW-chaining race** (user). Being tested via `ORK_DYN_NOCHAIN=1` (see below).

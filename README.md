@@ -379,6 +379,7 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 | `ORK_DOM_DRAIN` | retirement barrier before an IOMMU domain switch (**default on**; `=0` restores the old blind sleep). A doorbell op is "done" when its output cell lands, which is *before* the kernel retires the job, so switching domains races the un-retired job and hurts dispatch. Measured 11.47% → 1.99% stalls on `i4_widek_stall_probe`, median unchanged. Single-domain models never reach it. |
 | `ORK_DOM_SETTLE_US` | width of the old blind pre-switch sleep, used only when `ORK_DOM_DRAIN=0` (default 1000) |
 | `ORK_I4_KTMO_MUL` | scale ONLY the submit timeout handed to the kernel (default 1). Diagnostic: the driver's `rknpu_job_timeout_clean` compares µs against a millisecond value, so the real reap threshold is 1000× shorter than intended — and that accidental aggressive reaping is **load-bearing** (making it "correct" measures 2.6× *worse*). See the wiki NPU-Quirks. |
+| `ORK_KMSG_SUBMIT` | stamp every submit into `/dev/kmsg` so userspace submits interleave with kernel NPU messages in one `dmesg` stream (cached fd, one write). **Diagnostic only, and it perturbs what it measures** — the extra syscall per submit moved the doorbell stall rate 3.25% → 6.00%, so use it to localise an event, never to quote a rate. |
 
 ### orkpack / streaming / multi-domain (ggml-ork)
 | var | effect |

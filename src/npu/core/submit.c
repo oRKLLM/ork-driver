@@ -104,6 +104,29 @@ void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki
  * the per-program rate is the one comparable to 1/4000. */
 unsigned long orki_submit_n = 0, orki_submit_prog = 0;
 
+/* ORK_KMSG_SUBMIT=1 — stamp every submit into /dev/kmsg so USERSPACE submits and the KERNEL's watchdog
+ * reports land in the SAME dmesg stream, in order. Without this the two halves of a dispatch failure cannot
+ * be lined up: userspace knows the op/shape/domain, the kernel knows the core and the PC task counter, and
+ * nothing links them but wall-clock eyeballing.
+ *
+ * Correlate like this:
+ *   ork: sub#1871 dom=6 cm=0x2 tasks=21 fl=0x3 rc=0        <- this submit
+ *   RKNPU: core 1 NO TASK PROGRESS ... task counter stuck at 0x0, job age 115001 us
+ * `cm` is a MASK (bit i = core i), so it names which core the kernel then reports on.
+ *
+ * Uses a CACHED fd rather than ork_kmsg(), which open()s and close()s per call: three syscalls on the
+ * submit hot path is ~5% of the 167 us dispatch floor, and this is a dispatch-TIMING defect — a heavy probe
+ * would perturb the thing being measured. Off by default for the same reason. */
+static void orki_submit_stamp(const struct rknpu_submit *sub, int domain, int rc){
+    static int kfd = -2;
+    if (kfd == -2) { kfd = getenv("ORK_KMSG_SUBMIT") ? open("/dev/kmsg", O_WRONLY|O_CLOEXEC) : -1; }
+    if (kfd < 0 || !sub) return;
+    char b[160];
+    int n = snprintf(b, sizeof b, "<4>ork: sub#%lu dom=%d cm=0x%x tasks=%u fl=0x%x rc=%d\n",
+                     orki_submit_n, domain, sub->core_mask, sub->task_number, sub->flags, rc);
+    if (n > 0) { ssize_t w = write(kfd, b, (size_t)n < sizeof b ? (size_t)n : sizeof b - 1); (void)w; }
+}
+
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     orki_submit_n++; orki_submit_prog += sub ? (unsigned long)sub->task_number : 0;
     /* OFFLINE GUARD. ork_npu_init_offline hands out a context with fd = -1 for CPU-side work (pack building
@@ -152,6 +175,7 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     if(_nb) sub->flags |= 0x2;
     double _fd_t0 = ork_now_us();
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
+    orki_submit_stamp(sub, domain, rc);   /* ORK_KMSG_SUBMIT: interleave with the kernel watchdog in dmesg */
     { double _fd_dt = ork_now_us() - _fd_t0; orki_fd_ioctl_us += _fd_dt; orki_fd_hw_raw_last = (long long)sub->hw_elapse_time;
       orki_fd_hw_us += (double)sub->hw_elapse_time; orki_fd_n++;
       if(_nb){ int async=(rc==0 && _fd_dt<50.0);  /* returned in <50us => before the HW could run => async */
