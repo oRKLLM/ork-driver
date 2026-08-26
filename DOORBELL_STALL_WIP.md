@@ -1390,3 +1390,42 @@ ratchets.
 **Methodology note:** runtime feature-gating made an 11-kernel bisect into four workload runs. Worth
 preserving that property when adding future diagnostics — every new behaviour behind a param that
 defaults off.
+
+### ★★ THE ACCUMULATOR FOUND — unbalanced domain PUTS (and my earlier refutation was wrong)
+
+Six consecutive runs on one boot, sampling after each:
+
+| run | rc | refcnt_now | map_n | unmap_n | LEAK | underflow | mismatch |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 | 0 | 71 | 71 | 0 | 0 | 0 |
+| 2 | 124 | 0 | 142 | 92 | **50** | **5** | 0 |
+| 3-6 | 139 | 0 | 142 | 92 | 50 | 5 | 3 |
+
+1. **The refcount does not ratchet up — it UNDERFLOWS.** `dbg_domain_underflow` reaches 5. There are
+   EXCESS PUTS.
+2. **An over-put is harmful before it ever goes negative.** With a job holding the domain (refcount 1),
+   a spurious put drops it to 0, and `rknpu_iommu_domain_get_and_switch()` proceeds because it only
+   tests `refcount == 0` — **switching domains while work is still live**. That is precisely the
+   `mismatch domain` signature. The 5 counted underflows are only those that went BELOW zero; puts
+   that merely reached zero early are invisible and must be more numerous.
+3. 50 mappings leak in run 2; from run 3 the counters freeze because allocation already fails.
+
+**Correction to an earlier entry in this document.** The refcount-underflow theory was recorded as
+REFUTED on the strength of `dbg_domain_underflow == 0` — but that was ONE clean run, and the
+accumulation needs several. Over six runs it is 5. The refutation was a window-size error, and the
+theory is now the leading candidate, not a dead one.
+
+**Prime suspect: our own kernel change 02** — the *added* `rknpu_iommu_domain_put()` in
+`rknpu_job_timeout_clean()`. The wiki has flagged it as a double-put risk since it landed ("it is an
+*added* put, so a path that already released the reference makes it a double-put"). The clamp
+(#patch45) prevents the counter going negative but CANNOT prevent the premature-zero window, which is
+the damaging part.
+
+**Next:** tag `rknpu_iommu_domain_put()` with its caller (`__builtin_return_address(0)` or an explicit
+site enum) and log which site over-puts. That names the exact line rather than inferring it. Then
+either remove the change-02 put or make it conditional on the reference actually being held.
+
+**Implication for the recovery state machine** (HEALTHY -> DRAINING -> TEARDOWN -> REINIT, new submits
+`-EAGAIN`): the right trigger sensor is now clear. It should watch for the refcount reaching zero while
+jobs are still in flight — the premature-zero condition — not IOVA headroom, which only degrades much
+later and would fire long after corruption started.
