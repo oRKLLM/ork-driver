@@ -1298,3 +1298,54 @@ known-executing point rather than from the watchdog.
 - `dom_cooldown_us` default 0 and should stay there: measured useless.
 - Log capture moved to `/var/lib/ork-logs/kmsg.log` on the NVMe (`/var/log` is tmpfs and was eating
   datasets on every reboot).
+
+### ★ SUB-BLOCK DUMP with a VALIDATED control — CDMA identical, CNA/DPU status differs
+
+First, the control was validated rather than assumed. A suspicion arose that the PC completed-task
+counter never advances mid-job (which would have made "counter 0x0" meaningless and the whole
+"committed but never starts" framing wrong). Measured directly: **`wd_seen_job=37921`,
+`wd_cnt_nonzero=2120`, `wd_max_cnt=8`.** The counter DOES advance, task by task. The framing survives,
+and `cnt > 0` is a sound definition of "provably executing".
+
+With that control:
+
+```
+                   HEALTHY (cnt>0)                    STALLED
+CNA  +0x1000  00010008 0001000e ...          00000005 0000000e ...
+DPU  +0x4000  00000000 0000000e ...          00000005 0000000e ...
+CDMA +0x5000  00000000 .. 0000000f ..        00000000 .. 0000000f ..     IDENTICAL
+CDMA +0x5020  00000000 .. 00000001 ..        00000000 .. 00000001 ..     IDENTICAL
+```
+
+**CDMA is byte-identical between healthy and stalled.** The "NPU is stuck on a synchronous/blocking
+DMA read that never returns" hypothesis is therefore NOT supported: there is no DMA-engine state
+difference at all. Combined with all four MMU banks reading IDLE, nothing indicates an outstanding
+memory transaction.
+
+The difference sits in CNA and DPU. On NVDLA-derived blocks `+0x000` is `S_STATUS` and `+0x004` is
+`S_POINTER`:
+
+- CNA `S_STATUS`  healthy `0x00010008`  stalled `0x00000005`
+- DPU `S_STATUS`  healthy `0x00000000`  stalled `0x00000005`
+- CNA `S_POINTER` healthy `0x0001000e`  stalled `0x0000000e`
+
+Both blocks read exactly `0x5` when stalled. The healthy samples have **bit 16** set where the stalled
+ones have it clear — in NVDLA that bit selects the ping-pong register group, which would place this
+adjacent to the existing ping-pong quirk.
+
+**Caveats, stated because they matter:** the healthy and stalled samples are different ops, so config
+words differ legitimately; and the `S_STATUS`/`S_POINTER` reading is inferred from NVDLA convention,
+not from a verified RK3588 register map. Confirm against mainline
+`drivers/accel/rocket/rocket_registers.h` before building on it. What is NOT a config artifact is CDMA
+being identical while CNA/DPU status diverges.
+
+### ⚠ OPEN REGRESSION — `mismatch domain` is back
+
+Patch 46 (serializing `rknpu_soft_reset` against domain switching) measured **0** mismatch lines
+immediately after it landed. On kernel #33 the same workload produced **867**, with
+`switch iommu domain time out` at 0 — the two failure modes appear to have traded places. Either the
+fix regressed somewhere across kernels #23-#33, or the original zero was luck.
+
+This contaminated several runs: allocations fail with `errno=22`, the bench SIGSEGVs on a NULL buffer,
+and it is the likely reason the `cnt > 0` healthy control captured nothing on kernel #32. Needs a
+bisect; not started.
