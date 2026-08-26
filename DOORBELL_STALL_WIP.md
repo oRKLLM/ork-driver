@@ -676,6 +676,49 @@ does nothing.
   end-to-end latency has NOT collapsed yet despite the re-commit completing. Measure where that time goes
   (watchdog detect latency ~115 ms + quiesce + re-attach + re-commit) before claiming the win.
 
+## ⚠ RETRACTION + BUG: experiment 11's "IOMMU re-attach is essential" is UNSUPPORTED
+
+**Retraction.** The kick was returning **-EBUSY on every stall**: `mutex_trylock(&reset_lock)` failed
+(a device-wide `rknpu_soft_reset` holds it across its `msleep(100)` and one is almost always in flight),
+and my code **returned before the re-commit**. So mode 3's "deficit 1.0/stall" did NOT mean the re-commit
+succeeded — it meant **no re-commit was attempted**. Mode 2's 2.0 meant it was attempted and failed. The
+metric conflated "never tried" with "tried and worked", and the good number was read as success.
+**The claim that the IOMMU re-attach is the essential ingredient is unsupported.** (Fourth time this
+session a matching number misled: log the RETURN VALUE next to the count.)
+
+**A real bug I introduced, still unfixed: use-after-free in `rknpu_job_kick_stalled`.** It reads
+`subcore_data->job` under `irq_lock`, RELEASES the lock, then resets the core and re-commits that pointer.
+In between, the job can complete and be freed by `cleanup_work`. Symptom: repeated panics in code with
+nothing to do with the NPU —
+```
+pc : cfs_rq_clock_pelt+0x14/0x54     (CFS scheduler)
+pc : aa_put_label+0x18/0x6c          (AppArmor)
+```
+classic slab corruption. Mode 3 is worst because the IOMMU re-attach widens the window enormously.
+**Fix before any further kick testing:** hold `irq_lock` across the sequence, or take a reference on the
+job. `wd_kick` defaults to 0, so the board is safe as it stands.
+
+**A pre-existing driver wart my patch exposed (FIXED):** `rknpu_soft_reset` treated a failed `trylock` as
+SUCCESS (`return 0`) without resetting anything. Harmless while it was the only resetter; once the per-core
+path also took `reset_lock`, userspace's `RKNPU_ACT_RESET` silently became a no-op and the workload ran
+~10x slower (2.7 vs 34 commits/s). Now it waits for the in-flight reset instead. **That ~10x was my bug,
+not the inherent cost of the quiesce** — an earlier claim to the contrary was wrong.
+
+## ★ RECOVERY LATENCY MEASURED — detection is ~100% of it
+
+```
+detect=115016us  reset=21us  iommu=0us  recommit=7us  total=28us
+detect=114015us  reset=21us  iommu=0us  recommit=7us  total=28us
+```
+
+**The recovery ACTION costs 28 microseconds.** Per-core reset 21 us, re-commit 7 us. Detection costs
+**115 ms** — over 99.9% of the latency, and it is a pure threshold (`wd_samples=64` at a nominal 1 kHz;
+the effective sample period is ~1.8 ms because `queue_work` throttles it). Against a 5.7 ms op, 8-16
+samples would detect in ~15-30 ms with ample margin.
+
+So the achievable ceiling is roughly **3.6 s -> ~20 ms per miss**, and none of it requires knowing the root
+cause — PROVIDED a working recovery action is found (mode 2 is confirmed not to be one).
+
 ## Open hypotheses
 
 1. **Task-boundary / HW-chaining race** (user). Being tested via `ORK_DYN_NOCHAIN=1` (see below).
