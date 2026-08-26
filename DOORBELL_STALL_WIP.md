@@ -771,3 +771,124 @@ sudo ORK_NPU_LOCK_WAIT=600 tools/util/npu_guard.sh -- taskset -c 4-7 \
   env ORK_MC_DIAG=1 ORK_QUANT=4 ORK_MIXED_W4A4=1 timeout 900 \
   ./bin/ork_ppl ~/q27_rtn_v6.orkpack ~/llama.cpp/README.md 64 64 1
 ```
+## Session 2026-08-26 — doorbell stall: IOMMU theories refuted, board-killer found
+
+### Board-stability bugs found and fixed (these were blocking every experiment)
+
+1. **`ork_npu_reap_stuck` use-after-free (OUR code, `src/npu/core/device.c`).** It fired
+   NONBLOCK dummy jobs, slept 3 ms, then `orki_bdestroy()`d the A/B/C buffers those jobs still
+   referenced. Not a rare race: the function is only called when a core is already stuck, i.e.
+   exactly when the dummy cannot complete in 3 ms. Killed the board from three different sites
+   (`rb_erase`/`drm_vma_node_revoke`, `sg_free_table`/`__free_pages`, and a later `fork` via slab
+   corruption) — always seconds AFTER it returned, which is why it read as a kernel bug.
+   FIX: one BLOCKING submit per core after the dummies; it cannot return until that core has
+   retired everything queued ahead of it. Positive drain, not a timing guess.
+
+2. **Kernel: NULL iommu domain dereferenced (patch 33/34, `rknpu_iommu.c`).**
+   `rknpu_iommu_dma_map_sg` / `_unmap_sg` / `_alloc_iova` all do `domain->iova_cookie` with no
+   NULL check. The switch failure path does `detach(src)` then, if both attaches fail, returns
+   with the device attached to NOTHING — so the next GEM op panics at offset 0x40.
+   Reachable in practice: a stalled job cannot be drained -> `switch iommu domain time out`.
+   FIX: `rknpu_iommu_cookie()` helper returns NULL instead of faulting; plus the switch's
+   failure path now attaches any still-valid domain rather than leaving the device detached.
+   STRONG CANDIDATE for the long-standing "NPU wedge needs a power cycle".
+
+3. **Kernel: watchdog cadence (no rebuild needed).** `wd_period_us=1000` costs ~100x throughput
+   (2.8 commits/s vs 283-490/s warm). Detection is `wd_samples * wd_period_us`, so
+   `period=10000, samples=12` keeps the same ~120 ms detection at 1/10th the sampling.
+
+### Stall root cause — what is now RULED OUT (all with counters/controls, not readings)
+
+| hypothesis | test | result |
+|---|---|---|
+| deferred attach leaves stale page table | `rk_dbg_attach_deferred` (patch 29) | REFUTED: 0 deferred vs 1017 programmed during the run |
+| domain switch races an in-flight job | `rknpu_dbg_switch_inflight` (patch 30) | REFUTED: 0 in-flight vs 1012 idle |
+| the MMU itself is wedged | read RK_MMU_STATUS at stall (patch 31) | REFUTED: all 4 banks `0x19` = paging, **idle**, replay-empty |
+| recovery needs post-reset settle time | kick_mode 6, settle 2/10/40 ms (patch 32) | REFUTED: 0 recovered out of 20 stalls |
+
+An **idle** MMU at stall time is the strongest single clue: the NPU core never issued a memory
+request at all. The failure is upstream of the IOMMU entirely.
+
+### Recovery: what works
+
+- `KICKED JOB COMPLETED` ~4.47 ms after the kick, extremely reproducible (4466/4471/4473/4478 us).
+- Only the IOMMU detach/attach variant recovers: **3/3 with it, 0/11 without**.
+- And it is NOT the elapsed time (settle refuted above) — so something in
+  `rk_iommu_enable()` (force-reset of all MMU banks / ZAP_CACHE / paging cycle / clk_bulk) is
+  the active ingredient. Which one is the open question.
+- Latency: detect ~115 ms (tunable) + reset 21 us + iommu 4.6-42 ms + recommit 7 us.
+
+### Open / next
+
+- **UNRESOLVED CONFOUND:** kick_mode 3 drew 0 stalls in 2500 reps twice, while mode 6 drew 8-10
+  in the same script. A kick cannot prevent a stall, so this is probably an ordering artifact —
+  an interleaved A-B-A-B (`/tmp/p35.sh`) was launched to settle it and has not yet completed.
+- Narrow which part of `rk_iommu_enable()` is curative (force-reset vs ZAP vs paging cycle vs
+  clock) — that is the cheap-recovery lever.
+- Residual domain-0 asymmetry: extra domains get `iommu_get_dma_cookie()` + a hand-patched
+  `domain->type |= __IOMMU_DOMAIN_DMA_API`, skipping `iova_reserve_iommu_regions()` that the
+  real `iommu_dma_init_domain()` path runs. Roadmap item, not chased.
+- Nothing pushed. Kernel patches 07-34 not yet exported to wiki attachments (only 04/05/06 are).
+- `src/npu/core/device.c` is in ATTEST_SRCS -> the reap-stuck fix needs a board `make test` and a
+  refreshed `tests/sbc_attest.txt` in the same commit.
+
+### LATE-SESSION CORRECTION — the 3/3 recovery result is RETRACTED
+
+Patch 35 made `rknpu_job_abort()` clear `subcore_data->job` unconditionally (it previously left a
+freed pointer published whenever `job->irq_entry[i]` was set). With that fixed, the kick now finds
+NULL and declines, and mode 3 recovers **0/5** instead of 3/3.
+
+So the earlier "IOMMU re-attach recovers 3/3" almost certainly measured a **use-after-free**: the
+kick was re-committing a job `abort` had already freed. It completed (`KICKED JOB COMPLETED` ~4.47 ms,
+suspiciously identical every time) because the memory was still mapped. Do not build on that result.
+The IOMMU-vs-no-IOMMU 3/3-vs-0/11 split is therefore also unsafe to cite.
+
+### The corruption chain, fully traced
+
+    stall -> job stuck -> rknpu_iommu_domain_get_and_switch() waits 6 s -> "switch iommu domain time out"
+      -> rknpu_gem_object_destroy() cannot unmap the IOVA -> "RKNPU: failed to destroy memory"
+      -> it releases the GEM object ANYWAY
+      -> shmem inode evicted with pages still mapped:
+             BUG: Bad page cache ... "still mapped when deleted"
+             (filemap_unaccount_folio / shmem_undo_range / shmem_evict_inode)
+      -> allocator corrupt from here on; the box panics later somewhere unrelated
+         (cfs_rq_clock_pelt, __memcg_kmem_charge_page via fork, sg_free_table/__free_pages)
+
+That last hop is the remaining unfixed bug and the highest-value next fix: **when the IOMMU unmap
+fails, `rknpu_gem_object_destroy` must NOT free the object.** Deliberately leaking the buffer is
+strictly better than corrupting the page allocator.
+
+Also still unfixed: my kick's mode-3 detach/attach can leave the device detached (patch 36 checks
+the return and falls back, but 83 switch timeouts still appeared afterwards, so it is not fully
+contained). Given the retraction above, the kick has no demonstrated benefit and should be left
+DISARMED (`wd_kick=0`, `wd_period_us=0` -- both are the defaults) until the GEM-destroy fix lands.
+
+### Board / kernel state at session end
+- Running kernel #12 (patches 29-36), watchdog disarmed, no probe running.
+- Kernel source of truth: `board:~/kbuild/linux-rockchip` (NOT /tmp -- tmpfs, wiped on reboot).
+- VM builds: `tools/util/vm_kbuild.sh --keep` = ~30 s sync+build+install (SBC incremental was 2-5 min);
+  `--stop` shuts it down. It now syncs the WHOLE driver plus `drivers/iommu/rockchip-iommu.c`.
+
+### CORRECTION to "the corruption chain" above — the last hop is WRONG
+
+Read the code instead of inferring it:
+
+- `rknpu_gem_object_destroy()` on 3 failed switches **returns early** — it does NOT free. It skips
+  `rknpu_gem_free_buf()`, `rknpu_gem_release()` and `rknpu_iommu_domain_put()`. So it already
+  leaks-rather-than-corrupts, and the proposed "don't free when the unmap fails" fix is a NO-OP.
+- Skipping `rknpu_iommu_domain_put()` there is also CORRECT, not a leak:
+  `rknpu_iommu_domain_get_and_switch()` `atomic_inc`s the refcount only on its two success paths
+  (`domain_id == current` and `refcount==0 -> switch ok`); the timeout and switch-failure paths
+  return without taking a reference. The parallel I drew to kernel change 02 does not hold.
+- `rknpu_gem_free_object()` is DRM's `->free` callback and just calls `..._object_destroy()`, so an
+  early return there leaks the `drm_gem_object` — it does not release it.
+
+What the corruption report actually says: `mapcount:1` + "still mapped when deleted" from
+`shmem_evict_inode` means a **CPU page-table mapping** (a userspace VMA) still referenced the page
+when the shmem inode was truncated. That is an mmap/VMA accounting problem, NOT the IOMMU unmap.
+The precise defect is UNIDENTIFIED. Next instrumentation should target the GEM mmap/vm_close path
+(`rknpu_gem_mmap` / `drm_gem_vm_close` / the probe's own munmap-vs-destroy ordering), not the IOMMU.
+
+Still true and unaffected: the reap-stuck UAF fix, the NULL-domain guards, the abort dangling-pointer
+fix, the watchdog cadence finding, the four refuted stall hypotheses, and the retraction of the
+3/3 recovery result.
