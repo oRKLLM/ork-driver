@@ -1253,3 +1253,48 @@ out) — the position comparison is within-run and unaffected.
 2. Then test the mechanism: does a quiesce/settle/prime after `iommu_attach_device` — before the first
    commit — eliminate it? `ork_dom_prime` already exists userspace-side; the kernel equivalent would be
    refusing to commit until the NPU is confirmed idle post-switch.
+
+### ★ COOLDOWN CAUSAL TEST — FAILED. Time-since-switch is not causal either.
+
+A-B-A-B, `ork_bench` 1.5B-Q8, kernel #29:
+
+| cooldown | rc | wall | **stalls** | cooldowns fired |
+|---|---|---|---|---|
+| 0 | 0 | 83 s | **86** | 0 |
+| 1000 us | 0 | 82 s | **86** | 105 |
+| 0 | 0 | 82 s | **86** | 0 |
+| 1000 us | 0 | 81 s | **86** | 105 |
+
+**The cooldown fired 105 times per treatment cell and the stall count did not move: 86 every run.**
+
+That is the THIRD correlate of "just after a domain switch" to survive replication and then fail its
+causal test — after inter-commit spacing and after domain identity. All three are real correlations;
+none is the mechanism. The common thread is that **delaying does not help**, which argues the problem
+is not a settling time at all.
+
+Silver lining: the workload is now an exceptionally good A/B substrate — 86 stalls and 7.19 tok/s on
+every single run, so any real effect is immediately visible.
+
+### Sub-block register dump (CNA 0x1000 / DPU 0x4000 / CDMA 0x5000) — INCONCLUSIVE
+
+Built to test whether the NPU is stuck mid-read (a DMA outstanding upstream of translation) or never
+issued one at all. Result: the healthy and stalled snapshots are **byte-identical**, all three blocks,
+both cores. CDMA reads all-zeros in both.
+
+**Do not read that as "no hung read".** The control is likely invalid: the "healthy" snapshot fires
+when a job is present with `wd_flat == 0`, which only means RECENTLY COMMITTED — plausibly the same
+register state as a job that is about to be reported stalled. A genuinely-executing snapshot needs the
+counter-advanced branch, which a 10 ms sampler almost never catches (the first attempt captured zero).
+
+To make it decisive: (a) widen the window past the first 8 words per block to find any word that moves
+at all, and (b) get a real running control — sample far faster, or trigger the baseline dump from a
+known-executing point rather than from the watchdog.
+
+### Working state
+
+- Kernel #31. `switch_escalate=3` (default ON) reaps stuck jobs after 3 consecutive switch timeouts —
+  it fired twice in one run and the board survived, where the same workload had previously hard-wedged
+  into a plug cycle twice.
+- `dom_cooldown_us` default 0 and should stay there: measured useless.
+- Log capture moved to `/var/lib/ork-logs/kmsg.log` on the NVMe (`/var/log` is tmpfs and was eating
+  datasets on every reboot).
