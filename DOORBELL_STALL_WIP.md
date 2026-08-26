@@ -639,6 +639,43 @@ IOMMU domain re-attach**, to find out which half of the device-wide sequence is 
 Kept in the tree: `rknpu_soft_reset_core()` is correct and useful regardless (no msleep, no global stall of
 `rknpu_job_next`); it just is not sufficient on its own.
 
+## ★ EXPERIMENT 11 (2026-08-26): the IOMMU RE-ATTACH is the essential recovery ingredient
+
+Recovery-ingredient factorial, n=4000/cell, `deficit = commit - done` over the cell:
+
+| mode | ingredients | stalls | deficit/stall |
+|---|---|---|---|
+| 0 | baseline, no kick | 9 | 1.0 |
+| 2 | per-core reset + re-commit | 4 | **2.0** |
+| 4 | pre-pulse + per-core reset + re-commit | 6 | **2.0** |
+| 3 | per-core reset + **IOMMU re-attach** + re-commit | 9 | **1.0** |
+| 5 | pre-pulse + per-core reset + **IOMMU** + re-commit | 10 | **1.0** |
+
+**Read deficit/stall, not the stall count** (counts are noise at this n; the ratio is per-stall). Baseline
+1.0 = the original commit is lost. **Without the IOMMU re-attach: 2.0 — the re-commit fails too. With it:
+1.0 — the re-commit SUCCEEDS.**
+
+**Why:** `iommu_detach_device()` immediately followed by `iommu_attach_device()` of the SAME domain is not
+unbind/rebind, it is a RE-PROGRAMMING idiom — it makes the IOMMU driver rewrite the device translation-table
+registers. The NPU's `rk_iommu` shares the NPU's reset/power domain, so **resetting the core wipes its MMU
+programming**; a re-commit without restoring it has a valid-looking IOVA in `PC_DATA_ADDR` and no
+translation behind it. That is why mode 2 failed, and it was predictable before running it.
+
+**The pre-pulse is irrelevant** (2 vs 4, 3 vs 5 identical), confirming mode 1: re-triggering `PC_OP_EN`
+does nothing.
+
+### Consequences
+
+- Recovery does NOT need the device-wide six-line reset or its `msleep(100)`. It needs
+  **per-core reset + IOMMU re-attach + re-commit**.
+- **But the IOMMU re-attach CANNOT be async.** Bare from the watchdog it raced
+  `rknpu_iommu_dma_map_sg` and PANICKED the board (`__iommu_attach_group` -> NULL deref at 0x40 -> fatal
+  oops). It is safe only with `reset_lock` held and `soft_reseting = true` (the global dispatch quiesce),
+  which is what `rknpu_soft_reset` does. So recovery is cheaper, not free.
+- **STILL OPEN:** userspace continued to record these as >400 ms events even in modes 3/5, so the
+  end-to-end latency has NOT collapsed yet despite the re-commit completing. Measure where that time goes
+  (watchdog detect latency ~115 ms + quiesce + re-attach + re-commit) before claiming the win.
+
 ## Open hypotheses
 
 1. **Task-boundary / HW-chaining race** (user). Being tested via `ORK_DYN_NOCHAIN=1` (see below).
