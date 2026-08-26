@@ -1201,3 +1201,55 @@ between shapes within the same run is not, and that is the claim being made.
 they do, the extra-domain construction is the mechanism and the fix is to build domains >0 through the
 proper `iommu_dma_init_domain()` path rather than `iommu_get_dma_cookie()` + type patching. That is a
 far more tractable target than either pacing or a hardware handshake.
+
+## ★★ ROOT CAUSE LOCALIZED — stalls are the first ~3 commits after an IOMMU domain switch
+
+One run, 447 commits, 35 stalls, `prof_mask=3`:
+
+| position after switch | commits | stalls | rate |
+|---|---|---|---|
+| 0 (first after switch) | 26 | 12 | **46.2%** |
+| 1-2 | 50 | 23 | **46.0%** |
+| 3-9 | 116 | **0** | **0.0%** |
+| 10+ | 255 | **0** | **0.0%** |
+
+Controlling for position (`sinceswitch >= 3` only): dom 0 = 0/180, dom 1 = 0/171, dom 2 = 0/20.
+**The domain-index effect disappears completely.**
+
+**Every stall in the run happened within 3 commits of a domain switch. Nothing stalled after that, in
+371 commits.**
+
+### This invalidates two earlier conclusions from this same investigation
+
+- **"Domain >0 is implicated" (the shape-axis result) is WITHDRAWN.** dom 2 looked catastrophic only
+  because it is visited briefly, so a large fraction of its commits sit right after a switch. The
+  `iova_reserve_iommu_regions` asymmetry is a red herring for this bug.
+- **The inter-commit-gap correlation (change 16) is also a confound.** The first jobs into a
+  freshly-switched domain arrive in a burst, so short gaps CO-OCCUR with post-switch position. That is
+  why enforcing spacing produced no dose-response and inverted at 1500 us — it was pacing a symptom.
+
+### It explains previously unexplained results
+
+- `ndom=2` tripled the stall rate vs `ndom=1` on the int4 probe: more switches, not worse domains.
+- The 27B int4 case stalls less: fewer switches per unit of work.
+- "MMU idle at stall time" fits: the core never issued a memory request because its own post-switch
+  state is wrong, not because translation failed.
+
+### We already suspected this and never measured it
+
+`src/npu/core/domain.c:223` carries a comment about the *"first-submit-into-a-freshly-switched-domain
+hazard"*, and `ork_dom_prime` exists to prime a domain. The hazard was written down in our own
+userspace and never quantified.
+
+### Caveats
+
+Single run; 35 stalls. The separation (0/371 beyond position 2) is enormous, but it should be
+replicated before anything is built on it. Note also `prof_mask=3` perturbs absolute rates (run timed
+out) — the position comparison is within-run and unaffected.
+
+### Next
+
+1. **Replicate** on a second run, and on the int4 probe with `ndom=2`.
+2. Then test the mechanism: does a quiesce/settle/prime after `iommu_attach_device` — before the first
+   commit — eliminate it? `ork_dom_prime` already exists userspace-side; the kernel equivalent would be
+   refusing to commit until the NPU is confirmed idle post-switch.
