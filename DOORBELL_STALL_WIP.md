@@ -1029,3 +1029,96 @@ watchdog-independent denominators exist:
 Coverage = `wd_stalls / failed-to-wait-lines`. Residual blind spot, stated honestly: a stall seen by
 NEITHER instrument (never sampled and never timing out). Userspace times out on everything
 eventually, so that class should be empty, but these two instruments cannot prove it is.
+
+## DESIGN — reshaping submission so short inter-commit gaps cannot occur
+
+Desk work following the change-16 correlation (every stalled job committed 0.24-0.9 ms after the
+previous commit on that core) and the change-49 causal test (enforcing 500 us spacing cut stalls
+86 -> 12). The `min_commit_gap_us` knob is a DIAGNOSTIC, not a shipping fix: it busy-waits with
+`udelay()` because `rknpu_job_next()` can be reached from the completion IRQ, it burns CPU, and it
+is blind — it waits a fixed time whether or not the hardware needs it.
+
+### What actually happens today
+
+Commits reach the hardware from exactly three places, all funnelling through `rknpu_job_next()`:
+
+| caller | context | when |
+|---|---|---|
+| `rknpu_job_done()` (`rknpu_job.c:676`) | **completion IRQ** | previous job finished -> commit the next |
+| `rknpu_job_schedule()` (`:883`) | process | a new submit arrives and the core is idle |
+| `rknpu_job_timeout_clean()` (`:728`) | process | after reaping |
+
+`rknpu_job_next()` promotes one job off `todo_list`, stamps `hw_commit_time`, and calls
+`rknpu_job_commit()` **inline and immediately**. The programming sequence is:
+
+```
+PC_DATA_ADDR <- regcmd_addr        PC_DATA_AMOUNT <- regcfg_amount+extra
+INT_MASK / INT_CLEAR
+PC_TASK_CONTROL <- (0x6|pp) << task_number_bits | task_number     <- the trigger; 0x6 self-clears
+PC_DMA_BASE_ADDR <- task_base_addr
+```
+
+**Nothing in that sequence asks the hardware whether it is ready to accept a new program.** So the
+inter-commit gap is simply "how long the previous job took, plus IRQ latency". A burst of short jobs
+(colsplit slices) therefore produces sub-millisecond gaps as a matter of course — the driver has no
+pacing mechanism at all, by construction.
+
+### Why the completion path is the generator
+
+The dominant path is completion-IRQ -> immediate commit. That is the one place where the gap is
+bounded below only by how fast the previous job ran. `ork_dyn_colsplit` issues many small slices per
+core, so consecutive commits land within hundreds of microseconds. This is also why the effect was
+invisible in the 27B int4 work: bigger jobs, longer gaps.
+
+### Four candidate reshapes
+
+**A. Coalesce at the source (userspace, ork-driver) — biggest win, most work.**
+Submit N slices as ONE job with `task_number > 1` instead of N single-task jobs. The hardware then
+walks the task chain itself via the in-regcmd descriptor (`0101:0x0010` next-addr, `0101:0x0014`
+next-amount — already documented in AGENTS.md and already implemented for other paths as
+`run_chain_i8` / `ork_i4_bchain`). There is no second commit, so there is no gap to get wrong.
+Removes the failure mode rather than pacing around it, and it also removes per-submit overhead
+(~167 us floor). Cost: a colsplit chain-assembler; userspace, not kernel; must respect the
+`max_submit_number = 4095` / `pc_task_number_mask = 0xfff` limits.
+
+**B. Kernel-side pacing via hrtimer — pragmatic bridge, no busy-wait.**
+Keep a per-core `next_allowed_commit`. In `rknpu_job_next()`, if the deadline has not passed, arm an
+hrtimer for the remainder and commit from its callback instead of inline. Legal from IRQ context
+(arming an hrtimer is), and unlike `udelay()` it does not hold a CPU. Cost: deliberately idles the
+core for the gap; needs care that a job cannot be committed twice or reordered, and that the timer is
+cancelled on reset/abort teardown. Strictly better than the current knob, still blind.
+
+**C. Hardware handshake — the principled fix.**
+Poll a PC readiness/idle status before writing `PC_TASK_CONTROL`, instead of timing. Correct by
+construction, costs nothing when the block is already ready, and self-scales across SoCs and job
+sizes. Requires identifying the right bit — and there is already a lead: the commit snapshot records
+`status(pre)` as **0x5000 in some commits and 0x7000 in others**, and `RK_MMU`-style status semantics
+are named in mainline `drivers/accel/rocket/rocket_registers.h`, which AGENTS.md already designates as
+the cross-reference to consult before guessing on hardware. Cost: RE to confirm the bit's meaning; the
+poll must be bounded (it can run in IRQ context) with a fallback to B's behaviour on timeout.
+
+**D. Move the completion->commit hop into a workqueue.**
+Cheapest structurally: `rknpu_job_done()` queues work instead of committing inline, which both gets
+out of IRQ context (so sleeping waits become legal) and incidentally adds tens of microseconds. But
+the added latency is incidental, not guaranteed to exceed whatever the hardware needs, so on its own
+it is a mitigation, not a fix. Useful mainly as the enabler that makes B or C implementable with
+sleeping primitives.
+
+### Recommendation and sequencing
+
+1. **Prove the mechanism before building anything.** Extend the profiler to record `status(pre)` for
+   every commit and correlate it against stalled/healthy. If stalls line up with one status value, C
+   is correct and cheap. This reuses existing machinery and needs no refactor.
+2. **Ship A for the workload that hurts.** Coalescing colsplit slices removes the gap entirely and
+   pays back the per-submit floor as a bonus. It is the only option that improves throughput rather
+   than trading it away.
+3. **Use C as the general-purpose safety net**, with B as the fallback if the status bit cannot be
+   identified.
+4. Retire `min_commit_gap_us` once one of the above lands; keep it until then as the reproducer.
+
+### What would falsify this direction
+
+If the `min_gap=1500` cell does NOT reduce stalls further than `min_gap=500`, or if the repeat
+`min_gap=0` control does not return to ~86 stalls, then spacing is not the mechanism and this design
+is premature — the 86 -> 12 drop would be drift or a side effect of perturbing timing generally.
+That control is the gate; do not build A/B/C before it reads clean.
