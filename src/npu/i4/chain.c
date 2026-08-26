@@ -852,7 +852,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
                         rc[218] = 0x0014 | (0x0037u << 16);       rc[219] = (0x0101 << 16); }
                     memcpy((char*)RC->cpu + (size_t)pp * REGCMD_I4_N * 4, rc, REGCMD_I4_N * 4);
                     struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.enable_mask = 0xd; tt.int_mask = 0x300;
-                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */
+                    tt.int_clear = 0x1ffff; tt.regcfg_amount = 116; tt.regcmd_addr = RC->dma + (size_t)pp * REGCMD_I4_N * 4;   /* int4 = 116 regs */ tt.op_idx = (uint32_t)++orki_task_seq;   /* stale-task-array probe */
                     tk[pp] = tt; pp++;
                 }
             }
@@ -871,7 +871,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
         for (int col = 0; col < N; col++){ o[col] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[col]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
@@ -943,7 +943,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
         for (int e = 0; e < no; e++) { o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
         orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;

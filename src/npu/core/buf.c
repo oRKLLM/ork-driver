@@ -32,6 +32,15 @@ struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
      * ==0, stock kernel/DTB), drop to DRAM up front — don't even try. If SRAM exists but the alloc faults
      * (SRAM full/contended), retry once in DRAM below. Keeps the async submit path portable. */
     if((flags & RKNPU_MEM_TRY_ALLOC_SRAM) && orki_sram_total==0) flags &= ~RKNPU_MEM_TRY_ALLOC_SRAM;
+    /* ORK_RC_UNCACHED=1 (DIAGNOSTIC): drop RKNPU_MEM_CACHEABLE from scratch allocations. The regcmd and
+     * task buffers the PC fetches are allocated CACHEABLE (0x403 / 0x40b), so a stale CPU line over them
+     * means the NPU's descriptor fetch reads bytes the CPU never flushed -- which would look exactly like
+     * the doorbell dispatch failure: mapping valid (zero IOMMU faults measured), PC registers byte-identical
+     * to a healthy commit, and the job simply never starts. Uncached makes that impossible; if the stall
+     * rate collapses, stale regcmd is the cause. Diagnostic only -- the real fix would be a correct flush,
+     * not making every scratch buffer uncached. */
+    { static int unc = -1; if(unc < 0) unc = getenv("ORK_RC_UNCACHED") ? 1 : 0;
+      if(unc) flags &= ~RKNPU_MEM_CACHEABLE; }
     if(!ork_iova_reserve(dom,need)) return (struct buf){0};   /* proactive: avoid the in-kernel MEM_CREATE fault */
     struct rknpu_mem_create c; memset(&c,0,sizeof c); c.size=need; c.flags=flags; c.core_mask=RKNPU_CORE0_MASK; c.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&c)){

@@ -366,6 +366,211 @@ this session chasing. Every submit in the tree currently uses a SINGLE-core mask
 `RKNPU_CORE0_MASK`), so `use_core_num == 1` and the safe `case 1:` path is taken. **If you ever add a
 core_mask=0x7 submit, fill `subcore_task[2..4]`.**
 
+## SHAPE SWEEP (2026-08-25, n=4000/cell) — geometry does NOT matter, magnitude does
+
+**Per-row path (i4batch=0, M=1, ndom=2) — the model's DOMINANT failure mode:**
+
+| K | K-slices | stalls/4000 | rate | median |
+|---|---|---|---|---|
+| 10752 | **1** (no split) | **6** | 0.15% | 3.76 ms |
+| 17408 | 2 (uneven 10752+6656) | 15 | 0.38% | 5.73 ms |
+| 17408 (repeat) | 2 | 21 | 0.53% | 5.71 ms |
+| 21504 | 2 (**even** 2x10752) | 25 | 0.62% | 7.11 ms |
+
+**BCHAIN path (i4batch=1, M=64):** 17408 -> 85 (2.12%), 21504 -> 96 (2.40%), 10752 -> 76 (1.90%).
+
+**CLOSED: the "marginal geometry / uneven slice remainder" hypothesis.** It was the top lead (the registry's
+K=2560 H-table precedent supported it) and it is WRONG on BOTH paths: the EVEN split (21504) fails at least
+as often as the uneven one (17408). Do not revisit without new evidence.
+
+**Split COUNT matters** on the per-row path: Sk=1 gives 6/4000 vs 15-25 for Sk=2 (~3 sigma).
+
+**But it is NOT a per-program lottery.** "Each program independently risks failure" fits the per-row points
+(1 prog 0.15%, 2 prog ~0.3-0.6%) and then breaks completely: BCHAIN submits ~850 programs, which that model
+predicts should fail ~72% of the time versus the 2-3% measured. Duration correlates better (3.76/5.73/7.11
+ms -> 0.15/0.45/0.62%) but superlinearly, and three points do not justify fitting a curve.
+
+**So: the failing shapes are not special — they are just the BIGGEST.** The model's ffn_down is the largest,
+longest int4 op in the graph, which explains 12/12 misses landing there with no special geometric property.
+
+## ⚠ THE KERNEL PROGRESS WATCHDOG (patch 05) DESTABILISES THE BOARD — keep it OFF by default
+
+Three incidents attributable to it: v1 hard-hung (unguarded MMIO, fixed), and v3 COLD-RESET the board twice
+(instant SoC reset, no panic, no console, ramoops cleared — DRAM gone, so it is a cold reset not a Linux
+reboot). Discriminator, same cell (K=17408 M=1 ndom=2 n=4000):
+
+| NPU watchdog | outcome |
+|---|---|
+| ON (`wd_period_us=1000`) | board cold-reset mid-run |
+| **OFF (`wd_period_us=0`)** | completed, 21/4000, same boot_id, board healthy |
+
+An earlier PMIC/thermal hypothesis for these resets is REFUTED by that discriminator (idle temps 28-30 C,
+trips at 75/80/85 C; and the reset follows the watchdog, not the workload). **Set `wd_period_us=0` for any
+routine run;** enable it only for deliberate diagnosis, accepting a possible reset.
+
+## Log capture — what actually persists (learned after losing 3 wedges' evidence)
+
+- `/var/log` is **DietPi RAMlog** (`AUTO_SETUP_LOGGING_INDEX=-1`, hourly clear) — nothing survives a reboot.
+- journald says `Storage=persistent` but its files are TRUNCATED and `journalctl -k` returns "No entries".
+- ramoops/pstore IS configured (dmesg-0/1, console, pmsg regions) and would hold a **panic**, but our
+  failure is a COLD reset that clears DRAM, so pstore comes back empty every time.
+- **netconsole WORKS and is now persistent** (`/etc/modules-load.d/netconsole.conf` +
+  `/etc/modprobe.d/netconsole.conf`, target `6666@10.3.0.238` via the GATEWAY mac). Receiver: a UDP listener
+  on the Mac (`/tmp/netcon_listen.py` -> `/tmp/netcon.log`).
+- **TRAP that cost an hour:** default `console_loglevel = 4`, so only messages BELOW level 4 reach the
+  console and hence netconsole. `<4>`/KERN_WARNING test messages were silently dropped and I wrongly
+  concluded netconsole was broken; a `<3>`/KERN_ERR message arrived instantly. `kernel.printk = 8 4 1 7` is
+  now persisted in `/etc/sysctl.d/`. **Absence of low-priority lines in an old capture is NOT evidence the
+  event did not happen** — e.g. `RKNPU: soft reset` is LOG_INFO (level 6) and was invisible at loglevel 4.
+- `RKNPU: soft reset, num: 6` — `num` is `num_srsts`, the COUNT OF DT RESET LINES (constant 6 on RK3588),
+  not a reset counter. Count log lines, not that field.
+
+## EXPERIMENT 1 (2026-08-26): the job IS committed; the hardware never starts
+
+Kernel counters (patch 07) over one 4000-rep run, K=17408 M=1 ndom=2:
+
+```
+commit=16075   irq=16065   done=16065   nojob=0   unpow=0     stall-recover events: 10
+```
+
+**commit - done = 10 = exactly the stall count.** Each stall is one job COMMITTED to the PC that never
+completed.
+
+- **irq == done** -> every interrupt that reached the handler produced a completion. **NO interrupts lost.**
+  This REFUTES the "lost completion IRQ leaves subcore_data->job set, next submit sits on todo_list" theory
+  — the job was not queued-and-forgotten, it was committed.
+- **nojob = 0** -> no spurious interrupts.
+- **unpow = 0** -> the Change-6 power guard never fired here, so patch 06 is NOT converting crashes into
+  lost completions (a caveat raised when it landed; now cleared for this workload).
+
+**The window is now: `rknpu_job_subcore_commit()` writes the PC registers -> hardware never begins -> no
+interrupt.** Consistent with the PC completed-task counter reading 0x0.
+
+**NEXT: read the PC registers BACK immediately after the commit write and compare healthy vs stalled.**
+- readback wrong (OPERATION_ENABLE / task number reads 0) => the write did not land: visibility/ordering,
+  missing barrier, or clocks gated at commit time. Driver-fixable.
+- readback correct but nothing runs => genuine hardware condition; chase the PC state machine (the mainline
+  `accel/rocket` driver names these registers — see AGENTS.md).
+
+## EXPERIMENT 2 (2026-08-26): the COMMIT PATH IS EXONERATED — registers are byte-identical
+
+Patch 08 snapshots what the driver WROTE to the PC registers at commit and what reads BACK, reported by
+the watchdog on a stall, with a MATCHED healthy control (same `task_ctrl=0x7002` signature).
+
+```
+HEALTHY  data_addr=0xffd2f000 amount=0x3b int_mask=0x300 task_ctrl=0x1002 status(pre)=0x5000 status(post)=0x5000
+STALLED  data_addr=0xffd2f000 amount=0x3b int_mask=0x300 task_ctrl=0x1002 status(pre)=0x5000 status(post)=0x5000
+```
+
+**Every field identical**, including the same `data_addr` values appearing in both groups. The driver
+computes the right values, they land, and the PC state after the `PC_OP_EN` pulse is indistinguishable
+between a job that runs and one that does not.
+
+**Two false leads killed here, both from missing/наmismatched controls — the recurring failure mode:**
+1. `task_ctrl` wrote `0x7002` / read `0x1002` looked wrong. It is not: the register drops the `0x6` and
+   keeps bit 0 (pp_en) + task count. Healthy jobs behave identically.
+2. `status(pre)` `0x7000` (healthy) vs `0x5000` (stalled) looked like a real pre-commit state difference.
+   It was the UNMATCHED control: 1-task/pp-off jobs read `0x7000`, 2-task/pp-on jobs read `0x5000`. With
+   matched jobs both read `0x5000`.
+   *(And the first matched attempt logged ZERO healthy samples — the workload repeats a 4-job cycle, one
+   real `0x7002` op plus three `0x6001` drain dummies, and sampling every 500th completion aliased because
+   500 %% 4 == 0. Never sample a periodic workload on a modulo; log the first N matches instead.)*
+
+## Where that leaves it — the software chain is fully exonerated
+
+userspace OK -> ioctl OK -> queue OK (exp 1: commit-done deficit == stall count, irq == done) ->
+commit OK -> registers OK (exp 2) -> **DIVERGENCE** -> no execution, no interrupt, task counter 0x0.
+
+**Leading hypothesis: the PC's DESCRIPTOR FETCH FROM DRAM, through the IOMMU.** Registers only carry
+POINTERS (`data_addr` -> regcmd, `task_base_addr` -> the task array); identical pointers can still fetch
+stale or unmapped data. This fits every measurement:
+- registers identical (the pointer is right, the DATA or its MAPPING is not)
+- **domain switching triples the rate** — a switch changes page tables; a stale IOMMU TLB entry would make
+  the fetch fail silently
+- all three cores fail together — they share the iommu domain
+- retirement/aggressive reaping help — more time for writes/mappings to settle
+- scales with op magnitude, not geometry — more descriptor/regcmd bytes to become visible
+
+**NEXT:** correlate `rk_iommu` faults with stalls (the IOMMU driver already logs page faults), and try an
+explicit IOMMU TLB/domain flush after `dom_activate` to see whether the rate moves.
+
+## EXPERIMENTS 3-5 (2026-08-26): IOMMU, task array, and cacheability
+
+**3. IOMMU faults do NOT correlate — there are none.** 14 stalls in one run; `Page fault` 0, `BUS_ERROR` 0,
+`not attached to domain` 0, `switch iommu domain time out` 0. So the descriptor fetch is NOT hitting an
+unmapped/stale IOVA — a bad mapping would fault. **Refutes the stale-TLB form of the hypothesis.**
+
+**4. The task array is NOT stale.** Userspace now stamps a monotonic sequence into `rknpu_task.op_idx`
+(a field the uABI declares and the driver NEVER reads); the kernel logs what it sees at commit. Stalled
+commits report `seq = 737, 1045, 1325, 2731, 6397` — all distinct, increasing, tracking run progress over
+~8000 descriptors. A stale kernel-mapping read would show repeated or old stamps. **The kernel reads
+exactly what userspace just wrote.** (Caveat: the HEALTHY log line did not get the seq field — the format
+patch applied to only one of the two sites — but the stalled values are conclusive on their own.)
+
+**5. "Just make the buffers uncached" is NOT a viable test.** `ORK_RC_UNCACHED=1` (drops
+`RKNPU_MEM_CACHEABLE`) makes the probe die with **SIGBUS**: the kernel then maps the buffer as
+Device memory, and on ARM64 UNALIGNED ACCESS TO DEVICE MEMORY FAULTS — our `memcpy`/NEON writes into the
+regcmd are legal on Normal cacheable memory and illegal on Device. Knob kept for reference; do not expect
+it to run.
+
+### Where the elimination stands
+
+| stage | verdict |
+|---|---|
+| userspace build/submit | OK |
+| ioctl + queue | OK (exp 1: `commit-done` == stall count, `irq == done`) |
+| commit register writes | OK (exp 2: byte-identical healthy vs stalled) |
+| IOMMU mapping | OK (exp 3: zero faults) |
+| task descriptor freshness | OK (exp 4: fresh monotonic stamps) |
+| **regcmd DATA as the NPU DMA sees it** | **UNTESTED — the remaining candidate** |
+
+**NEXT:** the regcmd buffer (`mrc`, flags `0x403`) is CACHEABLE DRAM and has NO kernel mapping, so nothing
+has ever verified the bytes the NPU actually fetches. Add `RKNPU_MEM_KERNEL_MAPPING` (0x8) to that
+allocation so the kernel can read it at commit, and log a checksum of the first N words for healthy vs
+stalled jobs. If a stalled commit's regcmd reads as stale/zero, that is the cause; if it is correct, the
+whole software path is exonerated and the fault is in the PC's execution start itself.
+
+## EXPERIMENTS 6-7 (2026-08-26): regcmd data is fine; timeout_clean is the JANITOR, not the killer
+
+**6. The regcmd bytes DO reach DRAM.** `ORK_RC_VERIFY=1` checksums the buffer from cache, invalidates with
+a FROM_DEVICE sync, and re-checksums from DRAM. **0 mismatches over 4000 reps / 5 stalls.**
+POSITIVE CONTROL (`ORK_RC_VERIFY=2`, corrupts a word after the flush) DOES report
+`REGCMD MISMATCH`, so the detector is proven capable of firing. The last untested software link is clean.
+
+**7. `rknpu_job_timeout_clean` does NOT cause the stall.** Source reading suggested a strong mechanism: it
+soft-resets the NPU and drops the running job whenever `ktime_us_delta(now, job->timestamp) >=
+args->timeout` — MICROseconds vs a millisecond value, so an effective 1.5 ms threshold against jobs that
+run a median 5.7 ms. That predicts exactly the `commit - done` deficit we measure.
+
+Counter (patch 13) says: `stalls=14, commit-done=14, treap=14` — an exact match that LOOKS like
+confirmation. **But `last_kill_age_us = 157689`.** The reaped job was **157 ms** old, not 1.5-5.7 ms. That
+is the recovery timeline (stall -> watchdog reports ~115 ms -> userspace ACT_RESET + resubmit -> that
+resubmit's timeout_clean reaps the long-dead job). One reap per stall, hence the exact match.
+**timeout_clean is the JANITOR, not the killer** — and this would have been believed as a root cause if the
+KILL AGE had not been logged alongside the count. Corroborated independently: the watchdog reports the task
+counter as `0x0`, i.e. the job never started, so it was never killed mid-execution.
+
+### Elimination table (updated)
+
+| stage | verdict |
+|---|---|
+| userspace build/submit | OK |
+| ioctl + queue | OK (exp 1) |
+| commit register writes | OK (exp 2, matched control) |
+| IOMMU mapping | OK (exp 3, zero faults) |
+| task descriptor freshness | OK (exp 4, fresh monotonic stamps) |
+| regcmd bytes in DRAM | OK (exp 6, with positive control) |
+| timeout_clean killing live jobs | REFUTED (exp 7, kill age 157 ms) |
+| **PC start after a correct commit** | **the remaining gap** |
+
+Every software stage is now exonerated with a control. The job is committed with byte-identical registers,
+valid mappings, fresh descriptors and correct regcmd bytes in DRAM — and the PC does not begin. Still open
+whether that is a driver-visible condition or silicon.
+
+**Method note for whoever continues:** three separate false root causes this session came from a count
+matching without a corroborating measurement (lost IRQs, marginal K geometry, timeout_clean). Always log a
+second, independent quantity (an age, a sequence, a checksum) next to any count that "matches".
+
 ## Open hypotheses
 
 1. **Task-boundary / HW-chaining race** (user). Being tested via `ORK_DYN_NOCHAIN=1` (see below).

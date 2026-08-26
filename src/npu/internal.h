@@ -392,7 +392,10 @@ int orki_cpu_gemm_grouped(int M,int K,int N,int G,const int8_t *A,const int8_t *
                           const float *aScale,const float *bScale,float *C);
 ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 int orki_i4_ktmo_ms(void);   /* kernel-facing int4 submit timeout (ORK_I4_KTMO_MUL); see i4/run.c */
-extern unsigned long orki_submit_n, orki_submit_prog;   /* diagnostic: doorbell submit/program counters (see core/submit.c) */
+extern unsigned long orki_submit_n, orki_submit_prog;
+extern unsigned long orki_task_seq;
+int orki_rc_verify(int fd, struct buf *b, size_t nbytes);   /* diagnostic: regcmd reached DRAM? */
+extern unsigned long orki_rc_verify_n, orki_rc_verify_bad;   /* diagnostic: stamp written into rknpu_task.op_idx */   /* diagnostic: doorbell submit/program counters (see core/submit.c) */
 void orki_mc_recover_resubmit(ork_dyn_chain *h);
 void ork_install_term(void);
 void orki_i16_set_out(uint32_t*rc,int N,int stride,int mult,int shift);

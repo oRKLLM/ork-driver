@@ -103,6 +103,11 @@ void orki_trace_submit(struct rknpu_submit *sub) { if (getenv("ORK_TRACE")) orki
  * workload. Count both submits and PROGRAMS (task_number) -- a chained submit carries many programs, and
  * the per-program rate is the one comparable to 1/4000. */
 unsigned long orki_submit_n = 0, orki_submit_prog = 0;
+/* #patch (experiment): monotonic stamp written into rknpu_task.op_idx — a field the uABI declares
+ * but the driver NEVER reads. The kernel logs the value it sees at commit; if a STALLED commit reports
+ * an OLDER stamp than userspace just wrote, the kernel read a STALE task array (its kernel mapping did
+ * not see our write) and programmed the PC from a stale descriptor. That is decisive, and needs no timing. */
+unsigned long orki_task_seq = 0;
 
 /* ORK_KMSG_SUBMIT=1 — stamp every submit into /dev/kmsg so USERSPACE submits and the KERNEL's watchdog
  * reports land in the SAME dmesg stream, in order. Without this the two halves of a dispatch failure cannot
@@ -125,6 +130,46 @@ static void orki_submit_stamp(const struct rknpu_submit *sub, int domain, int rc
     int n = snprintf(b, sizeof b, "<4>ork: sub#%lu dom=%d cm=0x%x tasks=%u fl=0x%x rc=%d\n",
                      orki_submit_n, domain, sub->core_mask, sub->task_number, sub->flags, rc);
     if (n > 0) { ssize_t w = write(kfd, b, (size_t)n < sizeof b ? (size_t)n : sizeof b - 1); (void)w; }
+}
+
+/* ORK_RC_VERIFY=1 (DIAGNOSTIC): did our regcmd writes actually reach DRAM, i.e. are the bytes the NPU's
+ * DMA will fetch the bytes we wrote? Everything else in the dispatch chain is now exonerated (registers
+ * byte-identical healthy vs stalled, zero IOMMU faults, task descriptors freshly stamped), and this is the
+ * one link never verified: the regcmd is CACHEABLE DRAM with no kernel mapping, so nothing has ever read
+ * back what the device sees.
+ *
+ * Method needs no shadow copy and no kernel change: checksum the buffer as the CPU sees it (possibly from
+ * cache), then invalidate with a FROM_DEVICE sync so the next reads must come from DRAM, and checksum
+ * again. A mismatch means the TO_DEVICE flush did not land and the NPU would fetch stale bytes.
+ *
+ * NOTE this cannot be done by mapping the buffer uncached: dropping RKNPU_MEM_CACHEABLE gets it mapped as
+ * Device memory, and ARM64 faults on unaligned access to Device memory, so the regcmd memcpy SIGBUSes. */
+static uint64_t orki_rc_sum(const void *p, size_t n){
+    const uint32_t *w = (const uint32_t*)p; uint64_t h = 1469598103934665603ULL;
+    for (size_t i = 0; i < n/4; i++) { h ^= w[i]; h *= 1099511628211ULL; }
+    return h;
+}
+unsigned long orki_rc_verify_n, orki_rc_verify_bad;
+int orki_rc_verify(int fd, struct buf *b, size_t nbytes){
+    static int on = -1; if (on < 0) { const char *e = getenv("ORK_RC_VERIFY"); on = e ? atoi(e) : 0; }
+    if (!on || !b || !b->cpu || nbytes == 0) return 0;
+    if (nbytes > b->size) nbytes = b->size;
+    uint64_t c1 = orki_rc_sum(b->cpu, nbytes);
+    orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE);      /* invalidate -> next reads come from DRAM */
+    /* POSITIVE CONTROL (ORK_RC_VERIFY=2): corrupt one word AFTER the flush so the comparison MUST fail.
+     * "No mismatches" is worthless unless the detector is shown to be capable of firing — the same missing
+     * -control mistake that produced two false readings earlier in this investigation. */
+    if (on == 2 && orki_rc_verify_n == 0) ((volatile uint32_t*)b->cpu)[0] ^= 0xa5a5a5a5u;
+    uint64_t c2 = orki_rc_sum(b->cpu, nbytes);
+    if (orki_rc_verify_n == 0)
+        fprintf(stderr, "[rc-verify] ACTIVE: first check, %zu bytes, cache=%016llx dram=%016llx%s\n",
+                nbytes, (unsigned long long)c1, (unsigned long long)c2,
+                on == 2 ? "  (positive control: MUST differ)" : "");
+    orki_rc_verify_n++;
+    if (c1 != c2) { orki_rc_verify_bad++;
+        fprintf(stderr, "[rc-verify] REGCMD MISMATCH after flush: cache=%016llx dram=%016llx bytes=%zu\n",
+                (unsigned long long)c1, (unsigned long long)c2, nbytes); }
+    return c1 != c2;
 }
 
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
