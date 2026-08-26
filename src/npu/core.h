@@ -210,6 +210,9 @@ int ork_dyn_spin_probe(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int spin_
 int ork_dyn_steps(ork_dyn_chain *h);
 ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks);
 ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
+/* int8+fp16 implementation behind ork_dyn_begin_mc (which is the dtype DISPATCHER, in src/npu.c).
+ * Call the dispatcher, not this — int4 must be routed away before it reaches here. */
+ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore);
 struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
 void ork_dyn_dump(ork_dyn_chain *h, const char *label);

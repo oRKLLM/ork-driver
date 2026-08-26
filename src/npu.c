@@ -1304,6 +1304,31 @@ long orki_xcount[XP_NPROFILE][8]; int orki_xprof=-1;
 const char *orki_XPNAME[XP_NPROFILE]={"MC_MM","SC_MM","CHAIN_NT","STREAM_I8","STREAM_F16",
     "I4_MC","I4_MWARM","I4_INCR","I4CHAIN","I4_STREAM","SDP"};
 const char *orki_XFROM[8]={"COLD","F16","I8","I4","CHAIN","SDP?","I4STRM","?"};
+/* DTYPE DISPATCH for the NONBLOCK doorbell spine (roadmap Tier 19). The spine itself is dtype-agnostic
+ * substrate in npu/core/{dyn,dyn_ctl,colsplit}.c; deciding WHICH precision implementation runs is the
+ * scaffold's job, which is why this thin router lives here and not in core/.
+ *
+ * int4 has a separate begin (int16 output, its own tiling) in i4/chain.c; int8 and fp16 share one body
+ * because they share a 4-byte C. Routing int4 out HERE rather than inside the implementation is what stops
+ * an int4 diagnostic being added to a body int4 never reaches — the mistake that produced a full "no
+ * effect" A/B against the 27B from code that never executed.
+ *
+ * Behaviour-preserving vs the pre-Tier-19 in-body branch: install_term and both nc clamps are replicated
+ * on the int4 path, and the colsplit block it used to fall through is a guaranteed no-op for int4 (its
+ * `ci8` gate requires dtype == DT_I8). */
+ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc){
+    if (!c || S < 1 || S > 1024 || !tasks) return NULL;
+    int dt = tasks[0].w->dtype;
+    if (dt == DT_I4) {
+        ork_install_term();
+        if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
+        if (nc > S) nc = S;
+        return ork_i4_dyn_begin_mc(c, S, tasks, nc);
+    }
+    if (dt != DT_I8 && dt != DT_F16) return NULL;   /* doorbell carries int8 (int32 C) or fp16 (fp32 C) only */
+    return orki_dyn_begin_mc_impl(c, S, tasks, nc);
+}
+
 static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc){
     int dt=w->dtype, fd=c->fd;
     /* never exceed the hardware (or the buffer-array bound) — a bad ORK_NPU_MC can't over-index */

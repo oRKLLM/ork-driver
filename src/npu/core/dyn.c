@@ -259,16 +259,16 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
  * conforming K%512 && K<=4096, M<=64, Sn==1 (fp16 adds M*K<=32768). int4 = M==1, single K/N-slice (its HW
  * chain is M=1-only and writes int16). An op of an hw=1 KIND that fails this downgrades to the SW break path
  * (its SEQ_CLASS fn). Kept in lockstep with begin_mc / begin_mc_i4's per-task guards — change both together. */
-/* DTYPE DISPATCHER. Reads tasks[0].w->dtype and routes: DT_I4 leaves via ork_i4_dyn_begin_mc (i4/chain.c)
- * near the top, DT_I8/DT_F16 continue into the spine below (one implementation serves both — they share a
- * 4-byte C).
+/* The doorbell spine's multi-core begin — the int8 + fp16 IMPLEMENTATION, not a dispatcher. One body
+ * serves both precisions because they share a 4-byte C (the convention's MULTI case); the per-precision
+ * differences are the DT_F16 branches below.
  *
- * ⚠ READ THIS BEFORE INSTRUMENTING ANYTHING BELOW: **int4 NEVER reaches the body of this function.** An
- * int4 debugging session added a diagnostic to ORK_MC_ROUND further down, ran a full A/B against the 27B,
- * and got "no effect" from code that never executed — caught only because removing HW chaining failed to
- * produce the expected slowdown. If you are chasing an int4 doorbell behaviour, the submits you want are
- * in src/npu/i4/chain.c (ork_i4_dyn_begin_mc / run_i4_bchain_db), not here. */
-ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
+ * ⚠ int4 NEVER ARRIVES HERE. ork_dyn_begin_mc (the dtype dispatcher, in src/npu.c) routes DT_I4 to
+ * ork_i4_dyn_begin_mc in src/npu/i4/chain.c before this is called. An int4 debugging session once added a
+ * diagnostic to ORK_MC_ROUND below, A/B'd it against the 27B, and got "no effect" from code that never
+ * executed — caught only because removing HW chaining failed to produce the expected slowdown. If you are
+ * chasing int4 doorbell behaviour, the submits you want are in i4/chain.c. */
+ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc) {
     if (!c || S < 1 || S > 1024 || !tasks) return NULL;
     ork_install_term();   /* graceful SIGTERM: make the async poll interruptible (covers colsplit + i4 dispatch too) */
     if (nc < 1 || nc > c->soc->cores) nc = c->soc->cores;
@@ -285,9 +285,7 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
       /* fp16 colsplit is routed ONLY from run_multicore (which falls back to the single-core fp16 reference on NULL) — NOT here, so
        * direct ork_dyn_begin_mc callers (e.g. the SSM stream/pool fp16 path) keep their pre-Stage-1 behavior. */
     if (nc > S) nc = S;
-    int dt = tasks[0].w->dtype;
-    if (dt == DT_I4) return ork_i4_dyn_begin_mc(c, S, tasks, nc);   /* int4 (int16 out, M=1) has its own branch */
-    if (dt != DT_I8 && dt != DT_F16) return NULL;   /* async doorbell: int8 (int32 out) or fp16 (fp32 out) — both 4-byte C */
+    int dt = tasks[0].w->dtype;   /* DT_I8 or DT_F16 — the dispatcher filtered everything else */
     /* fp16 doorbell: bit-exact and enabled by default (was WIP-gated). The prior "residual ~10-20% all-16
      * cold-race" that kept it gated was NOT a chaining/coherency defect — it was the TEST feeding the A
      * activation from an ork_dma_alloc (zero-copy) buffer. This path STAGES A into maf via memcpy; a DMA-A
