@@ -379,5 +379,22 @@ void ork_npu_reap_stuck(ork_npu *c, int nc){
         ork_kmsg("reap-stuck: fp16 nonblock dummy core=%d (trigger timeout_clean)", i);
         struct timespec ds={0,3000000}; nanosleep(&ds,NULL);   /* let this core's dummy land + the scheduled cleanup_work run */
     }
+    /* The dummies above are NONBLOCK: the ioctl returns before the job runs, and the kernel keeps
+     * a reference to A/B/Cc until the job completes or is aborted. Freeing them on a 3 ms timer was
+     * a use-after-free -- and NOT a rare race, because this function is only ever called when a
+     * core is already stuck, which is exactly when the dummy cannot complete promptly. It reliably
+     * killed the board from three different call sites (rb_erase/drm_vma_node_revoke,
+     * sg_free_table/__free_pages, and a later fork via slab corruption), each an unrecoverable
+     * panic several seconds AFTER this returned, which is why it read as a kernel bug.
+     *
+     * Drain positively instead of guessing: one BLOCKING submit per core. It cannot return until
+     * that core has retired everything queued ahead of it (our dummy included), or until the
+     * kernel aborts it -- either way the references are gone. Its result is irrelevant. */
+    for(int i=0;i<nc;i++){
+        struct rknpu_submit s; memset(&s,0,sizeof s);
+        s.flags=0x1; s.task_number=1; s.task_obj_addr=c->task.obj; s.core_mask=1u<<i; s.fence_fd=-1; s.timeout=1000;
+        s.subcore_task[0]=s.subcore_task[1]=s.subcore_task[2]=(struct rknpu_subcore_task){0,1};
+        orki_rknpu_submit_ioctl(fd,&s,dom);   /* blocking: returns only once this core has drained */
+    }
     orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
 }
