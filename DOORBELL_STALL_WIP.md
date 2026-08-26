@@ -571,6 +571,74 @@ whether that is a driver-visible condition or silicon.
 matching without a corroborating measurement (lost IRQs, marginal K geometry, timeout_clean). Always log a
 second, independent quantity (an age, a sequence, a checksum) next to any count that "matches".
 
+## EXPERIMENTS 8-9 (2026-08-26): the PC block is identical, and a re-pulse does NOT rescue
+
+**8. Full PC/INT register block, matched healthy vs stalled — BYTE-IDENTICAL.**
+
+```
+HEALTHY  00000000 .. ffd2f000 0000003b 0000000f 00000000 00000300 .. 00001002 .. 00011000 | en=00000000
+STALLED  00000000 .. ffd2f000 0000003b 0000000f 00000000 00000300 .. 00001002 .. 00011000 | en=00000000
+```
+(map: 0x00 VERSION, 0x08 PC_OP_EN, 0x10 DATA_ADDR, 0x14 AMOUNT, 0x20 INT_MASK, 0x28 INT_STATUS,
+0x2c INT_RAW, 0x30 TASK_CTRL, 0x3c TASK_STATUS, 0xf008 ENABLE_MASK.)
+
+`ENABLE_MASK = 0` and `INT_STATUS = 0` are NORMAL — they read the same on jobs that run. Do not chase
+either. **The fault is not visible anywhere in the documented PC/INT register set.**
+
+**9. START-CONFIRM-AND-RETRY (`wd_kick=1`) does NOT rescue the job.** On a detected stall the watchdog
+re-pulses `PC_OP_EN` for that core (registers untouched and already verified correct). Result: **4 kicks,
+4 stalls — none recovered**; `commit - done` deficit unchanged. **So it is NOT a missed start trigger.**
+That was the most hopeful cheap fix and it is refuted. Only `ACT_RESET` + resubmit recovers.
+
+### Conclusion of the software investigation
+
+Everything the driver does is correct and verified with controls: queue, commit, registers, IOMMU mapping,
+descriptor freshness, regcmd bytes in DRAM, and the whole PC register block. The job does not start, raises
+no interrupt (INT_RAW = 0, so the hardware is not even signalling internally), and cannot be restarted by
+re-triggering — only a reset clears it. Remaining possibilities:
+1. a hung SUB-BLOCK (CNA / DPU / PPU have their own register windows, never dumped), or
+2. genuine silicon behaviour with no software-visible cause.
+
+### Therefore the practical target is CHEAP RECOVERY, not prevention
+
+Only a reset recovers, so make the reset cheap. `rknpu_soft_reset` asserts ALL SIX DT reset lines
+device-wide (`num: 6` = `num_srsts`, the count of `resets` phandles — NOT a counter), destroying warm state
+on all three cores; that plus the 614 ms detection window plus the resubmit is the ~3.6 s per miss.
+**If those 6 lines are per-core, asserting only the stalled core's reset would collapse the recovery cost
+without needing the root cause.** Check the DT `reset-names` for the rknpu node.
+
+Measured levers already in hand (all condition-based, cause-agnostic):
+- retire before switching domains (drain barrier): 11.47% -> 1.99%
+- bound programs per submit: Sk=1 0.15%, Sk=2 0.38-0.62%, BCHAIN ~850 progs 2-3%
+- minimise domain switches: ndom=2 roughly triples the rate
+- geometry (even/uneven K split) is irrelevant — do not constrain alignment
+
+## EXPERIMENT 10 (2026-08-26): per-core reset + re-commit ALSO fails to rescue
+
+Implemented `rknpu_soft_reset_core()` (asserts only `srst_a{N}` + `srst_h{N}`, no `msleep(100)`, no global
+`soft_reseting` flag) and `rknpu_job_kick_stalled()` (per-core reset then re-commit the same job), wired to
+the watchdog as `wd_kick=2`.
+
+| arm | stalls/4000 | mean | max | commit-done |
+|---|---|---|---|---|
+| kick off | 13 | 26.03 ms | 52633 ms | 13 (= 1/stall) |
+| kick=2 | 7 | 9.91 ms | 2125 ms | **14 (= 2/stall)** |
+
+Mechanically fine — 7 kicks, all returning 0. **But it does NOT rescue the job:** arm B's deficit is TWO
+uncompleted commits per stall (the original AND the re-commit). A successful rescue would give one.
+
+Do not be fooled by the mean/max: arm A contains a single 52.6 s outlier (recovery exhausted) which alone
+is half its total time; without it A ~51 s vs B ~40 s. And 13 vs 7 stalls is ~1.4 sigma. The kick's apparent
+win is an outlier artifact.
+
+**Finding: the stuck condition SURVIVES a per-core AXI+AHB reset.** So it is not confined to that core's bus
+interfaces. Only the full device-wide `rknpu_soft_reset` recovers — and that also re-attaches the IOMMU
+domain afterwards, which the per-core path deliberately skips. **Next cheap test: per-core reset PLUS the
+IOMMU domain re-attach**, to find out which half of the device-wide sequence is actually doing the work.
+
+Kept in the tree: `rknpu_soft_reset_core()` is correct and useful regardless (no msleep, no global stall of
+`rknpu_job_next`); it just is not sufficient on its own.
+
 ## Open hypotheses
 
 1. **Task-boundary / HW-chaining race** (user). Being tested via `ORK_DYN_NOCHAIN=1` (see below).
