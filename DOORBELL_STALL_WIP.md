@@ -1349,3 +1349,44 @@ fix regressed somewhere across kernels #23-#33, or the original zero was luck.
 This contaminated several runs: allocations fail with `errno=22`, the bench SIGSEGVs on a NULL buffer,
 and it is the likely reason the `cnt > 0` healthy control captured nothing on kernel #32. Needs a
 bisect; not started.
+
+### BISECT of the "mismatch regression" — patches 47-58 EXONERATED; patch 46 vindicated
+
+Rebuilding 11 kernels was unnecessary: nearly every change from #23 to #33 is runtime-gated by a
+module param, so the bisect was done by feature at runtime on kernel #33 (no builds, no reboots).
+
+| cell | rc | mismatch | switch-timeout | createfail |
+|---|---|---|---|---|
+| A everything OFF | 124 | 0 | 0 | 0 |
+| B + escalation (patch 54) | 124 | 0 | 0 | 0 |
+| C + watchdog + fast-abort | 124 | 0 | **15** | 0 |
+| D everything OFF (repeat) | **139** | 0 | 0 | **3** |
+
+**Conclusions**
+
+1. **Patches 47-58 are exonerated.** Cell D wedged with every new feature disabled.
+2. **The wedge is CUMULATIVE across runs on one boot**, not caused by any single run — it appeared on
+   the 4th run. This is why it was never reproducible on a fresh boot, and why several measurements
+   today were silently contaminated by it.
+3. **Patch 46 is vindicated, not regressed.** Its original result (mismatch 1600 -> 0, replaced by a
+   handful of switch timeouts) reproduces exactly as cell C: fast-abort on, mismatch 0,
+   switch-timeout 15. The 867 mismatch seen on #33 came from accumulated state after many runs — a
+   SEPARATE, still-uncharacterised leak.
+
+**Error chain of the wedge, now traced:**
+```
+mismatch domain get from iommu_get_domain_for_dev   (337)
+  -> failed to switch iommu domain, id: N, ret: -22 (250 + 87)
+    -> rknpu_gem_get_pages: dma map <size> fail
+      -> CREATE FAIL errno=22 in userspace -> NULL buffer -> SIGSEGV (rc=139)
+```
+
+**Open:** what accumulates. It survives across runs within a boot and clears only on reboot, so it is
+persistent kernel state — a leaked domain reference, a leaked IOVA range, or a domain left attached.
+`dbg_domain_underflow` stays 0, so it is not the refcount going negative. Next step would be to sample
+`iommu_domain_refcount` and the per-domain IOVA usage after each successive run and watch which one
+ratchets.
+
+**Methodology note:** runtime feature-gating made an 11-kernel bisect into four workload runs. Worth
+preserving that property when adding future diagnostics — every new behaviour behind a param that
+defaults off.
