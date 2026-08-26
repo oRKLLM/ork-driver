@@ -1162,3 +1162,42 @@ pacing; if shape shows nothing while timing does, the timer proposal revives on 
 **Method note worth keeping:** pre-registering the falsification condition BEFORE running the sweep is
 what made this readable. The 86 -> 12 result on its own looked like a win and would very likely have
 been written up as one.
+
+### ★ SHAPE-AXIS RESULT — the dominant factor is the IOMMU DOMAIN, not the op shape
+
+Userspace already logs the shape of every FAILED submit, so the stalled-side distribution was known.
+What it cannot give is the BASE RATE — how often each shape runs successfully — and without that
+"stalls happen on task_number=4" is uninformative if that shape is most of the traffic. Kernel-side
+per-commit shape logging (`prof_mask` bit 2) supplies the denominator.
+
+Stall rate by shape (`task_number/core_mask/domain`), one 1.5B-Q8 run:
+
+| shape | commits | stalls | rate |
+|---|---|---|---|
+| 4/0x4/**2**, 4/0x2/**2**, 2/0x1/**2** | 7 each | 6 each | **85.7%** |
+| 4/0x4/**1**, 4/0x2/**1** | 9 | 4 | 44.4% |
+| 9/*/**0** | 11 | 2 | 18.2% |
+| 2/0x1/**1** | 53 | 5 | 9.4% |
+| 2/0x4/**1**, 2/0x2/**1** | 44 | 1 | 2.3% |
+
+**Aggregated by domain: dom 2 = 18/21 (85.7%), dom 0 = 6/33 (18%), dom 1 = 20/200 (10%).**
+`task_number` and `core_mask` are second-order inside that. Domain 2 is ~8.5x worse than domain 1.
+
+**This converges with a finding parked earlier the same day.** `rknpu_iommu_switch_domain()` creates
+extra domains with `iommu_get_dma_cookie()` plus a hand-patched
+`dst_domain->type |= __IOMMU_DOMAIN_DMA_API`, which SKIPS `iova_reserve_iommu_regions()` that the real
+`iommu_dma_init_domain()` path performs. So domain 0 has the device's reserved/MSI regions carved out
+of its IOVA space and domains >0 do not. Two independent lines now point at the same asymmetry.
+
+It also retro-explains an early result: on the int4 probe `ndom=2` TRIPLED the stall rate vs `ndom=1`,
+which was read at the time as "domain switching is implicated". The better reading is
+**"domain >0 is implicated"**.
+
+**Caveat:** `prof_mask=3` costs ~500 printks and the run timed out (479 commits logged vs 1069 in an
+unlogged run), so ABSOLUTE rates here are perturbed by the instrumentation. The RELATIVE comparison
+between shapes within the same run is not, and that is the claim being made.
+
+**Next test (cheap, decisive):** force everything into domain 0 and see whether stalls collapse. If
+they do, the extra-domain construction is the mechanism and the fix is to build domains >0 through the
+proper `iommu_dma_init_domain()` path rather than `iommu_get_dma_cookie()` + type patching. That is a
+far more tractable target than either pacing or a hardware handshake.
