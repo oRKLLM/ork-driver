@@ -1429,3 +1429,39 @@ either remove the change-02 put or make it conditional on the reference actually
 `-EAGAIN`): the right trigger sensor is now clear. It should watch for the refcount reaching zero while
 jobs are still in flight — the premature-zero condition — not IOVA headroom, which only degrades much
 later and would fire long after corruption started.
+
+### ★★★ THE OVER-PUT, NAMED — `rknpu_job_abort` zeroes the domain refcount under live work
+
+Caller-tagged `rknpu_iommu_domain_put()` with `__builtin_return_address(0)` (`%pS`), reporting two
+conditions separately: underflow (below zero) and PREMATURE ZERO (hits exactly 0 while jobs are still
+in flight — no underflow, no warning, but `get_and_switch()` only tests `refcount == 0`, so it will
+then switch domains out from under live work).
+
+```
+UNDERFLOW      (1x)  rknpu_job_timeout_clean+0x11c/0x178
+PREMATURE ZERO (17x) rknpu_job_abort+0x40/0x250
+                (1x) rknpu_gem_sync_ioctl+0xfc/0x234
+```
+
+**Two distinct defects, and the dominant one was not the suspect:**
+
+1. `rknpu_job_timeout_clean` over-puts — this IS our kernel change 02's added put, caught going below
+   zero. The wiki's standing suspicion was correct.
+2. **`rknpu_job_abort` is the damaging one, 17x.** It drives the count to zero while other cores still
+   have jobs, silently licensing a domain switch under live work. That is the `mismatch domain`
+   mechanism.
+
+**Our own fast-abort amplifies it ~30x.** #patch41 issues an abort on EVERY detected stall (86 per run
+instead of a handful), so it multiplies the rate of this pre-existing hazard — which is why the wedge
+went from occasional to reproducible-within-two-runs today. The instrument amplified the disease, and
+that also explains why several of today's measurements were contaminated.
+
+**Fix direction (not yet implemented):** a job must put the domain reference only if it actually holds
+one, and the count must not be treated as "free" while any core has work. Options: track the reference
+per job rather than as a bare device-wide count, or gate `get_and_switch()` on "refcount == 0 AND no
+core busy" instead of the count alone. The latter is a smaller change and directly closes the
+premature-zero window, which is the one doing the damage.
+
+**Also validated here:** `/var/lib/ork-logs/kmsg.log.prev` preserved all of this across the crash+reboot
+that ended the run. On the old RAMlog path the entire dataset would have been lost — this is the second
+time that would have happened today.
