@@ -1122,3 +1122,43 @@ If the `min_gap=1500` cell does NOT reduce stalls further than `min_gap=500`, or
 `min_gap=0` control does not return to ~86 stalls, then spacing is not the mechanism and this design
 is premature — the 86 -> 12 drop would be drift or a side effect of perturbing timing generally.
 That control is the gate; do not build A/B/C before it reads clean.
+
+### ★ CAUSAL TEST RESULT — the spacing hypothesis FAILED its pre-registered criterion
+
+| `min_commit_gap_us` | rc | wall | stalls | enforced |
+|---|---|---|---|---|
+| 0 (control) | 0 | 81 s | 86 | 0 |
+| 500 | 124 | 323 s | **12** | 9 |
+| 1500 | 124 | 351 s | **46** | 72 |
+| 0 (repeat control) | 139 (SIGSEGV) | 2 s | — | — |
+
+Two independent failures:
+
+1. **No dose-response; it inverts.** 1500 us enforced spacing 8x more often (72 vs 9) yet produced 4x
+   MORE stalls than 500 us. The pre-registered criterion was "if min_gap=1500 does not reduce stalls
+   further than 500, spacing is not the mechanism". It did not.
+2. **The repeat control crashed** (userspace SIGSEGV; kernel clean, 0 oops lines), so there is no second
+   baseline and drift cannot be excluded on the 86 -> 12 either.
+
+Both enforced cells also timed out (323 s / 351 s vs the control's 81 s), so enforcement costs a great
+deal and does not reliably buy anything.
+
+**Therefore the change-16 correlation stands as correlation only.** Do NOT build hrtimer pacing
+(design option B) or any timer/threshold in the submit path on this basis — the premise it would rest
+on was tested and declined to confirm. Options A/B/C in the design above are all PARKED pending a
+mechanism.
+
+**Better explanation to test next: the gap is a SYMPTOM of which op is running, not a cause.** Bursts
+of small fast jobs are a workload phase, and that phase may be stall-prone for reasons unrelated to
+spacing. This fits the independently-observed clustering on particular shapes (`task_number=4` on
+cores 0x2/0x4, `task_number=2` on 0x1, `task_number=9` on all three) and explains why perturbing
+timing moves the count around without a clean dose-response.
+
+**Next step (cheap, same machinery, no refactor):** re-aim the profiler from the TIMING axis to the
+SHAPE axis — record `task_number`, `regcfg_amount`, `core_mask`, `iommu_domain_id` per job and split
+stalled vs healthy on those. If stalls belong to particular op shapes that is far more actionable than
+pacing; if shape shows nothing while timing does, the timer proposal revives on firmer ground.
+
+**Method note worth keeping:** pre-registering the falsification condition BEFORE running the sweep is
+what made this readable. The 86 -> 12 result on its own looked like a win and would very likely have
+been written up as one.
