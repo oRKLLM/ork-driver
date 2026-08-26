@@ -892,3 +892,35 @@ The precise defect is UNIDENTIFIED. Next instrumentation should target the GEM m
 Still true and unaffected: the reap-stuck UAF fix, the NULL-domain guards, the abort dangling-pointer
 fix, the watchdog cadence finding, the four refuted stall hypotheses, and the retraction of the
 3/3 recovery result.
+
+### PAUSED 2026-08-26 — board handed to another agent
+
+Board access stopped mid-investigation at the user's request. Resume point below.
+
+**Board state left behind:** kernel #12 `6.1.115-vendor-rk35xx-fence` (changes 4-9), watchdog DISARMED
+(`wd_kick=0`, `wd_period_us=0`), no probe, no orkd. Changes 7/8 are ACTIVE and behaviour-changing, so any
+measurement taken by another agent on this board is not comparable with pre-#12 numbers — record `uname -v`.
+
+**Where the "still mapped when deleted" hunt got to.** Chasing why a shmem page has `mapcount:1` when the
+inode is evicted:
+
+- `orki_bdestroy()` (`src/npu.c:268`) is CORRECT: `munmap()` then `MEM_DESTROY`.
+- **`ork_sig_teardown()` (`src/npu.c:261`) is NOT**: the SIGTERM handler issues `MEM_DESTROY` on every live
+  buffer **without munmapping first**. This session SIGTERMed the probe repeatedly, so it ran often.
+  Whether that is actually illegal is unresolved — the driver uses stock `drm_gem_mmap` with
+  `drm_gem_vm_open`/`drm_gem_vm_close` as `vm_ops`, which DO refcount, so the object should survive until
+  the VMA closes. So this is SUSPICIOUS BUT NOT YET A PROVEN BUG.
+- **Candidate, UNVERIFIED:** `rknpu_gem_mmap_obj()` has an `err_close_vm:` path that calls
+  `drm_gem_vm_close(vma)` explicitly when `rknpu_gem_mmap_buffer()` fails, then returns the error. If the
+  VFS mmap-failure path also invokes `vm_ops->close`, that is a double reference drop -> premature free ->
+  exactly "still mapped when deleted". NOT confirmed: it needs (a) checking whether `mmap_region()` calls
+  `->close` on the `call_mmap()` failure path for this kernel, and (b) confirming `rknpu_gem_mmap_buffer()`
+  ever actually fails in our workload — it may well be an unreachable path here, in which case this is a
+  dead end and the real cause is elsewhere.
+
+**Next steps when the board is free** (cheapest first):
+1. Desk work, no board: read `mm/mmap.c` `mmap_region()` in this tree and settle whether `->close` runs on
+   the `call_mmap()` error path. Kills or promotes the candidate above for free.
+2. Add a counter to `rknpu_gem_mmap_buffer()`'s failure path. If it never fires under the probe, the
+   candidate is dead.
+3. Only then instrument VMA open/close vs GEM free ordering.
