@@ -1645,3 +1645,33 @@ web search did not surface the bit positions. Confirm before asserting "DMA read
 2. Identify the bits from `rocket_registers.h` (fetch from a 6.10+ tree) or RK3588 TRM ch.36.
 3. Re-check whether the earlier stall dumps that showed `INT_RAW_STATUS = 0` were a different failure
    mode or simply captured before the bits latched.
+
+### UNMASKING BITS 30/31 — no interrupt delivered; they are not interrupt sources
+
+`int_mask_extra=0xc0000000` OR'd into INT_MASK (and into every INT_CLEAR write, so a level source
+could not storm; plus a self-disarming guard). One run, **6 genuine stalls** (`NO TASK PROGRESS`) and
+10 timed-out waits:
+
+```
+int_extra_fired      = 0     <- the unmasked condition never delivered
+invalid irq status   = 0     <- the handler's own mismatch diagnostic never fired
+int_mask_extra after = 0xc0000000   <- storm guard did NOT trip; it simply never fired
+```
+
+**So bits 30/31 are not interrupt sources**, and the "DMA read/write error" inference does not survive.
+More likely `INT_RAW_STATUS` mixes interrupt sources in the low bits (healthy reads `0x8`) with a STATE
+field in the high bits, making `0xc0000000` a state encoding rather than two error flags.
+
+**What survives:** it is still a genuine hardware discriminator — `0x00000008` healthy vs `0xc0000000`
+stalled, same register, same core — so a stall is detectable by READING one register instead of
+waiting 12 samples for a counter not to move. Detection becomes immediate, polled rather than
+interrupt-driven. That is worth having: it would cut detection from ~120 ms to one register read, and
+it is a far more direct signal than "the counter has not moved".
+
+**Measurement bug in this run, recorded so the numbers are not misread:** the script counted
+`PROF stalled` lines without setting `prof_mask=1`, so it reported `stalls=0`. That was structurally
+zero, not an absence of stalls — the kernel log shows 6. The conclusion is unaffected (6 stalls, 0
+interrupts) but the printed `stalls=0` in `~/unmask.out` is wrong.
+
+**Next:** confirm `0xc0000000` is reliable across many stalls and never appears on a healthy job, then
+use it as the watchdog's detection predicate instead of the task counter.
