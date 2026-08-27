@@ -2020,3 +2020,67 @@ The stall may be silicon and may not be fixable soon. It does not have to be fat
 job's domain reference were released correctly, a stall would cost one timeout instead of killing
 every later allocation. `switch_escalate` (patch 54, reap-on-switch-timeout) exists for this and
 was **not set** in any of today's runs — being A/B'd against the reproducer now.
+
+---
+
+## 2026-08-27 (later) — ease-in tested properly; a NEW first-touch bug found
+
+### The ease-in ramp does NOT help (and the flat wash didn't either)
+
+Two distinct interventions, both measured on the deterministic reproducer, interleaved same-boot:
+
+- `ORK_DOM_WASH=n` — n copies of ONE tiny op. n=0: 2,2,1,2 · n=1: 1,2,2 · n=3: 2,2,2,2
+- `ORK_DOM_RAMP=n` — n ops of INCREASING size (128x16 -> 512x64 -> 1024x64). ramp=0: 1,2,2,2 ·
+  ramp=3: 2,2,2,2
+
+**The ramp was VERIFIED to run, not assumed:** kernel `cnt_commit` goes 15 -> 42 per run
+(+27 = 3 ops x 3 cores x 3 switches), reproducibly 15/42/15/42. "No effect" here means the
+intervention executed and changed nothing.
+
+**Scope caveat — the faithful version is still untested.** The ramp ops are fp16 M=1; the failing
+path is int8 colsplit. So this tested "warm the domain with progressively larger *fp16* ops", not
+"ease into the same datapath", and interleaving fp16 before int8 also forces a precision-mode
+re-warm. A same-dtype (int8) ramp has NOT been tried.
+
+### Two more invariances
+
+- `ORK_DOM_DRAIN=0` (no post-switch drain at all): stalls and mismatch **unchanged** -> the stalls
+  are NOT in the drain submits (whose return codes ork-driver ignores).
+- `ORK_MM_TIMEOUT` 3000/6000/12000/30000/60000: **identical** failure at every value, with wall
+  time scaling 12 s -> 127 s. So the op truly never completes; it is not merely slow. (Hypothesis
+  "slow, not hung" — tested and REFUTED.)
+
+### ★ NEW BUG: first op in a FRESHLY CREATED domain returns wrong data
+
+Same kernel (#48), same binary, same invocation (`sudo -E timeout ./orkd_dom_api`):
+
+    in-suite (make test):  domain=1 bit-exact · domain=2 bit-exact · domain=1 bit-exact -> PASS
+    standalone:            domain=1 MISMATCH  · domain=2 bit-exact · domain=1 bit-exact -> FAIL
+
+Always the FIRST op, always in the freshly created domain; every later op — including a LARGER op
+in the same domain — is bit-exact. In `make test` ~40 tests have already run and the domains are
+already established, so the first-touch never happens.
+
+**And nothing is reported to userspace:** zero `errno=110`, zero self-heal warnings. The op returns
+SUCCESS with wrong data. That is the dangerous part — for a 27B run it is garbage output rather
+than an error.
+
+This is a *first-touch* correctness bug on a new domain, i.e. the class `ork_dom_prime`'s anchor
+was meant to cover. The ramp missed it because the ramp fires in `ork_dom_activate` (on SWITCH),
+not at domain CREATION. **Next test: warm the domain at creation time, not at switch time.**
+
+Note this is NOT caused by kernel B5 (`dom_reclaim`): with `dom_reclaim=0` the same run dies
+earlier at `CREATE FAIL errno=22`, so B5 exposes the mismatch rather than creating it. Verified
+A/B, 2x each, perfectly reproducible.
+
+### Correction to an earlier claim in this document
+
+"The stalling op is `ork_dyn_colsplit K=1024 N=128`" came from kernel #46, where the app printed
+`errno=110` naming it. In the current configuration NO op reports an error, so that attribution
+must not be carried forward without re-deriving it.
+
+### Invalid experiment, for the record
+
+A "warm daemon" test was meaningless: it printed `orkd_probe: connect/spawn FAILED` because
+`make test` exports `ORKD_BIN=$PWD/orkd` and the standalone script did not, so no daemon ever
+spawned. Any standalone orkd test must export `ORKD_BIN`.
