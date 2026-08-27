@@ -1530,3 +1530,27 @@ Two requirements worth designing in:
 2. Re-measure `dbg_premature_zero`; it should go to zero. That is the pass/fail.
 3. Only then consider the claim system, as a refactor with a known-good baseline to compare against.
 4. Drop the `any_core_busy` gate if (1) proves out — it would be redundant and carries starvation risk.
+
+### ★ GATE TEST RESULT — `any_core_busy` guard is NOT shippable (starvation confirmed)
+
+```
+run 1  rc=124  prem_zero=27  underflow=6  mismatch=0  switch-TO=18  createfail=0   (no result line)
+```
+
+1. **It does guard**: `mismatch domain` 0, down from hundreds. The switch genuinely no longer happens
+   under live work.
+2. **But it starves switching**: 18 switch timeouts and the run did not complete. On a continuously-fed
+   3-core pipeline there is rarely an instant when no core holds a job, so switches wait the full 6 s
+   and fail. This is the starvation risk flagged in the design above — now measured.
+3. **It does not fix the defect**: `prem_zero=27`, `underflow=6`, both UNCHANGED. The over-put still
+   happens every run; the gate only declines to act on it.
+
+**Verdict: revert or default-off.** It trades a corruption for a hang, and leaves the root cause intact.
+
+**What it proves for the design.** The thing that breaks is precisely the case the claim system
+distinguishes and this gate cannot: blocking traffic that is on the SAME domain and therefore safe.
+That distinction is load-bearing, not an elegance argument.
+
+**Confirms the recommended sequence** (per-job ownership bit first): the bit stops the over-put
+happening at all, so there is nothing for a gate to guard and no reason to block same-domain work.
+`dbg_premature_zero` going to 0 is the pass/fail — the gate leaves it at 27, a correct fix must zero it.
