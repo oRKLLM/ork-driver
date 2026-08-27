@@ -1800,3 +1800,33 @@ returns WITHOUT freeing, leaking the object and its IOVA permanently. Recorded a
 Proposed chain (UNVERIFIED): stall -> switch times out -> destroy bails -> IOVA leaked in domain 0 ->
 accumulates over runs -> domain 0 exhausted -> dma map fail -> every allocation EINVAL -> wedge.
 Confirm by watching `map_n - unmap_n` against domain-0 IOVA across runs before building anything.
+
+### ★ LEAK MEASURED — real, but NOT the wedge cause
+
+```
+run   rc    map_n unmap_n MAPLEAK  iova_alloc  iova_free  IOVA_OUTST  bailed
+1     124   45    12      33       59016 KB    8832 KB    50184 KB    20
+2-5   139   (frozen — board wedged on run 1, nothing ran after)
+```
+
+**The destroy-path leak is real:** 20 bails in ONE run, 33 leaked mappings, ~49 MB outstanding IOVA.
+`rknpu_gem_object_destroy()` does leak objects and their IOVA when the domain switch times out, exactly
+as the code reading predicted.
+
+**It is NOT the wedge cause.** 49 MB against the 3900 MB ceiling is 1.3%. The board wedged on run 1
+with the allocator nowhere near full, so IOVA exhaustion is refuted as the mechanism.
+
+**Where the reasoning went wrong:** the log sequence is
+`mismatch domain` -> `failed to switch iommu domain, ret: -22` -> `rknpu_gem_get_pages: dma map fail`.
+The map fails BECAUSE the switch failed. I built a chain on the last link (map failure -> assumed IOVA
+exhaustion) and skipped the first. The proposed chain
+"stall -> destroy bails -> IOVA leaked -> domain 0 exhausted -> wedge" is therefore WITHDRAWN.
+
+**Still worth fixing on its own merits:** 20 leaked GEM objects per run is a genuine resource leak, and
+`rknpu_gem_object_destroy()` should not need a successful domain switch to release an object.
+
+**The accumulator is still unidentified.** It is whatever makes `iommu_get_domain_for_dev()` disagree
+PERSISTENTLY with `rknpu_dev->iommu_domains[]`. That is the core IOMMU's own view diverging from
+rknpu's hand-maintained bookkeeping — which is the architectural fault line: rknpu fakes multi-domain
+on a subsystem that models one default domain per group, and even overwrites
+`iommu_group->default_domain` to do it. Every wedge symptom today lives in that gap.
