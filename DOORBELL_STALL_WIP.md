@@ -2147,3 +2147,60 @@ the thing to isolate: core coverage, blocking vs the ppflags path, or buffer ide
   instead of printing a bare "MISMATCH". "511 of 512 zero" is what turned a vague miscompute into
   "the op never ran".
 - `ORK_WARM_REPS=<n>` — cold-buffer warmup depth (default 2 = unchanged). Kept to hold the negative.
+
+---
+
+## 2026-08-27 (late) — ISOLATED: the post-reset reps are DROPPED, not stale
+
+### The measurement that settles it
+
+Kernel commit/completion counters across the whole run (`cnt_commit`, `cnt_done`, `cnt_irq`):
+
+| `ORK_XSPEC_NORESET` | commits | done | irq | first case |
+|---|---|---|---|---|
+| 0 (reset fires) | 17 | **15** | **15** | MISMATCH |
+| 1 (no reset) | 17 | **17** | **17** | bit-exact |
+
+Same commits, but with the reset **2 jobs never complete**. Attributing them:
+
+| drain | reps | commits | done | missing |
+|---|---|---|---|---|
+| 0 | 2 | 8 | 6 | **2** |
+| 0 | 3 | 10 | 7 | **3** |
+| 1 | 2 | 17 | 15 | **2** |
+| 0 | 1 | 6 | 5 | **1** |
+
+**`missing == reps`, exactly.** Every submit belonging to the first int8 op after the ACT_RESET is
+committed and NONE completes.
+
+### What this kills
+
+- **"More warmup reps"** — cannot work. The reps are not returning stale data; they are not
+  executing. Depth 2/3/4 fails because you cannot warm a pipeline with commits it never runs.
+- **"The 3-core drain repairs the state"** — WRONG, and it was my claim. `ORK_RESET_DRAIN` (new,
+  in `ork_npu_enter` immediately after the ACT_RESET) cures nothing at ANY core coverage:
+  1=all cores, 2=core 0 only, 3=cores 1|2 — all still MISMATCH, twice each. Submits 6-8 in the
+  original trace were case 2's PRE-SWITCH retirement barrier, not a repair. Later ops succeed
+  because they are a DIFFERENT op.
+- The drop window therefore covers exactly the first op's submits and closes by itself.
+
+### The sharp remaining contradiction — chase this
+
+The dropped submits are **BLOCKING** (`orki_submit1`, flags 0x5). The kernel returns success, so
+`rknpu_job_wait()` saw `RKNPU_JOB_DONE`, and `ork_i8_mm_run()` returns 0 — yet `cnt_done` and
+`cnt_irq` do NOT increment for those jobs, and the output buffer keeps its seeded sentinel. So the
+wait path and the completion accounting disagree about the same job. Resolve that disagreement
+(which flag/counter each uses, and whether the job is being completed by a path that skips the IRQ
+accounting) and the bug follows.
+
+### Still true / still ruled out
+
+`ORK_XSPEC_NORESET=1` remains a working workaround (bit-exact, 2x). Ruled out, each measured:
+kernel light switch (`switch_reset` 0/1), domain identity, warmup depth, ping-pong, both colsplit
+submit paths, post-switch wash/ramp/drain, submit timeout 3s..60s, and now post-RESET drain at
+every core mask.
+
+### New hooks
+
+`ORK_RESET_DRAIN=1|2|3` (mode.c, after the ACT_RESET) and `orki_dom_drain_mask(c, cmask)` —
+sacrificial op with selectable core coverage, kept so this negative stays reproducible.

@@ -157,6 +157,16 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain){
             fprintf(stderr,"[ork XSPEC-COST] n=%ld total=%.1fms mean=%.0fus\n", nn, acc/1000.0, acc/nn);
         } else orki_act(fd,RKNPU_ACT_RESET,0);
         for(int i=0;i<ORK_MAXCORE;i++){ c->chain_lut_devloaded[i]=0; c->chain_task_built[i]=0; }   /* a reset clears the SDP LUT SRAM (all cores) + the mode pipeline -> force a per-core reload and a task rebuild */
+        /* ORK_RESET_DRAIN (ISOLATION): the FIRST op after this ACT_RESET is silently DROPPED — it
+         * returns an unwritten buffer with no error (ORK_XSPEC_NORESET=1 makes it bit-exact). Extra
+         * warmup reps on the same core do NOT cure it (ORK_WARM_REPS 2/3/4 all fail), so the cure is
+         * not simply "submit again". Run a sacrificial op HERE, right after the reset, and vary its
+         * core coverage to find out what the cure actually requires:
+         *   1 = all cores   2 = core 0 only   3 = cores 1|2 (not the core the real op uses) */
+        { static int rd=-1; if(rd<0){const char*e=getenv("ORK_RESET_DRAIN"); rd=e?atoi(e):0;}
+          if(rd==1) orki_dom_drain_mask(c, ~0u);
+          else if(rd==2) orki_dom_drain_mask(c, 0x1u);
+          else if(rd==3) orki_dom_drain_mask(c, 0x6u); }
     }
     int wclr=0;
     switch(x->wc){

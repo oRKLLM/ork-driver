@@ -146,9 +146,12 @@ void ork_dom_flush_if_dirty(ork_npu *c){
 /* Shape-parameterised drain. The EASE-IN ramp (ORK_DOM_RAMP) steps K/N upward across a few
  * sacrificial ops so the first real work in a freshly switched domain is not a cold jump from
  * nothing straight to a full-size tile. Bounded by c->Af (A + B + C must fit): K*2 + K*N*2 + N*2. */
-static void orki_dom_drain_kn(ork_npu *c, int K, int N);
-void orki_dom_drain(ork_npu *c){ orki_dom_drain_kn(c, 512, 16); }
-static void orki_dom_drain_kn(ork_npu *c, int K, int N){
+static void orki_dom_drain_kn(ork_npu *c, int K, int N, unsigned cmask);
+void orki_dom_drain(ork_npu *c){ orki_dom_drain_kn(c, 512, 16, ~0u); }
+/* ISOLATION HOOK: same sacrificial op, restricted to a core mask, so "3 cores" and "core 0 only"
+ * can be compared directly (see ORK_RESET_DRAIN in mode.c). */
+void orki_dom_drain_mask(ork_npu *c, unsigned cmask){ orki_dom_drain_kn(c, 512, 16, cmask); }
+static void orki_dom_drain_kn(ork_npu *c, int K, int N, unsigned cmask){
     if(!c || c->fd < 0) return;
     if(!c->regcmd.cpu || !c->task.cpu || !c->Af.cpu) return;      /* domain not yet furnished -> nothing in flight */
     size_t aoff = 0, boff = (size_t)K*2, coff = boff + (size_t)K*N*2;
@@ -168,6 +171,7 @@ static void orki_dom_drain_kn(ork_npu *c, int K, int N){
     orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     int nc = c->soc->cores; if(nc < 1) nc = 1; if(nc > ORK_MAXCORE) nc = ORK_MAXCORE;
     for(int i = 0; i < nc; i++){
+        if(!(cmask & (1u<<i))) continue;
         struct rknpu_submit s; memset(&s, 0, sizeof s);
         s.flags = 0x1;                                            /* BLOCKING (no 0x2) — this IS the barrier */
         s.task_number = 1; s.task_obj_addr = c->task.obj; s.core_mask = 1u<<i; s.fence_fd = -1;
@@ -240,7 +244,7 @@ void orki_dom_activate(ork_npu *c,int dom){
     { static const struct { int K, N; } RAMP[] = { {128,16}, {512,64}, {1024,64}, {512,128} };
       static int ramp=-2; if(ramp==-2){ const char*e=getenv("ORK_DOM_RAMP"); ramp=e?atoi(e):0; }
       int nr = ramp; if(nr > (int)(sizeof RAMP/sizeof RAMP[0])) nr = (int)(sizeof RAMP/sizeof RAMP[0]);
-      for(int _r=0; _r<nr; _r++) orki_dom_drain_kn(c, RAMP[_r].K, RAMP[_r].N); }
+      for(int _r=0; _r<nr; _r++) orki_dom_drain_kn(c, RAMP[_r].K, RAMP[_r].N, ~0u); }
     { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
       if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }

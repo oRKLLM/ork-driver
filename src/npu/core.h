@@ -68,6 +68,7 @@ void ork_dom_reanchor(ork_npu *c, int dom);
 void ork_dom_flush_if_dirty(ork_npu *c);
 void orki_dom_activate(ork_npu *c,int dom);
 void orki_dom_drain(ork_npu *c);   /* retirement barrier: tiny BLOCKING submit per core before a domain switch */
+void orki_dom_drain_mask(ork_npu *c, unsigned cmask);   /* same, restricted to a core mask (isolation hook) */
 
 /* ---- core/submit.c — the raw DRM submit path ---- */
 void orki_act(int fd,uint32_t f,uint32_t v);
