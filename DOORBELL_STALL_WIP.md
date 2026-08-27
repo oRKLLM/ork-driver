@@ -1830,3 +1830,115 @@ PERSISTENTLY with `rknpu_dev->iommu_domains[]`. That is the core IOMMU's own vie
 rknpu's hand-maintained bookkeeping — which is the architectural fault line: rknpu fakes multi-domain
 on a subsystem that models one default domain per group, and even overwrites
 `iommu_group->default_domain` to do it. Every wedge symptom today lives in that gap.
+
+---
+
+## 2026-08-26 — DIRECTION SET: option B (own the domains explicitly)
+
+**User decision:** B is the only acceptable option. Target workload is a **27B model**
+(~13–14 GB at int4), so ≥4 domains must be simultaneously resident. Streaming (option A) and
+single-domain (option C) are both rejected as shipping fixes — C survives only as a diagnostic.
+
+### Why A was rejected (and the zero-copy question answered)
+
+A (single domain + streaming) does **not** literally break zero-copy: dma-buf imports keep their
+pages, and streaming cycles the **IOVA window**, not the data — remap, not memcpy. But it
+reintroduces map/unmap churn on every working-set rotation, and the multi-domain import work is
+exactly what took `Bf` from **190 s → 6 s**. So A trades correctness for residence performance.
+For a 27B model it is a non-starter.
+
+### The root architectural defect, now identified precisely
+
+`dma-iommu.c`:
+```c
+static struct iommu_domain *iommu_get_dma_domain(struct device *dev)
+{ return dev->iommu_group->default_domain; }
+```
+**The DMA API always maps into `default_domain`.** To make `dma_map_sg()` land in domain N, the
+vendor rewrites the core's notion of the default:
+`rknpu_dev->iommu_group->default_domain = dst_domain;` (rknpu_iommu.c:687), using a **private copy
+of `struct iommu_group`** pasted into the driver (rknpu_iommu.c:505–537) to reach the field.
+
+That single lie is the origin of the `mismatch domain` errors and the stale-pointer hazards: any
+core path that reattaches "the default" attaches a domain we own and may have freed.
+
+It is also **load-bearing as written** — `iommu_detach_device()` → `__iommu_group_set_core_domain()`
+reattaches `group->default_domain`, and `__iommu_attach_group()` returns `-EBUSY` unless
+`group->domain == group->default_domain`. So the line cannot simply be deleted; the mapping path
+must stop depending on the DMA API first.
+
+### Good news: our buffers already bypass the DMA API
+
+ork-driver allocates with flags `0x403` / `0x40b` =
+`NON_CONTIGUOUS | CACHEABLE | [KERNEL_MAPPING] | IOMMU_LIMIT_IOVA_ALIGNMENT`.
+
+- bit 0 `NON_CONTIGUOUS` → `rknpu_gem_alloc_buf()` routes to `rknpu_gem_get_pages()`, the shmem path
+- bit 10 → `iova_aligned = false` → **skips the `dma_map_sg()` short-circuit**
+
+and `rknpu_iommu_dma_map_sg()`'s non-aligned path is **already explicit**: it allocates IOVA itself
+and calls `iommu_map_sg(domain, …)` / `iommu_unmap(domain, …)` against
+`iommu_get_domain_for_dev()` (= `group->domain`, correct without the lie).
+
+So for our workload the DMA API is nearly vestigial. `dma_alloc_attrs` is only on the CONTIGUOUS
+path, which we never take. The cookie survives only as an **IOVA allocator we ourselves create**
+(`iommu_get_dma_cookie` + the `type |= __IOMMU_DOMAIN_DMA_API` patch + `iommu_setup_dma_ops`, whose
+only real job is `iommu_dma_init_domain()` initialising *our* `iovad`).
+
+### The remaining cost: every switch force-resets the MMU
+
+`rk_iommu_attach_device()` → `rk_iommu_enable()` → `rk_iommu_enable_stall()` +
+**`rk_iommu_force_reset()`** (every MMU bank) + DTE_ADDR write + ZAP + paging on.
+
+Going through the core's detach/attach makes this *worse*, not better: without the `default_domain`
+lie, `detach(D1)` bounces the device onto the true default D0 before `attach(D2)`, i.e. **two**
+full MMU force-resets per switch instead of one — in precisely the window patch30 shows racing
+in-flight jobs.
+
+### Chosen implementation shape for B
+
+Add a **light domain-switch primitive to `rockchip-iommu.c`** (already in our patch set, 3 patches):
+
+    stall → write RK_MMU_DTE_ADDR on all banks → ZAP_CACHE → unstall
+
+No `force_reset`, no paging off/on, and **no core detach/attach** — so no `default_domain` write,
+no `-EBUSY` dance, no transient domain. rknpu then:
+
+1. calls the new primitive instead of `iommu_detach_device`/`iommu_attach_device`
+2. passes the domain **explicitly** to `rknpu_iommu_dma_map_sg`/`unmap_sg` instead of querying
+   `iommu_get_domain_for_dev()` (rknpu already knows `iommu_domains[id]`)
+3. drops the `mismatch domain` check — it becomes meaningless, and it is currently itself a
+   failure source
+4. deletes the private `struct iommu_group` copy and the `default_domain` write
+
+This is "own the domains explicitly" implemented at the rockchip-iommu layer rather than the VFIO
+layer. It avoids DMA-ownership constraints and blocking-domain churn, and it is the only variant
+that also removes the force-reset.
+
+**VFIO route, for the record (verified available, kept as fallback):** all APIs are exported in
+this kernel — `iommu_group_claim_dma_owner`/`release`, `iommu_attach_group`/`detach_group`,
+`iommu_map_sg`, `iommu_unmap` — and `__iommu_group_set_core_domain()` has the
+`if (group->owner) new_domain = group->blocking_domain;` branch that makes detach/attach legal
+without touching `default_domain`. It does **not** avoid the force-reset.
+
+### Patch 70 (deferred GEM reclaim): NOT a fix — keep for visibility only
+
+A/B result, 4 runs: `deferred=20, reclaimed=0` every run; runs 2–4 returned rc=139 with
+**byte-identical** counters, i.e. the board was already wedged after run 1 and they never reached
+the NPU. Reclaim requires switching *into* the very domain that is unreachable, so it can never
+fire in the failure it was written for. It converts a silent leak into a tracked one. Nothing more.
+
+### Open: is multi-domain switching causal at all?
+
+`ORK_PIN_DOM=<n>` added at the `ork_dom()` chokepoint (`src/npu.c`) — forces every buffer and
+submit into one domain, so a model that fits one 4 GiB window runs with **zero** switches.
+A-B-A-B-A-B interleaved against the multi-domain control (`~/pin.sh` on the board) to keep board
+degradation from masquerading as an effect.
+
+Control reproduces the failure as expected: `errno=110` on a `domain=2` submit,
+`domain 0 live=1314 MiB / 1 live=1489 MiB / 2 live=447 MiB` (total 3251 MiB — note a 1.5B Q8_0
+model is spending far more IOVA than its weights, so per-domain scratch duplication is
+substantial, and pinning should *reduce* total live).
+
+**Gate:** if pinning eliminates the failure, switching is confirmed causal and the light-switch
+primitive is the fix to build. If it fails pinned too, the cause is elsewhere and B must be
+re-aimed before any kernel work.
