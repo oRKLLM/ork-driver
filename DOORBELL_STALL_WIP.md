@@ -1554,3 +1554,40 @@ That distinction is load-bearing, not an elegance argument.
 **Confirms the recommended sequence** (per-job ownership bit first): the bit stops the over-put
 happening at all, so there is nothing for a gate to guard and no reason to block same-domain work.
 `dbg_premature_zero` going to 0 is the pass/fail — the gate leaves it at 27, a correct fix must zero it.
+
+### ★ PER-JOB OWNERSHIP BIT — fixes the over-release, does NOT fix the wedge
+
+```
+run 1  rc=0    PREM_ZERO=29   underflow=0  mismatch=0  createfail=0   7.26 tok/s
+run 2  rc=0    PREM_ZERO=58   underflow=0  mismatch=0  createfail=0   7.27 tok/s
+run 3  rc=124  PREM_ZERO=259  underflow=0  mismatch=0  createfail=0   (timeout)
+run 4  rc=139  PREM_ZERO=259  underflow=0  mismatch=3  createfail=3   (SIGSEGV)
+```
+
+**Fixed:** `dbg_domain_underflow` is 0 across all four runs (was 6). The strict over-release — one
+acquire, three teardown paths releasing it — is genuinely closed by making release idempotent per job.
+
+**NOT fixed:** the wedge still arrives by run 4, same `mismatch` + `createfail` signature. So the
+over-release was a real defect but not the accumulator.
+
+**And the "benign window" reading of `premature_zero` is doubtful.** I argued the counter was
+over-broad because `rknpu_job_next()` publishes `subcore_data->job` before `rknpu_job_commit()`
+acquires — true, but it does not explain run 3 jumping 58 -> 259 (201 in ONE run vs ~29 in each healthy
+one), in exactly the run that timed out. More likely the counter tracks STALL DURATION: a stalled job
+sits in `subcore_data->job` for seconds, so every unrelated release during that window is counted. That
+makes it a symptom of stalling, not the accumulator.
+
+**Pre-registered criterion, honestly scored.** I set `premature_zero == 0` as pass/fail before running.
+It failed. I then argued the criterion was wrong — which is partly true (the pre-commit window is real)
+but I should not have leaned on it, because the run-3 spike contradicts the benign reading. The
+defensible claim is narrow: **underflow 6 -> 0**. Everything else is unproven.
+
+**Status of the wedge: cause still unknown.** Ruled out so far — refcount underflow (fixed, wedge
+persists), the `any_core_busy` gate (starves, wedge persists), domain identity, inter-commit spacing,
+post-switch cooldown. What still ratchets across runs has not been identified; `map_n - unmap_n` showed
+50 leaked mappings in one earlier pass and remains the least-explored lead.
+
+**Scoreboard for the session:** five interventions tested, five failed to fix the target defect.
+Three of them (spacing, cooldown, gate) failed their causal tests outright; REINIT works but is a
+workaround; the ownership bit fixes a real but different bug. The one durable gain is that each
+failure was measured rather than assumed.
