@@ -1942,3 +1942,81 @@ substantial, and pinning should *reduce* total live).
 **Gate:** if pinning eliminates the failure, switching is confirmed causal and the light-switch
 primitive is the fix to build. If it fails pinned too, the cause is elsewhere and B must be
 re-aimed before any kernel work.
+
+---
+
+## 2026-08-27 — B landed; a minimal deterministic reproducer; one lead retracted
+
+### B is in (kernel #46/#47), validated
+
+`rk_iommu_switch_domain()` + driver-owned IOVA + `default_domain` overwrite deleted. Wiki
+*Kernel-Modifications* Change 18, patch `attachments/12-rk-iommu-light-domain-switch.patch`.
+
+- board `make test` **ALL TESTS PASSED**, including `orkd_dom_api` multi-domain **bit-exact**
+- `mismatch domain`: present → **0**
+- `switch iommu domain time out` in the multi-domain bench: **12 → 0**
+- pinned perf unchanged: 217.03/11.72 (#45) → 217.19, 216.61 / 11.67, 11.67 (#46), 219.81/11.60 (#47)
+
+ZAP_CACHE alone is sufficient — `rk_iommu_force_reset()` was not doing necessary work on the
+switch path. **Caveat:** that `make test` pass is a SAMPLE, not proof of stall-freedom; the stall
+can and does hit the suite (see below).
+
+### THE REPRODUCER — use this, not a model bench
+
+    sudo -E ORK_MM_TIMEOUT=3000 timeout 200 ./orkd_dom_api      # FAILS 5/5, ~3 min
+    sudo -E ORK_PIN_DOM=0 ORK_MM_TIMEOUT=3000 ./orkd_dom_api    # PASSES, rc=0, 0 stalls
+
+Same binary, same shapes, same timeout — **only the domain count differs**. Deterministic, no
+model load, no GGUF. This replaces the multi-minute `ork_bench` loop for all stall work.
+
+`ORK_MM_TIMEOUT=3000` is what makes it deterministic: at the 60 s default the same stall is
+"intermittent" only because each occurrence costs a minute. The stalling op is
+`ork_dyn_colsplit K=1024 N=128` at M=16 — microseconds of real work, so a 3 s timeout is NOT a
+premature abort.
+
+### Causal chain, now established in order (kernel timestamps)
+
+    11022.648  switch 0->1, 1->0, 0->1              (normal)
+    11022.875  NO TASK PROGRESS core 0, counter 0x0  <-- THE STALL, first event
+    11034.865  switch iommu domain time out, id: 2   <-- stalled job still holds a domain ref
+    11034.865  rknpu_gem_object_create error         --> MEM_CREATE errno=22, domain 2 unusable
+    11037.892  failed to wait job, task counter: 0   <-- the 3 s submit timeout finally returns
+
+So: **stall → held domain reference → switch timeout → MEM_CREATE EINVAL → dead domain → dead
+run.** One root cause, four symptoms. `errno=22` at `dom_iova=0MB` is NOT IOVA exhaustion.
+
+The refcount is held by jobs that are *genuinely still in flight* (stalled), so the "premature
+put" diagnostic is a red herring for THIS failure — a premature put lowers the count; what blocks
+a switch is a count stuck ABOVE zero.
+
+### RETRACTED: the `task_ctrl` readback is not a failed start
+
+Stalled commit snapshot showed `WROTE task_ctrl=0x7001 → READBACK 0x1001` — the `0x6000` trigger
+field missing, which looked like the PC failing to tell the NPU to start.
+
+**A matched control refutes it.** Healthy 1-task samples don't exist in any passing workload, so
+the control was taken at the nearest matched signature, `0x7002`:
+
+    HEALTHY  WROTE task_ctrl=0x7002 -> READBACK 0x1002   status(pre/post)=0x5000
+    STALLED  WROTE task_ctrl=0x7001 -> READBACK 0x1001   status(pre/post)=0x7000
+
+The trigger field reads back cleared in **both**: it is self-clearing, and the readback is normal.
+This is the FOURTH single-sample candidate this session killed by a matched control (after CNA/DPU
+`S_STATUS 0x5`, `PC_OP_EN=0`, `INT_RAW_STATUS 0xc0000000`). Do not re-derive it.
+
+**Still open, still confounded:** `status = 0x7000` (stalled) vs `0x5000` (healthy), i.e. bit
+`0x2000`. The two samples differ in task count (1 vs 2), so the bit may simply encode that. A
+clean test needs a HEALTHY 1-task (`0x7001`) sample — and no passing workload produces one
+(`ork_bench` pinned: 0 samples; `orkd_dom_api` pinned: 0 samples, though it PASSES). Why the
+`0x7001` signature appears only on the failing path is itself unexplained and worth a look.
+
+`dbg_healthy_ctrl` is now a live module param (`#patchB4`) so the control can be re-aimed at
+whatever signature is stalling without a rebuild — the old hard-coded `0x7002` gate would have
+silently logged nothing against a `0x7001` stall.
+
+### Next: make a stall SURVIVABLE (the 27B-relevant lever)
+
+The stall may be silicon and may not be fixable soon. It does not have to be fatal: if an aborted
+job's domain reference were released correctly, a stall would cost one timeout instead of killing
+every later allocation. `switch_escalate` (patch 54, reap-on-switch-timeout) exists for this and
+was **not set** in any of today's runs — being A/B'd against the reproducer now.
