@@ -2418,3 +2418,55 @@ divergence**, not silicon. Candidates:
 Earlier I flagged `status(pre/post)` `0x7000` (stalled) vs `0x5000` (healthy) — bit `0x2000` — as
 open but confounded by task count (1 vs 2). On #51 the stalls are 2- and 4-task and read **`0x5000`**,
 the healthy value. Confirmed a task-count artifact, not a health bit. Do not re-derive it.
+
+---
+
+## 2026-08-27 — live-domain audit (kernel #52): 4 more real bugs, stall UNCHANGED
+
+Swept every `iommu_get_domain_for_dev()` caller in the driver, since Change 18 made it a known-bad
+accessor (it reports the group's DEFAULT domain, never the live one).
+
+| site | verdict |
+|---|---|
+| `rknpu_iommu.c` `init_domain()` | correct (at init the core's domain IS domain 0) |
+| `rknpu_gem.c:75` IOTLB flush | **WRONG** — flushed domain 0, stale translations for pages just mapped into domain N |
+| `rknpu_gem.c:504` cache `iommu_map()` | **WRONG** — SRAM/NBUF buffer mapped into domain 0 |
+| `rknpu_gem.c:657` cache `iommu_unmap()` | **WRONG** — unmapped from domain 0 |
+| `rknpu_reset.c` PER-CORE reset | **WRONG — the twin of the Change 20 bug, which that change MISSED** |
+
+The per-core one is the path `RKNPU_ACT_RESET_CORE` and the progress watchdog drive, i.e. it fires
+during the very multi-domain runs under investigation. Change 20 fixed the device-wide reset and
+left its per-core counterpart carrying the identical bug. All fixed in Change 21 (build #52).
+
+### Result: the hypothesis is WEAKENED, not confirmed
+
+| mode | #51 | #52 |
+|---|---|---|
+| multi | 124 / 21 stalls / 20 e110 | **124 / 21 stalls / 20 e110** |
+| pinned | 0 / 0 / 0, 218.0 t/s | **0 / 0 / 0, 219.94 t/s** |
+
+Byte-identical. Four genuine instances of "live domain vs hardware page table diverge" were found
+and fixed and the stall did not move. **Do not re-run this reasoning** — the page-table-divergence
+lead has been pursued to exhaustion in the driver.
+
+### Everything the stall has now survived
+
+light switch (Change 18) · reclaim-and-retry (19) · soft-reset live domain (20) · per-core reset +
+IOTLB flush + cache map/unmap (21) · warmup depth 2/3/4 · ping-pong on/off · sacrificial ops at every
+position and core mask (wash/ramp/RESET_DRAIN) · drain on/off · timeouts 3 s..60 s · `switch_reset`
+full-vs-light.
+
+Meanwhile the CONTRAST is rock solid and reproducible on every kernel: pinned = 0 stalls, ~218-220
+tok/s, coherent; multi-domain = ~21 stalls, 20 errno=110, rc=124. Whatever it is, it is a property of
+running more than one domain, and it is no longer any of the software divergences we can find.
+
+### Suggested next angles (not yet tried)
+
+- **Two domains, no third**: does the stall need >=3 domains, or does it appear with exactly 2? The
+  reproducer (`orkd_dom_api`, 2 domains) now PASSES while the bench (3 domains) fails — that is a
+  live discriminator and cheap to test by capping the bench's domain count.
+- **Domain count vs IOVA pressure**: bench domains hold GBs; `orkd_dom_api` holds KBs. Test a
+  2-domain bench with real weights to separate "many domains" from "large domains".
+- **Correlate the stall with a specific switch**: log every `rk_iommu_switch_domain` with a sequence
+  number and match against the `NO TASK PROGRESS` timestamps — is the stalling job always the Nth
+  after a switch, or unrelated to switches entirely?
