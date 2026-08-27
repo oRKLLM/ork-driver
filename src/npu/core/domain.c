@@ -222,8 +222,13 @@ void orki_dom_activate(ork_npu *c,int dom){
      * sweep plateaued at the same ~2% — so a SECOND cause remains. A pre-switch barrier is blind to a
      * first-submit-into-a-freshly-switched-domain hazard; this tests for one. c->dom_active is already the
      * NEW domain here, and its scratch was just furnished above, so orki_dom_drain now targets it. */
-    { static int pd=-1; if(pd<0) pd = getenv("ORK_DOM_DRAIN") ? atoi(getenv("ORK_DOM_DRAIN")) : 1;
-      if(pd>=2) orki_dom_drain(c); }
+    /* ORK_DOM_WASH=<n> (EXPERIMENT): n SACRIFICIAL tiny ops in the NEW domain right after the switch,
+     * to ride out the post-swap "danger zone" before real work lands. ORK_DOM_DRAIN>=2 is the n=1
+     * case and still means that. Measured on the deterministic reproducer: n=1 does nothing. */
+    { static int wash=-2;
+      if(wash==-2){ const char*e=getenv("ORK_DOM_WASH");
+          if(e) wash=atoi(e); else { const char*d=getenv("ORK_DOM_DRAIN"); wash=(d&&atoi(d)>=2)?1:0; } }
+      for(int _w=0; _w<wash; _w++) orki_dom_drain(c); }
     { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
       if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }
