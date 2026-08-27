@@ -38,7 +38,16 @@ for f in $FILES .config; do
 done
 
 echo "== building (16 cores) =="
-ssh $VM "$P; docker exec kbuild sh -c 'cd /root/linux-rockchip && make ARCH=arm64 olddefconfig >/dev/null 2>&1 && nice -n 5 make ARCH=arm64 -j16 Image modules > /root/vmbuild.log 2>&1; echo build-exit=\$?; grep -E \"error:\" /root/vmbuild.log | head -5'"
+BUILD_OUT=$(ssh $VM "$P; docker exec kbuild sh -c 'cd /root/linux-rockchip && make ARCH=arm64 olddefconfig >/dev/null 2>&1 && nice -n 5 make ARCH=arm64 -j16 Image modules > /root/vmbuild.log 2>&1; echo build-exit=\$?; grep -E \"error:\" /root/vmbuild.log | head -5'" 2>&1)
+echo "$BUILD_OUT"
+# ABORT ON A FAILED BUILD. This used to fall through to the install step and ship the PREVIOUS image,
+# so the board booted a STALE kernel while the log still said "installed". An experiment then measures
+# the old code and reads as a clean negative — which is exactly what happened once (a compile error in
+# a fix was scored as "the fix does not work"). Never install what did not build.
+if ! echo "$BUILD_OUT" | grep -q "build-exit=0"; then
+    echo "vm_kbuild: BUILD FAILED — NOT installing. The board keeps its current kernel." >&2
+    exit 1
+fi
 
 echo "== installing Image to the board =="
 ssh $VM "$P; docker exec kbuild cat /root/linux-rockchip/arch/arm64/boot/Image" > /tmp/_vmImage

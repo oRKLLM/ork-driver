@@ -93,6 +93,7 @@ enum e_rknpu_action {
 	RKNPU_GET_BW_TW = 11,
 	RKNPU_SET_BW_TW = 12,
 	RKNPU_ACT_CLR_TOTAL_RW_AMOUNT = 13,
+	RKNPU_ACT_SET_DOMAIN = 0x102,   /* make a domain live (no alloc) — see orki_bimport_f */
 	RKNPU_GET_DT_WR_AMOUNT = 14,
 	RKNPU_GET_DT_RD_AMOUNT = 15,
 	RKNPU_GET_WT_RD_AMOUNT = 16,

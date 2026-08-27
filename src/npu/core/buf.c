@@ -116,6 +116,14 @@ struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); close(dbuf); return (struct buf){0}; }   /* IOVA wedge guard */
     if(orki_load_prof) _t=ork_now_us();
     if(tr){ fprintf(stderr,"[IMP]   mmap ok -> PRIME_FD_TO_HANDLE...\n"); fflush(stderr); }
+    /* MAKE THE TARGET DOMAIN LIVE FIRST. PRIME_FD_TO_HANDLE maps the sg into whatever domain is live
+     * at that instant — the ioctl carries no domain — and the MEM_CREATE below names `dom` too LATE,
+     * because an already-imported handle is not re-mapped. Without this a weight can be mapped in one
+     * domain and used in another: the submit is committed and never completes, with no error
+     * (measured: dom_scale_probe imported=1 failed at cycle 0; native packs are unaffected because
+     * their MEM_CREATE does the switch and the mapping together). */
+    { struct rknpu_action da; memset(&da,0,sizeof da); da.flags=RKNPU_ACT_SET_DOMAIN; da.value=(uint32_t)dom;
+      ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&da); }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(orki_load_prof){ orki_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
@@ -190,6 +198,14 @@ struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
     if(p==MAP_FAILED){ perror("mmap(import_fd)"); return (struct buf){0}; }
     int dom=ork_dom(domain);
     if(!ork_iova_reserve(dom,sz)){ munmap(p,sz); return (struct buf){0}; }
+    /* MAKE THE TARGET DOMAIN LIVE FIRST. PRIME_FD_TO_HANDLE maps the sg into whatever domain is live
+     * at that instant — the ioctl carries no domain — and the MEM_CREATE below names `dom` too LATE,
+     * because an already-imported handle is not re-mapped. Without this a weight can be mapped in one
+     * domain and used in another: the submit is committed and never completes, with no error
+     * (measured: dom_scale_probe imported=1 failed at cycle 0; native packs are unaffected because
+     * their MEM_CREATE does the switch and the mapping together). */
+    { struct rknpu_action da; memset(&da,0,sizeof da); da.flags=RKNPU_ACT_SET_DOMAIN; da.value=(uint32_t)dom;
+      ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&da); }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
