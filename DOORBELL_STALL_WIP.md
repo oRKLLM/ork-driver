@@ -1675,3 +1675,37 @@ interrupts) but the printed `stalls=0` in `~/unmask.out` is wrong.
 
 **Next:** confirm `0xc0000000` is reliable across many stalls and never appears on a healthy job, then
 use it as the watchdog's detection predicate instead of the task counter.
+
+### ★ CNA/DPU `S_STATUS = 0x5` IS THE RUNNING STATE — not a failure signature
+
+Time series across 400 watchdog samples, tagging each by `wd_flat` so progressing and stalling samples
+sit in one stream:
+
+```
+PROGRESSING (flat<=2):   11 x CNA=00000005 DPU=00000005
+                          2 x CNA=00010008 DPU=00010008
+STALLING    (flat>=6):  378 x CNA=00000005 DPU=00000005
+```
+
+`0x5` occurs on **healthy, progressing** samples. It is the RUNNING state, not the failure state. The
+earlier one-shot comparison (`healthy = 0x00000000` vs `stalled = 0x00000005`) was precisely the
+sampling artifact flagged when it was recorded: the single healthy sample landed BETWEEN tasks.
+
+**What it does establish — and this is the useful part.** At a stall the downstream units are in the
+SAME running state as during healthy execution. So the PC is **not** failing to issue the start: it
+starts CNA/DPU, they enter RUNNING, and they never complete. The failure is downstream of the start
+command, inside the units' execution — not in the command-processor handshake.
+
+### ⚠ THIS ALSO PUTS THE `INT_RAW_STATUS` RESULT IN DOUBT
+
+`INT_RAW_STATUS` = `0x00000008` healthy vs `0xc0000000` stalled came from the SAME one-shot
+methodology — one healthy sample against one stalled sample — which has now dissolved once under
+repeated sampling. It should not be treated as established until it survives a time series of the same
+kind. The unmasking test already showed those bits are not interrupt sources; if they also appear on
+healthy samples, there is no positive discriminator left at all and the whole "hardware is reporting
+it" line collapses.
+
+**Method note.** Two "positive findings" today came from single-sample comparisons and one has already
+failed. Any register claimed to distinguish healthy from stalled must be sampled repeatedly across
+both populations before it is believed. The `cnt > 0` control is necessary but NOT sufficient — it
+proves the job executed a task, not that the sample caught it mid-execution.
