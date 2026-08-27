@@ -1709,3 +1709,49 @@ it" line collapses.
 failed. Any register claimed to distinguish healthy from stalled must be sampled repeatedly across
 both populations before it is believed. The `cnt > 0` control is necessary but NOT sufficient — it
 proves the job executed a task, not that the sample caught it mid-execution.
+
+### ★ `INT_RAW_STATUS` IS NOT A DISCRIMINATOR EITHER — no register distinguishes stalled from healthy
+
+Time series, 800 samples:
+
+```
+PROGRESSING (flat<=2):   12 x RAW=40010000     6 x RAW=c0000000     ratio 2:1
+STALLING    (flat>=6):  509 x RAW=40010000   255 x RAW=c0000000     ratio 2:1
+```
+
+`0xc0000000` occurs on **33% of healthy samples and 33% of stalling samples** — the same ratio. It
+carries no information about the failure. The earlier "healthy 0x8 vs stalled 0xc0000000" was the third
+single-sample comparison today to dissolve under repeated sampling, and the "the hardware is reporting
+the failure" claim is WITHDRAWN.
+
+**Consolidated negative:** across the PC block, CNA, DPU, CDMA and all four MMU banks, **no register we
+have read distinguishes a stalled job from a healthy one.** Commit registers byte-identical, regcmd
+bytes verified correct in DRAM, MMU idle with zero faults, CDMA identical, CNA/DPU in the same RUNNING
+state, INT_RAW_STATUS identically distributed. The hardware state during a stall is indistinguishable
+from normal execution.
+
+That is the strongest available support for the failure being at silicon level: the device accepts the
+work, presents exactly as running, and never completes — while reporting nothing anywhere we can read.
+It is also consistent with the same signature appearing on the vendor's own stack
+(rockchip-linux/rknn-toolkit2#320).
+
+**Consequence for strategy:** stop hunting a diagnostic signal. There is none in the registers we can
+reach. Engineer around the one robust structural fact instead — the positional clustering after a
+domain switch.
+
+### NEXT: "wash" the danger window with sacrificial submits
+
+Measured structure: commits at positions 0-2 after a domain switch stall at ~46%; position 3+ stalls at
+0% (0/371 in one run).
+
+The cooldown's failure is EVIDENCE FOR this, not against it. Forcing >1 ms after a switch changed
+nothing (105 cooldowns fired, 86 stalls unchanged). If the mechanism were a settling TIME that should
+have worked. If instead the first N SUBMITS after a switch are consumed, waiting is useless and only
+submits can absorb it — and nothing tried so far has consumed submits in the danger window.
+
+Economics are lopsided: ~3 sacrificial submits x ~56 switches per run = ~168 tiny submits, roughly
+28 ms at the ~167 us submit floor, against the ~172 s currently lost (86 stalls x ~2 s of fast-abort).
+Even a partial effect is overwhelmingly worth it.
+
+`ork_dom_prime()` already exists in ork-driver for exactly this and has never been measured. Userspace
+is the right place — the kernel cannot synthesise a valid regcmd.
