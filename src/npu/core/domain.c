@@ -143,10 +143,14 @@ void ork_dom_flush_if_dirty(ork_npu *c){
  * ~11% the next), so only same-session adjacent arms are comparable — hence the B-A-B bracket.
  * DEFAULT ON. `ORK_DOM_DRAIN=0` restores the old blind sleep. Single-domain never reaches here
  * (dom_activate returns early when dom == dom_active), so it costs single-domain models nothing. */
-void orki_dom_drain(ork_npu *c){
+/* Shape-parameterised drain. The EASE-IN ramp (ORK_DOM_RAMP) steps K/N upward across a few
+ * sacrificial ops so the first real work in a freshly switched domain is not a cold jump from
+ * nothing straight to a full-size tile. Bounded by c->Af (A + B + C must fit): K*2 + K*N*2 + N*2. */
+static void orki_dom_drain_kn(ork_npu *c, int K, int N);
+void orki_dom_drain(ork_npu *c){ orki_dom_drain_kn(c, 512, 16); }
+static void orki_dom_drain_kn(ork_npu *c, int K, int N){
     if(!c || c->fd < 0) return;
     if(!c->regcmd.cpu || !c->task.cpu || !c->Af.cpu) return;      /* domain not yet furnished -> nothing in flight */
-    const int K = 512, N = 16;
     size_t aoff = 0, boff = (size_t)K*2, coff = boff + (size_t)K*N*2;
     if(c->Af.size < coff + (size_t)N*2) return;                   /* Af too small (should not happen) */
     int fd = c->fd; unsigned dom = c->dom_active;
@@ -229,6 +233,14 @@ void orki_dom_activate(ork_npu *c,int dom){
       if(wash==-2){ const char*e=getenv("ORK_DOM_WASH");
           if(e) wash=atoi(e); else { const char*d=getenv("ORK_DOM_DRAIN"); wash=(d&&atoi(d)>=2)?1:0; } }
       for(int _w=0; _w<wash; _w++) orki_dom_drain(c); }
+    /* ORK_DOM_RAMP=<n> (EXPERIMENT): EASE-IN. n sacrificial ops of INCREASING size, so the domain
+     * is warmed up gradually instead of taking a full-size tile as its first work. Distinct from
+     * ORK_DOM_WASH, which repeats one tiny shape n times and measured as having no effect. Steps
+     * are chosen to fit c->Af (262144 B): the last is the largest tile that fits. */
+    { static const struct { int K, N; } RAMP[] = { {128,16}, {512,64}, {1024,64}, {512,128} };
+      static int ramp=-2; if(ramp==-2){ const char*e=getenv("ORK_DOM_RAMP"); ramp=e?atoi(e):0; }
+      int nr = ramp; if(nr > (int)(sizeof RAMP/sizeof RAMP[0])) nr = (int)(sizeof RAMP/sizeof RAMP[0]);
+      for(int _r=0; _r<nr; _r++) orki_dom_drain_kn(c, RAMP[_r].K, RAMP[_r].N); }
     { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
       if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }
