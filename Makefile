@@ -835,6 +835,10 @@ test_orkd_2conn_seq: tools/test_orkd_2conn_seq.c $(COBJ)
 
 # orkd_dom_api — validate client-managed IOMMU domains (ork_npu_domain_alloc/free + set_pack_domain), direct or
 # routed: sudo ./orkd_dom_api | sudo env ORK_USE_ORKD=1 ORKD_BIN=$PWD/orkd ./orkd_dom_api
+# dom_scale_probe — bisect the SCALE at which a two-domain workload starts stalling (see the file header)
+dom_scale_probe: tools/dom_scale_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 orkd_dom_api: tools/orkd_dom_api.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 

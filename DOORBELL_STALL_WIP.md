@@ -2530,3 +2530,47 @@ involvement · intra-process switch/submit race · `task_ctrl` readback · `stat
 
 Invariant that still holds on every kernel: **pinned = 0 stalls, ~218-220 tok/s, coherent; the same
 workload across 2 domains = ~20 stalls, 20 errno=110, rc=124.**
+
+---
+
+## 2026-08-27 — SCALE bisected: refuted on both axes. Remaining difference is `imported=1`.
+
+New tool `tools/dom_scale_probe.c` — the bench's SHAPE (weights resident per domain, then alternating
+switch+submit cycles), with cycle count and resident bytes as free variables. Reports the first
+failing cycle, so one run answers "does it break, and at what count".
+
+| axis | setting | result |
+|---|---|---|
+| cycles, small shape | 2000 x (switch+submit), M=8 K=512 N=64 | **PASS** bit-exact, 0.28 ms/cycle |
+| cycles, bench shape | 2000 x, M=32 K=2048 N=512 | **PASS** bit-exact, 0.38 ms/cycle |
+| resident bytes | 600 x, 128 MiB over 2 domains | **PASS** bit-exact |
+| resident bytes | 600 x, 512 MiB | **PASS** bit-exact |
+| resident bytes | 600 x, **1024 MiB** (bench profile) | **PASS** bit-exact |
+
+The probe now matches the failing bench on **domain count (2), domain indices (1,2), resident bytes
+(~1 GiB), op shape, and cycle count** — and passes. So neither cycle count nor residency is the
+trigger.
+
+(`stalls=1..2` appear in dmesg on the residency runs: watchdog DETECTIONS of >120 ms no-progress
+that subsequently completed. Every output was bit-exact. Do not read a dmesg NO TASK PROGRESS line
+as a failure by itself — the wd threshold is 120 ms and a big cold weight-DMA can exceed it.)
+
+### ★ The one structural difference left: IMPORTED weights
+
+The bench's failing submit names it explicitly:
+
+    op=ork_dyn_colsplit weight[K=1536 N=1536 dom=2 imported=1]
+
+The bench's weights arrive from ggml-ork as **dma-buf imports** (`PRIME_FD_TO_HANDLE`); the probe
+packs natively (`ork_i8_mm_pack` -> `bcreate`). That is now the standout difference, and it is a
+known-fraught area: kernel Change 3 existed precisely because `rknpu_gem_prime_import_sg_table()`
+ignores MEM_CREATE's `iommu_domain_id`, so an import's sg is mapped against whatever domain was
+attached at import time rather than the one recorded. Under the light switch "whatever was attached"
+is decided by our own bookkeeping, so this deserves a fresh read, not an assumption that Change 3
+still covers it.
+
+**Next step:** extend `dom_scale_probe` to source its weights via `ork_dma_alloc` + the import path
+instead of a native pack, and re-run the same matrix. If imported weights stall where native ones do
+not, that is the trigger and it is testable in minutes rather than a 400 s bench run.
+
+Secondary differences not yet isolated: 3-core colsplit concurrency, and int8/fp16 mode mixing.
