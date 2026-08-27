@@ -516,3 +516,4 @@ void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src);
 extern double orki_f16_slice_us;
 
 #endif /* ORK_NPU_INTERNAL_H */
+extern size_t orki_sram_got;   /* #sram: bytes MEM_CREATE actually placed in on-chip SRAM */

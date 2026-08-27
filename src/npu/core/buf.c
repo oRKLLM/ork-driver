@@ -26,6 +26,12 @@
 
 size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
 
+/* #sram: how many bytes MEM_CREATE actually placed in on-chip SRAM. TRY_ALLOC_SRAM is a *try* —
+ * the kernel silently falls back to DRAM when SRAM is exhausted (956 KB total on RK3588), so an
+ * experiment that assumes placement is measuring nothing. MEM_CREATE returns the achieved size in
+ * args->sram_size; accumulate it so a test can VERIFY rather than assume. */
+size_t orki_sram_got;
+
 struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     int dom=ork_dom(domain); size_t need=orki_pgup(size);
     /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (orki_sram_total
@@ -59,6 +65,7 @@ struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
     struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
     orki_live_add(fd,b.handle,b.obj);
+    orki_sram_got += (size_t)c.sram_size;   /* #sram: achieved, not requested */
     orki_bcreate_n++;
     return b;
 }

@@ -80,7 +80,24 @@ ork_npu *ork_npu_init(void){
                   orki_sram_total?"(SRAM-backed alloc available)":"(none — DRAM-only, TRY_ALLOC_SRAM fails over)"); }
     ork_npu *c=calloc(1,sizeof *c); c->fd=fd; c->soc=soc; c->last_dt=-1; c->core_budget=soc->cores; c->pack_domain=-1; c->last_async_cpu=-1;
     pthread_mutex_init(&c->pmu,NULL); pthread_cond_init(&c->pgo,NULL); pthread_cond_init(&c->pdn,NULL);
-    c->regcmd=orki_bcreate(fd,2097152,0x403,-1); c->task=orki_bcreate(fd,524288,0x40b,-1); c->Af=orki_bcreate(fd,(size_t)4*32768*2,0x403,-1);
+    /* #sram (DIAGNOSTIC, ORK_SRAM_REGCMD=1): place the regcmd — the buffer the PC DMA-fetches at
+     * dispatch — in on-chip SRAM instead of DRAM.
+     *
+     * WHY. No register we can read distinguishes a stalled job from a healthy one (PC block, CNA, DPU,
+     * CDMA and all four MMU banks are identical or identically distributed), so there is no signal left
+     * to chase. This changes a PHYSICAL property of the fetch instead of its timing or ordering, which
+     * every previous attempt varied. SRAM does NOT bypass the IOMMU — the kernel still maps it and
+     * hands back an IOVA — so translation is held constant while the target moves from external DDR to
+     * on-chip memory. If stalls vanish, the failure is in the DRAM access path; if they persist, it is
+     * upstream of where the data lives.
+     *
+     * SRAM is 956 KB and the regcmd buffer is 2 MB, so only the first part can land there — which is
+     * the part that matters, since regcmd_addr points at the START of the buffer. TRY_ALLOC_SRAM is a
+     * *try*: verify with orki_sram_got rather than assuming placement. */
+    { static int sr = -1; if(sr < 0) sr = getenv("ORK_SRAM_REGCMD") ? 1 : 0;
+      uint32_t rcf = sr ? (0x403u | RKNPU_MEM_TRY_ALLOC_SRAM) : 0x403u;
+      c->regcmd=orki_bcreate(fd,2097152,rcf,-1); c->task=orki_bcreate(fd,524288,0x40b,-1); c->Af=orki_bcreate(fd,(size_t)4*32768*2,0x403,-1);
+      if(sr) fprintf(stderr,"[ork] ORK_SRAM_REGCMD=1: %zu KB of the regcmd landed in on-chip SRAM (0 = fell back to DRAM)\n", orki_sram_got>>10); }
     struct rknpu_task t; memset(&t,0,sizeof t); t.enable_mask=0xd;t.int_mask=0x300;t.int_clear=0x1ffff;t.regcfg_amount=108;t.regcmd_addr=c->regcmd.dma;
     memcpy(c->task.cpu,&t,sizeof t); orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     if(!c->regcmd.cpu||!c->task.cpu||!c->Af.cpu){ork_npu_free(c);return NULL;}

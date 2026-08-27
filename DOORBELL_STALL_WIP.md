@@ -1755,3 +1755,48 @@ Even a partial effect is overwhelmingly worth it.
 
 `ork_dom_prime()` already exists in ork-driver for exactly this and has never been measured. Userspace
 is the right place — the kernel cannot synthesise a valid regcmd.
+
+### SRAM-RESIDENT REGCMD — no effect (and the A-B-A control caught a false positive)
+
+`ORK_SRAM_REGCMD=1` allocates the regcmd with `RKNPU_MEM_TRY_ALLOC_SRAM`. Placement VERIFIED from the
+`sram_size` that MEM_CREATE returns, not assumed: **956 KB landed in on-chip SRAM**. Since
+`regcmd_addr` points at the buffer start and the kernel fills SRAM from the beginning, the bytes the PC
+actually fetches were on-chip.
+
+```
+DRAM    11 / 2000   0.55%
+SRAM     7 / 2000   0.35%     <- 956 KB verified on-chip
+DRAM2    3 / 2000   0.15%     <- repeat control
+```
+
+**No SRAM effect.** The repeat control is LOWER than the SRAM arm, so the sequence 11 -> 7 -> 3 is
+drift; run-to-run variance exceeds the DRAM-vs-SRAM difference. Without the second control, "11 -> 7"
+would have looked like a 36% win.
+
+**What it does establish:** moving the regcmd off DDR to on-chip memory does not reduce stalls, so the
+failure is upstream of where the fetched data lives — not in the DRAM access path. Note SRAM does NOT
+bypass the IOMMU (the kernel maps it and returns an IOVA), so this varied the physical target while
+holding translation constant. Translation/domain state remains unexcluded.
+
+**Sizing note:** `REGCMD_N = 224` words = 896 B per program, so the 2 MB regcmd buffer holds ~2300
+programs while these workloads chain at most 9 tasks (~8 KB). It is ~99.6% unused, and a 256 KB buffer
+would fit entirely in SRAM. Not changed — it is a CORE allocation and would need attest + board test.
+
+### REINIT does NOT recover a fully wedged device — correction
+
+Earlier recorded as working. That test ran against a DEGRADED board (`premature_zero=29`, no
+`CREATE FAIL`), never a fully wedged one. Against the real wedge: `REINIT ok, exit=0` and allocations
+still fail `errno=22`.
+
+**Why:** `rknpu_iommu_free_domains()` frees domains 1..15. Domain **0** is the IOMMU core's default
+domain and is not freed, so its IOVA allocator keeps every outstanding reservation — and the failures
+are `dom=0`, from `rknpu_iommu_dma_alloc_iova()` inside domain 0.
+
+**Likely holder of that IOVA:** `rknpu_gem_object_destroy()` bails after 3 failed domain switches and
+returns WITHOUT freeing, leaking the object and its IOVA permanently. Recorded at the time as
+"leak rather than corrupt", which is safe per-event but accumulates — matching the 50 leaked mappings
+(`map_n - unmap_n`) measured earlier and never chased.
+
+Proposed chain (UNVERIFIED): stall -> switch times out -> destroy bails -> IOVA leaked in domain 0 ->
+accumulates over runs -> domain 0 exhausted -> dma map fail -> every allocation EINVAL -> wedge.
+Confirm by watching `map_n - unmap_n` against domain-0 IOVA across runs before building anything.
