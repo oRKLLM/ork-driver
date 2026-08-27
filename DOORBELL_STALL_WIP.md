@@ -2204,3 +2204,65 @@ every core mask.
 
 `ORK_RESET_DRAIN=1|2|3` (mode.c, after the ACT_RESET) and `orki_dom_drain_mask(c, cmask)` —
 sacrificial op with selectable core coverage, kept so this negative stays reproducible.
+
+---
+
+## 2026-08-27 (night) — the contradiction resolved, and the silent corruption FIXED
+
+### The contradiction was my own mis-attribution
+
+I claimed a BLOCKING submit was returning success for a job that never completed. Instrumented it
+(`#patchB7`: count a blocking submit that returns 0 without `RKNPU_JOB_DONE`, and count submits
+missing `RKNPU_JOB_PC`). Result: **`dbg_false_ok=0`, `dbg_nopc=0`** — no blocking submit ever lied,
+and PC was always set. The kernel is behaving correctly; only one site sets `RKNPU_JOB_DONE` and it
+increments `cnt_done` in the same block, so the accounting was never inconsistent.
+
+The submits are **NOT blocking**. `run_fullk_dec` uses the DOORBELL variant `orki_submit1_db`
+(`sub.flags = ork_ppflags() | 0x2` = NONBLOCK), which waits by polling a last-word sentinel.
+
+### The actual defect (userspace, ours)
+
+```c
+for(;;){ ... if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* timeout: just breaks */
+orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
+c->warmed=1; return 0;                                                     /* returns 0 regardless */
+```
+
+The sentinel poll fell out of the loop on timeout and returned **success anyway**, so a DROPPED op
+was indistinguishable from a completed one: the caller consumed an output buffer still holding its
+seed. This also explains the wall-time scaling with `ORK_MM_TIMEOUT` (12 s at 3 s, 127 s at 60 s) —
+that is the poll burning its cap, once per rep.
+
+### Fix (landed)
+
+`orki_submit1_db` now tracks whether the sentinel landed and, if it did not, prints an error naming
+the op/domain/rep and returns -1 — but only on the LAST rep, since a throwaway warmup rep may
+legitimately miss. Counter `orki_db_miss`.
+
+Validated:
+
+| | first case | errors |
+|---|---|---|
+| reset fires | **`run/pack FAIL`** (was a silent MISMATCH) | 2 loud, op-named |
+| reset suppressed | bit-exact, PASS | none — no false positives |
+
+Full board `make test`: **ALL TESTS PASSED**, exactly ONE sentinel miss in the whole suite (the
+known post-reset drop, on a non-final rep, correctly tolerated — `orkd_dom_api` still passes
+in-suite bit-exact).
+
+**Silent wrong data is now a loud, attributable failure.** For a 27B run that is the difference
+between garbage output and an error the caller can act on. The underlying drop (first int8 op after
+a mode-transition ACT_RESET never executes) is UNCHANGED and still open; `ORK_XSPEC_NORESET=1`
+remains the workaround.
+
+### Same pattern elsewhere — audit these next
+
+The colsplit NONBLOCK poll (`src/npu/core/colsplit.c`, `if (el > 3e6) break;`) and the `dyn.c`
+sentinel polls fall out on timeout the same way. They are not the default path here but carry the
+identical silent-success risk.
+
+### Process note
+
+A `make test` failure while validating this was NOT the code: `test_speed` tripped its 6500 us
+latency limit at 12240 us because the reboot script pinned the CPU governors but not the DMC one
+(`dmc_ondemand`). Re-pinned -> ALL TESTS PASSED. Always set BOTH after a reboot.

@@ -328,6 +328,7 @@ int orki_testcore = -1;
 int orki_tc(void){ if(orki_testcore<0){ const char*e=getenv("ORK_NPU_TESTCORE"); int t=e?atoi(e):0; if(t<0||t>2)t=0; orki_testcore=t; } return orki_testcore; }
 void ork_npu_set_test_core(int core){ if(core>=0&&core<=2) orki_testcore=core; }
 
+unsigned long orki_db_miss;   /* doorbell sentinel misses (op committed but never ran) */
 /* Cold-buffer warmup depth. ORK_WARM_REPS overrides for A/B. See orki_submit1(). */
 int orki_warm_reps(void){ static int r=-1; if(r<0){const char*e=getenv("ORK_WARM_REPS"); r=e?atoi(e):2; if(r<1)r=1;} return r; }
 
@@ -355,9 +356,23 @@ int orki_submit1_db(ork_npu *c, size_t nout){
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
-        double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0;
-        for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff)break; if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
-        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
+        double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0; int landed=0;
+        for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff){landed=1;break;} if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
+        orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
+        /* SENTINEL NEVER LANDED => THE OP DID NOT RUN. Report it.
+         *
+         * This poll used to fall out of the loop on timeout and `return 0` anyway, so a DROPPED op
+         * was indistinguishable from a completed one: the caller got success and consumed an output
+         * buffer still holding its seed. Measured on the first int8 op after a mode-transition
+         * ACT_RESET -- every submit committed, NONE completed (kernel cnt_done/cnt_irq flat), 511 of
+         * 512 output words still zero with the seeded sentinel surviving, and not one error printed
+         * anywhere. Silent wrong data is the worst possible failure for a model run; a loud one at
+         * least lets the caller fall back. A non-final warmup rep may legitimately miss, so only the
+         * LAST rep is fatal. */
+        if(!landed){ orki_db_miss++;
+            fprintf(stderr,"[ork] ERROR: doorbell sentinel never landed (op=%s dom=%u nout=%zu rep=%d/%d, waited %.0f ms) — the op did NOT run; failing instead of returning stale output\n",
+                    orki_last_op?orki_last_op:"?", c->dom_active, nout, rep+1, reps, cap/1000.0);
+            if(last) return -1; } }
     c->warmed=1; return 0;
 }
 int orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uintptr_t c_start, uintptr_t c_end) {
