@@ -1465,3 +1465,68 @@ premature-zero window, which is the one doing the damage.
 **Also validated here:** `/var/lib/ork-logs/kmsg.log.prev` preserved all of this across the crash+reboot
 that ended the run. On the old RAMlog path the entire dataset would have been lost — this is the second
 time that would have happened today.
+
+## DESIGN — the domain reference should be OWNED, not counted
+
+Desk work while the `any_core_busy` gate test ran. Mapping every acquire/release site gives a stark
+asymmetry:
+
+| file | acquires (`get_and_switch`) | releases (`domain_put`) |
+|---|---|---|
+| `rknpu_job.c` | **1** — `:727`, at commit | **3** — `:668` done, `:755` abort, `:967` timeout_clean |
+| `rknpu_gem.c` | 4 | 5 |
+| `rknpu_drv.c` | 1 | 1 |
+
+**A job acquires the reference once and three different teardown paths can release it**, with nothing
+recording whether this job still holds one. done-then-aborted, or aborted-then-reaped, double-releases.
+That is precisely why caller tagging put `rknpu_job_abort+0x40` at the top with 17 hits, and why
+`rknpu_job_timeout_clean` (our change 02, an *added* release) shows up too.
+
+### Minimal correct fix — a per-job ownership bit (~10 lines)
+
+`job->flags` already carries `RKNPU_JOB_DONE`(0), `RKNPU_JOB_ASYNC`(1) and our `RKNPU_JOB_STALLED`(8),
+so a bit is free:
+
+```c
+/* at the single acquire, rknpu_job.c:727, on success */
+set_bit(RKNPU_JOB_HOLDS_DOMAIN_BIT, &job->flags);
+
+/* at EACH of the three releases */
+if (test_and_clear_bit(RKNPU_JOB_HOLDS_DOMAIN_BIT, &job->flags))
+        rknpu_iommu_domain_put(rknpu_dev);
+```
+
+Now whichever teardown path runs first releases it, and the others cannot. Release becomes idempotent
+per job, which is the actual invariant. Leaves the gem sites alone — those acquire/release pairs are
+locally balanced.
+
+This is strictly better than the `any_core_busy` gate currently under test: the gate PREVENTS a
+switch during the window an over-put opens, whereas this stops the window opening at all. The gate
+also blocks same-domain traffic and risks starving switches on a busy pipeline.
+
+### The generalisation — a claim/lease system (user's proposal, and the right end state)
+
+Make the reference owned by a claimant rather than a bare count. Reader-writer semantics:
+
+- `claim(D)` while the device is already on `D` -> **shared**, succeeds immediately, coexists with
+  other claims on `D`;
+- `claim(D')` while on `D` -> **exclusive**, waits for all claims to drain, switches, then holds;
+- `release` drops only the caller's own claim.
+
+Why it beats the per-job bit as an end state: it covers the non-job sites too, and — critically — it
+distinguishes "device busy" from "device busy IN A DIFFERENT DOMAIN". The `any_core_busy` gate cannot
+make that distinction and so blocks switches that would have been perfectly safe.
+
+Two requirements worth designing in:
+1. **Tie claims to the `drm_file`** so a dying process releases automatically. Today a killed client
+   leaks its reference — plausibly part of what accumulates across runs.
+2. A submit either polls its claim or is queued behind it. `get_and_switch()`'s existing wait loop is
+   already close; the difference is that the wait would be attributable to a claim rather than
+   satisfiable by an unrelated party's release.
+
+### Recommended sequence
+
+1. Per-job ownership bit — small, targeted, fixes the measured defect. Do this first.
+2. Re-measure `dbg_premature_zero`; it should go to zero. That is the pass/fail.
+3. Only then consider the claim system, as a refactor with a known-good baseline to compare against.
+4. Drop the `any_core_busy` gate if (1) proves out — it would be redundant and carries starvation risk.
