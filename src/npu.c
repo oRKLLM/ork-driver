@@ -179,9 +179,9 @@ int orki_budget(ork_npu*c, int M){
  * shared mutable domain. bcreate/bimport take an explicit `domain`; rknpu_submit_ioctl sets
  * sub->iommu_domain_id from a parameter. The pack-path default for the ggml-ork caller lives on
  * the ork_npu ctx (c->pack_domain), read once per pack to stamp w->domain. dom<0 => default. */
-/* ORK_PIN_DOM=<n> (DIAGNOSTIC): force EVERY buffer/submit into domain <n> — a model that fits one
- * 4 GiB window then runs with ZERO switches, isolating the switch from the rest of the datapath. */
-int ork_dom(int dom){ static int pin=-2; if(pin==-2){const char*e=getenv("ORK_PIN_DOM"); pin=e?atoi(e):-1;} return pin>=0 ? pin : (dom>=0 ? dom : ork_dom_default()); }
+/* ORK_PIN_DOM=<n>: force EVERY buffer/submit into domain <n> (zero switches). ORK_DOM_BASE=<n>: shift
+ * every domain up by <n> — isolates whether a failure needs domain 0 (the DMA-API-backed default). */
+int ork_dom(int dom){ static int pin=-2,bs=0; if(pin==-2){const char*e=getenv("ORK_PIN_DOM");pin=e?atoi(e):-1;const char*b=getenv("ORK_DOM_BASE");bs=b?atoi(b):0;} int d=pin>=0?pin:(dom>=0?dom:ork_dom_default()); return bs>0?d+bs:d; }
 /* ---- IOVA WEDGE GUARD -----------------------------------------------------------------------
  * The rk_iommu v2 IOVA window is 32-bit (~4 GiB) PER iommu_domain_id, and the kernel rknpu driver
  * FAULTS inside MEM_CREATE (rknpu_iommu_dma_map_sg -> rknpu_gem_object_create) when that window is

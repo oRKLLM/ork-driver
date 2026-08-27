@@ -2470,3 +2470,63 @@ running more than one domain, and it is no longer any of the software divergence
 - **Correlate the stall with a specific switch**: log every `rk_iommu_switch_domain` with a sequence
   number and match against the `NO TASK PROGRESS` timestamps — is the stalling job always the Nth
   after a switch, or unrelated to switches entirely?
+
+---
+
+## 2026-08-27 — three more hypotheses refuted (domain count, domain 0, intra-process race)
+
+### 1. "The bench uses more domains than the probe" — FALSE, it uses TWO
+
+The failing bench's own failure dump:
+
+    [iova@fail] domain 0 live=957 MiB   submit domain=1
+    [iova@fail] domain 1 live=80 MiB    weight dom=1 (x20)
+    [iova@fail] total live=1037 MiB
+
+So capping it at 2 domains is a NO-OP — it already is 2. Two further consequences:
+
+- domain 1 holds only **80 MiB**, and the whole model is **1037 MiB**, which fits in ONE 4 GiB
+  window. ggml-ork splits this 1.5B gratuitously; `ORK_PIN_DOM=0` is why pinned is clean AND fast.
+- **domain COUNT is not the discriminator**: `orkd_dom_api` uses 2 domains and PASSES, the bench
+  uses 2 domains and FAILS.
+
+### 2. "It needs domain 0 (the DMA-API-backed default) in the set" — REFUTED
+
+`ORK_DOM_BASE=<n>` added (shifts every domain up by n) because the passing probe uses domains {1,2}
+while the failing bench uses {0,1}.
+
+| `ORK_DOM_BASE` | domains | rc | stalls | errno=110 |
+|---|---|---|---|---|
+| 0 | 0,1 | 124 | 21 | 20 |
+| 1 | **1,2,3** | 124 | 20 | 20 |
+| 0 | 0,1 | 124 | 20 | 20 |
+
+Excluding domain 0 entirely changes nothing.
+
+### 3. "A domain switch races the 3 concurrent pool-thread submits" — REFUTED
+
+The kernel logs `job iommu domain id: X, dev iommu domain id: Y` on every job-wait timeout. Over a
+whole boot: **115 of 121 lines have X == Y**. The only 6 mismatches (`job 2, dev 0`) are from a
+two-process collision (see below), not the normal stalls. During single-process stalls the job's
+domain and the device's domain AGREE.
+
+Caveat: that compares the driver's bookkeeping on both sides, not the hardware page table — but
+Changes 20/21 closed the paths where those could diverge.
+
+### Board self-reset — MY error, not the code
+
+The board hard-faulted and auto-rebooted because I launched `make test` while the `ORK_DOM_BASE` A/B
+was still running its final arm: two workloads on a single-stream NPU. `mt3.sh` does NOT go through
+`npu_guard.sh`. The persistent NVMe log caught it (`job iommu domain id: 2, dev iommu domain id: 0`,
+`switch iommu domain time out ret: -110`, `domain_put UNDERFLOW from rknpu_job_abort`) — textbook
+concurrent-submit damage. **Always wrap board NPU work in `npu_guard.sh --`, including `make test`.**
+
+### Standing summary of what the stall is NOT
+
+Refuted with measurements: light switch flush depth · reclaim-and-retry · soft-reset live domain ·
+per-core reset · IOTLB flush domain · cache map/unmap domain · warmup depth · ping-pong · sacrificial
+ops (every position, count and core mask) · drain on/off · timeout 3s..60s · domain COUNT · domain 0
+involvement · intra-process switch/submit race · `task_ctrl` readback · `status` bit 0x2000.
+
+Invariant that still holds on every kernel: **pinned = 0 stalls, ~218-220 tok/s, coherent; the same
+workload across 2 domains = ~20 stalls, 20 errno=110, rc=124.**
