@@ -136,7 +136,11 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   ours" while running a patched driver. So: **record `uname -r` with any result that matters, and treat
   results from different kernels as incomparable.** The patches, rationale, the three kernels available in
   `/boot` for bisecting, and the revert procedure (`/boot/RESTORE_STOCK_KERNEL.sh`, two symlink flips) are
-  on the wiki: *Kernel-Modifications*. Kernel diffs live THERE, not here — this repo is a userspace library
+  on the wiki: *Kernel-Modifications*. **The shipped vendor driver's OWN contracts and defects (IOMMU
+  domains, dma-buf imports, reset paths, the domain refcount, the ms/us timeout bug) are catalogued on the
+  wiki page *Vendor-Kernel-Behaviour* — read it before touching anything IOMMU-, submit- or reset-related.
+  Note especially: "job committed, PC task counter 0x0, no interrupt, no error" has NEVER once been silicon
+  in this project; every instance was a page-table mismatch.** Kernel diffs live THERE, not here — this repo is a userspace library
   over the stock DRM uABI and should stay one.
 - **RUN `sudo tools/util/npu_guard.sh -- <cmd>` FOR ANYTHING THAT TOUCHES THE NPU.** More than one agent
   may share this board. The guard checks who holds the render node (`/proc/*/fd` → `renderD12[89]`), that
