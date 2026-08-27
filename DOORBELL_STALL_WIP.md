@@ -2372,3 +2372,49 @@ unexplained. Re-run the multi-domain bench on #51 before assuming anything about
 - Rocket has **no stall detection**: no task-counter monitoring, no missing-interrupt logic, just a
   500 ms `drm_sched` timeout -> `rocket_job_timedout()` -> core reset -> restart the scheduler. So
   mainline gives NO evidence that the RK3588 dispatch stall is known silicon behaviour.
+
+---
+
+## 2026-08-27 — multi-domain bench re-run on #51: the ORIGINAL stall survives
+
+1.5B Q8_0, `ork_bench ... 256 32`, stall DETECTION only (`wd_abort_ms=0`), governors pinned.
+
+| mode | rc | stalls | swtmo | errno=110 | silent drops | perf |
+|---|---|---|---|---|---|---|
+| multi | 124 | 21 | 0 | 20 | 0 | — |
+| multi | 124 | 21 | 0 | 20 | 0 | — |
+| multi | 124 | 20 | 0 | 20 | 0 | — |
+| **pinned** | **0** | **0** | **0** | **0** | **0** | **218.0 tok/s prefill**, coherent output |
+
+### What changed and what did not
+
+| | #45 | #46 | #51 |
+|---|---|---|---|
+| board wedge | **hard, reboot required** | no | no |
+| `switch iommu domain time out` | 12 | 0 | **0** |
+| silent wrong data | — | yes | **0** |
+| failure | unkillable D-state | rc=124 | rc=124 + **20 loud errno=110** |
+
+Multi-domain is now SAFE (no wedge, no dead domain, no silent corruption) but still does not WORK.
+For the 27B goal that remains the blocker.
+
+### ★ The lead has changed — stop assuming silicon
+
+The stall signature is `job committed, PC task counter 0x0, no interrupt`. **Change 20 proved that a
+PAGE-TABLE MISMATCH produces exactly that signature** (the driver believed domain N was live while
+the hardware was pointed at domain 0 -> committed, never completed, no IRQ, no error). So the
+leading hypothesis for the remaining stall should be **another live-domain / hardware-page-table
+divergence**, not silicon. Candidates:
+
+- `ork_dom_activate` switching while jobs are still queued or in flight on OTHER cores (the stall
+  hits all three cores at once, `dom=1`, `tasks=0/2`, `0/4`, `0/4` — a whole-device event)
+- the per-domain scratch swap (`dom_save[]`) racing the switch
+- any other path that reprograms or resets the MMU without going through the live domain, i.e. the
+  same class as the `rknpu_soft_reset()` bug Change 20 fixed — that one was found by reading for
+  `iommu_get_domain_for_dev()` callers, and that grep is worth repeating across the whole driver
+
+### Register lead RETIRED
+
+Earlier I flagged `status(pre/post)` `0x7000` (stalled) vs `0x5000` (healthy) — bit `0x2000` — as
+open but confounded by task count (1 vs 2). On #51 the stalls are 2- and 4-task and read **`0x5000`**,
+the healthy value. Confirmed a task-count artifact, not a health bit. Do not re-derive it.
