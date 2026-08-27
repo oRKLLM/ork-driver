@@ -2574,3 +2574,68 @@ instead of a native pack, and re-run the same matrix. If imported weights stall 
 not, that is the trigger and it is testable in minutes rather than a 400 s bench run.
 
 Secondary differences not yet isolated: 3-core colsplit concurrency, and int8/fp16 mode mixing.
+
+---
+
+## 2026-08-27 — ★★★ ROOT CAUSE FOUND: dma-buf IMPORTS are mapped into domain 0
+
+### The decisive A/B
+
+`tools/dom_scale_probe.c` gained an `imported` mode (pack -> `ork_w_dump` -> `ork_i8_mm_load_import`),
+so native vs imported is the ONLY variable — same shape, residency, cycles, domains:
+
+| weight source | result |
+|---|---|
+| native pack | **PASS**, 600 cycles bit-exact (x2) |
+| **dma-buf import** | **FAIL at cycle 0**, errno=110 on all 3 cores (x2) |
+
+It fails on the FIRST cycle, so scale was never involved — the bench only looked scale-dependent
+because every one of its weights is imported.
+
+### Mechanism
+
+`rknpu_gem_prime_import_sg_table()`:
+
+```c
+rknpu_obj->dma_addr = sg_dma_address(sgt->sgl);              /* IOVA from the attachment */
+rknpu_obj->iommu_domain_id = rknpu_dev->iommu_domain_id;     /* recorded as domain N */
+```
+
+The sg was mapped by `dma_buf_map_attachment()` -> the **DMA API** -> `iommu_get_dma_domain(dev)` ->
+**`iommu_group->default_domain` = domain 0**. Before Change 18 the vendor's `default_domain`
+overwrite made that land in the live domain. Now imports map into **domain 0** while being recorded
+as domain N, so a submit in domain N resolves an IOVA that exists only in domain 0's page table:
+committed, never completes, no interrupt.
+
+**This is the THIRD consequence of Change 18** (after Changes 20 and 21) and the one the
+`iommu_get_domain_for_dev` grep structurally could not find — the DMA API does it implicitly, inside
+`dma_buf_map_attachment`.
+
+### Confirmation (zero code, predicted in advance)
+
+| config | predicted | measured |
+|---|---|---|
+| imported + `ORK_PIN_DOM=0` (live == default) | PASS | **PASS** bit-exact |
+| imported + multi-domain | FAIL | **FAIL at cycle 0** |
+| native + pinned | PASS | **PASS** |
+
+### Fix options — a real design decision, NOT obvious
+
+1. **Scope the `default_domain` override to the import window.** Set
+   `group->default_domain = live` around the attachment map (and the destroy unmap), restore
+   immediately. Minimal, and provably restores pre-Change-18 semantics for exactly this path. The
+   objection to the vendor's version was that it was PERMANENT — every switch left the core pointing
+   at a domain we might free; a scoped set/restore under `domain_lock` has none of that exposure.
+   **Complication:** the map happens in DRM core (`drm_gem_prime_import` via
+   `DRM_IOCTL_PRIME_FD_TO_HANDLE`), *before* our `.gem_prime_import_sg_table` hook runs, so scoping
+   needs an interception point we do not currently have.
+2. **Map imports into the live domain ourselves** (`iommu_map_sg` on the attachment's sg, use that
+   IOVA). Fits the Change-18 philosophy. **Complication:** the attachment's own DMA-API mapping still
+   consumes **domain 0** IOVA, so a >4 GiB model would exhaust domain 0 — the exact cap multi-domain
+   exists to escape. Needs a way to attach without the core mapping.
+3. **Re-instate `default_domain` tracking permanently**, now that Changes 20/21 make every internal
+   consumer use the live domain explicitly. Simplest, but gives back Change 18's central goal.
+
+Recommendation: **(1) if an interception point can be found, else (2) with the domain-0 IOVA cost
+measured first.** Do NOT pick blind — Change 18 was chosen unilaterally and produced three
+downstream bugs in this same subsystem (Changes 20, 21, and this one).
