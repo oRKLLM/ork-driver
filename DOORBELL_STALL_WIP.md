@@ -1591,3 +1591,57 @@ post-switch cooldown. What still ratchets across runs has not been identified; `
 Three of them (spacing, cooldown, gate) failed their causal tests outright; REINIT works but is a
 workaround; the ownership bit fixes a real but different bug. The one durable gain is that each
 failure was measured rather than assumed.
+
+## ★★★ THE HARDWARE IS REPORTING THE FAILURE — into a MASKED bit nobody reads
+
+The CPU->NPU protocol is a doorbell plus a DMA-fetched program: write `PC_DATA_ADDR` (0x10) with the
+regcmd's IOVA, `PC_DATA_AMOUNT` (0x14), the interrupt regs, then `PC_TASK_CONTROL` (0x30) whose `0x6`
+field is the trigger. The NPU then DMA-reads the regcmd from DRAM and executes it; completion raises a
+GIC interrupt (SPI 110/111/112).
+
+Dumping the **PC block** (0x0000) for a healthy job (`cnt > 0`) against a stalled one — the comparison
+never previously made, because only the stall path dumped it:
+
+```
+                         [0x20]    [0x24]    [0x28]    [0x2c]           [0x30]
+HEALTHY core1  +0x0020: 00000300  00000000  00000000  00000008        00001002
+STALLED core0  +0x0020: 00000300  00000000  00000000  c0000000        00001002
+                        INT_MASK  INT_CLEAR INT_STATUS INT_RAW_STATUS  TASK_CONTROL
+```
+
+**`INT_RAW_STATUS`: `0x00000008` when healthy, `0xc0000000` when stalled** — bits 30 and 31 latched.
+`INT_MASK` is `0x300`, which does NOT cover them, so the condition raises **no interrupt**: the
+hardware detects something, reports it, and nothing is listening.
+
+Everything else in the block is identical and correct at the stall: `PC_DATA_ADDR` holds the regcmd
+IOVA, `PC_DATA_AMOUNT` is right, the `0x6` trigger has been consumed (`0x7002` written -> `0x1002`
+read back), `INT_STATUS` is 0 (no delivered interrupt).
+
+**`PC_OP_EN` (0x08) is 0 in BOTH** — so the "run enable was never set" hypothesis is dead. Worth noting
+because the stall dump alone looked damning and the control killed it.
+
+### Why this is the strongest result of the investigation
+
+Everything until now was negative (five mechanisms eliminated, three interventions failing causal
+tests). This is the first *positive*, hardware-level discriminator between a stalled and a healthy job,
+and it is a register the hardware sets itself.
+
+AGENTS.md records that on this part "DMA faults surface as `PC_INTERRUPT_RAW_STATUS_DMA_READ_ERROR`",
+which — if bits 30/31 are the DMA read/write error bits — would make the mechanism: doorbell fires, the
+NPU attempts the regcmd fetch, **the DMA read errors**, the error latches into a masked bit, no
+interrupt is delivered, and the job sits forever with counter 0. That is consistent with every earlier
+observation, including MMU-idle (the transaction failed rather than pending) and the absence of any
+IOMMU fault.
+
+**NOT yet established:** the meaning of bits 30/31. Mainline `drivers/accel/rocket/rocket_registers.h`
+names these registers (built from RK3588 TRM ch.36 + NVDLA) but is far newer than this 6.1 tree, and a
+web search did not surface the bit positions. Confirm before asserting "DMA read error".
+
+### Next, in order
+
+1. **Unmask them.** Set `INT_MASK` to include bits 30/31 and see whether an interrupt is delivered at
+   the stall. If it is, detection becomes interrupt-driven and immediate instead of a ~120 ms polling
+   watchdog — and it would confirm the hardware is actively trying to report the failure.
+2. Identify the bits from `rocket_registers.h` (fetch from a 6.10+ tree) or RK3588 TRM ch.36.
+3. Re-check whether the earlier stall dumps that showed `INT_RAW_STATUS = 0` were a different failure
+   mode or simply captured before the bits latched.
