@@ -37,7 +37,9 @@ void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near th
  * we don't pre-slice) OR the sliced run itself errors, REFUSE — never a blocking fall-back (#45). */
 
 static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
-    int cold = !c->mwarm[i];   /* capture BEFORE the bsync section sets mwarm=1 — fp16 uses it for the cold-buffer warmup */
+    /* (a `cold` capture used to live here for an fp16 cold-buffer warmup that was never implemented —
+     * the variable was dead and the comment claimed a behaviour that did not exist. Measured 2026-08-27:
+     * a cold warmup on this path changes nothing; the post-ACT_RESET drop is not a cold-buffer effect.) */
     if (a->active) {
         if (a->h->oSk[i] <= 1) orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf orki_bsync (unused for i>0, double for i=0) */
         orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
@@ -163,7 +165,15 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                     int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
                     if (all) break;
                 }
-                double el = ork_now_us() - pt; if (el > 3e6) break;
+                double el = ork_now_us() - pt;
+                if (el > 3e6) {   /* SENTINEL NEVER LANDED => the op did not run. Falling through here used
+                    * to drop straight into the FROM_DEVICE bsync and the host accumulate, so a dropped tile
+                    * was summed as if it had completed -- silent wrong output. Flag it the same way the fp16
+                    * per-slice poll above does (mc_error -> run-level recovery / nc=1 backstop). */
+                    c->mc_error = 1;
+                    fprintf(stderr, "[ork] ERROR: colsplit NB sentinel never landed (core=%d nout=%d, waited %.0f ms) — the op did NOT run; flagging mc_error instead of accumulating stale output\n",
+                            i, no, el/1000.0);
+                    break; }
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
       }
         orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);

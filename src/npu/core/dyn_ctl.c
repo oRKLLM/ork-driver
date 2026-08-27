@@ -200,6 +200,7 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
     return 0; }
 
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
+    int drain_fail = 0;   /* a full-surface verify timed out => partials were never written */
     /* SPIN TEARDOWN (safety): a persistent spin tail keeps re-reading the scratch/regcmd after the real outputs
      * land, so freeing below would race an in-flight re-orki_run (IOMMU fault / wedge). Null-terminate EVERY reserved
      * spin slot first: wherever the sequencer currently is, its next slot is now terminal, so it stops within
@@ -385,7 +386,17 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
                  * verify here, NOT a per-core 3-thread civac-scan (which thrashes the NPU writeback). fp16 K-split only. */
                 { volatile int32_t *o = (volatile int32_t*)h->outptr[i]; double pt = ork_now_us();
                   for (;;) { int all = 1; for (int e = 0; e < no; e++) { __asm__ volatile("dc civac,%0"::"r"(&o[e]):"memory"); if (o[e] == ORK_DYN_SENT) { all = 0; break; } }
-                      if (all) break; double el = ork_now_us() - pt; if (el > 3e6) break; if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
+                      if (all) break;
+                      double el = ork_now_us() - pt;
+                      if (el > 3e6) {   /* VERIFY TIMED OUT. This loop exists precisely to stop the accumulate
+                          * from reading a mid-drain partial (the documented ~1/40 wrong-answer), but on timeout
+                          * it used to break and sum anyway -- doing the exact thing it guards against, silently,
+                          * with SENT-seeded words folded into the result. Refuse instead. */
+                          drain_fail = 1; h->c->mc_error = 1;
+                          fprintf(stderr, "[ork] ERROR: fp16 K-split partials never drained (core=%d nout=%d, waited %.0f ms) — refusing to accumulate SENT-seeded words\n",
+                                  i, no, el/1000.0);
+                          break; }
+                      if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
                 const float *src = (const float*)h->outptr[i]; float *df = (float*)d;   /* colsplit wide-K fp16: sum Sk f32 partials, ks-ascending == mcworker, bit-exact. */
                 const size_t kstride = (size_t)Me * Nn;
                 for (int m = 0; m < Me; m++) { const float *base = src + (size_t)m * Nn; float *dr = df + (size_t)m * ds; int n = 0;
@@ -438,7 +449,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
     for (int i = 0; i < h->nascr; i++) orki_bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
-    int r = last; free(h);
+    int r = drain_fail ? -1 : last; free(h);   /* a verify timeout is an error, not a frontier */
     orki_in_doorbell = 0;
     if (orki_ork_term) {   /* a SIGTERM/SIGINT arrived mid-poll: we've drained + written back cleanly — now honor it */
         sigaction(SIGTERM, &orki_prev_sig[0], NULL); sigaction(SIGINT, &orki_prev_sig[1], NULL); raise(SIGTERM);

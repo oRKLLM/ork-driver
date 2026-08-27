@@ -193,14 +193,19 @@ ork_dyn_chain *ork_dyn_begin(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
      * re-seed and run the real pass. Cold without any warm is flaky (miscomputes — measured 1/16). */
     #define ORK_DYN_SEED() do { for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1)); \
         *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while (0)
+    int warm_landed = 0;
     if (!c->warmed) {
         ORK_DYN_SEED(); sub.timeout = orki_mm_timeout_ms();
         if (!orki_rknpu_submit_ioctl(fd, &sub, h->dom)) {                 /* warm pass */
             double tw = ork_now_us(); for (;;) { int alld = 1;
                 for (int i = 0; i < S; i++) { volatile int32_t *db = (volatile int32_t*)(h->outptr[i] + (h->N - 1));
                     __asm__ volatile("dc civac,%0"::"r"(db):"memory"); if (*db == ORK_DYN_SENT) { alld = 0; break; } }
-                if (alld || ork_now_us() - tw > 2e6) break; } }
-        c->warmed = 1;
+                if (alld) { warm_landed = 1; break; }
+                if (ork_now_us() - tw > 2e6) break; } }
+        /* Only claim the context is warm if the warm pass ACTUALLY landed. Setting it
+         * unconditionally meant a warm pass the hardware never ran still marked the context warm,
+         * so every later op skipped warming on the strength of a pass that never happened. */
+        if (warm_landed) c->warmed = 1;
     }
     if (_dbg) fprintf(stderr, "[dyn] warm phase done (warmed=%d), spin=%d reserve=%d — applying spin + real submit next\n", c->warmed, (reserve > P) ? 1 : 0, reserve);
     /* PERSISTENT SPIN TAIL (on whenever reserve>P — a reserve budget implies a persistent spin) — applied HERE, AFTER warm, so the warm pass ran the

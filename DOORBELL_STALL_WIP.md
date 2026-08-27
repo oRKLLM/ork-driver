@@ -2266,3 +2266,50 @@ identical silent-success risk.
 A `make test` failure while validating this was NOT the code: `test_speed` tripped its 6500 us
 latency limit at 12240 us because the reboot script pinned the CPU governors but not the DMC one
 (`dmc_ondemand`). Re-pinned -> ALL TESTS PASSED. Always set BOTH after a reboot.
+
+---
+
+## 2026-08-27 — AUDIT of every sentinel poll (the fall-out-on-timeout pattern)
+
+Six poll sites. The question for each: on timeout, is the failure reported, or does the code carry
+on as if the data landed?
+
+| # | site | path | on timeout | verdict |
+|---|---|---|---|---|
+| 1 | `colsplit.c` fp16 per-slice | default fp16 K-split | `wedged=1` -> `mc_error` + located `[F16-WEDGE-DETECT]` dump | **SAFE** (the model to copy) |
+| 2 | `colsplit.c` NB poll | `ORK_COLSPLIT_NB` (opt-in) | bare `break` -> bsync -> accumulate | **WAS UNSAFE** — fixed |
+| 3 | `dyn.c` warm pass | doorbell warm | bare `break`, then `c->warmed = 1` **unconditionally** | **WAS SLOPPY** — fixed |
+| 4 | `dyn.c:535` begin_mc poll-to-done | fp16 doorbell | bare `break`, returns `h` | mitigated by site 6's verify in `end()` |
+| 5 | `dyn_ctl.c:92` spin/redirect probe | probe only | returns `comp` = completion count | **SAFE** (caller sees the count) |
+| 6 | `dyn_ctl.c:388` fp16 K-split verify | **default** fp16 wide-K accumulate | bare `break`, then **sums anyway** | **WAS UNSAFE (worst)** — fixed |
+
+### Site 6 was the serious one
+
+That verify exists specifically to stop the accumulate reading a mid-drain partial — its own comment
+calls it "the ~1/40 wedge/wrong-answer". On timeout it broke out and summed regardless, folding
+SENT-seeded words into the result. It did the exact thing it was written to prevent, silently, on a
+DEFAULT path. Now: `drain_fail` -> `mc_error` -> diagnostic -> `ork_dyn_end` returns -1 instead of a
+frontier.
+
+### Site 2
+
+Fixed to match site 1: `mc_error` + a diagnostic naming core/nout/wait, instead of falling through
+into the bsync and host accumulate.
+
+### Site 3
+
+`c->warmed = 1` was set even when the warm pass never landed, so every later op skipped warming on
+the strength of a pass that never happened. Now only set when the pass actually lands.
+
+### Also removed
+
+The dead `int cold = !c->mwarm[i]` in `ork_csub_worker`, whose comment claimed "fp16 uses it for the
+cold-buffer warmup" — untrue: the variable was never read (`-Wunused-variable`) and a cold warmup on
+that path was measured to change nothing.
+
+### Validation
+
+Board `make test`: **ALL TESTS PASSED**, one sentinel miss (the known post-ACT_RESET drop, non-final
+rep, correctly tolerated), and **neither new guard fired** — no false positives. Note site 2 is
+opt-in so the suite does not exercise it; site 6 is default fp16 wide-K and stayed clean, i.e. those
+partials do drain reliably in the suite.
