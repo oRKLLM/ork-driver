@@ -2313,3 +2313,62 @@ Board `make test`: **ALL TESTS PASSED**, one sentinel miss (the known post-ACT_R
 rep, correctly tolerated), and **neither new guard fired** — no false positives. Note site 2 is
 opt-in so the suite does not exercise it; site 6 is default fp16 wide-K and stayed clean, i.e. those
 partials do drain reliably in the suite.
+
+---
+
+## 2026-08-27 — POST-RESET DROP: FIXED (it was a regression from Change 18, not silicon)
+
+### Root cause
+
+`rknpu_soft_reset()` re-establishes the MMU after the hardware reset with
+
+```c
+domain = iommu_get_domain_for_dev(rknpu_dev->dev);
+iommu_detach_device(domain, ...); iommu_attach_device(domain, ...);
+```
+
+That was only correct while the OLD code overwrote `iommu_group->default_domain` on every switch.
+Change 18 took the IOMMU core out of the switch path, so this returns the group's DEFAULT domain
+(domain 0) and **re-attached domain 0 while the driver still believed domain N was live**. The next
+job's IOVAs resolved against the wrong page table -> committed, never completed, no interrupt, no
+error, output buffer left holding its seed.
+
+**So the "post-ACT_RESET drop" was MY regression from Change 18, not a hardware stall.** Everything
+fits: single-domain (`ORK_PIN_DOM=0`) never saw it (live == domain 0); `ORK_XSPEC_NORESET=1` avoided
+it (no reset, no clobber); the window closed at the next op because that op's domain switch
+re-established the page table; and no amount of warmup reps helped because every rep resolved
+against the same wrong table.
+
+### Fix (kernel Change 20, build #51)
+
+New exported `rk_iommu_reprogram(dev)` — unconditionally re-enable the MMU from `iommu->domain`
+(which the light switch keeps pointed at the live domain). Unconditional is the point:
+`rk_iommu_switch_domain()` short-circuits when the domain is unchanged, and here the domain has NOT
+changed — the HARDWARE was wiped. `rknpu_soft_reset()` now calls it instead of the
+`iommu_get_domain_for_dev()` detach/attach pair.
+
+### Measured
+
+| | before (#50) | after (#51) |
+|---|---|---|
+| standalone `orkd_dom_api` | MISMATCH 5/5 | **PASS bit-exact 3/3** |
+| reproducer `ORK_MM_TIMEOUT=3000` | FAIL 5/5, 2 stalls + 1 swtmo each | **PASS 3/3, stalls=0, swtmo=0** |
+| `make test` | pass, 1 sentinel miss | pass, **0** sentinel misses |
+
+`ORK_XSPEC_NORESET=1` is no longer needed (its arm still passes).
+
+### What this does NOT close
+
+The ORIGINAL dispatch stall seen in the big multi-domain `ork_bench` runs (job committed, PC task
+counter 0x0, no interrupt, 60 s timeouts) is a SEPARATE phenomenon and is untouched by this. Do not
+conflate them: this one was a wrong-page-table drop with a software cause; that one is still
+unexplained. Re-run the multi-domain bench on #51 before assuming anything about it.
+
+### Mainline cross-reference (`accel/rocket`)
+
+- `rocket_core_reset()` does **no IOMMU work at all** — only reset-line assert/deassert. rknpu's
+  soft reset entangles an IOMMU detach/attach with the hardware reset, and that extra step is what
+  broke. The vendor design is the outlier here.
+- Rocket has **no stall detection**: no task-counter monitoring, no missing-interrupt logic, just a
+  500 ms `drm_sched` timeout -> `rocket_job_timedout()` -> core reset -> restart the scheduler. So
+  mainline gives NO evidence that the RK3588 dispatch stall is known silicon behaviour.
