@@ -35,6 +35,12 @@ static int one_domain(ork_npu*c,int dom,int M,int K,int N,uint32_t seed){
         if(ork_i8_mm_run(c, w, M, A, C)==0){
             ref_i8(M,K,N,A,B,R);
             rc = memcmp(C,R,(size_t)M*N*4)==0 ? 0 : -2;
+            if(rc==-2){   /* characterise the mismatch: all-zero (never written) vs garbage vs partial */
+                long ne=0, nz=0, first=-1; size_t n=(size_t)M*N;
+                for(size_t i=0;i<n;i++){ if(C[i]!=R[i]){ ne++; if(first<0) first=(long)i; } if(C[i]==0) nz++; }
+                fprintf(stderr,"    [diff] %ld/%zu elems differ, %ld zero in C; first idx %ld: got %d want %d\n",
+                        ne,n,nz,first, first>=0?C[first]:0, first>=0?R[first]:0);
+            }
         }
         ork_mm_free(c, w);
     }

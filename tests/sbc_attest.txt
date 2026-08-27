@@ -1,3 +1,3 @@
 # Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together.
 # CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file.
-CORE_SHA=675562be56b26255a0106840e654f4ff3d36be6cc7f2f7d3c2cf1a1d8e2d5609
+CORE_SHA=c2797d24463a46fe424bae48ec7425c9f3ad150d765407cb827272f789a8062d

@@ -2084,3 +2084,66 @@ must not be carried forward without re-deriving it.
 A "warm daemon" test was meaningless: it printed `orkd_probe: connect/spawn FAILED` because
 `make test` exports `ORKD_BIN=$PWD/orkd` and the standalone script did not, so no daemon ever
 spawned. Any standalone orkd test must export `ORKD_BIN`.
+
+---
+
+## 2026-08-27 (evening) — the first-touch mismatch: CAUSE CONFIRMED, not yet fixed
+
+### What it actually is
+
+NOT a domain bug. The failing op is simply the FIRST int8 op of the process, and it follows the
+cold->int8 mode-transition `ACT_RESET`:
+
+    [ork XSPEC] reset profile=1 from=-1 to=1 chain=0
+    [ork] ACT_RESET #1
+    [subtrace 4] op=run_fullk_dec dom=1 core=0x1   <- the cold 2-rep warmup
+    [subtrace 5] op=run_fullk_dec dom=1 core=0x1
+        [diff] 512/512 elems differ, 511 zero in C   <- output never written
+
+Exactly one ACT_RESET fires in the whole run. Domain 2's identical op has NO reset and is
+bit-exact. **511 zeros + exactly 1 non-zero = the seeded `ORK_DYN_SENT` sentinel surviving**, i.e.
+the op never executed — it is not a miscompute. Nothing reports an error: the submit succeeds,
+`ork_i8_mm_run()` returns 0, and the caller consumes an all-zero result.
+
+### Causally confirmed (A/B, 2x each, perfectly reproducible)
+
+| `ORK_XSPEC_NORESET` | result |
+|---|---|
+| 0 (reset fires) | **MISMATCH** |
+| 1 (reset suppressed) | **bit-exact, PASS** |
+
+That is a working WORKAROUND today. It is NOT a shipped fix: flipping the XSPEC row by default is
+a Phase-2 mode-transition change, which AGENTS.md requires be validated with the full battery
+(`make test` per keep-warm knob, `mode_probe` 56-pair sweep, `ORK_DEBUG_RESET` site diff). Not run.
+
+### Ruled out — each measured, most A/B'd. DO NOT re-derive.
+
+- **kernel light switch** (`switch_reset` 1 vs 0): identical mismatch -> patch B1/B2/B3 did NOT
+  cause this
+- **domain identity**: domain 2's identical shape is bit-exact; only the first op is affected
+- **warmup depth** (`ORK_WARM_REPS` 2/3/4): identical mismatch -> more throwaway reps do not help
+- **ping-pong** (`ORK_NO_PINGPONG` 0 vs 1): identical mismatch
+- **colsplit submit paths**: both were patched with a cold warmup and neither changed anything —
+  the op does not go through them. It is `run_fullk_dec` via `orki_submit1` (confirmed by
+  `ORK_SUBTRACE`). Those speculative edits were REVERTED.
+- **post-switch sacrificial ops**: wash n=1/n=3, ramp n=3, and `ORK_DOM_DRAIN=0` all identical
+- **submit timeout**: 3 s / 6 s / 12 s / 30 s / 60 s identical, wall time scaling with the timeout
+
+### The lead worth taking next
+
+The state IS self-healing: right after the failing op, submits 6-8 are a **3-core BLOCKING drain**
+(`flags=0x1`), and every op after them is correct. So a sacrificial op does cure it — it is needed
+after the **RESET**, not after a domain switch (which is why every switch-triggered wash/ramp
+missed). But note the per-op 2-rep warmup in `orki_submit1` fires on the same core and does NOT
+cure it, so the operative difference between "2 reps on core 0" and "a 3-core blocking drain" is
+the thing to isolate: core coverage, blocking vs the ppflags path, or buffer identity.
+
+### New diagnostics (kept — these are what cracked it)
+
+- `ORK_SUBTRACE=1` — every `orki_rknpu_submit_ioctl`: seq, op name, domain, core mask, task count,
+  caller address. This is what showed the op was `run_fullk_dec`/`orki_submit1` after three wrong
+  guesses at the code path.
+- `orkd_dom_api` now characterises a mismatch (count differing, count zero, first index, got/want)
+  instead of printing a bare "MISMATCH". "511 of 512 zero" is what turned a vague miscompute into
+  "the op never ran".
+- `ORK_WARM_REPS=<n>` — cold-buffer warmup depth (default 2 = unchanged). Kept to hold the negative.

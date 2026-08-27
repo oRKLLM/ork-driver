@@ -173,6 +173,10 @@ int orki_rc_verify(int fd, struct buf *b, size_t nbytes){
 }
 
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
+    { static int st=-1; static int seq=0; if(st<0) st = getenv("ORK_SUBTRACE") ? 1 : 0;
+      if(st) fprintf(stderr,"[subtrace %d] op=%s dom=%d core=0x%x tn=%u caller=%p\n",
+                     ++seq, orki_last_op?orki_last_op:"?", domain, sub->core_mask,
+                     sub->task_number, __builtin_return_address(0)); }
     orki_submit_n++; orki_submit_prog += sub ? (unsigned long)sub->task_number : 0;
     /* OFFLINE GUARD. ork_npu_init_offline hands out a context with fd = -1 for CPU-side work (pack building
      * and scoring on a machine with no NPU). The paths that support it intercept BEFORE here and never
@@ -324,6 +328,9 @@ int orki_testcore = -1;
 int orki_tc(void){ if(orki_testcore<0){ const char*e=getenv("ORK_NPU_TESTCORE"); int t=e?atoi(e):0; if(t<0||t>2)t=0; orki_testcore=t; } return orki_testcore; }
 void ork_npu_set_test_core(int core){ if(core>=0&&core<=2) orki_testcore=core; }
 
+/* Cold-buffer warmup depth. ORK_WARM_REPS overrides for A/B. See orki_submit1(). */
+int orki_warm_reps(void){ static int r=-1; if(r<0){const char*e=getenv("ORK_WARM_REPS"); r=e?atoi(e):2; if(r<1)r=1;} return r; }
+
 int orki_submit1(ork_npu *c){
     int fd=c->fd;
     struct rknpu_submit sub;memset(&sub,0,sizeof sub);sub.flags=ork_ppflags();sub.task_number=1;sub.task_obj_addr=c->task.obj;sub.fence_fd=-1;
@@ -331,7 +338,7 @@ int orki_submit1(ork_npu *c){
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     /* first submit on a fresh output buffer returns stale (NPU primed against wedging by the
      * RKNPU_ACT_RESET); run one throwaway warmup with a short timeout, then the real submit. */
-    int reps=c->warmed?1:2;
+    int reps=c->warmed?1:orki_warm_reps();
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT");return -1;} continue; }
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE); }
@@ -344,7 +351,7 @@ int orki_submit1_db(ork_npu *c, size_t nout){
     sub.core_mask=1u<<orki_tc();
     sub.subcore_task[0]=sub.subcore_task[1]=sub.subcore_task[2]=(struct rknpu_subcore_task){0,1};
     volatile int32_t *o=(volatile int32_t*)c->Cc.cpu; size_t li=nout-1;
-    int reps=c->warmed?1:2;
+    int reps=c->warmed?1:orki_warm_reps();
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
