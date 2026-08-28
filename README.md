@@ -6,7 +6,12 @@
 programs and submitting them to the in-tree `rknpu` DRM kernel driver via ioctls on
 `/dev/dri/cardN`. It does **not** use Rockchip's proprietary `librknnrt`, and it is **not** a
 kernel module — it is a small userspace library that talks to the kernel driver that already
-ships with your board. The regcmd ISA was reverse-engineered from scratch; the result is an
+ships with your board. **One caveat if you use more than one IOMMU domain** (models
+larger than the ~4 GiB per-domain IOVA window): the stock `rknpu` driver has reference-counting and
+domain-switch defects that wedge the NPU under that workload. Fixes are proposed upstream as
+[rockchip-linux/kernel#390](https://github.com/rockchip-linux/kernel/pull/390); until they land you
+need a patched kernel from [`oRKLLM/rk3588-kernel`](https://github.com/oRKLLM/rk3588-kernel).
+Single-domain use (the common case) is unaffected and needs no kernel changes. The regcmd ISA was reverse-engineered from scratch; the result is an
 open, dependency-free fp16 + int8/w8a8 matmul primitive fast enough to run a real LLM.
 
 > Status: **RK3588 validated on hardware** (Radxa ROCK 5B). On Qwen3-1.7B w8a8 it does **decode

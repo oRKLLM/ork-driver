@@ -141,7 +141,12 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   wiki page *Vendor-Kernel-Behaviour* — read it before touching anything IOMMU-, submit- or reset-related.
   Note especially: "job committed, PC task counter 0x0, no interrupt, no error" has NEVER once been silicon
   in this project; every instance was a page-table mismatch.** Kernel diffs live THERE, not here — this repo is a userspace library
-  over the stock DRM uABI and should stay one.
+  over the stock DRM uABI and should stay one. **The kernel work itself lives in
+  [`oRKLLM/rk3588-kernel`](https://github.com/oRKLLM/rk3588-kernel)** (a fork of the VENDOR tree
+  `rockchip-linux/kernel`, not the armbian copy): branch `rknpu-iommu-rework` is proposed upstream as
+  **[PR #390](https://github.com/rockchip-linux/kernel/pull/390)**, which closes
+  [issue #387](https://github.com/rockchip-linux/kernel/issues/387). PR #388 (the five refcount fixes
+  alone) was CLOSED — measured insufficient for multi-domain; see the Experiment Log 2026-08-28.
 - **RUN `sudo tools/util/npu_guard.sh -- <cmd>` FOR ANYTHING THAT TOUCHES THE NPU.** More than one agent
   may share this board. The guard checks who holds the render node (`/proc/*/fd` → `renderD12[89]`), that
   NPU utilisation is idle, and that no fault storm is in progress; with `--` it holds an flock for the
