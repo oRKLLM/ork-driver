@@ -160,6 +160,15 @@ size_t       ork_i8_w_dump_bf_cpu(ork_npu *ctx, int K, int N, const int8_t *B, v
  * own tiler so the layouts cannot drift; byte-identity is asserted by test_i4_dump_cpu. out=NULL -> size.
  * K%32, N%64. */
 size_t       ork_i4_w_dump_cpu(ork_npu *ctx, int K, int N, const int8_t *B, void *out, size_t cap);
+/* fp16 read-back: the counterpart of ork_f16_mm_pack + ork_w_dump, so an fp16 weight can be persisted
+ * in a .orkpack and restored. Same blob format and round-trip as the int8/int4 pairs. A loaded fp16
+ * weight carries no per-channel bscale (fp16 never has one) and rebuilds its CONTIG copy lazily on the
+ * first colsplit, exactly as a freshly packed one does. NULL on shape/size mismatch.
+ * ork_f16_mm_load_import backs each tile with a dma-buf the NPU reads in place; NULL if import is
+ * unavailable, in which case the caller falls back to ork_f16_mm_load. */
+ork_w       *ork_f16_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+ork_w       *ork_f16_mm_load_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
+
 ork_w       *ork_i8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* COMPACT int4 PERSIST (the streaming consumer for a mixed .orkpack): dump the COMPACT int4 nibble store
  * + per-channel scales (~half of the int8 ork_w_dump), and reload it straight into NPU DMA, inflating the

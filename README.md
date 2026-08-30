@@ -329,8 +329,9 @@ are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol d
 W8A8 *or* W4A4 symmetric — int4 activations are int4, and the SDP LUT op consumes int8/int16, so there is
 no int4 activation path to implement. int16 is the *activation* precision (the accuracy tier between int8
 and fp16 for SDP ops), not a weight-storage tier, which is why it has no pack/load/import/quantise row and
-only 22 functions to int8's 184. fp16 weights are not persisted to `.orkpack` — the pack format is
-int8/int4 — so fp16 has no persist or zero-copy-import row. MoE expert coalescing is int4-only because the
+only 22 functions to int8's 184. fp16 weights can now be persisted and restored
+(`ork_f16_mm_load` / `ork_f16_mm_load_import`); the daemon-routed import (`ork_i8_mm_import`) remains
+int8-only, as it does for int4. MoE expert coalescing is int4-only because the
 auto-profile packs experts as NF4.
 
 The genuinely open gaps, and whether they are worth closing, are tracked on the wiki
