@@ -137,6 +137,18 @@ driver fix, not a dead end.
 | `ork_npu_requant_perchan_i32` (7026) | standalone SDP int32→int16 per-channel requant | **PARTIAL — loopback not viable** | (2026-07-15) "SDP clamps to 2-byte read → errno 110"; over-fetch fix rc=0 "BUT processes as TWO int16 lanes, not true int32" | int16-range accumulators usable (even-channel low half); full int32 needs lane recombine (open) |
 | `ork_f16_npu_replay_reshape` / `rope_neox_f16` (6856/6424) | reshape/permute, NEOX RoPE fp16 | WIP | `reshape_probe_f16`, `rope_probe` | RE-stage |
 
+## sequence scans (linear attention / SSM, `src/npu/ssm.c`)
+
+The chunked form of a linear-attention recurrence: the intra-chunk part becomes a batch of small
+matmuls the NPU runs as a pooled 3-core fp16 stream, while the inter-chunk carry stays sequential on
+the CPU. Whether that trade wins is a **scale** question, and the two scans answer it differently —
+which is the reason both rows exist. Do not generalize one to the other.
+
+| name | purpose | status | probe → verdict | gotchas | use / notes |
+|---|---|---|---|---|---|
+| `ork_ssm_scan_f32` (`ssm.c` 182) | Mamba-2 / SSD chunked scan; matches `ggml_compute_forward_ssm_scan_f32` | **PROVEN** | `test_ssd_chunk_npu` (in `make test`) → byte-coherent vs the CPU reference; model-level ~**2× at Q8_0 2.7B** (9.72 vs 4.37 P128, 18.0 vs 8.89 P512) | **Crossover is real and the small-model verdict inverts.** An earlier "no crossover" reading came from 130M + Q5_K, where CPU-dequant projections diluted the scan out of the measurement. CPU recurrence craters ~33× with scale (cache-bound); NPU degrades ~11× (submit floor amortized over a growing count of tiny matmuls). | Enabled fork-side by a SIZE GATE, not here: `ggml-ork.cpp:9844` keeps `nh<64` (≈<1.5B) on the CPU. Knobs `ORK_SSM_CHAIN` (default 1 — fused-multicore fp16 stream), `ORK_SSM_CS` (default 128), `ORK_SSM_KEEPWARM`. |
+| `ork_gdn_scan_f32` (branch `feat/gdn`) | Gated DeltaNet scan (Qwen3.5 / Qwen3-Next / Ornith) | **WIP — coherent, not a win** | **no probe in this tree** (the chunk validator and its per-stage profiler live on `feat/gdn`, so this row cannot be re-verified from `main` — check it out first) → coherent end-to-end in a real Qwen3.5 model, but **loses ~1.9× @0.8B, ~4.8× @9B** (gap WIDENS with scale) | **The SSD result does not transfer.** GDN's chunked form adds a CPU UT-solve (**38%** of scan time) that the CPU recurrence simply skips, plus 44% NPU submit; and GDN state fits cache, so the CPU side never craters — **no crossover exists to cross**. | NOT on `main`. Parked on `feat/gdn` (+ `GDN_ON_NPU_WIP.md`). Marshaller machinery it produced — weightless-op offload, densify, state-transpose/GQA — was reusable and did land. |
+
 ## ggml FFN handlers (env-selectable, `ggml-ork.cpp`)
 
 | flag | purpose | status | probe / evidence | notes |
