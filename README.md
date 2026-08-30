@@ -299,8 +299,8 @@ are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol d
 | output stage (requant) | ✅ | ✅ | — | ✅ |
 | fused-act output stage | ✅ | — | — | — |
 | pack weights | ✅ | ✅ | ✅ | — |
-| load / .orkpack persist | ✅ | — | ✅ | — |
-| zero-copy import / adopt | ✅ | — | ✅ | — |
+| load / .orkpack persist | ✅ | ✅ | ✅ | — |
+| zero-copy import / adopt | ✅ | ✅ | ✅ | — |
 | quantise from f32 | ✅ | — | ✅ | — |
 | run — single core | ✅ | ✅ | ✅ | — |
 | run — multicore | ✅ | ✅† | ✅ | — |
@@ -323,7 +323,6 @@ are asserted in `tools/precision_overrides.tsv`, and each must cite the symbol d
 † **f16 / run — multicore** — i8/colsplit.c is the ONLY fp16 multicore path (#45) (`ork_dyn_begin_colsplit`)
 † **f16 / run — NONBLOCK doorbell** — same colsplit path — fp16 wide-K rides the doorbell (`ork_dyn_begin_colsplit`)
 † **i16 / run — HW chain** — the i16 chain rides the general PC-chain core in i8/probe.c rather than a dedicated i16 one (`ork_npu_chain_progs`)
-
 
 **Most blanks are by design, not a TODO.** int4 has no SDP/activation row because the RK3588 datapath is
 W8A8 *or* W4A4 symmetric — int4 activations are int4, and the SDP LUT op consumes int8/int16, so there is
