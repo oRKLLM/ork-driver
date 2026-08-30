@@ -236,6 +236,12 @@ size_t       ork_i8_w_dump_cpu_st(ork_npu *ctx, int K, int N, const int8_t *B, v
  * (N*K/2). Allocates a K*N int8 scratch internally, so call it per tensor. */
 size_t       ork_i4_cpu_blob_from_tiled(ork_npu *ctx, int K, int N, const void *blob, size_t n, unsigned char *out, size_t cap);
 size_t       ork_i4a8_pack_cpu_blob(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap);  /* nf4: 1=NF4 codebook, 0=uniform (caller routes by source: full-precision->NF4) */
+/* As ork_i4a8_pack_cpu_blob, byte-identical in the blob it emits, but also reports the relative
+ * quantisation error of the pack: qerr = sqrt( SUM imp*(w-q)^2 / SUM imp*w^2 ), imp = imatrix[k] when
+ * supplied and 1 otherwise. Relative, so it is comparable across weights of different shapes, and
+ * defined exactly as the GPTQ path defines it so the two rank compatibly. This is the producer for
+ * orkpack_entry.qerr, which a re-tiering policy consumes. qerr_out may be NULL. */
+size_t       ork_i4a8_pack_cpu_blob_qerr(ork_npu *ctx, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap, float *qerr_out);
 /* GPTQ int4 weight quant (ork_gptq.c; in-tree, NO external deps). Error-compensated column-sequential rounding
  * with the calibration Hessian H=X^T X -> uniform symmetric int4 [-8,7] + per-(row,group) scale (native-W4A4
  * form: dequant w=code*scale; composes with Hadamard = QuaRot). W:[N(out)*K(in)] fp32; H:[K*K] (DESTROYED);

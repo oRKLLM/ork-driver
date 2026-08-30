@@ -72,6 +72,42 @@ static int one_i4a8(ork_npu *off, int K, int N, const char *tag){
     return bad ? 1 : 0;
 }
 
+/* ork_i4a8_pack_cpu_blob_qerr must (a) emit a byte-identical blob to the plain packer -- a metric that
+ * perturbs the pack is worse than no metric -- and (b) report a relative error that behaves. Checked
+ * for both codebooks, with and without an imatrix. CPU only. */
+static int one_qerr(ork_npu *off, int K, int N, int nf4, const char *tag){
+    size_t nb=(size_t)K*N; float *f=malloc(nb*sizeof *f), *im=malloc((size_t)K*sizeof *im);
+    int bad=0; void *a=NULL,*b=NULL,*e=NULL;
+    if(!f||!im){ printf("  [%-12s] alloc FAIL\n",tag); bad=1; goto out; }
+    { uint32_t s0=0x9e3779b9u ^ (uint32_t)(K*31+N);
+      for(size_t i=0;i<nb;i++){ s0=s0*1103515245u+12345u; f[i]=(float)((int)((s0>>16)&0x7ff)-1024)/1024.0f; }
+      for(int k=0;k<K;k++){ s0=s0*1103515245u+12345u; im[k]=(float)((s0>>16)&0x3ff)/1024.0f + 0.01f; } }
+
+    size_t need=ork_i4a8_pack_cpu_blob(off,K,N,f,NULL,nf4,NULL,0);
+    a=malloc(need); b=malloc(need); e=malloc(need);
+    if(!a||!b||!e||!need){ printf("  [%-12s] size FAIL\n",tag); bad=1; goto out; }
+
+    float q=-1.0f, q2=-1.0f, qim=-1.0f;
+    if(!ork_i4a8_pack_cpu_blob     (off,K,N,f,NULL,nf4,a,need)      ||
+       !ork_i4a8_pack_cpu_blob_qerr(off,K,N,f,NULL,nf4,b,need,&q)){ printf("  [%-12s] pack FAIL\n",tag); bad=1; goto out; }
+    if(memcmp(a,b,need)){ printf("  [%-12s] BLOB DIFFERS with qerr requested\n",tag); bad=1; goto out; }
+    if(!(q>0.0f && q<1.0f)){ printf("  [%-12s] qerr out of range: %g\n",tag,(double)q); bad=1; goto out; }
+
+    /* deterministic, and NULL qerr_out must still be accepted */
+    if(!ork_i4a8_pack_cpu_blob_qerr(off,K,N,f,NULL,nf4,e,need,&q2) || q2!=q){
+        printf("  [%-12s] qerr not deterministic (%g vs %g)\n",tag,(double)q,(double)q2); bad=1; goto out; }
+    if(!ork_i4a8_pack_cpu_blob_qerr(off,K,N,f,NULL,nf4,e,need,NULL)){ printf("  [%-12s] NULL qerr_out FAIL\n",tag); bad=1; goto out; }
+
+    /* an imatrix reweights the sum, so the reported error should move */
+    if(!ork_i4a8_pack_cpu_blob_qerr(off,K,N,f,im,nf4,e,need,&qim)){ printf("  [%-12s] imatrix pack FAIL\n",tag); bad=1; goto out; }
+    if(!(qim>0.0f && qim<1.0f)){ printf("  [%-12s] imatrix qerr out of range: %g\n",tag,(double)qim); bad=1; goto out; }
+
+    printf("  [%-12s] blob identical, qerr=%.5f  imatrix-weighted qerr=%.5f\n",tag,(double)q,(double)qim);
+out:
+    free(f); free(im); free(a); free(b); free(e);
+    return bad;
+}
+
 int main(void){
     ork_npu *off = ork_npu_init_offline("rk3588");
     if(!off){ printf("test_offline_load: ork_npu_init_offline FAILED\n"); return 1; }
@@ -85,6 +121,9 @@ int main(void){
     bad |= one_i4a8(off, 4096,  512, "K-slice");
     bad |= one_i4a8(off, 1024, 8192, "wide-N");
     bad |= one_i4a8(off, 1536,  256, "non-pow2");
+    bad |= one_qerr (off, 1024,  256, 0, "qerr uniform");
+    bad |= one_qerr (off, 1024,  256, 1, "qerr NF4");
+    bad |= one_qerr (off, 1536,  128, 0, "qerr non-pow2");
     ork_npu_free(off);
     printf("test_offline_load: %s\n", bad ? "FAIL" : "PASS");
     return bad ? 1 : 0;

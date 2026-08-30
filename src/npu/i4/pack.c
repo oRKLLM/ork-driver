@@ -769,6 +769,27 @@ void orki_i4_tile_B(uint8_t*dst,const int8_t*B,int K,int N,int nib){
  * imatrix clip-grid, SR with a per-call seed) so the bytes match. Single-threaded (caller parallelizes over
  * experts). out=NULL → required size. K%32,N%32. */
 size_t ork_i4a8_pack_cpu_blob(ork_npu *c, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap){
+    return ork_i4a8_pack_cpu_blob_qerr(c, K, N, f32, imatrix, nf4, out, cap, NULL);
+}
+
+/* As ork_i4a8_pack_cpu_blob and byte-identical in the blob it emits, but also reports the relative
+ * quantisation error the pack induces:
+ *
+ *     qerr = sqrt( SUM_n SUM_k imp[k]*(w - q)^2  /  SUM_n SUM_k imp[k]*w^2 )
+ *
+ * with imp[k] the caller's imatrix importance, or 1 when imatrix is NULL. Defined exactly as the GPTQ
+ * path defines it, so a qerr produced here ranks compatibly with one from ggml_backend_ork_gptq_finalize:
+ * diag(H) and the imatrix diagonal are the same quantity up to a scale factor, and the metric is
+ * relative, so the scale cancels. That comparability is the point -- it is what lets a uniform first
+ * pass be re-tiered from its own qerr.
+ *
+ * Relative rather than absolute so it is comparable across weights of different shapes and magnitudes.
+ * Costs one extra pass over data already in cache: this is the only place holding w, the importance
+ * vector and the codes at the same time, which is why the metric belongs here rather than in a caller
+ * that would have to dequantise the emitted blob to reconstruct it.
+ *
+ * qerr_out may be NULL, in which case this is exactly the original function. */
+size_t ork_i4a8_pack_cpu_blob_qerr(ork_npu *c, int K, int N, const float *f32, const float *imatrix, int nf4, void *out, size_t cap, float *qerr_out){
     (void)c;
     if(K%32 || N%32 || !f32) return 0;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nibsz=(size_t)K*N/2, need=hdr+sc+nibsz;
@@ -784,6 +805,10 @@ size_t ork_i4a8_pack_cpu_blob(ork_npu *c, int K, int N, const float *f32, const 
     uint8_t *qidx=nf4?malloc((size_t)K):NULL;
     float   *imdq=imatrix?malloc((size_t)K*sizeof(float)):NULL;
     if(!qf32 || (nf4&&!qidx) || (imatrix&&!imdq)){ free(qf32); free(qidx); free(imdq); return 0; }
+    /* qerr accumulators, and the NF4 dequant table (same construction as ork_i4a8_mm_pack_im) */
+    double qnum=0.0, qden=0.0;
+    int8_t nf4_lut[16];
+    if(qerr_out && nf4) for(int i=0;i<16;i++) nf4_lut[i]=(int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
     for(int n=0;n<N;n++){
         const float *fr=f32+(size_t)n*K; float mx=1e-9f; int k=0;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -796,7 +821,19 @@ size_t ork_i4a8_pack_cpu_blob(ork_npu *c, int K, int N, const float *f32, const 
         uint8_t *nib=Bi4+(size_t)n*(K/2);
         if(nf4){ bscale[n]=mx/127.0f; orki_nf4_quant_chan(fr,K,mx,sr,&seed,nib,qidx); }
         else   { float scale=mx/7.0f; bscale[n]=scale; orki_i4_quant_chan(fr,K,scale,sr,&seed,nib,qf32); }
+        if(qerr_out){
+            /* Both paths leave the integer CODE for element k in qf32[k] (NF4 after inflating its
+             * index through the codebook), and the dequantised value is code*bscale[n] in both. */
+            if(nf4) orki_nf4_inflate_chan_f32(qidx,K,nf4_lut,qf32);
+            const float bs=bscale[n];
+            for(int kk=0;kk<K;kk++){
+                double w=fr[kk], q=(double)qf32[kk]*bs, d=w-q;
+                double imp=imatrix?imatrix[kk]:1.0;
+                qnum+=imp*d*d; qden+=imp*w*w;
+            }
+        }
     }
+    if(qerr_out) *qerr_out = qden>0.0 ? (float)sqrt(qnum/qden) : 0.0f;
     memcpy(p,&h,hdr);   /* header last: bscale/Bi4 already in place */
     free(qf32); free(qidx); free(imdq);
     return need;
