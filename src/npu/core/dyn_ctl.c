@@ -333,7 +333,14 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
                         h->mc_dom, (si>=0&&si<h->S)?h->oSk[si]:-1, ork_now_us()-t0, miss_to, orki_submit_n, orki_submit_prog, first, last2, runs,
                         runs == 1 ? "ONE-RUN(stalled write)" : (runs > 1 && rl1 && gap1 > rl1) ? "STRIDED(tile-geometry?)" : "SCATTERED");
             }
-            if (h->mc_dt == DT_I4) h->c->dom_dirty = 1;   /* #54: an int4 doorbell DROP happened -> a stuck job may linger in this domain even after recover (the reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it (ork_dom_flush_if_dirty) BEFORE switching away -> the switch to the next domain won't time out. */
+            /* #54: a doorbell DROP happened -> a stuck job may linger in this domain even after recover (the
+             * reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it
+             * (ork_dom_flush_if_dirty) BEFORE switching away -> the switch to the next domain won't time out.
+             * ALL dtypes, not just int4: the drop is a property of the doorbell, not of the precision, and an
+             * int8/fp16 drop wedges the next switch exactly the same way. Record the dropped job's OWN submit
+             * timeout, because that is what timeout_clean ages against -- int4 submits bounded, int8/fp16 do not. */
+            { int _tmo = (h->mc_dt == DT_I4) ? orki_i4_submit_tmo_ms() : (int)orki_mm_timeout_ms();
+              h->c->dom_dirty = 1; if (_tmo > h->c->dom_dirty_ms) h->c->dom_dirty_ms = _tmo; }
             orki_mc_recover_resubmit(h);
             continue;
         }

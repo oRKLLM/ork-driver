@@ -104,11 +104,21 @@ void ork_dom_flush_if_dirty(ork_npu *c){
      * reapable + any last in-flight op has time to retire; then (2) per-core reap dummy triggers timeout_clean.
      * Second reap pass catches a reap-dummy that itself dropped (its own short timeout has elapsed by then).
      * Only on a dirty (real-drop) boundary — rare — so the ~1.7s is paid only when a switch would otherwise wedge. */
-    { int ms = orki_i4_submit_tmo_ms() + 200; struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
+    /* WAIT past the DROPPED job's OWN submit timeout -- not a fixed int4-shaped one. timeout_clean reaps a job
+     * only once it has aged past the timeout it was submitted with, and the doorbell dtypes differ by 40x
+     * (int4 ~1.5s bounded, int8/fp16 orki_mm_timeout_ms = 60s default). A fixed 1.7s after an int8 drop finds
+     * nothing reapable and clears the flag, so the switch wedges anyway with the bug now invisible.
+     * ORK_DOM_REAP_MAX_MS caps the wait for an operator who would rather risk the switch than stall (the 60s
+     * is paid only on a real drop immediately before a domain switch, where the alternative is a wedge). */
+    { int ms = c->dom_dirty_ms > 0 ? c->dom_dirty_ms : orki_i4_submit_tmo_ms();
+      const char *mx = getenv("ORK_DOM_REAP_MAX_MS"); if(mx){ int m=atoi(mx); if(m>0 && ms>m) ms=m; }
+      ms += 200;
+      if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[dom] dirty-REAP wait %dms (dropped job's submit timeout)\n", ms);
+      struct timespec ts = {ms/1000, (long)(ms%1000)*1000000L}; nanosleep(&ts,NULL); }
     ork_npu_reap_stuck(c, c->soc->cores);
     { struct timespec ts = {0, 400*1000000L}; nanosleep(&ts,NULL); }   /* let a dropped reap-dummy pass its 300ms timeout */
     ork_npu_reap_stuck(c, c->soc->cores);
-    c->dom_dirty=0;
+    c->dom_dirty=0; c->dom_dirty_ms=0;
 }
 
 

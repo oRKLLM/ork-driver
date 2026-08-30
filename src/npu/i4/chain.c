@@ -753,7 +753,8 @@ int ork_dyn_grouped_end(ork_dyn_chain *h) {
             if (el > 1000.0) { long bo=orki_i4_backoff_ns(); if(bo){ struct timespec ts = {0, bo}; nanosleep(&ts, NULL); } } }
         if (landed || orki_ork_term) break;
         if (recov < recov_max) { if (getenv("ORK_MC_DIAG")) fprintf(stderr, "[MC-RECOVER grp] int4 grouped round never landed (attempt %d) — reset+resubmit\n", recov);
-            h->c->dom_dirty = 1;   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty) */
+            { h->c->dom_dirty = 1; int _tmo = orki_i4_submit_tmo_ms();   /* #54: int4 drop -> reap-at-boundary (see ork_dom_flush_if_dirty); record its bounded submit timeout as the reap wait */
+              if (_tmo > h->c->dom_dirty_ms) h->c->dom_dirty_ms = _tmo; }
             orki_mc_recover_resubmit(h); continue; }
         break;
     }
