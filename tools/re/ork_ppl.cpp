@@ -191,7 +191,10 @@ int main(int argc, char** argv){
      * graph and issues no submits -- so it needs no warmup decode. (A warmup was the earlier approach and
      * is kept behind ORK_PPL_WARM for comparison; a 1-token warmup is useless here anyway, since M==1 is
      * declined to the CPU and materialises nothing.) */
-    if (ggml_backend_ork_preload && !getenv("ORK_PPL_NOPRELOAD")) {
+    if (ggml_backend_ork_preload) {   /* ORK_PPL_NOPRELOAD is gone: it existed to dodge a preload that
+                                       * built the wrong weight geometry (issue #4, fixed), and skipping preload
+                                       * moves weight loading INSIDE the timed region -- the exact thing this
+                                       * harness exists to keep out of it. */
         const int64_t tp = llama_time_us();
         const int n = ggml_backend_ork_preload();
         fprintf(stderr, "[ork_ppl] preload: %d weights in %.1f s (excluded from the scored time below)\n",
