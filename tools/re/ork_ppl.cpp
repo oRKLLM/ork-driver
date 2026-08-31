@@ -235,25 +235,59 @@ int main(int argc, char** argv){
          * independent, so fan them out; the reduction keeps the sum deterministic ENOUGH for A/B (each
          * position's own log-sum-exp is computed identically, only the outer accumulation reorders, and
          * that is fp-associativity noise many orders below the differences under test). */
-        double wnll = 0.0; int wscored = 0; int bad = -1;
-        #pragma omp parallel for schedule(static) reduction(+:wnll,wscored)
+        double wnll = 0.0; int wscored = 0; int bad = -1; int flat = 0;
+        #pragma omp parallel for schedule(static) reduction(+:wnll,wscored,flat)
         for (int i = 0; i < W - 1; ++i){
             const float* lg = llama_get_logits_ith(ctx, i);
-            if (!lg){ bad = i; continue; }
+            /* `bad` is written from many threads, so it needs the critical section -- it is the ONLY
+             * detector for an unhonoured batch.logits[i], and a torn/lost write would silently turn a
+             * hard failure into a scored run. Keep the lowest index for a stable message. */
+            if (!lg){
+                #pragma omp critical
+                { if (bad < 0 || i < bad) bad = i; }
+                continue;
+            }
             /* log_softmax in double: subtract the max before exp so a 250k vocab cannot overflow, and
-             * the tail still contributes (a float accumulator loses it). */
-            double mx = lg[0];
-            for (int v = 1; v < n_vocab; ++v) if (lg[v] > mx) mx = lg[v];
+             * the tail still contributes (a float accumulator loses it). Track the min too: it costs
+             * nothing inside a loop already touching every logit, and a CONSTANT row is the one
+             * failure this harness cannot otherwise see (see the max-entropy check below). */
+            double mx = lg[0], mn = lg[0];
+            for (int v = 1; v < n_vocab; ++v){ if (lg[v] > mx) mx = lg[v]; else if (lg[v] < mn) mn = lg[v]; }
+            if (mx - mn < 1e-6) ++flat;
             double sum = 0.0;
             for (int v = 0; v < n_vocab; ++v) sum += exp((double)lg[v] - mx);
             wnll += (mx + log(sum)) - (double)lg[chunk[i+1]];   // -log p(next)
             ++wscored;
         }
         if (bad >= 0){ fprintf(stderr,"[ork_ppl] no logits at %d — batch.logits[i] not honoured?\n", bad); return 3; }
+        /* A CONSTANT logit row scores exactly -log(1/n_vocab) whatever the token, so a window of them
+         * yields PPL == n_vocab: a plausible-looking float that is not a measurement at all. That is
+         * arithmetic, not a heuristic -- softmax of a constant vector IS the uniform distribution -- so
+         * report it as the read failure it is rather than letting it into an A/B table (issue #4). */
+        if (flat > 0){
+            fprintf(stderr,"[ork_ppl] FLAT LOGITS: %d of %d scored rows in window %d are constant "
+                           "(max-min < 1e-6). Those rows score ln(n_vocab) = %.6f by construction; the "
+                           "logits buffer was not written. NOT a perplexity result.\n",
+                    flat, wscored, w+1, log((double)n_vocab));
+            llama_batch_free(b); llama_free(ctx); llama_model_free(model); llama_backend_free();
+            return 4;
+        }
         nll += wnll; scored += wscored;
         if (nwin > 1) fprintf(stderr,"[ork_ppl] window %d/%d  running PPL = %.4f\n", w+1, nwin, exp(nll/scored));
     }
     double secs = (llama_time_us()-t0)/1e6;
+
+    /* Backstop for the same failure arriving by any other route (a partially-constant buffer, a
+     * misindexed read landing on zeroed memory): mean NLL == ln(n_vocab) is the score of a model
+     * carrying no information, which no real quantisation produces. */
+    if (fabs(nll/scored - log((double)n_vocab)) < 1e-3){
+        fprintf(stderr,"[ork_ppl] MAX-ENTROPY RESULT: mean NLL %.6f == ln(n_vocab) %.6f, i.e. PPL == "
+                       "n_vocab exactly. This is what a uniform/unwritten logits buffer scores, not a "
+                       "measurement. Refusing to report it (issue #4).\n",
+                nll/scored, log((double)n_vocab));
+        llama_batch_free(b); llama_free(ctx); llama_model_free(model); llama_backend_free();
+        return 4;
+    }
 
     printf("[ork_ppl] PPL = %.4f   (mean NLL %.6f over %ld scored tokens, %d x %d-token windows, ubatch=%d, %.1f s)\n",
            exp(nll/scored), nll/scored, scored, nwin, W, UB, secs);
