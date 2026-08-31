@@ -534,3 +534,13 @@ int orki_cpu_chain_i8(int S, const ork_mm_task_i8 *t){
         orki_cpu_gemm_i32(t[i].M,w->K,w->N,t[i].A,w->cpu_codes,t[i].C); }
     return 0;
 }
+
+/* Resident GEOMETRY of a packed weight. The wcache in ggml-ork is keyed by the source tensor's data
+ * pointer, and a FUSED group weight is stored under its first member's pointer -- so one key can be asked
+ * for two different shapes (per-tensor at decode, concatenated at prefill). Without a way to ask what a
+ * cached weight actually IS, a consumer silently used the wrong one and the matmul emitted nothing
+ * (ork-driver#4). This is that question, and it is dtype-agnostic on purpose: every tier has the collision. */
+void ork_w_dims(const ork_w *w, int *K, int *N){
+    if(K) *K = w ? w->K : 0;
+    if(N) *N = w ? w->N : 0;
+}

@@ -139,6 +139,10 @@ void         ork_w_free(ork_w *w);
  */
 void         ork_mm_free(ork_npu *ctx, ork_w *w);
 size_t       ork_w_bytes(const ork_w *w);   /* resident NPU bytes (Bb+Bf) — for a streaming cache's IOVA budget */
+/* Geometry of a packed weight (K,N). A weight cache keyed by source pointer can be asked for the wrong
+ * SHAPE — a per-tensor weight where a fused/concatenated one is meant, or vice versa — and the mismatch is
+ * silent at the matmul. Ask before you use a cached weight; see ork-driver#4. NULL w yields 0,0. */
+void         ork_w_dims(const ork_w *w, int *K, int *N);
 int          ork_w_quant_kind(const ork_w *w);   /* ORK_QK_* of the int4 weight store (UNIFORM / CODEBOOK_NF4) */
 /* Per-output-channel dequant scale (length N) retained on an int4-packed weight (ork_i4a8_mm_pack /
  * ork_i4a8_mm_load); C_real[m][n] = aScale[m]*bscale[n]*Ci[m][n]. NULL for non-int4 weights. */
