@@ -87,3 +87,23 @@ it once so nobody has to.
 
 Packs above `ORK_ORKPACK_MAX_REGEN_MB` (default 2048) now refuse to regenerate; `ORK_ORKPACK_CLOBBER=1`
 overrides when discarding is genuinely intended.
+
+## `vm_kbuild.sh` — build the board kernel
+
+Builds the RK3588 kernel on the `.239` Colima VM (~7 min vs ~45 on the SBC), installs the Image to the
+board, and shuts the VM down (`--keep` leaves it up for the next build; `--stop` stops it).
+
+**Know what you are building.** By default it builds the **board's own working tree**
+(`~/kbuild/linux-rockchip`), which makes the board authoritative for kernel work — but also means any edit
+anyone left there is included in the next kernel *anybody* builds, and is attributed to whatever change
+they thought they were testing. `uname -v` is a number, not a manifest ([#5](https://github.com/oRKLLM/ork-driver/issues/5)).
+
+```sh
+tools/util/vm_kbuild.sh --keep                        # live board tree (default)
+tools/util/vm_kbuild.sh --from-branch board-snapshot-59   # a reviewable git ref instead
+```
+
+Either way the run prints its provenance and the `#patchNN` inventory before building. `--from-branch`
+reads sources from a checkout of the kernel fork (`$ORK_KERNEL_REPO`, default `~/Dev/rk3588-kernel`),
+including that branch's `board/*.config` when it carries one. Snapshots of what the board actually ran
+live on `board-snapshot-<N>` branches there.
