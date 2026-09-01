@@ -395,7 +395,7 @@ Truthy = `1`/`true`/`yes`/`on` unless a value is noted. Unset = off / default.
 | `ORK_DOMAINS=<n>` | **DEPRECATED** — the domain count is auto-sized from the resident orkpack footprint. Honored **only as a clamp-UP** (force *more* domains than auto, never fewer): a value below the auto count under-provisions IOVA (last-domain overflow → Bf PRIME-fail → warmup wedge) and is ignored with a warning, while a larger value is a valid escape hatch when the auto footprint under-counts. Use `ORK_DOMAIN_LAYERS` for manual layer→domain control. |
 | `ORK_DOMAIN_LAYERS` | manual layers-per-domain (advanced; the auto-sizer byte-balances by default) |
 | `ORK_WCACHE_BUDGET_MB`, `ORK_STREAM_RAM_BUDGET_MB` | resident-weight / RAM streaming LRU budgets |
-| `ORK_EVICT_SRC`, `ORK_NO_IMPORT`, `ORK_IMPORT_CHUNK_MB`, `ORK_NO_CONSOLIDATE_IMPORT` | zero-copy import controls |
+| `ORK_NO_IMPORT`, `ORK_IMPORT_CHUNK_MB`, `ORK_NO_CONSOLIDATE_IMPORT` | zero-copy import controls |
 
 ### MoE (ggml-ork)
 | var | effect |
