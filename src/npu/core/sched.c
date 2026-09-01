@@ -259,12 +259,77 @@ void orki_npu_pool_ensure(ork_npu *c){
     for(int i=1;i<c->pool_n;i++){ c->pwa[i]=(struct ork_pw){c,i}; pthread_create(&c->pth[i],NULL,orki_npu_pool_worker,&c->pwa[i]); }
 }
 
+/* Read one unsigned from a sysfs file; -1 if unavailable. */
+static long orki_sysfs_ul(const char *fmt, int cpu){
+    char path[160]; snprintf(path, sizeof path, fmt, cpu);
+    FILE *f = fopen(path, "r"); if(!f) return -1;
+    long v = -1; if(fscanf(f, "%ld", &v) != 1) v = -1;
+    fclose(f); return v;
+}
+
+/* THE BIG CLUSTER IS A GAP, NOT A MAXIMUM.
+ *
+ * Pinning the NPU driver threads to the big cores is worth a lot (AGENTS: "the difference between losing
+ * to and beating librkllmrt"), so getting the set wrong is expensive and silent. Two ways to get it wrong,
+ * both of which this function used to:
+ *
+ * 1. "top half of the cpu count". sysconf(_SC_NPROCESSORS_ONLN) is a COUNT of online CPUs, but CPU_SET
+ *    takes ABSOLUTE ids. Take cpu0-1 offline and the count is 6, so it pinned ids 3,4,5 -- and id 3 is an
+ *    A55. Same under any cpuset/container restriction. It also assumes the big cluster is numbered last,
+ *    which is a convention, not a guarantee.
+ *
+ * 2. "the CPUs whose capacity/max-freq equals the maximum". Tempting, and wrong on real silicon: binning
+ *    makes nominally identical cores differ slightly. MEASURED on this RK3588 (ork-driver#6) --
+ *    cpu4-5 cap 1003 @ 2304 MHz, cpu6-7 cap 1024 @ 2352 MHz, from IDENTICAL device-tree OPP tables whose
+ *    top entries are gated by per-bin opp-supported-hw masks and selected by a live PVTM measurement.
+ *    An == max test therefore keeps only cpu6,7 -- half the big cluster -- which cost 1.42x
+ *    (176.3 vs 251.6 tok/s on a 512-token prefill).
+ *
+ * So: enumerate the ONLINE cpus by absolute id, rank them by capability, and split at the LARGEST
+ * RELATIVE GAP. Within-cluster binning spread (1003 -> 1024 = 1.02x) cannot be mistaken for a cluster
+ * boundary (405 -> 1003 = 2.48x). Falls back to every online CPU if the topology is unreadable or has no
+ * meaningful gap (a uniform SMP part) -- pinning to everything is the same as not pinning, which is the
+ * right answer there.
+ */
 int ork_big_core_set(cpu_set_t *s){
 #if defined(__linux__)
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
     if(off) return 0;
-    long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<2) return 0;
-    CPU_ZERO(s); for(int k=(int)(ncpu/2);k<ncpu;k++) CPU_SET(k,s);  /* top half = big cluster on RK35xx */
+
+    long conf = sysconf(_SC_NPROCESSORS_CONF); if(conf < 2 || conf > CPU_SETSIZE) return 0;
+    int  id[CPU_SETSIZE]; long cap[CPU_SETSIZE]; int n = 0;
+    cpu_set_t online; CPU_ZERO(&online);
+    if(sched_getaffinity(0, sizeof online, &online) != 0) return 0;
+
+    for(int c = 0; c < (int)conf; c++){
+        if(!CPU_ISSET(c, &online)) continue;            /* absolute id, and only what we may run on */
+        long v = orki_sysfs_ul("/sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        if(v <= 0) v = orki_sysfs_ul("/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+        if(v <= 0) return 0;                            /* unreadable topology: do not guess */
+        id[n] = c; cap[n] = v; n++;
+    }
+    if(n < 2) return 0;
+
+    for(int i = 1; i < n; i++){                         /* insertion sort by capability, ascending */
+        int di = id[i]; long dc = cap[i]; int j = i - 1;
+        while(j >= 0 && cap[j] > dc){ cap[j+1] = cap[j]; id[j+1] = id[j]; j--; }
+        cap[j+1] = dc; id[j+1] = di;
+    }
+
+    int cut = 0; double best = 1.0;                     /* split at the largest RELATIVE step */
+    for(int i = 1; i < n; i++){
+        double r = (double)cap[i] / (double)cap[i-1];
+        if(r > best){ best = r; cut = i; }
+    }
+    if(best < 1.20) cut = 0;                            /* uniform part: no cluster boundary to find */
+
+    CPU_ZERO(s);
+    for(int i = cut; i < n; i++) CPU_SET(id[i], s);
+    if(getenv("ORK_TRACE")){
+        fprintf(stderr, "[ork-trace] big cores:");
+        for(int i = cut; i < n; i++) fprintf(stderr, " cpu%d(%ld)", id[i], cap[i]);
+        fprintf(stderr, "  (gap %.2fx at index %d of %d online)\n", best, cut, n);
+    }
     return 1;
 #else
     (void)s; return 0;
