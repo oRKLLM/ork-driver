@@ -108,18 +108,34 @@ int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
      * batch slice 0 correct, every later slice stale — probe: scratchpad bmm_probe, Hkv=16/rk2=1 gave
      * NRMSE 1.37 from head 1 on multi-core, PASS with ORK_NPU_MC=1). Refresh the copies in place: K,N
      * are unchanged so the sizes match, and keeping them valid avoids any bcreate/bdestroy churn. */
-    if(w->Bbc_valid && w->Bbc.cpu){ size_t off=0;
+    /* A REFRESH THAT CANNOT COMPLETE MUST NOT HALF-COMPLETE. The bounds check below guards an invariant the
+     * comment above asserts (K,N unchanged => the derived copy is exactly the right size), so tripping it
+     * means that invariant is broken. Breaking out of the loop and syncing anyway would leave the later
+     * K-slices holding the PREVIOUS weight and the *_valid latch still set — reintroducing, in narrower
+     * form, the exact silent-stale defect this block exists to fix. Instead: free the copy and clear the
+     * latch. colsplit rebuilds it from Bb (which IS fresh) on the next multi-core run, so this self-heals;
+     * the free is required because that rebuild assigns over w->Bbc / w->Bbc_ns[ns] and would otherwise
+     * leak the old buffer's IOVA. */
+    if(w->Bbc_valid && w->Bbc.cpu){ size_t off=0; int ok=1;
         for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*N*2;
-            if(off+sz>w->Bbc.size || !w->Bb[ks].cpu) break;
+            if(off+sz>w->Bbc.size || !w->Bb[ks].cpu){ ok=0; break; }
             memcpy((char*)w->Bbc.cpu+off, w->Bb[ks].cpu, sz); off+=sz;}
-        orki_bsync(c->fd,&w->Bbc,RKNPU_MEM_SYNC_TO_DEVICE);}
+        if(ok) orki_bsync(c->fd,&w->Bbc,RKNPU_MEM_SYNC_TO_DEVICE);
+        else { fprintf(stderr,"[ork] fp16 CONTIG refresh does not fit (K=%d N=%d Sk=%d, buf=%zu) — dropping the "
+                              "derived copy so colsplit rebuilds it\n", K, N, Sk, w->Bbc.size);
+               orki_bdestroy(c->fd,&w->Bbc); w->Bbc_valid=0; } }
     if(w->Bbc_ns_valid && w->Bbc_ns){
         for(int ns=0;ns<Sn;ns++){ if(!w->Bbc_ns[ns].cpu) continue;
-            int c0=ns*NMAX, sw=(N-c0<NMAX)?(N-c0):NMAX; size_t off=0;
+            int c0=ns*NMAX, sw=(N-c0<NMAX)?(N-c0):NMAX; size_t off=0; int ok=1;
             for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS; size_t sz=(size_t)Kp*sw*2;
-                if(off+sz>w->Bbc_ns[ns].size || !w->Bb[(size_t)ns*Sk+ks].cpu) break;
+                if(off+sz>w->Bbc_ns[ns].size || !w->Bb[(size_t)ns*Sk+ks].cpu){ ok=0; break; }
                 memcpy((char*)w->Bbc_ns[ns].cpu+off, w->Bb[(size_t)ns*Sk+ks].cpu, sz); off+=sz;}
-            orki_bsync(c->fd,&w->Bbc_ns[ns],RKNPU_MEM_SYNC_TO_DEVICE);}}
+            if(ok) orki_bsync(c->fd,&w->Bbc_ns[ns],RKNPU_MEM_SYNC_TO_DEVICE);
+            else { fprintf(stderr,"[ork] fp16 per-slice CONTIG refresh does not fit (slice %d, K=%d sw=%d, buf=%zu) — "
+                                  "dropping the derived copies\n", ns, K, sw, w->Bbc_ns[ns].size);
+                   /* one bad slice invalidates the set: the latch is per-weight, not per-slice */
+                   for(int q=0;q<Sn;q++) orki_bdestroy(c->fd,&w->Bbc_ns[q]);
+                   w->Bbc_ns_valid=0; break; } } }
     return 0;
 }
 
