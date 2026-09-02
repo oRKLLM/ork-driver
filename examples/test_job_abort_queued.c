@@ -1,38 +1,32 @@
-/* test_job_abort_queued.c — REGRESSION TEST for oRKLLM/ork-driver#3: a job aborted while still
- * QUEUED must be unlinked from the kernel's per-core todo_list before it is freed.
+/* test_job_abort_queued.c — DIAGNOSTIC, not a regression test. Read this before trusting it.
  *
- * THE BUG (kernel, drivers/rknpu/rknpu_job.c). rknpu_job_abort() cleared subcore_data->job -- which
- * only retires the job that is RUNNING -- and then freed the job via rknpu_job_cleanup(). A job
- * aborted while still QUEUED stayed linked in subcore_data->todo_list, so the NEXT submit's
- * rknpu_job_next() did list_first_entry() + list_del_init() through freed slab: a WRITE to a wild
- * address (WnR=1), oopsing in rknpu_job_next <- rknpu_job_schedule <- rknpu_submit_ioctl.
- * Fixed by rknpu-job-list-uaf ("rknpu: unlink an aborted job from the core todo_lists before
- * freeing it"), which adds list_del_init(&job->head[i]) to the abort loop + INIT_LIST_HEAD at alloc.
+ * WHAT IT WAS FOR. oRKLLM/rk3588-kernel#1: rknpu_job_abort() freed a job still linked on
+ * subcore_data->todo_list, so the next rknpu_job_next() did list_first_entry() + list_del_init() through
+ * freed slab — a write to a wild address, oopsing via rknpu_job_schedule/rknpu_submit_ioctl. Fixed by
+ * adding list_del_init(&job->head[i]) to the abort loop plus INIT_LIST_HEAD at alloc.
  *
- * HOW THIS REPRODUCES IT WITHOUT THE DOMAIN SWITCH. In the field the aborts came from a concurrent
- * IOMMU domain switch (get_and_switch -> reap_all_cores -> timeout_clean). But the switch is only
- * what PROVOKED the aborts; the defect is in abort itself. A very short submit timeout provokes the
- * same aborts directly, with no domain juggling and no concurrent submits -- which matters, because
- * concurrent submits on the single NPU queue are themselves unsafe and would confound the test.
+ * WHAT IT ACTUALLY DOES: two processes. A child re-execs itself with a tiny ORK_MM_TIMEOUT so its submits
+ * time out, then the parent packs and runs a matmul and asserts bit-exactness against a CPU reference. The
+ * todo_list is per-DEVICE and outlives the child, so a job freed while linked would be walked by the
+ * parent's submit.
  *
- * SHAPE. Two phases, and they must be two PROCESSES:
- *   child  - ORK_MM_TIMEOUT tiny -> submits time out -> rknpu_job_abort() runs with jobs still
- *            queued behind the running one on the same core. (The timeout is cached in a static on
- *            first use, so it cannot be changed mid-process -- hence a separate process.)
- *            It is fork + EXEC, never a bare fork: ork_npu_init() spawns a worker pool, so a bare
- *            fork in a later cycle hands the child a mutex locked by a thread that does not exist
- *            in it, and the child deadlocks in futex_wait. exec resets the address space.
- *   parent - normal timeout -> packs and runs a matmul, asserting bit-exactness vs a CPU reference.
- *            The todo_list is per-DEVICE and outlives the child, so if the child freed a linked job
- *            this submit is the one that walks it.
- * Sequential, never concurrent: the child exits before the parent submits.
+ * WHY IT IS NOT A REGRESSION TEST: it does not reach the abort path. MEASURED — dmesg records ZERO
+ * "job abort" lines across a full run, at 5ms and at 1ms timeouts and with a K=4096 shape that cannot
+ * finish in time. The reason is structural: ork submits with RKNPU_JOB_NONBLOCK (submit.c, dyn.c), so the
+ * kernel never calls rknpu_job_wait() and rknpu_job_abort() is only reached from a BLOCKING submit's
+ * timeout or a failed rknpu_job_schedule(). Neither is reachable from the normal API. The field crash came
+ * from llama-completion with two concurrent threads, and concurrent submits on the single NPU queue are
+ * themselves the documented wedge-and-power-cycle hazard, so synthesising it here is not safe.
  *
- * FAILURE MODE IS LOUD. With the fix absent this can oops the kernel rather than fail cleanly, and
- * a panic here does not reboot (SMP: failed to stop secondary CPUs) -- it needs a power cycle. That
- * is inherent to regression-testing a kernel use-after-free from userspace: the honest signal is a
- * dead board. Kept bounded (few cycles, tiny shapes) so the exposure is as small as it can be.
+ * So it PASSES without testing anything, which is why it is in DIAGNOSTICS and not EXAMPLES: `make test`
+ * must not report a guarantee it does not provide. Genuinely closing that gap needs either a kernel-side
+ * debugfs hook to force an abort with a job queued, or an accepted way to drive concurrent submits.
  *
- * 0 = pass, nonzero = fail.
+ * Kept because the two-process shape is the reusable part, and because the negative result is worth
+ * recording: a future attempt should start by checking dmesg for "job abort" before believing a pass.
+ *
+ * fork+EXEC, never a bare fork: ork_npu_init() spawns a worker pool, so a bare fork in a later cycle hands
+ * the child a mutex locked by a thread that does not exist in it and it deadlocks in futex_wait (observed).
  */
 #include "ork_npu.h"
 #include <stdio.h>

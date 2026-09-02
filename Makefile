@@ -44,10 +44,36 @@ COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # o
 # only that header, so it must not invalidate the attest).
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
-EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8
+# EXAMPLES ARE THE TEST SUITE: each self-validates against a CPU reference and exits 0/nonzero, and
+# `make test` runs every one. Something that only PRINTS for a human to read is not a test -- it cannot
+# fail, so running it proves nothing -- and it belongs in DIAGNOSTICS below.
+EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_slice_rescue test_i4_gemm test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8
+
+# DIAGNOSTICS: built by `make all` (so they cannot rot, and CI compiles them) but NOT run by `make test`,
+# because they assert nothing. test_baseline/test_registers/test_layouts print NPU output beside a CPU
+# reference for a human to eyeball and then `return 0` whatever the numbers say; test_registers contains no
+# comparison at all. They were in EXAMPLES, which made them look like tests the suite was running -- it was
+# not, and adding them would have been worse: guaranteed passes. bench, test_nf4_decode and
+# test_moe_dispatch are here for the same reason: all three are measurement tools (us/expert, achieved
+# GB/s, whether the dispatch tax amortizes) that `return 0` unconditionally. llama2 stays in EXAMPLES
+# because it IS run -- gated on $(MODEL) and skipped with a message when the model is absent.
+#
+# test_f16colsplit is here for a DIFFERENT reason, and it is the interesting one. Unlike the others it is a
+# real test: it checks three shapes bit-exact against a CPU reference and returns its fail flag. But it
+# cannot be run in the suite yet -- QUARANTINED, with evidence:
+#   standalone (sudo npu_guard -- ./test_f16colsplit): PASS in ~15s, all three shapes maxerr=0.00e+00
+#   inside `make test`:                                HARD-WEDGED the board, twice (no ping/SSH, needed a
+#                                                      plug power-cycle both times; ~140s in on the retry)
+# So the fault is an INTERACTION with what runs before it, not the test -- which fits this board's history
+# of mode-transition wedges (see the mode_probe note in AGENTS.md: matmul <-> int8-SDP hard-wedged until
+# the c->task save/restore fix). Registering it would trade a missing test for a suite that power-cycles
+# the board, which is strictly worse: the suite is how everything else gets validated.
+# To fix properly: bisect which preceding test leaves the mode that kills it (mode_probe is the tool), fix
+# that transition, then move this line back into EXAMPLES. Do NOT just re-register it and hope.
+DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued test_f16colsplit
 TESTS :=
 
-all: check-registry check-install $(EXAMPLES) $(TESTS)
+all: check-registry check-install $(EXAMPLES) $(TESTS) $(DIAGNOSTICS)
 
 # Build-time gate: OPS_REGISTRY.md must not cite nonexistent probes/ops, and every
 # PROVEN/PARTIAL/DEAD status must be backed by a probe (or an explicit no-probe note).
@@ -56,7 +82,7 @@ all: check-registry check-install $(EXAMPLES) $(TESTS)
 check-registry:
 	@sh tools/check_registry.sh
 
-$(EXAMPLES): %: examples/%.c $(COBJ)
+$(EXAMPLES) $(DIAGNOSTICS): %: examples/%.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 $(TESTS): %: %.c $(COBJ)
@@ -542,7 +568,7 @@ SUDO ?= sudo -E
 #
 # The orkd daemon gate runs LAST (the daemon owns the NPU) and is grouped rather than folded into the
 # loop, because orkd_seq_probe needs ORK_USE_ORKD=1 and the loop has one shared environment.
-test: $(EXAMPLES) $(TESTS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
+test: $(EXAMPLES) $(TESTS) $(DIAGNOSTICS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
 	@fail=0; ORKD_BIN=$$PWD/orkd; export ORKD_BIN; \
 	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_i4_dump_cpu" "test_cpu_gemm" "test_offline_load" "test_f16_load" "test_grouped_i8" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
