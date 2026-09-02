@@ -47,7 +47,7 @@ ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3
 EXAMPLES := test_matmul quant i4 layer decode model llama2 bench perplexity_i4 test_baseline test_registers test_layouts test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_f16colsplit test_slice_rescue test_i4_gemm test_nf4_decode test_moe_dispatch test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8
 TESTS :=
 
-all: check-registry $(EXAMPLES) $(TESTS)
+all: check-registry check-install $(EXAMPLES) $(TESTS)
 
 # Build-time gate: OPS_REGISTRY.md must not cite nonexistent probes/ops, and every
 # PROVEN/PARTIAL/DEAD status must be backed by a probe (or an explicit no-probe note).
@@ -484,10 +484,39 @@ hadamard_i4_npu: tools/hadamard_i4_npu.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
 # install the public header + both libs (override PREFIX=/path as needed)
-install: libork_npu.a libork_npu.so
-	install -d $(DESTDIR)$(PREFIX)/lib $(DESTDIR)$(PREFIX)/include
+# The umbrella ork_npu.h is a 49-line header that #includes TEN parts under include/ork/, so installing it
+# alone produced a tree that cannot compile a single consumer ("fatal error: 'ork/context.h' file not
+# found"). ork_spine.h (documented public in README), ork_slice.h and ork_native_cpu.h were missing too.
+# Never noticed because nothing here consumes the INSTALLED tree: the fork vendors this repo as a submodule
+# and every example builds with -Iinclude from the source. `make check-install` below is the gate.
+# Headers are their own target so check-install can exercise THIS list -- the thing that actually drifts --
+# without needing the libs, which only build on the board.
+.PHONY: install-headers
+install-headers:
+	install -d $(DESTDIR)$(PREFIX)/include/ork
+	install -m644 include/ork_npu.h include/ork_spine.h include/ork_slice.h include/ork_native_cpu.h $(DESTDIR)$(PREFIX)/include/
+	install -m644 include/ork/*.h $(DESTDIR)$(PREFIX)/include/ork/
+
+install: libork_npu.a libork_npu.so install-headers
+	install -d $(DESTDIR)$(PREFIX)/lib
 	install -m644 libork_npu.a libork_npu.so $(DESTDIR)$(PREFIX)/lib/
-	install -m644 include/ork_npu.h $(DESTDIR)$(PREFIX)/include/
+
+# Stage an install into a temp DESTDIR and COMPILE against it. The install list is a hand-maintained
+# duplicate of what the umbrella pulls in, so it drifts the moment a header is added under include/ork/ --
+# and the failure is invisible to everyone working from the source tree. Needs no NPU and no libs beyond
+# what `all` already built; runs in about a second.
+.PHONY: check-install
+check-install:
+	@d=$$(mktemp -d) || exit 1; \
+	 $(MAKE) -s install-headers DESTDIR=$$d PREFIX=/usr >/dev/null 2>&1 || { echo "check-install: FAIL -- install-headers errored"; rm -rf $$d; exit 1; }; \
+	 printf '#define _GNU_SOURCE\n#include <ork_npu.h>\n#ifdef __linux__\n#include <ork_spine.h>\n#endif\nint main(void){ return (int) sizeof(ork_npu *); }\n' > $$d/c.c; \
+	 if $(CC) -I$$d/usr/include -fsyntax-only $$d/c.c 2>$$d/err; then \
+	   echo "check-install: OK -- the installed header tree compiles"; rm -rf $$d; \
+	 else \
+	   echo "check-install: FAIL -- the INSTALLED headers do not compile:"; sed -n '1,6p' $$d/err; \
+	   echo "  => a header is reachable from include/ork_npu.h but missing from the install target above."; \
+	   rm -rf $$d; exit 1; \
+	 fi
 
 # --- tests: the examples ARE the tests (each self-validates vs a CPU reference and exits
 # 0/nonzero). Run them on the board; a wall timeout catches an NPU hang. The llama2 test
@@ -620,7 +649,7 @@ clean:
 	rm -rf docs/api
 	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so $(COBJ)
 
-.PHONY: all lib install test clean check-attest check-registry
+.PHONY: all lib install install-headers test clean check-attest check-registry check-install
 
 attn_cost: tools/attn_cost.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
