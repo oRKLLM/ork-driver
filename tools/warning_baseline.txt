@@ -1,1 +1,21 @@
-152
+# Per-signature warning ratchet, enforced by .github/workflows/build.yml.
+# One line per gcc warning flag: "<count> [-Wflag]", plus "[untagged]" for warnings gcc emits with no flag.
+#
+# PER-SIGNATURE on purpose. A scalar total lets a drop in one warning pay for a rise in another, and turns
+# re-baselining after a compiler change into a silent-absorption channel. Compared per flag, neither works.
+#
+# CI-RELATIVE. The count comes from where the gate runs: the board (gcc 14.2.0 Debian) and the runner
+# disagree on -Wmisleading-indentation for the identical tree, because it is a heuristic that differs
+# between gcc builds. The OS image is pinned but the compiler is not, so an upgrade can move these --
+# the failing run prints the exact replacement block. Re-baseline deliberately; never delete the gate.
+100 [-Wmisleading-indentation]
+13 [-Wunknown-pragmas]
+8 [-Wenum-compare]
+7 [-Wunused-variable]
+7 [-Wunused-function]
+5 [-Wunused-result]
+4 [-Wmaybe-uninitialized]
+2 [untagged]
+1 [-Wunused-but-set-variable]
+1 [-Wstrict-aliasing]
+1 [-Wcomment]

@@ -27,28 +27,49 @@ jobs:
           make check-install
 
       - name: compile
+        # shell: bash is LOAD-BEARING, not style. Without it GitHub runs `run:` as `bash -e {0}` -- -e but
+        # NOT pipefail -- so `make | tee` reports tee's status and a build that FAILS TO COMPILE exits 0.
+        # `shell: bash` is documented to use `bash --noprofile --norc -eo pipefail`. Verified: under
+        # `bash -e`, `false | tee` gives rc=0; under `bash -eo pipefail` it gives rc=1.
+        #
+        # The first version of this workflow omitted it, which neutered BOTH gates with one pipe: the
+        # compile step could not fail, and the ratchet then counted warnings from a TRUNCATED log -- fewer
+        # warnings, so it passed too. Exactly the silently-discarded-status class this repo has been
+        # fixing elsewhere.
+        shell: bash
         run: make -j$(nproc) 2>&1 | tee /tmp/build.log
 
       - name: warning ratchet
-        # The tree carries a warning backlog (mostly -Wmisleading-indentation from its deliberately dense
-        # one-line style). Failing on all of them would demand a large, low-signal cleanup, so this ratchets
-        # instead — the same approach tools/size_budget.txt already takes for file size: the count may fall,
-        # never rise. That blocks NEW warnings without holding the build hostage to old ones.
+        shell: bash
+        # PER-SIGNATURE, not a scalar total. A single number lets a drop in one warning fund an increase in
+        # another ("fixed 10 indentation, added 10 unused-variable" nets zero), and it makes re-baselining
+        # after a compiler change a silent-absorption channel: if the count drifts down to 140 and someone
+        # then adds 12 warnings, a 152 baseline still waves it through. Comparing per flag closes both.
         #
-        # The baseline is CI-RELATIVE, and deliberately so. The board (gcc 14.2.0 Debian) reports 147 for
-        # the same tree where this runner reports 152 — the same -Wmisleading-indentation heuristic differs
-        # between builds of gcc. So "clean on the board" does not mean "clean here", and the number that
-        # matters is the one measured where the gate runs. A runner image upgrade can therefore move it:
-        # re-baseline (and say so in the commit), do not disable the gate.
+        # The compiler is NOT pinned (ubuntu-24.04-arm pins the OS image, not gcc), so an image upgrade can
+        # legitimately move these. When that happens the failure output contains the exact file to commit --
+        # re-baseline deliberately, and the diff shows which signatures moved rather than hiding it in a
+        # total.
         run: |
-          n=$(grep -c "warning:" /tmp/build.log || true)
-          base=$(grep -oE '^[0-9]+' tools/warning_baseline.txt | head -1)
-          echo "warnings: $n (baseline $base)"
-          if [ "$n" -gt "$base" ]; then
-            echo "::error::$n warnings > baseline $base — a new warning was introduced"
-            grep "warning:" /tmp/build.log | tail -20
+          grep -oE '\[-W[a-z-]+\]' /tmp/build.log | sort | uniq -c | awk '{print $1, $2}' > /tmp/sig.txt
+          u=$(grep -c 'warning:' /tmp/build.log || true)
+          t=$(grep -cE 'warning:.*\[-W' /tmp/build.log || true)
+          echo "$((u - t)) [untagged]" >> /tmp/sig.txt
+          sort -k2 /tmp/sig.txt > /tmp/now.txt
+          sort -k2 tools/warning_baseline.txt | grep -vE '^\s*#|^\s*$' > /tmp/base.txt || true
+          echo "--- current ---"; cat /tmp/now.txt
+          fail=0
+          while read -r n sig; do
+            b=$(awk -v s="$sig" '$2==s {print $1}' /tmp/base.txt); b=${b:-0}
+            if [ "$n" -gt "$b" ]; then echo "::error::$sig went $b -> $n"; fail=1; fi
+          done < /tmp/now.txt
+          while read -r n sig; do
+            c=$(awk -v s="$sig" '$2==s {print $1}' /tmp/now.txt); c=${c:-0}
+            [ "$c" -lt "$n" ] && echo "::notice::$sig improved $n -> $c (commit the block below to hold it)"
+          done < /tmp/base.txt
+          if [ "$fail" = 1 ]; then
+            echo "commit this as tools/warning_baseline.txt only if the increase is intended:"; cat /tmp/now.txt
+            grep -E 'warning:' /tmp/build.log | tail -20
             exit 1
           fi
-          if [ "$n" -lt "$base" ]; then
-            echo "::notice::down to $n — lower tools/warning_baseline.txt to $n to hold the gain"
-          fi
+          echo "warning ratchet OK (per-signature)"
