@@ -124,4 +124,11 @@ int          ork_mm_collect(ork_npu *ctx, int ticket, void *C);
 int          ork_i4_mm_run_grouped(ork_npu *ctx, ork_w *w, int M, const int8_t *A,
                                    const float *aScale, const float *bScale, float *C);
 
+/* CPU int8 matmul: C[M,N] int32 = A[M,K] int8 x B[K,N] int8, B row-major raw codes. NEON widening MAC
+ * (vmlal_n_s16), OpenMP over M, and BIT-EXACT with the NPU's int32 accumulate -- which is what makes it
+ * usable as a reference and as the honest CPU side of a routing decision. Exposed because deciding
+ * CPU-vs-NPU requires timing BOTH, and a caller measuring the CPU with its own hand-rolled loop would
+ * flatter the NPU. No NPU/ctx needed. */
+void         ork_i8_mm_run_cpu(int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
+
 #endif /* ORK_RUN_H */

@@ -544,3 +544,9 @@ void ork_w_dims(const ork_w *w, int *K, int *N){
     if(K) *K = w ? w->K : 0;
     if(N) *N = w ? w->N : 0;
 }
+
+/* Public entry point for the internal CPU int8 GEMM (see include/ork/run.h). A forward rather than a
+ * rename so the ~4 internal call sites stay put and the two cannot drift. */
+void ork_i8_mm_run_cpu(int M,int K,int N,const int8_t *A,const int8_t *B,int32_t *C){
+    orki_cpu_gemm_i32(M,K,N,A,B,C);
+}
