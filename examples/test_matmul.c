@@ -640,6 +640,17 @@ int main(void){
     fail|=check_i8(c8, 256, 3584, 256, 0x454860dd91b46165ULL);   /* int8 1-core K=3584 M=256 (mg_max*64=64)   */
     fail|=check_i8(c8, 256, 256,  32, 0xf23ebd149849d390ULL);    /* int8 1-core K=256 (K%512!=0 -> run_loop) M=256>32768/Kp — guards the sched=0 M-tile cap (rows past the tile were garbage pre-fix) */
     ork_npu_free(c8);
+
+    /* No ioctl may fail UNEXPECTEDLY over a clean run. MEM_SYNC/MEM_DESTROY/ACTION returns used to be
+     * discarded everywhere, and on this vendor driver those failures do not surface at the call site --
+     * they surface later as silent wrong numbers (a stale buffer) or as a wedge (leaked IOVA). Asserting
+     * here turns that class into a test failure instead of a mystery two hours later. Expected failures
+     * (recovery paths poking a device already believed stuck) are counted separately and NOT asserted on,
+     * so a healthy run cannot go red -- a gate that cries wolf gets switched off. */
+    const long iofail = ork_io_failures(), ioexp = ork_io_expected_failures();
+    if (iofail) { fprintf(stderr, "[test_matmul] %ld UNEXPECTED ioctl failure(s) — see the [ork-io] lines above\n", iofail); fail = 1; }
+    else if (ioexp) printf("test_matmul: %ld expected (recovery-path) ioctl failure(s), 0 unexpected\n", ioexp);
+
     printf("%s\n",fail?"FAIL":"ALL OK");
     return fail?1:0;
 }

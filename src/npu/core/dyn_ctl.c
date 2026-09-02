@@ -496,7 +496,7 @@ double orki_f16_slice_us;   /* running max of a SUCCESSFULLY-landed fp16 K-slice
 void orki_mc_recover_resubmit(ork_dyn_chain *h){
     ork_npu *c = h->c; int fd = c->fd;
     if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[mc-recover] doorbell MISS -> ACT_RESET + resubmit | dom=%d S=%d nc=%d esz=%d\n", h->mc_dom, h->S, h->mc_nc, h->esz);
-    struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+    struct rknpu_action a; memset(&a, 0, sizeof a); a.flags = RKNPU_ACT_RESET; orki_io_ok(fd, DRM_IOCTL_RKNPU_ACTION, &a, "ACT_RESET(doorbell recover)", 1);
     { struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL); }   /* let the reset fully settle before resubmit — a resubmit into a not-yet-quiesced NPU re-drops (sticky miss) */
     /* #54 MULTI-DOMAIN: the ACT_RESET above DROPS the NPU's IOMMU domain state. Resubmitting into a non-0
      * mc_dom then triggers a domain switch that TIMES OUT ("switch iommu domain time out, id: N") and poisons

@@ -153,6 +153,11 @@ extern int orki_live_fd;
 extern int orki_live_n, orki_live_cap;
 extern int orki_reap_n;
 extern long orki_bcreate_n, orki_bimport_n, orki_bdestroy_n;
+/* Counted ioctl. `may_fail` marks a call a recovery path EXPECTS to fail (reap dummies, poking a device
+ * already believed stuck) so the unexpected counter stays assertable. Returns 0 ok, -1 on failure. */
+int  orki_io_ok(int fd, unsigned long req, void *arg, const char *what, int may_fail);
+void orki_act_opt(int fd,uint32_t f,uint32_t v);   /* advisory action: failure is permitted and counted separately */
+extern long orki_io_fail_n, orki_io_expected_n;
 extern long orki_prof_submit_chained;
 extern long orki_prof_submit_progs;
 extern pthread_mutex_t orki_live_mu;

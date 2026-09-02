@@ -126,12 +126,12 @@ int ork_ctx_fd_reap(ork_npu *c){
      * refcount underflow/use-after-free -> slab corruption (vendor rknpu bug). RKNPU_ACT_RESET removes the job from the
      * scheduler first, so the subsequent close/drm_release puts each handle exactly once. (Proven necessary only for
      * REAL drops: 10 FORCE_WEDGE reaps of a CLEAN fd never underflowed; the underflow needs a stuck job at close.) */
-    { struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; ioctl(c->fd,DRM_IOCTL_RKNPU_ACTION,&ra);
+    { struct rknpu_action ra; memset(&ra,0,sizeof ra); ra.flags=RKNPU_ACT_RESET; orki_io_ok(c->fd,DRM_IOCTL_RKNPU_ACTION,&ra,"ACT_RESET(pre-close)",1);
       struct timespec qs={0,2000000}; nanosleep(&qs,NULL); }   /* 2ms: let the reset settle + the aborted job drain before close */
     close(c->fd);
     int nf=open(card,O_RDWR); if(nf<0){ perror("FD-REAP reopen"); c->fd=-1; return -1; }
     prctl(PR_SET_TIMERSLACK,(unsigned long)1000,0UL,0UL,0UL);
-    orki_act(nf,RKNPU_POWER_ON,0); orki_act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    orki_act_opt(nf,RKNPU_POWER_ON,0); orki_act(nf,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     c->fd=nf;
     /* all prior IOMMU mappings + live handles are gone with the old fd */
     pthread_mutex_lock(&orki_live_mu); orki_live_n=0; orki_live_fd=nf; pthread_mutex_unlock(&orki_live_mu);

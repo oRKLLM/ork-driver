@@ -71,7 +71,7 @@ ork_npu *ork_npu_init(void){
       } }
     int fd=open(card,O_RDWR); if(fd<0){perror("open NPU card");return NULL;}
     prctl(PR_SET_TIMERSLACK, (unsigned long)1000, 0UL, 0UL, 0UL);   /* 1µs timer slack (default 50µs): precise short nanosleeps for the doorbell backoffs */
-    orki_act(fd,RKNPU_GET_DRV_VERSION,0);orki_act(fd,RKNPU_POWER_ON,0);orki_act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
+    orki_act(fd,RKNPU_GET_DRV_VERSION,0);orki_act_opt(fd,RKNPU_POWER_ON,0);orki_act(fd,RKNPU_SET_PROC_NICE,(uint32_t)-19);
     /* Query NPU on-chip SRAM once: gates the TRY_ALLOC_SRAM->DRAM failover in orki_bcreate (see orki_sram_total). */
     { struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_GET_TOTAL_SRAM_SIZE;
       if(!ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a)) orki_sram_total=a.value;

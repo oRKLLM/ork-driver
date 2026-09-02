@@ -136,4 +136,11 @@ int          ork_npu_domain_free(ork_npu *ctx, int domain);
  * There is no fixed domain cap — `n` is whatever the auto-sizer computes. No-op for n<=1 (single-domain). */
 void         ork_npu_set_ndomains(ork_npu *ctx, int n);
 
+/* Count of ioctls that failed UNEXPECTEDLY this process. The kernel driver this library sits on has
+ * documented IOVA-leak and domain-refcount defects, and its failures present as silent wrong numbers or a
+ * later wedge rather than as an error at the call site -- so a run being clean is worth asserting.
+ * ork_io_expected_failures() counts the ones recovery paths deliberately provoke; do NOT assert on it. */
+long ork_io_failures(void);
+long ork_io_expected_failures(void);
+
 #endif /* ORK_CONTEXT_H */

@@ -255,7 +255,7 @@ void orki_live_reap(int fd){
     for(int i=0;i<n;i++){
         struct rknpu_mem_destroy d; memset(&d,0,sizeof d);
         d.handle=orki_live[i].handle; d.obj_addr=orki_live[i].obj;
-        ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+        orki_io_ok(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d,"MEM_DESTROY(teardown)",1);   /* handles may already be gone via drm_release -> expected */
     }
     orki_live_n=0;
     pthread_mutex_unlock(&orki_live_mu);
@@ -263,12 +263,12 @@ void orki_live_reap(int fd){
 void ork_sig_teardown(int sig){
     if(!orki_sig_busy){ orki_sig_busy=1; int fd=orki_live_fd;   /* best-effort: process is terminating, no lock (races benign) */
         if(fd>=0){ int n=orki_live_n;
-            for(int i=0;i<n;i++){ struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=orki_live[i].handle; d.obj_addr=orki_live[i].obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d); }
+            for(int i=0;i<n;i++){ struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=orki_live[i].handle; d.obj_addr=orki_live[i].obj; orki_io_ok(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d,"MEM_DESTROY(teardown)",1); }
             struct rknpu_action a; memset(&a,0,sizeof a); a.flags=RKNPU_ACT_RESET; ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a); } }
     signal(sig,SIG_DFL); raise(sig);
 }
 void orki_bdestroy(int fd,struct buf*b){ if(!b->cpu)return; munmap(b->cpu,b->size);
-    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; orki_io_ok(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d,"MEM_DESTROY",0);   /* targeted free: failure LEAKS IOVA */
     orki_live_del(b->handle); orki_imp_unreg(b);   /* drop the (now-dangling) buf* from the fd-reap import registry */
     orki_bdestroy_n++;
     ork_iova_release(b->domain,b->size);
@@ -1493,7 +1493,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
                 close(oldfd);
                 ork_kmsg("FDCLOSE-REAP: close() returned WITHOUT synchronous crash — reopening %s", c->soc->card);
                 int nf = open(c->soc->card, O_RDWR);
-                if (nf >= 0) { orki_act(nf, RKNPU_POWER_ON, 0); }
+                if (nf >= 0) { orki_act_opt(nf, RKNPU_POWER_ON, 0); }
                 ork_kmsg("FDCLOSE-REAP: reopened fd=%d (errno=%d) — close+reopen SURVIVED; _exit(0) (skip stale teardown)", nf, nf<0?errno:0);
                 fflush(NULL);
                 _exit(0);

@@ -286,8 +286,8 @@ void ork_dma_bsync_to_device(ork_npu *c, void *ptr, size_t size){
     struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     struct rknpu_mem_sync s; memset(&s,0,sizeof s);
     s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE; orki_io_ok(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s,"MEM_SYNC(bidi)",0);
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; orki_io_ok(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s,"MEM_SYNC(to-dev)",0);
 }
 
 /* Diagnostic only (tools/dmabuf_fill_probe.c): allocate a registered DMA buffer with a caller-chosen
@@ -306,7 +306,7 @@ void ork_dma_clean_to_device(ork_npu *c, void *ptr, size_t size){
     struct buf *b=orki_dma_find(c,ptr); if(!b) return;
     struct rknpu_mem_sync s; memset(&s,0,sizeof s);
     s.obj_addr=b->obj; s.offset=(uint64_t)((char*)ptr-(char*)b->cpu); s.size=size?size:b->size;
-    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; ioctl(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);
+    s.flags=RKNPU_MEM_SYNC_TO_DEVICE; orki_io_ok(c->fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s,"MEM_SYNC(to-dev)",0);
 }
 
 struct buf orki_bstage_alloc(size_t size){
@@ -330,7 +330,8 @@ int orki_bstage_map(int fd, struct buf*b){
 
 void orki_bstage_unmap(int fd, struct buf*b){
     if(!b->obj && !b->handle) return;
-    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj; ioctl(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d);
+    struct rknpu_mem_destroy d; memset(&d,0,sizeof d); d.handle=b->handle; d.obj_addr=b->obj;
+    orki_io_ok(fd,DRM_IOCTL_RKNPU_MEM_DESTROY,&d,"MEM_DESTROY",0);   /* a failure here LEAKS IOVA -- count it */
     b->dma=0; b->obj=0; b->handle=0;
 }
 

@@ -29,11 +29,71 @@ void orki_setrn(uint32_t*rc,int n,enum ork_reg_id id,uint32_t v){
 }
 
 
+/* ---- COUNTED IOCTL: never discard a return from a driver whose known defects are IOVA leaks and
+ * domain-refcount bugs -------------------------------------------------------------------------------
+ *
+ * MEM_SYNC, MEM_DESTROY and ACTION returns used to be dropped at every call site. Those three failures map
+ * exactly onto the two ways this project has actually been burned:
+ *   - a failed MEM_SYNC leaves a stale/incoherent buffer -> SILENT WRONG NUMBERS (a matmul that "ran" and
+ *     wrote nothing scored as a plausible float; ork-driver#4),
+ *   - a failed MEM_DESTROY leaks IOVA -> eventual wedge (measured on the board: 20 destroy bails and
+ *     ~49 MB outstanding in ONE run),
+ *   - a failed ACT_RESET is the worst of the three: the recovery path sleeps 1ms and resubmits BELIEVING
+ *     the device was reset, so the reset silently not happening looks exactly like silicon misbehaving.
+ *
+ * EXPECTED vs UNEXPECTED is the load-bearing distinction. Some of these are supposed to fail: the reap
+ * dummies in ork_npu_reap_stuck exist precisely to be timed out, and the recovery paths deliberately poke a
+ * device they already believe is stuck. Counting those as errors would make a "failures == 0" assertion go
+ * red on healthy runs -- and the first response to a gate that cries wolf is to switch it off, which leaves
+ * us worse off than having no gate. So expected failures are counted separately and reported, never
+ * asserted on.
+ *
+ * errno is logged SYMBOLICALLY: this project's own notes key on specific values (errno=110 is a genuine
+ * wedge, while a dmesg "soft reset" is a deliberate per-call reset), and a bare number is what produced the
+ * int16-SiLU misdiagnosis. */
+long orki_io_fail_n, orki_io_expected_n;
+
+int orki_io_ok(int fd, unsigned long req, void *arg, const char *what, int may_fail){
+    if(ioctl(fd, req, arg) == 0) return 0;
+    const int e = errno;
+    if(may_fail){ orki_io_expected_n++;
+        if(getenv("ORK_IO_TRACE"))
+            fprintf(stderr,"[ork-io] %s failed as permitted: %s (errno=%d)\n", what, strerror(e), e);
+        return -1; }
+    orki_io_fail_n++;
+    /* Rate-limited: a genuine storm must not bury the first occurrence, which is the informative one. */
+    if(orki_io_fail_n <= 8 || getenv("ORK_IO_TRACE"))
+        fprintf(stderr,"[ork-io] UNEXPECTED %s failure #%ld: %s (errno=%d)%s\n",
+                what, orki_io_fail_n, strerror(e), e,
+                orki_io_fail_n == 8 ? " [further reports suppressed; set ORK_IO_TRACE=1]" : "");
+    return -1;
+}
+
+/* Public counter so a test can assert the run was clean (see ork_npu.h). */
+long ork_io_failures(void){ return orki_io_fail_n; }
+long ork_io_expected_failures(void){ return orki_io_expected_n; }
+
+/* Advisory action: the caller does not care whether the driver implements it. FIRST USE, and the counted
+ * wrapper is how it was found: RKNPU_POWER_ON (0x14) returns EINVAL on EVERY context init on this vendor
+ * kernel, and has done silently for the life of the project because the return was discarded. It is
+ * harmless -- the NPU powers up through runtime PM on the first submit, which is why nothing ever broke --
+ * but it is a dead ioctl issued on every init, and calling it "expected" is the honest classification
+ * rather than pretending it succeeds. */
+void orki_act_opt(int fd,uint32_t f,uint32_t v){
+    struct rknpu_action a={.flags=f,.value=v};
+    char nm[48]; snprintf(nm,sizeof nm,"ACTION(flags=0x%x,val=%u)",f,v);
+    orki_io_ok(fd,DRM_IOCTL_RKNPU_ACTION,&a,nm,1);
+}
+
 void orki_act(int fd,uint32_t f,uint32_t v){
     if(f==RKNPU_ACT_RESET){ static long n=0; if(getenv("ORK_DEBUG_RESET")){ void*ra=__builtin_return_address(0); Dl_info di;
         if(dladdr(ra,&di)) fprintf(stderr,"[ork] ACT_RESET #%ld off=0x%lx obj=%s\n",++n,(unsigned long)((char*)ra-(char*)di.dli_fbase),di.dli_fname);
         else fprintf(stderr,"[ork] ACT_RESET #%ld ra=%p\n",++n,ra); } }
-    struct rknpu_action a={.flags=f,.value=v};ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&a);}
+    struct rknpu_action a={.flags=f,.value=v};
+    /* Name the action in the failure: "ACTION failed" is not actionable when the same entry point carries
+     * RESET, POWER_ON, SET_DOMAIN and the counters. */
+    char nm[48]; snprintf(nm,sizeof nm,"ACTION(flags=0x%x,val=%u)",f,v);
+    orki_io_ok(fd,DRM_IOCTL_RKNPU_ACTION,&a,nm,0);}
 
 void orki_dump_submit(struct rknpu_submit *sub) {
     fprintf(stderr, "[ork-trace] === SUBMIT flags=0x%x timeout=%u task_number=%u core=0x%x domain=%u ===\n",

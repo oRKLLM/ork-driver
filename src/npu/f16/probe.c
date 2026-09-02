@@ -189,7 +189,7 @@ int ork_f16_npu_percore_probe(ork_npu*c,int M,int K,int N,const ork_f16*A,const 
     struct buf wbuf[ORK_MAXCORE]={{0}}, wimp[ORK_MAXCORE]={{0}}, abuf[ORK_MAXCORE]={{0}},
                cob[ORK_MAXCORE]={{0}}, rcb[ORK_MAXCORE]={{0}}, tkb[ORK_MAXCORE]={{0}};
     int shared_dbuf=-1, ret=-1;
-    for(int i=0;i<cores;i++){ cfd[i]=open(card,O_RDWR); if(cfd[i]<0) goto done; orki_act(cfd[i],RKNPU_POWER_ON,0); }
+    for(int i=0;i<cores;i++){ cfd[i]=open(card,O_RDWR); if(cfd[i]<0) goto done; orki_act_opt(cfd[i],RKNPU_POWER_ON,0); }
     if(mode==1){   /* ONE shared full-N weight imported into every fd; tile the FULL B once via the primary map */
         size_t wsz=(size_t)K*N*2;
         wimp[0]=orki_bimport(cfd[0],wsz,0); if(!wimp[0].cpu) goto done; shared_dbuf=wimp[0].heap_fd;

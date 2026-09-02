@@ -536,7 +536,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
          * is safe ONLY because it soft-resets BEFORE teardown. So HALT the DMA ourselves FIRST — RKNPU_ACT_RESET
          * (-> rknpu_soft_reset) as the very first recovery action + a settle — so that if any later recovery submit
          * errors into abort, its domain_put window has NO live DMA to escape. Closes the kernel-ordering hole. */
-        { struct rknpu_action ra; memset(&ra, 0, sizeof ra); ra.flags = RKNPU_ACT_RESET; ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &ra);
+        { struct rknpu_action ra; memset(&ra, 0, sizeof ra); ra.flags = RKNPU_ACT_RESET; orki_io_ok(fd, DRM_IOCTL_RKNPU_ACTION, &ra, "ACT_RESET(f16-drop recover)", 1);
           struct timespec ts = {0, 5000000}; nanosleep(&ts, NULL); }   /* 5ms settle: let the CDMA fully quiesce before any further submit */
         ork_kmsg("F16 drop (K=%d N=%d M=%d) -> RESET-FIRST (halt DMA) + reap_stuck + int8 dummy health-gate + de-escalate to nc=1 (NO fp16 resubmit)", w->K, w->N, M);
         ork_npu_reap_stuck(c, nc);
