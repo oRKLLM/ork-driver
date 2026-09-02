@@ -308,6 +308,26 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
             if (rc >= 0) return rc;   /* retired + landed */
             errno = e;
         }
+        /* NOT EVERY ERRNO MEANS THE DEVICE NEEDS RESETTING. The reset below is not free -- it clears warm,
+         * and a cold re-entry is a miscompute risk (see the retry note above) -- so it must be reserved for
+         * failures that actually say something about device state. These do not:
+         *   EINTR   a signal, not the NPU. Also NOT retried: the ioctl may have been interrupted after the
+         *           job was committed, so re-issuing the same regcmd could double-submit it. Return and let
+         *           the caller decide. (Unreachable as we currently use the driver -- the job wait is
+         *           wait_event_timeout, uninterruptible, and the one interruptible wait is the fence-in path
+         *           we never take since fence_fd is always -1. Handled anyway: it becomes reachable the day
+         *           anyone enables fences, and the failure mode would be a silent cold-miscompute.)
+         *   ENODEV  the fd is gone; a reset cannot help and the ioctl would fail too.
+         *   ENOMEM / EFAULT  host-side allocation or a bad pointer -- our bug, not the device's.
+         * Everything else (notably ETIMEDOUT, the documented wedge signature) still resets. */
+        if (e == EINTR || e == ENODEV || e == ENOMEM || e == EFAULT) {
+            fprintf(stderr, "[ork] RKNPU_SUBMIT failed with %s (errno=%d) — NOT a device-state failure, "
+                            "returning the error WITHOUT a reset | op=%s K=%d N=%d dom=%u\n",
+                    strerror(e), e, orki_last_op ? orki_last_op : "?", orki_last_K, orki_last_N,
+                    sub->iommu_domain_id);
+            errno = e;
+            return rc;
+        }
         fprintf(stderr, "[ork] WARNING: RKNPU_SUBMIT ioctl failed (rc=%d, errno=%d) | submit domain=%u task_number=%u core=0x%x | last regcmd op=%s weight[K=%d N=%d dom=%d imported=%d]. Triggering self-healing reset...\n",
                 rc, e, sub->iommu_domain_id, sub->task_number, sub->core_mask,
                 orki_last_op, orki_last_K, orki_last_N, orki_last_wdom, orki_last_import);
@@ -317,7 +337,7 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
           fprintf(stderr,"  [iova@fail] total live=%zu MiB\n", tot>>20); }
         if (getenv("ORK_DUMP_FAIL")) orki_dump_submit(sub);   /* full failing regcmd on demand */
         struct rknpu_action a = { .flags = RKNPU_ACT_RESET, .value = 0 };
-        ioctl(fd, DRM_IOCTL_RKNPU_ACTION, &a);
+        orki_io_ok(fd, DRM_IOCTL_RKNPU_ACTION, &a, "ACT_RESET(submit self-heal)", 1);   /* poking an already-failing device */
         errno = e;
     }
     return rc;
