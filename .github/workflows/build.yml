@@ -1,0 +1,48 @@
+# COMPILE THE CODE. Until now CI ran only `make check-attest` — sha256 + grep — so nothing verified the
+# tree even builds; a commit that did not compile could reach main and only fail on the board.
+#
+# It was believed this could not run in CI because the sources are Linux-only (sys/prctl.h,
+# pthread_barrier_t). That is not the blocker: both are fine on Linux/x86. The real blocker is 30 unguarded
+# arm_neon.h includes and ~39 NEON intrinsics, which no x86 compiler will accept. So the fix is not to make
+# the tree portable — it is to compile it where it belongs. GitHub's arm64 Linux runners are free for public
+# repos and satisfy prctl, pthread_barrier AND NEON, so the FULL tree builds with no source changes.
+#
+# Still no NPU here, so nothing is run — `make test` remains the board's job, gated by check-attest.
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: gates that need no NPU
+        run: |
+          make check-registry
+          make check-install
+
+      - name: compile
+        run: make -j$(nproc) 2>&1 | tee /tmp/build.log
+
+      - name: warning ratchet
+        # The tree carries a warning backlog (mostly -Wmisleading-indentation from its deliberately dense
+        # one-line style). Failing on all of them would demand a large, low-signal cleanup, so this ratchets
+        # instead — the same approach tools/size_budget.txt already takes for file size: the count may fall,
+        # never rise. That blocks NEW warnings without holding the build hostage to old ones.
+        run: |
+          n=$(grep -c "warning:" /tmp/build.log || true)
+          base=$(cat tools/warning_baseline.txt)
+          echo "warnings: $n (baseline $base)"
+          if [ "$n" -gt "$base" ]; then
+            echo "::error::$n warnings > baseline $base — a new warning was introduced"
+            grep "warning:" /tmp/build.log | tail -20
+            exit 1
+          fi
+          if [ "$n" -lt "$base" ]; then
+            echo "::notice::down to $n — lower tools/warning_baseline.txt to $n to hold the gain"
+          fi
