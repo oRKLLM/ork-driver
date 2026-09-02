@@ -130,9 +130,18 @@ int orkd_handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
     struct orkd_attn_rr a;
     if (orkd_readn(cl->fd, &a, sizeof a) <= 0) return -1;
     int nch = (int)a.nchains, Nq = (int)a.Nq, Nk = (int)a.Nk, Kp = (int)a.Kp, dv = (int)a.dv;
-    size_t tbytes = (nch>=1 && nch<=ORKD_ATTN_RR_MAX) ? (size_t)nch*3*8 : 0;
-    /* bad nchains: still consume the triples+Q we can compute, then error. abytes was sent by the client. */
-    if (nch < 1 || nch > ORKD_ATTN_RR_MAX || Nq < 1 || Nk < 1 || Kp < 1 || dv < 1 || a.abytes > ORKD_MAX_BYTES
+    /* A BAD nchains IS NOT RECOVERABLE, so do not pretend to resync. The triples that follow are
+     * nchains*3*8 bytes, and if nchains itself is out of range we cannot know how many the client actually
+     * sent -- draining only `abytes` leaves those bytes in the stream, and every subsequent request on this
+     * connection is then parsed from the wrong offset. Silent misparsing of later, VALID requests is worse
+     * than losing the connection, so drop it: return -1 and let the caller close. A bad nchains is a broken
+     * or hostile client either way. */
+    if (nch < 1 || nch > ORKD_ATTN_RR_MAX){
+        orkd_send_error(cl->fd, tag, ORKD_EPROTO, "attn_rr nchains out of range — dropping (stream position unknowable)");
+        return -1; }
+    size_t tbytes = (size_t)nch*3*8;
+    /* nchains is sane from here, so tbytes is known and the stream CAN be resynced: drain and keep going. */
+    if (Nq < 1 || Nk < 1 || Kp < 1 || dv < 1 || a.abytes > ORKD_MAX_BYTES
         || a.abytes != (uint32_t)((size_t)nch * Nq * Kp)){
         orkd_drain(cl->fd, tbytes + a.abytes); orkd_send_error(cl->fd, tag, ORKD_EPROTO, "attn_rr dims"); return 0; }
     uint64_t *trip = malloc(tbytes); int8_t *Q = malloc(a.abytes ? a.abytes : 1);
@@ -152,6 +161,21 @@ int orkd_handle_attn_rr(struct client *cl, ork_npu *npu, uint64_t tag){
         for (int j=0;j<cl->nw;j++){ uint64_t id=cl->wt[j].id;
             if (id==wkt_id) ckt=&cl->wt[j]; if (id==wones_id) co=&cl->wt[j]; if (id==wv_id) cv=&cl->wt[j]; }
         if (!ckt||!co||!cv){ bad=1; break; }
+        /* THE DIMS ARE THE CLIENT'S; THE WEIGHTS ARE OURS. Every buffer above is sized from Nq/Nk/Kp/dv as
+         * the client declared them, but the matmul reads A as [M x K] and writes C as [M x N] using the
+         * RESIDENT weight's own K,N. Declare Kp=64 against a K=2048 weight and task 0 reads 32x past the
+         * end of Q; understate Nk and it writes past scb. So ask the driver what each weight actually is
+         * (ork_w_dims) and require it to match what the declared dims imply:
+         *     kt : K==Kp  N==Nk      (Q[Nq x Kp] -> scb[Nq x Nk])
+         *     ones: K==Nk  N==32     (eb[Nq x Nk] -> ss[Nq x 32])
+         *     v  : K==Nk  N==dv      (eb[Nq x Nk] -> avb[Nq x dv])
+         * Checked against the packed weight rather than the K,N recorded at registration, so a mismatch
+         * introduced anywhere between register and use is still caught. */
+        { int wk=0, wn=0; int ok=1;
+          ork_w_dims(ckt->w,&wk,&wn); if (wk!=Kp || wn!=Nk) ok=0;
+          ork_w_dims(co->w,&wk,&wn);  if (wk!=Nk || wn!=32) ok=0;
+          ork_w_dims(cv->w,&wk,&wn);  if (wk!=Nk || wn!=dv) ok=0;
+          if (!ok){ bad=1; break; } }
         int8_t *Qn = Q + (size_t)n*Nq*Kp;
         tk[n][0]=(ork_mm_task_i8){ ckt->w, Nq, Qn,             scb[n] };
         tk[n][1]=(ork_mm_task_i8){ ckt->w, Nq, (int8_t*)scb[n], eb[n] };

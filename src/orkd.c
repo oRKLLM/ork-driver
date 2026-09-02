@@ -12,6 +12,7 @@
  * detected here as socket EOF -> the subscriber is dropped (ref--) and (once the NPU is wired) its resident
  * weights/IOVA are reclaimed. That is the design fix for the leak-on-kill that otherwise forces a reboot. */
 
+#define _GNU_SOURCE   /* struct ucred / SO_PEERCRED: the peer-credential gate in the accept loop */
 #include "orkd_proto.h"
 #include "orkd_shm.h"
 #include "orkd_ring.h"
