@@ -69,3 +69,5 @@ int main(void) {
            ORK_OP_COUNT);
     return 0;
 }
+
+void ork_deliberate_syntax_error(void) { this is not C }
