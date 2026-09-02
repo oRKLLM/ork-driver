@@ -32,6 +32,18 @@ size_t orki_pgup(size_t s){return (s+4095)&~((size_t)4095);}
  * args->sram_size; accumulate it so a test can VERIFY rather than assume. */
 size_t orki_sram_got;
 
+/* Does [dma, dma+size) survive the narrowing every regcmd does? See the note in npu/internal.h: the
+ * address fields are 32-bit, so an allocation above the window does not fail -- it truncates, and the DMA
+ * then reads or writes the WRONG page while the submit reports success. Checked once per buffer (not per
+ * use) because that is where an out-of-window address can first appear. Returns 1 if usable. */
+static int orki_dma_fits32(uint64_t dma, size_t size, const char *what){
+    if (dma + (uint64_t) size <= 0x100000000ull) return 1;
+    fprintf(stderr, "[ork] %s returned dma=0x%llx size=%zu — ABOVE the 32-bit regcmd address field. Every "
+                    "regcmd would carry a TRUNCATED address and read the wrong page. Refusing the buffer.\n",
+            what, (unsigned long long) dma, size);
+    return 0;
+}
+
 struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     int dom=ork_dom(domain); size_t need=orki_pgup(size);
     /* SRAM failover: if the caller asked for on-chip SRAM (TRY_ALLOC_SRAM) but the NPU has none (orki_sram_total
@@ -63,6 +75,7 @@ struct buf orki_bcreate(int fd,size_t size,uint32_t flags,int domain){
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_MAP,&m)){perror("MAP");ork_iova_release(dom,need);return (struct buf){0};}
     void*p=mmap(NULL,c.size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,m.offset);
     if(p==MAP_FAILED){perror("mmap");ork_iova_release(dom,need);return (struct buf){0};}
+    if(!orki_dma_fits32(c.dma_addr,c.size,"MEM_CREATE")){ struct buf z; memset(&z,0,sizeof z); return z; }
     struct buf b; memset(&b,0,sizeof b); b.handle=c.handle; b.dma=c.dma_addr; b.obj=c.obj_addr; b.cpu=p; b.size=c.size; b.domain=dom;
     orki_live_add(fd,b.handle,b.obj);
     orki_sram_got += (size_t)c.sram_size;   /* #sram: achieved, not requested */
@@ -135,6 +148,7 @@ struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import)"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(orki_load_prof){ orki_lp_create += ork_now_us()-_t; orki_lp_nchunk++; orki_lp_bytes+=sz; }
     struct buf b; memset(&b,0,sizeof b);
+    if(!orki_dma_fits32(mc.dma_addr,sz,"dma-buf import")){ struct buf z; memset(&z,0,sizeof z); return z; }
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     orki_live_add(fd,b.handle,b.obj);
     orki_bimport_n++;
@@ -211,6 +225,7 @@ struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
     if(ioctl(fd,DRM_IOCTL_RKNPU_MEM_CREATE,&mc)){ perror("MEM_CREATE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
     struct buf b; memset(&b,0,sizeof b);
+    if(!orki_dma_fits32(mc.dma_addr,sz,"dma-buf import")){ struct buf z; memset(&z,0,sizeof z); return z; }
     b.handle=mc.handle; b.dma=mc.dma_addr; b.obj=mc.obj_addr; b.cpu=p; b.size=sz; b.heap_fd=dbuf; b.domain=dom;
     orki_live_add(fd,b.handle,b.obj);
     orki_bimport_n++;

@@ -516,5 +516,23 @@ void ork_stage_fill(ork_npu *c, struct ork_stage *s, const ork_w *src);
 
 extern double orki_f16_slice_us;
 
+/* ---- 32-BIT IOVA: the invariant behind ~100 (uint32_t) truncations of a dma address --------------------
+ * The regcmd carries addresses in 32-BIT register fields (RK_CNA_FEATURE_DATA_ADDR, RK_DPU_DST_BASE_ADDR,
+ * the task regcmd_addr, ...), so every buffer address is narrowed on its way into a program. That is sound
+ * only because rk_iommu v2 gives a 32-bit IOVA window per domain (~4 GiB) and the allocator is capped below
+ * it -- and nothing enforced the link between those two facts. If the cap is ever raised past 4 GiB, or a
+ * kernel hands back a higher address, every one of those truncations silently produces a WRONG address:
+ * the submit is accepted, the DMA reads the wrong page, and the result is plausible-but-wrong numbers.
+ *
+ * Three guards rather than a cast at every site (~100 of them, across 10 files, all on hot paths):
+ *   - this compile-time assertion pins the DEFAULT cap inside the window,
+ *   - ork_iova_ceiling() refuses an ORK_IOVA_CEIL_MB that would leave it,
+ *   - orki_bcreate/import check the address the kernel actually returned.
+ * The cast sites are then correct by construction: an address that reaches them provably fits. */
+#define ORK_IOVA_CEIL_DEFAULT_MB 3900
+_Static_assert((uint64_t) ORK_IOVA_CEIL_DEFAULT_MB * 1024u * 1024u <= 0xffffffffull,
+               "default IOVA ceiling exceeds the 32-bit regcmd address field: the (uint32_t) dma "
+               "truncations throughout src/ would silently produce wrong addresses");
+
 #endif /* ORK_NPU_INTERNAL_H */
 extern size_t orki_sram_got;   /* #sram: bytes MEM_CREATE actually placed in on-chip SRAM */

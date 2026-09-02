@@ -26,7 +26,15 @@ int ork_dom_default(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_IOM
 
 size_t ork_iova_ceiling(void){
     static size_t v=0;
-    if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):3900; if(mb<=0)mb=3900; v=(size_t)mb*1024u*1024u; }
+    if(!v){ const char*e=getenv("ORK_IOVA_CEIL_MB"); long mb=e?atol(e):ORK_IOVA_CEIL_DEFAULT_MB; if(mb<=0)mb=ORK_IOVA_CEIL_DEFAULT_MB;
+        /* Addresses are narrowed to 32 bits on their way into a regcmd (see internal.h), so a ceiling past
+         * the window would hand out addresses that truncate to the WRONG page rather than failing. Clamp
+         * and say so: a slightly smaller window is a capacity limit, a truncated address is wrong output. */
+        if((uint64_t)mb*1024u*1024u > 0xffffffffull){
+            fprintf(stderr,"[ork] ORK_IOVA_CEIL_MB=%ld exceeds the 32-bit regcmd address field — clamping to %d MB "
+                           "(a larger window needs wider address fields, not a bigger cap)\n", mb, ORK_IOVA_CEIL_DEFAULT_MB);
+            mb=ORK_IOVA_CEIL_DEFAULT_MB; }
+        v=(size_t)mb*1024u*1024u; }
     return v;
 }
 
