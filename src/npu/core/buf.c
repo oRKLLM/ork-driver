@@ -135,8 +135,14 @@ struct buf orki_bimport_f(int fd,size_t size,int domain,uint32_t memflags){
      * domain and used in another: the submit is committed and never completes, with no error
      * (measured: dom_scale_probe imported=1 failed at cycle 0; native packs are unaffected because
      * their MEM_CREATE does the switch and the mapping together). */
+    /* A FAILED SWITCH HERE IS THE WHOLE BUG. If this errors and we import anyway, the sg is mapped into
+     * whatever domain is still live and the weight is then used from another -- the "committed, never
+     * completes, no error" signature, which per the project notes has never once been silicon. So it is
+     * NOT may_fail: abort the import and let the caller fall back, exactly as a PRIME failure does.
+     * get_and_switch also fails on a switch TIMEOUT, which is precisely when continuing is unsafe. */
     { struct rknpu_action da; memset(&da,0,sizeof da); da.flags=RKNPU_ACT_SET_DOMAIN; da.value=(uint32_t)dom;
-      ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&da); }
+      if(orki_io_ok(fd,DRM_IOCTL_RKNPU_ACTION,&da,"ACT_SET_DOMAIN(import)",0)){
+          ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; } }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE"); ork_iova_release(dom,sz); munmap(p,sz); close(dbuf); return (struct buf){0}; }
     if(orki_load_prof){ orki_lp_prime += ork_now_us()-_t; _t=ork_now_us(); }
@@ -218,8 +224,14 @@ struct buf orki_bimport_fd(int fd,int dbuf,size_t size,int domain){
      * domain and used in another: the submit is committed and never completes, with no error
      * (measured: dom_scale_probe imported=1 failed at cycle 0; native packs are unaffected because
      * their MEM_CREATE does the switch and the mapping together). */
+    /* A FAILED SWITCH HERE IS THE WHOLE BUG. If this errors and we import anyway, the sg is mapped into
+     * whatever domain is still live and the weight is then used from another -- the "committed, never
+     * completes, no error" signature, which per the project notes has never once been silicon. So it is
+     * NOT may_fail: abort the import and let the caller fall back, exactly as a PRIME failure does.
+     * get_and_switch also fails on a switch TIMEOUT, which is precisely when continuing is unsafe. */
     { struct rknpu_action da; memset(&da,0,sizeof da); da.flags=RKNPU_ACT_SET_DOMAIN; da.value=(uint32_t)dom;
-      ioctl(fd,DRM_IOCTL_RKNPU_ACTION,&da); }
+      if(orki_io_ok(fd,DRM_IOCTL_RKNPU_ACTION,&da,"ACT_SET_DOMAIN(import_fd)",0)){
+          ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; } }
     struct drm_prime_handle ph; memset(&ph,0,sizeof ph); ph.fd=dbuf; ph.flags=0;
     if(ioctl(fd,DRM_IOCTL_PRIME_FD_TO_HANDLE,&ph)){ perror("PRIME_FD_TO_HANDLE(import_fd)"); ork_iova_release(dom,sz); munmap(p,sz); return (struct buf){0}; }
     struct rknpu_mem_create mc; memset(&mc,0,sizeof mc); mc.handle=ph.handle; mc.flags=0; mc.size=0; mc.core_mask=RKNPU_CORE0_MASK; mc.iommu_domain_id=dom;
