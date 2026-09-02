@@ -34,9 +34,15 @@ jobs:
         # one-line style). Failing on all of them would demand a large, low-signal cleanup, so this ratchets
         # instead — the same approach tools/size_budget.txt already takes for file size: the count may fall,
         # never rise. That blocks NEW warnings without holding the build hostage to old ones.
+        #
+        # The baseline is CI-RELATIVE, and deliberately so. The board (gcc 14.2.0 Debian) reports 147 for
+        # the same tree where this runner reports 152 — the same -Wmisleading-indentation heuristic differs
+        # between builds of gcc. So "clean on the board" does not mean "clean here", and the number that
+        # matters is the one measured where the gate runs. A runner image upgrade can therefore move it:
+        # re-baseline (and say so in the commit), do not disable the gate.
         run: |
           n=$(grep -c "warning:" /tmp/build.log || true)
-          base=$(cat tools/warning_baseline.txt)
+          base=$(grep -oE '^[0-9]+' tools/warning_baseline.txt | head -1)
           echo "warnings: $n (baseline $base)"
           if [ "$n" -gt "$base" ]; then
             echo "::error::$n warnings > baseline $base — a new warning was introduced"
