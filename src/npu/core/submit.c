@@ -232,6 +232,14 @@ int orki_rc_verify(int fd, struct buf *b, size_t nbytes){
     return c1 != c2;
 }
 
+/* Read one kernel counter from /sys/module/rknpu/parameters/. Used only on the sentinel-failure path, so
+ * the sysfs cost is irrelevant next to the timeout we just burned. -1 if unreadable. */
+static long orki_rknpu_cnt(const char *name){
+    char p[128]; snprintf(p,sizeof p,"/sys/module/rknpu/parameters/%s",name);
+    FILE *f=fopen(p,"r"); if(!f) return -1;
+    long v=-1; if(fscanf(f,"%ld",&v)!=1) v=-1; fclose(f); return v;
+}
+
 int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     { static int st=-1; static int seq=0; if(st<0) st = getenv("ORK_SUBTRACE") ? 1 : 0;
       if(st) fprintf(stderr,"[subtrace %d] op=%s dom=%d core=0x%x tn=%u caller=%p\n",
@@ -436,6 +444,16 @@ int orki_submit1_db(ork_npu *c, size_t nout){
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
         if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
+        /* PROBE (2026-09-03): snapshot the kernel's commit/irq/done counters BEFORE the poll so a failure
+         * can say WHICH stage stopped. The three deltas separate the only candidates left after #patch71
+         * ruled out a blocked queue:
+         *   commit=0            the job never reached the hardware at all
+         *   commit>0, irq=0     committed and the hardware never raised completion (a real stall)
+         *   irq>0, sentinel not landed  it COMPLETED but the write did not land where we are looking --
+         *                       i.e. a page-table/domain mismatch, which is what every previous instance
+         *                       of this signature in this project turned out to be
+         * Cheap: three sysfs reads per op, and only when the op is about to be polled. */
+        const long k_c0=orki_rknpu_cnt("cnt_commit"), k_i0=orki_rknpu_cnt("cnt_irq"), k_d0=orki_rknpu_cnt("cnt_done");
         double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0; int landed=0;
         for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff){landed=1;break;} if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);
@@ -452,6 +470,18 @@ int orki_submit1_db(ork_npu *c, size_t nout){
         if(!landed){ orki_db_miss++;
             fprintf(stderr,"[ork] ERROR: doorbell sentinel never landed (op=%s dom=%u nout=%zu rep=%d/%d, waited %.0f ms) — the op did NOT run; failing instead of returning stale output\n",
                     orki_last_op?orki_last_op:"?", c->dom_active, nout, rep+1, reps, cap/1000.0);
+            { const long dc=orki_rknpu_cnt("cnt_commit")-k_c0, di=orki_rknpu_cnt("cnt_irq")-k_i0,
+                         dd=orki_rknpu_cnt("cnt_done")-k_d0, nj=orki_rknpu_cnt("cnt_nojob");
+              const char *verdict = (k_c0<0) ? "kernel counters unreadable"
+                                  : (dc<=0)  ? "NEVER COMMITTED — the job did not reach the hardware"
+                                  : (di<=0)  ? "COMMITTED, NO IRQ — hardware never signalled completion"
+                                             : "COMPLETED BUT WROTE ELSEWHERE — suspect a page-table/domain mismatch";
+              fprintf(stderr,"[ork]   probe: commit+%ld irq+%ld done+%ld (cnt_nojob=%ld) | submit_dom=%u weight_dom=%d "
+                             "imported=%d core_mask=0x%x K=%d N=%d => %s\n",
+                      dc, di, dd, nj, c->dom_active, orki_last_wdom, orki_last_import,
+                      sub.core_mask, orki_last_K, orki_last_N, verdict);
+              ork_kmsg("SENTINEL MISS: commit+%ld irq+%ld done+%ld submit_dom=%u weight_dom=%d — %s",
+                       dc, di, dd, c->dom_active, orki_last_wdom, verdict); }
             if(last) return -1; } }
     c->warmed=1; return 0;
 }

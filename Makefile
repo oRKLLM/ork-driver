@@ -91,9 +91,23 @@ EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_sp
 # see -- not the queue. Next probe: at sentinel-failure time dump the PC task counter, whether an IRQ fired
 # for that job, and the live domain vs the weight's domain.
 #
-# It stays quarantined because the failure is intermittent, not because its cause is unknown-and-scary: it
-# now FAILS the suite loudly rather than stalling 60s and printing PASS, so registering it would make the
-# suite red about once every two runs. Fix the dispatch failure first.
+# ROOT CAUSE FOUND 2026-09-03 (kernel #61 + the userspace probe in npu/core/submit.c). At the stall:
+#   commit+0 irq+0 done+0 | submit_dom=0 weight_dom=0 => NEVER COMMITTED, and the domains MATCH
+# so it is not a page-table mismatch -- a genuine counterexample to this project's usual rule. The kernel
+# then names the culprit:
+#   core 0: NOT dispatching -- still owned by job (flags 0x2, age 60313754us, int_cnt 1, run_cnt 0)
+# flags 0x2 = RKNPU_JOB_NONBLOCK, run_cnt 0 = dispatched, int_cnt 1 = NEVER DECREMENTED, i.e. no completion
+# was ever accounted for it. That job owns core 0 permanently and every later submit queues behind it and
+# never commits. So: a NONBLOCK job is committed to the hardware, its completion is never accounted, and
+# the core is dead for the rest of the process.
+#
+# Still quarantined: the fix is in the kernel's NONBLOCK completion accounting, not here, and until it
+# lands this test makes the suite red about every other run.
+#
+# Two dead ends recorded so it is not re-tried: dispatch was NOT blocked by prior fault state (job faults=0
+# in a reproducing boot), and re-driving the queue after a soft reset (#patch72, which fixes a REAL but
+# different hole -- job_next bails while soft_reseting and nothing re-promotes) does not fix this one; it
+# only made the stuck owner observable.
 DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued test_f16colsplit
 TESTS :=
 
