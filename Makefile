@@ -80,9 +80,20 @@ EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_sp
 # is that this test is sensitive to a preceding job timeout from ANYWHERE in the suite, not to a mode left
 # by any particular predecessor. n=1 on that correlation, so it is a lead, not a conclusion.
 #
-# Consequence for anyone re-registering it: a green run proves little, because a fresh boot passes. The
-# question to answer first is why a prior job timeout makes this shape stop dispatching, and mode_probe is
-# NOT the tool for that -- start from the doorbell sentinel path and the fault state it does not clear.
+# INSTRUMENTED 2026-09-03 (kernel #60, #patch71: counters on rknpu_job_next's dispatch decision), and BOTH
+# hypotheses above are FALSIFIED:
+#   dbg_blocked_slow = 0   -- dispatch was NEVER declined because a stale job still owned the core
+#   job faults       = 0   -- no abort/timeout/commit-failed in the boot, yet it still reproduced
+# So it is neither a stuck owner blocking the queue nor prior fault state. It is an intermittent
+# (~1 run in 2) doorbell sentinel failure on this test's FIRST op, at dom=0, with the kernel reporting
+# nothing at all. Per the project's own rule that "committed, never completes, no error" has never once
+# been silicon, the remaining candidates are a page-table/domain mismatch or a completion the poll cannot
+# see -- not the queue. Next probe: at sentinel-failure time dump the PC task counter, whether an IRQ fired
+# for that job, and the live domain vs the weight's domain.
+#
+# It stays quarantined because the failure is intermittent, not because its cause is unknown-and-scary: it
+# now FAILS the suite loudly rather than stalling 60s and printing PASS, so registering it would make the
+# suite red about once every two runs. Fix the dispatch failure first.
 DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued test_f16colsplit
 TESTS :=
 
