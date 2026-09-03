@@ -64,12 +64,25 @@ EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_sp
 #   standalone (sudo npu_guard -- ./test_f16colsplit): PASS in ~15s, all three shapes maxerr=0.00e+00
 #   inside `make test`:                                HARD-WEDGED the board, twice (no ping/SSH, needed a
 #                                                      plug power-cycle both times; ~140s in on the retry)
-# So the fault is an INTERACTION with what runs before it, not the test -- which fits this board's history
-# of mode-transition wedges (see the mode_probe note in AGENTS.md: matmul <-> int8-SDP hard-wedged until
-# the c->task save/restore fix). Registering it would trade a missing test for a suite that power-cycles
-# the board, which is strictly worse: the suite is how everything else gets validated.
-# To fix properly: bisect which preceding test leaves the mode that kills it (mode_probe is the tool), fix
-# that transition, then move this line back into EXAMPLES. Do NOT just re-register it and hope.
+# BISECTED 2026-09-03, and the obvious suspect is EXONERATED. The failure is real and always lands here:
+#   [ork] ERROR: doorbell sentinel never landed (op=run_loop dom=0 nout=35840, waited 60000 ms)
+# logged immediately after "TEST_MODE_TRANSITION: PASS" in both wedged runs -- the committed-but-never-
+# completes signature, and the 60s wait is what made the suite look like it hung at ~140s.
+#
+# But it is NOT caused by the preceding test order. Prefix bisection (reboot, run the first N suite tests,
+# then this one) SURVIVED at every N tried, including N=36 -- the exact prefix that precedes it in the
+# suite, all 36 rc=0. And the real `make test` with this line registered PASSES on a freshly booted board,
+# twice in a row.
+#
+# What does correlate is PRIOR FAULT STATE IN THE SAME BOOT. On the third consecutive suite run the guard
+# refused to start: run 2 had produced one real "RKNPU: job timeout" (dmesg, t=138s) -- the suite still
+# passed -- and that single event inside npu_guard's 120s window blocked run 3. So the working hypothesis
+# is that this test is sensitive to a preceding job timeout from ANYWHERE in the suite, not to a mode left
+# by any particular predecessor. n=1 on that correlation, so it is a lead, not a conclusion.
+#
+# Consequence for anyone re-registering it: a green run proves little, because a fresh boot passes. The
+# question to answer first is why a prior job timeout makes this shape stop dispatching, and mode_probe is
+# NOT the tool for that -- start from the doorbell sentinel path and the fault state it does not clear.
 DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued test_f16colsplit
 TESTS :=
 
