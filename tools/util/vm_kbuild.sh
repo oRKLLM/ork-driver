@@ -87,7 +87,7 @@ scp -q /tmp/_vmf $VM:/tmp/vmsync_/.config
 ssh $VM "$P; docker cp /tmp/vmsync_/.config kbuild:/root/linux-rockchip/.config"
 
 echo "== building (16 cores) =="
-BUILD_OUT=$(ssh $VM "$P; docker exec kbuild sh -c 'cd /root/linux-rockchip && make ARCH=arm64 olddefconfig >/dev/null 2>&1 && nice -n 5 make ARCH=arm64 -j16 Image modules > /root/vmbuild.log 2>&1; echo build-exit=\$?; grep -E \"error:\" /root/vmbuild.log | head -5'" 2>&1)
+BUILD_OUT=$(ssh $VM "$P; docker exec kbuild sh -c 'cd /root/linux-rockchip && make ARCH=arm64 olddefconfig >/dev/null 2>&1 && nice -n 5 make ARCH=arm64 -j16 Image modules > /root/vmbuild.log 2>&1; echo build-exit=\$?; grep -E \"error:|undefined reference|Error [0-9]|ld: \" /root/vmbuild.log | head -8'" 2>&1)
 echo "$BUILD_OUT"
 # ABORT ON A FAILED BUILD. This used to fall through to the install step and ship the PREVIOUS image,
 # so the board booted a STALE kernel while the log still said "installed". An experiment then measures

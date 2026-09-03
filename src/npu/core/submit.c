@@ -472,7 +472,15 @@ int orki_submit1_db(ork_npu *c, size_t nout){
                     orki_last_op?orki_last_op:"?", c->dom_active, nout, rep+1, reps, cap/1000.0);
             { const long dc=orki_rknpu_cnt("cnt_commit")-k_c0, di=orki_rknpu_cnt("cnt_irq")-k_i0,
                          dd=orki_rknpu_cnt("cnt_done")-k_d0, nj=orki_rknpu_cnt("cnt_nojob");
+              /* The commit/irq/done counters are GATED OFF in the kernel by default (they are per-job, so
+               * they run ~85k times a suite). Off, they read a flat zero -- which is indistinguishable
+               * from "the job never committed" and would make this probe confidently misreport every
+               * stall. So check the gate first and ask for a re-run instead of inventing a verdict.
+               * dbg_on is absent entirely on a kernel without the instrumentation; k_c0<0 covers that. */
+              const long on = orki_rknpu_cnt("dbg_on");
               const char *verdict = (k_c0<0) ? "kernel counters unreadable"
+                                  : (on==0)  ? "NO VERDICT — kernel job counters are off; enable them with "
+                                               "`echo on > /sys/kernel/debug/rknpu/counters` and re-run"
                                   : (dc<=0)  ? "NEVER COMMITTED — the job did not reach the hardware"
                                   : (di<=0)  ? "COMMITTED, NO IRQ — hardware never signalled completion"
                                              : "COMPLETED BUT WROTE ELSEWHERE — suspect a page-table/domain mismatch";
