@@ -47,7 +47,7 @@ ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3
 # EXAMPLES ARE THE TEST SUITE: each self-validates against a CPU reference and exits 0/nonzero, and
 # `make test` runs every one. Something that only PRINTS for a human to read is not a test -- it cannot
 # fail, so running it proves nothing -- and it belongs in DIAGNOSTICS below.
-EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_slice_rescue test_i4_gemm test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8
+EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_slice_rescue test_i4_gemm test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8 test_f16colsplit
 
 # DIAGNOSTICS: built by `make all` (so they cannot rot, and CI compiles them) but NOT run by `make test`,
 # because they assert nothing. test_baseline/test_registers/test_layouts print NPU output beside a CPU
@@ -58,57 +58,17 @@ EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_sp
 # GB/s, whether the dispatch tax amortizes) that `return 0` unconditionally. llama2 stays in EXAMPLES
 # because it IS run -- gated on $(MODEL) and skipped with a message when the model is absent.
 #
-# test_f16colsplit is here for a DIFFERENT reason, and it is the interesting one. Unlike the others it is a
-# real test: it checks three shapes bit-exact against a CPU reference and returns its fail flag. But it
-# cannot be run in the suite yet -- QUARANTINED, with evidence:
-#   standalone (sudo npu_guard -- ./test_f16colsplit): PASS in ~15s, all three shapes maxerr=0.00e+00
-#   inside `make test`:                                HARD-WEDGED the board, twice (no ping/SSH, needed a
-#                                                      plug power-cycle both times; ~140s in on the retry)
-# BISECTED 2026-09-03, and the obvious suspect is EXONERATED. The failure is real and always lands here:
-#   [ork] ERROR: doorbell sentinel never landed (op=run_loop dom=0 nout=35840, waited 60000 ms)
-# logged immediately after "TEST_MODE_TRANSITION: PASS" in both wedged runs -- the committed-but-never-
-# completes signature, and the 60s wait is what made the suite look like it hung at ~140s.
-#
-# But it is NOT caused by the preceding test order. Prefix bisection (reboot, run the first N suite tests,
-# then this one) SURVIVED at every N tried, including N=36 -- the exact prefix that precedes it in the
-# suite, all 36 rc=0. And the real `make test` with this line registered PASSES on a freshly booted board,
-# twice in a row.
-#
-# What does correlate is PRIOR FAULT STATE IN THE SAME BOOT. On the third consecutive suite run the guard
-# refused to start: run 2 had produced one real "RKNPU: job timeout" (dmesg, t=138s) -- the suite still
-# passed -- and that single event inside npu_guard's 120s window blocked run 3. So the working hypothesis
-# is that this test is sensitive to a preceding job timeout from ANYWHERE in the suite, not to a mode left
-# by any particular predecessor. n=1 on that correlation, so it is a lead, not a conclusion.
-#
-# INSTRUMENTED 2026-09-03 (kernel #60, #patch71: counters on rknpu_job_next's dispatch decision), and BOTH
-# hypotheses above are FALSIFIED:
-#   dbg_blocked_slow = 0   -- dispatch was NEVER declined because a stale job still owned the core
-#   job faults       = 0   -- no abort/timeout/commit-failed in the boot, yet it still reproduced
-# So it is neither a stuck owner blocking the queue nor prior fault state. It is an intermittent
-# (~1 run in 2) doorbell sentinel failure on this test's FIRST op, at dom=0, with the kernel reporting
-# nothing at all. Per the project's own rule that "committed, never completes, no error" has never once
-# been silicon, the remaining candidates are a page-table/domain mismatch or a completion the poll cannot
-# see -- not the queue. Next probe: at sentinel-failure time dump the PC task counter, whether an IRQ fired
-# for that job, and the live domain vs the weight's domain.
-#
-# ROOT CAUSE FOUND 2026-09-03 (kernel #61 + the userspace probe in npu/core/submit.c). At the stall:
-#   commit+0 irq+0 done+0 | submit_dom=0 weight_dom=0 => NEVER COMMITTED, and the domains MATCH
-# so it is not a page-table mismatch -- a genuine counterexample to this project's usual rule. The kernel
-# then names the culprit:
-#   core 0: NOT dispatching -- still owned by job (flags 0x2, age 60313754us, int_cnt 1, run_cnt 0)
-# flags 0x2 = RKNPU_JOB_NONBLOCK, run_cnt 0 = dispatched, int_cnt 1 = NEVER DECREMENTED, i.e. no completion
-# was ever accounted for it. That job owns core 0 permanently and every later submit queues behind it and
-# never commits. So: a NONBLOCK job is committed to the hardware, its completion is never accounted, and
-# the core is dead for the rest of the process.
-#
-# Still quarantined: the fix is in the kernel's NONBLOCK completion accounting, not here, and until it
-# lands this test makes the suite red about every other run.
-#
-# Two dead ends recorded so it is not re-tried: dispatch was NOT blocked by prior fault state (job faults=0
-# in a reproducing boot), and re-driving the queue after a soft reset (#patch72, which fixes a REAL but
-# different hole -- job_next bails while soft_reseting and nothing re-promotes) does not fix this one; it
-# only made the stuck owner observable.
-DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued test_f16colsplit
+# (test_f16colsplit WAS quarantined here from 2026-09-02: it passed standalone but hard-wedged the board
+# inside the suite. Root-caused 2026-09-03 to a kernel bug -- RKNPU_IOCTL scoped the power reference to the
+# IOCTL, so a NONBLOCK submit dropped it while the job was still running; the deferred power-off then fired
+# and the completion interrupt landed on an unpowered block, where the handler must bail. The completion
+# was never accounted, that core stayed owned forever, and every later submit queued behind it and never
+# committed. Measured: cnt_unpow=3441 dropped interrupts. Fixed by scoping the reference to the JOB
+# (kernel #patch73, mirroring the #patch64 dom_held pattern); cnt_unpow=0 and four consecutive suites pass.
+# It is back in EXAMPLES above. NOTE it needs that kernel fix -- on a kernel without #patch73 it will fail
+# roughly every other run.)
+
+DIAGNOSTICS := test_baseline test_registers test_layouts bench test_nf4_decode test_moe_dispatch test_job_abort_queued
 TESTS :=
 
 all: check-registry check-install $(EXAMPLES) $(TESTS) $(DIAGNOSTICS)
@@ -608,7 +568,7 @@ SUDO ?= sudo -E
 # loop, because orkd_seq_probe needs ORK_USE_ORKD=1 and the loop has one shared environment.
 test: $(EXAMPLES) $(TESTS) $(DIAGNOSTICS) chain_xition_probe chainrr_conc_probe orkd orkd_probe orkd_ring_probe orkd_seq_probe orkd_dom_api
 	@fail=0; ORKD_BIN=$$PWD/orkd; export ORKD_BIN; \
-	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_i4_dump_cpu" "test_cpu_gemm" "test_offline_load" "test_f16_load" "test_grouped_i8" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
+	for t in "test_api_parity" "test_spine" "test_activations" "test_matmul" "test_bmm" "quant" "i4" "perplexity_i4" "layer" "decode" "model 1" "model 12" "test_speed" "test_chain_i4" "test_gptq" "test_i4_dump_cpu" "test_cpu_gemm" "test_offline_load" "test_f16_load" "test_grouped_i8" "test_slice_rescue" "test_i4_gemm" "test_sn3" "test_affinity" "test_stream_interleave" "test_mm_i8_out8" "test_silu_native" "test_ewmul_i8" "test_ewmul_f16" "test_ewmul_i16" "test_silu" "test_add" "test_gelu" "test_ssd_chunk" "test_ssd_chunk_npu" "test_mode_transition" "test_f16colsplit" "chain_xition_probe" "test_bmm_fused" "chainrr_conc_probe"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
 	for t in "orkd_probe mm" "orkd_ring_probe" "orkd_dom_api"; do \
 	 echo "== $$t"; $(SUDO) timeout -k 15 $(TEST_TIMEOUT) ./$$t || fail=1; done; \
