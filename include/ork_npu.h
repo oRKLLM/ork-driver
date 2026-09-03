@@ -27,7 +27,7 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  * a short git hash ("MAJOR.MINOR.PATCH+g<hash>") when built with -DORK_GIT_HASH (the Makefile injects
  * it where git is available).
  */
-#define ORK_NPU_VERSION "1.0.122"
+#define ORK_NPU_VERSION "1.0.123"
 /* On-disk .orkpack format version — DECOUPLED from the library MAJOR. Bump this ONLY when the persisted bytes'
  * meaning changes (tile layout/geometry or quant rule); it stays at the MAJOR of the last format-changing
  * release. The 1.0.0 release did NOT change the format, so it stays 0 (existing .orkpacks remain valid). */
