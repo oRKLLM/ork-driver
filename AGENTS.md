@@ -140,7 +140,11 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   domains, dma-buf imports, reset paths, the domain refcount, the ms/us timeout bug) are catalogued on the
   wiki page *Vendor-Kernel-Behaviour* — read it before touching anything IOMMU-, submit- or reset-related.
   Note especially: "job committed, PC task counter 0x0, no interrupt, no error" has NEVER once been silicon
-  in this project; every instance was a page-table mismatch.** Kernel diffs live THERE, not here — this repo is a userspace library
+  in this project — but as of 2026-09-03 it is no longer always a page-table mismatch either. The
+  counterexample is a NONBLOCK submit whose completion interrupt was DROPPED because the NPU was powered
+  down under the still-running job (kernel #patch73), with the domains matching. Check job accounting
+  FIRST — `cat /sys/kernel/debug/rknpu/counters` (`unpow`/`blocked_slow`) and `dmesg | grep "NOT
+  dispatching"` — then the domain, then the hardware.** Kernel diffs live THERE, not here — this repo is a userspace library
   over the stock DRM uABI and should stay one. **The kernel work itself lives in
   [`oRKLLM/rk3588-kernel`](https://github.com/oRKLLM/rk3588-kernel)** (a fork of the VENDOR tree
   `rockchip-linux/kernel`, not the armbian copy): branch `rknpu-iommu-rework` is proposed upstream as
