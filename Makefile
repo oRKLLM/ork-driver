@@ -1203,6 +1203,9 @@ spine_layer_probe: tools/spine_layer_probe.c $(COBJ)
 chainrr_bench_probe: tools/chainrr_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+decode_bw_probe: tools/decode_bw_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 attn_decode_bench_probe: tools/attn_decode_bench_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
