@@ -25,6 +25,17 @@
 #                2 = + fused FFN decode chain and q,k,v / gate-up group fusion at M==1
 # min_m:         routing threshold; 0 = leave to the default/calibration.
 #
+# ALL ROWS MEASURED 2026-09-04 on rk3588 (A76 @2400 MHz, kernel 6.1.115 #70, governors performance),
+# ork_bench P=512 G=32, route 0 vs route 2 (and route 1 where it mattered).
+#
 # soc     n_layer  n_embd   n_ff  attn_kv  decode_route  min_m
-rk3588         28    1024   3072     1024             0      0   # qwen3-0.6b-f16
-rk3588         28    2048  12288     1024             0      0   # qwen3-1.7b-f16
+rk3588         28    1024   3072     1024             0      0   # qwen3-0.6b-f16      CPU 15.70 vs r2 5.12-5.58 (NPU 2.8-3x slower)
+rk3588         28    2048  12288     1024             0      0   # qwen3-1.7b f16+q8_0 CPU 10.21 vs r2 10.36 (tie in noise) — ONE row covers both source precisions
+rk3588         28    1536  17920      256             0      0   # qwen2.5-1.5b-q8_0   CPU 11.51 vs r2 11.48 (tie in noise)
+rk3588         24    1024   3584        0             1      0   # qwen3.5-0.8b-bf16   *** NPU WINS *** CPU 2.44 vs r1 3.13 (1.28x, +-0.4% over 3 trials); r1==r2 so the fused FFN adds nothing
+#
+# NOT keyable, measured and left on the default (their fingerprint collapses to n_layer alone — SSM models
+# have no attn_q/ffn_gate/attn_k tensors — so a row would risk colliding with any future model of the same
+# depth). Both measured CPU-decode-best anyway, which IS the default:
+#   mamba2-130m-f16  (24/0/0/0)  CPU 64.88-67.77 vs r2 36.30
+#   mamba2-2.7b-q8   (64/0/0/0)  CPU 6.47        vs r2 6.09
