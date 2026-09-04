@@ -639,6 +639,69 @@ int ork_mm_attn_orkd(ork_npu *c, ork_w *wkt, ork_w *wones, ork_w *wv,
 /* RR variant: nchains fused-attn chains (per-chain wkt/wv, shared wones) fanned across the daemon's cores in ONE
  * round-trip (ORKD_ATTN_RR / ork_mm_run_chains_rr_biased). Q = nchains*Nq*Kp int8 (chain-major); Sigma =
  * nchains*Nq*32, av = nchains*Nq*dv int32 (attn_c = av_c/Sigma_c). All weights must be daemon-resident. -3 if not. */
+/* DIRECT-MODE twin of ork_mm_attn_rr_orkd (below), same flat argument shape.
+ *
+ * ork_mm_attn_rr_orkd requires c->daemon and returns -3 without it, which is correct for what it is --
+ * a transport shim -- but it meant a consumer running the library IN-PROCESS had no way to reach the
+ * fused attention chain at all. ggml-ork called it unconditionally and silently fell back to the
+ * 2-submit host-softmax path on every decode step; measured, that fallback is ~2.4x SLOWER than the
+ * fused chain and turned an intended decode win into a 3.3x end-to-end regression.
+ *
+ * So the chain assembly lives here, once, and both paths use it -- the same reason orki_layer_mm was
+ * moved out of orkd.c. The daemon handler builds the identical 4-task graph from ids it has resolved;
+ * this builds it from ork_w* the caller already holds.
+ *
+ *   t0 QK^T   Q[Nq,Kp] x wkt[Kp,Nk]  -> scores      (requant r_mult/r_shift)
+ *   t1 exp    SDP on t0's output, on-chip           (kind 2, biased exp LUT)
+ *   t2 reduce e x wones[Nk,32]        -> Sigma       (every output column is the same sum)
+ *   t3 e.V    e x wv[Nk,dv]           -> av
+ *
+ * Sigma and av are the CALLER's, laid out chain-major then row: Sigma[(n*Nq+q)*32], av[(n*Nq+q)*dv].
+ * The chain writes them in place, so there is no copy. Only the two intermediates are allocated here.
+ * Weights must be LOCAL (not daemon-resident) -- the mirror of the is_orkd check in the orkd twin.
+ * 0/ok, <0 on error; the caller is expected to have a working fallback either way. */
+int ork_i8_attn_run_rr(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
+                       int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                       double in_scale, double out_scale, double max_bias,
+                       const int8_t *Q, int32_t *Sigma, int32_t *av){
+    if (!c || c->daemon || nchains < 1 || !wkt || !wones || !wv) return -3;
+    if (Nq < 1 || Nk < 1 || Kp < 1 || dv < 1 || !Q || !Sigma || !av) return -2;
+    if (wones->is_orkd) return -3;
+    /* THE DIMS ARE THE CALLER'S; THE WEIGHTS ARE OURS -- the same trap the daemon handler guards. A
+     * matmul reads A as [Nq x K] and writes C as [Nq x N] from the RESIDENT weight's own K,N, so an
+     * understated Nk writes past scb and an understated Kp reads past Q. Ask each weight what it is. */
+    { int wk = 0, wn = 0;
+      ork_w_dims(wones, &wk, &wn); if (wk != Nk || wn != 32) return -2;
+      for (int n = 0; n < nchains; n++){
+          if (!wkt[n] || !wv[n] || wkt[n]->is_orkd || wv[n]->is_orkd) return -3;
+          ork_w_dims(wkt[n], &wk, &wn); if (wk != Kp || wn != Nk) return -2;
+          ork_w_dims(wv[n],  &wk, &wn); if (wk != Nk || wn != dv)  return -2; } }
+    const size_t nb = (size_t)Nq * Nk * 4;
+    int32_t **scb = calloc(nchains, sizeof *scb), **eb = calloc(nchains, sizeof *eb);
+    ork_mm_task_i8 (*tk)[4] = calloc(nchains, sizeof *tk);
+    const ork_mm_task_i8 **chains = calloc(nchains, sizeof *chains);
+    int *S = calloc(nchains, sizeof *S);
+    int rc = -1;
+    if (scb && eb && tk && chains && S){
+        int oom = 0;
+        for (int n = 0; n < nchains && !oom; n++){
+            scb[n] = malloc(nb); eb[n] = malloc(nb);
+            if (!scb[n] || !eb[n]){ oom = 1; break; }
+            tk[n][0] = (ork_mm_task_i8){ wkt[n], Nq, (int8_t*)(Q + (size_t)n*Nq*Kp), scb[n] };
+            tk[n][1] = (ork_mm_task_i8){ wkt[n], Nq, (int8_t*)scb[n],                eb[n]  };
+            tk[n][2] = (ork_mm_task_i8){ wones,  Nq, (int8_t*)eb[n],  Sigma + (size_t)n*Nq*32 };
+            tk[n][3] = (ork_mm_task_i8){ wv[n],  Nq, (int8_t*)eb[n],  av    + (size_t)n*Nq*dv };
+            chains[n] = tk[n]; S[n] = 4;
+        }
+        ork_chain_op ops[4] = { {1,-1,0,r_mult,r_shift}, {2,0,0,0,0}, {0,1,0,0,0}, {0,1,0,0,0} };
+        if (!oom) rc = ork_mm_run_chains_rr_biased(c, nchains, chains, S, ops, in_scale, out_scale, max_bias);
+    }
+    if (scb) for (int n = 0; n < nchains; n++) free(scb[n]);
+    if (eb)  for (int n = 0; n < nchains; n++) free(eb[n]);
+    free(scb); free(eb); free(tk); free(chains); free(S);
+    return rc;
+}
+
 int ork_mm_attn_rr_orkd(ork_npu *c, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
                         int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
                         double in_scale, double out_scale, double max_bias, const int8_t *Q, int32_t *Sigma, int32_t *av){

@@ -58,6 +58,15 @@ int          ork_mm_run_chains_rr(ork_npu *ctx, int nchains, const ork_mm_task_i
 /* Same concurrent round-robin, but the fused exp bakes in a scalar max_bias (e=exp((score-max_bias)*in_scale)/
  * out_scale) so the chains are correct on REAL scores without a live max — fans N attention cores' fused
  * [QK^T->exp->reduce,e.V] chains across the NPU cores. Reloads the per-core device LUT on rebuild. 0/ok,<0 err. */
+/* DIRECT-MODE fused attention fan-out: nchains [QK^T->exp->reduce,e.V] chains across the NPU cores from
+ * one dispatch, built from ork_w* the caller holds. The flat-argument twin of ork_mm_attn_rr_orkd, which
+ * needs a daemon and returns -3 without one -- an in-process consumer had no route to the fused chain at
+ * all before this. Sigma/av are the caller's, chain-major then row: Sigma[(n*Nq+q)*32], av[(n*Nq+q)*dv].
+ * Weights must be local (not daemon-resident). 0/ok, <0 err. */
+int          ork_i8_attn_run_rr(ork_npu *ctx, int nchains, ork_w *const *wkt, ork_w *wones, ork_w *const *wv,
+                                int Nq, int Nk, int Kp, int dv, int r_mult, int r_shift,
+                                double in_scale, double out_scale, double max_bias,
+                                const int8_t *Q, int32_t *Sigma, int32_t *av);
 int          ork_mm_run_chains_rr_biased(ork_npu *ctx, int nchains, const ork_mm_task_i8 *const *chains, const int *S,
                                   const ork_chain_op *ops, double in_scale, double out_scale, double max_bias);
 /* ORKD coalesced SwiGLU FFN: run the whole [gate->silu->up->glu->down] inner as ONE daemon-side HW-chained

@@ -370,6 +370,10 @@ int main(int argc, char** argv){
 
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx   = P + G + 64;
+    // Pin ONE sequence. llama.cpp divides n_ctx across n_seq_max, so leaving the default quartered the
+    // usable context: a P=1024 run reported n_ctx_seq=256 and could never grow the KV cache past it,
+    // which silently caps any length-dependent path (e.g. the gated NPU decode attention) below its gate.
+    cp.n_seq_max = 1;
     cp.n_batch = P > UB ? P : UB;
     cp.n_ubatch= UB;
     cp.n_threads = 4; cp.n_threads_batch = 4;
