@@ -150,6 +150,40 @@ int main(int argc,char**argv){
         if(wg)ork_mm_free(c,wg); if(wu)ork_mm_free(c,wu); if(wd)ork_mm_free(c,wd);
         free(Bg);free(Bd);free(xi);free(gl);free(gi);free(ui);free(di);free(glf);
     }
+    /* PRECOMPILED-CACHE A/B (ORK_BW_PC=1). The per-call host cost is the real target (kernel #patch74
+     * showed hardware is identical across contexts and the sentinel poll never waits), and ork_pc_* is the
+     * mechanism aimed at it: compile the regcmd ONCE, then per call only refresh A and submit -- no synth,
+     * no validate, no K-slice accumulate. Two costs to weigh against that: it requires the output C in an
+     * ork DMA buffer, and it submits SINGLE-CORE (core_mask=1) where colsplit spreads K-slices over 3.
+     * So it trades host cost for hardware time, and only a measurement says which wins at a given shape. */
+    if(getenv("ORK_BW_PC")){
+        int32_t *Cd = (int32_t*)ork_dma_alloc(c, (size_t)N*4);
+        if(!Cd){ printf("  PC: ork_dma_alloc failed\n"); }
+        else {
+            ork_mm_task_i8 t1 = { w[0], 1, A, Cd };
+            ork_pc_chain *pc = ork_pc_compile(c, 1, &t1);
+            if(!pc){ printf("  PC: ork_pc_compile REFUSED this shape (K%%512=%d K=%d Sn=%d)\n", K%512, K, 1); }
+            else {
+                ork_pc_run(pc);                                     /* warm (cold pass is internal) */
+                hw_zero(); double t0=now_us();
+                for(int r=0;r<REP;r++) ork_pc_run(pc);
+                double us=(now_us()-t0)/REP;
+                unsigned long long hs=0; unsigned long hn=0; hw_read(&hs,&hn);
+                printf("  PC (precompiled, single-core): %8.3f ms/call | KERNEL hw=%.1f us/job (%.1f jobs/call)\n",
+                       us/1000.0, hn?(double)hs/hn/1000.0:0.0, (double)hn/REP);
+                /* same shape through the normal path, for the A/B */
+                ork_mm_task_i8 t2 = { w[0], 1, A, C[0] };
+                ork_i8_mm_run_chain(c,1,&t2);
+                hw_zero(); t0=now_us();
+                for(int r=0;r<REP;r++) ork_i8_mm_run_chain(c,1,&t2);
+                double us2=(now_us()-t0)/REP; hw_read(&hs,&hn);
+                printf("  normal (synth per call, 3-core): %8.3f ms/call | KERNEL hw=%.1f us/job (%.1f jobs/call)  => PC is %.2fx\n",
+                       us2/1000.0, hn?(double)hs/hn/1000.0:0.0, (double)hn/REP, us2/us);
+                ork_pc_free(pc);
+            }
+            ork_dma_free(c, Cd);
+        }
+    }
     printf("PASS — bandwidth scaling measured\n");
     for(int i=0;i<NW;i++){ ork_mm_free(c,w[i]); free(C[i]); }
     ork_npu_free(c); free(A); free(B); return 0;

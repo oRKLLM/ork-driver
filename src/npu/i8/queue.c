@@ -109,6 +109,11 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
     unsigned pcsf = getenv("ORK_PC_NO_SRAM") ? 0 : RKNPU_MEM_TRY_ALLOC_SRAM;
     pc->pool = orki_bcreate(fd, (size_t)S * REGCMD_I8_N * 4, 0x403 | pcsf, c->dom_active);
     if (!pc->pool.cpu) { free(pc); return NULL; }
+    /* 0x40b keeps RKNPU_MEM_KERNEL_MAPPING (0x8) — the kernel READS descriptors, so dropping it yields a
+     * malformed task. DRAM deliberately, NOT SRAM: SRAM-placing a kernel-read buffer hard-wedged the board
+     * (2026-09-04). Only the regcmd pool above is NPU-read and therefore SRAM-safe. */
+    pc->tk = orki_bcreate(fd, (size_t)S * sizeof(struct rknpu_task), 0x40b, c->dom_active);
+    if (!pc->tk.cpu) { orki_bdestroy(fd, &pc->pool); free(pc); return NULL; }
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < S; i++) { ork_w *w = tasks[i].w; int K = w->K;
         pc->ascr[i] = orki_bcreate(fd, (size_t)K, 0x403 | pcsf, c->dom_active);
@@ -134,12 +139,12 @@ ork_pc_chain *ork_pc_compile(ork_npu *c, int S, const ork_mm_task_i8 *tasks) {
 int ork_pc_run(ork_pc_chain *pc) {
     if (!pc) return -1; ork_npu *c = pc->c; int fd = c->fd, S = pc->S, N = pc->N;
     for (int i = 0; i < S; i++) { memcpy(pc->ascr[i].cpu, pc->asrc[i], (size_t)pc->Ksz[i]); orki_bsync(fd, &pc->ascr[i], RKNPU_MEM_SYNC_TO_DEVICE); }
-    struct rknpu_task *t = c->task.cpu; memset(t, 0, (size_t)S * sizeof *t);
+    struct rknpu_task *t = pc->tk.cpu; memset(t, 0, (size_t)S * sizeof *t);
     for (int p = 0; p < S; p++) { t[p].enable_mask = 0xd; t[p].int_mask = 0x300; t[p].int_clear = 0x1ffff;
         t[p].regcfg_amount = 108; t[p].regcmd_addr = pc->pool.dma + (size_t)p * REGCMD_I8_N * 4; }
-    orki_bsync(fd, &c->task, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(fd, &pc->tk, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
     struct rknpu_submit sub; memset(&sub, 0, sizeof sub);
-    sub.flags = ork_ppflags() | 0x2u; sub.task_number = S; sub.task_obj_addr = c->task.obj; sub.core_mask = 1; sub.fence_fd = -1;
+    sub.flags = ork_ppflags() | 0x2u; sub.task_number = S; sub.task_obj_addr = pc->tk.obj; sub.core_mask = 1; sub.fence_fd = -1;
     sub.subcore_task[0] = sub.subcore_task[1] = sub.subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)S};
     sub.timeout = orki_mm_timeout_ms();
     #define ORK_PC_SEED() do { for (int x=0;x<S;x++){ volatile int32_t*db=(volatile int32_t*)(pc->outptr[x]+(N-1)); *db=ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } __asm__ volatile("dsb ish":::"memory"); } while(0)
@@ -159,4 +164,4 @@ int ork_pc_run(ork_pc_chain *pc) {
 }
 
 void ork_pc_free(ork_pc_chain *pc) { if (!pc) return; int fd = pc->c->fd;
-    for (int i=0;i<pc->S;i++) orki_bdestroy(fd,&pc->ascr[i]); orki_bdestroy(fd,&pc->pool); free(pc); }
+    for (int i=0;i<pc->S;i++) orki_bdestroy(fd,&pc->ascr[i]); orki_bdestroy(fd,&pc->tk); orki_bdestroy(fd,&pc->pool); free(pc); }

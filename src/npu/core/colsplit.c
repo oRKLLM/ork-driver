@@ -264,7 +264,9 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             /* pre-grow mrc/mtk for this core: fp16 chunks are small (<=8 @ K>=2048) => Sk*ceil(M/chunk) programs.
              * bound generously (512); tkf re-fetched after any grow. */
             size_t needrc = (size_t)512 * REGCMD_N * 4, needtk = (size_t)512 * sizeof(struct rknpu_task);
-            if (RC->size < needrc) { orki_bdestroy(fd, &c->mrc[i]); c->mrc[i] = orki_bcreate(fd, needrc, 0x403, c->dom_active);
+            /* keep the SRAM request on the regrow path too, else a grown chain silently drops to DRAM */
+            if (RC->size < needrc) { orki_bdestroy(fd, &c->mrc[i]);
+                c->mrc[i] = orki_bcreate(fd, needrc, 0x403 | (getenv("ORK_NO_SRAM_DB") ? 0u : (uint32_t)RKNPU_MEM_TRY_ALLOC_SRAM), c->dom_active);
                 if (!c->mrc[i].cpu) { free(h); return NULL; } RC = &c->mrc[i]; c->mwarm[i] = 0; }
             if (c->mtk[i].size < needtk) { orki_bdestroy(fd, &c->mtk[i]); c->mtk[i] = orki_bcreate(fd, needtk, 0x40b, c->dom_active);
                 if (!c->mtk[i].cpu) { free(h); return NULL; } tkf = (struct rknpu_task*)c->mtk[i].cpu; }

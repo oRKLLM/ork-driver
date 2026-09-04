@@ -440,6 +440,12 @@ struct ork_dyn_queue { ork_npu *c; int chunk_max, ncore, linger_us; ork_mm_task_
 struct ork_pc_chain {
     ork_npu *c; int S, N, warmed; unsigned dom;
     struct buf pool;                 /* S precompiled programs, contiguous in one buffer */
+    /* OWN task-descriptor array, SRAM-requested like the pool. It used to borrow c->task, which is the
+     * SHARED descriptor buffer the doorbell also builds into — so a precompiled chain interleaved with any
+     * normal submit clobbered the other's descriptors. Observed as a reset storm the moment both ran in
+     * the same decode step. The descriptors ARE the per-call work here (rewriting regcmd_addr to select
+     * which precompiled program runs), so they belong to the chain, next to the programs they point at. */
+    struct buf tk;
     struct buf ascr[512];            /* per-program fixed A scratch (address baked into the program) */
     const void *asrc[512]; int Ksz[512];   /* caller's A source + K, re-read each run */
     struct buf *outbuf[512]; int32_t *outptr[512];

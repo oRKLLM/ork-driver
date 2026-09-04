@@ -363,7 +363,21 @@ int orki_mc_ensure(ork_npu *c,int nc){
     }
     for(int i=0;i<nc;i++){
         if(c->mrc[i].cpu) continue;        /* alloc once, per core, up to the max ever requested */
-        c->mrc[i]=orki_bscratch(c,65536,0x403,c->dom_active); c->mtk[i]=orki_bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=orki_bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
+        /* PER-CORE DOORBELL BUFFERS IN ON-CHIP SRAM when the kernel/DTB provide it. These are re-bsync'd on
+         * EVERY submit (mrc TO_DEVICE, mtk TO|FROM_DEVICE), and that cache maintenance is pure per-call host
+         * cost — which is the M=1 decode wall (kernel-side hardware time is identical between a tight probe
+         * and a real consumer, and the sentinel poll never waits; see the wiki Optimization Roadmap). They
+         * are small (64 KB each) against a 956 KB region, so unlike the 2 MB c->regcmd they fit whole.
+         * TRY_ALLOC_SRAM is a *try*: orki_bcreate fails it over to DRAM when there is no SRAM or it is
+         * full, so this is safe on a stock kernel/DTB. ORK_NO_SRAM_DB opts out for A/B.
+         *
+         * REGCMD ONLY -- NOT the task descriptors (mtk). Descriptors are 0x40b, i.e. they carry
+         * RKNPU_MEM_KERNEL_MAPPING because the KERNEL reads them, and SRAM-placing a kernel-read buffer
+         * HARD-WEDGED the board (no ping, plug power-cycle to recover) on 2026-09-04. ork_pc_compile made
+         * the same distinction all along: it SRAM-requests its regcmd pool (0x403) and nothing else.
+         * mrc is NPU-read, so it is the safe one. Do not add dbsf to a 0x40b buffer. */
+        const uint32_t dbsf = getenv("ORK_NO_SRAM_DB") ? 0u : (uint32_t)RKNPU_MEM_TRY_ALLOC_SRAM;
+        c->mrc[i]=orki_bscratch(c,65536,0x403|dbsf,c->dom_active); c->mtk[i]=orki_bscratch(c,65536,0x40b,c->dom_active); c->maf[i]=orki_bscratch(c,(size_t)4*32768*2,0x403,c->dom_active);
         if(!c->mrc[i].cpu||!c->mtk[i].cpu||!c->maf[i].cpu) {
             fprintf(stderr, "[ork] ERROR: mc_ensure failed to allocate multi-core buffers for core %d (IOMMU full?)\n", i);
             return -1;
