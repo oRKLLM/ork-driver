@@ -7,7 +7,8 @@
  *
  * WHAT THIS IS (and the two places it diverges from a naive reading of the design):
  *
- *  1. Submission model. The kernel rejects task_number>1 (tools/batch_probe.c proved this — it
+ *  1. Submission model. STALE: "the kernel rejects task_number>1" (batch_probe) is REFUTED -- vendor int4
+ *     batches multi-task with task_number=rows, and our chain assemblers do it routinely. Original note: it
  *     times out). The *proven* monolithic-chain mechanism is task_number=1 + 0x0010 NEXT-pointer
  *     patching, which is exactly what ork_i8_mm_run_chain() already synthesizes: E expert matmuls
  *     strung into a single driver flight. So we chain, we do not "fuse N tasks".

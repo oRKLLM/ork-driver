@@ -552,7 +552,11 @@ the kernel NPU driver (recover with `sudo reboot`; re-pin governors afterwards, 
 ### Diagnostic tools (board only; not in `all`/`test`)
 - `make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters] [a]` — per-matmul ork vs the closed RKNN matmul API (same int8 (M,K,N)); `a` arg = the AC-layout probe.
 - `make mc_prof && sudo ./mc_prof [M] [K] [N] [iters]` — per-core copy/submit/accumulate breakdown; `ORK_TEST_DMA=1` puts A in a zero-copy DMA buffer.
-- `make batch_probe && sudo ./batch_probe [ntask]` — multi-task-per-submit probe (it times out; the kernel rejects `task_number>1`).
+- `make batch_probe && sudo ./batch_probe [ntask]` — multi-task-per-submit probe. **Its "the kernel rejects
+  `task_number>1`" verdict is REFUTED** — the vendor's own int4 path batches multi-task with
+  `task_number`=rows (`tools/re/README.md`), and our chain assemblers submit multi-task graphs routinely
+  (see "Multi-task hardware chaining" above). The probe times out for its own reasons; do not read it as
+  "chaining is impossible" — that reading has cost re-derivation more than once.
 - `sudo tools/bench_monitored.sh --label L -- <cmd>` — wraps any workload (e.g. `llama-bench`/`llama-completion`) and samples RK3588 resource use (RAM, RAM-bandwidth via DMC `devfreq/dmc/load`, NPU, GPU, CPU, swap — same sources as oRKLLM's `monitor.js`), printing per-resource **avg + peak**. Sampler pins to the little cores (`--sampler-cpus`, default `0-3`) so it doesn't perturb the workload. Makes a tok/s number attributable: it revealed decode is **latency/serialization-bound, NOT bandwidth-bound** (decode leaves NPU ~90% idle and RAM-BW at ~26% avg / 75% peak — nothing saturates). Isolate decode with `llama-bench -p 0 -n N` or a short-prompt/long-generation completion.
 
 ### Zero-copy DMA (`ork_dma_alloc`/`ork_dma_free`)

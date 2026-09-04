@@ -6,7 +6,7 @@
  *
  *   (1) M-batch amortization curve: ork_f16_mm_run at M = 1,2,4,8,16 on a target-shaped matmul. The
  *       correct primitive is a single M=N matmul (the M-scheduler / prefill path) — NOT a multi-task
- *       submit (task_number>1 is broken on the rknpu kernel: EINVAL/timeout). If M=N collapses the
+ *       submit (STALE: "task_number>1 is broken" is REFUTED -- see OPS_REGISTRY chain assemblers). If M=N collapses the
  *       per-token cost, the floor is amortized.
  *   (2) Accept-gate cost: the CPU NEON logit-argmax + accept/reject sweep over the N-token tree, in
  *       place (no tensor re-allocation). Must stay a tiny fraction of one verify forward or it leaks
