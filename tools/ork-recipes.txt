@@ -1,0 +1,30 @@
+# ork-recipes — published per-model routing recipes.
+#
+# Tuning is DATA, not knobs. The right routing for a model cannot be guessed (this project has had
+# microbenchmarks predict wins that measured as 3-5x regressions), and making every user sweep for it is
+# worse than measuring once and publishing. Drop this file at one of the searched paths and ggml-ork picks
+# it up at model load — no recompile, no repack.
+#
+# Searched, first match wins:
+#   $ORK_RECIPES  ·  ./ork-recipes.txt  ·  ~/.config/ork/recipes.txt  ·  /etc/ork/recipes.txt
+# An external row overrides the compiled-in table. A locally measured pack calibration outranks both (it
+# was measured on THAT machine and re-verified against it). ORK_DECODE_ROUTE is a development override.
+#
+# KEY = (model shape fingerprint x SoC). A shape tuple rather than a name, because what decides whether a
+# route pays is geometry against achieved bandwidth — so two fine-tunes of one architecture inherit the
+# same recipe automatically. Read the fingerprint off any run:
+#     [ORK RECIPE] model fingerprint: n_layer=.. n_embd=.. n_ff=.. attn_kv=.. soc=..
+#
+# SoC is part of the key and rows apply ONLY on a match: a recipe measured on a board with the A76s
+# unlocked to 2400 MHz and a custom kernel must not be applied blind to a stock board. Anything unmatched
+# falls back to the safe default — which is also the measured-best config on every model so far, so an
+# absent model loses nothing.
+#
+# decode_route:  0 = decode on CPU (the measured-best default everywhere so far)
+#                1 = dense M==1 matmuls on the NPU
+#                2 = + fused FFN decode chain and q,k,v / gate-up group fusion at M==1
+# min_m:         routing threshold; 0 = leave to the default/calibration.
+#
+# soc     n_layer  n_embd   n_ff  attn_kv  decode_route  min_m
+rk3588         28    1024   3072     1024             0      0   # qwen3-0.6b-f16
+rk3588         28    2048  12288     1024             0      0   # qwen3-1.7b-f16

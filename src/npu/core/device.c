@@ -398,3 +398,11 @@ void ork_npu_reap_stuck(ork_npu *c, int nc){
     }
     orki_bdestroy(fd,&A); orki_bdestroy(fd,&B); orki_bdestroy(fd,&Cc);
 }
+
+/* The DETECTED SoC id, or NULL before init / on an unknown part. Lives here rather than in the scaffold:
+ * it is a dtype-agnostic caps-registry query, and npu.c is ratcheted to shrink. Exposed because a
+ * consumer's tuning is SoC-conditional -- a published per-model recipe must be keyed by the part rather
+ * than applied blind to whatever board it lands on. */
+const char *ork_npu_soc_id(ork_npu *c){
+    return (c && c->soc) ? c->soc->id : NULL;
+}

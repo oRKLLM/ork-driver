@@ -11,6 +11,11 @@
 #define ORK_CONTEXT_H
 /** @brief Runtime library version. @return "MAJOR.MINOR.PATCH" or "MAJOR.MINOR.PATCH+g<hash>". */
 const char  *ork_npu_version(void);
+/* The DETECTED SoC id ("rk3588", "rk3576", ...), or NULL before init / on an unknown part. Read-only and
+ * owned by the caps registry. Exposed because a consumer's tuning is SoC-conditional: what routing pays
+ * depends on the part, so a published per-model recipe has to be keyed by it (see the wiki Model-Recipes
+ * page) rather than applied blind to whatever board it lands on. */
+const char  *ork_npu_soc_id(ork_npu *ctx);
 
 /**
  * @brief On-disk pack-format (.orkpack) compatibility token — the library's MAJOR version.
