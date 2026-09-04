@@ -482,6 +482,26 @@ Reference (Qwen3-1.7B-w8a8, RK3588 board `10.3.0.236`, `-t 4`, warm): librkllmrt
 ### Managing Baseline Thresholds
 When committing new performance optimizations to `ork-driver` or `ggml-ork`, you MUST run the integration benchmark script (`tools/bench_two_turn.sh` via `make bench-llama`) on the Rockchip SBC to ensure there is no significant degradation (e.g., M-scheduling bugs or KV-cache penalties). 
 If your optimizations successfully increase the performance baselines above the current documented numbers, you must explicitly update the threshold constants in the test scripts (e.g., `BASELINE_DECODE` in `tools/bench_two_turn.sh`) to the new, higher values before merging. Do not allow baselines to stagnate or decay.
+### Per-model recipes — CHECK THIS BEFORE BRINGING UP A MODEL
+
+**[Model Recipes](https://github.com/oRKLLM/ork-driver/wiki/Model-Recipes) is the recommended config
+per model**, with the measurement behind every row. Read it first when starting on a model: the right
+config is model-shaped (whether a path pays depends on layer count, head geometry and weight sizes
+against measured bandwidth), and several paths that look like wins in isolation lose end-to-end. Do not
+re-derive from intuition — that has cost this project repeatedly, most recently a fused decode-attention
+path that a microbenchmark said would win 1.36-2.84x and that measured a 3-5x regression.
+
+Two tiers, and you touch neither by hand in normal use:
+- **machine**: the `.orkpack` footer's calibration record (`orkpack_calib_hdr`/`orkpack_calib`), read at
+  load and provenance-guarded by `ork_calib_valid_here()` — big-core freq (so a DTB/OPP change
+  invalidates it), core count, pack-format token, governor state, and a `uname` hash (**a kernel change
+  moves the submit floor**). Carries the resolved DECODE ROUTE and `min_m`.
+- **human**: the wiki page above, plus the quantization recipe below (a FILE property, and the biggest
+  lever there is).
+
+Sibling pages, easy to confuse: *Model Recipes* = what to use; *Benchmark Configs Registry* = what was
+set when we measured a given number; *Benchmark Standards* = how to measure at all.
+
 ### MoE models: the profile is AUTOMATIC (no knobs) — the model type decides
 
 A routed-MoE model (any `GGML_OP_MUL_MAT_ID`, detected at load-time graph planning) auto-selects the
