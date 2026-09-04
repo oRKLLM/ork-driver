@@ -115,7 +115,8 @@ void ork_parallel_for(int n, void (*fn)(int,int,void*), void *ctx);
 void orki_pin_big_core(int id);
 void orki_pin_little_core(int id);
 void orki_npu_pool_ensure(ork_npu *c);
-int ork_big_core_set(cpu_set_t *s);
+int ork_big_core_set(cpu_set_t *s);      /* honours ORK_NO_AFFINITY — for callers that pin for life */
+int orki_big_core_mask(cpu_set_t *s);    /* ignores it — for SCOPED save/set/restore around one call */
 
 /* ---- core/mode.c — the mode-transition layer (XSPEC / ork_npu_enter) ---- */
 int ork_npu_enter(ork_npu *c, int to, int profile, int chain);
@@ -133,6 +134,8 @@ extern double orki_prof_i8_us, orki_prof_i4_us;
 extern double orki_rt_setup, orki_rt_submit, orki_rt_copy;
 extern int orki_load_prof;
 extern int orki_ork_prof;
+extern double orki_db_begin_us, orki_db_end_us;   /* doorbell phase split (ORK_PROFILE) */
+extern long   orki_db_begin_n,  orki_db_end_n;
 extern int orki_xprof;
 extern long orki_fd_n;
 extern long orki_lp_nchunk;

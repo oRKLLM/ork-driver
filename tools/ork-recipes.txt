@@ -32,7 +32,7 @@
 rk3588         28    1024   3072     1024             0      0   # qwen3-0.6b-f16      CPU 15.70 vs r2 5.12-5.58 (NPU 2.8-3x slower)
 rk3588         28    2048  12288     1024             0      0   # qwen3-1.7b f16+q8_0 CPU 10.21 vs r2 10.36 (tie in noise) — ONE row covers both source precisions
 rk3588         28    1536  17920      256             0      0   # qwen2.5-1.5b-q8_0   CPU 11.51 vs r2 11.48 (tie in noise)
-rk3588         24    1024   3584        0             1      0   # qwen3.5-0.8b-bf16   *** NPU WINS *** CPU 2.44 vs r1 3.13 (1.28x, +-0.4% over 3 trials); r1==r2 so the fused FFN adds nothing
+rk3588         24    1024   3584        0             1      0   # qwen3.5-0.8b-bf16   *** NPU WINS *** CPU 2.44 vs r1 3.40 (1.40x after the doorbell big-core fix; was 1.28x before it)
 #
 # NOT keyable, measured and left on the default (their fingerprint collapses to n_layer alone — SSM models
 # have no attn_q/ffn_gate/attn_k tensors — so a row would risk colliding with any future model of the same

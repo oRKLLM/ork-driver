@@ -19,6 +19,11 @@
  * accumulate), and the submit count. Pins why large-M multi-core barely scales. Call _reset before
  * the timed region. core in [0, cores). */
 void         ork_npu_mc_reset(void);
+/* Doorbell phase split for the M=1 / colsplit regime, which the orki_mc_* counters do not cover
+ * (they are M>1 mcworker only). begin = regcmd synth + bsync + NONBLOCK ioctl; end = sentinel poll +
+ * writeback + teardown. Needs ORK_PROFILE=1. Reset with ork_npu_db_reset. */
+void         ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *end_n);
+void         ork_npu_db_reset(void);
 double       ork_npu_mc_synth(int core);   /* host synth+bsync subset of `submit` (overlappable); ioctl/NPU = submit - synth */
 
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8

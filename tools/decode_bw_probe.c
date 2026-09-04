@@ -56,6 +56,8 @@ int main(int argc,char**argv){
         ork_mm_task_i8 t[SMAX];
         for(int i=0;i<S;i++) t[i]=(ork_mm_task_i8){ w[i], 1, A, C[i] };
         if(ork_i8_mm_run_chain(c,S,t)){ printf("  %d  chain rc!=0 (declined)\n",S); continue; }   /* warm */
+        if(getenv("ORK_PROFILE")) ork_npu_db_reset();   /* reset BEFORE the timed loop, else the average
+                                                        * folds in init/pack warmups and reads absurdly high */
         double t0=now_us();
         /* ROTATE through the pool so each rep touches a different set -- the real decode access pattern. */
         /* ORK_BW_FRESH=1: malloc/free the A and C buffers EVERY rep, as the FFN decode handler does (6
@@ -76,6 +78,17 @@ int main(int argc,char**argv){
         double us=(now_us()-t0)/REP;
         double bytes=(double)S*K*N;
         printf("  %d  %5d  %8.3f  %5.2f  %5.2f\n", S, S, us/1000.0, bytes/us/1000.0, bytes/us/1000.0/S);
+        /* PER-PHASE DECOMPOSITION (ORK_PROFILE=1). copy = activation host-copy + bsync; submit = regcmd
+         * synth + ioctl + result bsync; synth = the host subset of submit, so ioctl+HW = submit - synth;
+         * acc = host K-slice accumulate. This is the comparison that was never made: the same numbers
+         * out of the FFN decode handler tell us WHICH phase costs the handler its 2.4x. */
+        if(getenv("ORK_PROFILE")){
+            double bu=0,eu=0; long bn=0,en=0;
+            ork_npu_db_timing(&bu,&bn,&eu,&en);
+            if(bn) printf("       doorbell: begin=%7.1f us/call (n=%ld)  end(poll+writeback)=%7.1f us/call (n=%ld)\n",
+                          bu/bn, bn, en?eu/en:0.0, en);
+            ork_npu_db_reset();
+        }
     }
     g_load_stop = 1; for(int i=0;i<NL;i++) pthread_join(lt[i],0);
     printf("PASS — bandwidth scaling measured\n");

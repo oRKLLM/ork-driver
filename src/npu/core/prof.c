@@ -45,3 +45,14 @@ void ork_npu_xprof_dump(void){
     for(int p=0;p<XP_NPROFILE;p++){ long tot=0; for(int f=0;f<8;f++) tot+=orki_xcount[p][f]; if(!tot) continue;
         fprintf(stderr,"  %-11s:",orki_XPNAME[p]); for(int f=0;f<8;f++) if(orki_xcount[p][f]) fprintf(stderr," %s=%ld",orki_XFROM[f],orki_xcount[p][f]); fprintf(stderr,"\n"); }
 }
+
+/* Doorbell phase split (ORK_PROFILE), incremented at the call site in run_multicore. The M=1 int8 path
+ * is begin_mc -> colsplit -> dyn_end, which the orki_mc_* counters do NOT cover (those are the M>1
+ * mcworker prefill only), so this regime had no phase breakdown at all. */
+double orki_db_begin_us = 0, orki_db_end_us = 0;
+long   orki_db_begin_n = 0,  orki_db_end_n = 0;
+
+void ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *end_n){
+    if(begin_us)*begin_us=orki_db_begin_us; if(begin_n)*begin_n=orki_db_begin_n;
+    if(end_us)*end_us=orki_db_end_us;       if(end_n)*end_n=orki_db_end_n; }
+void ork_npu_db_reset(void){ orki_db_begin_us=orki_db_end_us=0; orki_db_begin_n=orki_db_end_n=0; }

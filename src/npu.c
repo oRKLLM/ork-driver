@@ -1368,9 +1368,32 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         /* ONE doorbell submit: ork_dyn_begin_mc -> ork_dyn_begin_colsplit auto-decomposes base (M-tiled),
          * wide-N (Sn>1 N-sliced, M-tiled) and wide-K (K>4096 K-split, M-tiled) across cores, all any-M. */
         ork_mm_task_i8 t = { .w=w, .M=M, .A=(const int8_t*)A, .C=(int32_t*)C };
+        /* RUN THE DOORBELL ON A BIG CORE. This path is NONBLOCK: ork_dyn_begin_mc synthesises the regcmd,
+         * bsyncs and issues the ioctl, and ork_dyn_end SPIN-POLLS the sentinel -- all on the CALLING
+         * thread. orki_pin_big_core below is only reached on the single-core fall-through, so this branch
+         * ran on whatever core the consumer happened to be on. Under ggml that is often an A55, and it
+         * cost 1.27x end-to-end on M=1 decode (4.93 -> 6.28 tok/s when the process was taskset to the
+         * A76s), because BOTH the host half and the poll loop run at the little core's clock.
+         *
+         * SCOPED, not persistent, and to the SET rather than one core. orki_pin_big_core pins the caller
+         * to a single CPU for the rest of its life; doing that to ggml's main thread would collide with
+         * its own threadpool on that exact core -- the oversubscription the note under that function warns
+         * cratered decode 9.3 -> 2.3 tok/s. So: save the caller's mask, widen to the big cluster for the
+         * call, restore. Two syscalls against a ~700us call. ORK_NO_AFFINITY disables it via
+         * ork_big_core_set returning 0. */
+        cpu_set_t _prev, _big; int _aff = 0;
+        if (orki_big_core_mask(&_big) && pthread_getaffinity_np(pthread_self(), sizeof _prev, &_prev) == 0)
+            _aff = (pthread_setaffinity_np(pthread_self(), sizeof _big, &_big) == 0);
+        double _tb = orki_ork_prof ? ork_now_us() : 0;
         ork_dyn_chain *h = ork_dyn_begin_mc(c, 1, &t, nc);
-        if(!h) return orki_slice_rescue_or_refuse(c,w,M,A,C,nc);  /* #33: run pre-built doorbell tiles if any, else refuse (never wedge-fallback) */
-        return ork_dyn_end(h) < 0 ? -1 : 0;
+        if(orki_ork_prof){ orki_db_begin_us += ork_now_us()-_tb; orki_db_begin_n++; }
+        if(!h){ if(_aff) pthread_setaffinity_np(pthread_self(), sizeof _prev, &_prev);
+                return orki_slice_rescue_or_refuse(c,w,M,A,C,nc); }  /* #33: pre-built tiles if any, else refuse (never wedge-fallback) */
+        double _te = orki_ork_prof ? ork_now_us() : 0;
+        int _rc = ork_dyn_end(h);
+        if(orki_ork_prof){ orki_db_end_us += ork_now_us()-_te; orki_db_end_n++; }
+        if(_aff) pthread_setaffinity_np(pthread_self(), sizeof _prev, &_prev);   /* restore the caller's mask */
+        return _rc < 0 ? -1 : 0;
       }
       if(i8 && w->Sn>1 && (w->K>4096 || !w->Bf)){
         /* int8 WIDE-N with no single-submit base (no Bf, or K>4096): serve each N-slice as a standalone Sn==1

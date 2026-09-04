@@ -291,10 +291,27 @@ static long orki_sysfs_ul(const char *fmt, int cpu){
  * meaningful gap (a uniform SMP part) -- pinning to everything is the same as not pinning, which is the
  * right answer there.
  */
-int ork_big_core_set(cpu_set_t *s){
+/* TWO DIFFERENT QUESTIONS, deliberately separated.
+ *
+ * ork_big_core_set() honours ORK_NO_AFFINITY, because its callers PIN A THREAD FOR LIFE (the NPU-driver
+ * workers). ggml-ork sets that flag in direct mode for a measured reason: those workers share the 4 big
+ * cores with llama.cpp's -t 4 threadpool, and pinning them there oversubscribes and drags PREFILL
+ * (136 -> 213 t/s at M=228).
+ *
+ * orki_big_core_mask() ignores it, for callers that place work only for the DURATION OF ONE CALL and
+ * restore afterwards. That is a different trade: the M=1 doorbell runs its host half AND its spin-poll on
+ * the calling thread, and leaving it wherever the consumer happened to be costs 1.27x on decode
+ * (4.93 -> 6.28 tok/s when the process is taskset to the A76s, with the doorbell's host phase halving
+ * from ~600us to ~380us). No persistent pin, so it cannot oversubscribe the threadpool the way the flag
+ * guards against -- the prefill measurement that motivated the flag does not apply to it. */
+static int orki_big_core_mask_impl(cpu_set_t *s, int honor_env);
+int ork_big_core_set(cpu_set_t *s){ return orki_big_core_mask_impl(s, 1); }
+int orki_big_core_mask(cpu_set_t *s){ return orki_big_core_mask_impl(s, 0); }
+
+static int orki_big_core_mask_impl(cpu_set_t *s, int honor_env){
 #if defined(__linux__)
     static int off=-1; if(off<0) off=getenv("ORK_NO_AFFINITY")?1:0;
-    if(off) return 0;
+    if(honor_env && off) return 0;
 
     long conf = sysconf(_SC_NPROCESSORS_CONF); if(conf < 2 || conf > CPU_SETSIZE) return 0;
     int  id[CPU_SETSIZE]; long cap[CPU_SETSIZE]; int n = 0;
@@ -332,7 +349,7 @@ int ork_big_core_set(cpu_set_t *s){
     }
     return 1;
 #else
-    (void)s; return 0;
+    (void)s; (void)honor_env; return 0;
 #endif
 }
 int orki_mc_ensure(ork_npu *c,int nc){
