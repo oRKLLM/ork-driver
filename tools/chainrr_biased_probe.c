@@ -19,7 +19,8 @@ static int rq(void){ g=g*1664525u+1013904223u; return (int)((g>>26)%9)-4; }  /* 
 static int vv(void){ g=g*1664525u+1013904223u; return (int)((g>>27)%5)-2; }   /* [-2,2] */
 
 int main(int argc,char**argv){
-    int NC=argc>1?atoi(argv[1]):3, Nq=32, d=128, Nk=512, Kp=512, dv=128;
+    int NC=argc>1?atoi(argv[1]):3, Nq=argc>2?atoi(argv[2]):32, d=128,
+        Nk=argc>3?atoi(argv[3]):512, Kp=512, dv=128;   /* Nq=1 => the M=1 decode case */
     if(NC<1)NC=1; if(NC>8)NC=8;
     setvbuf(stdout,0,_IONBF,0);
     ork_npu*c=ork_npu_init(); if(!c){printf("init failed\n");return 2;}
