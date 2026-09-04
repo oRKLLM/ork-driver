@@ -134,7 +134,7 @@ extern double orki_prof_i8_us, orki_prof_i4_us;
 extern double orki_rt_setup, orki_rt_submit, orki_rt_copy;
 extern int orki_load_prof;
 extern int orki_ork_prof;
-extern double orki_db_begin_us, orki_db_end_us;   /* doorbell phase split (ORK_PROFILE) */
+extern double orki_db_begin_us, orki_db_end_us, orki_db_poll_us;   /* doorbell phase split (ORK_PROFILE) */
 extern long   orki_db_begin_n,  orki_db_end_n;
 extern int orki_xprof;
 extern long orki_fd_n;

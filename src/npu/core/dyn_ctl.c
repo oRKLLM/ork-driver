@@ -284,6 +284,7 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
              * (the M>1 prefill regression: M=256 was 2.8x slower under a pure spin). Decode stays tight (el<1ms =>
              * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
             if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        if (orki_ork_prof) orki_db_poll_us += ork_now_us() - t0;   /* the WAIT half of ork_dyn_end */
         last = ork_dyn_progress(h);
         if (last >= h->S - 1 || orki_ork_term) break;            /* all done, or interrupted */
         if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */

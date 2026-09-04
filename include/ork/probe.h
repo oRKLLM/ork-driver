@@ -24,6 +24,7 @@ void         ork_npu_mc_reset(void);
  * writeback + teardown. Needs ORK_PROFILE=1. Reset with ork_npu_db_reset. */
 void         ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *end_n);
 void         ork_npu_db_reset(void);
+double       ork_npu_db_poll(void);   /* the WAIT half of `end`; end-poll = drain + accumulate + writeback */
 double       ork_npu_mc_synth(int core);   /* host synth+bsync subset of `submit` (overlappable); ioctl/NPU = submit - synth */
 
 /* RE/calibration only: probe this SoC's single-submit K-tile ceiling. Runs ONE M=1 full-K int8

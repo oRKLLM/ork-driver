@@ -50,9 +50,15 @@ void ork_npu_xprof_dump(void){
  * is begin_mc -> colsplit -> dyn_end, which the orki_mc_* counters do NOT cover (those are the M>1
  * mcworker prefill only), so this regime had no phase breakdown at all. */
 double orki_db_begin_us = 0, orki_db_end_us = 0;
+/* Splits ork_dyn_end in two: orki_db_poll_us is the WAIT for the sentinel; (end - poll) is everything
+ * after -- drain, K-slice accumulate (which rendezvouses through the NPU thread pool), writeback, free.
+ * Kernel #patch74 showed the hardware is FASTER in the consumer than in the probe (113.8 vs 143.9 us/job),
+ * so the gap is on this side, and this says which half of it. */
+double orki_db_poll_us = 0;
 long   orki_db_begin_n = 0,  orki_db_end_n = 0;
 
 void ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *end_n){
     if(begin_us)*begin_us=orki_db_begin_us; if(begin_n)*begin_n=orki_db_begin_n;
     if(end_us)*end_us=orki_db_end_us;       if(end_n)*end_n=orki_db_end_n; }
-void ork_npu_db_reset(void){ orki_db_begin_us=orki_db_end_us=0; orki_db_begin_n=orki_db_end_n=0; }
+void ork_npu_db_reset(void){ orki_db_begin_us=orki_db_end_us=orki_db_poll_us=0; orki_db_begin_n=orki_db_end_n=0; }
+double ork_npu_db_poll(void){ return orki_db_poll_us; }

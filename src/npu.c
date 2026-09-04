@@ -1381,6 +1381,8 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * cratered decode 9.3 -> 2.3 tok/s. So: save the caller's mask, widen to the big cluster for the
          * call, restore. Two syscalls against a ~700us call. ORK_NO_AFFINITY disables it via
          * ork_big_core_set returning 0. */
+        if(orki_ork_prof){ static long _nn=0; if((_nn++%512)==0)
+            fprintf(stderr,"[ork-nc] doorbell M=%d K=%d N=%d nc=%d (cores=%d)\n", M, w->K, w->N, nc, c->soc->cores); }
         cpu_set_t _prev, _big; int _aff = 0;
         if (orki_big_core_mask(&_big) && pthread_getaffinity_np(pthread_self(), sizeof _prev, &_prev) == 0)
             _aff = (pthread_setaffinity_np(pthread_self(), sizeof _big, &_big) == 0);
