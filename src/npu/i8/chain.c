@@ -266,7 +266,25 @@ int orki_i8_run_chain_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, const
         int routable = 1;
         for (int i = 0; i < S; i++) if (tasks[i].M > 64 && !tasks[i].w->Bf) { routable = 0; break; }
         if (routable) {
-            ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, 1);   /* single-core doorbell spine (chain stays single-core) */
+            /* MULTI-CORE. The tasks in a non-ss chain are INDEPENDENT by construction: this entrypoint
+             * takes a bare task list with no ops[] dependency graph (that is _chain_ffn's job), and this
+             * branch carries no SDP LUT, so neither of the two reasons the chain path is single-core
+             * applies here. The LUT is the real constraint -- it lives in ONE core's physically-per-core
+             * SDP SRAM, which is why a fused chain must stay put and why RR fans INDEPENDENT chains
+             * across cores instead of splitting one. A pure-matmul batch has no LUT to pin.
+             *
+             * This was costing 3x on any single fused batch. Attention gets away with the single-core
+             * chain because a layer has Hkv independent chains for RR to spread; an FFN layer has ONE
+             * chain, so it occupied one core and left two idle -- fusing bought a dispatch saving that
+             * was not the bottleneck and paid for it in forfeited parallelism.
+             *
+             * nc=0 means all cores (see ork_dyn_begin_mc); npu.c's SEQ_FLUSH_HW already batches
+             * independent tasks this way. EXCEPT under concurrent RR dispatch (force_core>=0): that
+             * worker owns exactly one core, and N workers each fanning across 3 would collide, so it
+             * stays pinned. ORK_CHAIN_NC overrides for A/B (1 = the old behaviour). */
+            int nc = (force_core >= 0) ? 1 : 0;
+            if (nc != 1) { const char *e = getenv("ORK_CHAIN_NC"); if (e) nc = atoi(e); }
+            ork_dyn_chain *h = ork_dyn_begin_mc(c, S, tasks, nc);
             if (!h) return -1;                                     /* rejected/alloc-fail — surface it, no fallback */
             int d = ork_dyn_end(h);                                /* auto-dumps on an incomplete drain */
             return (d == S - 1) ? 0 : -1;                          /* all landed = ok; miss = error (dumped) */
