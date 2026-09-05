@@ -1065,6 +1065,12 @@ f16_dumpdiff: tools/f16_dumpdiff.c $(COBJ)
 sram_bw_probe: tools/sram_bw_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# SRAM separate-port probe WITH THE NPU IN THE LOOP. Supersedes sram_bw_probe, whose NPU side was not
+# weight-bandwidth-bound (128 KiB weight vs a 167us submit floor) so placement could not register. This one
+# chains T tasks over a ~640 KiB weight and GATES on a measured streaming fraction before reporting.
+sram_port_probe: tools/sram_port_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
