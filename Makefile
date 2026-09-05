@@ -1080,6 +1080,16 @@ npu_fixed_cost_probe: tools/npu_fixed_cost_probe.c $(COBJ)
 npu_host_cost_probe: tools/npu_host_cost_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# CPU+NPU aggregate memory throughput in ONE currency (bytes consumed), checked against the DDR
+# controller's own load counter -- decides whether a 3rd engine (Mali) has any headroom to add.
+engine_mix_probe: tools/engine_mix_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Mali-G610 streaming bandwidth via Vulkan compute (the 3rd-engine question). Board-only, needs libvulkan
+# and tools/vkbw.spv (glslc -O tools/vkbw.comp -o tools/vkbw.spv). Not in all/test.
+vk_bw_probe: tools/vk_bw_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -lvulkan -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

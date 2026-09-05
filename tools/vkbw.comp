@@ -1,0 +1,12 @@
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In  { uvec4 data[]; };
+layout(std430, binding = 1)          buffer Out { uint  res[];  };
+layout(push_constant) uniform PC { uint nvec; } pc;
+void main(){
+    uint stride = gl_NumWorkGroups.x * 64u;
+    uint gid    = gl_GlobalInvocationID.x;
+    uvec4 acc = uvec4(0);
+    for (uint i = gid; i < pc.nvec; i += stride) acc += data[i];   /* coalesced streaming read */
+    res[gid] = acc.x + acc.y + acc.z + acc.w;
+}
