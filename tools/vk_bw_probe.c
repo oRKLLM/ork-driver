@@ -37,6 +37,8 @@ static void *dmc_sampler(void*a){
 int main(int argc,char**argv){
     size_t MIB = argc>1?(size_t)atoi(argv[1]):64;
     double SECS = argc>2?atof(argv[2]):3.0;
+    int MODE = argc>3?atoi(argv[3]):0;          /* 0 = memory stream, 1 = compute-bound (no DRAM traffic) */
+    uint32_t CITERS = argc>4?(uint32_t)atoi(argv[4]):20000;
     setvbuf(stdout,0,_IONBF,0);
     size_t BYTES = MIB<<20; uint32_t nvec = (uint32_t)(BYTES/16);   /* uvec4 = 16 B */
 
@@ -85,7 +87,9 @@ int main(int argc,char**argv){
     }
     { void*p=0; VKC(vkMapMemory(dev,mem[0],0,BYTES,0,&p)); memset(p,1,BYTES); vkUnmapMemory(dev,mem[0]); }
 
-    FILE*f=fopen("tools/vkbw.spv","rb"); if(!f) f=fopen("vkbw.spv","rb");
+    const char*spv = MODE ? "tools/vkcompute.spv" : "tools/vkbw.spv";
+    const char*spv2= MODE ? "vkcompute.spv"       : "vkbw.spv";
+    FILE*f=fopen(spv,"rb"); if(!f) f=fopen(spv2,"rb");
     if(!f){ printf("vkbw.spv not found (run: glslc -O tools/vkbw.comp -o tools/vkbw.spv)\n"); return 2; }
     fseek(f,0,SEEK_END); long ssz=ftell(f); fseek(f,0,SEEK_SET);
     uint32_t*code=malloc(ssz); if(fread(code,1,ssz,f)!=(size_t)ssz){ printf("spv read fail\n"); return 2; } fclose(f);
@@ -126,7 +130,8 @@ int main(int argc,char**argv){
     VKC(vkBeginCommandBuffer(cb,&cbbi));
     vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pipe);
     vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,pl,0,1,&ds,0,0);
-    vkCmdPushConstants(cb,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&nvec);
+    uint32_t pcval = MODE ? CITERS : nvec;
+    vkCmdPushConstants(cb,pl,VK_SHADER_STAGE_COMPUTE_BIT,0,4,&pcval);
     vkCmdDispatch(cb,GROUPS,1,1);
     VKC(vkEndCommandBuffer(cb));
 
@@ -147,8 +152,10 @@ int main(int argc,char**argv){
     }
     double dt=(now_us()-t0)/1e6;
     g_dmc_stop=1; pthread_join(dth,0);
-    printf("  Mali streaming read: %.2f GB/s  (%d dispatches of %zu MiB in %.2fs)\n",bytes/1e9/dt,iters,MIB,dt);
+    if(MODE) printf("  Mali COMPUTE-bound: %.1f Mdispatch-iters/s  (%d dispatches x %u iters in %.2fs)\n",
+                    (double)iters*CITERS*GROUPS*64/1e6/dt, iters, CITERS, dt);
+    else     printf("  Mali streaming read: %.2f GB/s  (%d dispatches of %zu MiB in %.2fs)\n",bytes/1e9/dt,iters,MIB,dt);
     printf("  DMC during run: avg %.0f%%  peak %.0f%%   (theoretical peak 33.8 GB/s)\n",g_dmc_avg,g_dmc_peak);
-    printf("  implied bus share: %.0f%% of the ~30 GB/s practical ceiling\n", bytes/1e9/dt/30.0*100);
+    if(!MODE) printf("  implied bus share: %.0f%% of the ~30 GB/s practical ceiling\n", bytes/1e9/dt/30.0*100);
     return 0;
 }

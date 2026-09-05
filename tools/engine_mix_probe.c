@@ -84,30 +84,36 @@ static double cpu_stop(pthread_t*th,int n){ double s=0; for(int i=0;i<n;i++) s+=
     g_cpu_stop=1; for(int i=0;i<n;i++) pthread_join(th[i],0); return s; }
 
 /* ---- NPU engine: chained int8 matmul, weight bytes consumed ---- */
-typedef struct { ork_npu*c; ork_mm_task_i8*tk; int T,K,N; volatile int stop; volatile double gb; } npu_arg;
+typedef struct { ork_npu*c; ork_mm_task_i8*tk; int T,K,N,M; volatile int stop; volatile double gb, gmac; } npu_arg;
 static void *npu_stream(void*a){
     npu_arg*n=(npu_arg*)a; cpu_set_t s; CPU_ZERO(&s); CPU_SET(4,&s); sched_setaffinity(0,sizeof s,&s);
-    double t0=now_us(); size_t bytes=0;
+    double t0=now_us(); size_t bytes=0; size_t macs=0;
     while(!n->stop){ if(ork_i8_mm_run_chain(n->c,n->T,n->tk)<0) break;
-        bytes += (size_t)n->T*n->K*n->N; double dt=(now_us()-t0)/1e6; if(dt>0) n->gb=bytes/1e9/dt; }
+        bytes += (size_t)n->T*n->K*n->N;
+        macs  += (size_t)n->T*n->M*n->K*n->N;
+        double dt=(now_us()-t0)/1e6; if(dt>0){ n->gb=bytes/1e9/dt; n->gmac=macs/1e9/dt; } }
     return NULL;
 }
 
 int main(int argc,char**argv){
     int K=argc>1?atoi(argv[1]):1024, N=argc>2?atoi(argv[2]):640, T=argc>3?atoi(argv[3]):16;
+    /* ORK_MIX_NPU_M>1 makes the NPU arm COMPUTE-bound: one weight stream amortised over M rows, so
+     * arithmetic intensity rises and the NPU stops being a heavy DRAM client. M=1 is the decode shape. */
+    int NPUM = getenv("ORK_MIX_NPU_M") ? atoi(getenv("ORK_MIX_NPU_M")) : 1;
     setvbuf(stdout,0,_IONBF,0);
     { cpu_set_t s4; CPU_ZERO(&s4); CPU_SET(4,&s4); sched_setaffinity(0,sizeof s4,&s4); }
     ork_npu*c=ork_npu_init(); if(!c){ printf("init failed\n"); return 1; }
     int8_t*B=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int8_t)(i&0x3f);
     ork_w*w=ork_i8_mm_pack(c,K,N,B); if(!w){ printf("pack fail\n"); return 2; }
-    int8_t*A=(int8_t*)ork_dma_alloc(c,(size_t)K); memset(A,1,(size_t)K);
-    int32_t*Cb=(int32_t*)ork_dma_alloc(c,(size_t)T*N*4);
+    int8_t*A=(int8_t*)ork_dma_alloc(c,(size_t)K*(NPUM>1?NPUM:1)); memset(A,1,(size_t)K*(NPUM>1?NPUM:1));
+    int32_t*Cb=(int32_t*)ork_dma_alloc(c,(size_t)T*N*4*(NPUM>1?NPUM:1));
     ork_mm_task_i8*tk=calloc(T,sizeof *tk);
-    for(int j=0;j<T;j++){ tk[j].w=w; tk[j].M=1; tk[j].A=A; tk[j].C=Cb+(size_t)j*N; tk[j].cstride=0; }
+    for(int j=0;j<T;j++){ tk[j].w=w; tk[j].M=NPUM; tk[j].A=A; tk[j].C=Cb+(size_t)j*N*NPUM; tk[j].cstride=0; }
 
     double PEAK = 2112.0*2*8/1000.0;   /* MHz * DDR * 64-bit / 1000 -> GB/s theoretical */
     printf("engine_mix_probe: K=%d N=%d T=%d | LPDDR theoretical peak %.1f GB/s (DMC 2112 MHz x2 x8B)\n",K,N,T,PEAK);
-    printf("  NPU host on core 4; CPU read-stream workers on cores 5-7. All figures are BYTES CONSUMED.\n\n");
+    printf("  NPU host on core 4; CPU workers on cores 5-7. GB/s = BYTES CONSUMED. NPU M=%d (%s).\n\n",
+           NPUM, NPUM>1?"COMPUTE-bound: weight amortised over M rows":"memory-bound decode shape");
     printf("  %-14s %8s %8s %8s   %8s %8s\n","config","CPU GB/s","NPU GB/s","sum","DMC avg","DMC peak");
 
     struct { int ncpu, npu; } cfg[] = {{1,0},{2,0},{3,0},{0,1},{1,1},{2,1},{3,1}};
@@ -127,10 +133,15 @@ int main(int argc,char**argv){
         struct timespec run={2,0}; nanosleep(&run,0);
         g_dmc_stop=1; pthread_join(dth,0);
         double cg = ncpu? cpu_stop(cth,ncpu) : 0;
-        double ng = 0; if(usenpu){ na.stop=1; pthread_join(nth,0); ng=na.gb; }
+        double ng = 0, nmac = 0; if(usenpu){ na.stop=1; pthread_join(nth,0); ng=na.gb; nmac=ng*NPUM; }
+        /* GMAC/s = weight-GB/s * M exactly (macs = T*M*K*N, bytes = T*K*N).
+         * CAVEAT: at M>1 the 'bytes consumed' column counts WEIGHT ONLY, but the NPU also reads A
+         * (M*K per task) and writes C (M*N*4). At M=256 that is 256 KiB + 160 KiB against 160 KiB of
+         * weight -- so the GB/s column undercounts NPU DRAM traffic ~3.6x here. Trust DMC, not the sum. */
         char lbl[32]; snprintf(lbl,sizeof lbl,"%s%s%s", ncpu?"CPU":"", ncpu?(char[]){'0'+ncpu,0}:"", usenpu?(ncpu?"+NPU":"NPU"):"");
         double sum=cg+ng;
-        printf("  %-14s %8.2f %8.2f %8.2f   %7.0f%% %7.0f%%\n",lbl,cg,ng,sum,g_dmc_avg,g_dmc_peak);
+        if(NPUM>1) printf("  %-14s %8.2f %8.2f %8.2f   %7.0f%% %7.0f%%   NPU %7.1f GMAC/s\n",lbl,cg,ng,sum,g_dmc_avg,g_dmc_peak,nmac);
+        else       printf("  %-14s %8.2f %8.2f %8.2f   %7.0f%% %7.0f%%\n",lbl,cg,ng,sum,g_dmc_avg,g_dmc_peak);
         if((ncpu==0||usenpu==0) && sum>best_single) best_single=sum;
         if(sum>best_sum){ best_sum=sum; dmc_at_best=g_dmc_avg; }
     }

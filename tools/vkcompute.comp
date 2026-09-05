@@ -1,0 +1,20 @@
+#version 450
+/* Compute-bound arm: four INDEPENDENT dependent-integer chains per invocation so the shader cores are
+ * busy on ALU throughput while touching essentially no memory (one uint written per invocation).
+ * Integer LCG rather than float FMA to avoid NaN/overflow paths whose cost varies. The loop count comes
+ * from a push constant so the compiler cannot fully unroll it away. */
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer In  { uvec4 data[]; };
+layout(std430, binding = 1)          buffer Out { uint  res[];  };
+layout(push_constant) uniform PC { uint iters; } pc;
+void main(){
+    uint gid = gl_GlobalInvocationID.x;
+    uint a = gid*2654435761u + 1u, b = a^0x9e3779b9u, c = a+0x85ebca6bu, d = a*0xc2b2ae35u;
+    for (uint i = 0u; i < pc.iters; ++i) {
+        a = a*1664525u + 1013904223u; a ^= a >> 15;
+        b = b*1103515245u + 12345u;   b ^= b >> 13;
+        c = c*22695477u + 1u;         c ^= c >> 16;
+        d = d*69069u + 362437u;       d ^= d >> 14;
+    }
+    res[gid] = a ^ b ^ c ^ d;
+}
