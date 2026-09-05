@@ -1094,6 +1094,10 @@ vk_bw_probe: tools/vk_bw_probe.c
 vk_gemm_probe: tools/vk_gemm_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -lvulkan -lm -lpthread
 
+# Bounds the value of on-chip accumulator retention by measuring K-slicing with host summing.
+ksplit_accum_probe: tools/ksplit_accum_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
