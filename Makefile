@@ -1071,6 +1071,15 @@ sram_bw_probe: tools/sram_bw_probe.c $(COBJ)
 sram_port_probe: tools/sram_port_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# Splits the fixed per-task cost (a in time = a + b*N) into host vs kernel-reported HARDWARE time, under a
+# SPIN vs LOAD contender, to find what the 2.19x contention inflation actually is. Needs #patch74 counters.
+npu_fixed_cost_probe: tools/npu_fixed_cost_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Does the precompiled regcmd cache absorb the host-side contention the fixed per-task cost suffers?
+npu_host_cost_probe: tools/npu_host_cost_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
