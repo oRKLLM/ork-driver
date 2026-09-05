@@ -1,0 +1,61 @@
+#version 450
+/* Real int8 GEMM on Mali: C[M,N] (int32) = A[M,K] (int8) x Bt[N,K] (int8, K-contiguous).
+ * Uses the hardware 4x int8 dot product (VK_KHR_shader_integer_dot_product), the same primitive class the
+ * NPU's MAC array uses, so GMAC/s is directly comparable. 64x64 C tile per workgroup, 4x4 per thread,
+ * A/B tiles staged through shared memory. Bt is pre-transposed so 4 consecutive K values are contiguous
+ * for both operands -- a real implementation packs B once, exactly as ork packs its NPU weights once.
+ *
+ * NOTE: the SIGNED 4x8 dot product is selected by the INT container type. With uint containers the compiler
+ * silently resolves to the UNSIGNED overload, which would compute a different (wrong) result for negative
+ * weights -- caught here only because the return type then failed to assign to an int. */
+#extension GL_EXT_integer_dot_product : require
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer BufA  { int  a[]; };
+layout(std430, binding = 1) readonly buffer BufBt { int  b[]; };
+layout(std430, binding = 2)          buffer BufC  { int  c[]; };
+layout(push_constant) uniform PC { uint M, N, K; } pc;
+
+shared int As[64][16];
+shared int Bs[64][16];
+
+void main(){
+    uint kq = pc.K / 4u;                      /* uints per row (4 int8 each) */
+    uint tileRow = gl_WorkGroupID.y * 64u;
+    uint tileCol = gl_WorkGroupID.x * 64u;
+    uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    uint tid = ty * 16u + tx;
+
+    int acc[4][4];
+    for (int i = 0; i < 4; ++i) for (int j = 0; j < 4; ++j) acc[i][j] = 0;
+
+    /* Stage 64 K-values (16 uints) per barrier pair rather than 16. Each round then does 4x4x16 = 256 dot
+     * products per thread against two barriers, a 4x better compute-to-barrier ratio; shared use is
+     * 2 x 64 x 16 x 4 B = 8 KB against the 32 KB limit. */
+    for (uint k0 = 0u; k0 < kq; k0 += 16u) {
+        for (uint s = 0u; s < 4u; ++s) {                 /* 256 threads stage 1024 uints -> 4 each */
+            uint idx = tid + s * 256u, r = idx / 16u, u = idx % 16u;
+            As[r][u] = a[(tileRow + r) * kq + k0 + u];
+            Bs[r][u] = b[(tileCol + r) * kq + k0 + u];
+        }
+        barrier();
+        /* REGISTER BLOCKING. The naive i/j/u order issues TWO shared-memory loads per dot product, which is
+         * what actually caps this kernel -- not the barriers. Hoisting the 4 A and 4 B values for a given k
+         * into registers turns 32 shared loads per 16 dot products into 8. */
+        for (uint u = 0u; u < 16u; ++u) {
+            int av0 = As[ty*4u+0u][u], av1 = As[ty*4u+1u][u], av2 = As[ty*4u+2u][u], av3 = As[ty*4u+3u][u];
+            int bv0 = Bs[tx*4u+0u][u], bv1 = Bs[tx*4u+1u][u], bv2 = Bs[tx*4u+2u][u], bv3 = Bs[tx*4u+3u][u];
+            acc[0][0]=dotPacked4x8AccSatEXT(av0,bv0,acc[0][0]); acc[0][1]=dotPacked4x8AccSatEXT(av0,bv1,acc[0][1]);
+            acc[0][2]=dotPacked4x8AccSatEXT(av0,bv2,acc[0][2]); acc[0][3]=dotPacked4x8AccSatEXT(av0,bv3,acc[0][3]);
+            acc[1][0]=dotPacked4x8AccSatEXT(av1,bv0,acc[1][0]); acc[1][1]=dotPacked4x8AccSatEXT(av1,bv1,acc[1][1]);
+            acc[1][2]=dotPacked4x8AccSatEXT(av1,bv2,acc[1][2]); acc[1][3]=dotPacked4x8AccSatEXT(av1,bv3,acc[1][3]);
+            acc[2][0]=dotPacked4x8AccSatEXT(av2,bv0,acc[2][0]); acc[2][1]=dotPacked4x8AccSatEXT(av2,bv1,acc[2][1]);
+            acc[2][2]=dotPacked4x8AccSatEXT(av2,bv2,acc[2][2]); acc[2][3]=dotPacked4x8AccSatEXT(av2,bv3,acc[2][3]);
+            acc[3][0]=dotPacked4x8AccSatEXT(av3,bv0,acc[3][0]); acc[3][1]=dotPacked4x8AccSatEXT(av3,bv1,acc[3][1]);
+            acc[3][2]=dotPacked4x8AccSatEXT(av3,bv2,acc[3][2]); acc[3][3]=dotPacked4x8AccSatEXT(av3,bv3,acc[3][3]);
+        }
+        barrier();
+    }
+    for (int i = 0; i < 4; ++i)
+        for (int j = 0; j < 4; ++j)
+            c[(tileRow + ty*4u + uint(i)) * pc.N + tileCol + tx*4u + uint(j)] = acc[i][j];
+}

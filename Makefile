@@ -1090,6 +1090,10 @@ engine_mix_probe: tools/engine_mix_probe.c $(COBJ)
 vk_bw_probe: tools/vk_bw_probe.c
 	$(CC) $(CFLAGS) -o $@ $< -lvulkan -lm -lpthread
 
+# Mali int8 GEMM in GMAC/s, verified bit-exact against a CPU reference — the NPU-vs-GPU compute comparison.
+vk_gemm_probe: tools/vk_gemm_probe.c
+	$(CC) $(CFLAGS) -o $@ $< -lvulkan -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
