@@ -1098,6 +1098,10 @@ vk_gemm_probe: tools/vk_gemm_probe.c
 ksplit_accum_probe: tools/ksplit_accum_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# #39 re-open: does WEIGHT_REUSE compute correctly when the weight fits the CBUF weight banks?
+wreuse_probe: tools/wreuse_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

@@ -422,6 +422,22 @@ ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *t
                 for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                     memset(rc, 0, sizeof rc);
                     orki_i8_synth(rc, mc, K, N, adma + (uint32_t)((size_t)m0 * K), bdma, cbase + (uint32_t)((size_t)m0 * N * 4), 1, CBUF, 0);
+                    /* #39 re-open (ORK_MTILE_WR=1): every M-tile re-streams the SAME K*N weight from bdma. If it
+                     * fits the CBUF weight banks it should stay resident, so tiles after the first can set
+                     * WEIGHT_REUSE (0x1040 b13) and skip the re-DMA. #39 tested only the fold path, baked from a
+                     * K=3584 N=1216 capture (4.36 MB vs ~352 KB of banks) -- never resident, hence "computes
+                     * wrong". Here 0x1040 is synthesised from mc, so a small K*N genuinely is. */
+                    { const char *wre = getenv("ORK_MTILE_WR"); int wrm = wre ? atoi(wre) : 0;
+                      if (m0 > 0 && wrm) { uint32_t cur = 0;
+                        for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2)
+                            if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cur = rc[k2] >> 16; break; }
+                        /* wrm=2 is a POSITIVE CONTROL: clobber the bank split to a value that must miscompute.
+                         * If mode 2 still returns bit-exact output, the register write is not reaching the
+                         * hardware at all and a bit-exact mode 1 proves nothing. Always verify the probe can
+                         * detect a change before believing that it detected none. */
+                        uint32_t nv = (wrm >= 2) ? 0x1bu : (cur | 0x2000u);
+                        orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
+                        if (getenv("ORK_MTILE_WR_V")) fprintf(stderr, "[wr] m0=%d 0x1040 %#x -> %#x\n", m0, cur, nv); } }
                     if (orki_validate_regcmd("ork_dyn_mc_mt", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I8_N * 4;
                         rc[216] = 0x0010 | ((nx & 0xffff) << 16); rc[217] = (0x0101 << 16) | ((nx >> 16) & 0xffff);

@@ -431,6 +431,19 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                   memset(rc, 0, sizeof rc);
                   orki_i8_synth(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
                            (uint32_t)(CC->dma + (segbase + (size_t)m0 * segw) * 4), 1, CBUF, 0);   /* [mc,segw] contiguous block */
+                  /* #39 re-open (ORK_MTILE_WR): M-tiles of a segment re-stream the SAME K*segw weight from
+                   * wbase, so if it fits the CBUF weight banks it should stay resident and tiles after the
+                   * first can set WEIGHT_REUSE (0x1040 b13). ORK_MTILE_WR=2 is a positive control that
+                   * clobbers the bank split to a value which MUST miscompute. It PROVED the write reaches the
+                   * hardware (a 60 s job timeout + 6 soft resets), and is kept only for re-proving that if
+                   * ever needed -- do not run it casually, it wedges the NPU on a shared board. */
+                  { const char *wre = getenv("ORK_MTILE_WR"); int wrm = wre ? atoi(wre) : 0;
+                    if (m0 > 0 && wrm) { uint32_t cv = 0;
+                      for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2)
+                          if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
+                      uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | 0x2000u);
+                      orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
+                      if (getenv("ORK_MTILE_WR_V")) fprintf(stderr, "[wr-cs] m0=%d 0x1040 %#x -> %#x\n", m0, cv, nv); } }
                   if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                   np++;
