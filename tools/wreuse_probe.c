@@ -44,6 +44,7 @@ static int run_one(ork_npu*c,int M,int K,int N,int wr,int32_t*C,double*us,int it
 
 int main(int argc,char**argv){
     int M=argc>1?atoi(argv[1]):256, K=argc>2?atoi(argv[2]):4096;
+    int N0=argc>3?atoi(argv[3]):32, N1=argc>4?atoi(argv[4]):512;
     setvbuf(stdout,0,_IONBF,0);
     ork_npu*c=ork_npu_init(); if(!c){ printf("init failed\n"); return 1; }
     int mcap=orki_i8_chain_fullk_mcap(c,K);
@@ -52,7 +53,7 @@ int main(int argc,char**argv){
     printf("  observed 0x1040 base on this path is 0x48 (DATA_BANK=8, WEIGHT_BANK=4 => ~128 KB), and reuse is\n"
            "  bit-exact ABOVE that size, so the win is NOT explained by simple weight-bank residency.\n\n");
     printf("  %-6s %-10s %-12s %-10s %-10s\n","N","weight","reuse result","base us","reuse us");
-    for(int N=32; N<=512; N*=2){
+    for(int N=N0; N<=N1; N*=2){
         int32_t*C0=calloc((size_t)M*N,4), *C1=calloc((size_t)M*N,4);
         double u0=0,u1=0;
         int r0=run_one(c,M,K,N,0,C0,&u0,20);
@@ -72,7 +73,7 @@ int main(int argc,char**argv){
         long refbad0=0, refbad1=0;
         { int8_t*Br=malloc((size_t)K*N); for(size_t i=0;i<(size_t)K*N;i++) Br[i]=(int8_t)((i*7+3)&0x1f)-16;
           int8_t*Ar=malloc((size_t)M*K); for(size_t i=0;i<(size_t)M*K;i++) Ar[i]=(int8_t)((i*5+1)&0x1f)-16;
-          for(size_t idx=0; idx<(size_t)M*N; idx+=53){
+          for(size_t idx=0; idx<(size_t)M*N; idx+=(N>1024?509:53)){
               int r=(int)(idx/N), cc=(int)(idx%N); int32_t ref=0;
               for(int k=0;k<K;k++) ref += (int32_t)Ar[(size_t)r*K+k]*(int32_t)Br[(size_t)k*N+cc];
               if(C0[idx]!=ref) refbad0++; if(C1[idx]!=ref) refbad1++; }

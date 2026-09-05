@@ -438,6 +438,13 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                    * hardware (a 60 s job timeout + 6 soft resets), and is kept only for re-proving that if
                    * ever needed -- do not run it casually, it wedges the NPU on a shared board. */
                   { const char *wre = getenv("ORK_MTILE_WR"); int wrm = wre ? atoi(wre) : 0;
+                    /* ENVELOPE GATE. Reuse is verified bit-exact ONLY at K=4096 with a single N-slice; with
+                     * the bit applied unconditionally `make test` fails three test_matmul goldens
+                     * (ref-checked WRONG): {256,3584,3584}, {256,2048,2048}, {96,3584,18944}. Note K=3584 has
+                     * the SAME mcap=64 as K=4096, so the boundary is NOT the M-tile geometry and is not yet
+                     * understood -- this gate is the MEASURED envelope, not a derived one. Do not widen it
+                     * without re-running make test. */
+                    if (wrm && !(K == 4096 && w->Sn == 1)) wrm = 0;
                     if (m0 > 0 && wrm) { uint32_t cv = 0;
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2)
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
