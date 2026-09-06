@@ -58,7 +58,13 @@ double orki_db_poll_us = 0;
 long   orki_db_begin_n = 0,  orki_db_end_n = 0;
 
 void ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *end_n){
-    if(begin_us)*begin_us=orki_db_begin_us; if(begin_n)*begin_n=orki_db_begin_n;
-    if(end_us)*end_us=orki_db_end_us;       if(end_n)*end_n=orki_db_end_n; }
+    /* One statement per line: `if(a) x; if(b) y;` reads to gcc as the second being guarded by the first
+     * (-Wmisleading-indentation), and these two lines are what took the CI warning ratchet from 100 to 102
+     * on 2026-09-04 (commit 393f28b, "sched: run the M=1 doorbell on a big core"). */
+    if(begin_us) *begin_us = orki_db_begin_us;
+    if(begin_n)  *begin_n  = orki_db_begin_n;
+    if(end_us)   *end_us   = orki_db_end_us;
+    if(end_n)    *end_n    = orki_db_end_n;
+}
 void ork_npu_db_reset(void){ orki_db_begin_us=orki_db_end_us=orki_db_poll_us=0; orki_db_begin_n=orki_db_end_n=0; }
 double ork_npu_db_poll(void){ return orki_db_poll_us; }
