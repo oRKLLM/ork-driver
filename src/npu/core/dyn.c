@@ -429,8 +429,9 @@ ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *t
                      * wrong". Here 0x1040 is synthesised from mc, so a small K*N genuinely is. */
                     { const char *wre = getenv("ORK_MTILE_WR"); int wrm = wre ? atoi(wre) : 0;
                       if (m0 > 0 && wrm) { uint32_t cur = 0;
-                        for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2)
+                        for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                             if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cur = rc[k2] >> 16; break; }
+                        }
                         /* wrm=2 is a POSITIVE CONTROL: clobber the bank split to a value that must miscompute.
                          * If mode 2 still returns bit-exact output, the register write is not reaching the
                          * hardware at all and a bit-exact mode 1 proves nothing. Always verify the probe can

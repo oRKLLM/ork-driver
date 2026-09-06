@@ -446,8 +446,9 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                      * without re-running make test. */
                     if (wrm && !(K == 4096 && w->Sn == 1)) wrm = 0;
                     if (m0 > 0 && wrm) { uint32_t cv = 0;
-                      for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2)
+                      for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
+                      }
                       uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | 0x2000u);
                       orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
                       if (getenv("ORK_MTILE_WR_V")) fprintf(stderr, "[wr-cs] m0=%d 0x1040 %#x -> %#x\n", m0, cv, nv); } }
