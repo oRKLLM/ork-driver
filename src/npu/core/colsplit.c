@@ -228,6 +228,22 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
      * to a core that never loaded the operand has nothing to reuse. Forcing nc=1 puts every M-tile on one
      * core and tests that constraint directly. */
     { const char *e = getenv("ORK_WR_NC"); if (e && *e) { int v = atoi(e); if (v > 0) ncreq = v; } }
+    /* WEIGHT_REUSE N-TILING (ORK_WR_NTILE=1). The measured law is
+     *     reuse correct  <=>  K * segw  <=  WEIGHT_BANK banks x 32 KB
+     * so instead of WIDENING WEIGHT_BANK to fit a big segment -- which collapses mcap, because 0x1040
+     * couples the split to the K-reduction schedule (mc*K = DATA_BANK*32KB) and the two fields share 12
+     * banks -- cut the SEGMENT to fit the banks we already have. This is Mesa's shipping strategy
+     * ("full weights, partial input": rkt_task.c enables reuse only when the weights already fit, and
+     * splits the input instead). The binding tile is the FULL one (mc == mcap), which takes the most data
+     * banks and so leaves the fewest weight banks. Round down to a whole column tile; if that leaves less
+     * than one, this shape cannot host reuse at the default split and the cap stays 0 (reuse off). */
+    int segcap = 0;
+    if (dt == DT_I8 && getenv("ORK_WR_NTILE")) {
+        long dbank = (long)mcap * K / 32768;                       /* the mc*K = DATA_BANK*32KB invariant */
+        long wbank = 12 - dbank;
+        if (wbank > 0) { long cols = wbank * 32768 / K; segcap = (int)(cols / nt_sz) * nt_sz; }
+        if (segcap < nt_sz) segcap = 0;
+    }
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (dt == DT_F16 && w->Sk > 1 && nc > 2 && getenv("ORK_F16_2CORE")) nc = 2;   /* variant B: fewer concurrent fp16 fetchers (reliability/speed trade) */
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
@@ -429,7 +445,9 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
         { int c1e = c0 + Ncore; size_t segbase = 0; int cur = c0;
           while (cur < c1e) {
               int ns = cur / NMAX_C, sl1 = (ns + 1) * NMAX_C; if (sl1 > N) sl1 = N;
-              int segend = (c1e < sl1) ? c1e : sl1, segw = segend - cur, is0 = cur - ns * NMAX_C;
+              int segend = (c1e < sl1) ? c1e : sl1;
+              if (segcap > 0 && segend - cur > segcap) segend = cur + segcap;   /* N-tile to fit the weight banks */
+              int segw = segend - cur, is0 = cur - ns * NMAX_C;
               uint32_t wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(is0 / nt_sz) * K * nt_sz);   /* slice ns, in-slice col offset */
               for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
                   if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
@@ -466,7 +484,13 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                      * happens to keep make test green. Do not read it as characterising anything.
                      * ORK_MTILE_WR_ALL=1 bypasses it for characterisation; out of envelope the result is
                      * WRONG (not a hang), so sweeping is safe. Never set it in production. */
-                    if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
+                    /* THE REAL PREDICATE, when N-tiling is on. segcap was chosen so K*segw fits the weight
+                     * banks, so reuse is licensed by the measured law rather than by a shape whitelist. The
+                     * capacity is read from the WEIGHT_BANK field of the program we just synthesised, not
+                     * assumed -- if orki_i8_synth ever picks a different split this fails closed instead of
+                     * silently corrupting. The old gate below stays for the non-N-tiled path. */
+                    if (segcap > 0) { if (!wrm) wrm = 1; }
+                    else if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
                     if (m0 > 0 && wrm) { uint32_t cv = 0;
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
@@ -501,7 +525,15 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                               g1010 = (rc[k7] >> 16) | ((rc[k7+1] & 0xffff) << 16); break; }
                       }
                       uint32_t dr = getenv("ORK_MTILE_DR") ? 1u : 0u;
+                      /* Capacity check against the ACTUAL emitted split: WEIGHT_BANK is cv[7:4]. Under
+                       * N-tiling this should always pass (segcap was derived to make it pass); it is kept
+                       * as the load-bearing guard so a geometry change can only cost the speedup, never
+                       * correctness. Bit 12 is never licensed by it -- DATA_REUSE is invalid in this loop
+                       * order (consecutive tasks share the weight and DIFFER in the activation). */
+                      if (segcap > 0 && !dr) { uint32_t wb = (cv >> 4) & 0xf;
+                          if ((size_t)K * segw > (size_t)wb * 32768u) wrm = 0; }
                       uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | (dr ? 0x1000u : 0x2000u));
+                      if (!wrm) nv = cv;   /* capacity guard declined: emit the untouched split, no reuse bit */
                       orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
                       /* VERIFY-AFTER-WRITE: read the register back out of the emitted program and report which
                        * reuse bit is actually present. Placed AFTER the write on purpose -- the previous dump
@@ -528,6 +560,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             tt.int_clear = 0x1ffff; tt.regcfg_amount = 108; tt.regcmd_addr = RC->dma + (size_t)p * REGCMD_I8_N * 4; tk[p] = tt; }
         h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = M * Ncore; h->oM[i] = M; h->oSk[i] = 0;
         h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = N; h->ocol0[i] = c0;
+        h->osegcap = segcap;   /* end()'s boundary-scatter re-derives segments; it must use the SAME cut */
         h->oscat[i] = (nseg > 1);   /* boundary-scatter ONLY when the balanced range crosses a slice boundary (>=2 segments);
             * a single-segment core (all base Sn==1, incl. attention) is a plain contiguous [M,Ncore] block -> keep the
             * cheap per-row-last-col done + ostride copy-back (oscat=0). Setting oscat unconditionally forced the

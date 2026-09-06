@@ -436,7 +436,9 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             int c0 = h->ocol0[i]; size_t blk = 0; int cur = c0, coff = 0;
             while (coff < Ne) {
                 int ns = cur / NMAXe, sl1 = (ns + 1) * NMAXe; if (sl1 > h->N) sl1 = h->N;
-                int segend = (c0 + Ne < sl1) ? (c0 + Ne) : sl1, segw = segend - cur;
+                int segend = (c0 + Ne < sl1) ? (c0 + Ne) : sl1;
+                if (h->osegcap > 0 && segend - cur > h->osegcap) segend = cur + h->osegcap;   /* same cut as emission */
+                int segw = segend - cur;
                 for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * h->ostride[i] + coff], &src[blk + (size_t)m * segw], (size_t)segw * 4);
                 blk += (size_t)Me * segw; coff += segw; cur = segend;
             }

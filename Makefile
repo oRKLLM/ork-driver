@@ -1256,3 +1256,8 @@ kv_append_probe: tools/kv_append_probe.c $(COBJ)
 # capture librknnrt matmul regcmds (B resident, run xN) to prove whether the vendor reuses weight. RKNN_DIR + shim.
 rknn_reuse_cap: tools/re/rknn_reuse_cap.c
 	$(CC) $(CFLAGS) -I$(RKNN_DIR) -o $@ $< -L$(RKNN_DIR) -lrknnrt -lm
+
+# Does WEIGHT_REUSE N-tiling pay? Weight read once per SEGMENT instead of per (segment x M-tile), against
+# a ceil(Ncore/segcap)x program-count rise. Checks bit-exactness vs untiled on every row. Not in all/test.
+ntile_bench: tools/ntile_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread

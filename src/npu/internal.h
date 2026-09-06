@@ -203,6 +203,11 @@ struct ork_dyn_chain {
                                  * to dst at this row stride (a column-slice of a wider C, colsplit M>1). 0 = contiguous. */
     int        ocol0[1024];     /* colsplit balanced wide-N: this core's first C column (c0). With oscat, end()
                                  * recomputes the within-slice segment widths from (ocol0, nout/oM, N, nmax). */
+    int        osegcap;         /* WEIGHT_REUSE N-tiling (ORK_WR_NTILE): extra cap, in COLUMNS, on a colsplit
+                                 * segment so the segment's K*segw weight fits the CBUF weight banks and the
+                                 * M-tiles after the first can reuse it. 0 = off (segments cut at nmax only).
+                                 * begin_colsplit's emission and end()'s boundary-scatter MUST apply the same
+                                 * cut, so it lives on the handle rather than being recomputed from nmax. */
     int8_t     oscat[1024];     /* 1 => balanced wide-N BOUNDARY-SCATTER copy-back: scratch is segment-major
                                  * [M,segw] blocks (each program contiguous, no notch); end() scatters each segment
                                  * to C[c0+coff .. ) at row-stride N, segment widths cut at nmax slice boundaries. */
