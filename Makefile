@@ -1266,3 +1266,14 @@ ntile_bench: tools/ntile_bench.c $(COBJ)
 # the activation? Three arms so the reorder and the reuse bit are separable. Not in all/test.
 mouter_bench: tools/mouter_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# A/A control: identical config in every arm, to size the position-in-sequence bias that any A/B
+# arm-ordered benchmark inherits. Not in all/test.
+aa_probe: tools/aa_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Characterise HOW a reuse bit's output is wrong: determinism, row/column locality, error structure and
+# MAGNITUDE (the count saturates under a K-sum; the magnitude does not). ORK_WR_FULLRAND=1 widens the test
+# inputs off the 2-bit LCG whose period once manufactured a whole false clean/corrupt table. Not in all/test.
+wr_diag: tools/wr_diag.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
