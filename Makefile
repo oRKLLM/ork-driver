@@ -1261,3 +1261,8 @@ rknn_reuse_cap: tools/re/rknn_reuse_cap.c
 # a ceil(Ncore/segcap)x program-count rise. Checks bit-exactness vs untiled on every row. Not in all/test.
 ntile_bench: tools/ntile_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Transposed (M-tile-outer) colsplit: does DATA_REUSE become valid when consecutive programs share
+# the activation? Three arms so the reorder and the reuse bit are separable. Not in all/test.
+mouter_bench: tools/mouter_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread

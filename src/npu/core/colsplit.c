@@ -237,6 +237,17 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
      * splits the input instead). The binding tile is the FULL one (mc == mcap), which takes the most data
      * banks and so leaves the fewest weight banks. Round down to a whole column tile; if that leaves less
      * than one, this shape cannot host reuse at the default split and the cap stays 0 (reuse off). */
+    /* ORK_WR_MOUTER=1: TRANSPOSE the emission order to M-tile-OUTER / segment-INNER. The default order is
+     * segment-outer, so consecutive programs on a core share the WEIGHT (wbase constant) and differ in the
+     * ACTIVATION -- which is why WEIGHT_REUSE is the semantically valid bit there and DATA_REUSE corrupts at
+     * every shape. Transposed, consecutive programs share the ACTIVATION (adma + m0*K is identical across
+     * segments) and differ in the weight, so DATA_REUSE (0x1040 b12) becomes the valid one and fires for
+     * every segment after the first. This is the decode-shaped schedule: one token's activation against many
+     * weight tiles. It is a pure ORDER change -- the scratch address is (segbase + m0*segw), computed from
+     * the segment table rather than from the loop, so end()'s copy-back is untouched. */
+    /* =1 transpose AND set DATA_REUSE; =2 transpose ONLY (no reuse bit). The two must be separable or a
+     * mismatch is ambiguous between "the reorder is wrong" and "bit 12 is still wrong". */
+    int mouter = 0; { const char *e = getenv("ORK_WR_MOUTER"); if (dt == DT_I8 && e && *e) mouter = atoi(e); }
     int segcap = 0;
     if (dt == DT_I8 && getenv("ORK_WR_NTILE")) {
         long dbank = (long)mcap * K / 32768;                       /* the mc*K = DATA_BANK*32KB invariant */
@@ -244,6 +255,12 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
         if (wbank > 0) { long cols = wbank * 32768 / K; segcap = (int)(cols / nt_sz) * nt_sz; }
         if (segcap < nt_sz) segcap = 0;
     }
+    /* ORK_WR_SEGW=<cols>: force the segment width outright. DATA reuse needs SEVERAL segments per core to
+     * have anything to reuse across, and at M=1 (decode) a core owns one segment unless its range crosses
+     * nmax -- so the decode case cannot be exercised at all without this. Unlike segcap it carries no
+     * capacity meaning: the data operand fits by construction (mc*K = DATA_BANK*32KB defines the M-tile). */
+    { const char *e = getenv("ORK_WR_SEGW");
+      if (dt == DT_I8 && e && *e) { int v = atoi(e); if (v >= nt_sz) segcap = (v / nt_sz) * nt_sz; } }
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (dt == DT_F16 && w->Sk > 1 && nc > 2 && getenv("ORK_F16_2CORE")) nc = 2;   /* variant B: fewer concurrent fp16 fetchers (reliability/speed trade) */
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
@@ -442,15 +459,36 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
          * into within-slice segments; lay the scratch SEGMENT-MAJOR ([M,segw] blocks back-to-back) and write each
          * program contiguously (synth stride=0 => Ncol==row-stride, NO notch). Balanced (even [c0,c1)) + notch-free.
          * end() boundary-scatters each block to its C column sub-range at row-stride N (h->oscat, using h->ocol0). */
-        { int c1e = c0 + Ncore; size_t segbase = 0; int cur = c0;
-          while (cur < c1e) {
+        { int c1e = c0 + Ncore; size_t sgbase = 0; int cur = c0;
+          /* Cut the segments ONCE into a table, then walk (segment, M-tile) in whichever order is asked for.
+           * The scratch address of a program is (segbase + m0*segw) and its activation is (adma + m0*K), so
+           * neither depends on the walk order and the SEGMENT-MAJOR scratch layout end() expects is preserved
+           * either way -- that is what makes the transpose a pure reordering rather than a relayout. */
+          int nsgmax = Ncore / nt_sz + 2;
+          struct { int segw, is0, ns; uint32_t wbase; size_t segbase; } *sg = malloc((size_t)nsgmax * sizeof *sg);
+          if (!sg) { free(h); return NULL; }
+          int nsg = 0;
+          while (cur < c1e && nsg < nsgmax) {
               int ns = cur / NMAX_C, sl1 = (ns + 1) * NMAX_C; if (sl1 > N) sl1 = N;
               int segend = (c1e < sl1) ? c1e : sl1;
               if (segcap > 0 && segend - cur > segcap) segend = cur + segcap;   /* N-tile to fit the weight banks */
               int segw = segend - cur, is0 = cur - ns * NMAX_C;
-              uint32_t wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(is0 / nt_sz) * K * nt_sz);   /* slice ns, in-slice col offset */
-              for (int m0 = 0; m0 < M; m0 += mcap) { int mc = (M - m0 < mcap) ? (M - m0) : mcap;
-                  if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(h); return NULL; }
+              sg[nsg].segw = segw; sg[nsg].is0 = is0; sg[nsg].ns = ns; sg[nsg].segbase = sgbase;
+              sg[nsg].wbase = (uint32_t)(w->Bf[ns].dma + (uint64_t)(is0 / nt_sz) * K * nt_sz);   /* slice ns, in-slice col offset */
+              nsg++; sgbase += (size_t)M * segw; cur = segend;
+          }
+          nseg = nsg;
+          { int ntile = (M + mcap - 1) / mcap;
+            for (int idx = 0; idx < nsg * ntile; idx++) {
+              int s  = mouter ? (idx % nsg)   : (idx / ntile);
+              int ti = mouter ? (idx / nsg)   : (idx % ntile);
+              int seg_first = mouter ? (s == 0) : (ti == 0);   /* first program of this reuse run */
+              int m0 = ti * mcap, mc = (M - m0 < mcap) ? (M - m0) : mcap;
+              int segw = sg[s].segw, is0 = sg[s].is0, ns = sg[s].ns;
+              uint32_t wbase = sg[s].wbase; size_t segbase = sg[s].segbase;
+              (void)is0; (void)ns; (void)seg_first;
+              {
+                  if ((size_t)(np+1) * REGCMD_I8_N * 4 > RC->size) { free(sg); free(h); return NULL; }
                   memset(rc, 0, sizeof rc);
                   orki_i8_synth(rc, mc, K, segw, adma + (uint32_t)((size_t)m0 * K), wbase,
                            (uint32_t)(CC->dma + (segbase + (size_t)m0 * segw) * 4), 1, CBUF, 0);   /* [mc,segw] contiguous block */
@@ -489,9 +527,16 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                      * capacity is read from the WEIGHT_BANK field of the program we just synthesised, not
                      * assumed -- if orki_i8_synth ever picks a different split this fails closed instead of
                      * silently corrupting. The old gate below stays for the non-N-tiled path. */
-                    if (segcap > 0) { if (!wrm) wrm = 1; }
+                    /* TRANSPOSED order: the previous program on this core shared the ACTIVATION (same m0,
+                     * different segment), so bit 12 -- not bit 13 -- is the licensed one, and it fires for
+                     * every segment after the first. Weight reuse is INVALID here for the mirror-image
+                     * reason it is valid in the default order, so it is forced off rather than left to the
+                     * gate below. The data operand always fits by construction: mc*K = DATA_BANK*32KB is
+                     * the invariant that DEFINES the M-tile. */
+                    if (mouter) wrm = (mouter == 1 && !seg_first) ? 1 : 0;
+                    else if (segcap > 0) { if (!wrm) wrm = 1; }
                     else if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
-                    if (m0 > 0 && wrm) { uint32_t cv = 0;
+                    if ((mouter ? !seg_first : (m0 > 0)) && wrm) { uint32_t cv = 0;
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
                       }
@@ -524,7 +569,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                           if ((rc[k7] & 0xffff) == 0x1010 && ((rc[k7+1] >> 16) & 0xffff) == 0x201) {
                               g1010 = (rc[k7] >> 16) | ((rc[k7+1] & 0xffff) << 16); break; }
                       }
-                      uint32_t dr = getenv("ORK_MTILE_DR") ? 1u : 0u;
+                      uint32_t dr = (mouter || getenv("ORK_MTILE_DR")) ? 1u : 0u;   /* transposed => DATA_REUSE */
                       /* Capacity check against the ACTUAL emitted split: WEIGHT_BANK is cv[7:4]. Under
                        * N-tiling this should always pass (segcap was derived to make it pass); it is kept
                        * as the load-bearing guard so a geometry change can only cost the speedup, never
@@ -545,12 +590,13 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                           fprintf(stderr,
                           "[wr-cs] K=%d mcap=%d m0=%d | 0x1040 %#x b12=%d | 0x1010=%#x GRAINS=%u KGRP=%u\n",
                           K, mcap, m0, rb, !!(rb & 0x1000u), g1010, (g1010 >> 4) & 0x3ff, (g1010 >> 16) & 0xff); } } }
-                  if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
+                  if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(sg); free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                   np++;
               }
-              segbase += (size_t)M * segw; cur = segend; nseg++;
+            }
           }
+          free(sg);
         }
         for (int p = 0; p < np; p++) { uint32_t *pr = (uint32_t*)((char*)RC->cpu + (size_t)p * REGCMD_I8_N * 4);
             if (p < np - 1) { uint64_t nx = RC->dma + (size_t)(p+1) * REGCMD_I8_N * 4;
