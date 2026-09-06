@@ -535,7 +535,32 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                      * the invariant that DEFINES the M-tile. */
                     if (mouter) wrm = (mouter == 1 && !seg_first) ? 1 : 0;
                     else if (segcap > 0) { if (!wrm) wrm = 1; }
-                    else if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
+                    else {
+                      /* NATURAL FIT — the gate is the LAW, not a shape list. A whitelist can only be wrong
+                       * about shapes nobody has run yet; the measured law
+                       *     reuse correct  <=>  K * segw <= WEIGHT_BANK banks * 32 KB
+                       * is a property of the geometry, so evaluating it on the segment we were ALREADY going
+                       * to emit engages reuse exactly where it is free and correct, for any future shape.
+                       * WEIGHT_BANK = 12 - DATA_BANK and DATA_BANK = mcap*K/32768 (the invariant that
+                       * defines the M-tile), so the binding case is the full tile. Deliberately NOT the
+                       * forcing function: segcap (ORK_WR_NTILE) narrows segments to MAKE the weight fit and
+                       * measured 0.39-0.42x, because a 64-column program is far below the width the NPU
+                       * computes efficiently and each added task costs ~9-13 us. This path adds no tasks
+                       * and narrows nothing -- it only claims a re-stream that was already avoidable, which
+                       * needs M > mcap to exist at all. Escape hatch: ORK_NO_MTILE_WR=1. */
+                      /* mc == mcap IS PART OF THE LAW, not a detail. A short final M-tile gets a DIFFERENT
+                       * synthesised bank split (0x1040 is derived from mc), so its bank boundaries do not
+                       * line up with the loader's and it reads stale bytes. Measured: K=1024 mcap=320 with
+                       * M=512 splits 320+192 and MISMATCHES, while every all-full-tile shape (K=2048
+                       * mcap=128 M=512 -> 128x4, K=3072 mcap=64 -> 64x8) is bit-exact.
+                       * The bank counts are NOT predicted here -- 12 - mcap*K/32768 is wrong below K=2048
+                       * (K=1024 emits 0xa2: WEIGHT_BANK=10, DATA_BANK=2, not the 2/10 that predicts) -- so
+                       * the capacity half is checked against the EMITTED word by the readback guard below,
+                       * which is now the load-bearing one on every path. */
+                      int wfit = (mc == mcap);
+                      if (wfit && !getenv("ORK_NO_MTILE_WR")) wrm = 1;
+                      else if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
+                    }
                     if ((mouter ? !seg_first : (m0 > 0)) && wrm) { uint32_t cv = 0;
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
@@ -575,8 +600,11 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                        * as the load-bearing guard so a geometry change can only cost the speedup, never
                        * correctness. Bit 12 is never licensed by it -- DATA_REUSE is invalid in this loop
                        * order (consecutive tasks share the weight and DIFFER in the activation). */
-                      if (segcap > 0 && !dr) { uint32_t wb = (cv >> 4) & 0xf;
-                          if ((size_t)K * segw > (size_t)wb * 32768u) wrm = 0; }
+                      /* CAPACITY, checked against the split actually emitted (cv[7:4]) rather than a
+                       * predicted one. This runs on EVERY weight-reuse path now: when it was conditioned on
+                       * segcap>0 the natural-fit gate had no readback protection and shipped a mismatch. */
+                      if (!dr) { uint32_t wb = (cv >> 4) & 0xf;
+                          if ((size_t)K * (size_t)segw > (size_t)wb * 32768u) wrm = 0; }
                       uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | (dr ? 0x1000u : 0x2000u));
                       if (!wrm) nv = cv;   /* capacity guard declined: emit the untouched split, no reuse bit */
                       orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);

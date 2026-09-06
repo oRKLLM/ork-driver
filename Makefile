@@ -1277,3 +1277,8 @@ aa_probe: tools/aa_probe.c $(COBJ)
 # inputs off the 2-bit LCG whose period once manufactured a whole false clean/corrupt table. Not in all/test.
 wr_diag: tools/wr_diag.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Law-gated WEIGHT_REUSE: does it win where the weight fits NATURALLY (narrow N)? Both arms checked
+# bit-exact against each other. Not in all/test.
+law_bench: tools/law_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
