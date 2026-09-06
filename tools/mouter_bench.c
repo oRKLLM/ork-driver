@@ -27,15 +27,21 @@ int main(int argc,char**argv){
      * already multi-segment; plus a narrow one as the control where nothing is segmented. */
     struct { int K,N; } sh[] = {{3584,18944},{3584,4608},{2048,8192},{2048,2048}};
     int Ms[] = {64,256};
+    struct { int K,N; } one[1]; int oneM[1];
+    int nsh = (int)(sizeof sh/sizeof sh[0]), nms = (int)(sizeof Ms/sizeof Ms[0]);
+    if (argc > 5) {   /* explicit K N M: forcing a narrow segw on a wide-N shape explodes the task count */
+        one[0].K = atoi(argv[3]); one[0].N = atoi(argv[4]); oneM[0] = atoi(argv[5]);
+        nsh = 1; nms = 1;
+    }
     printf("segment width forced to %s columns\n", segw);
     printf("%-6s %-6s %-5s %-10s %-12s %-10s %-12s %s\n",
            "K","N","M","base_us","reorder","reorder_us","reuse(b12)","reuse_us / x");
-    for(size_t q=0;q<sizeof sh/sizeof sh[0];q++){
-        int K=sh[q].K,N=sh[q].N;
+    for(int q=0;q<nsh;q++){
+        int K=(argc>5)?one[0].K:sh[q].K, N=(argc>5)?one[0].N:sh[q].N;
         int8_t *B=malloc((size_t)K*N); s_=999; for(size_t i=0;i<(size_t)K*N;i++)B[i]=rnd();
         ork_w *w=ork_i8_mm_pack(c,K,N,B); if(!w){ printf("%-6d %-6d pack failed\n",K,N); free(B); continue; }
-        for(size_t r=0;r<sizeof Ms/sizeof Ms[0];r++){
-            int M=Ms[r]; int8_t *A=malloc((size_t)M*K); int32_t *C=malloc((size_t)M*N*4);
+        for(int r=0;r<nms;r++){
+            int M=(argc>5)?oneM[0]:Ms[r]; int8_t *A=malloc((size_t)M*K); int32_t *C=malloc((size_t)M*N*4);
             s_=4242; for(size_t i=0;i<(size_t)M*K;i++)A[i]=rnd();
             unsigned long long h[3]; double us[3]; int ok=1;
             for(int arm=0;arm<3;arm++){
@@ -51,7 +57,7 @@ int main(int argc,char**argv){
             }
             unsetenv("ORK_WR_MOUTER"); unsetenv("ORK_WR_SEGW");
             if(!ok) printf("%-6d %-6d %-5d run failed\n",K,N,M);
-            else printf("%-6d %-6d %-5d %-10.0f %-12s %-10.0f %-12s %.0f / %.3fx\n", K,N,M, us[0],
+            else printf("%-6d %-6d %-5d %-10.1f %-12s %-10.1f %-12s %.1f / %.4fx\n", K,N,M, us[0],
                         h[1]==h[0]?"bit-exact":"MISMATCH", us[1],
                         h[2]==h[0]?"bit-exact":"MISMATCH", us[2], us[0]/us[2]);
             free(A); free(C);
