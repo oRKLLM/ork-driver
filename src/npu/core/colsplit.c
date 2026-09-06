@@ -223,6 +223,11 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
     int dt = w->dtype;   /* DT_I8 today; fp16/int4 branches keyed on this (Stage 0: dt==DT_I8 == byte-identical) */
     int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = orki_mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
+    /* ORK_WR_NC: pin the core count for the reuse investigation. Mesa's rocket driver comments that weight
+     * reuse requires "all tasks to the same core" (rkt_ml.c) -- CBUF is per-core, so a reuse tile dispatched
+     * to a core that never loaded the operand has nothing to reuse. Forcing nc=1 puts every M-tile on one
+     * core and tests that constraint directly. */
+    { const char *e = getenv("ORK_WR_NC"); if (e && *e) { int v = atoi(e); if (v > 0) ncreq = v; } }
     int nc = ncreq; if (nc > NN) nc = NN; if (nc > c->soc->cores) nc = c->soc->cores; if (nc < 1) nc = 1;
     if (dt == DT_F16 && w->Sk > 1 && nc > 2 && getenv("ORK_F16_2CORE")) nc = 2;   /* variant B: fewer concurrent fp16 fetchers (reliability/speed trade) */
     if (w->domain != c->dom_active || (w->domain && !c->dom_save)) orki_dom_activate(c, w->domain);
@@ -466,12 +471,48 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
                       }
-                      uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | 0x2000u);
+                      /* ORK_MTILE_DR=1 selects DATA_REUSE (bit 12) instead of WEIGHT_REUSE (bit 13). The two
+                       * are different operands: bit 13 governs the weight path (K*segw vs WEIGHT_BANK), bit
+                       * 12 the feature path (mc*K vs DATA_BANK -- which always fits EXACTLY, since the M-tile
+                       * is defined by the data-bank capacity). Anything claimed about DATA_REUSE must be
+                       * checked against the EMITTED word, not this variable: an earlier attempt at this knob
+                       * was lost from the tree mid-session and its results silently described WEIGHT_REUSE. */
+                      /* ORK_WR_WBANK=<n>: force WEIGHT_BANK[7:4]=n, DATA_BANK[3:0]=12-n. DATA_REUSE
+                       * correctness correlates 8/8 with WEIGHT_BANK being a power of two (clean at W=4,2;
+                       * corrupt at W=11,10,9,6,5) -- but that is a correlation ACROSS SHAPES. This forces the
+                       * field at a fixed shape so the claim can be tested by intervention, which is what every
+                       * predicate that died this session failed to survive. */
+                      { const char *wbe = getenv("ORK_WR_WBANK");
+                        if (wbe) { int wb = atoi(wbe);
+                          if (wb >= 1 && wb <= 11) { int db = 12 - wb;
+                            cv = (cv & ~0xffu) | ((uint32_t)wb << 4) | (uint32_t)db; } } }
+                      /* ORK_WR_GRAINS=<hex>: force CNA_CONV_CON2 (0x1010) = FEATURE_GRAINS[13:4] |
+                       * KERNEL_GROUP[23:16], documented as "atoms fetched per pass". A bank-ROTATION account
+                       * of DATA_REUSE -- activations written round-robin across banks, the reuse tile needing
+                       * the rotation phase to land where the loader left it -- predicts correctness depends
+                       * jointly on bank count and atoms-per-pass, which would explain why no single field has
+                       * predicted it. Unlike the power-of-two patterns, this is a mechanism, so it is worth
+                       * an intervention rather than another correlation. */
+                      { const char *ge = getenv("ORK_WR_GRAINS");
+                        if (ge) orki_setrn(rc, REGCMD_I8_N, RK_CNA_CONV_CON2, (uint32_t)strtoul(ge, 0, 0)); }
+                      uint32_t g1010 = 0;
+                      for (int k7 = 0; k7 + 1 < REGCMD_I8_N; k7 += 2) {
+                          if ((rc[k7] & 0xffff) == 0x1010 && ((rc[k7+1] >> 16) & 0xffff) == 0x201) {
+                              g1010 = (rc[k7] >> 16) | ((rc[k7+1] & 0xffff) << 16); break; }
+                      }
+                      uint32_t dr = getenv("ORK_MTILE_DR") ? 1u : 0u;
+                      uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | (dr ? 0x1000u : 0x2000u));
                       orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
-                      if (getenv("ORK_MTILE_WR_V")) fprintf(stderr,
-                          "[wr-cs] K=%d N=%d M=%d mcap=%d | seg ns=%d is0=%d segw=%d wbase=%#x | m0=%d mc=%d"
-                          " | 0x1040 %#x -> %#x\n",
-                          K, N, M, mcap, ns, is0, segw, (unsigned)wbase, m0, mc, cv, nv); } }
+                      /* VERIFY-AFTER-WRITE: read the register back out of the emitted program and report which
+                       * reuse bit is actually present. Placed AFTER the write on purpose -- the previous dump
+                       * ran BEFORE it and therefore showed identical words for both bits. */
+                      if (getenv("ORK_MTILE_WR_V")) { uint32_t rb = 0;
+                          for (int k6 = 0; k6 + 1 < REGCMD_I8_N; k6 += 2) {
+                              if ((rc[k6] & 0xffff) == 0x1040 && ((rc[k6+1] >> 16) & 0xffff) == 0x201) { rb = rc[k6] >> 16; break; }
+                          }
+                          fprintf(stderr,
+                          "[wr-cs] K=%d mcap=%d m0=%d | 0x1040 %#x b12=%d | 0x1010=%#x GRAINS=%u KGRP=%u\n",
+                          K, mcap, m0, rb, !!(rb & 0x1000u), g1010, (g1010 >> 4) & 0x3ff, (g1010 >> 16) & 0xff); } } }
                   if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                   np++;

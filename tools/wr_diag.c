@@ -21,7 +21,14 @@
 
 extern int orki_i8_chain_fullk_mcap(ork_npu *c, int K);
 static uint32_t sd = 12345;
-static int rnd(void){ sd = sd*1103515245u + 12345u; return (int)((sd>>16)&3); }
+/* ORK_WR_FULLRAND=1 widens this from 2 bits to the full int8 range. It is not cosmetic: bit k of an LCG
+ * mod 2^32 has period 2^(k+1), so bits 16-17 REPEAT EVERY 262144 VALUES. Any shape whose per-M-tile
+ * activation size (mcap*K) is a multiple of that period gets consecutive tiles holding BIT-IDENTICAL
+ * rows -- and then reusing the previous tile's data is correct BY COINCIDENCE, with no fetch having been
+ * declined. K=2048 (128*2048) and K=4096 (64*4096) are both exactly 262144. Both were recorded "CLEAN". */
+static int rnd(void){ sd = sd*1103515245u + 12345u;
+    static int full = -1; if(full < 0) full = getenv("ORK_WR_FULLRAND") ? 1 : 0;
+    return full ? (int)((sd>>16)&0xff) - 128 : (int)((sd>>16)&3); }
 
 static int run(ork_npu*c, int M,int K,int N, const int8_t*A, const int8_t*B, int32_t*C, int wr){
     if(wr) setenv("ORK_MTILE_WR","1",1); else unsetenv("ORK_MTILE_WR");
@@ -44,6 +51,20 @@ int main(int argc,char**argv){
     for(size_t i=0;i<(size_t)K*N;i++) B[i]=(int8_t)(rnd()-1);
     int32_t *Cref=malloc((size_t)M*N*4), *Cb1=malloc((size_t)M*N*4), *Cb2=malloc((size_t)M*N*4);
     if(run(c,M,K,N,A,B,Cref,0)){ printf("ref run failed\n"); return 2; }
+    /* ORK_WR_PRE_K/N: inject a DIFFERENT shape between the reference pass and the reuse pass. Hypothesis:
+     * reuse reads whatever the banks currently hold, so it is correct only when the IMMEDIATELY PRECEDING
+     * op used the same weight -- which this harness accidentally arranges (ref then reuse, same weight), as
+     * does a 20-iteration timing loop. Real workloads run a different matmul each time, which is the
+     * wr_sweep / test_matmul case (9/9 corrupt). If so, priming flips this shape from 0.0%% to corrupt. */
+    if(getenv("ORK_WR_PRE_K")){
+        int pk=atoi(getenv("ORK_WR_PRE_K")), pn=getenv("ORK_WR_PRE_N")?atoi(getenv("ORK_WR_PRE_N")):pk;
+        int8_t*pa=malloc((size_t)M*pk),*pb=malloc((size_t)pk*pn); int32_t*pc2=malloc((size_t)M*pn*4);
+        for(size_t j=0;j<(size_t)M*pk;j++) pa[j]=(int8_t)(rnd()-1);
+        for(size_t j=0;j<(size_t)pk*pn;j++) pb[j]=(int8_t)(rnd()-1);
+        int prc=run(c,M,pk,pn,pa,pb,pc2,0);
+        printf("  [prime] ran a DIFFERENT shape K=%d N=%d between ref and reuse (rc=%d)\n",pk,pn,prc);
+        free(pa); free(pb); free(pc2);
+    }
     if(run(c,M,K,N,A,B,Cb1,1)){ printf("reuse run 1 failed\n"); return 2; }
     if(run(c,M,K,N,A,B,Cb2,1)){ printf("reuse run 2 failed\n"); return 2; }
 
@@ -84,11 +105,45 @@ int main(int argc,char**argv){
     long zero=0,tot=0; for(size_t j=0;j<(size_t)M*N;j++) if(Cb1[j]!=Cref[j]){ tot++; if(Cb1[j]==0) zero++; }
     printf("        total wrong=%ld, of which exactly ZERO=%ld (%.1f%%)\n", tot, zero, tot?100.0*zero/tot:0.0);
 
+    /* [4a] ERROR MAGNITUDE. C[m,n] = sum_k A[m,k]*B[k,n], so the two operands corrupt ASYMMETRICALLY: a
+     * stale WEIGHT column ruins only that column (columns are independent), but a stale ACTIVATION at ANY k
+     * ruins the WHOLE ROW for every n, because every output in the row sums over all k. Partial data
+     * staleness therefore CASCADES to ~100% of outputs, and the error COUNT saturates -- it cannot tell
+     * "one bank stale" from "everything stale". The MAGNITUDE can: if a fraction f of the k-terms are
+     * stale, each output should be off by roughly f, not wildly. */
+    { double sum_rel = 0; long n_rel = 0; int32_t maxabs = 0; double refmag = 0;
+      for (size_t j = 0; j < (size_t)M*N; j++) {
+          int32_t r = Cref[j] < 0 ? -Cref[j] : Cref[j]; refmag += r;
+          if (Cb1[j] == Cref[j]) continue;
+          int32_t d = Cb1[j] - Cref[j]; if (d < 0) d = -d;
+          if (d > maxabs) maxabs = d;
+          if (r > 0) { sum_rel += (double)d / r; n_rel++; }
+      }
+      printf("  [4a] ERROR MAGNITUDE over wrong elements: mean |diff|/|ref| = %.3f, max |diff| = %d, mean |ref| = %.0f\n",
+             n_rel ? sum_rel/n_rel : 0.0, maxabs, refmag/((double)M*N));
+      printf("        <<1  => only a FRACTION of the k-terms are stale (partial residency, cascaded by the K-sum)\n"
+             "        ~1+  => the reduction is essentially unrelated to the reference (whole operand wrong)\n"); }
+
     /* [5] IS THE CORRECT PART CONTIGUOUS IN COLUMNS?  The pack layout is column-major in 32-wide groups
      * (woff = ((n/32)*KT + k/32)*1024 + ...), so a weight bank holding the last-streamed bytes would make a
      * CONTIGUOUS RUN of 32-column groups correct. If instead the correct columns are scattered, residency is
      * interleaved and no N-tiling could fix it. This is the test of "are the weights uploaded in a layout
      * that reuse can work with". */
+    /* [4b] ROW distribution within the first reuse tile. WEIGHT_REUSE corrupted in COLUMNS (the correct
+     * ones a contiguous run = the resident weight slice). DATA_REUSE's operand is the ACTIVATION, so any
+     * partial residency should localise in ROWS instead. A contiguous run of correct rows would be the
+     * direct analogue and would give a data-side capacity law; scattered rows would not. */
+    printf("  [4b] ROW DISTRIBUTION of CORRECT elements inside the first reuse tile:\n        ");
+    { int r0 = mcap, r1 = (2*mcap < M) ? 2*mcap : M, shown = 0, runs = 0, prev = -1;
+      for (int r = r0; r < r1 && shown < 64; r++, shown++) {
+          int ok = 1;
+          for (int n2 = 0; n2 < N; n2++) if (Cb1[(size_t)r*N+n2] != Cref[(size_t)r*N+n2]) { ok = 0; break; }
+          printf("%c", ok ? '#' : '.');
+          if (ok != prev) { runs++; prev = ok; }
+      }
+      printf("   ('#' = row fully correct; %d transitions)\n", runs);
+      printf("        %s\n", runs <= 3 ? "CONTIGUOUS -> row-wise residency, a data-side capacity law is plausible"
+                                        : "SCATTERED  -> not simple row residency"); }
     printf("  [5] COLUMN DISTRIBUTION of CORRECT elements within core segment 0 (32-col groups):\n");
     { int segw = N/3, ngrp = segw/32, row = mcap;   /* first reuse row */
       int shown=0, runs=0, prev=-1;
