@@ -437,6 +437,13 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                    * clobbers the bank split to a value which MUST miscompute. It PROVED the write reaches the
                    * hardware (a 60 s job timeout + 6 soft resets), and is kept only for re-proving that if
                    * ever needed -- do not run it casually, it wedges the NPU on a shared board. */
+                  if (getenv("ORK_WR_GEOM")) { uint32_t g1040 = 0;
+                      for (int k3 = 0; k3 + 1 < REGCMD_I8_N; k3 += 2) {
+                          if ((rc[k3] & 0xffff) == 0x1040 && ((rc[k3+1] >> 16) & 0xffff) == 0x201) { g1040 = rc[k3] >> 16; break; }
+                      }
+                      fprintf(stderr, "[geom] K=%d N=%d M=%d mcap=%d nc=%d | c0=%d c1e=%d ns=%d is0=%d segw=%d"
+                              " | m0=%d mc=%d | 0x1040=%#x wbase=%#x\n",
+                              K, N, M, mcap, nc, c0, c1e, ns, is0, segw, m0, mc, g1040, (unsigned)wbase); }
                   { const char *wre = getenv("ORK_MTILE_WR"); int wrm = wre ? atoi(wre) : 0;
                     /* ENVELOPE GATE. Reuse is verified bit-exact ONLY at K=4096 with a single N-slice; with
                      * the bit applied unconditionally `make test` fails three test_matmul goldens
@@ -444,14 +451,27 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                      * the SAME mcap=64 as K=4096, so the boundary is NOT the M-tile geometry and is not yet
                      * understood -- this gate is the MEASURED envelope, not a derived one. Do not widen it
                      * without re-running make test. */
-                    if (wrm && !(K == 4096 && w->Sn == 1)) wrm = 0;
+                    /* PLACEHOLDER GATE -- deliberately NOT the real predicate. The measured law is
+                     *     reuse correct  <=>  K*segw <= WEIGHT_BANK banks * 32 KB
+                     * (correct_fraction = min(1, capacity/(K*segw)); verified 0.0%% wrong at 1.0x, 49.8%% at
+                     * 2x, 89.3%% at 10.9x -- tools/wr_diag.c). The loader streams the whole weight but the
+                     * banks retain only the LAST capacity bytes, so the reuse tile reads stale bytes beyond
+                     * that. Implementing the real rule needs N-tiling to fit the banks AND widening
+                     * WEIGHT_BANK via 0x1040 (4->11 banks), so until then this fails closed on a shape that
+                     * happens to keep make test green. Do not read it as characterising anything.
+                     * ORK_MTILE_WR_ALL=1 bypasses it for characterisation; out of envelope the result is
+                     * WRONG (not a hang), so sweeping is safe. Never set it in production. */
+                    if (wrm && !(K == 4096 && w->Sn == 1) && !getenv("ORK_MTILE_WR_ALL")) wrm = 0;
                     if (m0 > 0 && wrm) { uint32_t cv = 0;
                       for (int k2 = 0; k2 + 1 < REGCMD_I8_N; k2 += 2) {
                           if ((rc[k2] & 0xffff) == 0x1040 && ((rc[k2+1] >> 16) & 0xffff) == 0x201) { cv = rc[k2] >> 16; break; }
                       }
                       uint32_t nv = (wrm >= 2) ? 0x1bu : (cv | 0x2000u);
                       orki_setrn(rc, REGCMD_I8_N, RK_CNA_CBUF_CON0, nv);
-                      if (getenv("ORK_MTILE_WR_V")) fprintf(stderr, "[wr-cs] m0=%d 0x1040 %#x -> %#x\n", m0, cv, nv); } }
+                      if (getenv("ORK_MTILE_WR_V")) fprintf(stderr,
+                          "[wr-cs] K=%d N=%d M=%d mcap=%d | seg ns=%d is0=%d segw=%d wbase=%#x | m0=%d mc=%d"
+                          " | 0x1040 %#x -> %#x\n",
+                          K, N, M, mcap, ns, is0, segw, (unsigned)wbase, m0, mc, cv, nv); } }
                   if (orki_validate_regcmd("ork_dyn_colsplit", c, rc, REGCMD_I8_N, w, NULL, 0)) { free(h); return NULL; }
                   memcpy((char*)RC->cpu + (size_t)np * REGCMD_I8_N * 4, rc, REGCMD_I8_N * 4);
                   np++;

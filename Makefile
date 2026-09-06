@@ -1102,6 +1102,10 @@ ksplit_accum_probe: tools/ksplit_accum_probe.c $(COBJ)
 wreuse_probe: tools/wreuse_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
 
+# Validated WEIGHT_REUSE sweep: mirrors test_matmul's structure so it can actually DETECT the corruption.
+wr_sweep: tools/wr_sweep.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
 # submit-queue chunk-pipeline bench: CPU‖NPU decode-split overlap. Not in all/test.
 ork_dyn_queue_bench: tools/ork_dyn_queue_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
