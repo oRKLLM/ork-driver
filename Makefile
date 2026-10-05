@@ -1282,3 +1282,9 @@ wr_diag: tools/wr_diag.c $(COBJ)
 # bit-exact against each other. Not in all/test.
 law_bench: tools/law_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# Cheapest decisive measurement for NPU-side training: per-step weight pack/repack cost vs the matmul it
+# enables (the resident-weight design is pack-once/run-many; a training step re-packs every weight), plus
+# the fp16 M-cap consequence at training shapes. Self-validating vs an fp64 reference. Not in all/test.
+train_scope_bench: tools/train_scope_bench.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
