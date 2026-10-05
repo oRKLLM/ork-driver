@@ -279,9 +279,23 @@ rather than returning stale output. It left an orphaned job holding core 0.
 
 Cause: the two registers are written **as a pair**. A real sched=1 emission at K=3584 would set
 `CONV_CON2 = 16 × min(mc+1, pow2_floor(cbuf/K)) = 16 × 16 = 256`; the test left the sched=0 value
-`16×51 = 816` while declaring 11 data banks. **Untested and still open:** `{CBUF_CON0=0x1b,
-CONV_CON2=256, mc ≤ 50}` as a consistent pair. Not attempted — the board was down and a second attempt at
-a mechanism that already wedged it needs an explicit decision.
+`16×51 = 816` while declaring 11 data banks. **So the hypothesis is untested, not refuted** — what failed
+was the test. The pair to try is `{CBUF_CON0=0x1b, CONV_CON2=256, mc ≤ 50}`. Not attempted: the board was
+down, and a second attempt at a mechanism that already wedged it needs an explicit operator decision.
+
+**Source arithmetic raises confidence in it considerably [S].** Evaluate the sched=1 branch at the
+*known-good, measured-exact* K=1024 / mcap=176 configuration:
+
+```
+R = 57344/1024 = 56 → pow2_floor = 32 ;  rows = min(177,32) = 32  →  CONV_CON2 = 512
+scale = 4 ; base = (int)(177−15·3) = 132 ; slope = 60 ; mg = (176+63)/64 = 3
+v = 132 − 60·2 = 12  →  clamped  →  0x1b
+```
+
+**The configuration that is already validated bit-exact emits exactly `0x1b` — DATA_BANK 11,
+WEIGHT_BANK 1.** So `0x1b` is a *proven-good* large-tile bank split, not a speculative value; K=3584
+simply never receives it. It also disposes of the "mc=50 is multi-pass" worry: the working K=1024 case is
+equally multi-pass (mc=176 against rows=32), so the hardware already carries that routinely.
 
 ### 9.3 int8 is unaffected — the impact is fp16-only, and not the production prefill path
 
@@ -324,8 +338,23 @@ shed the 49.5 ms transpose **[M]** and the 5.5 ms repack **[M]** that the NPU pa
 Following it through, the split becomes **NPU: fwd gate/up only, 15.0 GFLOP, ~16.8 ms** vs **CPU:
 everything else, 52.7 GFLOP, ~351 ms [E]** — i.e. **the NPU does ~5% of a training step.** Throughput
 improves to ~122 tok/s **[E]** from 82, but the verdict hardens rather than softens: this is *CPU training
-with a 5% NPU assist*, and 4× A76 alone is ~20× short of an M5 Max. **It also makes §7.1 item 2 more
-valuable, not less** — the bank-split fix is what would make the accelerator relevant at all here.
+with a 5% NPU assist*, and 4× A76 alone is ~20× short of an M5 Max.
+
+**Two qualifications, and the first is the important one:**
+
+1. **This recommendation is CONDITIONAL ON §9.2 STAYING UNRESOLVED, and the two findings are coupled.**
+   The mcap 16/32 scan measured 296–437 GFLOP/s — fast but wrong, because the banks had not moved. If
+   `{0x1b, 256}` lands bit-exact, the NPU returns to roughly 300–437 GFLOP/s at K=3584, comfortably above
+   NEON's 120–185, and **this recommendation inverts.** Read as a pair: the answer is probably "fix the
+   encoding", and "use the CPU" is the fallback if it cannot be fixed.
+2. **CPU capacity is not free.** Prefill on this board already measures ~88% CPU-bound (act-quant ~45%,
+   resolve ~43%, NPU ~11%) **[M, prior]**. A NEON GEMM arm contends with act-quant, the 49.5 ms
+   transposes and Adam8bit, so 120–185 GFLOP/s is a *standalone* upper bound an end-to-end step will not
+   realise. "Move it to the CPU" sounds free and is not.
+
+What survives both qualifications is the dispatch rule this board keeps teaching: **dispatch on resource
+profile, not engine identity.** At 563 FLOP/byte the shape is compute-bound and genuinely will not fight
+the ~30 GB/s bus, which is precisely the condition under which a second engine is additive here.
 
 ### 9.5 Standing rule adopted: no numerics check without a positive control
 
