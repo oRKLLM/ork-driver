@@ -43,7 +43,7 @@ static void cmp(const char *op,const char *wrt,double *p,const double *g,int n,d
     double L0 = loss();
     double atol = 16.0 * fabs(L0) * 2.220446049250313e-16 / eps;   /* fd roundoff floor */
     if(atol < 1e-14) atol = 1e-14;
-    double worst=0, wa=0, wf=0, wabs=0; int bad=0;
+    double worst=0, wabs=0; int bad=0;
     for(int s=0;s<6;s++){
         int i=(s*n)/6+s; if(i>=n) i=n-1;
         double sv=p[i];
@@ -53,7 +53,7 @@ static void cmp(const char *op,const char *wrt,double *p,const double *g,int n,d
         double fd=(Lp-Lm)/(2*eps), an=g[i], ad=fabs(an-fd);
         double rel = fabs(fd)>0 ? ad/fabs(fd) : (fabs(an)>0?1e9:0);
         if(!(ad<=atol || rel<=1e-6)) bad++;
-        if(rel>worst){ worst=rel; wa=an; wf=fd; wabs=ad; }
+        if(rel>worst){ worst=rel; wabs=ad; }
     }
     if(bad) fails++;
     printf("  %-12s d/d%-8s rel %.2e  |Δ| %.2e  (floor %.1e)  %s\n", op, wrt, worst, wabs, atol,
@@ -159,6 +159,24 @@ static void kl_bwd(void){
     }
 }
 
+/* POSITIVE CONTROLS — this harness's own rule (a numerics check with no configuration that MUST fail is
+ * vacuous) applied to itself. Each is a plausible real mistake:
+ *   rms_bwd_broken : drops the r-coupling term in dx — the single easiest RMSNorm error, and it still
+ *                    gives a descent direction, so only a gradient check catches it.
+ *   sw_bwd_broken  : uses silu(a) where silu'(a) belongs in da — a wrong-derivative slip.
+ * If either PASSES the check, the check cannot see a wrong gradient and every other row is meaningless. */
+static void rms_bwd_broken(void){
+    double ms=0; for(int i=0;i<RN;i++) ms+=rx[i]*rx[i]; ms/=RN;
+    double r=sqrt(ms+reps);
+    for(int i=0;i<RN;i++) ry[i]=rg[i]*rx[i]/r;
+    for(int k=0;k<RN;k++){ rdg[k]=ry[k]*rx[k]/r; rdx[k]=rg[k]*ry[k]/r; }   /* r-coupling term MISSING */
+}
+static void sw_bwd_broken(void){
+    for(int i=0;i<SN;i++) sy[i]=sa[i]*sig(sa[i])*sb[i];
+    for(int k=0;k<SN;k++){ double s=sig(sa[k]), silu=sa[k]*s;
+        sdb[k]=silu*sy[k]; sda[k]=sb[k]*sy[k]*silu; }                      /* silu where silu' belongs */
+}
+
 int main(void){
     const double eps=1e-6;
     printf("fp64 gradient checks for the non-matmul backward ops   (CPU only, no board)\n");
@@ -181,8 +199,21 @@ int main(void){
     for(int i=0;i<CB*CV;i++){ kz[i]=rnd()*3.0; kzr[i]=rnd()*3.0; }
     kl_bwd(); cmp("KL(q||p)","z",kz,kdz,CB*CV,kl_loss,eps);
 
-    printf("\n%s\n", fails==0
+    /* ---- positive controls: these MUST fail, or the checker is blind ---- */
+    printf("\npositive controls (each MUST fail — otherwise this harness proves nothing):\n");
+    int before=fails;
+    rms_bwd_broken(); cmp("RMSNorm-BAD","x",rx,rdx,RN,rms_loss,eps);
+    sw_bwd_broken();  cmp("SwiGLU-BAD","a",sa,sda,SN,sw_loss,eps);
+    int controls_fired = fails-before;
+
+    if(controls_fired<2){
+        printf("\nVOID — %d of 2 positive controls did NOT fail. The check cannot detect a wrong\n"
+               "       gradient, so the PASSes above carry no information.\n", 2-controls_fired);
+        return 3;
+    }
+    printf("  (both controls failed, as required — the checker can see a wrong gradient)\n");
+    printf("\n%s\n", before==0
         ? "ALL PASS — RMSNorm, SwiGLU, cross-entropy and KL backward formulae are correct."
-        : "SOME FAILED — see above.");
-    return fails!=0;
+        : "SOME REAL CHECKS FAILED — see above.");
+    return before!=0;
 }

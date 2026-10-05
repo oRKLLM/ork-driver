@@ -65,6 +65,42 @@ static void backward(void){
     if(ork_f16_mm_run(c,wdH,K1,Xt,dW1))     die("dW1");               /* dW1 = Xᵀ·dH */
 }
 
+/* fp64 ORACLE for the chained gradient. The finite-difference check below differentiates an
+ * fp16-ROUNDED forward, which this project has since established is NOT a reference: the same method
+ * reported a correct attention dK as 38x wrong. dW1 is the claim that matters here — W1 reaches the loss
+ * only through dH — so it needs an oracle, not a difference of rounded losses. Recomputes the entire
+ * two-layer forward and backward in double from the SAME fp16 operands the NPU saw. */
+static void oracle2(double *odW1,double *odW2){
+    size_t mk1=(size_t)M*K1, k12=(size_t)K1*K2, mk2=(size_t)M*K2, k2n=(size_t)K2*N, mn=(size_t)M*N;
+    double *H=malloc(mk2*8), *Y=malloc(mn*8);
+    if(!H||!Y) die("oracle alloc");
+    for(int m=0;m<M;m++) for(int j=0;j<K2;j++){ double a=0;
+        for(int i=0;i<K1;i++) a+=(double)(float)Xh[(size_t)m*K1+i]*(double)(float)W1h[(size_t)i*K2+j];
+        H[(size_t)m*K2+j]=a; }                                              /* H = X·W1 */
+    for(int m=0;m<M;m++) for(int n=0;n<N;n++){ double a=0;
+        for(int j=0;j<K2;j++) a+=(double)(float)((ork_f16)H[(size_t)m*K2+j])*(double)(float)W2h[(size_t)j*N+n];
+        Y[(size_t)m*N+n]=a; }                                               /* Y = H·W2, H re-rounded as the NPU does */
+    for(int j=0;j<K2;j++) for(int n=0;n<N;n++){ double a=0;
+        for(int m=0;m<M;m++) a+=(double)(float)((ork_f16)H[(size_t)m*K2+j])*Y[(size_t)m*N+n];
+        odW2[(size_t)j*N+n]=a; }                                            /* dW2 = Hᵀ·dY,  dY = Y */
+    double *dH=malloc(mk2*8); if(!dH) die("oracle alloc");
+    for(int m=0;m<M;m++) for(int j=0;j<K2;j++){ double a=0;
+        for(int n=0;n<N;n++) a+=Y[(size_t)m*N+n]*(double)(float)W2h[(size_t)j*N+n];
+        dH[(size_t)m*K2+j]=a; }                                             /* dH = dY·W2ᵀ  ◄ chaining */
+    for(int i=0;i<K1;i++) for(int j=0;j<K2;j++){ double a=0;
+        for(int m=0;m<M;m++) a+=(double)(float)Xh[(size_t)m*K1+i]*(double)(float)((ork_f16)dH[(size_t)m*K2+j]);
+        odW1[(size_t)i*K2+j]=a; }                                           /* dW1 = Xᵀ·dH */
+    (void)mk1;(void)k12;(void)k2n;
+    free(H);free(Y);free(dH);
+}
+static void vs_oracle2(const char*nm,const float *npu,const double *ref,size_t n){
+    double mx=0,mg=0;
+    for(size_t i=0;i<n;i++){ double a=fabs(ref[i]); if(a>mg)mg=a; }
+    for(size_t i=0;i<n;i++){ double d=fabs((double)npu[i]-ref[i])/(mg>0?mg:1); if(d>mx)mx=d; }
+    printf("  %-4s vs fp64 oracle (same fp16 in)  max err / max|ref|  %.3e   %s\n",
+           nm, mx, mx<2e-2?"PASS":"FAIL");
+}
+
 int main(int argc,char**argv){
     M  = argc>1?atoi(argv[1]):128;
     K1 = argc>2?atoi(argv[2]):512;
@@ -96,6 +132,13 @@ int main(int argc,char**argv){
     printf("two layers  X[%d,%d] -W1-> H[%d,%d] -W2-> Y[%d,%d]   lr=%g steps=%d\n\n",M,K1,M,K2,M,N,lr,steps);
     double L0=forward(); backward();
 
+    { double *o1=malloc((size_t)K1*K2*8), *o2=malloc((size_t)K2*N*8);
+      if(o1&&o2){ oracle2(o1,o2);
+        printf("ORACLE — NPU vs fp64 over identical fp16 operands (this is the gate):\n");
+        vs_oracle2("dW1",dW1,o1,(size_t)K1*K2);   /* the CHAINED gradient */
+        vs_oracle2("dW2",dW2,o2,(size_t)K2*N);
+        printf("\n"); }
+      free(o1);free(o2); }
     /* check 1: both gradients are the right matmul of their operands */
     double e1=0;
     for(int s=0;s<6;s++){
