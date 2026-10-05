@@ -11,27 +11,38 @@ Tags: **[M]** measured on this board · **[D]** derived from [M] · **[S]** read
 
 **Training works on this hardware, correctly, today — with no changes to ork-driver.**
 
-Every gradient a transformer training step needs has been computed on the NPU and validated against an
-fp64 reference. The goal was a first *correct* training loop, speed secondary; that goal is met.
+**Every matmul gradient has been computed on the NPU and validated against fp64; the non-matmul backward
+ops are implemented and validated on the CPU; GDN backward is derived and validated in fp64 but not yet
+ported.** The goal was a first *correct* training loop, speed secondary.
 
-| path | validation | result |
+| path | validated against | result |
 |---|---|---|
 | linear forward `Y = X·W` | — | ✅ |
-| `dW = Xᵀ·dY` | vs fp64, same fp16 operands | **3.853e-07** |
-| `dW` | vs central finite differences | **1.210e-03** |
-| `dX` chaining across two layers | vs finite differences (W1 reaches loss only via `dH`) | **4.862e-02** |
-| attention `dV = Pᵀ·dO` | vs fp64 oracle | **3.789e-04** |
-| attention `dQ = dS·K` | vs fp64 oracle | **2.826e-04** |
-| attention `dK = dSᵀ·Q` | vs fp64 oracle | **2.989e-04** |
-| one-layer SGD, 12 steps | loss monotone | 937383 → **569701** |
-| two-layer SGD, 12 steps | loss monotone | 639813 → **36221** |
+| `dW = Xᵀ·dY` | fp64, same fp16 operands | **3.853e-07** |
+| `dW1` **chained across two layers** | **fp64 oracle** | **2.581e-04** |
+| `dW2` | fp64 oracle | 1.982e-04 |
+| attention `dV = Pᵀ·dO` | fp64 oracle | 3.789e-04 |
+| attention `dQ = dS·K` | fp64 oracle | 2.826e-04 |
+| attention `dK = dSᵀ·Q` | fp64 oracle | 2.989e-04 |
+| softmax `dS` | implied by dQ/dK + fp64 formula check | 7.4e-08 / 1.3e-06 |
+| RMSNorm `dx`,`dg` · SwiGLU `da`,`db` · CE · KL | fp64 central differences, **with positive controls** | 4.8e-07 … within fd floor |
+| **GDN** `dq,dk,dv,dα,dβ` (recurrent form) | fp64 central differences, **with positive control** | **1.1e-08 … 3.2e-07** |
+
+**Every row above is an oracle or an fp64 formula check.** Earlier drafts also listed finite differences
+against an *fp16-rounded* forward (dW 1.21e-03, chaining 4.86e-02); those are removed — §9.3 explains why
+that method is not a reference, and both claims are now carried by fp64 oracles instead.
+
+*Sanity, not validation:* one- and two-layer SGD both reduced the loss monotonically over 12 steps
+(937383→569701, 639813→36221). §2.1 is explicit that convergence is **not** evidence of a correct
+gradient — a wrong-but-correlated gradient still descends — so these are recorded here and nowhere else.
 
 **No new library primitives were needed.** `dX` and `dW` are ordinary matmuls with transposed operands —
 existing `ork_f16_mm_pack` / `ork_f16_mm_run` calls. That is why all of this was validated without
 touching `src/`.
 
 Probes: `tools/train_step_proof.c`, `tools/train_2layer_proof.c`, `tools/train_attn_bwd_proof.c`,
-`tools/attn_bwd_fp64_ref.c` (CPU-only oracle).
+`tools/attn_bwd_fp64_ref.c`, `tools/bwd_ops_fp64_check.c`, `tools/gdn_bwd_fp64_ref.c` (the last three
+CPU-only oracles).
 
 ---
 
@@ -71,14 +82,14 @@ transpose, so these are CPU work. See §5.
 | operation | forward | backward | where | validated |
 |---|---|---|---|---|
 | Linear | `ork_f16_mm_pack`/`run` **[S]** | `dX`, `dW` — same calls, transposed operands | **NPU** | ✅ 3.9e-07 vs fp64 |
-| Linear, cross-layer | — | `dH` chaining | **NPU** | ✅ 4.9e-02 vs finite diff |
+| Linear, cross-layer | — | `dH` chaining | **NPU** | ✅ 2.6e-04 vs fp64 oracle |
 | Attention | `ork_bmm_fp16_strided` **[S]** | `dV`,`dP`,`dQ`,`dK` — four matmuls | **NPU** | ✅ ~3e-04 vs fp64 oracle |
 | Softmax | `ork_f16_npu_softmax` **[S]** | `dS = P⊙(dP − rowsum)·scale` | **CPU** — AI < 1 | ✅ *implied by dQ/dK* |
 | RMSNorm | `ork_f16_npu_rmsnorm` **[S]** | `dx` incl. the `r`-coupling term; `dg` | **CPU** | ✅ 4.8e-07 / 4.9e-08 |
 | SwiGLU | `ork_f16_mm_run_silu`, `ork_f16_npu_ewmul` **[S]** | `da`, `db`; `silu'(x)=σ(1+x(1−σ))` | **CPU** | ✅ 1.5e-07 / 2.4e-07 |
 | Cross-entropy | write (trivial) | `(p − y)/B` | **CPU** | ✅ within fd noise floor |
 | KL (distillation) | write (trivial) | `(p − q)/B` | **CPU** | ✅ within fd noise floor |
-| **GDN recurrence** | — | **write — the one real unknown** | **CPU** — the on-NPU scan is measured to *lose* 1.9×@0.8B / 4.8×@9B | ❌ |
+| **GDN recurrence** | — | derived + validated in fp64; **C port outstanding** | **CPU** — the on-NPU scan is measured to *lose* 1.9×@0.8B / 4.8×@9B | ✅ 1.1e-08 … 3.2e-07 |
 | Adam8bit | — | — | CPU | ❌ ordinary |
 | MoE router + gather/scatter | partial (inference) | write | CPU | ❌ |
 | **Transpose** | **missing** | **missing** | CPU today — §5 | the one primitive worth adding |
@@ -92,10 +103,21 @@ CPU-only, no board, both sides fp64 so the check tests the *formulae* rather tha
 question. The two easy things to get wrong are covered: RMSNorm's `dx` coupling through `r`, and
 `silu'`.
 
+**GDN backward is no longer an unknown.** `tools/gdn_bwd_fp64_ref.c` derives and validates the recurrent
+form (`dq` 1.1e-08, `dk` 3.2e-07, `dv` 3.1e-07, `dα` 1.7e-08, `dβ` 4.7e-08 vs fp64 central differences).
+Its convention matches the production chunkwise implementation exactly — that one computes
+`u_t = β_t(v_t − S_{t−1} g_t k_t)`, `S_t = g_t S_{t−1} + u_t k_tᵀ`, which is this file's
+`Ŝ=αS`, `e=v−Ŝk`, `S=Ŝ+βekᵀ` with `α≡g` and `βe≡u`. Two independent derivations agreeing.
+
+**And a chunked reference already exists**: `qwen35-lora-moe/kernels/gdn_chunkwise.py` and
+`gdn_backward.py` implement the chunkwise-parallel form with a custom VJP, including the UT-solve
+backward, under MLX autograd. So the remaining GDN work is a **C port with two oracles to check against**
+— the fp64 recurrent reference here for correctness, and MLX fp32 fixtures for the chunked rearrangement
+— rather than a derivation.
+
 `grep -rinE "backward|gradient|_grad|adam|optimiz" include/` returns nothing **[S]**: ork-driver has no
-autograd, no backward op and no optimizer — nor should it (§7.1). **After the above, GDN recurrence
-backward is the single remaining piece of unvalidated mathematics.** Everything else outstanding is
-framework plumbing.
+autograd, no backward op and no optimizer — nor should it (§7.1). Everything still outstanding is
+framework plumbing or a port, not unvalidated mathematics.
 
 ---
 
@@ -114,6 +136,19 @@ not wrong.
 Practical consequence for model design: **choose dimensions so contraction dims are powers of two below
 2048.** Attention is naturally well-shaped (contractions over `d`=128 and `T`), as the proofs confirmed.
 FFN down-projections (contraction = intermediate size) are the ones that miss it.
+
+**Applied to MoE expert widths [D].** The expert down-projection contracts over the expert FFN width, so
+that width decides the path. Pick from the left column:
+
+| expert FFN width | power of two < 2048? | down-projection |
+|---|---|---|
+| 512, 1024 | ✅ | **fast path** |
+| 768, 1152, 1536 | ❌ | slow path |
+| 2048 and above | ❌ (bound is strict) | slow path |
+
+Expert *count* is free — it does not enter a contraction dim. So on a 0.8B, 16 or 64 experts are both
+fine; it is choosing e.g. 768 for the expert width that silently lands every expert on the slow path.
+The gate/up projections contract over `d_model`, so that wants to be a power of two under 2048 too.
 
 **IOVA [D]:** ~1.5 GB of resident fp16 weights for a 0.75B model against a measured ~3.9 GiB ceiling.
 Not a constraint at this size; one domain suffices, which also avoids the multi-domain defect class.
@@ -208,9 +243,24 @@ this — they are existing calls.
 | | status |
 |---|---|
 | RMSNorm, SwiGLU, softmax, CE, KL backward | **done and validated** — `tools/bwd_ops_fp64_check.c` |
-| **GDN recurrence backward** | **the one real unknown.** The chunked delta-rule form already carries a UT-solve in the *forward* (38% of scan time); its backward needs the reverse-time recurrence plus the transpose of that solve. Not a 20-line op |
+| **GDN recurrence backward** | **derived and validated** (`gdn_bwd_fp64_ref.c`). Remaining: a C port of the *chunked* form, which `qwen35-lora-moe/kernels/gdn_backward.py` already implements with a custom VJP — a port with two oracles, not a derivation |
 | autograd graph | adopt ggml-opt rather than write |
+| **fp16 K-split of wide-K matmuls** | **optional, conditional — see below** |
 | Adam8bit, data pipeline, checkpointing, MoE router bwd | ordinary |
+
+### 7.3 K-split: a conditional, partly-retracted option
+
+Decomposing a wide-K fp16 matmul into power-of-two slices measured, in one controlled session at
+**M=1024**, 1.87× on the NPU portion and **1.2–1.6× overall** once packing is accounted on both sides —
+and it was **more accurate** (1.778e-06 vs 2.874e-06 vs fp64), because shorter accumulations condition
+better. That accuracy result is internally controlled and stands.
+
+**But the speed result does not generalise.** A clean A/B of the library's own K-slice size at
+**M=4096** (`soc->ks` 2048 vs 1024, same session, governors pinned) showed **no difference**: 453.4 vs
+451.3 GFLOP/s. The two are consistent only if the benefit is M-dependent — the monolithic path measures
+197 GFLOP/s at M=1024 and 453 at M=4096, so there is far more to recover at low M — but **that was not
+isolated**, and an earlier 6.04× claim in this area turned out to be a clock artifact (§9.2). Treat
+K-split as a low-M option worth re-measuring, not as a settled win.
 
 **Recommended path: ggml-opt + ggml-ork [E].** ggml-opt already owns the autograd graph and optimizer,
 ggml-ork already routes `MUL_MAT` to ork-driver, and the gradient matmuls are `MUL_MAT`s. The gap is
@@ -263,6 +313,7 @@ sudo tools/util/npu_guard.sh -- timeout 600 ./train_step_proof   256 1024 1024 1
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_2layer_proof 128 512 512 512 12 1e-4
 sudo tools/util/npu_guard.sh -- timeout 900 ./train_attn_bwd_proof 256 128 2.0
 cc -O2 -o /tmp/ref tools/attn_bwd_fp64_ref.c -lm && /tmp/ref 128 64 2.0 1e-5   # CPU only, no board
+cc -O2 -o /tmp/gdn tools/gdn_bwd_fp64_ref.c -lm && /tmp/gdn 24 8 8 1e-6        # CPU only, no board
 ```
 
 Board safety: always via `npu_guard.sh --`, always with `timeout`, SIGTERM only — a hard kill mid-submit
