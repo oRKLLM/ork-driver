@@ -7,6 +7,34 @@ Every figure is tagged **[M]** measured on this board today, **[D]** derived fro
 
 ---
 
+> # ⚠ RETRACTION — read this first (2026-10-05)
+>
+> **The `75.7 GFLOP/s` figure for `fwd down` (K=3584), used throughout §1, §4, §5 and §9, was measured
+> with the DDR governor unpinned after a reboot. Re-measured at DDR 2112 MHz it is 453.4 GFLOP/s.**
+>
+> Consequences, all of them mine to own:
+>
+> | claim | status |
+> |---|---|
+> | "12× spread between the fast and slow fp16 path" | **WRONG** — the real spread is 902 vs 453 ≈ **2×** |
+> | "6.04× from `soc->ks` 2048→1024" | **WITHDRAWN** — `ks=2048` 453.4 vs `ks=1024` 451.3, i.e. **noise** |
+> | "fp16 `ks` is unapplied tech debt costing an order of magnitude" | **WITHDRAWN** — it costs ~0% |
+> | "Sk=4 bug in the fp16 K-slice path" | **WRONG** — `f16_sk_sweep` passes Sk=1…7 standalone |
+> | §5 projection ~82 tok/s (FFN only) | **too pessimistic** — recomputed ~168 tok/s **[D]** |
+> | §0 verdict: no-go by ~20–45× | **STANDS**, margin narrows to roughly **10–25×** |
+> | §4.1 dW error decomposition | **STANDS** — single-session, internally controlled |
+> | §9.2 `0x1b` refutation + the weight-tile law | **STANDS** — internally controlled A/B |
+> | §3 pack/repack ratios | **STANDS** — single-session |
+>
+> **Root cause of the error: I compared a measurement taken before two board reboots against one taken
+> after, and attributed the difference to a configuration change.** Governors reset on boot. Every
+> cross-session comparison in the original text is therefore unsafe; only within-session A/Bs survive,
+> which is why the surviving rows above are exactly the internally-controlled ones.
+>
+> **Standing rule added: re-baseline after any reboot, and never compare across one.** This is the same
+> class of error as the arm-position bias documented in the Experiment Log — a difference in measurement
+> conditions read as a difference in the thing being measured.
+>
 > **AMENDED 2026-10-05 — read §9 before §1.1 and §7.** Peer review corrected the *attribution* of the
 > central finding (mcap=4 is an unprogrammed register, not a hardware capacity), narrowed its impact
 > (int8 is unaffected, so production prefill is not), and a follow-up measurement refuted the obvious
