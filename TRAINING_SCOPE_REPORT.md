@@ -68,22 +68,34 @@ transpose, so these are CPU work. See §5.
 
 ## 3. Inventory
 
-| operation | forward | backward | where |
-|---|---|---|---|
-| Linear | `ork_f16_mm_pack`/`run` **[S]** | `dX`, `dW` — same calls, transposed operands **[M]** | **NPU, proven** |
-| Attention | `ork_bmm_fp16_strided` **[S]** | `dV`,`dP`,`dQ`,`dK` — four matmuls **[M]** | **NPU, proven** |
-| Softmax | `ork_f16_npu_softmax` **[S]** | `dS = P⊙(dP − rowsum)` | **CPU** — AI < 1, memory-bound |
-| RMSNorm | `ork_f16_npu_rmsnorm` **[S]** | write | CPU |
-| SwiGLU | `ork_f16_mm_run_silu`, `ork_f16_npu_ewmul` **[S]** | write | CPU |
-| Cross-entropy, KL | — | write | CPU |
-| GDN recurrence | — | write | **CPU** — the on-NPU scan is measured to *lose* 1.9×@0.8B / 4.8×@9B |
-| Adam8bit | — | — | CPU |
-| MoE router + gather/scatter | partial (inference) | write | CPU |
-| **Transpose** | **missing** | **missing** | CPU today — §5 |
+| operation | forward | backward | where | validated |
+|---|---|---|---|---|
+| Linear | `ork_f16_mm_pack`/`run` **[S]** | `dX`, `dW` — same calls, transposed operands | **NPU** | ✅ 3.9e-07 vs fp64 |
+| Linear, cross-layer | — | `dH` chaining | **NPU** | ✅ 4.9e-02 vs finite diff |
+| Attention | `ork_bmm_fp16_strided` **[S]** | `dV`,`dP`,`dQ`,`dK` — four matmuls | **NPU** | ✅ ~3e-04 vs fp64 oracle |
+| Softmax | `ork_f16_npu_softmax` **[S]** | `dS = P⊙(dP − rowsum)·scale` | **CPU** — AI < 1 | ✅ *implied by dQ/dK* |
+| RMSNorm | `ork_f16_npu_rmsnorm` **[S]** | `dx` incl. the `r`-coupling term; `dg` | **CPU** | ✅ 4.8e-07 / 4.9e-08 |
+| SwiGLU | `ork_f16_mm_run_silu`, `ork_f16_npu_ewmul` **[S]** | `da`, `db`; `silu'(x)=σ(1+x(1−σ))` | **CPU** | ✅ 1.5e-07 / 2.4e-07 |
+| Cross-entropy | write (trivial) | `(p − y)/B` | **CPU** | ✅ within fd noise floor |
+| KL (distillation) | write (trivial) | `(p − q)/B` | **CPU** | ✅ within fd noise floor |
+| **GDN recurrence** | — | **write — the one real unknown** | **CPU** — the on-NPU scan is measured to *lose* 1.9×@0.8B / 4.8×@9B | ❌ |
+| Adam8bit | — | — | CPU | ❌ ordinary |
+| MoE router + gather/scatter | partial (inference) | write | CPU | ❌ |
+| **Transpose** | **missing** | **missing** | CPU today — §5 | the one primitive worth adding |
 
-`grep -rinE "backward|gradient|_grad|adam|optimiz" include/` returns nothing **[S]**: there is no
-autograd, no backward op, no optimizer. Those are the framework, and they are the bulk of the work —
-but they are ordinary CPU fp32 code where correctness is not in question.
+**Softmax backward is proven, not pending** — `dQ` and `dK` are computed *from* `dS`, so they cannot
+agree with the fp64 oracle at 3e-04 unless `dS` is right; and `attn_bwd_fp64_ref.c` validates the same
+formula against fp64 central differences independently (7.4e-08 / 1.3e-06).
+
+**RMSNorm, SwiGLU, CE and KL backward are implemented and validated** in `tools/bwd_ops_fp64_check.c` —
+CPU-only, no board, both sides fp64 so the check tests the *formulae* rather than any precision
+question. The two easy things to get wrong are covered: RMSNorm's `dx` coupling through `r`, and
+`silu'`.
+
+`grep -rinE "backward|gradient|_grad|adam|optimiz" include/` returns nothing **[S]**: ork-driver has no
+autograd, no backward op and no optimizer — nor should it (§7.1). **After the above, GDN recurrence
+backward is the single remaining piece of unvalidated mathematics.** Everything else outstanding is
+framework plumbing.
 
 ---
 
@@ -171,15 +183,34 @@ fix here.
 
 ## 7. Remaining work
 
+### 7.1 Where the code lives — ork-driver stays a matmul library
+
+**Exactly one thing belongs inside ork-driver: `ork_f16_transpose`.** It is a device primitive and the
+largest backward-pass cost. Everything else belongs *on top*, for reasons that are the project's own:
+AGENTS.md scopes ork-driver as "a userspace **matmul** library", with a 900-line-per-file budget and a
+probe-anchored op registry — an autograd graph, optimizer state, a data pipeline and checkpointing are
+none of those. And there is a direct precedent: **`ggml-ork` lives in the llama.cpp-rockchip fork, not
+in ork-driver** — the backend adapter sits in the consumer repo. Training should take the same shape,
+which also makes the ggml-opt path below the natural one.
+
+The probes in `tools/` stay where they are: they are evidence that the boundary holds, not the framework.
+
+### 7.2 The work
+
 **In ork-driver — one item.** `ork_f16_transpose`. As a library op it takes the full mechanical tax:
 `make check-registry` **fails the build** if its `OPS_REGISTRY.md` row names no probe or cites a dead
 symbol; the examples ARE the suite, so it needs a self-validating one in `make test`; `tests/sbc_attest.txt`
 must be refreshed from a board run; naming is enforced dtype-first. The gradient matmuls need none of
 this — they are existing calls.
 
-**On top of ork-driver — the bulk, all CPU fp32.** Autograd graph, GDN recurrence backward (the largest
-single piece of real maths), RMSNorm/SwiGLU/softmax backward, cross-entropy, KL, Adam8bit, data pipeline,
-checkpointing, MoE router backward if MoE.
+**On top of ork-driver — all CPU fp32.** What is left after §3:
+
+| | status |
+|---|---|
+| RMSNorm, SwiGLU, softmax, CE, KL backward | **done and validated** — `tools/bwd_ops_fp64_check.c` |
+| **GDN recurrence backward** | **the one real unknown.** The chunked delta-rule form already carries a UT-solve in the *forward* (38% of scan time); its backward needs the reverse-time recurrence plus the transpose of that solve. Not a 20-line op |
+| autograd graph | adopt ggml-opt rather than write |
+| Adam8bit, data pipeline, checkpointing, MoE router bwd | ordinary |
 
 **Recommended path: ggml-opt + ggml-ork [E].** ggml-opt already owns the autograd graph and optimizer,
 ggml-ork already routes `MUL_MAT` to ork-driver, and the gradient matmuls are `MUL_MAT`s. The gap is
@@ -226,6 +257,7 @@ changed nothing) and near-uniform softmax (`dK` got *worse* with more logit spre
 ## Appendix — reproduction
 
 ```sh
+cc -O2 -o /tmp/bwd tools/bwd_ops_fp64_check.c -lm && /tmp/bwd                  # CPU only, no board
 make train_step_proof train_2layer_proof train_attn_bwd_proof
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_step_proof   256 1024 1024 12 2e-4
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_2layer_proof 128 512 512 512 12 1e-4
