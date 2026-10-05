@@ -13,7 +13,33 @@
 > | dW vs central finite differences | 1.210e-03 **PASS** | 4.862e-02 **PASS** |
 > | loss fell monotonically, 12 steps | **PASS** 937383→569701 | **PASS** 639813→36221 |
 >
+> **Attention backward — the last unvalidated NPU path — also passes**, against an fp64 oracle over
+> identical fp16 operands (`tools/train_attn_bwd_proof.c`, `tools/attn_bwd_fp64_ref.c`):
+>
+> | | dV | dQ | dK |
+> |---|---|---|---|
+> | NPU vs fp64 oracle | **3.789e-04** | **2.826e-04** | **2.989e-04** |
+>
+> So the **complete NPU-side training surface is validated**: linear forward, `dX`, `dW`, cross-layer
+> chaining, and attention `dQ`/`dK`/`dV`.
+>
+> Heterogeneous split, measured: **NPU ~7.0 ms** for the six attention matmuls (contractions over `D=128`
+> and `T=256`, both on the fast `sched=1` path) against **CPU ~1.8 ms** for softmax forward/backward and
+> four transposes. The memory-bound reduction stays off the NPU, consistent with this board's rule that
+> engines are additive on different resources and zero-sum on the same.
+>
 > `tools/train_step_proof.c`, `tools/train_2layer_proof.c` — board `.236`, governors pinned.
+>
+> **Method note that cost four detours and is the most reusable thing here.** The attention probe first
+> reported `dV` passing while `dQ`/`dK` failed at 4.7e-01 — *and the loss still fell every step*. Two
+> plausible explanations were both wrong (fp16 underflow of `dS`: loss scaling moved the error 4.683e-01 →
+> 4.690e-01, nothing; near-uniform softmax: `dK` got **worse** with more spread). What settled it was a
+> **CPU-only fp64 oracle**, which isolated three candidates in order: formula (correct, 7e-08), NPU path
+> (correct, 3e-04), and the finite-difference check — which was the fault. It differentiates an
+> fp16-*rounded* forward and divides by `max(|fd|,1e-4)`, so where the true derivative is small the
+> forward's rounding noise is inflated without bound; `dK` read as 38× while being correct to four digits.
+> **Build the oracle first. A cleverer check is not a substitute for a known-good reference**, and this is
+> the fourth time in this session that a harness rather than the hardware was at fault.
 >
 > **Why the finite-difference check is the load-bearing one.** Checking dW against an fp64 matmul of the
 > same operands only asks "is this a correct matmul?" — a transposed, mis-strided or stale gradient passes
@@ -151,7 +177,7 @@ The arithmetic agrees: one CBUF bank is 32768 B, a K=3584 fp16 row is 7168 B, so
 | `dX = dY·Wᵀ` | — | needs Wᵀ packed | **NPU + CPU transpose** (no transposed-B primitive) |
 | `dW = Xᵀ·dY` | — | needs Xᵀ materialised + dY packed | **NPU + CPU transpose + per-step pack** |
 | Attention fwd | `ork_bmm_fp16_strided` **[S]** | — | **NPU** (strided operands avoid `ggml_cont`) |
-| Attention bwd | — | missing | **write** |
+| Attention bwd | — | **PROVEN [M]** — `dV=Pᵀ·dO`, `dP=dO·Vᵀ`, `dQ=dS·K`, `dK=dSᵀ·Q` all ~3e-04 vs fp64 | **NPU matmuls + CPU softmax-bwd** — no new primitive |
 | GDN recurrence fwd | — | — | **CPU** — on-NPU GDN scan measured to *lose* 1.9× @0.8B / 4.8× @9B, gap widening |
 | GDN recurrence bwd | — | missing | **write, CPU** — expected dominant cost |
 | RMSNorm | `ork_f16_npu_rmsnorm` **[S]** | missing | fwd NPU / bwd **write** |
