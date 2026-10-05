@@ -283,7 +283,41 @@ Cause: the two registers are written **as a pair**. A real sched=1 emission at K
 was the test. The pair to try is `{CBUF_CON0=0x1b, CONV_CON2=256, mc ≤ 50}`. Not attempted: the board was
 down, and a second attempt at a mechanism that already wedged it needs an explicit operator decision.
 
-**Source arithmetic raises confidence in it considerably [S].** Evaluate the sched=1 branch at the
+**UPDATE — tested with the registers paired, and it HUNG AGAIN [M].** `{CBUF_CON0=0x1b,
+CONV_CON2=256, mc=50}` at K=3584: sentinel never landed, soft reset num 6, orphaned job on core 0,
+second reboot required. **The hypothesis is refuted by measurement, not merely untested.**
+
+**Why — and this explains the power-of-two gate completely.** The pack layout is `[NT][KT][16][32]`, so
+an N-tile is 16 columns and one tile of weight is `K × 16 × 2` bytes. That must fit the weight
+allocation:
+
+```
+K × 16 × 2  ≤  WEIGHT_BANK × 32768      ⟺      K ≤ WEIGHT_BANK × 1024
+```
+
+`0x1b` sets **WEIGHT_BANK = 1**, so it is valid only for **K ≤ 1024**. At K=3584 one weight tile is
+114,688 B = 3.5 banks, so the hardware is told it has 32 KB for a tile that cannot fit, and it stalls
+waiting for weight data that never arrives — a hang, not a wrong answer, exactly as observed twice.
+
+**And this is what the `K < 2048` gate actually encodes.** sched=1 admits K ∈ {128, 256, 512, 1024} —
+*precisely the K values where a single weight bank holds one tile*. K=2048 would need two, and the gate
+excludes it. The power-of-two condition is incidental; **the real constraint is `K ≤ 1024`, forced by the
+`if(v<0x1b)v=0x1b` clamp pinning WEIGHT_BANK to 1.** The formula cannot express a split with more weight
+banks, so it cannot serve large K no matter how the affine terms behave.
+
+**The derived maximum valid split at K=3584 [D]** — untested, and a third board attempt was not taken
+without an explicit decision after two wedges:
+
+```
+WEIGHT_BANK = ceil(3584/1024) = 4 ;  DATA_BANK = 12 − 4 = 8   →  0x48
+mcap = 8 × 32768 / 7168 = 36.6 → 36        (not the 50 that 0x1b implied)
+CONV_CON2 = 256 as before
+```
+
+That predicts **36 rows/tile, a 9× improvement over mcap=4, not 12.5×** — and it is consistent with the
+earlier scan, where mc=8 was correct and mc=16 was not.
+
+**Source arithmetic for the original (now-refuted) idea [S].** Evaluate the sched=1 branch at the
 *known-good, measured-exact* K=1024 / mcap=176 configuration:
 
 ```

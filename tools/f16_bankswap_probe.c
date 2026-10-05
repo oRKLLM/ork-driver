@@ -38,7 +38,21 @@
 
 #define CNA_BLK 0x201
 #define REG_CBUF_CON0 0x1040
+#define REG_CONV_CON2 0x1010
 #define BANKS_SWAPPED 0x1b   /* DATA_BANK=11, WEIGHT_BANK=1  — the sched=1 clamp value */
+
+/* The two registers are written AS A PAIR in the sched=1 branch, and the first attempt at this test moved
+ * only the bank split — leaving CONV_CON2 at the sched=0 value 16*(mc+1) = 816 while telling the CBUF it
+ * had 11 data banks. Inconsistent schedule vs split, and the submit HUNG (sentinel never landed, soft
+ * reset num 6, orphaned job holding core 0, board needed a reboot). A real sched=1 emission computes
+ *     R = pow2_floor(cbuf/K) ; rows = min(mc+1, R) ; CONV_CON2 = 16*rows
+ * which at K=3584, cbuf=57344 gives R=16, rows=16, CONV_CON2=256. Note rows caps at R regardless of mc,
+ * so mc=50 is multi-pass — that is normal, not a problem: the validated K=1024/mcap=176 case is equally
+ * multi-pass (rows=32 against mc=176) and emits exactly 0x1b itself. */
+static int conv_con2_for(int K,int mc,int cbuf){
+    int R=cbuf/K; if(R<1)R=1; { int rp2=1; while(rp2*2<=R) rp2*=2; R=rp2; }
+    int rows=(mc+1<R)?(mc+1):R; return 16*rows;
+}
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 static unsigned s_=4242; static float rnd(void){ s_=s_*1103515245u+12345u; return (float)((int)((s_>>13)&0x7fff)-16384)/16384.0f; }
@@ -73,9 +87,15 @@ int main(int argc,char**argv){
     if(ork_f16_mm_run(c,w,M,A,Cb)){ printf("arm B failed\n"); return 1; }
     tb=now_us(); ork_f16_mm_run(c,w,M,A,Cb); tb=now_us()-tb;
 
-    /* ---- C: the hypothesis. Raise the tile AND swap the banks to 11-data/1-weight. ---- */
-    ork_f16_fuzz_clear(); ork_f16_fuzz_add(CNA_BLK,REG_CBUF_CON0,BANKS_SWAPPED); set_mtile(mc_hi);
-    if(ork_f16_mm_run(c,w,M,A,Cc)){ printf("arm C failed (submit error)\n"); return 1; }
+    /* ---- C: the hypothesis. Raise the tile AND move the banks AND make the grain count agree. ---- */
+    int cc2 = conv_con2_for(K,mc_hi,57344);
+    printf("arm C will emit CBUF_CON0=0x%02x, CONV_CON2=%d (sched=0 would have used %d)\n",
+           BANKS_SWAPPED, cc2, 16*(mc_hi+1));
+    ork_f16_fuzz_clear();
+    ork_f16_fuzz_add(CNA_BLK,REG_CBUF_CON0,BANKS_SWAPPED);
+    ork_f16_fuzz_add(CNA_BLK,REG_CONV_CON2,cc2);
+    set_mtile(mc_hi);
+    if(ork_f16_mm_run(c,w,M,A,Cc)){ printf("arm C failed (submit error / hang)\n"); return 1; }
     tc=now_us(); ork_f16_mm_run(c,w,M,A,Cc); tc=now_us()-tc;
     ork_f16_fuzz_clear(); unsetenv("ORK_F16_MTILE");
 
