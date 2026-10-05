@@ -390,6 +390,113 @@ What survives both qualifications is the dispatch rule this board keeps teaching
 profile, not engine identity.** At 563 FLOP/byte the shape is compute-bound and genuinely will not fight
 the ~30 GB/s bus, which is precisely the condition under which a second engine is additive here.
 
+### 9.4a It IS tech debt — the hardware does this today, in int8 **[M]/[S]**
+
+Asked directly: is the fp16 cap a hardware limit or unfinished software? **Unfinished software**, and the
+proof is that the same silicon does it correctly in another dtype.
+
+`orki_i8_synth` and `orki_f16_synth` carry the **identical formula**, differing only in a divisor that is
+itself correct (fp16 rows are 2 bytes, so `K/256 ≡ 2K/512`) **[S]**:
+
+```
+int8:  scale = K/512 ;  base = (int)(177.0 − 15.0·(scale−1))
+fp16:  scale = K/256 ;  base = (int)(177.0 − 15.0·(scale−1))
+```
+
+`base` goes negative past `scale = 12.8`. The two dtypes then diverge:
+
+| | valid to | actual | result |
+|---|---|---|---|
+| int8 | K ≤ 6554 | **K-splits at 4096** → scale ≤ 8 | ✅ in range; programs its banks at any K |
+| fp16 | K ≤ 3277 | **no K-split** → K=3584 → scale 14 | ❌ out of range; gate added; banks discarded |
+
+**The root cause is that fp16 lacks int8's K-split.** int8 stays inside the formula's valid range by
+construction; fp16 runs off the end, and a `K < 2048` gate was added to route around the breakage rather
+than fix it — silently throwing away the bank allocation as a side effect. Unfinished generalisation.
+
+Confirmed at the hardware level: int8 at K=3584 evaluates to `base = (int)(177−90) = 87 = 0x57`
+(DATA 7 / WEIGHT 5), satisfying `mc·K = 64×3584 = 7×32768` **[D]** — a non-power-of-two K with a
+correctly programmed split, in production, today.
+
+### 9.4b Bank split is necessary but NOT sufficient — the residual is a third register **[M]**
+
+Four configurations tested at K=3584, M=1024 (arm A reference = mcap 4 / `0xb1`; arm B = tile raised,
+banks unmoved, as the positive control):
+
+| banks | mc | GFLOP/s | differing / 1,048,576 | |
+|---|---|---|---|---|
+| `0xb1` (1/11) | 4 | 196.0 | — | default, correct |
+| `0xb1` (1/11) | 36 | 474.8 | 811,008 | control fires ✅ |
+| `0x1b` (11/1) | 50 | — | — | **HANG** (weight tile > WEIGHT_BANK) |
+| **`0x48`** (8/4) | 36 | **472.3** | **7,840** (0.75%) | 2.4× faster |
+| **`0x57`** (7/5) | 32 | **453.3** | **9,040** (0.86%) | int8's own value at this K |
+
+Moving the banks removes the hang and eliminates **~99% of the error** (811,008 → ~8,000), and buys
+**~2.4×**. But a ~0.8% residual persists **at every split, including the one int8 itself uses here** —
+so the residual is **bank-split-independent** and is therefore a third piece of state, not the allocation.
+
+**Prime suspect: `CBUF_CON1` / `DATA_ENTRIES`.** fp16 sets it to `K/32` with **no `mc` dependence**
+**[S]**, while the int8 fold path computes `(K/64)·mc`. Raising the tile without updating it leaves the
+data buffer under-described — the right shape for a small residual. **Untested.**
+
+**The parameter search stops here.** Four attempts, two board wedges, and this repo's method record
+documents an eight-hypothesis register hunt that was ultimately fitted to an artifact. The remaining work
+is not more guessing: it is **porting int8's approach** (K-split to stay in range, or a byte-derived
+split `data_banks = ceil(mc·K·2/32768)`, `weight_banks = 12 − data_banks`) using a working reference
+implementation in the same codebase — a bounded engineering task, not an RE expedition.
+
+**Revised value of §7.1 item 2: ~2.4× demonstrated, bit-exactness one register away, with a reference
+implementation to copy.** That is a stronger case than the original estimate, and it is now ork-driver
+work with a known shape rather than an open question.
+
+### 9.4c K-SPLIT: the shippable fix — 1.2–1.6×, bit-safe, zero RE **[M]**
+
+Since int8 stays in the formula's valid range *by K-splitting*, the obvious move is to give fp16 the same
+treatment — and it needs no guessed registers at all, because it makes the **already-validated** sched=1
+path applicable instead of trying to repair sched=0.
+
+`3584 = 1024 + 1024 + 1024 + 512` — every chunk is in the measured-exact set `{128,256,512,1024}`, mcap
+176/352 instead of 4. (2×1792 would not work: 1792 is not a power of two, so the gate still refuses it.)
+
+| | µs **[M]** | |
+|---|---|---|
+| monolithic (shipped, mcap 4) | 38,145 | 197.0 GFLOP/s |
+| K-split total | 43,110 | 0.88× |
+| └ **NPU runs** | **20,446** | **1.87× faster** |
+| └ packs (4) | 11,277 | |
+| └ A K-slice copies | 2,465 | |
+| └ host fp32 accumulate | 5,400 | 2.2 GB/s — plain scalar loop |
+
+**The raw total is misleading** and the first reading of it was unfair: the monolithic figure excludes its
+pack while K-split's includes four. Corrected **[D]**:
+
+| compared fairly | monolithic | K-split | |
+|---|---|---|---|
+| **training** (weights change; both must pack) | 13,776 + 38,145 = 51,921 | 43,110 | **1.20×** |
+| **inference** (weights resident; neither packs) | 38,145 | 28,311 | **1.35×** |
+| inference + NEON accumulate **[E]** | 38,145 | ~24,000 | **~1.59×** |
+
+Note the four chunk packs (11,277 µs) are **cheaper than the single monolithic pack** (13,776 µs) — same
+total elements — so chunking adds no packing cost. The accumulate is unoptimised scalar at 2.2 GB/s and
+is the obvious next improvement.
+
+**It is also MORE accurate than the shipped path**: max relerr vs fp64 **1.778e-06 (split)** vs
+**2.874e-06 (monolithic)** **[M]**. Splitting a long accumulation into fp32 partials improves
+conditioning. The 797,719 differing elements are the summation-order change, not error — this is
+correctly *not* bit-identical.
+
+**The two routes, compared:**
+
+| approach | speedup | correct? | RE needed | board risk |
+|---|---|---|---|---|
+| bank poke (`0x48`/`0x57`) | 2.4× | **No** — 0.75–0.86% wrong, cause unknown | yes, unresolved | **wedged the board twice** |
+| **K-split** | **1.2–1.6×** | **Yes — more accurate than baseline** | **none** | none observed |
+
+**Recommendation: K-split.** It is smaller than the register fix promised but it is real, it inherits
+correctness from configurations already validated bit-exact, and it is ordinary engineering rather than
+reverse engineering. The register path remains open as a later upside if someone identifies the third
+piece of state (§9.4b) — the two are complementary, not alternatives.
+
 ### 9.5 Standing rule adopted: no numerics check without a positive control
 
 This harness produced a false pass (operands as multiples of 2⁻⁹ accumulate exactly in fp32 → `0.00e+00`

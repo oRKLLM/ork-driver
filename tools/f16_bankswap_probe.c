@@ -64,6 +64,18 @@ int main(int argc,char**argv){
     int K = argc>2?atoi(argv[2]):3584;
     int N = argc>3?atoi(argv[3]):1024;
     int mc_hi = argc>4?atoi(argv[4]):50;
+    /* bank byte: DATA_BANK[3:0] | WEIGHT_BANK[7:4]. Default 0x1b (DATA 11/WEIGHT 1) is the sched=1 clamp
+     * value and is REFUTED at K=3584 — it hangs, because one N-tile of weight is K*16*2 bytes and must fit
+     * WEIGHT_BANK*32768, i.e. K <= WEIGHT_BANK*1024. At K=3584 that needs WEIGHT_BANK >= 4, so the derived
+     * candidate is 0x48 (DATA 8 / WEIGHT 4) with mc <= 8*32768/(K*2) = 36. */
+    unsigned banks = argc>5?(unsigned)strtoul(argv[5],0,0):BANKS_SWAPPED;
+    { int wb=(banks>>4)&0xf, db=banks&0xf;
+      printf("banks=0x%02x -> DATA_BANK=%d WEIGHT_BANK=%d | weight tile needs %d banks (K*16*2/32768),"
+             " data allows mc<=%d\n", banks, db, wb, (K*16*2+32767)/32768, wb?db*32768/(K*2):0);
+      if(banks < 0x1b){ printf("REFUSING: 0x%02x is below the 0x1b clamp floor — forcing below it hangs"
+                               " the submit, which is the IOMMU-wedge path.\n",banks); return 2; }
+      if((K*16*2) > wb*32768){ printf("WARNING: one weight tile (%d B) exceeds WEIGHT_BANK (%d B) —"
+                               " expect a HANG, not a miscompute.\n", K*16*2, wb*32768); } }
     ork_npu *c = ork_npu_init(); if(!c){ printf("init failed\n"); return 1; }
 
     printf("K=%d N=%d M=%d   1 bank holds %d rows, 11 banks hold %d rows\n",
@@ -90,9 +102,9 @@ int main(int argc,char**argv){
     /* ---- C: the hypothesis. Raise the tile AND move the banks AND make the grain count agree. ---- */
     int cc2 = conv_con2_for(K,mc_hi,57344);
     printf("arm C will emit CBUF_CON0=0x%02x, CONV_CON2=%d (sched=0 would have used %d)\n",
-           BANKS_SWAPPED, cc2, 16*(mc_hi+1));
+           banks, cc2, 16*(mc_hi+1));
     ork_f16_fuzz_clear();
-    ork_f16_fuzz_add(CNA_BLK,REG_CBUF_CON0,BANKS_SWAPPED);
+    ork_f16_fuzz_add(CNA_BLK,REG_CBUF_CON0,banks);
     ork_f16_fuzz_add(CNA_BLK,REG_CONV_CON2,cc2);
     set_mtile(mc_hi);
     if(ork_f16_mm_run(c,w,M,A,Cc)){ printf("arm C failed (submit error / hang)\n"); return 1; }
@@ -106,9 +118,9 @@ int main(int argc,char**argv){
     }
     double g=2.0*M*K*N;
     printf("\n%-42s %10s %10s %12s %s\n","arm","us","GFLOP/s","differing","max relerr vs A");
-    printf("%-42s %10.0f %10.1f %12s %s\n","A default      mcap 4,  banks 0xb1",ta,g/(ta*1e3),"-","(reference)");
-    printf("%-42s %10.0f %10.1f %12ld %.2e\n","B control      mcap 50, banks 0xb1",tb,g/(tb*1e3),db,mb);
-    printf("%-42s %10.0f %10.1f %12ld %.2e\n","C hypothesis   mcap 50, banks 0x1b",tc,g/(tc*1e3),dc,mc_);
+    printf("%-42s %10.0f %10.1f %12s %s\n","A reference    mcap 4,   banks 0xb1",ta,g/(ta*1e3),"-","(reference)");
+    printf("%-42s %10.0f %10.1f %12ld %.2e\n","B control      mc=given, banks 0xb1",tb,g/(tb*1e3),db,mb);
+    printf("%-42s %10.0f %10.1f %12ld %.2e\n","C hypothesis   mc=given, banks given",tc,g/(tc*1e3),dc,mc_);
 
     printf("\n");
     if(db==0){ printf("VOID — the positive control (B) did NOT miscompute. The checker cannot see a wrong\n"
