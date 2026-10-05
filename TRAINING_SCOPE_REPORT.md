@@ -29,7 +29,8 @@ training loop, speed secondary.
 | softmax `dS` | implied by dQ/dK + fp64 formula check | 7.4e-08 / 1.3e-06 |
 | RMSNorm `dx`,`dg` · SwiGLU `da`,`db` · CE · KL | fp64 central differences, **with positive controls** | 4.8e-07 … within fd floor |
 | **GDN** `dq,dk,dv,dα,dβ` (recurrent form) | fp64 central differences, **with positive control** | **1.1e-08 … 3.2e-07** |
-| **GDN chunkwise-parallel** (the matmul form) | the recurrent backward, same cotangents | **2.7e-16** — machine precision |
+| **GDN chunkwise-parallel** (the matmul form) | the recurrent backward, same cotangents | **1.2e-14** at `d=128` — machine precision |
+| GDN chunkwise, `T=1024 d=128` | **MLX fp32 fixtures**, both its paths | 1.0e-05 (fp32 build), 9.7e-06 (fp64) |
 | GDN layer: conv1d, q/k RMSNorm, decay, output gate | fp64 central differences, 4 positive controls | 1.4e-10 … 5.5e-08 |
 
 **Every row above is an oracle or an fp64 formula check.** Earlier drafts also listed finite differences
@@ -93,7 +94,7 @@ transpose, so these are CPU work. See §5.
 | SwiGLU | `ork_f16_mm_run_silu`, `ork_f16_npu_ewmul` **[S]** | `da`, `db`; `silu'(x)=σ(1+x(1−σ))` | **CPU** | ✅ 1.5e-07 / 2.4e-07 |
 | Cross-entropy | write (trivial) | `(p − y)/B` | **CPU** | ✅ within fd noise floor |
 | KL (distillation) | write (trivial) | `(p − q)/B` | **CPU** | ✅ within fd noise floor |
-| **GDN recurrence** | chunkwise, in C | chunkwise backward, hand-derived, in C | **mixed** — the chunkwise form is matmuls (NPU-shaped); the sequential one is not | ✅ 2.7e-16 vs the recurrence |
+| **GDN recurrence** | chunkwise, in C | chunkwise backward, hand-derived, in C | **mixed** — the chunkwise form is matmuls (NPU-shaped); the sequential one is not | ✅ 1.2e-14 vs the recurrence; 1e-05 vs MLX at `T=1024 d=128` |
 | **GDN layer** (conv1d, q/k norm, decay, out gate) | — | all four, in C | **CPU** — elementwise | ✅ 1.4e-10 … 5.5e-08 |
 | Adam8bit | — | — | CPU | ❌ ordinary |
 | MoE router + gather/scatter | partial (inference) | write | CPU | ❌ |
@@ -125,18 +126,42 @@ its backward from `mx.vjp` through that same forward — deliberately, so the ad
 function it differentiates. C has no autograd, so the adjoint had to be derived, and the failure mode
 MLX was avoiding is the one this risks. Hence two oracles rather than one:
 
-| check | result |
+| check (at `T=128, d=128, C=64`) | result |
 |---|---|
-| chunkwise forward vs the sequential recurrence | 1.8e-16 (`Y`), 2.8e-16 (`S_final`) |
-| chunkwise backward vs the sequential backward, same cotangents | **2.0e-16 … 5.8e-16** on all six gradients |
-| chunkwise backward vs central differences of its *own* forward | 8e-09 … 4e-07 |
+| chunkwise forward vs the sequential recurrence | 1.1e-14 (`Y`), 7.1e-15 (`S_final`) |
+| chunkwise backward vs the sequential backward, same cotangents | **1.7e-15 … 1.2e-14** on all six gradients |
+| chunkwise backward vs central differences of its *own* forward | 5.6e-10 … 2.4e-07 |
 | chunk length 1, 2, 3, 5, 7, 8, 16, 32, T (incl. ragged tails) | identical at every length |
 | two positive controls (gate coupling via `M`; the Gram-matrix `dK` term) | both FAIL, as required |
 
-Verified at `T=128, d=128, C=64` and at ragged shapes. The backward-vs-backward agreement is at machine
-precision because the two are algebraically the same function — an identity check, not a tolerance one.
-Only one step is not a transcription of a forward line: the solve. `U = (I+M)⁻¹B` gives `dB = (I+M)⁻ᵀdU`
-(a transposed triangular solve) and `dM = −Z Uᵀ`; the inverse is formed in neither direction.
+The backward-vs-backward agreement is at machine precision because the two are algebraically the same
+function — an identity check, not a tolerance one. Only one step is not a transcription of a forward
+line: the solve. `U = (I+M)⁻¹B` gives `dB = (I+M)⁻ᵀdU` (a transposed triangular solve) and `dM = −Z Uᵀ`;
+the inverse is formed in neither direction.
+
+**And it is checked against MLX at the real shape and precision** (`tools/gdn_fixture_check.c`). fp64
+agreement with the sequential recurrence settles the algebra and says nothing about numerics at
+`d=128, T=1024` in fp32, where the live quantities are `γ_t/γ_s` ratios spanning orders of magnitude and
+a triangular solve. `qwen35-lora-moe/tools/export_gdn_fixtures.py` writes a flat fp32 fixture — inputs,
+cotangents, and **two** sets of gradients, one from MLX autograd through the sequential reference and
+one from the production chunkwise custom VJP. Disagreeing with both is a porting error; disagreeing
+with one is a numerical one. At `T=1024, d=128, C=64`, with `g` drawn through the real
+`exp(−exp(A_log)·softplus(·))` parameterisation so the small decays are exercised:
+
+| build | vs MLX sequential | vs MLX chunkwise |
+|---|---|---|
+| fp64 | 8.0e-07 … 3.6e-05 | 2.0e-06 … 2.9e-05 |
+| **fp32** | 7.1e-06 … 4.7e-05 | 7.0e-06 … 2.2e-05 |
+
+MLX's own two paths agree to **4.3e-05** on this host, so that is the ceiling on what any of this can
+claim — the C implementation is inside it. The fixture header carries that self-consistency figure and
+whether the exporting host's fp32 matmul is degraded (measured 8.3e-04 on an M5 Max against 2.7e-07 on
+an M3 Max, same code, because the matrix unit multiplies in bf16), and the C side takes its bar from
+those rather than inventing a tolerance.
+
+The C checker **includes** `gdn_chunk_bwd.c` and compiles it at both precisions (`-DGDN_REAL=float`)
+rather than reimplementing it: one implementation, two builds. A second copy would drift from the
+first, which is the failure mode this whole exercise is built to avoid.
 
 **And the recurrence is not the layer.** Qwen3.5's GDN block wraps it in four more pieces, all now
 derived and checked in `tools/gdn_layer_bwd_check.c`, each with a positive control: the depthwise causal
@@ -295,7 +320,7 @@ this — they are existing calls.
 | RMSNorm, SwiGLU, softmax, CE, KL backward | **done and validated** — `tools/bwd_ops_fp64_check.c` |
 | GDN backward, recurrent and chunkwise | **done** — `gdn_bwd_fp64_ref.c`, `gdn_chunk_bwd.c` |
 | GDN layer: conv1d, q/k norm, decay, output gate | **done** — `gdn_layer_bwd_check.c` |
-| **GDN numerics at real width** | the open GDN item: `d=128`, `T=1024`, fp16 — wants fp32 fixtures from the MLX implementation. Not a derivation |
+| GDN numerics at real width | **done** — `gdn_fixture_check.c` against MLX fp32 fixtures at `T=1024, d=128`, fp32 and fp64 builds |
 | autograd graph | adopt ggml-opt rather than write |
 | **fp16 K-split of wide-K matmuls** | **optional, conditional — see below** |
 | Adam8bit, data pipeline, checkpointing, MoE router bwd | ordinary |
@@ -377,6 +402,11 @@ cc -O2 -o /tmp/ref tools/attn_bwd_fp64_ref.c -lm && /tmp/ref 128 64 2.0 1e-5   #
 cc -O2 -o /tmp/gdn tools/gdn_bwd_fp64_ref.c -lm   && /tmp/gdn 24 8 8 1e-6      # CPU only, no board
 cc -O2 -o /tmp/gcb tools/gdn_chunk_bwd.c -lm     && /tmp/gcb 128 128 128 64   # CPU only, no board
 cc -O2 -o /tmp/glc tools/gdn_layer_bwd_check.c -lm && /tmp/glc                # CPU only, no board
+
+# GDN at real width, against MLX. In qwen35-lora-moe (that is where MLX lives; ork-driver has no Python):
+#   .venv/bin/python tools/export_gdn_fixtures.py --T 1024 --dk 128 --dv 128 --out /tmp/gdn1024.fix
+cc -O2 -Itools              -o /tmp/gfc64 tools/gdn_fixture_check.c -lm && /tmp/gfc64 /tmp/gdn1024.fix
+cc -O2 -Itools -DGDN_REAL=float -o /tmp/gfc32 tools/gdn_fixture_check.c -lm && /tmp/gfc32 /tmp/gdn1024.fix
 ```
 
 Board safety: always via `npu_guard.sh --`, always with `timeout`, SIGTERM only — a hard kill mid-submit
