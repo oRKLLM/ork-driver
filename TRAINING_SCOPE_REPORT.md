@@ -7,6 +7,11 @@ Every figure is tagged **[M]** measured on this board today, **[D]** derived fro
 
 ---
 
+> **AMENDED 2026-10-05 — read §9 before §1.1 and §7.** Peer review corrected the *attribution* of the
+> central finding (mcap=4 is an unprogrammed register, not a hardware capacity), narrowed its impact
+> (int8 is unaffected, so production prefill is not), and a follow-up measurement refuted the obvious
+> fix. The verdict below is unchanged; the reasoning behind it is materially different.
+
 ## 0. Verdict first
 
 **No-go for NPU-side training of this model on this hardware, by ~20–45×.** The stop condition in the brief was reached, so deliverables 6 (multi-board) and parts of 2 are scoped rather than measured — detail in §7.
@@ -238,3 +243,103 @@ ORK_F16_MTILE=<n> ...                                                        # M
 ```
 
 Board safety: always via `npu_guard.sh --`, always with `timeout`, SIGTERM only — a hard kill mid-submit wedges the IOMMU, and a power cut mid-submit can corrupt SPI and require physical reflash.
+
+---
+
+## 9. Amendments after peer review and follow-up measurement
+
+### 9.1 mcap=4 is an unprogrammed register, not a hardware capacity — §1.1 was wrong on attribution
+
+`orki_f16_synth` writes the bank split **only** in the sched=1 branch **[S]**:
+
+```c
+if(sched){ ... orki_setrn(rc,REGCMD_N,RK_CNA_CBUF_CON0,v); }
+else     { orki_setrn(rc,REGCMD_N,RK_CNA_CONV_CON2,16*(mc+1)); }   /* no CBUF_CON0 at all */
+```
+
+So at non-power-of-two K the split is never programmed and inherits the template default in
+`regcmd_array_4x32x16.h` (lines 4 and 7, word `0x00b11040`): **`0xb1` = DATA_BANK 1, WEIGHT_BANK 11**
+**[S]**. One data bank ÷ a 7168 B row = 4.57 → the observed mcap=4. **That is the template's allocation,
+not the silicon's** — the CBUF has 12 banks at K=3584 like anywhere else; 11 are assigned to weights and
+never reassigned. It also explains the miscompute better than §1.1 did: at mc=16 the activations want
+114,688 B against 32,768 — the tile was raised without moving the banks that hold it, so it went fast and
+silently wrong instead of faulting.
+
+**The `K < 2048` gate is a guard rail around a broken formula, not a hardware statement.** At K=3584,
+`scale=14`, so `base = (int)(177.0 - 15.0*13) = -18` **[S]** — the affine split goes negative past
+`scale ≈ 12.8` and the `if(v<0x1b)v=0x1b` clamp does all the work.
+
+### 9.2 The obvious fix is refuted — and it wedges the board **[M]**
+
+`0x1b` is `0xb1` nibble-swapped (DATA 11 / WEIGHT 1), and 11×32768/7168 = 50.28 → exactly the 180224/K
+figure, so "force `0x1040=0x1b`, mc ≤ 50" looked like a one-register fix. Tested via `ork_f16_fuzz_add`
+(three arms, with a positive control). **Arm C did not miscompute — it hung**: doorbell sentinel never
+landed at 20 s, twice; soft reset num 6; colsplit de-escalated to single core; the library then failed
+rather than returning stale output. It left an orphaned job holding core 0.
+
+Cause: the two registers are written **as a pair**. A real sched=1 emission at K=3584 would set
+`CONV_CON2 = 16 × min(mc+1, pow2_floor(cbuf/K)) = 16 × 16 = 256`; the test left the sched=0 value
+`16×51 = 816` while declaring 11 data banks. **Untested and still open:** `{CBUF_CON0=0x1b,
+CONV_CON2=256, mc ≤ 50}` as a consistent pair. Not attempted — the board was down and a second attempt at
+a mechanism that already wedged it needs an explicit decision.
+
+### 9.3 int8 is unaffected — the impact is fp16-only, and not the production prefill path
+
+`orki_i8_synth` has the identical structure, but **every int8 caller passes `sched` as a literal `1`**
+**[S]** (`core/colsplit.c`, `core/dyn_ctl.c`, `ssm.c`) — there is no `orki_i8_sched()`. int8 always
+programs the split at any K, which matches previously-measured geom dumps (K=3072 → `0x66`, K=3584 →
+`0x57`, both non-power-of-two, both satisfying `mc·K = DATA_BANK·32KB`).
+
+**So the earlier claim of "12× on production prefill" is withdrawn** — production prefill is int8 W8A8.
+The fp16 win is real but scoped to: the orkd F16 dtype, `ork_f16_mm_run_silu`, the attention bmm
+(`ork_bmm_fp16`), the SSM/GDN scan path, and fp16-native models.
+
+**Shared root cause, which is the more useful framing.** Both dtypes carry the same broken affine formula
+(`base` negative past `scale ≈ 12.8`) and dodge it differently — **int8 K-splits above 4096**, so
+`scale ≤ 8` keeps the formula valid and the banks programmed; **fp16 disables the schedule above 2048**,
+which skips the register write and inherits one data bank. One defect, two mitigations, only one of which
+costs an order of magnitude. The durable fix removes the formula for both: `data_banks =
+ceil(mc·K·2/32768)`, `weight_banks = 12 − data_banks`, both ≥ 1, no power-of-two dependency.
+
+### 9.4 NEON supplementation — the CPU beats the NPU on every slow-path shape **[E]**
+
+The shapes where the NPU is crippled are unusually CPU-friendly. `[4096,3584]×[3584,1024]` is 30.1 GFLOP
+over ~53.5 MB → **AI ≈ 563 FLOP/byte [D]**: compute-bound, so a NEON arm will not contend for the bus
+(this project's additivity rule: additive on different resources, zero-sum on the same).
+
+| | GFLOP/s |
+|---|---|
+| NPU, contraction 3584 | **75.7 [M]** |
+| 4× A76 @2.4 GHz NEON fp16 FMLA, peak | 307 **[D]** |
+| realistic GEMM at 40–60% of peak | **120–185 [E]** |
+
+**And a transposed GEMM is free on CPU** — an index order, not a materialised buffer. So dX and dW also
+shed the 49.5 ms transpose **[M]** and the 5.5 ms repack **[M]** that the NPU path cannot avoid:
+
+| per layer, 1024-tok micro-batch | NPU | NEON **[E]** |
+|---|---|---|
+| dX gate/up: matmul + 2 transposes + 2 repacks | 198 + 38 + 11 = **247 ms** | **~100 ms** |
+| dW (measured end-to-end 82 GFLOP/s incl. plumbing) | **26.3 ms [M]** | **~14 ms** |
+
+Following it through, the split becomes **NPU: fwd gate/up only, 15.0 GFLOP, ~16.8 ms** vs **CPU:
+everything else, 52.7 GFLOP, ~351 ms [E]** — i.e. **the NPU does ~5% of a training step.** Throughput
+improves to ~122 tok/s **[E]** from 82, but the verdict hardens rather than softens: this is *CPU training
+with a 5% NPU assist*, and 4× A76 alone is ~20× short of an M5 Max. **It also makes §7.1 item 2 more
+valuable, not less** — the bank-split fix is what would make the accelerator relevant at all here.
+
+### 9.5 Standing rule adopted: no numerics check without a positive control
+
+This harness produced a false pass (operands as multiples of 2⁻⁹ accumulate exactly in fp32 → `0.00e+00`
+at every shape), and this repo produced another last month (a 2-bit LCG whose period equalled `mcap·K`
+made consecutive M-tiles bit-identical; eight hypotheses were fitted to a pattern that did not exist in
+silicon). Same class, different mechanisms: **benign test data makes the check vacuous, and a vacuous
+pass is worse than no check because it ends the investigation.**
+
+`tools/f16_bankswap_probe.c` implements the rule — a configuration that MUST miscompute, and the probe
+returns `VOID` and refuses to report the hypothesis arm if the control comes back clean.
+
+### 9.6 Board state
+
+The arm-C wedge left core 0 held by an orphaned job (zero render-node holders, no dmesg progress). The
+documented recovery is a graceful `sudo reboot` over SSH; that was **denied by this session's permission
+classifier** and is left for the operator. **The board takes no work until it is cleared.**
