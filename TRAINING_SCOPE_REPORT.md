@@ -1,5 +1,50 @@
 # Training a 0.75B hybrid SLM on RK3588 NPUs via ork-driver — scoping report
 
+> # ✅ IT WORKS — correctness-first result (2026-10-05)
+>
+> **The report below answers "is it fast enough?" (no, by ~10–25×). That was the wrong question.** Asked
+> instead whether it can work *correctly*, even at 25× slower than ideal, the answer is **yes, and it is
+> demonstrated on hardware** — a real training loop, gradients verified against numerical derivatives,
+> loss converging.
+>
+> | | one layer | two layers (chained) |
+> |---|---|---|
+> | dW vs fp64, same fp16 operands | 3.853e-07 **PASS** | 8.443e-08 **PASS** |
+> | dW vs central finite differences | 1.210e-03 **PASS** | 4.862e-02 **PASS** |
+> | loss fell monotonically, 12 steps | **PASS** 937383→569701 | **PASS** 639813→36221 |
+>
+> `tools/train_step_proof.c`, `tools/train_2layer_proof.c` — board `.236`, governors pinned.
+>
+> **Why the finite-difference check is the load-bearing one.** Checking dW against an fp64 matmul of the
+> same operands only asks "is this a correct matmul?" — a transposed, mis-strided or stale gradient passes
+> it, and the loss can still fall. Only the numerical derivative of the *actual loss* catches that. In the
+> two-layer case W1 reaches the loss **solely through `dH = dY·W2ᵀ`**, so check 2 there is specifically the
+> proof that gradients flow correctly ACROSS a layer boundary.
+>
+> **No new library primitives were required.** `dX` and `dW` are ordinary matmuls with transposed operands,
+> so both proofs run against the shipped API with `src/` untouched. All NPU operands are resident weights
+> refreshed via `ork_f16_mm_repack` — no IOMMU alloc/free in the inner loop.
+>
+> **Two things that silently break it**, both load-bearing and neither obvious:
+> - **fp32 master weights are mandatory.** An SGD increment at a sane lr is below fp16 resolution, so an
+>   in-place fp16 update rounds every step to zero — the loss sits flat while appearing to run.
+> - **The backward pass needs two per-step transposes** a single-layer test never exercises: `Hᵀ` (an
+>   activation) and `W2ᵀ` (a weight). Only `Xᵀ` is loop-invariant.
+>
+> **What this changes about the plan.** The remaining work is integration, not hardware and not numerics:
+> autograd wiring, GDN backward, CE/KL, Adam8bit — all of which run on **CPU in fp32**, where correctness
+> is not in question and slowness does not matter. Path **(b) ggml-opt + ggml-ork** (§6) is unaffected and
+> still the recommendation. The §7 no-go stands *as a throughput statement only* and should not be read as
+> a feasibility one.
+>
+> **If this is productionised**, new primitives acquire the full mechanical tax: `make check-registry`
+> fails the build on an `OPS_REGISTRY.md` row without a named probe or citing a dead symbol; the examples
+> ARE the suite, so each op needs a self-validating one in `make test`; `tests/sbc_attest.txt` must be
+> refreshed from a board run; and naming is enforced dtype-first (`ork_f16_mm_grad_w`, not
+> `ork_backward_*`). The gradient matmuls need none of that — they are existing calls. **An
+> `ork_f16_transpose` would**, and it is the one worth adding: the CPU transpose is 49.5 ms per operand,
+> the single largest cost in the backward pass.
+
 **Date:** 2026-10-05 · **Board:** RK3588 `.236`, kernel `6.1.115-vendor-rk35xx-fence` · **Library:** ork-driver @ `81428a7`
 **Benchmarks:** `tools/train_scope_bench.c`, `tools/train_dw_bench.c` (this branch; self-validating against fp64)
 
