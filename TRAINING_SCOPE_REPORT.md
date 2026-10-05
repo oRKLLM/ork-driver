@@ -9,11 +9,13 @@ Tags: **[M]** measured on this board · **[D]** derived from [M] · **[S]** read
 
 ## 1. Verdict
 
-**Training works on this hardware, correctly, today — with no changes to ork-driver.**
+**Every gradient path is validated; an end-to-end step of the actual model has not run yet — and no
+change to ork-driver was needed to get here.**
 
 **Every matmul gradient has been computed on the NPU and validated against fp64; the non-matmul backward
-ops are implemented and validated on the CPU; GDN backward is derived and validated in fp64 but not yet
-ported.** The goal was a first *correct* training loop, speed secondary.
+ops are implemented and validated on the CPU; GDN backward is implemented in C in both the recurrent and
+the chunkwise-parallel form, along with the four layer ops around it.** The goal was a first *correct*
+training loop, speed secondary.
 
 | path | validated against | result |
 |---|---|---|
@@ -27,6 +29,8 @@ ported.** The goal was a first *correct* training loop, speed secondary.
 | softmax `dS` | implied by dQ/dK + fp64 formula check | 7.4e-08 / 1.3e-06 |
 | RMSNorm `dx`,`dg` · SwiGLU `da`,`db` · CE · KL | fp64 central differences, **with positive controls** | 4.8e-07 … within fd floor |
 | **GDN** `dq,dk,dv,dα,dβ` (recurrent form) | fp64 central differences, **with positive control** | **1.1e-08 … 3.2e-07** |
+| **GDN chunkwise-parallel** (the matmul form) | the recurrent backward, same cotangents | **2.7e-16** — machine precision |
+| GDN layer: conv1d, q/k RMSNorm, decay, output gate | fp64 central differences, 4 positive controls | 1.4e-10 … 5.5e-08 |
 
 **Every row above is an oracle or an fp64 formula check.** Earlier drafts also listed finite differences
 against an *fp16-rounded* forward (dW 1.21e-03, chaining 4.86e-02); those are removed — §9.3 explains why
@@ -41,8 +45,8 @@ existing `ork_f16_mm_pack` / `ork_f16_mm_run` calls. That is why all of this was
 touching `src/`.
 
 Probes: `tools/train_step_proof.c`, `tools/train_2layer_proof.c`, `tools/train_attn_bwd_proof.c`,
-`tools/attn_bwd_fp64_ref.c`, `tools/bwd_ops_fp64_check.c`, `tools/gdn_bwd_fp64_ref.c` (the last three
-CPU-only oracles).
+`tools/attn_bwd_fp64_ref.c`, `tools/bwd_ops_fp64_check.c`, `tools/gdn_bwd_fp64_ref.c`,
+`tools/gdn_chunk_bwd.c`, `tools/gdn_layer_bwd_check.c` (the last five CPU-only oracles).
 
 ---
 
@@ -89,7 +93,8 @@ transpose, so these are CPU work. See §5.
 | SwiGLU | `ork_f16_mm_run_silu`, `ork_f16_npu_ewmul` **[S]** | `da`, `db`; `silu'(x)=σ(1+x(1−σ))` | **CPU** | ✅ 1.5e-07 / 2.4e-07 |
 | Cross-entropy | write (trivial) | `(p − y)/B` | **CPU** | ✅ within fd noise floor |
 | KL (distillation) | write (trivial) | `(p − q)/B` | **CPU** | ✅ within fd noise floor |
-| **GDN recurrence** | — | derived + validated in fp64; **C port outstanding** | **CPU** — the on-NPU scan is measured to *lose* 1.9×@0.8B / 4.8×@9B | ✅ 1.1e-08 … 3.2e-07 |
+| **GDN recurrence** | chunkwise, in C | chunkwise backward, hand-derived, in C | **mixed** — the chunkwise form is matmuls (NPU-shaped); the sequential one is not | ✅ 2.7e-16 vs the recurrence |
+| **GDN layer** (conv1d, q/k norm, decay, out gate) | — | all four, in C | **CPU** — elementwise | ✅ 1.4e-10 … 5.5e-08 |
 | Adam8bit | — | — | CPU | ❌ ordinary |
 | MoE router + gather/scatter | partial (inference) | write | CPU | ❌ |
 | **Transpose** | **missing** | **missing** | CPU today — §5 | the one primitive worth adding |
@@ -103,17 +108,45 @@ CPU-only, no board, both sides fp64 so the check tests the *formulae* rather tha
 question. The two easy things to get wrong are covered: RMSNorm's `dx` coupling through `r`, and
 `silu'`.
 
-**GDN backward is no longer an unknown.** `tools/gdn_bwd_fp64_ref.c` derives and validates the recurrent
+**GDN backward is done, in both forms.** `tools/gdn_bwd_fp64_ref.c` derives and validates the recurrent
 form (`dq` 1.1e-08, `dk` 3.2e-07, `dv` 3.1e-07, `dα` 1.7e-08, `dβ` 4.7e-08 vs fp64 central differences).
-Its convention matches the production chunkwise implementation exactly — that one computes
+Its convention matches the production implementation exactly — that one computes
 `u_t = β_t(v_t − S_{t−1} g_t k_t)`, `S_t = g_t S_{t−1} + u_t k_tᵀ`, which is this file's
-`Ŝ=αS`, `e=v−Ŝk`, `S=Ŝ+βekᵀ` with `α≡g` and `βe≡u`. Two independent derivations agreeing.
+`Ŝ=αS`, `e=v−Ŝk`, `S=Ŝ+βekᵀ` with `α≡g` and `βe≡u`.
 
-**And a chunked reference already exists**: `qwen35-lora-moe/kernels/gdn_chunkwise.py` and
-`gdn_backward.py` implement the chunkwise-parallel form with a custom VJP, including the UT-solve
-backward, under MLX autograd. So the remaining GDN work is a **C port with two oracles to check against**
-— the fp64 recurrent reference here for correctness, and MLX fp32 fixtures for the chunked rearrangement
-— rather than a derivation.
+**The chunkwise-parallel form — the one that is matmuls — is ported and hand-derived**
+(`tools/gdn_chunk_bwd.c`). This matters because the sequential recurrence advances a `[Dv,Dk]` state once
+per token: serial depth `T`, all outer products and mat-vecs, which is precisely the work shape that
+leaves a matrix unit idle. The chunkwise form cuts serial depth to `T/C` and makes the intra-chunk work
+dense matmuls — `K Kᵀ`, `K Sᵀ`, `Q Kᵀ`, `P U`, `(U·tail)ᵀ K`, each an `ork_f16_mm_*` call.
+
+**Nothing could be transcribed.** The MLX reference implements the chunkwise *forward* by hand but gets
+its backward from `mx.vjp` through that same forward — deliberately, so the adjoint cannot drift from the
+function it differentiates. C has no autograd, so the adjoint had to be derived, and the failure mode
+MLX was avoiding is the one this risks. Hence two oracles rather than one:
+
+| check | result |
+|---|---|
+| chunkwise forward vs the sequential recurrence | 1.8e-16 (`Y`), 2.8e-16 (`S_final`) |
+| chunkwise backward vs the sequential backward, same cotangents | **2.0e-16 … 5.8e-16** on all six gradients |
+| chunkwise backward vs central differences of its *own* forward | 8e-09 … 4e-07 |
+| chunk length 1, 2, 3, 5, 7, 8, 16, 32, T (incl. ragged tails) | identical at every length |
+| two positive controls (gate coupling via `M`; the Gram-matrix `dK` term) | both FAIL, as required |
+
+Verified at `T=128, d=128, C=64` and at ragged shapes. The backward-vs-backward agreement is at machine
+precision because the two are algebraically the same function — an identity check, not a tolerance one.
+Only one step is not a transcription of a forward line: the solve. `U = (I+M)⁻¹B` gives `dB = (I+M)⁻ᵀdU`
+(a transposed triangular solve) and `dM = −Z Uᵀ`; the inverse is formed in neither direction.
+
+**And the recurrence is not the layer.** Qwen3.5's GDN block wraps it in four more pieces, all now
+derived and checked in `tools/gdn_layer_bwd_check.c`, each with a positive control: the depthwise causal
+**conv1d + silu** (`d/dx`, `d/dstate`, `d/dweight`, `d/dbias`), the **scaled RMSNorm on q and k** — note
+`mx.fast.rms_norm`, *not* L2, which differ by √D and would be a silent `1/√D` error — the **decay
+parameterisation** `β=σ(b)`, `g=exp(−exp(A_log)·softplus(a+dt_bias))` including the per-head `A_log` and
+`dt_bias` parameters, and the **gated RMSNorm** output `silu(z)·rms_norm(h,w)`.
+
+What remains for GDN is **not mathematics**: numerics at real width (`d=128`, `T=1024`, fp16 rather than
+fp64), which wants fp32 fixtures from the MLX implementation, and the wiring.
 
 `grep -rinE "backward|gradient|_grad|adam|optimiz" include/` returns nothing **[S]**: ork-driver has no
 autograd, no backward op and no optimizer — nor should it (§7.1). Everything still outstanding is
@@ -140,14 +173,27 @@ FFN down-projections (contraction = intermediate size) are the ones that miss it
 **Applied to MoE expert widths [D].** The expert down-projection contracts over the expert FFN width, so
 that width decides the path. Pick from the left column:
 
-| expert FFN width | power of two < 2048? | down-projection |
+| expert FFN width | power of two in [128, 2048)? | down-projection |
 |---|---|---|
-| 512, 1024 | ✅ | **fast path** |
-| 768, 1152, 1536 | ❌ | slow path |
-| 2048 and above | ❌ (bound is strict) | slow path |
+| 128, 256, 512, 1024 | ✅ | **fast path** |
+| 56 | — | **hard refusal**: not a multiple of 32 (K) or 16 (N) |
+| 64, 96, 224, 768, 1152, 1536 | ❌ | slow path |
+| 2048 and above | ❌ (the bound is strict) | slow path |
 
-Expert *count* is free — it does not enter a contraction dim. So on a 0.8B, 16 or 64 experts are both
-fine; it is choosing e.g. 768 for the expert width that silently lands every expert on the slow path.
+**Expert count is free only when experts are designed with their own width.** If experts are made by
+SPLITTING the dense FFN — which is the plan here — the count *sets* the width, `3584 / E`, and the two
+constraints collide:
+
+| experts (0.8B, FFN 3584) | width | result |
+|---|---|---|
+| 7 / 14 / 28 | 512 / 256 / 128 | **fast path** |
+| 16 | 224 | slow path (not a power of two) |
+| 64 | 56 | **hard refusal** — neither `K%32` nor `N%16` |
+
+The same arithmetic on the 4B (FFN 9216): 96 and 144 experts give widths 96 and 64 — both legal, both
+slow. **Choose the expert count from the divisor, not the other way round**: on a split-FFN MoE the
+viable counts are the ones whose quotient is a power of two in [128, 2048).
+
 The gate/up projections contract over `d_model`, so that wants to be a power of two under 2048 too.
 
 **IOVA [D]:** ~1.5 GB of resident fp16 weights for a 0.75B model against a measured ~3.9 GiB ceiling.
@@ -210,9 +256,13 @@ fp16, and at M=4096 it is unremarkable for mixed precision with fp32 masters. **
 blocker.** Note the error grows as the micro-batch shrinks (cancellation-sensitive); these are sampled
 maxima, so a production harness wants a full-surface check.
 
-**Loss scaling was *not* required** in the attention backward — tested, and it moved the error 4.683e-01
-→ 4.690e-01, i.e. not at all. It remains correct practice for fp16 training generally; it was not the
-fix here.
+**Whether loss scaling is needed is UNTESTED.** An earlier draft reported it as unnecessary on the
+grounds that applying it moved an attention-backward error 4.683e-01 → 4.690e-01. That number was the
+finite-difference artifact of §9.3, not a gradient error: the gradient was already correct, so loss
+scaling had nothing to move and the experiment could only ever have come out that way. It says nothing
+either way. The real question — fp16 underflow in small gradients at long sequence length, where the
+magnitudes are far below anything these probes exercise — has not been asked. Assume loss scaling is
+needed, as in any fp16 training, until a run at realistic length says otherwise.
 
 ---
 
@@ -238,12 +288,14 @@ symbol; the examples ARE the suite, so it needs a self-validating one in `make t
 must be refreshed from a board run; naming is enforced dtype-first. The gradient matmuls need none of
 this — they are existing calls.
 
-**On top of ork-driver — all CPU fp32.** What is left after §3:
+**On top of ork-driver — all CPU fp32 except the GDN chunk matmuls.** What is left after §3:
 
 | | status |
 |---|---|
 | RMSNorm, SwiGLU, softmax, CE, KL backward | **done and validated** — `tools/bwd_ops_fp64_check.c` |
-| **GDN recurrence backward** | **derived and validated** (`gdn_bwd_fp64_ref.c`). Remaining: a C port of the *chunked* form, which `qwen35-lora-moe/kernels/gdn_backward.py` already implements with a custom VJP — a port with two oracles, not a derivation |
+| GDN backward, recurrent and chunkwise | **done** — `gdn_bwd_fp64_ref.c`, `gdn_chunk_bwd.c` |
+| GDN layer: conv1d, q/k norm, decay, output gate | **done** — `gdn_layer_bwd_check.c` |
+| **GDN numerics at real width** | the open GDN item: `d=128`, `T=1024`, fp16 — wants fp32 fixtures from the MLX implementation. Not a derivation |
 | autograd graph | adopt ggml-opt rather than write |
 | **fp16 K-split of wide-K matmuls** | **optional, conditional — see below** |
 | Adam8bit, data pipeline, checkpointing, MoE router bwd | ordinary |
@@ -261,6 +313,15 @@ better. That accuracy result is internally controlled and stands.
 197 GFLOP/s at M=1024 and 453 at M=4096, so there is far more to recover at low M — but **that was not
 isolated**, and an earlier 6.04× claim in this area turned out to be a clock artifact (§9.2). Treat
 K-split as a low-M option worth re-measuring, not as a settled win.
+
+### 7.4 The one thing nothing above establishes
+
+**No end-to-end step of the actual model has run.** Every gradient path is validated in isolation and
+the two-layer proof chains `dX` across layers, but a 24-layer hybrid with real tokens, a real optimizer
+and a real data pipeline is an integration, and integrations fail for reasons unit checks do not see:
+shape plumbing, state carried across chunk and sequence boundaries, memory at `T=1024`, and fp16
+underflow at magnitudes these probes never produce (§6). That run is the next milestone, and it is the
+one that converts "every part is correct" into "training works".
 
 **Recommended path: ggml-opt + ggml-ork [E].** ggml-opt already owns the autograd graph and optimizer,
 ggml-ork already routes `MUL_MAT` to ork-driver, and the gradient matmuls are `MUL_MAT`s. The gap is
@@ -313,7 +374,9 @@ sudo tools/util/npu_guard.sh -- timeout 600 ./train_step_proof   256 1024 1024 1
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_2layer_proof 128 512 512 512 12 1e-4
 sudo tools/util/npu_guard.sh -- timeout 900 ./train_attn_bwd_proof 256 128 2.0
 cc -O2 -o /tmp/ref tools/attn_bwd_fp64_ref.c -lm && /tmp/ref 128 64 2.0 1e-5   # CPU only, no board
-cc -O2 -o /tmp/gdn tools/gdn_bwd_fp64_ref.c -lm && /tmp/gdn 24 8 8 1e-6        # CPU only, no board
+cc -O2 -o /tmp/gdn tools/gdn_bwd_fp64_ref.c -lm   && /tmp/gdn 24 8 8 1e-6      # CPU only, no board
+cc -O2 -o /tmp/gcb tools/gdn_chunk_bwd.c -lm     && /tmp/gcb 128 128 128 64   # CPU only, no board
+cc -O2 -o /tmp/glc tools/gdn_layer_bwd_check.c -lm && /tmp/glc                # CPU only, no board
 ```
 
 Board safety: always via `npu_guard.sh --`, always with `timeout`, SIGTERM only — a hard kill mid-submit
