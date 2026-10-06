@@ -98,7 +98,7 @@ transpose, so these are CPU work. See §5.
 | **GDN layer** (conv1d, q/k norm, decay, out gate) | — | all four, in C | **CPU** — elementwise | ✅ 1.4e-10 … 5.5e-08 |
 | Adam8bit | — | — | CPU | ❌ ordinary |
 | MoE router + gather/scatter | partial (inference) | write | CPU | ❌ |
-| **Transpose** | **missing** | **missing** | CPU today — §5 | the one primitive worth adding |
+| **Transpose** | `ork_f16_transpose` | `ork_f32_transpose_to_f16` | **CPU** (the NPU cannot — §5) | ✅ elementwise-exact, `test_transpose`; 6.4–14.9× |
 
 **Softmax backward is proven, not pending** — `dQ` and `dK` are computed *from* `dS`, so they cannot
 agree with the fp64 oracle at 3e-04 unless `dS` is right; and `attn_bwd_fp64_ref.c` validates the same
@@ -242,18 +242,34 @@ Not a go/no-go — the goal is correctness. These are for sizing the work.
 a pack. Never pack-and-free in a training loop. Re-packing is **not** a bottleneck: under 17% of the
 matmul it enables.
 
-**The CPU transpose is the real cost [M].** One `[4096,1024]` fp32→fp16 strided transpose is **49.5 ms**
-— more than a forward matmul, and 34% of a `dW`:
+**The CPU transpose was the real cost — now fixed [M].** One `[4096,1024]` fp32→fp16 strided transpose
+measured **49.5 ms**, more than a forward matmul and 34% of a `dW`. `ork_f16_transpose` /
+`ork_f32_transpose_to_f16` (`src/npu/f16/transpose.c`, blocked + NEON) take it to **8.1 ms**:
 
-| dW at M=4096 | µs |
-|---|---|
-| CPU transpose of X | **49,539** |
-| pack dY | 12,671 |
-| NPU matmul | 82,095 |
-| **total** | **144,305** |
+| dW at M=4096 | before µs | after µs |
+|---|---|---|
+| CPU transpose of X | 49,539 | **8,087** |
+| pack dY | 12,671 | 12,671 |
+| NPU matmul | 82,095 | 82,095 |
+| **total** | **144,305** | **102,853** (1.40×) |
 
-**`ork_f16_transpose` is the one primitive worth adding**, and the only item that would take the full
-registry/attest/naming tax (§7).
+Measured across shapes (A76, governors pinned, `tools/f16_transpose_probe.c`): **6.4×** at
+`[4096,1024]`, **12.7×** at `[1024,3584]`, **14.9×** at `[4096,3584]`; fp16→fp16 8.5–14.7×. Cache
+blocking alone is 3.6× and the register transpose supplies the rest — the naive loop was running at
+~1 GB/s of output on a core that streams ~8, so it was a cache-miss benchmark, not a bandwidth one.
+
+**It is a host op, and that was established before building it.** The NPU cannot transpose today: an
+on-device contiguous→cube relayout **is** the vendor RESHAPE op, whose campaign is blocked on undecoded
+read geometry (`0x107c`/`0x1080`, RE-stage behind `reshape_probe_f16`) — the fp16 matmul *hangs* writing
+the cube and int8 writes linear only; `ork_bmm_fp16_strided` gathers strided operands into contiguous
+host scratch rather than relaying out on-device; and `C[M,N]=A[M,K]·B[K,N]` cannot express a transpose
+at all. Revisit if the RESHAPE decode lands.
+
+**The bigger lever is not transposing.** `dWᵀ[N,K] = dYᵀ·X` takes X as the weight in its *natural*
+layout, so a caller transposes whichever of K/N is smaller and keeps that master transposed — the
+optimizer is elementwise, so orientation is free. On a 0.75B FFN that is `M×1024` either way instead of
+`M×3584` on gate/up: **3.5× less transpose work for nothing**. Same operand-swap that removed the Kᵀ
+pack from the attention bridge.
 
 **Heterogeneous split, measured on attention backward [M]:** NPU **~7.0 ms** for six matmuls, CPU
 **~1.8 ms** for softmax forward/backward and four transposes. The memory-bound reduction belongs on the
@@ -295,8 +311,8 @@ needed, as in any fp16 training, until a run at realistic length says otherwise.
 
 ### 7.1 Where the code lives — ork-driver stays a matmul library
 
-**Exactly one thing belongs inside ork-driver: `ork_f16_transpose`.** It is a device primitive and the
-largest backward-pass cost. Everything else belongs *on top*, for reasons that are the project's own:
+**Exactly one thing belonged inside ork-driver: `ork_f16_transpose`** — now implemented. It is a host
+layout primitive (the NPU cannot transpose; §5) and was the largest backward-pass cost. Everything else belongs *on top*, for reasons that are the project's own:
 AGENTS.md scopes ork-driver as "a userspace **matmul** library", with a 900-line-per-file budget and a
 probe-anchored op registry — an autograd graph, optimizer state, a data pipeline and checkpointing are
 none of those. And there is a direct precedent: **`ggml-ork` lives in the llama.cpp-rockchip fork, not
@@ -394,6 +410,8 @@ changed nothing) and near-uniform softmax (`dK` got *worse* with more logit spre
 
 ```sh
 cc -O2 -o /tmp/bwd tools/bwd_ops_fp64_check.c -lm && /tmp/bwd                  # CPU only, no board
+make test_transpose && ./test_transpose                                       # correctness, no NPU
+cc -O2 -march=armv8.2-a+fp16 -Iinclude -Isrc -o /tmp/ttp tools/f16_transpose_probe.c -lm && /tmp/ttp 3
 make train_step_proof train_2layer_proof train_attn_bwd_proof
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_step_proof   256 1024 1024 12 2e-4
 sudo tools/util/npu_guard.sh -- timeout 600 ./train_2layer_proof 128 512 512 512 12 1e-4
