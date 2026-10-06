@@ -11,6 +11,7 @@
 #
 # <symbol>                      <kind>       <note>
 ork_i8_mm_inflate_to_f16        CONVERSION   int8 source -> fp16 destination
+ork_f32_transpose_to_f16        CONVERSION   fp32 source -> fp16 destination (fused transpose+narrow)
 ork_i4_mm_pack_to_i8            CONVERSION   int4 source -> int8 tiles
 orki_i4_expand_chan_to_i8       CONVERSION   int4 source -> int8
 orki_nf4_inflate_chan_to_i8     CONVERSION   NF4 source -> int8
