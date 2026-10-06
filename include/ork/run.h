@@ -131,4 +131,23 @@ int          ork_i4_mm_run_grouped(ork_npu *ctx, ork_w *w, int M, const int8_t *
  * flatter the NPU. No NPU/ctx needed. */
 void         ork_i8_mm_run_cpu(int M, int K, int N, const int8_t *A, const int8_t *B, int32_t *C);
 
+/* ---- OPERAND TRANSPOSE (host) -------------------------------------------------------------------
+ * dst[C,R] = src[R,C]^T. Blocked + NEON; ~6-15x a naive loop on an A76 (see src/npu/f16/transpose.c
+ * for the measured table and tools/f16_transpose_probe.c for the probe). dst and src must not alias.
+ * Returns 0, or -1 on bad args / aliasing.
+ *
+ * This is a HOST op on purpose. The NPU cannot transpose today: an on-device contiguous->cube
+ * relayout is the vendor RESHAPE op, whose RE campaign is blocked on undecoded read geometry;
+ * ork_bmm_fp16_strided gathers strided operands into contiguous scratch on the host rather than
+ * relaying out on the device; and C[M,N]=A[M,K]B[K,N] cannot express a transpose at all.
+ *
+ * BEFORE CALLING THIS, CHECK WHETHER YOU NEED IT. A backward pass computes dW[K,N] = X^T dY, which
+ * needs X^T -- but dW^T[N,K] = dY^T X needs dY^T instead and takes X as the weight in its natural
+ * layout. Transpose whichever of the two is smaller and keep that master transposed; the optimizer
+ * is elementwise, so the orientation is free. Same operand-swap that removed the K^T pack from the
+ * attention bridge. No threading here by design: overlap it with an in-flight NONBLOCK submit.  */
+int          ork_f16_transpose       (ork_f16 *dst, const ork_f16 *src, int rows, int cols);
+/* Fused transpose + narrow: fp32 source (activations, gradients) straight to the fp16 operand the
+ * matmul wants, in one pass. Rounding is bit-identical to a scalar (ork_f16) cast. */
+int          ork_f32_transpose_to_f16(ork_f16 *dst, const float   *src, int rows, int cols);
 #endif /* ORK_RUN_H */
