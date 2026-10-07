@@ -187,7 +187,7 @@ int ork_f16_mm_run_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
     if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);
     if(DT_F16!=c->last_dt){ int kw=ork_f16warm()&&ORK_KW_DT(c->last_dt); if(!kw)c->warmed=0; if(!ork_nothrash()&&!kw)c->ccsz=0; c->last_dt=DT_F16; }   /* NOTHRASH: reuse Cc, no realloc under IOVA pressure (see orki_run()) */
-    int chunk=orki_f16_mtile(K,M);   /* fp16 M-tile = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was hardcoded 16, ~4-20x too small); ORK_F16_MTILE overrides */
+    int chunk=orki_f16_mtile_n(K,M,N);   /* fp16 M-tile = the 0x1040 schedule's ceiling, N-AWARE: a narrow N at a starved WEIGHT_BANK hangs the submit (r103, see orki_f16_mcap_n). ORK_F16_MTILE overrides */
     size_t maxaf=(size_t)chunk*K*2, maxout=(size_t)chunk*NMAX*4;   /* A fp16 (2B), C fp32 (4B) */
     if(c->Af.size<maxaf || c->Af.domain!=c->dom_active){ orki_bdestroy(fd,&c->Af); c->Af=orki_bcreate(fd,maxaf,0x403,c->dom_active); if(!c->Af.cpu)return -2; }
     if(c->ccsz<maxout || c->Cc.domain!=c->dom_active){ orki_bdestroy(fd,&c->Cc); c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active); c->ccsz=maxout; c->warmed=0; if(!c->Cc.cpu)return -2; }

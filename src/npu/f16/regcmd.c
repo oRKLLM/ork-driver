@@ -148,8 +148,56 @@ int orki_f16_mcap(int K,int sched){
     return cap<1?1:cap;
 }
 
+/* NARROW-N CEILING — the mcap above is necessary but NOT sufficient when N is small.
+ *
+ * r103 (2026-10-06): fp16 K=1024 N=16 is bit-exact at an M-chunk of 128 and HANGS at 144 — job
+ * committed, no interrupt, core stuck at 100%, board dead until a power cycle. N=32 hangs the same
+ * way at 176. N=3584 at 176 is fine (907 GFLOP/s), so it is narrow N specifically.
+ *
+ * MECHANISM, from the offline register diff (tools/f16_bankdiff.c — no board, no wedge). Exactly
+ * one structural register differs between the passing 128 and the hanging 144: 0x1040 goes
+ * 0x48 (DATA 8 / WEIGHT 4) -> 0x1b (DATA 11 / WEIGHT 1). Everything else that moves is a row count.
+ * DATA_BANK is ceil(mc*K*2/32768) and the base/slope formula is a linear encoding of it — but
+ * parameterised by mg = ceil(mc/64), the 64-row GROUP, not by mc. So at K=1024 mg=3 prices 192 rows,
+ * demands 12 data banks, leaves WEIGHT_BANK=0, and the 0x1b floor above rescues it to 11/1.
+ *
+ * WEIGHT_BANK=1 is survivable when the weight STREAMS (N=3584 needs 7.3 MB — nowhere near resident,
+ * so the single bank is just a window). It is fatal when the weight is small enough to sit at or
+ * just over one bank: K=1024 N=16 is 32768 B = exactly one bank, N=32 is two banks against one.
+ * Both hang. So the dangerous combination is a near-resident weight against a starved WEIGHT_BANK.
+ *
+ * THE GUARD. When the weight segment is small (<= 4 banks), require the EMITTED split to keep
+ * WEIGHT_BANK >= 2. Emitted, not ideal: the cap has to be computed from the same mg-based formula
+ * orki_f16_synth uses, or it would permit the very value that hangs (the ideal split for mc=144 is
+ * 9/3, but synth actually emits 11/1). At K=1024 that yields 128 — exactly the measured boundary.
+ * K=512 -> 320 (from 352), K=256 -> 640 (from 704).
+ *
+ * Every value this admits is inside the already-validated region, so the guard cannot itself wedge.
+ * The 4-bank trigger is deliberately conservative: N=16 and N=32 are measured bad and N=3584
+ * measured good, while N in between is UNMEASURED, so the trigger covers the unknown side. Narrowing
+ * it needs board runs, and each costs a power cycle. */
+int orki_f16_mcap_n(int K,int sched,int N){
+    int cap=orki_f16_mcap(K,sched);
+    if(!sched||K<1||N<1) return cap;
+    if((long)K*N*2 > 4L*32768) return cap;              /* weight streams — the measured-good regime */
+    double scale=(double)K/256.0;
+    int base=(int)(177.0-15.0*(scale-1.0)), slope=(int)(15.0*scale);
+    if(slope<1) return cap;                             /* K=128: broken encoding, measured prefix only */
+    int mgmax=0;
+    for(int mg=1;mg<=16;mg++){ int v=base-slope*(mg-1); if(v<0x20) break; mgmax=mg; }
+    if(mgmax<1) return cap;                             /* no safe group — leave the measured cap */
+    int ncap=mgmax*64;
+    return ncap<cap?ncap:cap;
+}
+
 inline int orki_f16_mtile(int K,int M){
     int chunk=orki_f16_mcap(K,orki_f16_sched(K));
+    if(chunk>M)chunk=M; if(chunk<1)chunk=1; return chunk;
+}
+
+/* N-aware twin of orki_f16_mtile: the chunk a run path may actually use for a [M,K]x[K,N] matmul. */
+int orki_f16_mtile_n(int K,int M,int N){
+    int chunk=orki_f16_mcap_n(K,orki_f16_sched(K),N);
     if(chunk>M)chunk=M; if(chunk<1)chunk=1; return chunk;
 }
 

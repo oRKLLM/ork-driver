@@ -388,6 +388,14 @@ int orki_mtile_cap(int Kred);
  * M one fp16 program computes correctly — MEASURED, see the big comment at its definition. Use it
  * to M-TILE where the caller can, and to REFUSE where it cannot. Do NOT apply it to int8. */
 int orki_f16_mcap(int K, int sched);
+/* N-AWARE ceiling: orki_f16_mcap is necessary but not sufficient — a narrow N at a starved
+ * WEIGHT_BANK hangs the submit (r103). Any path that knows N must use this one. */
+int orki_f16_mcap_n(int K, int sched, int N);
+/* r103: is this fp16 weight wide enough that it STREAMS? A small segment against a starved
+ * WEIGHT_BANK hangs the submit, and colsplit derives its program count in two places that must
+ * agree — so narrow shapes are kept out of colsplit and fall to the N-aware single-core path. */
+static inline int ork_f16_wide_enough(const ork_w *w){ return (long)w->K * w->N * 2 > 4L*32768; }
+int orki_f16_mtile_n(int K, int M, int N);
 int orki_f16_sched(int K);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);

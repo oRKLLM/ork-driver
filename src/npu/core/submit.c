@@ -234,7 +234,34 @@ int orki_rc_verify(int fd, struct buf *b, size_t nbytes){
 
 /* Read one kernel counter from /sys/module/rknpu/parameters/. Used only on the sentinel-failure path, so
  * the sysfs cost is irrelevant next to the timeout we just burned. -1 if unreadable. */
+/* The GATED job counters live in debugfs, as "  <name>  <value>" lines under a
+ * "gated counters: on|off" header. This is NOT the same instrumentation as the module parameters
+ * below, and reading the wrong one is how a wedge gets misdiagnosed: on 2026-10-06 (r103) the
+ * debugfs counters showed commit 2 / irq 0 / done 0 -- a committed job the hardware never completed
+ * -- while /sys/module/rknpu/parameters/cnt_* sat flat at zero, so the probe computed deltas of 0
+ * and confidently reported "NEVER COMMITTED -- the job did not reach the hardware". That points at
+ * the wrong half of the pipeline: dispatch instead of completion. Needs root; a failed read returns
+ * -1 so the caller says "unreadable" rather than inventing a verdict. */
+static long orki_rknpu_dbgcnt(const char *key){
+    FILE *f=fopen("/sys/kernel/debug/rknpu/counters","r"); if(!f) return -1;
+    char line[192]; long v=-1;
+    while(fgets(line,sizeof line,f)){
+        if(!strcmp(key,"dbg_on")){ const char*g=strstr(line,"gated counters:");
+            if(g){ v = strstr(g,"on")?1:0; break; } continue; }
+        char nm[64]; long x;
+        if(sscanf(line," %63s %ld",nm,&x)==2 && !strcmp(nm,key)){ v=x; break; }
+    }
+    fclose(f); return v;
+}
+
 static long orki_rknpu_cnt(const char *name){
+    /* debugfs first -- it is the one that actually counts (see above); the module parameters are
+     * kept as a fallback for kernels that expose those instead. */
+    static const struct { const char *param, *dbg; } map[] = {
+        {"cnt_commit","commit"}, {"cnt_irq","irq"}, {"cnt_done","done"},
+        {"cnt_nojob","nojob"},   {"dbg_on","dbg_on"} };
+    for(unsigned i=0;i<sizeof map/sizeof map[0];i++)
+        if(!strcmp(name,map[i].param)){ long v=orki_rknpu_dbgcnt(map[i].dbg); if(v>=0) return v; break; }
     char p[128]; snprintf(p,sizeof p,"/sys/module/rknpu/parameters/%s",name);
     FILE *f=fopen(p,"r"); if(!f) return -1;
     long v=-1; if(fscanf(f,"%ld",&v)!=1) v=-1; fclose(f); return v;
@@ -443,17 +470,26 @@ int orki_submit1_db(ork_npu *c, size_t nout){
     int reps=c->warmed?1:orki_warm_reps();
     for(int rep=0;rep<reps;rep++){ int last=(rep==reps-1); sub.timeout=orki_mm_timeout_ms();
         o[li]=0x7fffffff; __asm__ volatile("dc cvac,%0"::"r"(&o[li]):"memory"); __asm__ volatile("dsb ish":::"memory");   /* seed the last-word sentinel (matmul writes it last) */
-        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
-        /* PROBE (2026-09-03): snapshot the kernel's commit/irq/done counters BEFORE the poll so a failure
-         * can say WHICH stage stopped. The three deltas separate the only candidates left after #patch71
+        /* PROBE (2026-09-03): snapshot the kernel's commit/irq/done counters so a failure can say
+         * WHICH stage stopped. The three deltas separate the only candidates left after #patch71
          * ruled out a blocked queue:
          *   commit=0            the job never reached the hardware at all
          *   commit>0, irq=0     committed and the hardware never raised completion (a real stall)
          *   irq>0, sentinel not landed  it COMPLETED but the write did not land where we are looking --
          *                       i.e. a page-table/domain mismatch, which is what every previous instance
          *                       of this signature in this project turned out to be
-         * Cheap: three sysfs reads per op, and only when the op is about to be polled. */
+         * Cheap: three sysfs reads per op, and only when the op is about to be polled.
+         *
+         * TAKEN BEFORE THE SUBMIT, and that placement is the whole point (fixed 2026-10-06, r103).
+         * It used to be sampled AFTER orki_rknpu_submit_ioctl, so this job's own commit was already
+         * folded into the baseline and dc came back 0 — the probe then printed
+         * "commit+0 ... => NEVER COMMITTED — the job did not reach the hardware" for a job the
+         * kernel's own absolute counters showed as committed (commit 2 / irq 0 / done 0, i.e. the
+         * COMMITTED-NO-IRQ stall). The verdict was not merely unhelpful, it pointed at the wrong
+         * half of the pipeline, and a narrow-N fp16 wedge was diagnosed as a dispatch failure for
+         * it. Sample first, submit second. */
         const long k_c0=orki_rknpu_cnt("cnt_commit"), k_i0=orki_rknpu_cnt("cnt_irq"), k_d0=orki_rknpu_cnt("cnt_done");
+        if(orki_rknpu_submit_ioctl(fd,&sub,c->dom_active)){ if(last){perror("SUBMIT"); return -1;} continue; }
         double pt=ork_now_us(), cap=(double)orki_mm_timeout_ms()*1000.0; int landed=0;
         for(;;){ __asm__ volatile("dc civac,%0"::"r"(&o[li]):"memory"); if(o[li]!=0x7fffffff){landed=1;break;} if(ork_now_us()-pt>cap)break; }   /* last-col-last writeback => last word landing = tile done */
         orki_bsync(fd,&c->Cc,RKNPU_MEM_SYNC_FROM_DEVICE);

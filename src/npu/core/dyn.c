@@ -327,7 +327,7 @@ ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *t
          * 1 B/elem) and is 2x TOO LOOSE for fp16's 2 B/elem, so this path MISCOMPUTED at
          * non-pow2 K (measured: K=384 real ceiling 42, this permitted 85; K=640 -> 25 vs 51).
          * orki_f16_mcap is the measured envelope (1 CBUF bank sched=0, 11 banks sched=1). */
-        if (dt == DT_F16 && tasks[i].M > orki_f16_mcap(w->K, orki_f16_sched(w->K))) return NULL;
+        if (dt == DT_F16 && tasks[i].M > orki_f16_mcap_n(w->K, orki_f16_sched(w->K), w->N)) return NULL;   /* N-aware (r103) */
         if (w->Sk != 1 && !w->Bf && !ksplit) return NULL;   /* non-ksplit Sk>1 needs the full-K Bf; ksplit uses the Bb K-slices */
         if (w->domain != tasks[0].w->domain) return NULL; }   /* all tasks one domain (single submit domain) */
     if (tasks[0].w->domain != c->dom_active || (tasks[0].w->domain && !c->dom_save)) orki_dom_activate(c, tasks[0].w->domain);

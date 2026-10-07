@@ -1423,7 +1423,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
         return ORK_RC_WEDGE_PRONE;
       }
       /* i8 M>1 wide-N/wide-K are fully covered by r_wideN/r_wideK/slice above; nothing falls through (the mcworker CHAIN path is removed #45). */ }
-    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn > 1 && (w->N/16) >= 2 && w->Sk <= 64
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn > 1 && (w->N/16) >= 2 && ork_f16_wide_enough(w) && w->Sk <= 64
         && !getenv("ORK_COLSPLIT_SERIAL") && !getenv("ORK_F16_NO_WIDEN")) {
         /* fp16 WIDE-N (Sn>1): per-N-slice CONTIG colsplit. Each N-slice is served as a standalone Sn==1 CONTIG
          * problem — its Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated into ONE resident buffer (Bbc_ns[ns]) so the
@@ -1471,7 +1471,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
             c->mc_error = 0;   /* fall through to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC) for the whole matmul */
         }
     }
-    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> single-core fp16 reference */
+    if (dt == DT_F16 && ork_f16_colsplit() && nc > 1 && w->Sn == 1 && (w->N/32) >= 2 && ork_f16_wide_enough(w) && !getenv("ORK_COLSPLIT_SERIAL")) {   /* fp16 SW-chain needs the parallel per-core worker (per-K-slice submits); serial inline path can't run the boundary-broken chain -> single-core fp16 reference */
         /* Stage 1: fp16 Sn==1 rides the doorbell colsplit (bit-exact f32 K-slice accumulate). Call colsplit
          * DIRECTLY (not ork_dyn_begin_mc — that entry also serves SSM stream/pool fp16 callers we must not
          * touch). h==NULL (ineligible / buffers too small) FALLS BACK to orki_run()'s single-core fp16 reference (ORK_RC_F16_SC). */
@@ -1732,7 +1732,7 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
          * bank), and the sched=1 form overshot badly (4*R = 1024 @K=128 vs a real ceiling of 256,
          * which is why ork_f16_mm_run silently miscomputed there for any M in [257,1472]).
          * int8 keeps its own path untouched — it is measured-correct at mg_max*64. */
-        if(!dt) chunk=orki_f16_mcap(Kp,sched);
+        if(!dt) chunk=orki_f16_mcap_n(Kp,sched,Nc);   /* r103: N-AWARE — narrow N at a starved WEIGHT_BANK HANGS; this is the path that wedged (chunk was 176, so M=144 ran as ONE program). Nc, not N: Nc is what orki_f16_synth is handed. */
         /* sched=0 uses the DEFAULT 0x1040 template, which computes correctly only while the activation tile
          * fits its budget: mc*Kp <= 32768 elements. (RB/2)/Kp overshoots (e.g. int8 K=256 -> chunk=224, but
          * rows past 32768/256=128 in one submit are GARBAGE — isolated via shape_probe). The sched=1 path
