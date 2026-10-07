@@ -263,6 +263,9 @@ int orki_i4_untile_blob(ork_npu *c, int K, int N, const void *blob, size_t n, in
  * Scales are not read from the blob — this format does not carry them; the caller supplies them from the
  * pack index (which is where DT_I4_NATIVE gets them too). */
 ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t n, int G){
+    /* consumes an ork_i4_w_dump_cpu blob, which is stamped DT_I4 (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I4,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
     if(!c || (K%32) || (N%64)) return NULL;
     int8_t *codes=malloc((size_t)K*N);
     if(!codes) return NULL;
@@ -482,7 +485,15 @@ ork_w *ork_i4_mm_pack(ork_npu *c,int K,int N,const int8_t *B){
  * Correctness has an exact oracle — examples/test_i4_dump_cpu.c packs on the NPU, ork_w_dump's it, and
  * memcmp's against this. Byte-identical or the test fails; the layout cannot be subtly wrong and pass.
  * out=NULL -> return the byte size. K%32, N%64. */
+static size_t orki_i4_w_dump_cpu_body(ork_npu*,int,int,const int8_t*,void*,size_t);
 size_t ork_i4_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
+    if(out){ if(cap<ORK_PACK_HDR_BYTES) return 0; orki_pack_stamp(c,out,DT_I4,K,N); }
+    { size_t hdr_=ORK_PACK_HDR_BYTES; out = out ? (void*)((char*)out+hdr_) : NULL;
+      cap  = cap>hdr_ ? cap-hdr_ : 0;
+      size_t body_=orki_i4_w_dump_cpu_body(c,K,N,B,out,cap);
+      return body_ ? body_+hdr_ : 0; }
+}
+static size_t orki_i4_w_dump_cpu_body(ork_npu *c, int K, int N, const int8_t *B, void *out, size_t cap){
     if(!c || !B || (K%32) || (N%64)) return 0;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t off=0;
@@ -497,6 +508,10 @@ size_t ork_i4_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
 }
 
 ork_w *ork_i4_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before reading a tile (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I4,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+
     /* OFFLINE: reconstruct the raw [K][N] codes from the tiled blob — the exact inverse of the walk
      * ork_i4_w_dump_cpu / tile_i4_Bslice perform, written against the same index expression so the two
      * cannot drift. This is what lets a .orkpack be READ (and so SCORED) on a machine with no NPU; the
@@ -543,6 +558,10 @@ ork_w *ork_i4_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
 }
 
 ork_w *ork_i4_mm_load_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before reading a tile (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I4,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+
     if(K%32||N%64) return NULL;
     if(orki_dmaheap_open()<0) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
@@ -585,6 +604,10 @@ ork_w *ork_i4_mm_load_arena(ork_npu *c,int K,int N,const void *blob,size_t n){
 }
 
 ork_w *ork_i4_mm_load_import(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before reading a tile (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I4,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+
     if(K%32||N%64) return NULL;
     if(orki_dmaheap_open()<0) return NULL;
     int KS=ORK_I4_KS, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;

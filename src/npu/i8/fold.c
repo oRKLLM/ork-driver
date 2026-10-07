@@ -420,6 +420,10 @@ size_t ork_i8_w_dump_fold_cpu(ork_npu *c, int K, int N, const int8_t *B, void *o
 }
 
 ork_w *ork_i8_mm_load_fold(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before touching a byte of it (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I8,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+
     if(K!=FOLD_REF_K || N<1 || (N%32)) return NULL;
     const int NS=FOLD_REF_N; int nslice=(N+NS-1)/NS; if(nslice>64) return NULL;
     size_t need=0; for(int s=0;s<nslice;s++){int n0=s*NS,sw=(N-n0<NS)?(N-n0):NS; need+=orki_pgup((size_t)K*sw);}
@@ -437,6 +441,9 @@ ork_w *ork_i8_mm_load_fold(ork_npu *c,int K,int N,const void *blob,size_t n){
 }
 
 int ork_i8_w_attach_fold(ork_npu *c, ork_w *w, const void *blob, size_t n){
+    if(!w) return -1;
+    if(orki_pack_check(c,blob,n,DT_I8,w->K,w->N)) return -1;   /* packhdr.c (the Bf companion blob) */
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
     if(!c||!w||w->K!=FOLD_REF_K||w->N<1||(w->N%32)) return -1;
     if(w->Bfold) return 0;
     const int NS=FOLD_REF_N; int nslice=(w->N+NS-1)/NS; if(nslice<1||nslice>64) return -1;

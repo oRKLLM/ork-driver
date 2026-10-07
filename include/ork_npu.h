@@ -29,9 +29,12 @@ typedef struct ork_w   ork_w;       /* resident packed weights for one B[K,N] */
  */
 #define ORK_NPU_VERSION "1.0.152"
 /* On-disk .orkpack format version — DECOUPLED from the library MAJOR. Bump this ONLY when the persisted bytes'
- * meaning changes (tile layout/geometry or quant rule); it stays at the MAJOR of the last format-changing
- * release. The 1.0.0 release did NOT change the format, so it stays 0 (existing .orkpacks remain valid). */
-#define ORK_PACK_FORMAT_VERSION 0u
+ * meaning changes (tile layout/geometry or quant rule).
+ * 0 -> 1 (2026-10-07): every dumped weight now begins with a one-page ork_pack_hdr carrying the format,
+ * the resolved-caps identity and the SoC, and every loader REFUSES a blob without it. Packs written by
+ * an older build are headerless and are rejected with an actionable message; they are a derived cache,
+ * so the fix is to delete the .orkpack and let it rebuild. */
+#define ORK_PACK_FORMAT_VERSION 1u
 /* The API is split across the ork/ headers purely for readability; this umbrella is the entry point
  * and every consumer keeps including <ork_npu.h> unchanged. Order matters: the base typedefs
  * and version macros above must precede the parts, and the parts are included in their
