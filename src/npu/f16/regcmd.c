@@ -198,7 +198,9 @@ inline int orki_f16_mtile(int K,int M){
 /* N-aware twin of orki_f16_mtile: the chunk a run path may actually use for a [M,K]x[K,N] matmul. */
 int orki_f16_mtile_n(int K,int M,int N){
     int chunk=orki_f16_mcap_n(K,orki_f16_sched(K),N);
-    if(chunk>M)chunk=M; if(chunk<1)chunk=1; return chunk;
+    if(chunk>M) chunk=M;
+    if(chunk<1) chunk=1;
+    return chunk;
 }
 
 /* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_f16_synth(). Inert by default. */
