@@ -75,5 +75,6 @@ extern struct ork_regovr orki_f16_fovr[16];
 extern int orki_f16_fovr_n;
 
 int orki_f16_mtile(int K,int M);
+int orki_f16_mtile_n(int K,int M,int N);
 
 #endif /* ORK_NPU_F16_H */

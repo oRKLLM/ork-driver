@@ -117,7 +117,7 @@ static int f16_stream_check(int S,const ork_mm_task_f16 *tasks,int hard,int *cap
         if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
         if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
         if(w->K%32||w->N%16) return -2;
-        int cp=orki_f16_mcap(w->K,orki_f16_sched(w->K));
+        int cp=orki_f16_mcap_n(w->K,orki_f16_sched(w->K),w->N);   /* N-aware: narrow N hangs above the starved-WEIGHT_BANK boundary (r103) */
         if(hard&&cp>hard) cp=hard;
         if(cp<c0) c0=cp;
         if(tasks[i].M>mx) mx=tasks[i].M;
