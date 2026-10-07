@@ -130,6 +130,8 @@ size_t ork_i8_w_dump_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out, s
     int KS=orki_int8_ks(c), NMAX=c->soc->nmax;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t off=0;
+    if(out){ if(cap<ORK_PACK_HDR_BYTES) return 0; orki_pack_stamp(c,out,DT_I8,K,N); }
+    off+=ORK_PACK_HDR_BYTES;   /* one page: keeps every tile below page-aligned for zero-copy import */
     for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
       for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32; size_t tsz=orki_pgup((size_t)Kp*Nc);
         if(out){ if(off+tsz>cap) return 0;
@@ -148,6 +150,8 @@ size_t ork_i8_w_dump_bf_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
     if(!c || !B || (K%512) || K>4096 || (N%32)) return 0;
     int NMAX=c->soc->nmax, Sn=(N+NMAX-1)/NMAX, KTf=K/32;
     size_t off=0;
+    if(out){ if(cap<ORK_PACK_HDR_BYTES) return 0; orki_pack_stamp(c,out,DT_I8,K,N); }
+    off+=ORK_PACK_HDR_BYTES;
     for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32; size_t tsz=orki_pgup((size_t)K*Nc);
         if(out){ if(off+tsz>cap) return 0;
             int8_t *bb=(int8_t*)out+off; memset(bb,0,tsz);   /* zero the page-pad (matches a fresh dma-buf) */
@@ -163,6 +167,10 @@ size_t ork_i8_w_dump_bf_cpu(ork_npu *c, int K, int N, const int8_t *B, void *out
  * the host fill (load is from a disk/RAM blob either way). Same blob format / round-trip as load_i8.
  * Falls through to NULL (caller uses ork_i8_mm_load) if import is unavailable. */
 ork_w *ork_i8_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before touching a byte of it (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I8,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+
     /* OFFLINE (fd<0): no DMA, no device. Un-tile straight to CPU-backed codes, exactly as the int4 twin
      * does, so a .orkpack can be READ and SCORED on a machine with no NPU. Its absence was not a slow
      * path but a SILENT one: with no branch here the loader fell through to bcreate(-1), returned NULL,
@@ -216,6 +224,9 @@ ork_w *ork_i8_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){
 }
 
 ork_w *ork_i8_mm_load_import(ork_npu *c,int K,int N,const void *blob,size_t n){
+    /* REFUSE an unstamped or foreign pack before touching a byte of it (packhdr.c). */
+    if(orki_pack_check(c,blob,n,DT_I8,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
     if(K%32 || N%32) return NULL;
     if(orki_dmaheap_open()<0) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
@@ -363,6 +374,11 @@ ork_w *ork_i8_mm_adopt_imported(ork_npu *c,int K,int N,int bb_fd,int bf_fd,size_
 
 ork_w *ork_i8_mm_import(ork_npu *c,int K,int N,const void *blob,size_t n,size_t bf_off){
     if(!c || !c->daemon || !blob || K<=0 || N<=0 || !n) return NULL;
+    /* packhdr.c. bf_off is "where Bf starts IN THIS BLOB" and the caller measured it against the
+     * stamped bytes (it is the Bb dump's size), so it shifts with the body. */
+    if(orki_pack_check(c,blob,n,DT_I8,K,N)) return NULL;
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+    if(bf_off){ if(bf_off<=ORK_PACK_HDR_BYTES) return NULL; bf_off-=ORK_PACK_HDR_BYTES; }
     size_t bb_bytes = bf_off ? bf_off : n;          /* Bb = blob[0..bf_off); Bf = blob[bf_off..n) */
     size_t bf_bytes = bf_off ? (n - bf_off) : 0;
     /* Bb dma-buf */
@@ -403,6 +419,8 @@ int ork_i8_mm_repack(ork_npu *c,ork_w *w,int K,int N,const int8_t *B){
 }
 
 ork_w *ork_i8_mm_load_flags(ork_npu *c,int K,int N,const void *blob,size_t n,unsigned flags){
+    if(orki_pack_check(c,blob,n,DT_I8,K,N)) return NULL;   /* packhdr.c */
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
     if(K%32 || N%32) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
@@ -565,7 +583,10 @@ void ork_i8_stage_fill(ork_npu *c, struct ork_stage *s, const int8_t *B){
 }
 
 struct ork_stream_entry *ork_i8_stream_pool_add(struct ork_stream_pool *p, int K, int N, const void *blob, size_t n){
-    if(!p || K%32 || N%32) return NULL;
+    if(!p) return NULL;
+    if(orki_pack_check(p->c,blob,n,DT_I8,K,N)) return NULL;   /* packhdr.c */
+    blob=(const char*)blob+ORK_PACK_HDR_BYTES; n-=ORK_PACK_HDR_BYTES;
+    if(K%32 || N%32) return NULL;
     int KS=1024, NMAX=p->c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     size_t need=0;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;

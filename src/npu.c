@@ -768,7 +768,7 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
         return (w->dtype==DT_I4) ? ork_i4_w_dump_cpu(w->off_ctx, w->K, w->N, w->cpu_codes, out, cap)
                                  : ork_i8_w_dump_cpu(w->off_ctx, w->K, w->N, w->cpu_codes, out, cap);
     if(!w->Bb) return 0;
-    size_t off=0, nb=(size_t)w->Sk*w->Sn;
+    size_t off=ORK_PACK_HDR_BYTES, nb=(size_t)w->Sk*w->Sn;   /* one-page header, then the page-aligned tiles (packhdr.c) */ if(out){ if(cap<ORK_PACK_HDR_BYTES) return 0; orki_pack_stamp(w->off_ctx,out,w->dtype,w->K,w->N); }
     for(size_t i=0;i<nb;i++){ const struct buf *b=&w->Bb[i]; if(!b->cpu) continue;
         if(out){ if(off+b->size>cap) return 0; memcpy((char*)out+off,b->cpu,b->size); }
         off+=b->size; }

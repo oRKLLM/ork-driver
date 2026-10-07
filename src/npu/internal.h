@@ -401,6 +401,10 @@ int orki_f16_mtile_n(int K, int M, int N);
 struct ork_slice_f16_caps;
 void     orki_f16_plan_caps(const ork_npu *ctx, struct ork_slice_f16_caps *out);
 unsigned orki_f16_plan_capid(const ork_npu *ctx);
+/* persisted-weight header (src/npu/core/packhdr.c): stamp on dump, refuse on load. */
+unsigned orki_pack_capid(const ork_npu *ctx);
+void     orki_pack_stamp(const ork_npu *ctx, void *out, int dtype, int K, int N);
+int      orki_pack_check(const ork_npu *ctx, const void *blob, size_t n, int dtype, int K, int N);
 int orki_f16_sched(int K);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);

@@ -147,6 +147,43 @@ int          ork_w_quant_kind(const ork_w *w);   /* ORK_QK_* of the int4 weight 
 /* Per-output-channel dequant scale (length N) retained on an int4-packed weight (ork_i4a8_mm_pack /
  * ork_i4a8_mm_load); C_real[m][n] = aScale[m]*bscale[n]*Ci[m][n]. NULL for non-int4 weights. */
 const float *ork_w_bscale(const ork_w *w);
+/* ---- PERSISTED-WEIGHT HEADER ----------------------------------------------------------------
+ * Every blob from ork_w_dump / ork_*_w_dump_cpu begins with this, and every ork_*_mm_load* REFUSES a
+ * blob that lacks it or whose stamp disagrees with this build. Previously the int8/fp16 dump was a
+ * headerless raw-tile stream and, as ork/context.h noted, ork-driver "cannot self-detect" a wrong
+ * one because an incompatible blob of the same (K,N) has the same SIZE — so a pack built against
+ * another chip's geometry loaded silently.
+ *
+ * It is exactly ONE PAGE because the tiles that follow are page-aligned and the zero-copy import
+ * path (ork_*_mm_load_import) makes each tile a page-aligned view into a dma-buf; any other header
+ * size would shift every tile off its page.
+ *
+ * `capid` is the RESOLVED CAPS identity — SoC plus the geometry and envelope rules that decide tile
+ * layout and the M ceiling — not a "built by the SDK" boolean. The failure worth catching is a pack
+ * planned against different caps than the loader's, and a boolean is true in that case.
+ *
+ * A container that stores these blobs still records ork_pack_format_version() next to them and
+ * regenerates on a change; this header makes a missed regeneration fail loudly instead of silently. */
+#define ORK_PACK_MAGIC      0x4b50414fu   /* "OAPK" */
+#define ORK_PACK_HDR_BYTES  4096u
+typedef struct {
+    uint32_t magic;      /* ORK_PACK_MAGIC */
+    uint32_t fmt;        /* ork_pack_format_version() at dump time */
+    uint32_t capid;      /* resolved-caps identity (SoC + geometry + envelope rule) */
+    uint32_t dtype;      /* the ork dtype of the packed weight */
+    int32_t  K, N;
+    uint32_t hdr_bytes;  /* == ORK_PACK_HDR_BYTES; lets the header grow compatibly */
+    uint32_t flags;      /* reserved, 0 */
+    char     soc[16];    /* SoC id at dump time, for the diagnostic */
+} ork_pack_hdr;          /* zero-padded to ORK_PACK_HDR_BYTES */
+/* Load refusal causes (negative; loaders return NULL, these are what gets logged). */
+#define ORK_PACKERR_SHORT     (-1)   /* blob smaller than the header */
+#define ORK_PACKERR_UNSTAMPED (-2)   /* no magic: predates the header / not SDK-built */
+#define ORK_PACKERR_FORMAT    (-3)   /* different on-disk tile layout */
+#define ORK_PACKERR_CAPS      (-4)   /* different SoC geometry or envelope rule */
+#define ORK_PACKERR_SHAPE     (-5)   /* header disagrees with the requested dtype/K/N */
+size_t       ork_pack_hdr_bytes(void);   /* == ORK_PACK_HDR_BYTES, for callers sizing a buffer */
+
 /* PERSIST: dump a packed weight's tile bytes (out=NULL → size), and reload pre-tiled int8 bytes straight
  * into DMA (no dequant/quant/tile) — the .orkpack fast path that makes streaming re-packs a plain copy. */
 size_t       ork_w_dump(const ork_w *w, void *out, size_t cap);

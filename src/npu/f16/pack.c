@@ -109,7 +109,8 @@ static ork_w *f16_load_common(ork_npu *c, int K, int N, const void *blob, size_t
  * and round-trip as ork_f16_mm_pack + ork_w_dump. NULL on shape/size mismatch. */
 ork_w *ork_f16_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n)
 {
-	return f16_load_common(c, K, N, blob, n, 0);
+	if (orki_pack_check(c, blob, n, DT_F16, K, N)) return NULL;   /* packhdr.c: refuse unstamped/foreign */
+	return f16_load_common(c, K, N, (const char *)blob + ORK_PACK_HDR_BYTES, n - ORK_PACK_HDR_BYTES, 0);
 }
 
 /* As ork_f16_mm_load, but each resident tile is a dma-buf the NPU reads in place (dma-heap +
@@ -117,5 +118,6 @@ ork_w *ork_f16_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n)
  * fill. NULL if import is unavailable -- the caller falls back to ork_f16_mm_load. */
 ork_w *ork_f16_mm_load_import(ork_npu *c, int K, int N, const void *blob, size_t n)
 {
-	return f16_load_common(c, K, N, blob, n, 1);
+	if (orki_pack_check(c, blob, n, DT_F16, K, N)) return NULL;
+	return f16_load_common(c, K, N, (const char *)blob + ORK_PACK_HDR_BYTES, n - ORK_PACK_HDR_BYTES, 1);
 }
