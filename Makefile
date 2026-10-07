@@ -391,6 +391,11 @@ slice_replay: tools/slice_replay.c $(COBJ) examples/sigmoid_slice.h
 batch_probe: tools/batch_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# Does the pack-header gate refuse a REAL .orkpack? Reads an existing pack and feeds a real blob to the
+# real loader. Offline context (fd=-1) and O_RDONLY, so it needs no NPU and cannot touch the board's state.
+pack_gate_vs_orkpack: tools/pack_gate_vs_orkpack.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # apples-to-apples: SAME int8 matmul via ork-driver vs the closed RKNN matmul API (librknnrt).
 # Not in `all`/`test` — needs librknnrt.so + rknn_matmul_api.h present. Point RKNN_DIR at them.
 # make rknn_vs_ork RKNN_DIR=/tmp/rknn && sudo env LD_LIBRARY_PATH=/tmp/rknn ./rknn_vs_ork [iters]
