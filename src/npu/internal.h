@@ -396,6 +396,11 @@ int orki_f16_mcap_n(int K, int sched, int N);
  * agree — so narrow shapes are kept out of colsplit and fall to the N-aware single-core path. */
 static inline int ork_f16_wide_enough(const ork_w *w){ return (long)w->K * w->N * 2 > 4L*32768; }
 int orki_f16_mtile_n(int K, int M, int N);
+/* fp16 shape-planning internals (src/npu/f16/plan.c): the caps the public planner resolves, and
+ * their identity, so a pack stamp and the planner cannot drift apart. */
+struct ork_slice_f16_caps;
+void     orki_f16_plan_caps(const ork_npu *ctx, struct ork_slice_f16_caps *out);
+unsigned orki_f16_plan_capid(const ork_npu *ctx);
 int orki_f16_sched(int K);
 int orki_seq_op_ok(const ork_seq_op *o, unsigned *dom, int *have_dom);
 ork_async *ork_async_launch(struct ork_async tmpl);

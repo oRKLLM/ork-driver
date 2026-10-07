@@ -86,6 +86,10 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
             /* kcap MUST match the tiling below (it derives np_ks, the program count) — both now
              * come from the one measured envelope so they cannot disagree. */
+            /* N-BLIND cap, and that is safe ONLY because ork_f16_wide_enough() keeps narrow N out of
+             * colsplit upstream (npu.c). The two kcap sites here derive the program COUNT and must
+             * agree, so they cannot take a per-core N; if that gate is ever relaxed, these must move
+             * to orki_f16_mcap_n together or narrow N will wedge again (r103). */
             int kcap = orki_f16_mcap(Kp, orki_f16_sched(Kp));
             int np_ks = (M + kcap - 1) / kcap;
             struct rknpu_submit s; memset(&s, 0, sizeof s);
