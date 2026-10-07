@@ -190,12 +190,9 @@ int orki_f16_mcap_n(int K,int sched,int N){
     return ncap<cap?ncap:cap;
 }
 
-inline int orki_f16_mtile(int K,int M){
-    int chunk=orki_f16_mcap(K,orki_f16_sched(K));
-    if(chunk>M)chunk=M; if(chunk<1)chunk=1; return chunk;
-}
-
-/* N-aware twin of orki_f16_mtile: the chunk a run path may actually use for a [M,K]x[K,N] matmul. */
+/* The chunk a run path may use for a [M,K]x[K,N] matmul. There is deliberately NO N-blind twin:
+ * one existed (orki_f16_mtile) and was removed with its last caller in the r103 fix, because an
+ * N-blind M-cap is unsafe by construction here and leaving it available invites its reuse. */
 int orki_f16_mtile_n(int K,int M,int N){
     int chunk=orki_f16_mcap_n(K,orki_f16_sched(K),N);
     if(chunk>M) chunk=M;

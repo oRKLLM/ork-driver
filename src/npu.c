@@ -1884,7 +1884,7 @@ int orki_fused_mtile(int K,int M){
  * "end-goal" precise on-NPU gate: recovers the full PPL gap the int8 silu output loses (ablation), at the cost
  * of the fp16 matmul (~3.3x int8, tools/f16_gate_bench) — a measured net-loss TODAY, so gated OFF, built out
  * for a future pipeline where it pays off. w = fp16 weight (ork_f16_mm_pack), A = fp16 [M,K], C = fp32 [M,N] silu.
- * K%32, N<=nmax. fp16 M-tile = orki_f16_mtile(K) = the 0x1040 schedule's bit-exact ceiling mg_max*64 (was a stale
+ * K%32, N<=nmax. fp16 M-tile = orki_f16_mtile_n(K,M,N) = the 0x1040 ceiling, N-aware since r103 (was a stale
  * chunk=16; the real "latent bug" is only ABOVE that ceiling — bit-exact validated, see f16_mtile / silu_f16_check).
  * 0/ok, -1 wedge, -2 shape, -3 SoC. STATUS (2026-07-05): RUNS on-NPU (no wedge) AND now CALIBRATED accurate —
  * tools/silu_f16_calib cracked it to mean|err|~0.08 / max 0.75 over silu[-8,8] (~1%, on par with int8 silu).

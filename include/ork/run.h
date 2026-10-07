@@ -150,4 +150,27 @@ int          ork_f16_transpose       (ork_f16 *dst, const ork_f16 *src, int rows
 /* Fused transpose + narrow: fp32 source (activations, gradients) straight to the fp16 operand the
  * matmul wants, in one pass. Rounding is bit-identical to a scalar (ork_f16) cast. */
 int          ork_f32_transpose_to_f16(ork_f16 *dst, const float   *src, int rows, int cols);
+
+/* ---- SHAPE PLANNING (the SDK "chef" surface) ---------------------------------------------------
+ * Largest M (rows) ONE fp16 program may carry for this K and N, i.e. the step the run path will
+ * tile to. <=0 means the shape is not runnable at all (misaligned, or outside the envelope).
+ *
+ * This is the SAME rule the runtime enforces (orki_f16_mcap_n), exposed so a caller can ask BEFORE
+ * committing to a shape instead of discovering it at submit time. The envelope is narrower than
+ * ork_f16_mm_pack's accept test (K%32, N%16) and depends on N as well as K: a narrow N at a starved
+ * CBUF WEIGHT_BANK hangs the hardware (r103), so the cap drops for small weight segments.
+ *
+ * Works on an ork_npu_init_offline() context — no device, no board — which is the point: model
+ * design (picking an FFN width, an expert count, a head dim) can be checked on a workstation. Pass
+ * it as the mmax callback of ork_slice_f16_caps (ork_slice_f16.h) to plan a full decomposition.
+ *
+ * Returns rows >=1, or <=0 if the shape is refused. K/N are the per-tile values (a K-slice and an
+ * N-tile), not necessarily the whole matmul's. */
+int          ork_f16_mm_mmax(const ork_npu *ctx, int K, int N);
+
+/* Is this whole [M,K]x[K,N] fp16 matmul runnable, and at what cost? Fills *programs with the number
+ * of NPU programs the run path will issue (one per tile) — the per-program submit floor is what
+ * decides whether a small shape is worth offloading at all. Either pointer may be NULL.
+ * 0 = runnable; <0 = refused (see ork_slice_f16_check for the codes). */
+int          ork_f16_mm_plan(const ork_npu *ctx, int M, int K, int N, int *programs);
 #endif /* ORK_RUN_H */
