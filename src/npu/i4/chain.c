@@ -343,12 +343,20 @@ static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,i
             int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
             int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
             for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;   /* a 64-int16 block = 2 x 64B cache lines */
-                if(mode==0){ for(int cc=0;cc<64;cc++) og[base+cc]=ORK_DYN_SENT16; }
+                /* The seed, the verify scan and the de-tile each walk the whole touched surface
+                 * (Hg*NBc*64 int16 per program) and were scalar. NEON them: bit-exact by construction,
+                 * these are pure data movement and a compare-reduce. */
+                if(mode==0){ const int16x8_t vs=vdupq_n_s16(ORK_DYN_SENT16);
+                    for(int cc=0;cc<64;cc+=8) vst1q_s16(&og[base+cc], vs); }
                 else if(mode==1){ __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory");
                     for(int cc=0;cc<64;cc++) if(((volatile int16_t*)og)[base+cc]==ORK_DYN_SENT16) return 0; }
-                else if(mode==3){ for(int cc=0;cc<64;cc++) if(og[base+cc]==ORK_DYN_SENT16) return 0; }
+                else if(mode==3){ const int16x8_t vs=vdupq_n_s16(ORK_DYN_SENT16);
+                    for(int cc=0;cc<64;cc+=8) if(vmaxvq_u16(vceqq_s16(vld1q_s16(&og[base+cc]),vs))) return 0; }
                 else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
-                else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc++) crow[cc]=og[base+cc]; } }
+                else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64;
+                    for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
+                        vst1q_s32(&crow[cc],   vmovl_s16(vget_low_s16(v)));
+                        vst1q_s32(&crow[cc+4], vmovl_s16(vget_high_s16(v))); } } }
             if(mode==4 && !ran) return 0;   /* this program is ENTIRELY sentinel => it truly never ran => real drop */
             tk++; } }
     return 1;
