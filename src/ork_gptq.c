@@ -58,7 +58,7 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     double *Hd  = (double*)malloc((size_t)K*K*sizeof(double));
     double *Wd  = (double*)malloc((size_t)N*K*sizeof(double));
     double *Hin = (double*)malloc((size_t)K*K*sizeof(double));
-    if (!Hd || !Wd || !Hin) { free(hdiag); free(Hd); free(Wd); free(Hin); return -2; }
+    if (!Hd || !Wd || !Hin) { free(Hd); free(Wd); free(Hin); return -2; }
 
     double dmean = 0; for (int i = 0; i < K; i++) dmean += (double)H[(size_t)i*K + i];
     dmean /= (double)K;
