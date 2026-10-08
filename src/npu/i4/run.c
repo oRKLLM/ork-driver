@@ -315,33 +315,50 @@ int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
      * need one per (ns,g) and the drain would have to stitch N-tiles, which is not what this shape needs. */
     if (M >= 2 && w->Sn == 1 && !getenv("ORK_I4_GRP_NOBCHAIN")) {
         const int G=w->gsize, Sk=w->K/G, N=w->N, K=w->K;
-        ork_w  *views = calloc((size_t)Sk, sizeof *views);
+        /* BATCHED DRAIN (ORK_I4_GRP_BATCH=<groups>, 0/unset = all at once, today's behaviour). The
+         * int32 partials are written by the NPU drain and read straight back by the accumulate below,
+         * so at Sk*M*N they are a ~15 MB round trip through DRAM. Running the groups in batches sized
+         * to fit the 3 MB L3 keeps that read in cache, at the price of Sk/batch chain launches instead
+         * of one. BIT-EXACT: batches ascend in g and accumulate in order, so the summation order is
+         * unchanged. Off by default until measured — it trades DRAM traffic for submit count and the
+         * sign of that trade is not obvious. */
+        int GB = Sk; { const char *e=getenv("ORK_I4_GRP_BATCH"); if(e){ int v=atoi(e); if(v>0&&v<Sk) GB=v; } }
+        ork_w  *views = calloc((size_t)GB, sizeof *views);
         int8_t *Aslice = malloc((size_t)M*K);                       /* NG contiguous [M x G] A-slices */
-        int32_t*P      = malloc((size_t)Sk*M*N*sizeof *P);           /* one int32 partial per group */
-        ork_mm_task_i4 *tk = calloc((size_t)Sk, sizeof *tk);
+        int32_t*P      = malloc((size_t)GB*M*N*sizeof *P);           /* one int32 partial per group in flight */
+        ork_mm_task_i4 *tk = calloc((size_t)GB, sizeof *tk);
         if (views && Aslice && P && tk) {
-            for (int g=0; g<Sk; g++) {
-                views[g].K=G; views[g].N=N; views[g].Sk=1; views[g].Sn=1; views[g].dtype=DT_I4;
-                views[g].owns=0;                                     /* VIEW: ork_mm_free must not free Bb */
-                views[g].domain=w->domain; views[g].Bb=&w->Bb[g];
+            int ok = 1;
+            if (GB < Sk) {   /* zero once; each batch accumulates into it */
+                #pragma omp parallel for schedule(static) if(M>1)
+                for (int m=0;m<M;m++){ float *cr=Cf_out_row(C,m,N); for (int n=0;n<N;n++) cr[n]=0.0f; }
+            }
+            for (int g0=0; g0<Sk && ok; g0+=GB) {
+            const int gb = (Sk-g0<GB)?(Sk-g0):GB;
+            for (int q=0; q<gb; q++) {
+                const int g=g0+q;
+                views[q].K=G; views[q].N=N; views[q].Sk=1; views[q].Sn=1; views[q].dtype=DT_I4;
+                views[q].owns=0;                                     /* VIEW: ork_mm_free must not free Bb */
+                views[q].domain=w->domain; views[q].Bb=&w->Bb[g];
                 int8_t *Ag = Aslice + (size_t)g*M*G;
                 for (int m=0;m<M;m++) memcpy(Ag+(size_t)m*G, A+(size_t)m*K+(size_t)g*G, (size_t)G);
-                tk[g].w=&views[g]; tk[g].M=M; tk[g].A=Ag; tk[g].C=P+(size_t)g*M*N;
+                tk[q].w=&views[q]; tk[q].M=M; tk[q].A=Ag; tk[q].C=P+(size_t)q*M*N;
             }
-            if (orki_i4_run_experts_bchain_db(c, tk, Sk, 0) == 0) {
+            if (orki_i4_run_experts_bchain_db(c, tk, gb, 0) == 0) {
                 #pragma omp parallel for schedule(static) if(M>1)
                 for (int m=0;m<M;m++){
                     float *cr=Cf_out_row(C,m,N);
-                    for (int n=0;n<N;n++) cr[n]=0.0f;
-                    for (int g=0; g<Sk; g++) {
-                        const int32_t *pg=P+(size_t)g*M*N+(size_t)m*N;
+                    if (GB >= Sk) for (int n=0;n<N;n++) cr[n]=0.0f;
+                    for (int q=0; q<gb; q++) {
+                        const int g=g0+q;
+                        const int32_t *pg=P+(size_t)q*M*N+(size_t)m*N;
                         const float as=aScale[(size_t)m*Sk+g]; const float *bs=bScale+(size_t)g*N;
                         for (int n=0;n<N;n++) cr[n]+=(float)pg[n]*as*bs[n];
                     }
                 }
-                free(tk); free(P); free(Aslice); free(views);
-                return 0;
+            } else ok = 0;      /* a batch refused: fall through; the path below rewrites C in full */
             }
+            if (ok) { free(tk); free(P); free(Aslice); free(views); return 0; }
         }
         free(tk); free(P); free(Aslice); free(views);               /* refused -> original path below */
     }
