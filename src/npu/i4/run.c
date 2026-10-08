@@ -320,8 +320,9 @@ int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
          * so at Sk*M*N they are a ~15 MB round trip through DRAM. Running the groups in batches sized
          * to fit the 3 MB L3 keeps that read in cache, at the price of Sk/batch chain launches instead
          * of one. BIT-EXACT: batches ascend in g and accumulate in order, so the summation order is
-         * unchanged. Off by default until measured — it trades DRAM traffic for submit count and the
-         * sign of that trade is not obvious. */
+         * unchanged. MEASURED A NEGATIVE and kept off — the extra submits cost more than the locality
+         * buys (29.1 ms off, 30.9 at batch 4, 30.5 at batch 8), because the reduction this targets is
+         * only ~5% of the total; dispatch dominates. Wiki: K-Grouping-Cost-On-RK3588. */
         int GB = Sk; { const char *e=getenv("ORK_I4_GRP_BATCH"); if(e){ int v=atoi(e); if(v>0&&v<Sk) GB=v; } }
         ork_w  *views = calloc((size_t)GB, sizeof *views);
         int8_t *Aslice = malloc((size_t)M*K);                       /* NG contiguous [M x G] A-slices */
