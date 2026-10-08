@@ -117,6 +117,11 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     /* MSE-optimal weight clip: on by default (strictly better on the per-group objective), ORK_GPTQ_NOCLIP=1
      * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
     const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
+    /* Clip-grid shape. Defaults reproduce the historical grid exactly: 8 points, 1.000 .. 0.781.
+     * See the comment at the search itself for why the floor is suspect at ng==1. */
+    int clip_n = 8; double clip_step = 0.03125;
+    { const char *e = getenv("ORK_GPTQ_CLIP_N");    if (e) { int v = atoi(e); if (v > 1 && v <= 64) clip_n = v; } }
+    { const char *e = getenv("ORK_GPTQ_CLIP_STEP"); if (e) { double v = atof(e); if (v > 0.0 && v < 0.2) clip_step = v; } }
 
     /* WORKING PRECISION for the three O(K^3) factorizations — ~20:1 of this function's arithmetic, so
      * this is where fp32 would pay: half the memory traffic and twice the NEON lanes. GATED OFF by
@@ -164,11 +169,37 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                  * side's 0.56) BECAUSE of the error compensation below: a clipped weight's residual is not
                  * absorbed locally, it is propagated into the not-yet-quantized columns, so over-tight scales
                  * are amplified here in a way they are not for activations. Cost is NT extra passes over one
-                 * group — negligible beside the Cholesky and the compensation loop, and pack-time only. */
+                 * group — negligible beside the Cholesky and the compensation loop, and pack-time only.
+                 *
+                 * THE FLOOR IS A GUESS, AND IT MAY BE ABOVE THE OPTIMUM AT PER-ROW GRANULARITY. The 0.78
+                 * justification above is about error PROPAGATION, which does not depend on how many columns
+                 * share a scale. But how far absmax overshoots does: with one scale spanning all K (ng==1,
+                 * which is every production shape here) the scale is pinned by the single largest weight in
+                 * thousands, so the MSE-optimal clip sits much tighter. A search cannot find an optimum it
+                 * cannot reach.
+                 *
+                 * MEASURED (per-row, heavy-tailed weights, structured H; tools-side probe, 2026-10-08).
+                 * H-weighted error and the mean chosen scale as a fraction of absmax, K=1024 N=64:
+                 *     no clip             993.8-equivalent    1.000
+                 *     grid floor 0.781    3796.8             0.815   <- today's default
+                 *     grid floor 0.656    2981.3             0.723
+                 *     grid floor 0.531    2526.6             0.642   <- 1.50x better than the default
+                 *     grid floor 0.406    2381.6             0.568
+                 * The chosen scale is still sliding with the floor at 0.406, i.e. the search is pinned
+                 * AGAINST the boundary for essentially every row — the signature of a mis-set bound, not of
+                 * a located optimum. The effect grows with K (1.30x at K=512, 1.50x at K=1024), and
+                 * production K is 1024-3072.
+                 *
+                 * ORK_GPTQ_CLIP_N / ORK_GPTQ_CLIP_STEP make the grid sweepable (defaults 8 / 0.03125 keep
+                 * today's behaviour exactly). NOT widened by default: widening can only lower this group's
+                 * own squared error, and we have just been reminded that the layer-local objective is a poor
+                 * predictor of perplexity — back-to-front ordering measured 1.3% better here and 0.45% (a
+                 * null) end-to-end. So the grid gets a knob, and the default moves on a PPL measurement. */
                 if (clip) {
                     double best = sc, be = -1.0;
-                    for (int t = 0; t < 8; t++) {
-                        const double a = 1.0 - 0.03125 * (double)t;   /* 1.000 .. 0.781 */
+                    for (int t = 0; t < clip_n; t++) {
+                        const double a = 1.0 - clip_step * (double)t;
+                        if (a <= 0.0) break;
                         const double s2 = a * mx / 7.0; if (s2 <= 0.0) continue;
                         double e = 0.0;
                         for (int c = j; c < j1; c++) {
