@@ -685,8 +685,14 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * domain -> across the auto-sized ~16 domains that's ~1.6 GB of bcreate scratch, exhausting the kernel GEM/CMA
      * pool so a fresh orki_bcreate (even a tiny mtk_all) EINVALs at ~the 5th domain. Free it here so only the ACTIVE
      * domain's mcc exists; the next run re-allocs it in its own domain. (int8's per-op scratch is tiny so it never
-     * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths. */
-    for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
+     * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths.
+     *
+     * MULTI-DOMAIN ONLY: with one domain there is one copy, and freeing it just forces a ~29 MB
+     * bdestroy+bscratch every call (the realloc above is gated on mccsz, which this zeroes).
+     * c->dom_save is the established single-vs-multi signal. ORK_I4_FREE_MCC=1 restores the
+     * unconditional free. Wiki: K-Grouping-Cost-On-RK3588. */
+    if (c->dom_save || getenv("ORK_I4_FREE_MCC"))
+        for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
     return 0;
 }
 
