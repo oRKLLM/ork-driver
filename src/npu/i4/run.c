@@ -330,10 +330,6 @@ int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
         ork_mm_task_i4 *tk = calloc((size_t)GB, sizeof *tk);
         if (views && Aslice && P && tk) {
             int ok = 1;
-            if (GB < Sk) {   /* zero once; each batch accumulates into it */
-                #pragma omp parallel for schedule(static) if(M>1)
-                for (int m=0;m<M;m++){ float *cr=Cf_out_row(C,m,N); for (int n=0;n<N;n++) cr[n]=0.0f; }
-            }
             for (int g0=0; g0<Sk && ok; g0+=GB) {
             const int gb = (Sk-g0<GB)?(Sk-g0):GB;
             for (int q=0; q<gb; q++) {
@@ -349,7 +345,7 @@ int ork_i4_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float 
                 #pragma omp parallel for schedule(static) if(M>1)
                 for (int m=0;m<M;m++){
                     float *cr=Cf_out_row(C,m,N);
-                    if (GB >= Sk) for (int n=0;n<N;n++) cr[n]=0.0f;
+                    if (g0 == 0) for (int n=0;n<N;n++) cr[n]=0.0f;   /* first batch initialises; later ones accumulate */
                     for (int q=0; q<gb; q++) {
                         const int g=g0+q;
                         const int32_t *pg=P+(size_t)q*M*N+(size_t)m*N;
