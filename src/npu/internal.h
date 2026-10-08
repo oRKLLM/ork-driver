@@ -267,6 +267,12 @@ void     orki_bdestroy(int fd, struct buf *b);
 int      orki_budget(ork_npu *c, int M);
 void     orki_i4_synth(uint32_t *rc, int mc, int K, int N, uint32_t aA, uint32_t aB, uint32_t aC);
 int      orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n);
+/* Refuse a program whose write/read WINDOW runs past the staging buffer it was handed.
+ * orki_validate_regcmd checks the base addresses are inside a known buffer; it cannot see the
+ * extent, which is the hole r104 fell through (a valid Cc base + an M-chunk 10% too tall = a
+ * committed job, no interrupt, core at 100%, board power-cycled). Call it with the bytes the
+ * program will actually touch, BEFORE the host gather and before the submit. */
+int      orki_check_extent(const char *op, const struct buf *b, size_t need, const char *what);
 void     orki_i4_tile_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
 extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_wdom, orki_last_import;
 extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;

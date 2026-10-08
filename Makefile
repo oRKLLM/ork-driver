@@ -47,7 +47,7 @@ ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3
 # EXAMPLES ARE THE TEST SUITE: each self-validates against a CPU reference and exits 0/nonzero, and
 # `make test` runs every one. Something that only PRINTS for a human to read is not a test -- it cannot
 # fail, so running it proves nothing -- and it belongs in DIAGNOSTICS below.
-EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_slice_rescue test_i4_gemm test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8 test_f16colsplit test_transpose test_f16_narrow_n test_slice_f16 test_pack_gate
+EXAMPLES := test_matmul quant i4 layer decode model llama2 perplexity_i4 test_speed test_chain_i4 test_sn3 test_activations test_affinity test_stream_interleave test_mm_i8_out8 test_silu_native test_ewmul_i8 test_ewmul_f16 test_ewmul_i16 test_silu test_add test_gelu test_bmm test_ssd_chunk test_ssd_chunk_npu test_mode_transition test_bmm_fused test_api_parity test_spine test_slice_rescue test_i4_gemm test_gptq test_i4_dump_cpu test_cpu_gemm test_offline_load test_f16_load test_grouped_i8 test_f16colsplit test_transpose test_f16_narrow_n test_f16_wide_k test_slice_f16 test_pack_gate
 
 # DIAGNOSTICS: built by `make all` (so they cannot rot, and CI compiles them) but NOT run by `make test`,
 # because they assert nothing. test_baseline/test_registers/test_layouts print NPU output beside a CPU

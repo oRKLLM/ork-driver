@@ -1587,6 +1587,29 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
 }
 
 
+/* orki_run_loop_chunk — THE M-chunk rule for orki_run's K-sliced run_loop, in ONE place.
+ *
+ * r104 (2026-10-08): this rule existed TWICE — in the pass that SIZES Af/Cc and in the loop that
+ * EMITS the programs — and they drifted. The emitter moved onto the measured fp16 envelope; the
+ * sizing copy kept the legacy int8 mg_max*64. Where fp16 is taller (Kp=512: 352 vs 320; Kp=1024:
+ * 176 vs 128) the NPU was programmed to write past the end of Cc, which on this hardware is not a
+ * fault but a hang — job committed, no interrupt, core at 100%, board power-cycled. NOT the r103
+ * starved-WEIGHT_BANK mechanism, just a buffer extent; every overrun here presents alike.
+ * Wiki: Exp-2026-10-08-fp16-Wide-K-Head-Hang. Both passes call this; neither keeps a copy. */
+static int orki_run_loop_chunk(int dt,int Kp,int Nc,int RB){
+    if(Kp<1) return 1;
+    int sched = dt ? (Kp==1024||Kp==512) : orki_f16_sched(Kp);
+    int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
+    int chunk = sched ? 4*R : ((RB/2)/Kp); if(chunk<1) chunk=1;
+    /* fp16: the MEASURED envelope, N-aware. The int8 forms above are derived from 32768 ELEMENTS,
+     * 2x too loose at 2 B/elem (see orki_f16_mcap). int8 is measured-correct at its own truncated
+     * ceiling and must NOT be moved onto the fp16 rule. */
+    if(!dt) chunk = orki_f16_mcap_n(Kp,sched,Nc);
+    /* sched=0 runs the DEFAULT 0x1040 template, correct only while mc*Kp <= 32768 elements. */
+    if(!sched){ int cap=32768/Kp; if(cap<1)cap=1; if(chunk>cap)chunk=cap; }
+    return chunk<1?1:chunk;
+}
+
 int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     /* multi-domain residence: swap in this domain's scratch (regcmd/task/Af/Cc/mc-*) so the submit's
      * buffers all live in the weight's domain (c->dom_active), and make any lazy scratch bcreate below
@@ -1622,17 +1645,18 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     size_t need=(size_t)M*N*4;                         /* output is fp32 or int32 (both 4 bytes) */
     if(c->cressz<need){c->cres=realloc(c->cres,need);c->cressz=need;}
     memset(c->cres,0,need);
+    /* Size Af/Cc from the SAME rule the emitting loop below uses (orki_run_loop_chunk) — see its
+     * comment for why a second copy of the rule here cost a board power cycle. Walk every N-tile,
+     * not just the widest: the fp16 cap is N-aware, so the tallest chunk is not always at max Nc. */
     size_t maxout=0, maxaf=0;
     for(int k0=0;k0<K;k0+=KS){
         int Kp=(K-k0<KS)?(K-k0):KS;
-        int sd=dt?(Kp==1024||Kp==512):((Kp&(Kp-1))==0 && Kp>=128 && Kp<(getenv("ORK_F16_HISCHED")?4096:2048));
-        int R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
-        double scale=(double)Kp/(dt?512.0:256.0); int base=(int)(177.0-15.0*(scale-1.0)),slope=(int)(15.0*scale), mg_max = base>=0x1b ? (base-0x1b)/slope+1 : 0;
-        int chunk = mg_max * 64; if(!sd) chunk = (RB/2)/Kp; if(chunk < 4*R) chunk = sd ? 4*R : ((RB/2)/Kp); if(chunk > M) chunk = M; if(chunk < 1) chunk = 1;
-        int rows=chunk<M?chunk:M;
-        int nc=N<NMAX?N:NMAX;
-        size_t o=(size_t)rows*nc*4; if(o>maxout)maxout=o;
-        size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
+        for(int n0=0;n0<N;n0+=NMAX){
+            int Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            int rows=orki_run_loop_chunk(dt,Kp,Nc,RB); if(rows>M)rows=M;
+            size_t o=(size_t)rows*Nc*4; if(o>maxout)maxout=o;
+            size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
+        }
     }
     if(dt==DT_I8 && M>1 && w->Bf && (K%512)==0 && K<=4096){
         int Kp=K, R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; }
@@ -1641,6 +1665,11 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         int rows=chunk<M?chunk:M;
         size_t sz=(size_t)rows*Kp*1;
         if(sz>maxaf)maxaf=sz;
+        /* r104: this branch writes rows*Nc int32 into c->Cc too, and only maxaf was ever bumped.
+         * It has not overrun because the K-sliced loop above happens to demand more at every
+         * production K — luck, not design, and luck a new SoC's K-slice would end. */
+        for(int n0=0;n0<N;n0+=NMAX){ int Nc=(N-n0<NMAX)?(N-n0):NMAX;
+            size_t o=(size_t)rows*Nc*4; if(o>maxout)maxout=o; }
     }
     if(c->ccsz<maxout){orki_bdestroy(fd,&c->Cc);c->Cc=orki_bcreate(fd,maxout,0x403,c->dom_active);c->ccsz=maxout;c->warmed=0; if(!c->Cc.cpu){fprintf(stderr, "[ork] ERROR: failed to allocate single-core/pre-core output buffer Cc (size=%zu, IOMMU full?)\n", maxout);return -1;}}
     if(c->Af.size<maxaf){
@@ -1676,6 +1705,9 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             uint64_t wbase=w->Bf[ns].dma;                  /* full-K weight, whole N-slice (single core) */
             for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
+                /* r104 extent guard; zero-copy A/C are the caller's buffers, so only staging. */
+                if(!abuf && orki_check_extent("run_fullk_dec",&c->Af,(size_t)mc*K*1,"activation Af")) return -1;
+                if(!cbuf && orki_check_extent("run_fullk_dec",&c->Cc,(size_t)mc*Nc*4,"output Cc")) return -1;
                 double _tc0=ork_now_us();
                 uint32_t adma;
                 if(abuf){ adma=(uint32_t)(abuf->dma + ((const char*)A-(const char*)abuf->cpu) + (size_t)m0*K); }
@@ -1726,19 +1758,10 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         orki_bsync(fd,&c->task,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE); }
     for(int ns=0;ns<w->Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
       for(int ks=0;ks<w->Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS;
-        int sched=dt?(Kp==1024||Kp==512):orki_f16_sched(Kp), R=RB/Kp; if(R<1)R=1; { int rp2=1; while(rp2*2<=R)rp2*=2; R=rp2; } int chunk=sched?4*R:((RB/2)/Kp); if(chunk<1)chunk=1;
-        /* fp16: the M-tile is the MEASURED envelope, not 4*R / (RB/2)/Kp. Those were derived from
-         * int8 (32768 ELEMENTS) and are 2x too loose for fp16 (2 B/elem => 16384 elems = 1 CBUF
-         * bank), and the sched=1 form overshot badly (4*R = 1024 @K=128 vs a real ceiling of 256,
-         * which is why ork_f16_mm_run silently miscomputed there for any M in [257,1472]).
-         * int8 keeps its own path untouched — it is measured-correct at mg_max*64. */
-        if(!dt) chunk=orki_f16_mcap_n(Kp,sched,Nc);   /* r103: N-AWARE — narrow N at a starved WEIGHT_BANK HANGS; this is the path that wedged (chunk was 176, so M=144 ran as ONE program). Nc, not N: Nc is what orki_f16_synth is handed. */
-        /* sched=0 uses the DEFAULT 0x1040 template, which computes correctly only while the activation tile
-         * fits its budget: mc*Kp <= 32768 elements. (RB/2)/Kp overshoots (e.g. int8 K=256 -> chunk=224, but
-         * rows past 32768/256=128 in one submit are GARBAGE — isolated via shape_probe). The sched=1 path
-         * caps to mg_max*64; sched=0 must cap to 32768/Kp. Without this, int8 K%512!=0 at M>32768/Kp miscomputes
-         * (make test never hit it: test_matmul K=2048/3584 are %512 -> run_fullk_dec). */
-        if(!sched){ int cap=32768/Kp; if(cap<1)cap=1; if(chunk>cap)chunk=cap; }
+        int sched=dt?(Kp==1024||Kp==512):orki_f16_sched(Kp);
+        /* ONE rule, shared with the Af/Cc sizing pass above — see orki_run_loop_chunk. It carries
+         * the fp16 measured envelope (N-aware, r103) and the sched=0 activation-tile cap. */
+        int chunk=orki_run_loop_chunk(dt,Kp,Nc,RB);
         /* fp16 M-scheduler (sched=1) has a VALID Kp WINDOW [128,2048): the 0x1040 K-reduction schedule (scale=Kp/256)
  * extrapolates too HIGH for small Kp (K=64->0x1040=188, K=32->190) and miscomputes (constant-garbage output),
  * and at Kp>=2048 it miscomputes >8 rows (mc<=8 OK / mc>=9 garbage). Outside the window, sched=0 (the general
@@ -1747,6 +1770,10 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
             { static int dbg=-1; if(dbg<0)dbg=getenv("ORK_RL_DBG")?1:0; if(dbg) fprintf(stderr,"[run_loop] ns=%d ks=%d Kp=%d sched=%d chunk=%d m0=%d mc=%d M=%d Nc=%d Afsz=%zu Ccsz=%zu\n",ns,ks,Kp,sched,chunk,m0,mc,M,Nc,c->Af.size,c->Cc.size); }
+            /* BEFORE the gather: a short Af is a host heap overflow on the line below, a short Cc
+             * an NPU hang with no interrupt (r104). */
+            if(orki_check_extent("run_loop",&c->Af,(size_t)mc*Kp*(dt?1:2),"activation Af")) return -1;
+            if(orki_check_extent("run_loop",&c->Cc,(size_t)mc*Nc*4,"output Cc")) return -1;
             double _tc0=ork_now_us();
             if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j]; }
             else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j]; }

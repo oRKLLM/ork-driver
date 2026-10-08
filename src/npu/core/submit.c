@@ -538,6 +538,19 @@ int orki_check_overlap(const char *name, uintptr_t a_start, uintptr_t a_end, uin
     return 0;
 }
 
+/* See internal.h. A staging buffer that is too small does NOT fail loudly on this hardware: the
+ * base address passes every sanity check, the job commits, and the write walks off the end of the
+ * mapped IOVA region — after which no completion interrupt arrives and the core stays busy until a
+ * power cycle. So the only cheap defence is to compare the program's extent against the buffer
+ * before submitting, which costs one comparison per program. */
+int orki_check_extent(const char *op, const struct buf *b, size_t need, const char *what) {
+    if (b && b->size >= need) return 0;
+    fprintf(stderr, "[ork] ERROR [%s]: %s window is %zu B but the buffer is %zu B — refusing to submit "
+                    "(a program past the end of its buffer does not fault, it HANGS the NPU).\n",
+            op ? op : "?", what ? what : "buffer", need, b ? b->size : (size_t)0);
+    return -1;
+}
+
 int orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, int n, const ork_w *w, const struct buf *extra, int extra_n) {
     /* stash context so a later submit failure can name the exact weight/op/domain/import-status that faulted */
     orki_last_op = op ? op : "?";
