@@ -117,9 +117,11 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     /* MSE-optimal weight clip: on by default (strictly better on the per-group objective), ORK_GPTQ_NOCLIP=1
      * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
     const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
-    /* Clip-grid shape. Defaults reproduce the historical grid exactly: 8 points, 1.000 .. 0.781.
-     * See the comment at the search itself for why the floor is suspect at ng==1. */
-    int clip_n = 8; double clip_step = 0.03125;
+    /* Clip-grid shape: 16 points, 1.000 .. 0.531. The historical grid was 8 points stopping at 0.781,
+     * which sits ABOVE the optimum at per-row granularity — see the comment at the search itself.
+     * 16 is measured, not guessed: it is an interior optimum (floor 0.406 is worse than 0.531, which
+     * is worse than neither 0.781 nor nothing), so it is a located peak rather than a trend. */
+    int clip_n = 16; double clip_step = 0.03125;
     { const char *e = getenv("ORK_GPTQ_CLIP_N");    if (e) { int v = atoi(e); if (v > 1 && v <= 64) clip_n = v; } }
     { const char *e = getenv("ORK_GPTQ_CLIP_STEP"); if (e) { double v = atof(e); if (v > 0.0 && v < 0.2) clip_step = v; } }
 
