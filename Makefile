@@ -393,6 +393,11 @@ batch_probe: tools/batch_probe.c $(COBJ)
 
 # Does the pack-header gate refuse a REAL .orkpack? Reads an existing pack and feeds a real blob to the
 # real loader. Offline context (fd=-1) and O_RDONLY, so it needs no NPU and cannot touch the board's state.
+# Rank a pack's weights by the qerr it recorded, and emit an ORK_I4_INT8_LAYERS promote list.
+# Index-only: no blobs, no IOVA, no model load — so it needs no NPU and links nothing.
+orkpack_qerr_rank: tools/orkpack_qerr_rank.c
+	$(CC) $(CFLAGS) -o $@ $< -lm
+
 pack_gate_vs_orkpack: tools/pack_gate_vs_orkpack.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 

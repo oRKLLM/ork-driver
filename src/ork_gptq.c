@@ -58,7 +58,7 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     double *Hd  = (double*)malloc((size_t)K*K*sizeof(double));
     double *Wd  = (double*)malloc((size_t)N*K*sizeof(double));
     double *Hin = (double*)malloc((size_t)K*K*sizeof(double));
-    if (!Hd || !Wd || !Hin) { free(Hd); free(Wd); free(Hin); return -2; }
+    if (!Hd || !Wd || !Hin) { free(hdiag); free(Hd); free(Wd); free(Hin); return -2; }
 
     double dmean = 0; for (int i = 0; i < K; i++) dmean += (double)H[(size_t)i*K + i];
     dmean /= (double)K;
@@ -73,6 +73,57 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
             for (int n = 0; n < N; n++) Wd[(size_t)n*K + i] = 0.0;
         } else Hd[(size_t)i*K + i] += lam;
     }
+
+    /* ACT-ORDER (ORK_GPTQ_ACTORDER=1) — quantize columns in DESCENDING diag(H) order.
+     *
+     * GPTQ compensates each column's rounding error into the columns it has not reached yet, so the
+     * compensation budget shrinks as the sweep advances: the last column quantized has nowhere to push
+     * its error. Processing the most important columns FIRST (largest diag(H) = largest accumulated
+     * activation energy) spends the budget where it matters and leaves the least important columns to
+     * absorb the leftovers. This is the standard `desc_act` refinement.
+     *
+     * NORMALLY ACT-ORDER COSTS A STORED PERMUTATION, AND HERE IT DOES NOT. With per-group scales the
+     * groups would straddle permuted columns, so the pack must carry the permutation and the runtime
+     * must apply it. With PER-ROW scales (G >= K, our default) there is exactly one scale per output
+     * channel covering every column, so the scale is computed over the same SET whatever the order, and
+     * the codes are written back into their original positions below. Nothing changes on disk and
+     * nothing changes at inference — so this is gated to G >= K rather than made to work with groups.
+     *
+     * The permutation must be applied BEFORE the factorizations: the Cholesky ordering is what defines
+     * the propagation structure, so permuting afterwards would reorder the columns without reordering
+     * the error feedback, which is the only thing act-order is trying to change. */
+    int *perm = NULL;
+    if (getenv("ORK_GPTQ_ACTORDER") && G >= K) {
+        perm = (int*)malloc((size_t)K * sizeof *perm);
+        double *tmp = (double*)malloc((size_t)K*K*sizeof *tmp);
+        if (perm && tmp) {
+            for (int i = 0; i < K; i++) perm[i] = i;
+            /* insertion sort on diag(H), descending — K is ~1-4k and this runs once per weight, far
+             * below the O(K^3) factorizations that follow. */
+            for (int i = 1; i < K; i++) {
+                const int key = perm[i]; const double kv = Hd[(size_t)key*K + key];
+                int j = i - 1;
+                while (j >= 0 && Hd[(size_t)perm[j]*K + perm[j]] < kv) { perm[j+1] = perm[j]; j--; }
+                perm[j+1] = key;
+            }
+            for (int i = 0; i < K; i++)                           /* H' = P H Pᵀ (symmetric permute) */
+                for (int j = 0; j < K; j++)
+                    tmp[(size_t)i*K + j] = Hd[(size_t)perm[i]*K + perm[j]];
+            memcpy(Hd, tmp, (size_t)K*K*sizeof *tmp);
+            for (int nn = 0; nn < N; nn++) {                      /* W' columns follow the same order */
+                double *row = Wd + (size_t)nn*K;
+                for (int i = 0; i < K; i++) tmp[i] = row[perm[i]];
+                memcpy(row, tmp, (size_t)K*sizeof *tmp);
+            }
+            free(tmp);
+        } else { free(perm); free(tmp); perm = NULL; }            /* no memory: run unpermuted, not wrong */
+    }
+
+    /* diag(H) MUST be captured HERE. The factorization chain below rewrites Hd IN PLACE (chol_lower
+     * turns it into L), so reading Hd[c*K+c] after that point yields L's diagonal — a different
+     * quantity that would silently mis-weight the clip objective rather than fail. */
+    double *hdiag = (double*)malloc((size_t)K * sizeof *hdiag);
+    if (hdiag) for (int i = 0; i < K; i++) hdiag[i] = Hd[(size_t)i*K + i];
 
     /* MSE-optimal weight clip: on by default (strictly better on the per-group objective), ORK_GPTQ_NOCLIP=1
      * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
@@ -96,18 +147,18 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     if (getenv("ORK_GPTQ_FP32")) {
         float *Hf = (float*)malloc((size_t)K*K*sizeof(float));
         float *Hif = (float*)malloc((size_t)K*K*sizeof(float));
-        if (!Hf || !Hif) { free(Hf); free(Hif); free(Hd); free(Wd); free(Hin); return -2; }
+        if (!Hf || !Hif) { free(Hf); free(Hif); free(hdiag); free(Hd); free(Wd); free(Hin); return -2; }
         for (size_t i = 0; i < (size_t)K*K; i++) Hf[i] = (float)Hd[i];
         int rc = chol_lower_f32(K, Hf);
         if (!rc) rc = inv_from_chol_f32(K, Hf, Hif);
         if (!rc) rc = chol_upper_f32(K, Hif);
-        if (rc) { free(Hf); free(Hif); free(Hd); free(Wd); free(Hin); return rc == -2 ? -2 : -3; }
+        if (rc) { free(Hf); free(Hif); free(hdiag); free(Hd); free(Wd); free(Hin); return rc == -2 ? -2 : -3; }
         for (size_t i = 0; i < (size_t)K*K; i++) Hin[i] = (double)Hif[i];
         free(Hf); free(Hif);
     } else {
-        if (gptq_chol_lower(K, Hd) != 0)      { free(Hd); free(Wd); free(Hin); return -3; }  /* Hd -> L */
-        if (gptq_inv_from_chol(K, Hd, Hin)!=0){ free(Hd); free(Wd); free(Hin); return -2; }  /* Hin = H⁻¹ */
-        if (gptq_chol_upper(K, Hin) != 0)     { free(Hd); free(Wd); free(Hin); return -3; }  /* Hin -> U upper */
+        if (gptq_chol_lower(K, Hd) != 0)      { free(hdiag); free(Hd); free(Wd); free(Hin); return -3; }  /* Hd -> L */
+        if (gptq_inv_from_chol(K, Hd, Hin)!=0){ free(hdiag); free(Hd); free(Wd); free(Hin); return -2; }  /* Hin = H⁻¹ */
+        if (gptq_chol_upper(K, Hin) != 0)     { free(hdiag); free(Hd); free(Wd); free(Hin); return -3; }  /* Hin -> U upper */
     }
 
     for (int j = 0; j < K; j++) {
@@ -126,15 +177,29 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                  * are amplified here in a way they are not for activations. Cost is NT extra passes over one
                  * group — negligible beside the Cholesky and the compensation loop, and pack-time only. */
                 if (clip) {
+                    /* GRID SHAPE is tunable (ORK_GPTQ_CLIP_N / _STEP): 8 points at 0.03125 was a guess,
+                     * never swept, and this is pack-time only. H-WEIGHTED OBJECTIVE (ORK_GPTQ_HWCLIP=1)
+                     * is a tractable stand-in for Schur Replay (arXiv 2609.36654), which observes that
+                     * scoring a scale by its own reconstruction error "can misestimate its final
+                     * reconstruction error" because quantizing one column updates those that follow.
+                     * Replaying the full GPTQ update per candidate is far too costly here; weighting each
+                     * column's squared error by diag(H) is the cheap approximation of the same idea —
+                     * it prices a column's error by how much activation energy actually flows through
+                     * it, instead of treating every column as equally important. */
+                    const int    NT = getenv("ORK_GPTQ_CLIP_N")    ? atoi(getenv("ORK_GPTQ_CLIP_N"))    : 8;
+                    const double ST = getenv("ORK_GPTQ_CLIP_STEP") ? atof(getenv("ORK_GPTQ_CLIP_STEP")) : 0.03125;
+                    const int    HW = getenv("ORK_GPTQ_HWCLIP") != NULL && hdiag != NULL;
                     double best = sc, be = -1.0;
-                    for (int t = 0; t < 8; t++) {
-                        const double a = 1.0 - 0.03125 * (double)t;   /* 1.000 .. 0.781 */
+                    for (int t = 0; t < (NT > 0 ? NT : 8); t++) {
+                        const double a = 1.0 - (ST > 0.0 ? ST : 0.03125) * (double)t;
+                        if (a <= 0.0) break;
                         const double s2 = a * mx / 7.0; if (s2 <= 0.0) continue;
                         double e = 0.0;
                         for (int c = j; c < j1; c++) {
                             const double w = Wd[(size_t)n*K + c];
                             long q = lround(w / s2); if (q > 7) q = 7; if (q < -8) q = -8;
-                            const double dd = w - (double)q * s2; e += dd*dd;
+                            const double dd = w - (double)q * s2;
+                            e += HW ? dd*dd * hdiag[c] : dd*dd;   /* pre-factorization diag(H) */
                         }
                         if (be < 0.0 || e < be) { be = e; best = s2; }
                     }
@@ -156,6 +221,22 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
             for (int c = j + 1; c < K; c++) row[c] -= err * hr[c]; /* propagate into not-yet-quantized columns */
         }
     }
-    free(Hd); free(Wd); free(Hin);
+    /* UN-PERMUTE: the sweep wrote codes[n][j] for the j-th column IN PERMUTED ORDER, i.e. the weight
+     * that originally lived at perm[j]. Put them back so the blob layout is byte-for-byte what every
+     * loader already expects — act-order changes the ORDER OF QUANTIZATION, never the format.
+     * Scales need no fixing: G >= K is enforced above, so there is one per row over all columns. */
+    if (perm) {
+        int8_t *tmp = (int8_t*)malloc((size_t)K);
+        if (tmp) {
+            for (int n = 0; n < N; n++) {
+                int8_t *row = codes + (size_t)n*K;
+                for (int j = 0; j < K; j++) tmp[perm[j]] = row[j];
+                memcpy(row, tmp, (size_t)K);
+            }
+            free(tmp);
+        }
+        free(perm);
+    }
+    free(hdiag); free(Hd); free(Wd); free(Hin);
     return 0;
 }
