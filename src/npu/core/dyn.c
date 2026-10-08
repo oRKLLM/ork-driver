@@ -44,12 +44,57 @@ int ork_dyn_end(ork_dyn_chain *h);
  * wide-N/K or when the M-program chain doesn't fit the per-core regcmd/task buffers. */
 
 
+/* orki_dyn_collision_landed — did op `i` actually land, or did a computed value merely LOOK like the
+ * seed? Called only once the completion spin has already timed out (h->collide_ok), so it never slows
+ * the hot path.
+ *
+ * WHY IT HAS TO EXIST. Completion is inferred from "the output no longer equals the sentinel we seeded".
+ * For int32 outputs that is sound: INT32_MAX is not a reachable accumulator. For int4 the output is
+ * int16 and the sentinel is 0x7fff, which IS reachable — a W4A4 accumulator saturates there (K=3072 with
+ * codes in [-8,7] reaches 196608, far past int16). So ONE legitimate output element equal to 32767
+ * anywhere in the surface makes the op look permanently stuck, the chain reports a doorbell miss, the
+ * recovery resubmits a round that already ran, and the decode finally fails. Measured 2026-10-08 on a
+ * W4A4 + SmoothQuant + randomized-Hadamard pack: deterministic, always the same matmul (ffn_down,
+ * M=64 K=3072 N=1024), gone the moment the calibration text changes, and absent under ORK_I4_BLOCKING
+ * — all four being signatures of a value collision rather than a dropped round.
+ *
+ * THE DISCRIMINATOR is the one the ORK_MC_DIAG census already reasons about, promoted from a printout
+ * to a decision: a round that never ran leaves the output ENTIRELY at the seed, and a write that
+ * stalled partway leaves a large contiguous tail — whereas a value collision leaves a handful of
+ * scattered singletons. So re-read through the kernel's DMA sync (architecturally complete, unlike a
+ * bare civac on the user VA) and accept the op only if the survivors are a vanishing fraction.
+ *
+ * It is deliberately LOUD. Accepting here means reading an output the hardware may still be writing,
+ * which would be silent wrong numbers — the one outcome worse than a failed decode. ORK_I4_NOCOLLIDE=1
+ * disables it for an A/B. */
+int orki_dyn_collision_landed(ork_dyn_chain *h, int i){
+    static int off = -1; if (off < 0) off = getenv("ORK_I4_NOCOLLIDE") ? 1 : 0;
+    if (off) return 0;
+    const int no = h->nout[i] ? h->nout[i] : h->N;
+    if (no < 1024) return 0;                      /* too small to tell a collision from a stall */
+    if (h->outbuf[i]) orki_bsync(h->c->fd, h->outbuf[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+    const int16_t *o = (const int16_t*)h->outptr[i];
+    long sent = 0; const long cap = no / 1000 > 0 ? no / 1000 : 1;   /* 0.1% of the surface */
+    for (int e = 0; e < no; e++) if (o[e] == ORK_DYN_SENT16 && ++sent > cap) return 0;
+    if (!sent) return 1;                          /* the sync alone cleared it: a read-visibility miss */
+    fprintf(stderr, "[ork] int4 doorbell: %ld/%d output elements equal the int16 seed 0x7fff after a DMA "
+                    "sync — a saturating W4A4 accumulator reaching the seed, not a dropped round. "
+                    "Accepting op %d as landed (ORK_I4_NOCOLLIDE=1 to refuse instead).\n", sent, no, i);
+    return 1;
+}
+
 int ork_dyn_done_i(ork_dyn_chain *h, int i){
     if (h->i4batch) {   /* #54 BCHAIN tile output: mode-1 last-program civac gate (cheap, per-poll), then on pass bsync + mode-3 full verify (once). Matches bch_db_worker's completion check; ork_dyn_end owns the recover. */
         ork_npu *c = h->c;
-        if (!orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1)) return 0;
-        orki_bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
-        return orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
+        int ok = orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1);
+        if (ok) {
+            orki_bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            ok = orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
+        }
+        /* This branch polls an int16 surface too, so it is subject to the same seed collision as the
+         * esz==2 path below — and it is the branch the W4A4 BCHAIN prefill actually takes. */
+        if (!ok && h->collide_ok) return orki_dyn_collision_landed(h, i);
+        return ok;
     }
     int M = h->oM[i] ? h->oM[i] : 1; int no = h->nout[i] ? h->nout[i] : h->N; int Nx = M ? no/M : no;
     if (h->esz == 2) {   /* int4: int16 output; its write-order over N is NOT last-col-last, so poll the FULL row.
@@ -87,7 +132,8 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
             __asm__ volatile("dsb ish":::"memory");
             int e0 = cs <= p0 ? 0 : (int)((cs - p0) / sizeof(int16_t));
             int e1 = (int)((ce - p0) / sizeof(int16_t));
-            for (int e = e0; e < e1; e++) if (o[e] == ORK_DYN_SENT16) return 0;
+            for (int e = e0; e < e1; e++) if (o[e] == ORK_DYN_SENT16)
+                return h->collide_ok ? orki_dyn_collision_landed(h, i) : 0;
         }
         return 1; }
     int NMAXd = h->c->soc->nmax;
