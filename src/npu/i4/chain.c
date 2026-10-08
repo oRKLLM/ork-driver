@@ -342,21 +342,15 @@ static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,i
             if(only_tk>=0 && tk!=only_tk){ tk++; continue; }   /* poll fast-gate: only the given program (last program lands last — chain runs in order) */
             int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
             int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
+            const int16x8_t vsent=vdupq_n_s16(ORK_DYN_SENT16);   /* seed/verify/de-tile are NEON: bit-exact, pure movement + a compare-reduce */
             for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;   /* a 64-int16 block = 2 x 64B cache lines */
-                /* The seed, the verify scan and the de-tile each walk the whole touched surface
-                 * (Hg*NBc*64 int16 per program) and were scalar. NEON them: bit-exact by construction,
-                 * these are pure data movement and a compare-reduce. */
-                if(mode==0){ const int16x8_t vs=vdupq_n_s16(ORK_DYN_SENT16);
-                    for(int cc=0;cc<64;cc+=8) vst1q_s16(&og[base+cc], vs); }
+                if(mode==0){ for(int cc=0;cc<64;cc+=8) vst1q_s16(&og[base+cc], vsent); }
                 else if(mode==1){ __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory");
                     for(int cc=0;cc<64;cc++) if(((volatile int16_t*)og)[base+cc]==ORK_DYN_SENT16) return 0; }
-                else if(mode==3){ const int16x8_t vs=vdupq_n_s16(ORK_DYN_SENT16);
-                    for(int cc=0;cc<64;cc+=8) if(vmaxvq_u16(vceqq_s16(vld1q_s16(&og[base+cc]),vs))) return 0; }
+                else if(mode==3){ for(int cc=0;cc<64;cc+=8) if(vmaxvq_u16(vceqq_s16(vld1q_s16(&og[base+cc]),vsent))) return 0; }
                 else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
-                else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64;
-                    for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
-                        vst1q_s32(&crow[cc],   vmovl_s16(vget_low_s16(v)));
-                        vst1q_s32(&crow[cc+4], vmovl_s16(vget_high_s16(v))); } } }
+                else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
+                        vst1q_s32(&crow[cc],vmovl_s16(vget_low_s16(v))); vst1q_s32(&crow[cc+4],vmovl_s16(vget_high_s16(v))); } } }
             if(mode==4 && !ran) return 0;   /* this program is ENTIRELY sentinel => it truly never ran => real drop */
             tk++; } }
     return 1;
@@ -695,12 +689,9 @@ int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntas
      * domain's mcc exists; the next run re-allocs it in its own domain. (int8's per-op scratch is tiny so it never
      * hit this; the big COALESCED output is int4-MoE-specific.) mrc/maf/mtk are ~MB and reused by other paths.
      *
-     * MULTI-DOMAIN ONLY: with one domain there is one copy, and freeing it just forces a ~29 MB
-     * bdestroy+bscratch every call (the realloc above is gated on mccsz, which this zeroes).
-     * c->dom_save is the established single-vs-multi signal. ORK_I4_FREE_MCC=1 restores the
-     * unconditional free. Wiki: K-Grouping-Cost-On-RK3588. */
-    if (c->dom_save || getenv("ORK_I4_FREE_MCC"))
-        for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
+     * MULTI-DOMAIN ONLY: one domain = one copy, so freeing only forces a ~29 MB realloc every call
+     * (the realloc above is gated on mccsz, which this zeroes). ORK_I4_FREE_MCC=1 reverts. Wiki: K-Grouping-Cost-On-RK3588. */
+    if (c->dom_save || getenv("ORK_I4_FREE_MCC")) for(int i=0;i<nc;i++){ if(c->mcc[i].cpu){ orki_bdestroy(fd,&c->mcc[i]); c->mcc[i]=(struct buf){0}; c->mccsz[i]=0; c->mwarm[i]=0; } }
     return 0;
 }
 
