@@ -21,6 +21,7 @@
  *
  * No NPU, no libc beyond math/stdlib — a pure CPU quantizer callable from the orkpack-build path. */
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -55,6 +56,37 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     const int G  = (group > 0 && group < K) ? group : K;
     const int ng = (K + G - 1) / G;
 
+    /* BACK-TO-FRONT ORDER (ORK_GPTQ_BACKFRONT=1). The loop below walks columns 0..K-1 and pushes each
+     * residual into the columns it has not reached yet. Run it from the LAST dimension to the first and
+     * it becomes exactly Babai's nearest-plane algorithm for the closest-vector problem on the lattice
+     * the Hessian defines — not an analogy, an identity (arXiv 2507.18553, "GPTQ as Babai's Nearest
+     * Plane Algorithm"). The payoff is a worst-case error BOUND: back-to-front inherits Babai's, while
+     * the forward order has none. That is a different claim from act-order, which reorders by
+     * diag(H) magnitude, has no bound, and measured NEGATIVE here (+3.6% PPL).
+     *
+     * HOW, without touching the numerics. Rather than rewriting the factorisation for the opposite
+     * triangle, reverse the COORDINATE ORDER: the algorithm is already Babai front-to-back, so run it
+     * verbatim in the reversed basis and it is back-to-front in the original one. H and W are copied
+     * into Hd/Wd regardless, so the reversal is free — it costs an index flip in two loops that were
+     * already running, and the Cholesky path, the clip search and the compensation are untouched.
+     *
+     * GROUPED SCALES. Reversal maps group g onto original group ng-1-g, which covers the SAME SET of
+     * columns only when the groups tile K exactly. With a short final group the reversed grouping
+     * straddles the original boundaries, so the two orders would not be comparable and the scales would
+     * not mean the same thing. Refuse that case and stay forward.
+     *
+     * Read fresh per call, NOT latched in a static. One getenv against three O(K^3) factorisations is
+     * free, and latching means the first weight in a process decides the mode for every weight after
+     * it — which silently defeats any in-process A/B (it defeated this change's own unit test, which
+     * reported an exact 1.000 ratio because the flag was sampled before the test set it). */
+    const int bf_env = getenv("ORK_GPTQ_BACKFRONT") != NULL;
+    const int rev = bf_env && (ng == 1 || (K % G) == 0);
+    if (bf_env && !rev) { static int warned = 0;
+        if (!warned) { warned = 1; fprintf(stderr, "[ork] GPTQ back-to-front declined: K=%d does not tile "
+            "by group %d, so the reversed grouping would not cover the same columns. Forward order.\n", K, G); } }
+    #define GQ_C(j) (rev ? (K  - 1 - (j)) : (j))      /* column index in the CALLER's basis */
+    #define GQ_G(g) (rev ? (ng - 1 - (g)) : (g))      /* group index in the CALLER's basis */
+
     double *Hd  = (double*)malloc((size_t)K*K*sizeof(double));
     double *Wd  = (double*)malloc((size_t)N*K*sizeof(double));
     double *Hin = (double*)malloc((size_t)K*K*sizeof(double));
@@ -64,8 +96,16 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     dmean /= (double)K;
     double lam = (double)damp * dmean; if (lam <= 0.0) lam = 1e-6;
 
-    for (size_t i = 0; i < (size_t)K*K; i++) Hd[i]  = (double)H[i];
-    for (size_t i = 0; i < (size_t)N*K; i++) Wd[i]  = (double)W[i];
+    /* The only two places the reversal costs anything: both loops already existed as copies. */
+    if (!rev) {
+        for (size_t i = 0; i < (size_t)K*K; i++) Hd[i] = (double)H[i];
+        for (size_t i = 0; i < (size_t)N*K; i++) Wd[i] = (double)W[i];
+    } else {
+        for (int i = 0; i < K; i++) for (int j = 0; j < K; j++)
+            Hd[(size_t)i*K + j] = (double)H[(size_t)(K-1-i)*K + (K-1-j)];
+        for (int n = 0; n < N; n++) for (int i = 0; i < K; i++)
+            Wd[(size_t)n*K + i] = (double)W[(size_t)n*K + (K-1-i)];
+    }
     for (int i = 0; i < K; i++) {                                 /* dead input channel -> unit diag, W col 0 */
         if (Hd[(size_t)i*K + i] <= 0.0) {
             for (int j = 0; j < K; j++) { Hd[(size_t)i*K + j] = 0; Hd[(size_t)j*K + i] = 0; }
@@ -140,16 +180,16 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                     }
                     sc = best;
                 }
-                scales[(size_t)n*ng + g] = (float)sc;
+                scales[(size_t)n*ng + GQ_G(g)] = (float)sc;
             }
         }
         double d = Hin[(size_t)j*K + j]; if (d == 0.0) d = 1e-12;
         #pragma omp parallel for schedule(static) if (N > 64)
         for (int n = 0; n < N; n++) {                             /* rows are independent at a fixed column */
-            const double sc = (double)scales[(size_t)n*ng + g];
+            const double sc = (double)scales[(size_t)n*ng + GQ_G(g)];
             const double w  = Wd[(size_t)n*K + j];
             long q = lround(w / sc); if (q > 7) q = 7; if (q < -8) q = -8;
-            codes[(size_t)n*K + j] = (int8_t)q;
+            codes[(size_t)n*K + GQ_C(j)] = (int8_t)q;
             const double err = (w - (double)q * sc) / d;         /* Cholesky-scaled residual */
             double *row = Wd + (size_t)n*K;
             const double *hr = Hin + (size_t)j*K;
@@ -157,5 +197,7 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
         }
     }
     free(Hd); free(Wd); free(Hin);
+    #undef GQ_C
+    #undef GQ_G
     return 0;
 }

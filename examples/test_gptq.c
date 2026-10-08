@@ -112,5 +112,44 @@ int main(void) {
     printf("test_gptq: %s\n", ok3 ? "  OK (clip never loses — alpha=1.0 is in the grid)"
                                    : "  FAIL (clip increased squared error; the grid must contain alpha=1.0)");
 
-    return (ok && ok2 && ok3) ? 0 : 1;
+    /* --- (d) BACK-TO-FRONT (ORK_GPTQ_BACKFRONT) ------------------------------------------------------
+     * Running the sweep from the last dimension to the first makes it Babai's nearest-plane algorithm
+     * (arXiv 2507.18553). It is implemented by reversing the COORDINATE ORDER and running the same code,
+     * so the one thing that can go wrong is the un-mapping: a column or group index that does not travel
+     * back to the caller's basis. That is not a statistical failure, so test it exactly — H=I must STILL
+     * reproduce RTN byte for byte, because the reversal has to be a pure relabelling. A mis-mapped index
+     * scrambles the codes against the weights and this fails immediately.
+     *
+     * K % group == 0 here (128 % 32), which is the condition the reversal requires: otherwise the
+     * reversed grouping would not cover the same column sets and the quantizer declines and stays
+     * forward. Then re-run on the STRUCTURED H and report the H-weighted error against the forward
+     * order, which is the number the ladder cares about. */
+    setenv("ORK_GPTQ_BACKFRONT", "1", 1);
+    setenv("ORK_GPTQ_NOCLIP", "1", 1);
+    memset(H, 0, (size_t)K*K*4);
+    for (int i = 0; i < K; i++) H[(size_t)i*K+i] = 1.0f;
+    int rc4 = ork_i4_gptq(K, N, W, H, group, cg, sg, 0.0f);
+    if (rc4) { printf("test_gptq: backfront H=I rc=%d FAIL\n", rc4); return 1; }
+    rtn_i4(K, N, group, ng, W, cr, sr);
+    long dc4 = 0; for (size_t i = 0; i < (size_t)N*K;  i++) if (cg[i] != cr[i]) dc4++;
+    long ds4 = 0; for (size_t i = 0; i < (size_t)N*ng; i++) if (sg[i] != sr[i]) ds4++;
+    int ok4 = (dc4 == 0 && ds4 == 0);
+    printf("test_gptq: back-to-front H=I identity | code mismatches=%ld/%d  scale mismatches=%ld/%d\n",
+           dc4, N*K, ds4, N*ng);
+    printf("test_gptq: %s\n", ok4 ? "  OK (reversal is a pure relabelling — indices un-map correctly)"
+                                   : "  FAIL (a column or group index does not travel back to the caller's basis)");
+
+    unsetenv("ORK_GPTQ_NOCLIP");
+    memcpy(H, Href, (size_t)K*K*4);
+    int rc5 = ork_i4_gptq(K, N, W, H, group, cg, sg, 0.01f);
+    if (rc5) { printf("test_gptq: backfront rc=%d FAIL\n", rc5); return 1; }
+    double eb = herr(K, N, ng, group, W, cg, sg, Href);
+    int ok5 = (eb < er);                       /* must still beat RTN; whether it beats FORWARD is the open question */
+    printf("test_gptq: back-to-front vs forward | back=%.5g  forward=%.5g  RTN=%.5g  (back/forward=%.3f)\n",
+           eb, eg, er, eg > 0 ? eb/eg : 0.0);
+    printf("test_gptq: %s\n", ok5 ? "  OK (back-to-front still beats RTN)"
+                                   : "  FAIL (back-to-front lost to RTN — the mechanism is broken, not merely worse)");
+    unsetenv("ORK_GPTQ_BACKFRONT");
+
+    return (ok && ok2 && ok3 && ok4 && ok5) ? 0 : 1;
 }
