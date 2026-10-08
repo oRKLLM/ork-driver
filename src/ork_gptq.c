@@ -178,17 +178,9 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                  * thousands, so the MSE-optimal clip sits much tighter. A search cannot find an optimum it
                  * cannot reach.
                  *
-                 * MEASURED (per-row, heavy-tailed weights, structured H; tools-side probe, 2026-10-08).
-                 * H-weighted error and the mean chosen scale as a fraction of absmax, K=1024 N=64:
-                 *     no clip             993.8-equivalent    1.000
-                 *     grid floor 0.781    3796.8             0.815   <- today's default
-                 *     grid floor 0.656    2981.3             0.723
-                 *     grid floor 0.531    2526.6             0.642   <- 1.50x better than the default
-                 *     grid floor 0.406    2381.6             0.568
-                 * The chosen scale is still sliding with the floor at 0.406, i.e. the search is pinned
-                 * AGAINST the boundary for essentially every row — the signature of a mis-set bound, not of
-                 * a located optimum. The effect grows with K (1.30x at K=512, 1.50x at K=1024), and
-                 * production K is 1024-3072.
+                 * Measured per-row at K=1024: the chosen scale is still sliding with the floor at 0.406,
+                 * i.e. the search is pinned AGAINST its boundary for essentially every row — a mis-set
+                 * bound, not a located optimum. Numbers: wiki K-Grouping-Cost-On-RK3588.
                  *
                  * ORK_GPTQ_CLIP_N / ORK_GPTQ_CLIP_STEP make the grid sweepable (defaults 8 / 0.03125 keep
                  * today's behaviour exactly). NOT widened by default: widening can only lower this group's
