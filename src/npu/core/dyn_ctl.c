@@ -284,6 +284,14 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
              * (the M>1 prefill regression: M=256 was 2.8x slower under a pure spin). Decode stays tight (el<1ms =>
              * no sleep, no latency cost); a multi-ms prefill adds only ~poll granularity (<=50us on ~8ms). */
             if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } }
+        /* The spin is over. Before calling this a dropped round, let the int4 poll tell a VALUE
+         * COLLISION apart from a real miss — the int16 seed 0x7fff is a reachable saturating W4A4
+         * accumulator, so one legitimate output can mask completion forever and send us into a
+         * resubmit of a round that already ran. See orki_dyn_collision_landed. */
+        if (!h->collide_ok && h->esz == 2) {
+            h->collide_ok = 1;
+            for (int i = 0; i < h->S; i++) if (!edone[i]) edone[i] = ork_dyn_done_i(h, i);
+        }
         if (orki_ork_prof) orki_db_poll_us += ork_now_us() - t0;   /* the WAIT half of ork_dyn_end */
         last = ork_dyn_progress(h);
         if (last >= h->S - 1 || orki_ork_term) break;            /* all done, or interrupted */
@@ -332,7 +340,14 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
                         (si>=0&&si<h->S)?h->oK[si]:-1, (si>=0&&si<h->S)?(h->oM[si]?h->oM[si]:1):-1,
                         (si>=0&&si<h->S&&h->oM[si]&&h->oSk[si])?(h->nout[si]/(h->oM[si]*h->oSk[si])):h->N,
                         h->mc_dom, (si>=0&&si<h->S)?h->oSk[si]:-1, ork_now_us()-t0, miss_to, orki_submit_n, orki_submit_prog, first, last2, runs,
-                        runs == 1 ? "ONE-RUN(stalled write)" : (runs > 1 && rl1 && gap1 > rl1) ? "STRIDED(tile-geometry?)" : "SCATTERED");
+                        /* A stalled write leaves a run that REACHES THE END of the surface — that is what
+                         * "the write got partway" means. A single run that stops short, especially a short
+                         * one near the front, is a value collision wearing a stalled write's shape; calling
+                         * it ONE-RUN(stalled write) sent this exact failure (1 element of 81920, at index 1)
+                         * into six pointless resubmits of a round that had already landed. */
+                        (runs == 1 && last2 == tot - 1) ? "ONE-RUN(stalled write)" :
+                        runs == 1 ? "ONE-RUN short of the end (VALUE COLLISION, not a stall)" :
+                        (runs > 1 && rl1 && gap1 > rl1) ? "STRIDED(tile-geometry?)" : "SCATTERED");
             }
             /* #54: a doorbell DROP happened -> a stuck job may linger in this domain even after recover (the
              * reap fires only on the next SAME-DOMAIN submit, not across a switch). Mark so dom_activate reaps it

@@ -192,6 +192,10 @@ enum ork_chain_kind { OCK_NONE=0, OCK_SW, OCK_HW, OCK_FUSED };
 /* the dynamic steered-submission chain handle — i4.c builds these directly */
 struct ork_dyn_chain {
     ork_npu *c; int S, P, N, reserve, mc, spin_end; unsigned dom;   /* reserve = submitted task_number (fixed budget; can't grow); mc = multi-core; spin_end = reserve if the tail is a persistent spin (forward-chained), else 0 */
+    int collide_ok;             /* set by ork_dyn_end once the completion spin has timed out: allow the int4
+                                 * (int16) poll to adjudicate a VALUE COLLISION rather than report a miss.
+                                 * The int16 sentinel 0x7fff IS a reachable saturating W4A4 accumulator, so a
+                                 * legitimate output can mask completion forever. See ork_dyn_done_i. */
     struct buf *outbuf[1024];   /* per-op output DMA buffer (writeback + doorbell) */
     int32_t   *outptr[1024];    /* per-op output cpu ptr; doorbell = outptr[i][nout[i]-1] (last written word) */
     int        nout[1024];      /* per-op output element count = M*N (M>1 support; doorbell polls the last element) */
@@ -273,6 +277,8 @@ int      orki_validate_regcmd(const char *op, ork_npu *c, const uint32_t *rc, in
  * committed job, no interrupt, core at 100%, board power-cycled). Call it with the bytes the
  * program will actually touch, BEFORE the host gather and before the submit. */
 int      orki_check_extent(const char *op, const struct buf *b, size_t need, const char *what);
+/* int4 doorbell value-collision adjudication — see its definition in npu/core/dyn.c. */
+int      orki_dyn_collision_landed(struct ork_dyn_chain *h, int i);
 void     orki_i4_tile_Aslice(uint8_t *dst, const int8_t *Arow, int k0, int Kp);
 extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_wdom, orki_last_import;
 extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;
