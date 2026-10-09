@@ -59,7 +59,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
          * (safe). The build terminated the regcmd chain at each slice boundary (kb[]); the oSk f32 accumulate below
          * then sums the Sk partials. Tiling recomputed identically to the build (deterministic). */
         ork_w *w = a->w; int M = a->h->oM[i], Sk = a->h->oSk[i], K = w->K;
-        int KS = c->soc->ks, kstart = 0;
+        int KS = orki_f16_ks(c), kstart = 0;
         const char *sge = getenv("ORK_F16_STAGGER"); int stag_us = sge ? atoi(sge) : 0;   /* variant A: per-core-index fetch stagger (µs) */
         /* fp16 SELF-HEAL — OPT-IN (ORK_F16_RECOV), default OFF. NAIVE retry-same-slice is HARMFUL and DISPROVEN:
          * resubmitting the identical 3-core concurrent fp16 slice re-triggers the SAME concurrent-fetch CDMA wild,
@@ -297,7 +297,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             * int8 WIDE-K branch with orki_f16_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
             * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_f16_synth()+Bb+dtype differ). */
             int CBUFf = (CBUF > 32768) ? 32768 : CBUF;   /* fp16 M-scheduler is validated only to the 32768-tile; a larger cbuf miscomputes mc>~cap (mcworker applies the same cap) */
-            int KS = c->soc->ks;
+            int KS = orki_f16_ks(c);
             struct rknpu_task *tkf = (struct rknpu_task*)c->mtk[i].cpu;
             size_t ksz = (size_t)w->Sk * M * Ncore * 4;   /* Sk f32 partials [ks][M][Ncore] */
             if (c->mccsz[i] < ksz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, ksz, 0x403, c->dom_active);

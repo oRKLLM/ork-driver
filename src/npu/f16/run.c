@@ -29,6 +29,34 @@
 #include "npu/core.h"
 #include "npu/f16/f16.h"
 
+/* fp16 row-major [K,N] -> the NPU weight tile [NT][KT][16][32], the shape orki_pack's fp16 arm and
+ * ork_f16_mm_repack both emit. Written once here because both had the same four-deep loop with the
+ * READ strided by N: at N=248320 that is one cache line fetched per element, 254M of them for the
+ * tied head's weight, on EVERY call (the scratch-pool callers re-tile per use). Walking kk outermost
+ * instead makes each read a contiguous run of 16 fp16 (one line serves the whole run) and leaves the
+ * strided access on the 1 KB destination tile, which is L1-resident. Same bytes, same order of
+ * assignment — the layout is a permutation, so this is exact. Parallel over the N-tile index. */
+struct f16_tile_arg { f16 *bb; const f16 *B; int KT, k0, n0, N; };
+static void f16_tile_range(int lo,int hi,void *a){
+    struct f16_tile_arg *t=a; int KT=t->KT,N=t->N,k0=t->k0,n0=t->n0;
+    for(int nt=lo;nt<hi;nt++) for(int kt=0;kt<KT;kt++){
+        f16 *d = t->bb + (size_t)nt*KT*16*32 + (size_t)kt*16*32;
+        for(int kk=0;kk<32;kk++){
+            const f16 *s = t->B + (size_t)(k0+kt*32+kk)*N + n0 + nt*16;
+            for(int nl=0;nl<16;nl++) d[nl*32+kk] = s[nl];
+        }
+    }
+}
+void orki_f16_tile(f16 *bb,const f16 *B,int NN,int KT,int k0,int n0,int N){
+    struct f16_tile_arg ta={bb,B,KT,k0,n0,N};
+    /* SERIAL for a small tile. ork_parallel_for wakes and joins a worker pool, which is free against
+     * a 254M-element head weight and is NOT free against a 64-wide GDN chunk weight re-tiled 10^5
+     * times a step: dispatching it unconditionally cost +6 s/step on the training harness (NPU gdn
+     * 18.5 -> 24.4 s) with no other change. 64 Ki elements is about where the pool starts to pay. */
+    if((long)NN*KT*16*32 < (1L<<16)) { f16_tile_range(0,NN,&ta); return; }
+    ork_parallel_for(NN,f16_tile_range,&ta);
+}
+
 static void tile_i8_to_f16_range(int lo,int hi,void *a){
     struct tile_i8f16_arg *t=a; int KT=t->KT,N=t->N,k0=t->k0,n0=t->n0;
     for(int nt=lo;nt<hi;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++){
@@ -61,7 +89,7 @@ static void tile_i8_to_f16_range(int lo,int hi,void *a){
 
 ork_w *ork_f16_mm_scratch(ork_npu *c,int K,int N){
     if(K%32||N%16) return NULL;
-    int KS=c->soc->ks, NMAX=c->soc->nmax;
+    int KS=orki_f16_ks(c), NMAX=c->soc->nmax;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
     w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=DT_F16;w->owns=1;w->domain=ork_dom(c->pack_domain);
@@ -78,7 +106,7 @@ ork_w *ork_f16_mm_scratch(ork_npu *c,int K,int N){
 int ork_i8_mm_inflate_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *bscale,int K,int N){
     if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
     if(w->K!=K || w->N!=N || !i8) return -2;
-    int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    int KS=orki_f16_ks(c), NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
         struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
@@ -91,12 +119,11 @@ int ork_i8_mm_inflate_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *b
 int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
     if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
     if(w->K!=K || w->N!=N) return -2;
-    int KS=c->soc->ks, NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    int KS=orki_f16_ks(c), NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
       for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1; f16*bb=b->cpu;
-        for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
-            bb[(size_t)nt*KT*16*32+(size_t)kt*16*32+nl*32+kk]=B[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
+        orki_f16_tile(b->cpu,B,NN,KT,k0,n0,N);
         orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
     /* DERIVED-COPY COHERENCE (defect fix). The fp16 MULTI-CORE colsplit does NOT read Bb: it builds a
      * CONTIGUOUS concatenation of the Sk K-slice tiles ONCE and caches it on the weight (w->Bbc for
@@ -176,12 +203,45 @@ static void set_f16_silu(uint32_t*rc,uint32_t out_bias,uint32_t idx_off,uint32_t
     /* 0x4010/0x40c0/0x4050/0x4084/0x4088 deliberately UNTOUCHED: REGCMD's fp16 output CVT is kept. */
 }
 
+/* Build (once) the FULL-K single-tile weight the fused single-submit paths need, from the Sk K-slice
+ * tiles. The tile is N-TILE-MAJOR — bb[nt][kt][16][32] — so a slice holds, for every nt, only its own
+ * kt range; the full cube wants all of a given nt's kt values contiguous. So the re-lay is one memcpy
+ * per (nt, slice), not a concatenation (which is what w->Bbc is, and why Bbc cannot be used here).
+ * Sn==1 only. Cached on the weight; reclaimed by ork_mm_free. 0/ok, <0 on alloc failure. */
+int orki_f16_bfull(ork_npu *c,ork_w *w){
+    if(w->Bfull_valid) return 0;
+    if(!c || !w || w->Sn!=1 || !w->Bb) return -1;
+    int K=w->K, N=w->N, KS=orki_f16_ks(c), KTfull=K/32, NN=N/16;
+    w->Bfull=orki_bcreate(c->fd,(size_t)K*N*2,0x403,w->domain);
+    if(!w->Bfull.cpu) return -1;
+    f16 *d=w->Bfull.cpu;
+    for(int nt=0;nt<NN;nt++){
+        int ktoff=0;
+        for(int ks=0;ks<w->Sk;ks++){
+            int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KTs=Kp/32;
+            if(!w->Bb[ks].cpu){ orki_bdestroy(c->fd,&w->Bfull); return -1; }
+            memcpy(d+((size_t)nt*KTfull+ktoff)*16*32,
+                   (const f16*)w->Bb[ks].cpu+(size_t)nt*KTs*16*32, (size_t)KTs*16*32*2);
+            ktoff+=KTs;
+        }
+    }
+    orki_bsync(c->fd,&w->Bfull,RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync(c->fd,&w->Bfull,RKNPU_MEM_SYNC_TO_DEVICE);
+    w->Bfull_valid=1;
+    return 0;
+}
+
 int ork_f16_mm_run_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
                         uint32_t out_bias,uint32_t idx_off,uint32_t cfg4068,const int16_t *lut,int nlut){
     if(!ork_ppu_fuse_enabled(c)) return -3;
-    /* fp16 weights live in w->Bb tiles (Bf is int8-only). Fused silu needs the WHOLE-K weight in one buffer,
-     * so require a single tile: Sk==1 (K within one fp16 K-slice, <=2048) and Sn==1 (N<=nmax). */
-    if(w->dtype!=DT_F16 || !w->Bb || w->Sk!=1 || w->Sn!=1) return -2;
+    /* fp16 weights live in w->Bb tiles (Bf is int8-only). The fused path applies its activation to the
+     * FINAL accumulated value, so it cannot be K-split at any cost — it needs the whole K as one
+     * [NT][K/32][16][32] cube. Sn==1 is still required (one N-tile per submit); Sk>1 is served by
+     * orki_f16_bfull, which re-lays the slices into that cube once and caches it on the weight. */
+    if(w->dtype!=DT_F16 || !w->Bb || w->Sn!=1) return -2;
+    uint32_t wdma;
+    if(w->Sk==1) wdma=(uint32_t)w->Bb[0].dma;
+    else { if(orki_f16_bfull(c,w)) return -2; wdma=(uint32_t)w->Bfull.dma; }
     int fd=c->fd,K=w->K,N=w->N,NMAX=c->soc->nmax,CBUF=c->soc->cbuf_elems;
     if(K%32 || N%16 || N>NMAX) return -2;
     if(CBUF>32768) CBUF=32768;                              /* fp16 keeps its validated 32768 tiling */
@@ -215,7 +275,7 @@ int ork_f16_mm_run_silu(ork_npu *c,ork_w *w,int M,const ork_f16 *A,float *C,
         ork_f16*ad=c->Af.cpu; for(int r=0;r<mc;r++)for(int j=0;j<K;j++) ad[(size_t)r*K+j]=A[(size_t)(m0+r)*K+j];
         orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
         uint32_t rc[REGCMD_N];
-        orki_f16_synth(rc,mc,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)c->Cc.dma,1,CBUF);
+        orki_f16_synth(rc,mc,K,N,(uint32_t)c->Af.dma,wdma,(uint32_t)c->Cc.dma,1,CBUF);
         set_f16_silu(rc,out_bias,idx_off,cfg4068);
         memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
         { struct rknpu_task *t=c->task.cpu; memset(t,0,sizeof *t);
@@ -324,7 +384,8 @@ int ork_f16_mm_build_rsqrt_lut(ork_npu *c, int n_feat, double eps, double ss_min
 
 int ork_f16_mm_run_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16 *out){
     if(!c||!w||!A||!out) return -2;
-    if(w->dtype!=DT_F16||w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks, N<=nmax) */
+    if(w->dtype!=DT_F16||w->Sn!=1||!w->Bb) return -2;                       /* one N-tile per program */
+    if(w->Sk!=1 && orki_f16_bfull(c,w)) return -2;                          /* one program = whole K: re-lay the K-slices */
     int K=w->K, N=w->N, fd=c->fd, CBUF=c->soc->cbuf_elems;
     if(K%32||N%32||N>c->soc->nmax||M<1||M>64||(N&7)) return -2;
     if(w->domain!=c->dom_active || (w->domain!=0 && !c->dom_save)) orki_dom_activate(c,w->domain);   /* activate the weight's IOMMU domain */
@@ -335,7 +396,7 @@ int ork_f16_mm_run_f16out(ork_npu *c, ork_w *w, int M, const ork_f16 *A, ork_f16
     ork_npu_enter(c,DT_F16,XP_STREAM_F16,OCK_NONE);                          /* prime fp16 pipeline (keep-warm-aware) */
     uint32_t rc[REGCMD_N];
     int sched=((K&(K-1))==0 && K>=128 && K<2048);                            /* run_stream_f16 rule; small K => 0 */
-    orki_f16_synth(rc,M,K,N,(uint32_t)c->Af.dma,(uint32_t)w->Bb[0].dma,(uint32_t)O.dma,sched,CBUF);
+    orki_f16_synth(rc,M,K,N,(uint32_t)c->Af.dma,orki_f16_wdma(w),(uint32_t)O.dma,sched,CBUF);
     orki_f16_set_out_fp16in(rc,M,N);                                              /* PROVEN vendor fp16-out stage (default CONTIGUOUS) */
     memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
     { struct rknpu_task*t=c->task.cpu; memset(t,0,sizeof *t); t->enable_mask=0xd; t->int_mask=0x300; t->int_clear=0x1ffff;

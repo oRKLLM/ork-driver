@@ -15,7 +15,12 @@ struct ork_soc {
     int cores;             /* NPU core count (3588:3, 3576:2, 3562/3568:1) */
     int cbuf_elems;        /* fp16 feature CBUF budget: rows-per-M-tile = cbuf_elems/K (int8: 2x) */
     int nmax;              /* max matmul output width (N) per submit; wider N is tiled */
-    int ks;                /* K-slice size: the scheduler-fast contraction range */
+    int ks;                /* K-slice size, the scheduler-fast contraction range. NO LONGER read by
+                            * any slicing site: int8 slices on orki_int8_ks() and fp16 on
+                            * orki_f16_ks(), both 1024, because a slice must land inside its
+                            * precision's 0x1040 schedule window or the M-tile collapses (fp16 at
+                            * ks=2048 fell to 8 rows/program). Still part of the pack-header
+                            * identity, and still the honest description of the chip. */
     int validated;         /* 1 = these params confirmed on real hardware; 0 = inherited/untested */
 };
 

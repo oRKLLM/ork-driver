@@ -37,7 +37,7 @@ void orki_f16_plan_caps(const ork_npu *ctx, ork_slice_f16_caps *out)
 {
     *out = ork_slice_f16_caps_rk3588();
     if (ctx && ctx->soc) {
-        if (ctx->soc->ks   > 0) out->kmax = ctx->soc->ks;      /* SoC K-slice, not a literal */
+        if (orki_f16_ks(ctx) > 0) out->kmax = orki_f16_ks(ctx);   /* the fp16 K-slice, not the SoC one (orki_f16_ks) */
         if (ctx->soc->nmax > 0) out->nmax = ctx->soc->nmax;
     }
     out->mmax = plan_mmax;
