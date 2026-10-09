@@ -248,16 +248,26 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
      * property of the model/shape, so the first weight to hit it has already made the point, and a
      * per-weight warning over 140 weights would be noise. ORK_GPTQ_CLIP_STATS=1 prints every weight. */
     if (clip_tot > 0) {
+        /* Report the floor the search ACTUALLY reached and name the knob that set it. With a pinned
+         * depth the binding bound is clip_n, not clip_min, and the first version of this message
+         * printed clip_min either way — so on a fixed grid it reported 0.100 when the search had
+         * stopped at 0.781 and advised lowering the wrong variable. A diagnostic that misnames its
+         * own cause is worse than none. */
+        const double eff = (clip_n > 0 && 1.0 - clip_step*(clip_n-1) > clip_min)
+                         ? 1.0 - clip_step*(clip_n-1) : clip_min;
+        const char *knob = (clip_n > 0 && 1.0 - clip_step*(clip_n-1) > clip_min)
+                         ? "raise ORK_GPTQ_CLIP_N (or unset it for the self-tuning search)"
+                         : "lower ORK_GPTQ_CLIP_MIN";
         const double frac = (double)clip_pin / (double)clip_tot;
         static int warned = 0;
         if (getenv("ORK_GPTQ_CLIP_STATS"))
             fprintf(stderr, "[ork] gptq clip: K=%d N=%d  %.1f%% of rows bottomed out (floor %.3f)\n",
-                    K, N, 100.0*frac, clip_min);
+                    K, N, 100.0*frac, eff);
         else if (frac > 0.10 && !warned) { warned = 1;
             fprintf(stderr, "[ork] gptq clip: %.0f%% of rows at K=%d chose the LOWEST scale the search "
-                            "reached (floor %.3f) — the clip grid is still truncated for this model, so "
-                            "the quantiser is leaving accuracy on the table. Lower ORK_GPTQ_CLIP_MIN.\n",
-                    100.0*frac, K, clip_min); }
+                            "reached (floor %.3f) — the clip grid is truncated for this model, so the "
+                            "quantiser is leaving accuracy on the table. To fix: %s.\n",
+                    100.0*frac, K, eff, knob); }
     }
     #undef GQ_C
     #undef GQ_G
