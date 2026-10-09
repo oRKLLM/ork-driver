@@ -119,7 +119,11 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
     /* Clip-grid shape. SELF-TUNING by default (clip_n = 0): walk alpha down until clip_slack
      * consecutive points fail to improve, floored at clip_min. ORK_GPTQ_CLIP_N pins a fixed depth
-     * instead, which reproduces older packs and is the A/B arm. Wiki: K-Grouping-Cost-On-RK3588. */
+     * instead, which reproduces older packs and is the A/B arm.
+     * End-to-end it TIES the hand-tuned depth (45.95 vs 45.75, inside the ~2% screen) and reports no
+     * truncation on this model — it ships as insurance, not as a win: a fixed depth is model-specific
+     * (the overshoot grows with K) so it degrades silently elsewhere, while the search says so.
+     * Wiki: K-Grouping-Cost-On-RK3588. */
     int clip_n = 0, clip_slack = 4, clip_minpts = 8; double clip_step = 0.03125, clip_min = 0.10;
     { const char *e = getenv("ORK_GPTQ_CLIP_N");     if (e) { int v = atoi(e); if (v > 1 && v <= 64) clip_n = v; } }
     { const char *e = getenv("ORK_GPTQ_CLIP_STEP");  if (e) { double v = atof(e); if (v > 0.0 && v < 0.2) clip_step = v; } }
