@@ -550,6 +550,23 @@ Q4_K gguf costs only +0.6% PPL, so the zero-config derived pack needs no f16 sou
 | `ORK_QUANT=4` | int4 W4A4 instead of int8 (experimental, incoherent) |
 | `ORK_DECODE_MC=1` | let M=1 (decode) matmuls split N-tiles across all 3 cores (default: single-core at M=1). +1.62× decode on the big FFN projections (7B-Q8_0, 0.92→1.49 t/s); off by default because small-N decode matmuls lose the multi-core barrier to the single-core dispatch floor. Residual gap to rkllm is the synchronous-execution wall, not core count |
 
+### W4A4 quality knobs (ggml-ork, set at PACK-BUILD time unless noted)
+
+`ORK_MIXED_W4A4=1` is the master gate — without it `ORK_QUANT=4` gives int4 weights inflated to int8
+with **no rotation and no GPTQ**, and still exits 0. Measured ladder: wiki *Experiment Log* 2026-10-08.
+
+| var | effect |
+|---|---|
+| `ORK_I4_SMOOTH=1` | SmoothQuant: `c_j = act_j^α / wmax_j^(1-α)` folded into the weights, divided out of the activations. The first technique that STACKS with GPTQ rather than substituting (57.49 → 52.65 at 4.0 bpw). `ORK_I4_SMOOTH_ALPHA` (default 0.5 — swept, optimal); `ORK_I4_SMOOTH_IGNORE=1` drops the pack's vector at run time |
+| `ORK_I4_RHT=1` | randomized Hadamard (sign flip before the FWHT). **Worth ÷1.32 WITHOUT GPTQ and nothing with it** — RHT and GPTQ are substitutes, confirmed on three bases. **NOT recorded in the pack**, so a build/run mismatch is silently catastrophic: set it on both or neither |
+| `ORK_I4_NOKRON=1` | revert the full-K Kronecker rotation at non-pow2 K to block-diagonal. Default is full-K; the Kronecker form measures 1.7% on seen text and **0.33% held-out**, i.e. a null where it counts, but it is structurally the right transform |
+| `ORK_GPTQ=1` | GPTQ. `ORK_GPTQ_DAMP` (default 0.01 = the AutoGPTQ default; **0.3 measured better here**, worth 0.9%), `ORK_GPTQ_CLIP_N` pins a fixed clip-grid depth (default is self-tuning), `ORK_GPTQ_CLIP_MIN`/`_SLACK`/`_STEP` shape the search, `ORK_GPTQ_CLIP_STATS=1` prints the pinned-floor census per weight, `ORK_GPTQ_BACKFRONT=1` Babai order (measured null), `ORK_GPTQ_NOCLIP=1` plain absmax |
+| `ORK_I4_INT8_LAYERS=<csv>` | substring-matched weights held at int8. The Q4_K_M structural prior (`attn_v` + `ffn_down`) **beats qerr ranking by 3.8% at a matched bit budget** — qerr is a poor ordering, not merely a flat one |
+| `ORK_A_DIAG=1` | one line per W4A4 matmul: activation scale range, non-finite counts, code range. Run-time |
+
+**Calibrate and evaluate on DISJOINT text.** Every ladder arm here calibrated GPTQ on the evaluation
+text, which flattered the result: the gap to Q4_K_M is 1.23× on seen text and **1.27× held-out**.
+
 ### CPU/MoE probes (sub-second, no model load — the iteration tools)
 - `make test_i4_gemm && sudo ./test_i4_gemm` — batched int4/NF4 GEMM vs the M=1 gemv: bit-exactness + the
   M>1 speedup (I4 2.3×, NF4 1.85×). In `make test`.
