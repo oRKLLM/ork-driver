@@ -135,8 +135,9 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   (different DDR type and clock, different kernel, different bootloader). Bring-up record, including
   the two defects that had to be fixed to reach the benchmark standard, is on the wiki:
   *Board-Provisioning-Rock-5B-Plus*. Note from it that **`.236` has Rockchip's A76 PVTM speed-bin
-  gate overridden in its DTB** — that is where its 2.4 GHz comes from, and it was undocumented
-  until 2026-10-09.
+  gate lifted in its DTB** — that is where its 2.4 GHz comes from (wiki: *Kernel-Modifications*
+  § "A76 clusters unlocked to 2400 MHz", which argues why that is not an overclock: 2304/2352/2400
+  all specify the same 1.00 V and the A76 is specified at 2.4 GHz).
 - **THE BOARD DOES NOT RUN A STOCK KERNEL.** It runs `6.1.115-vendor-rk35xx-sram`, carrying two of our
   changes: the NPU SRAM enabler (dts + `CONFIG_ROCKCHIP_RKNPU_SRAM=y`) and a `rknpu_job.c` IOMMU
   domain-refcount `put` on job timeout. Both were undocumented for weeks and were therefore a hidden
