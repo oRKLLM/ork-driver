@@ -31,10 +31,22 @@
  * linked; the forms here are transcribed from them, and the fixture comparison is what checks the
  * transcription. Positive controls (--break) remove one term each and MUST fail the gradient check.
  *
- * Build:  CPU only   cc -O2 -Itools -o tte tools/train_tiny_e2e.c -lm   [-fopenmp]
- *         NPU        cc -O2 -DWITH_NPU -Iinclude -Isrc -Itools -o tte tools/train_tiny_e2e.c libork_npu.a -lm -pthread
+ * Build:  CPU only   cc -O2 -fopenmp -Itools -o tte tools/train_tiny_e2e.c -lm
+ *         NPU        cc -O2 -fopenmp -DWITH_NPU -Iinclude -Isrc -Itools -o tte tools/train_tiny_e2e.c libork_npu.a -lm -pthread
+ *         -fopenmp is not optional any more: the host kernels below are NEON + OpenMP and the GDN
+ *         head loop is an OpenMP loop. Without it everything still RUNS (scalar fallbacks, serial)
+ *         but the step is ~2.5x slower. Run with `taskset -c 4-7 OMP_NUM_THREADS=4` on RK3588.
  * Run:    tte FIXTURE [--lin cpu|emu|npu] [--att ...] [--gdn ...] [--scale 0|1] [--steps N]
  *             [--break none|rms|gdn_dk|silu] [--curve FILE] [--nocheck]
+ *         `--gdn cpu` is the measured-optimal setting on RK3588 — see the NOTE the run prints.
+ * Knobs:  ORK_CE_REF=1   cross-entropy with libm exp in double (the pre-NEON form)
+ *         ORK_RMS_REF=1  RMSNorm backward with the sequential scalar dot (the pre-NEON form)
+ *         Both exist so a gradient-table shift can be ATTRIBUTED, not argued about. Measured on the
+ *         all-NPU arm, worst of the 14 spot-check tensors vs MLX: 4.43e-3 default, 3.67e-3 with
+ *         ORK_CE_REF, 3.74e-3 with ORK_RMS_REF, 3.34e-3 with both — against 3.35e-3 before any of
+ *         this work, so the two reassociations account for the whole shift and nothing else does.
+ *         The step-1 loss is IDENTICAL across all four (|d| 4.90e-6), i.e. the forward is untouched.
+ *         With `--gdn cpu` the worst tensor is 2.45e-3 (fp32 chunk operands) and the knobs are moot.
  */
 #include "tiny_e2e_gdn.h"
 #include <sys/mman.h>
@@ -126,25 +138,116 @@ static int BRK_RMS=0, BRK_SILU=0;
  * CE = logits softmax/loss/dlogits; OPT = AdamW. Matmul seconds come from tiny_e2e_mm.h. */
 static double T_GDN, T_SOFTMAX, T_CE, T_OPT;     /* positive controls; gm_BRK covers the GDN Gram term */
 
+/* NUMERICS A/B. The NEON rewrites change two things a gradient can see: the cross-entropy's exp
+ * (vexpq_f32, ~1e-6 relative, against libm exp in double) and RMSNorm-backward's dot (a four-lane
+ * accumulator, i.e. a reassociation). Both are selectable back to the original scalar form so a
+ * gradient-table shift can be ATTRIBUTED instead of argued about. Read once; off by default. */
+static int g_ce_ref=-1, g_rms_ref=-1;
+static int ce_ref(void){ if(g_ce_ref<0) g_ce_ref=getenv("ORK_CE_REF")?1:0; return g_ce_ref; }
+static int rms_ref(void){ if(g_rms_ref<0) g_rms_ref=getenv("ORK_RMS_REF")?1:0; return g_rms_ref; }
+
 static float *A(size_t n){ float*p=calloc(n?n:1,4); if(!p){fprintf(stderr,"oom\n");exit(3);} return p; }
 static float sigm(float x){ return 1.0f/(1.0f+expf(-x)); }
 static float siluf(float x){ return x*sigm(x); }
 static float dsiluf(float x){ float s=sigm(x); return s*(1.0f+x*(1.0f-s)); }
 static float softplusf(float x){ return x>0 ? x+log1pf(expf(-x)) : log1pf(expf(x)); }
 
+/* ------------------------------------------------------------------ NEON scalar-function kernels
+ * vexpq_f32 is the Cephes minimax exp from src/neon_activations.c (range-reduce x = n*ln2 + r,
+ * degree-5 poly, scale by 2^n), copied here because it is a file-static inline there and this is a
+ * tools/ program. Max relative error ~1e-6 over [-88,88] — three orders below the fp16-operand level
+ * the gradient check runs at, and the loss, which is checked against MLX at 5e-5, is computed from a
+ * sum accumulated in DOUBLE so only the per-term 1e-6 enters. */
+#ifdef MM_NEON
+static inline float32x4_t vexpq_f32(float32x4_t x){
+    x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-88.3762626647949f)), vdupq_n_f32(88.3762626647949f));
+    float32x4_t fx = vrndnq_f32(vmulq_f32(x, vdupq_n_f32(1.44269504088896341f)));
+    x = vfmsq_f32(x, fx, vdupq_n_f32(0.693359375f));
+    x = vfmsq_f32(x, fx, vdupq_n_f32(-2.12194440e-4f));
+    float32x4_t z = vmulq_f32(x, x), y = vdupq_n_f32(1.9875691500e-4f);
+    y = vfmaq_f32(vdupq_n_f32(1.3981999507e-3f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(8.3334519073e-3f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(4.1665795894e-2f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(1.6666665459e-1f), y, x);
+    y = vfmaq_f32(vdupq_n_f32(5.0000001201e-1f), y, x);
+    y = vfmaq_f32(x, y, z); y = vaddq_f32(y, vdupq_n_f32(1.0f));
+    int32x4_t p2 = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127)), 23);
+    return vmulq_f32(y, vreinterpretq_f32_s32(p2));
+}
+static inline float32x4_t vsigmoidq_f32(float32x4_t x){
+    return vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), vexpq_f32(vnegq_f32(x))));
+}
+static inline float32x4_t vsiluq_f32(float32x4_t x){ return vmulq_f32(x, vsigmoidq_f32(x)); }
+/* d/dx silu = s*(1 + x*(1-s)) */
+static inline float32x4_t vdsiluq_f32(float32x4_t x){
+    float32x4_t s = vsigmoidq_f32(x), one = vdupq_n_f32(1.0f);
+    return vmulq_f32(s, vfmaq_f32(one, x, vsubq_f32(one, s)));
+}
+#endif
+
 /* ------------------------------------------------------------------ elementwise ops */
-/* y = scale * w * x / r per row of length n; rinv[row] = 1/r. w may be NULL. */
+/* y = scale * w * x / r per row of length n; rinv[row] = 1/r. w may be NULL.
+ * Row-parallel; the sum of squares uses four NEON accumulators, which reassociates it (the error is
+ * SMALLER than the sequential sum's, and independent of the thread count because rows never split). */
 static void rms_fwd(int rows,int n,const float*x,const float*w,float scale,float*y,float*rinv){
+#ifdef MM_NEON
+    int nb=n&~15;
+    #pragma omp parallel for schedule(static) if(MM_OUTER && rows>1)
+    for(int i=0;i<rows;i++){
+        const float*a=x+(size_t)i*n; float*o=y+(size_t)i*n;
+        float32x4_t s0=vdupq_n_f32(0),s1=s0,s2=s0,s3=s0;
+        for(int j=0;j<nb;j+=16){
+            float32x4_t v0=vld1q_f32(a+j),v1=vld1q_f32(a+j+4),v2=vld1q_f32(a+j+8),v3=vld1q_f32(a+j+12);
+            s0=vfmaq_f32(s0,v0,v0); s1=vfmaq_f32(s1,v1,v1); s2=vfmaq_f32(s2,v2,v2); s3=vfmaq_f32(s3,v3,v3);
+        }
+        float ss=vaddvq_f32(vaddq_f32(vaddq_f32(s0,s1),vaddq_f32(s2,s3)));
+        for(int j=nb;j<n;j++) ss+=a[j]*a[j];
+        float ri=1.0f/sqrtf(ss/n+EPS); rinv[i]=ri;
+        float32x4_t vg=vdupq_n_f32(scale*ri);
+        if(w) for(int j=0;j<nb;j+=4) vst1q_f32(o+j, vmulq_f32(vmulq_f32(vld1q_f32(a+j),vld1q_f32(w+j)),vg));
+        else  for(int j=0;j<nb;j+=4) vst1q_f32(o+j, vmulq_f32(vld1q_f32(a+j),vg));
+        for(int j=nb;j<n;j++) o[j]=scale*a[j]*ri*(w?w[j]:1.0f);
+    }
+#else
     for(int i=0;i<rows;i++){
         const float*a=x+(size_t)i*n; float*o=y+(size_t)i*n; float ss=0;
         for(int j=0;j<n;j++) ss+=a[j]*a[j];
         float ri=1.0f/sqrtf(ss/n+EPS); rinv[i]=ri;
         for(int j=0;j<n;j++) o[j]=scale*a[j]*ri*(w?w[j]:1.0f);
     }
+#endif
 }
-/* bwd_ops_fp64_check.c's RMSNorm: dx = s*(w.dy*ri - x*ri^3*sum(dy.w.x)/n); dw += s*dy.x.ri */
+/* bwd_ops_fp64_check.c's RMSNorm: dx = s*(w.dy*ri - x*ri^3*sum(dy.w.x)/n); dw += s*dy.x.ri
+ * dw is a CROSS-ROW reduction, so the row loop is parallelised only when dw is absent (the GDN q/k
+ * norms, which are also the tallest at rows = M*heads). Splitting the dw case across threads would
+ * make the gradient depend on the thread count, which this harness must not do. */
 static void rms_bwd(int rows,int n,const float*x,const float*w,const float*rinv,float scale,
                     const float*dy,float*dx,float*dw,int brk){
+#ifdef MM_NEON
+    int nb=n&~3;
+    if(rms_ref()) goto scalar;
+    #pragma omp parallel for schedule(static) if(MM_OUTER && rows>1 && dw==NULL)
+    for(int i=0;i<rows;i++){
+        const float*a=x+(size_t)i*n,*d=dy+(size_t)i*n; float*o=dx+(size_t)i*n; float ri=rinv[i];
+        float32x4_t t0=vdupq_n_f32(0);
+        for(int j=0;j<nb;j+=4){ float32x4_t dv=vld1q_f32(d+j);
+            if(w) dv=vmulq_f32(dv,vld1q_f32(w+j));
+            t0=vfmaq_f32(t0,dv,vld1q_f32(a+j)); }
+        float dot=vaddvq_f32(t0);
+        for(int j=nb;j<n;j++) dot+=d[j]*(w?w[j]:1.0f)*a[j];
+        float c = brk ? 0.f : ri*ri*ri*dot/n;
+        float32x4_t vri=vdupq_n_f32(scale*ri), vc=vdupq_n_f32(scale*c);
+        for(int j=0;j<nb;j+=4){ float32x4_t dv=vld1q_f32(d+j);
+            if(w) dv=vmulq_f32(dv,vld1q_f32(w+j));
+            vst1q_f32(o+j, vfmsq_f32(vmulq_f32(dv,vri), vld1q_f32(a+j), vc)); }
+        for(int j=nb;j<n;j++) o[j]=scale*((w?w[j]:1.0f)*d[j]*ri - a[j]*c);
+        if(dw){ float32x4_t vs=vdupq_n_f32(scale*ri);
+            for(int j=0;j<nb;j+=4) vst1q_f32(dw+j, vfmaq_f32(vld1q_f32(dw+j), vmulq_f32(vld1q_f32(d+j),vld1q_f32(a+j)), vs));
+            for(int j=nb;j<n;j++) dw[j]+=scale*d[j]*a[j]*ri; }
+    }
+    return;
+scalar:
+#endif
     for(int i=0;i<rows;i++){
         const float*a=x+(size_t)i*n,*d=dy+(size_t)i*n; float*o=dx+(size_t)i*n; float ri=rinv[i], dot=0;
         for(int j=0;j<n;j++) dot+=d[j]*(w?w[j]:1.0f)*a[j];
@@ -152,6 +255,23 @@ static void rms_bwd(int rows,int n,const float*x,const float*w,const float*rinv,
         for(int j=0;j<n;j++) o[j]=scale*((w?w[j]:1.0f)*d[j]*ri - a[j]*c);
         if(dw) for(int j=0;j<n;j++) dw[j]+=scale*d[j]*a[j]*ri;
     }
+}
+/* a += b, NEON + OpenMP. Elementwise over disjoint outputs: bit-identical however it is split. The
+ * lm_head's dW accumulate alone is 254M elements a step, so this is not a small loop. */
+static void addto(float*a,const float*b,size_t n){
+#ifdef MM_NEON
+    size_t nb=n&~15u;
+    #pragma omp parallel for schedule(static) if(MM_OUTER && n>(1u<<16))
+    for(size_t i=0;i<nb;i+=16){
+        vst1q_f32(a+i,   vaddq_f32(vld1q_f32(a+i),   vld1q_f32(b+i)));
+        vst1q_f32(a+i+4, vaddq_f32(vld1q_f32(a+i+4), vld1q_f32(b+i+4)));
+        vst1q_f32(a+i+8, vaddq_f32(vld1q_f32(a+i+8), vld1q_f32(b+i+8)));
+        vst1q_f32(a+i+12,vaddq_f32(vld1q_f32(a+i+12),vld1q_f32(b+i+12)));
+    }
+    for(size_t i=nb;i<n;i++) a[i]+=b[i];
+#else
+    for(size_t i=0;i<n;i++) a[i]+=b[i];
+#endif
 }
 /* y = x W^T, W [out,in] (MLX nn.Linear layout) */
 static void lin(int rows,int in,int out,const float*x,const param*W,float*y){ g_mm_class=MMC_LIN; mm_nt(rows,in,out,x,W->w,y); }
@@ -162,22 +282,44 @@ static void lin_bwd(int rows,int in,int out,const float*x,param*W,const float*dy
     if((size_t)out*in>g_lt_n){ free(g_lt); g_lt=A((size_t)out*in); g_lt_n=(size_t)out*in; }
     g_mm_class=MMC_LIN;
     mm_tn(out,rows,in,dy,x,g_lt);                                 /* dW = dY^T X    */
-    for(size_t i=0;i<(size_t)out*in;i++) W->g[i]+=g_lt[i];
+    addto(W->g,g_lt,(size_t)out*in);
 }
-static void addto(float*a,const float*b,size_t n){ for(size_t i=0;i<n;i++) a[i]+=b[i]; }
 
 /* ------------------------------------------------------------------ FFN */
 static void ffn_fwd(layer*L,cache*c,const float*in,float*out){
     lin(M,D,F,in,L->wg,c->fg); lin(M,D,F,in,L->wu,c->fu);
-    for(size_t i=0;i<(size_t)M*F;i++) c->fa[i]=siluf(c->fg[i])*c->fu[i];
+    { size_t n=(size_t)M*F;                                      /* SwiGLU, one fused NEON pass */
+#ifdef MM_NEON
+      size_t nb=n&~3u;
+      #pragma omp parallel for schedule(static) if(MM_OUTER)
+      for(size_t i=0;i<nb;i+=4) vst1q_f32(c->fa+i, vmulq_f32(vsiluq_f32(vld1q_f32(c->fg+i)), vld1q_f32(c->fu+i)));
+      for(size_t i=nb;i<n;i++) c->fa[i]=siluf(c->fg[i])*c->fu[i];
+#else
+      for(size_t i=0;i<n;i++) c->fa[i]=siluf(c->fg[i])*c->fu[i];
+#endif
+    }
     lin(M,F,D,c->fa,L->wd,out);
 }
 static void ffn_bwd(layer*L,cache*c,const float*in,const float*dout,float*din){
     float *da=A((size_t)M*F), *dg=A((size_t)M*F), *du=A((size_t)M*F), *t=A((size_t)M*D);
     lin_bwd(M,F,D,c->fa,L->wd,dout,da);
-    for(size_t i=0;i<(size_t)M*F;i++){
-        dg[i]=da[i]*c->fu[i]*(BRK_SILU?1.0f:dsiluf(c->fg[i]));
-        du[i]=da[i]*siluf(c->fg[i]);
+    { size_t n=(size_t)M*F;                                      /* SwiGLU backward, one NEON pass */
+#ifdef MM_NEON
+      size_t nb=BRK_SILU?0:(n&~3u);
+      #pragma omp parallel for schedule(static) if(MM_OUTER)
+      for(size_t i=0;i<nb;i+=4){
+          float32x4_t g=vld1q_f32(c->fg+i), a=vld1q_f32(da+i), s=vsigmoidq_f32(g), one=vdupq_n_f32(1.0f);
+          vst1q_f32(dg+i, vmulq_f32(vmulq_f32(a,vld1q_f32(c->fu+i)), vmulq_f32(s,vfmaq_f32(one,g,vsubq_f32(one,s)))));
+          vst1q_f32(du+i, vmulq_f32(a, vmulq_f32(g,s)));
+      }
+      for(size_t i=nb;i<n;i++){
+          dg[i]=da[i]*c->fu[i]*(BRK_SILU?1.0f:dsiluf(c->fg[i]));
+          du[i]=da[i]*siluf(c->fg[i]); }
+#else
+      for(size_t i=0;i<n;i++){
+          dg[i]=da[i]*c->fu[i]*(BRK_SILU?1.0f:dsiluf(c->fg[i]));
+          du[i]=da[i]*siluf(c->fg[i]); }
+#endif
     }
     lin_bwd(M,D,F,in,L->wg,dg,din);
     lin_bwd(M,D,F,in,L->wu,du,t); addto(din,t,(size_t)M*D);
@@ -185,7 +327,21 @@ static void ffn_bwd(layer*L,cache*c,const float*in,const float*dout,float*din){
 }
 
 /* ------------------------------------------------------------------ GDN mixer */
-static gm_scr *GW;
+/* Per-thread chunk scratch. The 16 GDN heads are independent, so the head loop is an OpenMP loop
+ * whenever the chunk matmuls run on the CPU. It must stay SERIAL when they run on the NPU: one
+ * ork_npu context is a single submit stream and is not re-entrant. GWT[0] is the serial scratch. */
+#define GM_MAXTH 16
+static gm_scr *GWT[GM_MAXTH];
+#define GW GWT[0]
+static gm_scr *gm_tls(int C,int DK,int DV){
+#ifdef _OPENMP
+    int t=omp_get_thread_num(); if(t>=GM_MAXTH) t=GM_MAXTH-1;
+#else
+    int t=0;
+#endif
+    if(!GWT[t]) GWT[t]=gm_new(C,DK,DV);
+    return GWT[t];
+}
 #ifdef GDN_ORACLE   /* debug: the fp64 recurrence from gdn_chunk_bwd.c (link tools/tiny_e2e_gdn_oracle.c) */
 void gdn_oracle_fwd(int,int,int,int,const float*,const float*,const float*,const float*,const float*,float*);
 void gdn_oracle_bwd(int,int,int,int,const float*,const float*,const float*,const float*,const float*,const float*,
@@ -204,12 +360,32 @@ static void gdn_fwd(layer*L,cache*c,const float*in,float*out){
     const int KD=GH*GDK, VD=GH*GDV, CD=2*KD+VD;
     lin(M,D,CD,in,L->wqkv,c->qkv); lin(M,D,VD,in,L->wz,c->z);
     lin(M,D,GH,in,L->wb,c->bb);    lin(M,D,GH,in,L->wa,c->aa);
-    for(int b=0;b<B;b++) for(int t=0;t<T;t++) for(int ch=0;ch<CD;ch++){       /* conv1d + silu */
-        float p=0;
-        for(int r=0;r<KC;r++){ int u=t+r-(KC-1); if(u<0) continue;
-            p+=L->conv->w[ch*KC+r]*c->qkv[(size_t)(b*T+u)*CD+ch]; }
-        size_t ix=(size_t)(b*T+t)*CD+ch; c->pre[ix]=p; c->co[ix]=siluf(p);
-    }
+    /* depthwise causal conv1d + silu. The channel axis is contiguous in qkv/pre/co but the tap axis
+     * is contiguous in conv->w, so the taps are transposed once into wt[r][ch] and the kernel then
+     * runs NEON along ch; the (b,t) loop is output-disjoint and parallel. */
+    { float *wt=A((size_t)KC*CD);
+      for(int ch=0;ch<CD;ch++) for(int r=0;r<KC;r++) wt[(size_t)r*CD+ch]=L->conv->w[ch*KC+r];
+      #pragma omp parallel for schedule(static) collapse(2)
+      for(int b=0;b<B;b++) for(int t=0;t<T;t++){
+        float *pr=c->pre+(size_t)(b*T+t)*CD, *co=c->co+(size_t)(b*T+t)*CD;
+#ifdef MM_NEON
+        int cb=CD&~3;
+        for(int ch=0;ch<cb;ch+=4){
+            float32x4_t p=vdupq_n_f32(0);
+            for(int r=0;r<KC;r++){ int u=t+r-(KC-1); if(u<0) continue;
+                p=vfmaq_f32(p, vld1q_f32(wt+(size_t)r*CD+ch), vld1q_f32(c->qkv+(size_t)(b*T+u)*CD+ch)); }
+            vst1q_f32(pr+ch,p); vst1q_f32(co+ch,vsiluq_f32(p));
+        }
+        for(int ch=cb;ch<CD;ch++)
+#else
+        for(int ch=0;ch<CD;ch++)
+#endif
+        { float p=0;
+          for(int r=0;r<KC;r++){ int u=t+r-(KC-1); if(u<0) continue;
+              p+=L->conv->w[ch*KC+r]*c->qkv[(size_t)(b*T+u)*CD+ch]; }
+          pr[ch]=p; co[ch]=siluf(p); }
+      }
+      free(wt); }
     for(int i=0;i<M;i++){
         memcpy(c->qr+(size_t)i*KD, c->co+(size_t)i*CD,       (size_t)KD*4);
         memcpy(c->kr+(size_t)i*KD, c->co+(size_t)i*CD+KD,    (size_t)KD*4);
@@ -223,46 +399,85 @@ static void gdn_fwd(layer*L,cache*c,const float*in,float*out){
         c->beta[ix]=sigm(c->bb[ix]);
         c->logg[ix]=-expf(L->alog->w[h])*softplusf(c->aa[ix]+L->dtb->w[h]);
     }
-    float *q=A((size_t)T*GDK),*k=A((size_t)T*GDK),*v=A((size_t)T*GDV),*lg=A(T),*be=A(T),*y=A((size_t)T*GDV);
     int nc=(T+CH-1)/CH; size_t esz=(size_t)nc*GDV*GDK;
-    for(int b=0;b<B;b++) for(int h=0;h<GH;h++){
-        gather_head(q,c->qh,b,h,GH,GDK); gather_head(k,c->kh,b,h,GH,GDK); gather_head(v,c->vv,b,h,GH,GDV);
-        gather_sc(lg,c->logg,b,h,GH); gather_sc(be,c->beta,b,h,GH);
+    int gpar = (g_mm_mode[MMC_GDN]==MM_CPU);   /* NPU = single submit stream: heads must stay serial */
+    double tg0=now_s();
+    #pragma omp parallel if(gpar)
+    {
+        float *q=A((size_t)T*GDK),*k=A((size_t)T*GDK),*v=A((size_t)T*GDV),*lg=A(T),*be=A(T),*y=A((size_t)T*GDV);
+        gm_scr *gw=gm_tls(CH,GDK,GDV);
+        #pragma omp for schedule(static) collapse(2)
+        for(int b=0;b<B;b++) for(int h=0;h<GH;h++){
+            gather_head(q,c->qh,b,h,GH,GDK); gather_head(k,c->kh,b,h,GH,GDK); gather_head(v,c->vv,b,h,GH,GDV);
+            gather_sc(lg,c->logg,b,h,GH); gather_sc(be,c->beta,b,h,GH);
 #ifdef GDN_ORACLE
-        gdn_oracle_fwd(T,GDK,GDV,CH,q,k,v,lg,be,y); (void)esz;
+            gdn_oracle_fwd(T,GDK,GDV,CH,q,k,v,lg,be,y); (void)esz;
 #else
-        { double t0=now_s(); gm_fwd(GW,T,CH,q,k,v,lg,be,y,c->ent+(size_t)(b*GH+h)*esz); T_GDN+=now_s()-t0; }
+            gm_fwd(gw,T,CH,q,k,v,lg,be,y,c->ent+(size_t)(b*GH+h)*esz);
 #endif
-        scatter_head(c->y,y,b,h,GH,GDV);
+            scatter_head(c->y,y,b,h,GH,GDV);
+        }
+        free(q);free(k);free(v);free(lg);free(be);free(y);
     }
-    free(q);free(k);free(v);free(lg);free(be);free(y);
+    T_GDN+=now_s()-tg0;   /* WALL time of the whole head loop (gathers included): with the loop
+                           * parallel, summing per-head times would be CPU time, not wall. */
     rms_fwd(M*GH,GDV,c->y,L->gnorm->w,1.0f,c->yn,c->ry);                     /* gated RMSNorm */
-    for(size_t i=0;i<(size_t)M*VD;i++) c->o[i]=siluf(c->z[i])*c->yn[i];
+    { size_t n=(size_t)M*VD;
+#ifdef MM_NEON
+      size_t nb=n&~3u;
+      #pragma omp parallel for schedule(static)
+      for(size_t i=0;i<nb;i+=4) vst1q_f32(c->o+i, vmulq_f32(vsiluq_f32(vld1q_f32(c->z+i)), vld1q_f32(c->yn+i)));
+      for(size_t i=nb;i<n;i++) c->o[i]=siluf(c->z[i])*c->yn[i];
+#else
+      for(size_t i=0;i<n;i++) c->o[i]=siluf(c->z[i])*c->yn[i];
+#endif
+    }
     lin(M,VD,D,c->o,L->wout,out);
 }
 static void gdn_bwd(layer*L,cache*c,const float*in,const float*dout,float*din){
     const int KD=GH*GDK, VD=GH*GDV, CD=2*KD+VD;
     float *dO=A((size_t)M*VD),*dz=A((size_t)M*VD),*dyn=A((size_t)M*VD),*dy=A((size_t)M*VD);
     lin_bwd(M,VD,D,c->o,L->wout,dout,dO);
-    for(size_t i=0;i<(size_t)M*VD;i++){ dz[i]=dO[i]*c->yn[i]*dsiluf(c->z[i]); dyn[i]=dO[i]*siluf(c->z[i]); }
+    { size_t n=(size_t)M*VD;
+#ifdef MM_NEON
+      size_t nb=n&~3u;
+      #pragma omp parallel for schedule(static)
+      for(size_t i=0;i<nb;i+=4){
+          float32x4_t z=vld1q_f32(c->z+i), o=vld1q_f32(dO+i), s=vsigmoidq_f32(z), one=vdupq_n_f32(1.0f);
+          vst1q_f32(dz+i,  vmulq_f32(vmulq_f32(o,vld1q_f32(c->yn+i)), vmulq_f32(s,vfmaq_f32(one,z,vsubq_f32(one,s)))));
+          vst1q_f32(dyn+i, vmulq_f32(o, vmulq_f32(z,s)));
+      }
+      for(size_t i=nb;i<n;i++){ dz[i]=dO[i]*c->yn[i]*dsiluf(c->z[i]); dyn[i]=dO[i]*siluf(c->z[i]); }
+#else
+      for(size_t i=0;i<n;i++){ dz[i]=dO[i]*c->yn[i]*dsiluf(c->z[i]); dyn[i]=dO[i]*siluf(c->z[i]); }
+#endif
+    }
     rms_bwd(M*GH,GDV,c->y,L->gnorm->w,c->ry,1.0f,dyn,dy,L->gnorm->g,0);
 
     float *dqh=A((size_t)M*KD),*dkh=A((size_t)M*KD),*dvv=A((size_t)M*VD),*dlg=A((size_t)M*GH),*dbe=A((size_t)M*GH);
-    float *q=A((size_t)T*GDK),*k=A((size_t)T*GDK),*v=A((size_t)T*GDV),*lg=A(T),*be=A(T),*gy=A((size_t)T*GDV);
-    float *gq=A((size_t)T*GDK),*gk=A((size_t)T*GDK),*gv=A((size_t)T*GDV),*glg=A(T),*gbe=A(T);
     int nc=(T+CH-1)/CH; size_t esz=(size_t)nc*GDV*GDK;
-    for(int b=0;b<B;b++) for(int h=0;h<GH;h++){
-        gather_head(q,c->qh,b,h,GH,GDK); gather_head(k,c->kh,b,h,GH,GDK); gather_head(v,c->vv,b,h,GH,GDV);
-        gather_sc(lg,c->logg,b,h,GH); gather_sc(be,c->beta,b,h,GH); gather_head(gy,dy,b,h,GH,GDV);
+    int gpar = (g_mm_mode[MMC_GDN]==MM_CPU);
+    double tg0=now_s();
+    #pragma omp parallel if(gpar)
+    {
+        float *q=A((size_t)T*GDK),*k=A((size_t)T*GDK),*v=A((size_t)T*GDV),*lg=A(T),*be=A(T),*gy=A((size_t)T*GDV);
+        float *gq=A((size_t)T*GDK),*gk=A((size_t)T*GDK),*gv=A((size_t)T*GDV),*glg=A(T),*gbe=A(T);
+        gm_scr *gw=gm_tls(CH,GDK,GDV);
+        #pragma omp for schedule(static) collapse(2)
+        for(int b=0;b<B;b++) for(int h=0;h<GH;h++){
+            gather_head(q,c->qh,b,h,GH,GDK); gather_head(k,c->kh,b,h,GH,GDK); gather_head(v,c->vv,b,h,GH,GDV);
+            gather_sc(lg,c->logg,b,h,GH); gather_sc(be,c->beta,b,h,GH); gather_head(gy,dy,b,h,GH,GDV);
 #ifdef GDN_ORACLE
-        gdn_oracle_bwd(T,GDK,GDV,CH,q,k,v,lg,be,gy,gq,gk,gv,glg,gbe); (void)esz;
+            gdn_oracle_bwd(T,GDK,GDV,CH,q,k,v,lg,be,gy,gq,gk,gv,glg,gbe); (void)esz;
 #else
-        { double t0=now_s(); gm_bwd(GW,T,CH,q,k,v,lg,be,c->ent+(size_t)(b*GH+h)*esz,gy,gq,gk,gv,glg,gbe); T_GDN+=now_s()-t0; }
+            gm_bwd(gw,T,CH,q,k,v,lg,be,c->ent+(size_t)(b*GH+h)*esz,gy,gq,gk,gv,glg,gbe);
 #endif
-        scatter_head(dqh,gq,b,h,GH,GDK); scatter_head(dkh,gk,b,h,GH,GDK); scatter_head(dvv,gv,b,h,GH,GDV);
-        scatter_sc(dlg,glg,b,h,GH); scatter_sc(dbe,gbe,b,h,GH);
+            scatter_head(dqh,gq,b,h,GH,GDK); scatter_head(dkh,gk,b,h,GH,GDK); scatter_head(dvv,gv,b,h,GH,GDV);
+            scatter_sc(dlg,glg,b,h,GH); scatter_sc(dbe,gbe,b,h,GH);
+        }
+        free(q);free(k);free(v);free(lg);free(be);free(gy);free(gq);free(gk);free(gv);free(glg);free(gbe);
     }
-    free(q);free(k);free(v);free(lg);free(be);free(gy);free(gq);free(gk);free(gv);free(glg);free(gbe);
+    T_GDN+=now_s()-tg0;
 
     float *dbb=A((size_t)M*GH),*daa=A((size_t)M*GH);                         /* decay */
     for(int i=0;i<M;i++) for(int h=0;h<GH;h++){
@@ -278,18 +493,54 @@ static void gdn_bwd(layer*L,cache*c,const float*in,const float*dout,float*din){
     rms_bwd(M*GH,GDK,c->qr,NULL,c->rq,is*is,dqh,dqr,NULL,0);
     rms_bwd(M*GH,GDK,c->kr,NULL,c->rk,is,dkh,dkr,NULL,0);
     float *dpre=A((size_t)M*CD),*dqkv=A((size_t)M*CD);
-    for(int i=0;i<M;i++) for(int ch=0;ch<CD;ch++){
-        size_t ix=(size_t)i*CD+ch;
-        float dco = ch<KD ? dqr[(size_t)i*KD+ch] : ch<2*KD ? dkr[(size_t)i*KD+ch-KD] : dvv[(size_t)i*VD+ch-2*KD];
-        dpre[ix]=dco*dsiluf(c->pre[ix]);
+    #pragma omp parallel for schedule(static)
+    for(int i=0;i<M;i++){
+        const float *pre=c->pre+(size_t)i*CD; float *dp=dpre+(size_t)i*CD;
+        /* the three source slices are each contiguous in ch, so dsilu runs NEON over each run */
+        for(int seg=0;seg<3;seg++){
+            int lo = seg==0?0 : seg==1?KD : 2*KD, hi = seg==0?KD : seg==1?2*KD : CD;
+            const float *src = seg==0 ? dqr+(size_t)i*KD : seg==1 ? dkr+(size_t)i*KD : dvv+(size_t)i*VD;
+            int w=hi-lo, ch=0;
+#ifdef MM_NEON
+            for(; ch+4<=w; ch+=4) vst1q_f32(dp+lo+ch, vmulq_f32(vld1q_f32(src+ch), vdsiluq_f32(vld1q_f32(pre+lo+ch))));
+#endif
+            for(; ch<w; ch++) dp[lo+ch]=src[ch]*dsiluf(pre[lo+ch]);
+        }
     }
-    for(int b=0;b<B;b++) for(int t=0;t<T;t++) for(int ch=0;ch<CD;ch++){       /* conv bwd */
-        float dp=dpre[(size_t)(b*T+t)*CD+ch];
-        for(int r=0;r<KC;r++){ int u=t+r-(KC-1); if(u<0) continue;
-            size_t iu=(size_t)(b*T+u)*CD+ch;
-            L->conv->g[ch*KC+r]+=dp*c->qkv[iu];
-            dqkv[iu]+=dp*L->conv->w[ch*KC+r]; }
-    }
+    /* conv backward. dqkv and conv->g both accumulate ACROSS t, so t stays the serial axis and the
+     * CHANNEL axis carries the parallelism (channels are disjoint in both outputs) and the NEON. */
+    { float *wt=A((size_t)KC*CD);
+      for(int ch=0;ch<CD;ch++) for(int r=0;r<KC;r++) wt[(size_t)r*CD+ch]=L->conv->w[ch*KC+r];
+      int nth=1;
+#ifdef _OPENMP
+      nth=omp_get_max_threads(); if(nth>16) nth=16;
+#endif
+      #pragma omp parallel for schedule(static)
+      for(int th=0;th<nth;th++){
+        int c0=(int)((long)th*CD/nth), c1=(int)((long)(th+1)*CD/nth);
+        for(int b=0;b<B;b++) for(int t=0;t<T;t++){
+            const float *dpr=dpre+(size_t)(b*T+t)*CD;
+            for(int r=0;r<KC;r++){ int u=t+r-(KC-1); if(u<0) continue;
+                const float *qk=c->qkv+(size_t)(b*T+u)*CD; float *dq=dqkv+(size_t)(b*T+u)*CD;
+                int ch=c0;
+#ifdef MM_NEON
+                for(; ch+4<=c1; ch+=4){
+                    float32x4_t dp=vld1q_f32(dpr+ch);
+                    vst1q_f32(dq+ch, vfmaq_f32(vld1q_f32(dq+ch), dp, vld1q_f32(wt+(size_t)r*CD+ch)));
+                    float32x4_t gg=vmulq_f32(dp, vld1q_f32(qk+ch));
+                    L->conv->g[(ch+0)*KC+r]+=vgetq_lane_f32(gg,0);
+                    L->conv->g[(ch+1)*KC+r]+=vgetq_lane_f32(gg,1);
+                    L->conv->g[(ch+2)*KC+r]+=vgetq_lane_f32(gg,2);
+                    L->conv->g[(ch+3)*KC+r]+=vgetq_lane_f32(gg,3);
+                }
+#endif
+                for(; ch<c1; ch++){ float dp=dpr[ch];
+                    L->conv->g[ch*KC+r]+=dp*qk[ch];
+                    dq[ch]+=dp*wt[(size_t)r*CD+ch]; }
+            }
+        }
+      }
+      free(wt); }
     float *t=A((size_t)M*D);
     lin_bwd(M,D,CD,in,L->wqkv,dqkv,din);
     lin_bwd(M,D,VD,in,L->wz,dz,t);  addto(din,t,(size_t)M*D);
@@ -458,9 +709,11 @@ static double forward(int want_grad_buf){
         memcpy(c->x,x,md*4);
         rms_fwd(M,D,c->x,L->ln1->w,1.0f,c->n1,c->r1);
         if(L->lin) gdn_fwd(L,c,c->n1,mix); else att_fwd(L,c,c->n1,mix);
+        #pragma omp parallel for schedule(static)
         for(size_t i=0;i<md;i++) c->h[i]=c->x[i]+mix[i];
         rms_fwd(M,D,c->h,L->ln2->w,1.0f,c->n2,c->r2);
         ffn_fwd(L,c,c->n2,ff);
+        #pragma omp parallel for schedule(static)
         for(size_t i=0;i<md;i++) XL[i]=c->h[i]+ff[i];
         x=XL;                                           /* copied into the next layer's cache->x */
     }
@@ -468,13 +721,47 @@ static double forward(int want_grad_buf){
     rms_fwd(M,D,XL,FNORM->w,1.0f,XF,RF);
     g_mm_class=MMC_LIN; mm_nt(M,D,V,XF,EMB->w,LOGITS);                          /* tied lm_head */
     double L=0, tce=now_s();
+    /* softmax + loss + dlogits in ONE NEON pass over the 248,320-wide row. The old form called
+     * libm exp() TWICE per logit in double (508M calls a step); exp(z-lse)/M is exp(z-mx)/(s*M), so
+     * the second pass is a multiply by a constant and the exponentials are computed once. The sum
+     * stays in DOUBLE (two float64x2 accumulators) — 248k positive terms would lose ~1e-3 relative
+     * in fp32 — while each term carries vexpq_f32's ~1e-6, which is below the 5e-5 the step-1 loss
+     * is checked against. */
     #pragma omp parallel for reduction(+:L) schedule(static)
     for(int i=0;i<M;i++){
-        float*z=LOGITS+(size_t)i*V, mx=-INFINITY; for(int v=0;v<V;v++) if(z[v]>mx) mx=z[v];
+        float*z=LOGITS+(size_t)i*V; float*d=DLOG+(size_t)i*V;
+#ifdef MM_NEON
+        if(ce_ref()){
+            float mx=-INFINITY; for(int v=0;v<V;v++) if(z[v]>mx) mx=z[v];
+            double s=0; for(int v=0;v<V;v++) s+=exp((double)(z[v]-mx));
+            double lse=mx+log(s); L+=lse-z[TGT[i]];
+            for(int v=0;v<V;v++) d[v]=(float)(exp((double)z[v]-lse)/M);
+            d[TGT[i]]-=1.0f/M; continue;
+        }
+        int vb=V&~15;
+        float32x4_t m0=vdupq_n_f32(-INFINITY),m1=m0,m2=m0,m3=m0;
+        for(int v=0;v<vb;v+=16){ m0=vmaxq_f32(m0,vld1q_f32(z+v)); m1=vmaxq_f32(m1,vld1q_f32(z+v+4));
+                                 m2=vmaxq_f32(m2,vld1q_f32(z+v+8)); m3=vmaxq_f32(m3,vld1q_f32(z+v+12)); }
+        float mx=vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0,m1),vmaxq_f32(m2,m3)));
+        for(int v=vb;v<V;v++) if(z[v]>mx) mx=z[v];
+        float64x2_t a0=vdupq_n_f64(0),a1=vdupq_n_f64(0);
+        float32x4_t vmx=vdupq_n_f32(mx);
+        for(int v=0;v<vb;v+=4){ float32x4_t e=vexpq_f32(vsubq_f32(vld1q_f32(z+v),vmx));
+            vst1q_f32(d+v,e);
+            a0=vaddq_f64(a0,vcvt_f64_f32(vget_low_f32(e)));
+            a1=vaddq_f64(a1,vcvt_f64_f32(vget_high_f32(e))); }
+        double s=vaddvq_f64(vaddq_f64(a0,a1));
+        for(int v=vb;v<V;v++){ float e=expf(z[v]-mx); d[v]=e; s+=e; }
+        double lse=mx+log(s); L+=lse-z[TGT[i]];
+        float inv=(float)(1.0/(s*(double)M)); float32x4_t vi=vdupq_n_f32(inv);
+        for(int v=0;v<vb;v+=4) vst1q_f32(d+v, vmulq_f32(vld1q_f32(d+v),vi));
+        for(int v=vb;v<V;v++) d[v]*=inv;
+#else
+        float mx=-INFINITY; for(int v=0;v<V;v++) if(z[v]>mx) mx=z[v];
         double s=0; for(int v=0;v<V;v++) s+=exp((double)(z[v]-mx));
         double lse=mx+log(s); L+=lse-z[TGT[i]];
-        float*d=DLOG+(size_t)i*V;
         for(int v=0;v<V;v++) d[v]=(float)(exp((double)z[v]-lse)/M);
+#endif
         d[TGT[i]]-=1.0f/M;                                                       /* (p - y)/B */
     }
     T_CE+=now_s()-tce;
@@ -511,6 +798,29 @@ static void adamw(int step){
     double t0=now_s();
     for(int p=0;p<NPR;p++){
         param*q=&PR[p];
+#ifdef MM_NEON
+        /* NEON AdamW: elementwise over 752M parameters, so purely memory-bound (4 streams in,
+         * 3 out). vsqrtq_f32 and vdivq_f32 are the exact instructions, not the rsqrt estimate —
+         * the estimate would change the update by ~1e-3 relative and this must stay the reference. */
+        size_t nb=q->n&~3u;
+        float32x4_t vdec=vdupq_n_f32(dec),vb1=vdupq_n_f32(b1),vb2=vdupq_n_f32(b2),
+                    vo1=vdupq_n_f32(omb1),vo2=vdupq_n_f32(omb2),
+                    vc1=vdupq_n_f32(c1),vc2=vdupq_n_f32(c2),veps=vdupq_n_f32(eps);
+        #pragma omp parallel for schedule(static)
+        for(size_t i=0;i<nb;i+=4){
+            float32x4_t g=vld1q_f32(q->g+i), w=vmulq_f32(vld1q_f32(q->w+i),vdec);
+            float32x4_t m=vfmaq_f32(vmulq_f32(vb1,vld1q_f32(q->m+i)),vo1,g);
+            float32x4_t v=vfmaq_f32(vmulq_f32(vb2,vld1q_f32(q->v+i)),vo2,vmulq_f32(g,g));
+            vst1q_f32(q->m+i,m); vst1q_f32(q->v+i,v);
+            vst1q_f32(q->w+i, vsubq_f32(w, vdivq_f32(vmulq_f32(vc1,m), vfmaq_f32(veps,vsqrtq_f32(v),vc2))));
+        }
+        for(size_t i=nb;i<q->n;i++){
+            float g=q->g[i], w=q->w[i]*dec;
+            float m=b1*q->m[i]+omb1*g, v=b2*q->v[i]+omb2*g*g;
+            q->m[i]=m; q->v[i]=v;
+            q->w[i]=w-c1*m/(sqrtf(v)*c2+eps);
+        }
+#else
         #pragma omp parallel for schedule(static)
         for(size_t i=0;i<q->n;i++){
             float g=q->g[i], w=q->w[i]*dec;
@@ -518,6 +828,7 @@ static void adamw(int step){
             q->m[i]=m; q->v[i]=v;
             q->w[i]=w-c1*m/(sqrtf(v)*c2+eps);
         }
+#endif
     }
     T_OPT+=now_s()-t0;
 }
@@ -611,6 +922,10 @@ int main(int argc,char**argv){
            GH,GDK,CH,KC,HA,HKV,HD,ROPED,THETA);
     printf("  matmuls: linear=%s attention=%s gdn-chunk=%s  operand scaling=%s  break=%s\n",
            MN[g_mm_mode[MMC_LIN]],MN[g_mm_mode[MMC_ATT]],MN[g_mm_mode[MMC_GDN]],g_mm_scale?"pow2":"none",brk);
+    if(g_mm_mode[MMC_GDN]==MM_NPU)
+        printf("  NOTE: gdn-chunk=npu issues 110592 submits/step of ~1 MFLOP shapes against a ~167 us\n"
+               "        submit floor. `--gdn cpu` measured 7.6x faster on that block (29.5 -> 3.9 s/step)\n"
+               "        AND more accurate (fp32 operands): on RK3588 it is the recommended setting.\n");
     printf("  AdamW lr=%g wd=%g betas=(%g,%g) eps=%g bias-correction   fixture host %s mlx %s  MLX gpu-vs-cpu grad floor %s\n",
            LR,WD,B1,B2,AEPS,hget("HOST"),hget("MLX"),hget("SELFCONSIST"));
     int use_npu=0; for(int c=0;c<MMC_N;c++) if(g_mm_mode[c]==MM_NPU) use_npu=1;
@@ -691,7 +1006,7 @@ int main(int argc,char**argv){
         }
     }
     printf("matmul split at step 1:");
-    for(int c=0;c<MMC_N;c++) printf("  %s %ld calls %.3fs (npu %.3fs, %ld cpu-fallback, %ld slow-path K)",MMC_NAME[c],
+    for(int c=0;c<MMC_N;c++) printf("  %s %ld calls %.3fs (npu %.3fs, %ld cpu-fallback, %ld non-pow2 K)",MMC_NAME[c],
         g_mm_calls[c],g_mm_sec[c],g_mm_npu_sec[c],g_mm_fallback[c],g_mm_slowpath[c]);
     printf("\n");
     if(steps==0){ printf("\n%s\n",fails?"FAIL":"done"); return fails!=0; }
@@ -717,13 +1032,30 @@ int main(int argc,char**argv){
         double npu=g_mm_npu_sec[0]+g_mm_npu_sec[1]+g_mm_npu_sec[2];
         {   /* split: npu | host prep (mm wall - npu) for lin/att/gdn | GDN recurrence CPU (gm wall - gdn mm) |
              * softmax | CE | optimizer | rest (norms, SwiGLU, conv, decay, gates, rope, gathers) */
+            /* With the GDN chunk matmuls on the CPU the head loop is an OpenMP loop, so g_mm_sec[2]
+             * is CPU time summed over threads and cannot be subtracted from a wall clock. In that
+             * mode the whole GDN block is reported as one WALL figure (T_GDN, timed around the
+             * parallel loop) and the mm share is folded into it. */
+            int gcpu = (g_mm_mode[MMC_GDN]==MM_CPU);
             double *q=tsplit+(size_t)s*10; tstep[s]=dt;
-            q[0]=npu; q[1]=g_mm_sec[0]-g_mm_npu_sec[0]; q[2]=g_mm_sec[1]-g_mm_npu_sec[1]; q[3]=g_mm_sec[2]-g_mm_npu_sec[2];
-            q[4]=T_GDN-g_mm_sec[2]; q[5]=T_SOFTMAX; q[6]=T_CE; q[7]=T_OPT;
+            q[0]=npu; q[1]=g_mm_sec[0]-g_mm_npu_sec[0]; q[2]=g_mm_sec[1]-g_mm_npu_sec[1];
+            q[3]=gcpu?0.0:g_mm_sec[2]-g_mm_npu_sec[2];
+            q[4]=T_GDN-(gcpu?0.0:g_mm_sec[2]); q[5]=T_SOFTMAX; q[6]=T_CE; q[7]=T_OPT;
             q[8]=dt-(g_mm_sec[0]+g_mm_sec[1]+T_GDN+T_SOFTMAX+T_CE+T_OPT);
             q[9]=g_mm_npu_sec[2];
-            if(!mcurve) printf("  step %d  loss %.6f  %.3f s  [npu %.2f (gdn %.2f) | host prep lin %.2f att %.2f gdn %.2f | gdn-rec cpu %.2f | softmax %.2f | CE %.2f | adamw %.2f | rest %.2f]  fallbacks lin %ld\n",
+            if(!mcurve){ printf("  step %d  loss %.6f  %.3f s  [npu %.2f (gdn %.2f) | host prep lin %.2f att %.2f gdn %.2f | gdn-rec cpu %.2f | softmax %.2f | CE %.2f | adamw %.2f | rest %.2f]  fallbacks lin %ld\n",
                 s+1,L,dt,q[0],q[9],q[1],q[2],q[3],q[4],q[5],q[6],q[7],q[8],g_mm_fallback[0]);
+              double sc=0,ca=0,tr=0,rp=0,rn=0;
+              for(int c=0;c<MMC_N;c++){ if(c==MMC_GDN&&gcpu) continue;   /* CPU-mode GDN has no prep and its seconds are thread-summed */
+                  sc+=g_mm_scan_sec[c]; ca+=g_mm_cast_sec[c]; tr+=g_mm_tr_sec[c]; rp+=g_mm_repack_sec[c]; rn+=g_mm_run_sec[c]; }
+              printf("          prep: absmax %.2f cast %.2f transpose %.2f rescale/other %.2f | npu: repack %.2f run %.2f\n",
+                sc,ca,tr,(q[1]+q[2]+q[3])-(sc+ca+tr),rp,rn);
+              printf("          per class:");
+              for(int c=0;c<MMC_N;c++) printf("  %s repack %.2f run %.2f (%ld calls, %.0f GFLOP, %.0f GF/s)",MMC_NAME[c],
+                  g_mm_repack_sec[c],g_mm_run_sec[c],g_mm_calls[c],g_mm_flop[c]/1e9,
+                  g_mm_run_sec[c]>0?g_mm_flop[c]/g_mm_run_sec[c]/1e9:0.0);
+              printf("  | cpu-fallback %.2f s in %ld calls\n",g_mm_fb_sec[0]+g_mm_fb_sec[1]+g_mm_fb_sec[2],
+                  g_mm_fallback[0]+g_mm_fallback[1]+g_mm_fallback[2]); }
         }
         if(!mcurve){ fflush(stdout); continue; }
         double d=fabs(L-mcurve[s]), r=d/mcurve[s];
@@ -741,7 +1073,9 @@ int main(int argc,char**argv){
         for(int s=n0;s<steps;s++) sd+=(tstep[s]-mu)*(tstep[s]-mu); sd=n>1?sqrt(sd/(n-1)):0;
         printf("\nsteps %d..%d (step 1 = warm-up excluded): %.3f s/step  sd %.3f  min %.3f max %.3f   %.1f tok/s\n",
                n0+1,steps,mu,sd,mn,mxx,M/mu);
-        const char*nm[10]={"NPU repack+run","host prep linear","host prep attention","host prep gdn","GDN recurrence (CPU part)","attention softmax","cross-entropy","AdamW","rest (norms/SwiGLU/conv/gates/rope)","  of which NPU gdn"};
+        const char*nm[10]={"NPU repack+run","host prep linear","host prep attention","host prep gdn",
+            g_mm_mode[MMC_GDN]==MM_CPU ? "GDN chunk block, CPU (wall)" : "GDN recurrence (CPU part)",
+            "attention softmax","cross-entropy","AdamW","rest (norms/SwiGLU/conv/gates/rope)","  of which NPU gdn"};
         for(int k=0;k<10;k++){ double a=0; for(int s=n0;s<steps;s++) a+=tsplit[(size_t)s*10+k]; a/=n;
             printf("  %-38s %8.3f s  %5.1f%%\n",nm[k],a,100*a/mu); }
 #ifdef WITH_NPU
