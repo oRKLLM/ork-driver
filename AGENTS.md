@@ -128,7 +128,15 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 # from a workstation: rsync -a . board:ork-driver/ && ssh board 'cd ork-driver && make test'
 ```
 
-- The validated board is RK3588 (SBC IP: `10.3.0.236`).
+- The validated board is RK3588 (SBC IP: `10.3.0.236`). **There is now a SECOND RK3588 board,
+  `10.3.0.235`** (ROCK 5B+, LPDDR5 @ 2400 MHz, A76 @ 2400 MHz, stock Armbian vendor kernel). It has
+  NO NPU kernel patches yet — no rknpu IOMMU refcount fix and no NPU SRAM — so it is **not** a
+  substitute for `.236` on anything NPU-related, and the two boards' numbers are **not comparable**
+  (different DDR type and clock, different kernel, different bootloader). Bring-up record, including
+  the two defects that had to be fixed to reach the benchmark standard, is on the wiki:
+  *Board-Provisioning-Rock-5B-Plus*. Note from it that **`.236` has Rockchip's A76 PVTM speed-bin
+  gate overridden in its DTB** — that is where its 2.4 GHz comes from, and it was undocumented
+  until 2026-10-09.
 - **THE BOARD DOES NOT RUN A STOCK KERNEL.** It runs `6.1.115-vendor-rk35xx-sram`, carrying two of our
   changes: the NPU SRAM enabler (dts + `CONFIG_ROCKCHIP_RKNPU_SRAM=y`) and a `rknpu_job.c` IOMMU
   domain-refcount `put` on job timeout. Both were undocumented for weeks and were therefore a hidden
