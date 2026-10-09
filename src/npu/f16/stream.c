@@ -63,7 +63,7 @@ int ork_bmm_fp16_fused(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16*
     int ret=0;
     for(int b=0;b<nb;b++){
         w[b]=ork_f16_mm_pack(c,K,N,B+(size_t)b*K*N);
-        if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done3; }
+        if(!w[b]||w[b]->Sn!=1){ ret=-3; goto done3; }
         tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N};
     }
     ret=ork_f16_mm_run_stream_chain(c,nb,tk);
@@ -84,7 +84,7 @@ static void *stream_worker_f16(void *vp){
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
         memcpy(c->maf[i].cpu, t->A, (size_t)M*K*2); orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
         memset(rc,0,REGCMD_I8_N*4);
-        orki_f16_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, (uint32_t)w->Bb[0].dma, (uint32_t)c->mcc[i].dma, sched, CBUF);
+        orki_f16_synth(rc, M, K, N, (uint32_t)c->maf[i].dma, orki_f16_wdma(w), (uint32_t)c->mcc[i].dma, sched, CBUF);
         memcpy(c->mrc[i].cpu, rc, REGCMD_I8_N*4); orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
         struct rknpu_task *mt=c->mtk[i].cpu; memset(mt,0,sizeof *mt);
         mt[0].enable_mask=0xd; mt[0].int_mask=0x300; mt[0].int_clear=0x1ffff; mt[0].regcfg_amount=108; mt[0].regcmd_addr=c->mrc[i].dma;
@@ -111,11 +111,15 @@ static void *stream_worker_f16(void *vp){
  * silently miscomputed (Tier 14 A). One helper now owns the check, so they cannot drift again.
  * `hard` clamps to an additional per-program limit (the doorbell rejects fp16 M>64); 0 = none.
  * Writes the min cap across tasks, the max M, and whether every task's M is the same. */
-static int f16_stream_check(int S,const ork_mm_task_f16 *tasks,int hard,int *cap,int *maxM,int *uniform){
+static int f16_stream_check(ork_npu *c,int S,const ork_mm_task_f16 *tasks,int hard,int *cap,int *maxM,int *uniform){
     int c0=1<<30,mx=0,m0=tasks[0].M,uni=1;
-    for(int i=0;i<S;i++){ const ork_w *w=tasks[i].w;
+    for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
         if(!w||w->dtype!=DT_F16||tasks[i].M<=0) return -2;
-        if(w->Sn!=1||w->Sk!=1||!w->Bb) return -2;              /* single-slice fp16 (K<=ks,N<=nmax) */
+        if(w->Sn!=1||!w->Bb) return -2;                        /* one N-tile per program */
+        /* One program per task carries the WHOLE K, so a K-sliced weight needs its slices re-laid
+         * into a single full-K cube. Done HERE, single-threaded, before the pool launches — the
+         * workers below only READ w->Bfull. K <= one fp16 K-slice keeps Sk==1 and is untouched. */
+        if(w->Sk!=1 && orki_f16_bfull(c,w)) return -2;
         if(w->K%32||w->N%16) return -2;
         int cp=orki_f16_mcap_n(w->K,orki_f16_sched(w->K),w->N);   /* N-aware: narrow N hangs above the starved-WEIGHT_BANK boundary (r103) */
         if(hard&&cp>hard) cp=hard;
@@ -146,7 +150,7 @@ static int f16_stream_mtile(ork_npu *c,int S,const ork_mm_task_f16 *tasks,int ca
 int ork_f16_mm_run_stream(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
-    { int cap,maxM,uni,vrc=f16_stream_check(S,tasks,64,&cap,&maxM,&uni);   /* 64 = the doorbell's fp16 per-program limit */
+    { int cap,maxM,uni,vrc=f16_stream_check(c,S,tasks,64,&cap,&maxM,&uni);   /* 64 = the doorbell's fp16 per-program limit */
       if(vrc) return vrc;
       if(maxM>cap) return f16_stream_mtile(c,S,tasks,cap,maxM,uni,ork_f16_mm_run_stream); }
     /* P3 SPINE MIGRATION: fp16 stream onto the NONBLOCK doorbell (ork_dyn_begin_mc), like run_stream_i8. The
@@ -179,7 +183,7 @@ static void *stream_worker_f16ch(void *vp){
         int sched=(K&(K-1))==0 && K>=128 && K<2048;
         memcpy((char*)c->maf[i].cpu + (size_t)p*M*K*2, t->A, (size_t)M*K*2);
         memset(rc,0,REGCMD_I8_N*4);
-        orki_f16_synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), (uint32_t)w->Bb[0].dma,
+        orki_f16_synth(rc, M, K, N, (uint32_t)(c->maf[i].dma + (size_t)p*M*K*2), orki_f16_wdma(w),
               (uint32_t)(c->mcc[i].dma + (size_t)p*M*N*4), sched, CBUF);
         if(p<cnt-1){ uint64_t next=c->mrc[i].dma + (size_t)(p+1)*REGCMD_I8_N*4;   /* PC-chain to next program */
             rc[216]=0x0010|((next&0xffff)<<16); rc[217]=(0x0101u<<16)|((uint32_t)(next>>16)&0xffff); rc[218]=0x0014|(0x0037u<<16); }
@@ -212,7 +216,7 @@ static void *stream_worker_f16ch(void *vp){
 int ork_f16_mm_run_stream_chain(ork_npu *c, int S, const ork_mm_task_f16 *tasks){
     if(!c||S<1||!tasks) return -2;
     if(tasks[0].w && (tasks[0].w->domain!=c->dom_active || (tasks[0].w->domain!=0 && !c->dom_save))) orki_dom_activate(c,tasks[0].w->domain);
-    { int cap,maxM,uni,vrc=f16_stream_check(S,tasks,0,&cap,&maxM,&uni);   /* no extra per-program limit: the chain synths M itself */
+    { int cap,maxM,uni,vrc=f16_stream_check(c,S,tasks,0,&cap,&maxM,&uni);   /* no extra per-program limit: the chain synths M itself */
       if(vrc) return vrc;
       if(maxM>cap) return f16_stream_mtile(c,S,tasks,cap,maxM,uni,ork_f16_mm_run_stream_chain); }
     int fd=c->fd;
@@ -247,7 +251,7 @@ int ork_bmm_fp16_stream(ork_npu*c,int nb,int M,int K,int N,const f16*A,const f16
     if(!w||!tk){ free(w);free(tk); return -3; }
     int ret=0;
     for(int b=0;b<nb;b++){ w[b]=ork_f16_mm_pack(c,K,N,B+(size_t)b*K*N);
-        if(!w[b]||w[b]->Sk!=1||w[b]->Sn!=1){ ret=-3; goto done; }
+        if(!w[b]||w[b]->Sn!=1){ ret=-3; goto done; }
         tk[b]=(ork_mm_task_f16){w[b],M,A+(size_t)b*M*K,C+(size_t)b*M*N}; }
     ret=ork_f16_mm_run_stream(c,nb,tk);
 done:

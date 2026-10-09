@@ -76,7 +76,7 @@ static void layer(ork_npu*ctx,tlayer*L,float*x,int useNPU){
  * compare are kept, and run only to regenerate a golden (ORK_REGEN=1) or diagnose (ORK_FULL_REF=1). */
 static uint64_t fnv64(const void*p,size_t n){ const uint8_t*b=(const uint8_t*)p; uint64_t h=1469598103934665603ULL;
     for(size_t i=0;i<n;i++){ h^=b[i]; h*=1099511628211ULL; } return h; }
-static uint64_t model_gold(int nl){ switch(nl){ case 1: return 0xf7130c221a756578ULL; case 12: return 0x046bcfec25cd6248ULL; default: return 0; } }
+static uint64_t model_gold(int nl){ switch(nl){ case 1: return 0x5e6f504f5f5b355aULL; case 12: return 0x11d215b838940880ULL; default: return 0; } }   /* regenerated 2026-10-09: the fp16 K-slice (orki_f16_ks=1024) moves the fp32 K-partial accumulation, so the NPU output bytes change by design; the CPU-vs-NPU tolerance check was unaffected (maxabs 0.001239 at ref 7.38 / 0.02413 at 25.2) */
 int main(int argc,char**argv){
     int NL=argc>1?atoi(argv[1]):6; if(NL>MAXL)NL=MAXL;
     ork_npu*ctx=ork_npu_init(); if(!ctx){printf("init failed (NPU?)\n");return 1;}

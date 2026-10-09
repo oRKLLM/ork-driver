@@ -637,7 +637,7 @@ int  ork_w_domain(const ork_w *w){ return w?w->domain:0; }
  * tile bytes are BIT-IDENTICAL to ork_f16_mm_pack of the row-major dequantized weight. Emulated W8A16. */
 ork_w *orki_pack(ork_npu *c,int K,int N,const void *B,int dt){
     int nmod=dt?32:16; if(K%32||N%nmod) return NULL;
-    int KS=dt ? orki_int8_ks(c) : c->soc->ks, NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
+    int KS=dt ? orki_int8_ks(c) : orki_f16_ks(c), NMAX=c->soc->nmax, nt_sz=dt?32:16, esz=dt?1:2;
     int Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); w->K=K;w->N=N;w->Sk=Sk;w->Sn=Sn;w->dtype=dt; w->owns=1; w->domain=ork_dom(c->pack_domain); w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     /* FIX 2 (gated, ORK_CONSOLIDATE_I8): consolidate all int8 Bb tiles into ONE per-weight DMA buffer,
@@ -689,9 +689,7 @@ ork_w *orki_pack(ork_npu *c,int K,int N,const void *B,int dt){
             free(w->Bb); free(w); return NULL;
         }
         if(f16imp) orki_dmabuf_sync(b->heap_fd,DMA_BUF_SYNC_START|DMA_BUF_SYNC_WRITE);   /* imports: bracket the CPU fill (rknpu MEM_SYNC doesn't cover foreign imports) */
-        if(dt==DT_F16){ f16*bb=b->cpu; const f16*Bf=B;
-            for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<16;nl++)for(int kk=0;kk<32;kk++)
-                bb[nt*KT*16*32+kt*16*32+nl*32+kk]=Bf[(size_t)(k0+kt*32+kk)*N+(n0+nt*16+nl)];
+        if(dt==DT_F16){ orki_f16_tile(b->cpu,(const f16*)B,NN,KT,k0,n0,N);   /* blocked + all-core, like the int8 arm below */
         } else { int8_t*bb=b->cpu; const int8_t*Bi=B;
             struct tile_i8_arg ta={bb,Bi,KT,k0,n0,N}; ork_parallel_for(NN,orki_i8_tile_range,&ta);   // all-core tiling
         }
@@ -747,7 +745,7 @@ ork_w *ork_f16_mm_pack   (ork_npu *c,int K,int N,const f16    *B){
  * IOVA cap and gmax becomes a pure coherence<->speed dial. The fp16 MAC then runs int8-precision weights
  * against fp16 activations = emulated W8A16 (RK3588 has no native W8A16 datapath). */
 
-/* Allocate a REUSABLE fp16 scratch weight: fp16 tile layout ([Nt][Kt][16][32], KS=soc->ks) sized for
+/* Allocate a REUSABLE fp16 scratch weight: fp16 tile layout ([Nt][Kt][16][32], KS=orki_f16_ks) sized for
  * (K,N), buffers init-synced but carrying no data. Fill per-forward with ork_i8_mm_inflate_to_f16 and run
  * via ork_f16_mm_run / ork_f16_mm_run_silu. Reclaim with ork_mm_free like any packed weight. K%32, N%16.
  * Returns NULL on bad dims / alloc failure. */
@@ -826,7 +824,7 @@ size_t ork_w_dump(const ork_w *w, void *out, size_t cap){
 /* Re-tile fp16 B[K,N] (row-major) into an EXISTING fp16 ork_w (from ork_f16_mm_scratch/ork_f16_mm_pack, same
  * K,N) — no bcreate/bdestroy. The fp16 twin of ork_i8_mm_repack: lets a caller keep a persistent weight
  * POOL and refresh its data per chunk (kills the per-matmul IOMMU alloc/free churn). fp16 tile layout
- * [Nt][Kt][16][32] (KS=soc->ks). Bb only (the scan is single-slice small-K; no full-K Bf). 0/ok,<0. */
+ * [Nt][Kt][16][32] (KS=orki_f16_ks). Bb only (the scan is single-slice small-K; no full-K Bf). 0/ok,<0. */
 /* ---- Diagnostic only (tools/dmabuf_fill_probe.c): a load_i8 variant whose resident Bb tiles are
  * allocated with a CALLER-CHOSEN rknpu mem flag (0x401 WC vs 0x403 cacheable), so the probe can A/B
  * the weight-fill bandwidth AND the NPU read correctness for each flag. Allocates + leaves the blob
@@ -1177,6 +1175,7 @@ void ork_mm_free(ork_npu *c, ork_w *w){
     if(c && w->Bf) for(int i=0;i<w->Sn;i++)
         if(w->Bf[i].cpu && w->Bf[i].heap_fd>=0) orki_bdestroy(c->fd,&w->Bf[i]);
     if(c && w->Bfold) for(int i=0;i<w->fold_ns;i++) if(w->Bfold[i].cpu) orki_bdestroy(c->fd,&w->Bfold[i]);   /* #39 mfold resident weight */
+    if(c && w->Bfull_valid && w->Bfull.cpu) orki_bdestroy(c->fd,&w->Bfull);   /* fp16 fused-path full-K cube */
     /* dedicated single-buffer weights (grouped-i4, or consolidated int8): Bb[] entries are VIEWS (share
      * own_buf's handle/obj) — destroy the one backing buffer ONLY, never the views (double-free / munmap
      * of a sub-pointer). Reclaims IOVA. */
@@ -1432,7 +1431,7 @@ static int run_multicore(ork_npu *c,ork_w *w,int M,const void *A,void *C,int nc)
          * via task.cstride. Sn sequential begin/end. Any ineligible/wedged slice abandons colsplit for this matmul
          * and falls through to orki_run()'s single-core fp16 reference via ORK_RC_F16_SC (correctness). This removes fp16 wide-N's mcworker dependency
          * (task #45) using the validated Sn==1 no-drop path per slice. */
-        int NMAXn = c->soc->nmax, KSn = c->soc->ks;
+        int NMAXn = c->soc->nmax, KSn = orki_f16_ks(c);   /* fp16-only branch */
         if (!w->Bbc_ns_valid) {   /* build the per-N-slice CONTIG weights ONCE (resident; reclaimed at teardown like Bbc) */
             w->Bbc_ns = calloc((size_t)w->Sn, sizeof(struct buf));
             int build_ok = (w->Bbc_ns != NULL);
@@ -1632,7 +1631,7 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
     orki_pin_big_core(0);                                   /* single-core path also runs on the calling thread */
     int fd=c->fd,K=w->K,N=w->N, dt=w->dtype, NMAX=c->soc->nmax, CBUF=c->soc->cbuf_elems;
     if(dt==DT_F16 && CBUF>32768) CBUF=32768;   /* int8-only cbuf raise; fp16 keeps its validated 32768 tiling (see the fp16 colsplit path) */
-    int KS=dt ? orki_int8_ks(c) : c->soc->ks, RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
+    int KS=dt ? orki_int8_ks(c) : orki_f16_ks(c), RB=dt?2*CBUF:CBUF;     /* rows budget: int8 packs 2x rows/CBUF */
     /* entering int8 mode wedges the first submit unless the NPU is reset first (fp16 never
      * wedges — it cold-starts stale, which the warmup handles). Reset only when switching INTO
      * int8 — keeps fp16-only contexts free of any reset/log. Then re-warm on a fresh buffer. */
@@ -1775,8 +1774,10 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             if(orki_check_extent("run_loop",&c->Af,(size_t)mc*Kp*(dt?1:2),"activation Af")) return -1;
             if(orki_check_extent("run_loop",&c->Cc,(size_t)mc*Nc*4,"output Cc")) return -1;
             double _tc0=ork_now_us();
-            if(dt==DT_F16){ f16*ad=c->Af.cpu; const f16*Af=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Af[(size_t)(m0+r)*K+k0+j]; }
-            else { int8_t*ad=c->Af.cpu; const int8_t*Ai=A; for(int r=0;r<mc;r++)for(int j=0;j<Kp;j++) ad[(size_t)r*Kp+j]=Ai[(size_t)(m0+r)*K+k0+j]; }
+            /* A[m0..m0+mc, k0..k0+Kp) -> contiguous [mc][Kp]. The inner j run IS contiguous in both
+             * operands, so one memcpy per row replaces the scalar element loop (same bytes, same order). */
+            { size_t esz=(dt==DT_F16)?2:1; char*ad=c->Af.cpu; const char*As=A;
+              for(int r=0;r<mc;r++) memcpy(ad+(size_t)r*Kp*esz, As+((size_t)(m0+r)*K+k0)*esz, (size_t)Kp*esz); }
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             double _ts0=ork_now_us(); orki_mc_copy[0]+=_ts0-_tc0;
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
@@ -1786,8 +1787,19 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
             if(orki_submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
             double _ta0=ork_now_us(); orki_mc_sub[0]+=_ta0-_ts0;
-            if(dt==DT_F16){ float  *cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
-            else { int32_t*cc=c->Cc.cpu,*cr=c->cres; for(int r=0;r<mc;r++)for(int n=0;n<Nc;n++) cr[(size_t)(m0+r)*N+(n0+n)]+=cc[(size_t)r*Nc+n]; }
+            /* K-slice accumulate, NEON. Element-wise over DISJOINT outputs, so vectorising changes no
+             * summation order and the result is bit-identical; ks==0 STORES (c->cres is memset to 0,
+             * so += of the first slice is a read of a known zero) and that store is just a memcpy. */
+            for(int r=0;r<mc;r++){
+                const char *p=(const char*)c->Cc.cpu+(size_t)r*Nc*4;
+                char *q=(char*)c->cres+((size_t)(m0+r)*N+n0)*4; int n=0;
+                if(ks==0){ memcpy(q,p,(size_t)Nc*4); continue; }
+                if(dt==DT_F16){ const float *a=(const float*)p; float *b=(float*)q;
+                    for(; n+4<=Nc; n+=4) vst1q_f32(b+n, vaddq_f32(vld1q_f32(b+n), vld1q_f32(a+n)));
+                    for(; n<Nc; n++) b[n]+=a[n]; }
+                else { const int32_t *a=(const int32_t*)p; int32_t *b=(int32_t*)q;
+                    for(; n+4<=Nc; n+=4) vst1q_s32(b+n, vaddq_s32(vld1q_s32(b+n), vld1q_s32(a+n)));
+                    for(; n<Nc; n++) b[n]+=a[n]; } }
             orki_mc_acc[0]+=ork_now_us()-_ta0; orki_mc_n[0]++;
         }
       }

@@ -149,6 +149,15 @@ fold_resident_probe: tools/re/fold_resident_probe.c $(COBJ)
 f16_mcap_probe: tools/re/f16_mcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: per-shape fp16 matmul RATE with an fp64 reference on SAMPLED rows (first 64, last 64, 64
+# strided through the middle, so the first/last/interior M-chunks are all read) and a wrong-column
+# positive control that must FAIL. The full-row reference for a 248,320-wide head shape would take
+# ~1.5 h single-threaded; this takes seconds, which is what makes a per-shape before/after sweep
+# affordable. Anchors the fp16 K-slice row in OPS_REGISTRY.md. Board only, via the NPU guard:
+#   sudo tools/util/npu_guard.sh -- timeout -s TERM 300 ./f16_mm_rows_probe M K N [reps]
+f16_mm_rows_probe: tools/f16_mm_rows_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -fopenmp -o $@ $< $(COBJ) -lm
+
 # RE tool: root-cause the K=128 fp16 anomaly (ceiling 256 vs the schedule's ~1499, and a
 # first-bad-row-0 signature). Tests whether the envelope is NON-MONOTONIC in M, which would
 # implicate 0x1040's DATA_BANK/WEIGHT_BANK split rather than a row/area count.

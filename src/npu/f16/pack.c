@@ -6,7 +6,7 @@
  *
  * The blob is exactly what ork_w_dump emits: the Sk*Sn resident Bb tiles concatenated in the order
  * ork_w_dump walks them, Bb[ns*Sk+ks], each padded to its page-rounded allocation size. The geometry
- * below therefore has to match orki_pack's fp16 arm exactly -- KS = soc->ks (NOT the int8 K-slice),
+ * below therefore has to match orki_pack's fp16 arm exactly -- KS = orki_f16_ks (NOT the int8 K-slice),
  * N%16 (not 32), and 2 bytes per element -- or the round-trip silently mis-slices.
  *
  * Two fp16 specifics worth knowing before touching this:
@@ -38,7 +38,7 @@ static int f16_blob_geom(ork_npu *c, int K, int N, int *KS_o, int *NMAX_o,
 	if (!c || !c->soc || K <= 0 || N <= 0) return -1;
 	if (K % 32 || N % 16) return -1;              /* fp16 tile is [16][32]: N%16, not N%32 */
 
-	KS = c->soc->ks; NMAX = c->soc->nmax;
+	KS = orki_f16_ks(c); NMAX = c->soc->nmax;
 	if (KS <= 0 || NMAX <= 0) return -1;
 	Sk = (K + KS - 1) / KS; Sn = (N + NMAX - 1) / NMAX;
 

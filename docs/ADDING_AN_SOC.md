@@ -17,6 +17,11 @@ const struct ork_soc ork_soc_rk35xx = {
     .cbuf_elems=32768,       /* fp16 feature CBUF budget: rows-per-M-tile = cbuf_elems/K */
     .nmax=8192,              /* max matmul output width (N) per submit */
     .ks=2048,                /* K-slice size (scheduler-fast contraction range) */
+                             /* NOTE: this field is read by the INT8 path only as a historical
+                              * default; int8 slices on orki_int8_ks() and fp16 on orki_f16_ks(),
+                              * both 1024, because a K-slice has to land inside its precision's
+                              * 0x1040 schedule window or the M-tile collapses. See the fp16
+                              * K-slice row in OPS_REGISTRY.md. */
     .validated=0,            /* 0 until confirmed on real hardware (init prints a warning) */
 };
 ```

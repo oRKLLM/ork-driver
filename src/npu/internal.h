@@ -145,6 +145,12 @@ struct ork_w   { int K, N, Sk, Sn, dtype, gsize; int is_orkd; uint64_t orkd_id;
      * needs it for the SoC caps the tiler reads, and it takes no ork_npu argument. */
     int8_t *cpu_codes; struct ork_npu *off_ctx; struct buf *Bb; struct buf *Bf; int owns; uint8_t *Bi4; size_t Bi4_bytes; uint8_t quant_kind; float *bscale; int domain; struct buf own_buf; int own_buf_valid; struct buf *own_bufs; int n_own_bufs; uint32_t *pcrc; uint32_t *pcrc_meta; int pcrc_slots; int16_t *fa_lut; double fa_osc; struct buf *Bfold; int fold_ns; /* #39 mfold: resident fold_woff-layout weight (nslice bufs, K==FOLD_REF_K); NULL unless orkpack carries it */
     struct buf Bbc; int Bbc_valid; /* (A) fp16 CONTIGUOUS weight: all Sk K-slice Bb[ks] concatenated into ONE buffer (built lazily on the first colsplit; DEFAULT-ON for Sn==1, disabled by ORK_F16_NO_CONTIG) so the HW chain can walk slice->slice WITHOUT crossing a dma-buf boundary (the cross-buffer CDMA-wild) — enables one chained submit/core like int8. Sn==1 only. */
+    struct buf Bfull; int Bfull_valid; /* fp16 FULL-K SINGLE TILE: the Sk K-slice tiles re-laid as ONE
+        [NT][K/32][16][32] cube. NOT the same bytes as Bbc — Bbc concatenates whole slices, which
+        interleaves wrongly because the tile is N-tile-MAJOR, so slice s's nt block does not follow
+        slice s-1's nt block. Needed only by the FUSED single-submit paths (ork_f16_mm_run_silu and
+        the rsqrt LUT on top of it), which apply their activation to the FINAL accumulated value and
+        therefore cannot be K-split at all. Built lazily on first use, Sn==1 only. */
     struct buf *Bbc_ns; int Bbc_ns_valid; /* (A-wideN) fp16 Sn>1 PER-N-SLICE CONTIGUOUS weights: Sn buffers, Bbc_ns[ns] = that slice's Sk K-slice tiles (Bb[ns*Sk+ks]) concatenated. Each slice is served as a standalone Sn==1 CONTIG colsplit (no cross-buffer wild); built once, resident (reclaimed at ctx teardown like Bbc). */
     struct buf Bgap[3]; int Bgap_valid; /* (B') identity mul_perchan_f16 DRAIN-GAP dummy buffers [in,out,scale] — a chained no-op SDP inserted between K-slices (ORK_F16_GAP) to idle the weight-CDMA so the prior fp16 fetch drains before the next slice's base latches. */
     struct ork_w_sliced *sliced; /* #33 slice-and-dice rescue: pre-built c_base doorbell tiles for a refuse-prone shape (built at pack time; run at the refuse site instead of ORK_RC_WEDGE_PRONE). NULL for well-behaved weights. Carries its own dtype. */ };
@@ -394,6 +400,14 @@ int orki_build_act_lut16(ork_npu *c,double(*f)(double),double in_scale,double ou
 int orki_layer_mm(ork_npu *npu, ork_w *W, const int8_t *A, int K, int N, int32_t *C);
 int ork_dyn_grouped_end(ork_dyn_chain *h);
 int orki_int8_ks(ork_npu *c);
+int orki_f16_ks(const ork_npu *c);   /* fp16 K-slice (1024): keeps every slice inside orki_f16_sched's window — see the definition */
+/* fp16 [K,N] -> [NT][KT][16][32] weight tile, cache-blocked + parallel (npu/f16/run.c). Shared by
+ * orki_pack's fp16 arm and ork_f16_mm_repack, which had the same strided-read loop twice. */
+void orki_f16_tile(f16 *bb,const f16 *B,int NN,int KT,int k0,int n0,int N);
+int  orki_f16_bfull(ork_npu *c,ork_w *w);   /* lazily re-lay the Sk K-slice tiles into ONE full-K cube (fused single-submit paths) */
+/* The weight address a WHOLE-K single-program fp16 submit must use. Read-only, so a worker thread may
+ * call it once orki_f16_bfull has run on the single-threaded entry path. */
+static inline uint32_t orki_f16_wdma(const ork_w *w){ return (uint32_t)(w->Bfull_valid ? w->Bfull.dma : w->Bb[0].dma); }
 int orki_mtile_cap(int Kred);
 /* fp16 M-tile envelope (src/npu/f16/regcmd.c). Tree-wide because the scaffold (npu.c) and the
  * doorbell (i8/dyn.c) both need it and f16/f16.h is folder-private. orki_f16_mcap is the LARGEST

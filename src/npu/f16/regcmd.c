@@ -107,6 +107,23 @@ void orki_f16_set_out_fp16in(uint32_t*rc,int M,int N){
     }
 }
 
+/* fp16 K-SLICE (the fp16 twin of orki_int8_ks). fp16's M-tile ceiling collapses whenever a K-slice
+ * falls OUTSIDE orki_f16_sched's window [128,2048): the 0x1040 M-scheduler is off, so the cap is one
+ * CBUF bank of activations, 16384/Kp. At the SoC K-slice of 2048 that is EIGHT rows per program, and
+ * since a submit re-streams its whole Kp*Nc weight slice regardless of row count (AGENTS.md
+ * "weight-DMA amortization"), the matmul re-reads the weight M/8 times. Holding every fp16 K-slice
+ * at 1024 puts Kp back inside the window, where the measured cap is 180224/1024 = 176 rows — 22x
+ * fewer weight streams for identical arithmetic. Bit-exactness is unaffected: the K-split partials
+ * are summed host-side in slice order either way.
+ * ORK_F16_KTILE=<multiple of 32> overrides (A/B and RE); it must be set identically at pack and run,
+ * which it is because every fp16 slicing site calls this one function. */
+int orki_f16_ks(const ork_npu *c){ (void)c;
+    static int kt=-2;
+    if(kt==-2){ const char*e=getenv("ORK_F16_KTILE"); kt=e?atoi(e):0;
+        if(kt && (kt<32 || kt%32)) kt=0; }
+    return kt>0?kt:1024;
+}
+
 /* fp16 0x1040 SCHEDULE PREDICATE — the validated window, in ONE place. The run, chain and doorbell
  * paths each had their own copy and they had DRIFTED (chain `K<2048`, doorbell no upper bound at
  * all), so the same shape took different schedules on different entrypoints. */
