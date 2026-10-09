@@ -117,14 +117,15 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
     /* MSE-optimal weight clip: on by default (strictly better on the per-group objective), ORK_GPTQ_NOCLIP=1
      * restores plain absmax/7 for A/B. Read once — this is inside no hot loop, but the getenv is not free. */
     const int clip = (getenv("ORK_GPTQ_NOCLIP") == NULL);
-    /* Clip-grid shape: 16 points, 1.000 .. 0.531. The historical grid was 8 points stopping at 0.781,
-     * which sits ABOVE the useful range at per-row granularity — see the comment at the search itself.
-     * Widening is worth ~4.4% end to end and that is well outside the screen; WHERE in 0.594..0.406 the
-     * floor sits is NOT resolved (those five points span 1.4%, inside the noise), so 16 is the best
-     * sample rather than a located optimum. Wiki: K-Grouping-Cost-On-RK3588. */
-    int clip_n = 16; double clip_step = 0.03125;
-    { const char *e = getenv("ORK_GPTQ_CLIP_N");    if (e) { int v = atoi(e); if (v > 1 && v <= 64) clip_n = v; } }
-    { const char *e = getenv("ORK_GPTQ_CLIP_STEP"); if (e) { double v = atof(e); if (v > 0.0 && v < 0.2) clip_step = v; } }
+    /* Clip-grid shape. SELF-TUNING by default (clip_n = 0): walk alpha down until clip_slack
+     * consecutive points fail to improve, floored at clip_min. ORK_GPTQ_CLIP_N pins a fixed depth
+     * instead, which reproduces older packs and is the A/B arm. Wiki: K-Grouping-Cost-On-RK3588. */
+    int clip_n = 0, clip_slack = 4, clip_minpts = 8; double clip_step = 0.03125, clip_min = 0.10;
+    { const char *e = getenv("ORK_GPTQ_CLIP_N");     if (e) { int v = atoi(e); if (v > 1 && v <= 64) clip_n = v; } }
+    { const char *e = getenv("ORK_GPTQ_CLIP_STEP");  if (e) { double v = atof(e); if (v > 0.0 && v < 0.2) clip_step = v; } }
+    { const char *e = getenv("ORK_GPTQ_CLIP_MIN");   if (e) { double v = atof(e); if (v > 0.0 && v < 1.0) clip_min = v; } }
+    { const char *e = getenv("ORK_GPTQ_CLIP_SLACK"); if (e) { int v = atoi(e); if (v > 0 && v <= 32) clip_slack = v; } }
+    long clip_pin = 0, clip_tot = 0;   /* rows whose best alpha was the last point tried (see the search) */
 
     /* WORKING PRECISION for the three O(K^3) factorizations — ~20:1 of this function's arithmetic, so
      * this is where fp32 would pay: half the memory traffic and twice the NEON lanes. GATED OFF by
@@ -162,7 +163,9 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
         const int g = j / G;
         if (j % G == 0) {                                        /* new group: per-row symmetric scale */
             int j1 = j + G; if (j1 > K) j1 = K;
-            #pragma omp parallel for schedule(static) if (N > 64)
+            int pinned_g = 0, ntot_g = 0;   /* reduction, NOT a new pragma: a second omp directive would
+                                             * trip CI's -Wunknown-pragmas ratchet (CI builds without OpenMP) */
+            #pragma omp parallel for schedule(static) if (N > 64) reduction(+:pinned_g,ntot_g)
             for (int n = 0; n < N; n++) {
                 double mx = 0; for (int c = j; c < j1; c++) { double a = fabs(Wd[(size_t)n*K + c]); if (a > mx) mx = a; }
                 double sc = mx / 7.0; if (sc <= 0.0) sc = 1e-12;
@@ -185,16 +188,26 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                  * i.e. the search is pinned AGAINST its boundary for essentially every row — a mis-set
                  * bound, not a located optimum. Numbers: wiki K-Grouping-Cost-On-RK3588.
                  *
-                 * ORK_GPTQ_CLIP_N / ORK_GPTQ_CLIP_STEP make the grid sweepable (defaults 8 / 0.03125 keep
-                 * today's behaviour exactly). NOT widened by default: widening can only lower this group's
-                 * own squared error, and we have just been reminded that the layer-local objective is a poor
-                 * predictor of perplexity — back-to-front ordering measured 1.3% better here and 0.45% (a
-                 * null) end-to-end. So the grid gets a knob, and the default moves on a PPL measurement. */
+                 * SO THE GRID IS SELF-TUNING, not a tuned constant. A fixed depth is wrong by
+                 * construction: how far absmax overshoots grows with how many weights share the scale,
+                 * so the right floor moves with K and with the model. Instead, walk alpha down and stop
+                 * only once CLIP_SLACK consecutive points have failed to improve — the objective is
+                 * unimodal in alpha in practice — bounded by a hard CLIP_MIN for safety. A row that
+                 * wants 0.9 costs the minimum; a row that wants 0.3 keeps looking.
+                 *
+                 * `pinned` counts rows whose best alpha was the LAST point evaluated, i.e. the search
+                 * hit CLIP_MIN still improving. That is the signature the old fixed grid could not
+                 * report, and it is what made a mis-set floor invisible for so long: the search was
+                 * pinned against its boundary for essentially every row and said nothing. Reported
+                 * below, so a future model that needs a lower floor announces itself.
+                 *
+                 * ORK_GPTQ_CLIP_N forces the old FIXED-depth grid (A/B and reproducing old packs). */
                 if (clip) {
-                    double best = sc, be = -1.0;
-                    for (int t = 0; t < clip_n; t++) {
+                    double best = sc, be = -1.0; int bt = 0, t = 0;
+                    for (;; t++) {
                         const double a = 1.0 - clip_step * (double)t;
-                        if (a <= 0.0) break;
+                        if (a <= clip_min) break;
+                        if (clip_n > 0 && t >= clip_n) break;          /* fixed-depth override */
                         const double s2 = a * mx / 7.0; if (s2 <= 0.0) continue;
                         double e = 0.0;
                         for (int c = j; c < j1; c++) {
@@ -202,12 +215,16 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
                             long q = lround(w / s2); if (q > 7) q = 7; if (q < -8) q = -8;
                             const double dd = w - (double)q * s2; e += dd*dd;
                         }
-                        if (be < 0.0 || e < be) { be = e; best = s2; }
+                        if (be < 0.0 || e < be) { be = e; best = s2; bt = t; }
+                        else if (t - bt >= clip_slack && t + 1 >= clip_minpts) break;
                     }
                     sc = best;
+                    if (bt == t - 1 || bt == t) pinned_g++;            /* best was the last point tried */
+                    ntot_g++;
                 }
                 scales[(size_t)n*ng + GQ_G(g)] = (float)sc;
             }
+            clip_pin += pinned_g; clip_tot += ntot_g;
         }
         double d = Hin[(size_t)j*K + j]; if (d == 0.0) d = 1e-12;
         #pragma omp parallel for schedule(static) if (N > 64)
@@ -223,6 +240,21 @@ int ork_i4_gptq(int K, int N, const float *W, float *H, int group,
         }
     }
     free(Hd); free(Wd); free(Hin);
+    /* The grid announcing that it is still truncated. Warn ONCE per process: a mis-set floor is a
+     * property of the model/shape, so the first weight to hit it has already made the point, and a
+     * per-weight warning over 140 weights would be noise. ORK_GPTQ_CLIP_STATS=1 prints every weight. */
+    if (clip_tot > 0) {
+        const double frac = (double)clip_pin / (double)clip_tot;
+        static int warned = 0;
+        if (getenv("ORK_GPTQ_CLIP_STATS"))
+            fprintf(stderr, "[ork] gptq clip: K=%d N=%d  %.1f%% of rows bottomed out (floor %.3f)\n",
+                    K, N, 100.0*frac, clip_min);
+        else if (frac > 0.10 && !warned) { warned = 1;
+            fprintf(stderr, "[ork] gptq clip: %.0f%% of rows at K=%d chose the LOWEST scale the search "
+                            "reached (floor %.3f) — the clip grid is still truncated for this model, so "
+                            "the quantiser is leaving accuracy on the table. Lower ORK_GPTQ_CLIP_MIN.\n",
+                    100.0*frac, K, clip_min); }
+    }
     #undef GQ_C
     #undef GQ_G
     return 0;
