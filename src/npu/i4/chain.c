@@ -554,8 +554,14 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     if(r != -1 || getenv("ORK_I4_NOLADDER")) return r;
     int H = orki_i4_hcap(w->K), Wb = (131072/w->K) & ~63;
     if(Wb > w->N) Wb = w->N;
-    if(Wb > 64){ r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64); if(r != -1) return r; }
-    if(H > 4)     r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64);
+    /* RESET before every retry. A geometry the part will not take leaves CBUF residue, and the next
+     * attempt then computes against it -- not a miss but a WRONG ANSWER (test_slice_rescue i4-refuse,
+     * 308202 mismatches, 2026-10-10). This is the same stale-CBUF-residue mode orki_i4_hcap's K=2560
+     * entry documents. ork_npu_mode_reset is the heavyweight ACT_RESET + mode-invalidate, which is what
+     * a retry after a failed submit needs; it costs nothing on the path that never retries. */
+    if(Wb > 64){ ork_npu_mode_reset(c); r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64);
+                 if(r != -1) return r; }
+    if(H > 4){   ork_npu_mode_reset(c); r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64); }
     return r;
 }
 
