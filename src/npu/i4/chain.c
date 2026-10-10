@@ -436,7 +436,8 @@ static void *bch_db_worker(void *vp){
     a->rc=-2; return NULL;
 }
 
-int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+static int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc,
+                              int Hlim, int Wblim){
     if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
     int fd=c->fd, K=w->K, N=w->N;
     /* accurate wedge telemetry: the BCHAIN worker skips validate_regcmd by default, so orki_last_op would
@@ -452,6 +453,7 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * must move together with the 0x1040 split written in i4/run.c. */
     { const char*d=getenv("ORK_I4_DBNK"); if(d){ int n=atoi(d); if(n>=1&&n<=11){ H=n*orki_i4_hcap(K); if(H>64)H=64; } } }
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
+    if(Hlim>0 && Hlim<H) H=Hlim;                 /* geometry ladder (below): lower only, never raise */
     if(H<2) return -4;
     int Wb=(131072/K)&~63;
     /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
@@ -470,6 +472,7 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
      * until then, or a host-arithmetic break reads as a hardware failure.
      * ORK_I4_WB overrides for RE. */
     { const char*e=getenv("ORK_I4_WB"); if(e){int v=atoi(e); if(v>0) Wb=v;} }   /* re-read: lets one probe process sweep */
+    if(Wblim>0 && Wblim<Wb) Wb=Wblim;            /* geometry ladder (below): narrow only */
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
@@ -532,6 +535,28 @@ int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t 
     if(missed){ free(h); return -1; }   /* a core's blocking submit never completed — don't de-tile garbage; caller falls back */
     int last=ork_dyn_end(h);   /* prepolled: skips poll, de-tiles (i4batch) into C, frees h */
     return (last==nc-1) ? 0 : -1;
+}
+
+/* Run the BCHAIN batch, de-escalating the tile geometry if the hardware will not take it.
+ *
+ * Wb and the orki_i4_hcap() table are constants measured on ONE die. A second RK3588 accepts the
+ * submit and never starts the task at geometries the first one runs, so a doorbell miss here is not
+ * necessarily a dead shape -- it can be a geometry this part will not take. Retry once with the
+ * narrowest N-tile, then once with a shorter M-batch as well. Both steps are bit-exact: same tiles,
+ * same kernel, only the grouping changes, and the goldens are unchanged across them.
+ *
+ * H is only ever LOWERED. Raising it past orki_i4_hcap() does not fail, it MISCOMPUTES SILENTLY, which
+ * is why ORK_I4_H must never be used as a blanket override. A step that would not change the geometry
+ * is skipped, so a part where the measured values hold pays nothing. ORK_I4_NOLADDER=1 for an A/B.
+ * Wiki: Exp-2026-10-09-The-Domain-Reference-Leak. */
+int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+    int r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0);
+    if(r != -1 || getenv("ORK_I4_NOLADDER")) return r;
+    int H = orki_i4_hcap(w->K), Wb = (131072/w->K) & ~63;
+    if(Wb > w->N) Wb = w->N;
+    if(Wb > 64){ r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64); if(r != -1) return r; }
+    if(H > 4)     r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64);
+    return r;
 }
 
 static void *bch_mw_worker(void *vp){
