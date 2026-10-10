@@ -182,6 +182,14 @@ static inline double ork_now_us(void){ struct timespec t; clock_gettime(CLOCK_MO
 static inline void orki_setr(uint32_t*rc,int n,uint32_t b,uint32_t o,uint32_t v){for(int k=0;k+1<n;k+=2)if((rc[k]&0xffff)==o&&(rc[k+1]>>16)==b){rc[k]=(o)|((v&0xffff)<<16);rc[k+1]=(b<<16)|((v>>16)&0xffff);}}
 static inline void orki_bsync(int fd,struct buf*b,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=b->obj;s.size=b->size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
 static inline void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,uint32_t f){struct rknpu_mem_sync s;memset(&s,0,sizeof s);s.obj_addr=obj;s.offset=off;s.size=size;s.flags=f;ioctl(fd,DRM_IOCTL_RKNPU_MEM_SYNC,&s);}
+/* Sync only the LIVE extent of a reused scratch buffer. The per-core colsplit scratch is high-water
+ * marked (it only ever grows), so a whole-buffer orki_bsync charges every later call cache maintenance
+ * over the widest shape the process ever ran rather than over the bytes in flight. */
+static inline void orki_bsync_live(int fd,struct buf*b,size_t n,uint32_t f){
+    if(!b||!b->obj) return;
+    n=(n+4095)&~(size_t)4095;                      /* round out to a page: never sync LESS than the live bytes */
+    if(n>b->size) n=b->size; if(!n) return;
+    orki_bsync_off(fd,b->obj,0,n,f); }
 
 /* ---- cross-module internals (extern; defined in npu.c or a src/npu/<mod>.c module) ---- */
 void orki_pin_little_core(int id);          /* npu.c  — pin the caller to an idle A55 */

@@ -200,6 +200,7 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
     return 0; }
 
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
+    double csp_end_t0 = ork_now_us();
     int drain_fail = 0;   /* a full-surface verify timed out => partials were never written */
     /* SPIN TEARDOWN (safety): a persistent spin tail keeps re-reading the scratch/regcmd after the real outputs
      * land, so freeing below would race an in-flight re-orki_run (IOMMU fault / wedge). Null-terminate EVERY reserved
@@ -383,10 +384,21 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         }
         ork_dyn_dump(h, "ork_dyn_end incomplete (doorbell miss)");
     }
-    struct buf *done[1024]; int nd = 0;
-    for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; int seen = 0;
-        for (int j = 0; j < nd; j++) if (done[j] == b) seen = 1;
-        if (!seen) { orki_bsync(fd, b, RKNPU_MEM_SYNC_FROM_DEVICE); if (nd < 1024) done[nd++] = b; } }
+    double _e0 = ork_now_us();
+    /* Invalidate the LIVE output extent of each distinct scratch buffer, not b->size: the per-core
+     * colsplit scratch is high-water marked, so a whole-buffer sync charges every call for the widest
+     * shape the process ever ran (measured 9 ms/call on a 3.4 ms submit). */
+    struct buf *done[1024]; size_t dext[1024]; int nd = 0;
+    for (int i = 0; i < h->S; i++) { struct buf *b = h->outbuf[i]; if (!b) continue;
+        size_t off = (b->cpu && h->outptr[i]) ? (size_t)((const char*)h->outptr[i] - (const char*)b->cpu) : 0;
+        size_t ext = off + (size_t)(h->nout[i] ? h->nout[i] : h->N) * (h->esz == 2 ? 2u : 4u);
+        int j = 0; while (j < nd && done[j] != b) j++;
+        if (j == nd) { if (nd >= 1024) continue; done[nd] = b; dext[nd] = ext; nd++; }
+        else if (ext > dext[j]) dext[j] = ext; }
+    for (int j = 0; j < nd; j++) { orki_bsync_live(fd, done[j], dext[j], RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (orki_csp_on > 0) orki_csp_b[CSP_ENDSYNC] += (double)(dext[j] < done[j]->size ? dext[j] : done[j]->size); }
+    if (orki_csp_on > 0) { orki_csp_t[CSP_ENDSYNC] += ork_now_us() - _e0; orki_csp_n[CSP_ENDSYNC]++; }
+    double _e1 = ork_now_us();
     if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
         for (int i = 0; i < h->S; i++)
             orki_bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
@@ -473,6 +485,8 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             for (int m = 0; m < Me; m++) memcpy(&d[(size_t)m * h->ostride[i]], &src[(size_t)m * Ne], (size_t)Ne * 4); }
         else memcpy(h->dst[i], h->outptr[i], (size_t)no * 4); }
     __asm__ volatile("dsb ish":::"memory");   /* ensure the copy-back/scatter stores complete before the caller reads C (esp. a non-cacheable ork_dma_alloc dst) */
+    if (orki_csp_on > 0) { orki_csp_t[CSP_ENDCOPY] += ork_now_us() - _e1; orki_csp_n[CSP_ENDCOPY]++;
+                           orki_csp_t[CSP_END] += ork_now_us() - csp_end_t0; orki_csp_n[CSP_END]++; }
     for (int i = 0; i < h->nascr; i++) orki_bdestroy(fd, &h->ascr[i]);   /* free scratch A copies */
     int r = drain_fail ? -1 : last; free(h);   /* a verify timeout is an error, not a frontier */
     orki_in_doorbell = 0;

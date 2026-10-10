@@ -223,9 +223,26 @@ ork_dyn_chain *ork_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *tasks, 
  * Call the dispatcher, not this — int4 must be routed away before it reaches here. */
 ork_dyn_chain *orki_dyn_begin_mc_impl(ork_npu *c, int S, const ork_mm_task_i8 *tasks, int nc);
 ork_dyn_queue *ork_dyn_queue_create(ork_npu *c, int chunk_max, int ncore);
-struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar; };
+/* nb_af/nb_rc/nb_tk/nb_cc: the LIVE byte extent of this core's maf/mrc/mtk/mcc scratch for THIS call.
+ * The buffers are high-water marked, so syncing b->size charges every call for the widest shape the
+ * process ever ran; the worker syncs these extents instead. nb_af==0 => this core's A was flushed by
+ * the shared gather (fp16, and the int8 wide-K arm, both read maf[0]). */
+struct ork_csub { ork_npu *c; int i; struct rknpu_submit *subs; ork_w *w; ork_dyn_chain *h; int hardened; int active; int ksbar;
+                  size_t nb_af, nb_rc, nb_tk, nb_cc; };
 void ork_dyn_dump(ork_dyn_chain *h, const char *label);
 void ork_dyn_queue_destroy(ork_dyn_queue *q);
 void ork_dyn_queue_set_linger(ork_dyn_queue *q, int us);
+
+
+/* COLSPLIT PHASE PROFILE (ORK_CS_PROF=1) — attributes one ork_dyn_begin_colsplit + ork_dyn_end call
+ * to its phases, so a fixed per-call cost can be located instead of guessed. Core 0 runs on the
+ * calling thread, so its worker phases are wall-time; cores 1..n-1 run concurrently and are excluded. */
+enum { CSP_BEGIN, CSP_GATHER, CSP_SYNTH, CSP_SEED, CSP_SYNCIN, CSP_SUBMIT, CSP_SYNCOUT,
+       CSP_ACC, CSP_DISPATCH, CSP_END, CSP_ENDSYNC, CSP_ENDCOPY, CSP_N };
+extern double orki_csp_t[CSP_N];
+extern long   orki_csp_n[CSP_N];
+extern double orki_csp_b[CSP_N];   /* bytes handed to the kernel sync ioctls */
+extern int    orki_csp_on;
+void orki_csp_init(void);
 
 #endif /* ORK_NPU_CORE_H */

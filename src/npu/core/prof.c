@@ -68,3 +68,21 @@ void ork_npu_db_timing(double *begin_us, long *begin_n, double *end_us, long *en
 }
 void ork_npu_db_reset(void){ orki_db_begin_us=orki_db_end_us=orki_db_poll_us=0; orki_db_begin_n=orki_db_end_n=0; }
 double ork_npu_db_poll(void){ return orki_db_poll_us; }
+
+/* COLSPLIT PHASE PROFILE (ORK_CS_PROF=1) — see npu/core.h. Core 0 runs on the calling thread, so its
+ * worker phases are wall time; cores 1..n-1 run concurrently and are deliberately not counted. */
+double orki_csp_t[CSP_N]; long orki_csp_n[CSP_N]; double orki_csp_b[CSP_N]; int orki_csp_on = -1;
+static const char *orki_CSPNAME[CSP_N] = { "begin(total)","  A gather","  regcmd synth","  SENT seed",
+    "  bsync-in c0","  submit c0","  bsync-out c0","  accumulate c0","  pool dispatch+join",
+    "end(total)","  end bsync","  end copy-back" };
+static void orki_csp_dump(void){
+    if(orki_csp_on<=0) return;
+    fprintf(stderr,"[ork CS_PROF] colsplit phase attribution (core 0 / calling thread):\n");
+    for(int i=0;i<CSP_N;i++){ if(!orki_csp_n[i] && orki_csp_t[i]<=0) continue;
+        fprintf(stderr,"  %-22s %9.3f s  n=%-8ld %8.3f ms/call", orki_CSPNAME[i], orki_csp_t[i]/1e6,
+                orki_csp_n[i], orki_csp_n[i]?orki_csp_t[i]/orki_csp_n[i]/1000.0:0.0);
+        if(orki_csp_b[i]>0) fprintf(stderr,"  %8.1f MB/call", orki_csp_b[i]/(double)(orki_csp_n[i]?orki_csp_n[i]:1)/1048576.0);
+        fprintf(stderr,"\n"); }
+}
+void orki_csp_init(void){ if(orki_csp_on>=0) return; orki_csp_on = getenv("ORK_CS_PROF")?1:0;
+    if(orki_csp_on) atexit(orki_csp_dump); }
