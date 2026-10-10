@@ -188,7 +188,10 @@ static inline void orki_bsync_off(int fd,uint64_t obj,uint64_t off,size_t size,u
 static inline void orki_bsync_live(int fd,struct buf*b,size_t n,uint32_t f){
     if(!b||!b->obj) return;
     n=(n+4095)&~(size_t)4095;                      /* round out to a page: never sync LESS than the live bytes */
-    if(n>b->size) n=b->size; if(!n) return;
+    /* One statement per line: `if(a) x; if(b) y;` reads to gcc as the second being guarded by the
+     * first (-Wmisleading-indentation), and in a header 45 TUs include that is 45 warnings, not one. */
+    if(n>b->size) n=b->size;
+    if(!n) return;
     orki_bsync_off(fd,b->obj,0,n,f); }
 
 /* ---- cross-module internals (extern; defined in npu.c or a src/npu/<mod>.c module) ---- */
