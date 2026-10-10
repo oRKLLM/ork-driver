@@ -36,19 +36,28 @@ void ork_install_term(void);   /* fwd: graceful-SIGTERM install (defined near th
  * instead — one chained doorbell submit over c_base tiles, bit-exact. If there are no tiles (a shape
  * we don't pre-slice) OR the sliced run itself errors, REFUSE — never a blocking fall-back (#45). */
 
+/* CS_PROF helpers: accumulate a phase only for core 0 (the calling thread), where elapsed == wall. */
+#define CSP0(ph, stmt) do { if (orki_csp_on > 0 && i == 0) { double _t0 = ork_now_us(); stmt; \
+        orki_csp_t[ph] += ork_now_us() - _t0; orki_csp_n[ph]++; } else { stmt; } } while (0)
+#define CSPB(ph, nb) do { if (orki_csp_on > 0 && i == 0) orki_csp_b[ph] += (double)(nb); } while (0)
+
 static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a->c; int i = a->i, fd = c->fd;
     /* (a `cold` capture used to live here for an fp16 cold-buffer warmup that was never implemented —
      * the variable was dead and the comment claimed a behaviour that did not exist. Measured 2026-08-27:
      * a cold warmup on this path changes nothing; the post-ACT_RESET drop is not a cold-buffer effect.) */
     if (a->active) {
-        if (a->h->oSk[i] <= 1) orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* wide-K (oSk>1) shares the gathered A in maf[0], already flushed by the build gather — skip the redundant per-core maf orki_bsync (unused for i>0, double for i=0) */
-        orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        if (a->hardened || !c->mwarm[i]) orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+      /* LIVE EXTENT, not b->size: these buffers are high-water marked (see struct ork_csub). */
+      CSP0(CSP_SYNCIN, {
+        if (a->nb_af) { orki_bsync_live(fd, &c->maf[i], a->nb_af, RKNPU_MEM_SYNC_TO_DEVICE); CSPB(CSP_SYNCIN, a->nb_af); }   /* 0 => this core reads the shared gather in maf[0], already flushed by the build */
+        orki_bsync_live(fd, &c->mrc[i], a->nb_rc, RKNPU_MEM_SYNC_TO_DEVICE); CSPB(CSP_SYNCIN, a->nb_rc);
+        orki_bsync_live(fd, &c->mtk[i], a->nb_tk, RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE); CSPB(CSP_SYNCIN, a->nb_tk);
+        if (a->hardened || !c->mwarm[i]) { orki_bsync_live(fd, &c->mcc[i], a->nb_cc, RKNPU_MEM_SYNC_TO_DEVICE); CSPB(CSP_SYNCIN, a->nb_cc); }
         c->mwarm[i] = 1;
+      });
     }
     /* NO barrier + BLOCKING submit — EXACTLY the mcworker: 3 pool threads, each does a blocking submit on its
      * core and the kernel-waits (no userspace poll). ORK_COLSPLIT_NB flips to nonblock+poll for comparison. */
+    double csp_sub_t0 = ork_now_us();
     if (a->active) {
       if (a->h->mc_dt == DT_F16 && a->h->oSk[i] > 1 && !a->h->f16_contig) {   /* CONTIG builds ONE chained submit -> take the single-submit else-path (like int8), NOT the per-slice SW-chain */
         /* AUTO SW-CHAIN: fp16 K-split cannot HW-chain across distinct Bb[ks] weight buffers (the next task's base
@@ -180,7 +189,8 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                     break; }
                 if (el > 1000.0) { struct timespec ts = {0, 50000}; nanosleep(&ts, NULL); } } }
       }
-        orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (orki_csp_on > 0 && i == 0) { orki_csp_t[CSP_SUBMIT] += ork_now_us() - csp_sub_t0; orki_csp_n[CSP_SUBMIT]++; }
+        CSP0(CSP_SYNCOUT, { orki_bsync_live(fd, &c->mcc[i], a->nb_cc, RKNPU_MEM_SYNC_FROM_DEVICE); CSPB(CSP_SYNCOUT, a->nb_cc); });
         /* WIDE-K PARALLEL ACCUMULATE: sum this core's Sk [M,Ncore] partials into its C columns HERE, in this
          * pool thread — matching mcworker's chain-ksplit (each core accumulates its own partials in parallel)
          * instead of the SERIAL sum in ork_dyn_end (measured ~31ms serial vs ~13ms NPU submit on ffn_down =
@@ -194,6 +204,7 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             * this one (the concurrent-cross-buffer CDMA wild that produced the wrong-answers). So fp16 no longer needs
             * the single-threaded full-surface verify+accumulate in ork_dyn_end (5-9x slower — it serialized all cores'
             * partials through one thread); that path stays as a dormant fallback (unreached: this sets dst[i]=NULL). */
+            double csp_acc_t0 = ork_now_us();
             int Me = a->h->oM[i] ? a->h->oM[i] : 1, Sk = a->h->oSk[i], no = a->h->nout[i], Nn = no/(Sk*Me);
             size_t ds = a->h->ostride[i] > 0 ? (size_t)a->h->ostride[i] : (size_t)Nn, kstride = (size_t)Me*Nn;
             /* ks-OUTER (cache-friendly, like mcworker's chain-ksplit accumulate): read each K-slice partial
@@ -219,11 +230,13 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
                         for (; n < Nn; n++) dr[n] += bs[n]; } }
             }
             a->h->dst[i] = NULL;   /* accumulated per-core; ork_dyn_end copy-back skips this i */
+            if (orki_csp_on > 0 && i == 0) { orki_csp_t[CSP_ACC] += ork_now_us() - csp_acc_t0; orki_csp_n[CSP_ACC]++; }
         }
     }
     return NULL;
 }
 ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int ncreq) {
+    orki_csp_init(); double csp_beg_t0 = ork_now_us();
     ork_w *w = t->w; int K = w->K, N = w->N, M = t->M, fd = c->fd, CBUF = c->soc->cbuf_elems;
     int dt = w->dtype;   /* DT_I8 today; fp16/int4 branches keyed on this (Stage 0: dt==DT_I8 == byte-identical) */
     int nt_sz = (dt == DT_F16) ? 16 : 32, NN = N / nt_sz, mcap = orki_mtile_cap(K), NMAX_C = c->soc->nmax;   /* col-tile width: int8 32, fp16 16 (each Kp*32 BYTES: int8 32x1, fp16 16x2); mcap rows/program (int8); NMAX_C = N-slice width */
@@ -275,10 +288,23 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
     if (dt == DT_F16) ork_npu_enter(c, DT_F16, XP_MC_MM, OCK_NONE);
     else              ork_npu_enter(c, 3 /*DT_I8_CHAIN*/, XP_CHAIN_NT, OCK_HW);
     if (orki_mc_ensure(c, nc)) return NULL;
+    /* DECLINE AN OVER-LONG fp16 CHAIN BEFORE GROWING ANY SCRATCH. The emitter below caps a core's chain at
+     * 512 programs and bails mid-build — but by then it has already resized maf[] and mcc[] to the DECLINED
+     * shape, and those buffers only ever grow. The tall-M head gradient (M=248320 => 1411 programs) therefore
+     * left ~1.5 GB of maf and ~1 GB of mcc pinned in a 4 GiB domain for a matmul that then ran single-core,
+     * and every LATER call's whole-buffer scratch sync was charged against that high-water mark. The program
+     * count depends only on M and the K-slicing, so it can be decided here. */
+    if (dt == DT_F16) { int KSq = orki_f16_ks(c), npq = 0;
+        for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSq, Kp = (K-k0<KSq)?(K-k0):KSq;
+            int kc = orki_f16_mcap(Kp, orki_f16_sched(Kp)); if (kc < 1) kc = 1;
+            npq += (M + kc - 1) / kc; if (npq > 512) return NULL; } }
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
     h->mc_dt = dt;   /* set EARLY: ork_csub_worker (runs before the tail below) reads it for the accumulate dtype */
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    /* per-core LIVE scratch extents for this call (see struct ork_csub) */
+    size_t nbaf[ORK_MAXCORE], nbrc[ORK_MAXCORE], nbtk[ORK_MAXCORE], nbcc[ORK_MAXCORE];
+    memset(nbaf, 0, sizeof nbaf); memset(nbrc, 0, sizeof nbrc); memset(nbtk, 0, sizeof nbtk); memset(nbcc, 0, sizeof nbcc);
     uint32_t rc[REGCMD_I8_N + 4];
     for (int i = 0; i < nc; i++) {
         int t0 = (int)((long)i * NN / nc), t1 = (int)((long)(i+1) * NN / nc), Ncore = (t1 - t0) * nt_sz, c0 = t0 * nt_sz;
@@ -292,7 +318,8 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
         if (Ncore <= 0) { Pc[i] = 0; continue; }
         struct buf *RC = &c->mrc[i], *AF = &c->maf[i]; struct rknpu_task *tk = (struct rknpu_task*)c->mtk[i].cpu;
         size_t aesz = (dt == DT_F16) ? 2 : 1;   /* A element bytes: fp16 2, int8 1 */
-        if ((size_t)M * K * aesz > AF->size) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
+        /* fp16 gathers A ONCE into maf[0] and every core reads it, so growing maf[1..] is pure IOVA waste. */
+        if ((size_t)M * K * aesz > AF->size && (dt != DT_F16 || i == 0)) { orki_bdestroy(fd, &c->maf[i]); c->maf[i] = orki_bcreate(fd, (size_t)M*K*aesz, 0x403, c->dom_active); if (!c->maf[i].cpu) { free(h); return NULL; } AF = &c->maf[i]; }
         if (dt == DT_F16) {   /* fp16 colsplit (Stage 1): K-sliced Bb + host f32 accumulate; Sn==1 (gated). Mirrors the
             * int8 WIDE-K branch with orki_f16_synth()/f32/fp16-chunk. base (Sk==1) => single partial (accumulate is a copy).
             * Weight offset t0*Kp*32 and the 108-reg task are IDENTICAL to int8/mcworker (only orki_f16_synth()+Bb+dtype differ). */
@@ -313,11 +340,12 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             if (c->mtk[i].size < needtk) { orki_bdestroy(fd, &c->mtk[i]); c->mtk[i] = orki_bcreate(fd, needtk, 0x40b, c->dom_active);
                 if (!c->mtk[i].cpu) { free(h); return NULL; } tkf = (struct rknpu_task*)c->mtk[i].cpu; }
             struct buf *AFS = &c->maf[0];   /* gather A ONCE (shared, read-only across cores): fp16 [Sk][M][Kp] */
-            if (i == 0) { f16 *afg = (f16*)AFS->cpu; const f16 *Af = (const f16*)t->A; size_t goff = 0;
+            if (i == 0) { double _g0 = ork_now_us(); f16 *afg = (f16*)AFS->cpu; const f16 *Af = (const f16*)t->A; size_t goff = 0;
               for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                   for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, Af + (size_t)m*K + k0, (size_t)Kp*2);   /* per-row memcpy (== int8 wide-K gather); Sk==1 => contiguous. Scalar j-loop was a big fixed cost on low-M shapes. */
                   goff += (size_t)M*Kp; }
-              orki_bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+              orki_bsync_live(fd, AFS, goff * 2, RKNPU_MEM_SYNC_TO_DEVICE);   /* goff = the gathered element count; LIVE extent, not the high-water AFS->size */
+              if (orki_csp_on > 0) { orki_csp_t[CSP_GATHER] += ork_now_us() - _g0; orki_csp_n[CSP_GATHER]++; orki_csp_b[CSP_GATHER] += (double)goff*2; } }
             uint32_t a_base = (uint32_t)AFS->dma;
             int contig = (w->Sn == 1) && !getenv("ORK_F16_NO_CONTIG");   /* (A) DEFAULT-ON for Sn==1: ONE chained submit/core over a CONTIGUOUS weight (Bbc) — no cross-buffer boundary => no HW cross-boundary prefetch => no CDMA wild => no drop (validated 500-iter 0-drop + shape-suite bit-exact, 2.6x). Sn>1 (multi-N-slice) keeps the per-slice path + the recovery net. ORK_F16_NO_CONTIG opts out for A/B. */
             if (contig && i == 0 && !w->Bbc_valid) {   /* build the contiguous weight ONCE (single-threaded build): concat all Sk K-slice tiles into one buffer */
@@ -351,6 +379,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                     orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5038, (uint32_t)w->Bgap[2].dma);
                     orki_setrn(gap_pc, REGCMD_MUL_F16_CHAIN_N, RK_SDP_5034, 0x00000008); }
             }
+            double _s0 = ork_now_us();
             int np2 = 0; size_t goff = 0, sloff = 0; char kb[512] = {0}; unsigned char pcp[600] = {0};   /* pcp[p]=1 => program p is a perchan drain-gap (not a matmul) */
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
@@ -391,9 +420,12 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
                 struct rknpu_task tt; memset(&tt, 0, sizeof tt); tt.int_mask = 0x300; tt.int_clear = 0x1ffff;
                 tt.enable_mask = pcp[p] ? 0x18 : 0xd; tt.regcfg_amount = pcp[p] ? 69 : 108;   /* perchan: enable 0x18, 69 regs; matmul: 0xd, 108 */
                 tt.regcmd_addr = RC->dma + (size_t)p*REGCMD_N*4; tkf[p] = tt; }
+            if (orki_csp_on > 0) { orki_csp_t[CSP_SYNTH] += ork_now_us() - _s0; if (i == 0) orki_csp_n[CSP_SYNTH]++; }
             h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
             h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = t->cstride ? t->cstride : N;   /* f32 accumulate/copy-back -> C columns at row-stride N (cstride override: fp16 wide-N per-slice writes a sub-N result into the wider C at full stride) */
             Pc[i] = np2;
+            nbaf[i] = 0;   /* fp16 always reads the shared gather in maf[0], flushed above */
+            nbrc[i] = (size_t)np2 * REGCMD_N * 4; nbtk[i] = (size_t)np2 * sizeof(struct rknpu_task); nbcc[i] = ksz;
             memset(&subs[i], 0, sizeof subs[i]);
             subs[i].flags = (gap ? 0x1u : ork_ppflags()) | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;   /* gap chain carries an SDP (perchan) task -> ping-pong OFF (0x1); worker clears 0x2 -> blocking */
             subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
@@ -425,7 +457,7 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
               for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                   for (int m = 0; m < M; m++) memcpy(afg + goff + (size_t)m*Kp, (const int8_t*)t->A + (size_t)m*K + k0, (size_t)Kp);
                   goff += (size_t)M*Kp; }
-              orki_bsync(fd, AFS, RKNPU_MEM_SYNC_TO_DEVICE); }
+              orki_bsync_live(fd, AFS, goff, RKNPU_MEM_SYNC_TO_DEVICE); }   /* LIVE extent (int8: 1 B/elem), not the high-water AFS->size */
             uint32_t a_base = (uint32_t)AFS->dma;   /* shared gathered A for all cores */
             int np2 = 0; size_t goff = 0;
             for (int ks = 0; ks < w->Sk; ks++) {
@@ -452,6 +484,8 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             h->outbuf[i] = CC; h->outptr[i] = (int32_t*)CC->cpu; h->nout[i] = w->Sk * M * Ncore; h->oM[i] = M; h->oSk[i] = w->Sk;
             h->dst[i] = (int32_t*)((char*)t->C + (size_t)c0 * 4); h->ostride[i] = t->cstride ? t->cstride : N;   /* accumulate -> C columns at row-stride N (cstride override: int8 no-Bf/wide-K wide-N per-N-slice writes a sub-N result into the wider C at full stride) */
             Pc[i] = np2;
+            nbaf[i] = 0;   /* int8 wide-K also reads the shared gather in maf[0] */
+            nbrc[i] = (size_t)np2 * REGCMD_I8_N * 4; nbtk[i] = (size_t)np2 * sizeof(struct rknpu_task); nbcc[i] = ksz;
             memset(&subs[i], 0, sizeof subs[i]);
             subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np2; subs[i].task_obj_addr = c->mtk[i].obj;
             subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
@@ -644,6 +678,8 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             * cheap per-row-last-col done + ostride copy-back (oscat=0). Setting oscat unconditionally forced the
             * pathological full-surface poll on the base path and tanked native attention 73->13. */
         Pc[i] = np;
+        nbaf[i] = (size_t)M * K;   /* int8 base arm: this core's own A copy in maf[i] */
+        nbrc[i] = (size_t)np * REGCMD_I8_N * 4; nbtk[i] = (size_t)np * sizeof(struct rknpu_task); nbcc[i] = osz;
         memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = np; subs[i].task_obj_addr = c->mtk[i].obj;
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
@@ -695,28 +731,34 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
      * set so the run-level de-escalates to the nc=1 bit-exact backstop (single-core fp16 = no concurrent fetch = no drop).
      * Fast + SAFE: bounded nonblock recovery + a guaranteed-correct single-core recompute, never the resubmit thrash. */
     if (csub_barrier) pthread_barrier_init(&c->b_ioctl, NULL, nc);
+    double _sd0 = ork_now_us();
     if (!parallel_blocking || fp16_hard)
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; }
+        if (hardened) { int no = h->nout[i]; volatile int32_t *o = h->outptr[i]; for (int e = 0; e < no; e++) o[e] = ORK_DYN_SENT; if (orki_csp_on > 0) orki_csp_b[CSP_SEED] += (double)no*4; }
         else { int Mx = h->oM[i], Nx = h->nout[i]/Mx; for (int m = 0; m < Mx; m++) {
             volatile int32_t *db = h->outptr[i] + (size_t)m*Nx + (Nx-1); *db = ORK_DYN_SENT; __asm__ volatile("dc cvac,%0"::"r"(db):"memory"); } } }
     __asm__ volatile("dsb ish":::"memory");
+    if (orki_csp_on > 0) { orki_csp_t[CSP_SEED] += ork_now_us() - _sd0; orki_csp_n[CSP_SEED]++; }
     if (nc > 1 && !getenv("ORK_COLSPLIT_SERIAL")) {   /* DEFAULT: per-core submit+accumulate on pool threads (ork_csub_worker); ORK_COLSPLIT_SERIAL forces the legacy inline path below */
         struct ork_csub cs[ORK_MAXCORE];
-        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0, csub_barrier };
+        for (int i = 0; i < nc; i++) cs[i] = (struct ork_csub){ c, i, subs, w, h, hardened_w, Pc[i] != 0, csub_barrier,
+                                                                nbaf[i], nbrc[i], nbtk[i], nbcc[i] };
         orki_npu_pool_ensure(c);
         pthread_mutex_lock(&c->pmu); c->pjob = cs; c->pjob_nc = nc; c->pjob_fn = ork_csub_worker;
         c->pjob_stride = sizeof(struct ork_csub); c->pdone = 0; c->pgen++; pthread_cond_broadcast(&c->pgo);
         pthread_mutex_unlock(&c->pmu);
         ork_csub_worker(&cs[0]);   /* core 0 on this thread; cores 1..nc-1 on pool threads */
+        double _j0 = ork_now_us();
         pthread_mutex_lock(&c->pmu); while (c->pdone < nc - 1) pthread_cond_wait(&c->pdn, &c->pmu); pthread_mutex_unlock(&c->pmu);
+        if (orki_csp_on > 0) { orki_csp_t[CSP_DISPATCH] += ork_now_us() - _j0; orki_csp_n[CSP_DISPATCH]++; }
         if (csub_barrier) pthread_barrier_destroy(&c->b_ioctl);
         h->prepolled = 1;   /* workers already submitted + drained every core; ork_dyn_end skips its poll */
     } else
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
-        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
-        if (hardened || !c->mwarm[i]) orki_bsync(fd, &c->mcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: ALWAYS for the
+        if (nbaf[i]) orki_bsync_live(fd, &c->maf[i], nbaf[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync_live(fd, &c->mrc[i], nbrc[i], RKNPU_MEM_SYNC_TO_DEVICE);
+        orki_bsync_live(fd, &c->mtk[i], nbtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (hardened || !c->mwarm[i]) orki_bsync_live(fd, &c->mcc[i], nbcc[i], RKNPU_MEM_SYNC_TO_DEVICE);   /* clean-before: ALWAYS for the
             * interleaved decode/stream regime (M<=64 — a shared-scratch dirty line would evict over the NPU write and
             * resurrect a mid-row SENT); cold-only for prefill (M>64, not interleaved — avoids the per-op full flush). */
         c->mwarm[i] = 1;
@@ -744,5 +786,6 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
      * column = SENT). colsplit is int8-only; hardened (M<=64) = full-surface seed, matching orki_mc_recover_resubmit. */
     h->mc_nc = nc; h->mc_dt = dt; h->mc_dom = w->domain; h->mc_seed_all = hardened;   /* mc_dt: I8 recover; fp16 (Stage 1) => recov_max 0 (drains in-submit) */
     for (int i = 0; i < nc && i < ORK_MAXCORE; i++) { h->mc_subs[i] = subs[i]; h->mc_Pc[i] = Pc[i]; }
+    if (orki_csp_on > 0) { orki_csp_t[CSP_BEGIN] += ork_now_us() - csp_beg_t0; orki_csp_n[CSP_BEGIN]++; }
     return h;
 }
