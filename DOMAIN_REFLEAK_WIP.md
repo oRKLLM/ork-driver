@@ -130,3 +130,27 @@ inside the 3600 us limit. Kernel log for the whole run: 0 `reclaim`, 0 domain-sw
 
 **Still unrun on this kernel: `i4` and `test_slice_rescue`** — the known wedger, and `.235` has no
 remote power control.
+
+## int4 root-caused (2026-10-09, final)
+
+`i4` + `test_slice_rescue` re-run on the board-tree + SRAM kernel. SRAM changes nothing
+(`freeSRAM=956KiB` now shows in the dumps, same four failures).
+
+**Cause 1 — the bank-width N-tile.** `Wb=(131072/K)&~63` is too wide on `.235`.
+`ORK_I4_WB=64` makes M=8 K=512 N=256 and M=32 K=1024 N=128 pass `maxerr=0`, and takes
+**`TEST_SLICE_RESCUE` FAIL -> PASS (all 11 cases, every golden matching the `.236` value)**.
+Not universal: M=64/128/256 at K=512 N=256 pass at the default `Wb=256`.
+
+**Cause 2 — H=8 at K=2048 overshoots.** H=2/3/4 agree; H>=6 fails. The two remaining `i4` shapes.
+
+**A blanket `ORK_I4_H` override is UNSAFE.** `ORK_I4_WB=64 ORK_I4_H=4` makes all 16 `i4` shapes
+report `maxerr=0`, but `test_slice_rescue`'s `i4-wideK` (K=10240) and `i4-rem2560` (K=18944) then
+return `rc=0` with a WRONG golden. The H fix must be a per-K table edit.
+
+**The panic.** Stranded NONBLOCK jobs (`NOT dispatching ... run_cnt 0`) on all three cores ->
+power-off delay fires -> `npu1` won't idle -> stock vendor `panic("panic_on_set_idle")` in
+`drivers/soc/rockchip/pm_domains.c` (verified UNCHANGED from the armbian base). Only the board tree
+reaches it: `failed to set idle` appears exactly once in the whole netconsole history. Not the
+watchdog (`wd_period_us=0`) and not the per-core reset (`RKNPU_JOB_STALLED` only).
+
+Logs on the board: `/var/tmp/{i4_sram,i4_wb64,i4_wb64h4,sr_sram,sr_wb64,sr_wb64h4,valS}.log`.
