@@ -1,6 +1,9 @@
 # WIP recovery — `.235` state, and the IOMMU domain-reference leak (2026-10-09)
 
-**`.235` is hard down and needs a physical RST.** Do not power-cycle it from Home Assistant: the only
+**UPDATE: `.235` was reset by hand and is back up on the same kernel. The sections below describing it
+as down are kept as the record of what happened.**
+
+**`.235` was hard down and needed a physical RST.** Do not power-cycle it from Home Assistant: the only
 available outlet there is `Rock 5B Plug`, which is **`.236`** (another agent owns `.236` — hands off).
 
 ## THE KERNEL ON `.235` BOOTS. This is not a boot failure.
@@ -111,3 +114,19 @@ Written up and pushed: wiki `Exp-2026-10-09-The-Domain-Reference-Leak`, Experime
   hunks plus a watchdog) before trusting that kernel for NPU work on `.235`.
 - `test_slice_rescue` / the four `i4` shapes: characterised (board-specific H envelope, see
   `OPS_REGISTRY.md` and PR oRKLLM/ork-driver#26) but not fixed.
+
+## After the RST (2026-10-09, later)
+
+Board back on the same kernel: `uname -r` `6.1.115-vendor-rk35xx-npu`, DDR 2400, A76 2400/2400,
+`rockchip,sram` present, `dom_reclaim` back to its default 1.
+
+Ran `make test`'s full list **minus `i4` and `test_slice_rescue`** (`/var/tmp/val235_safe.sh`, same
+order, under the guard): **fail=0, everything passes** — `ORKD_DOM_API`, `orkd_seq_probe`,
+`chain_xition_probe`, `test_bmm_fused`, `chainrr_conc_probe`, `test_ssd_chunk_npu`,
+`test_mode_transition`, and notably `TEST_F16COLSPLIT` (which FAILED on the PR #390 build).
+`test_speed` 3-core 3405.0 us (scaling 1.78x) vs 3637.7 us / 1.65x on the PR #390 build, so it is now
+inside the 3600 us limit. Kernel log for the whole run: 0 `reclaim`, 0 domain-switch timeouts,
+0 `failed to switch` — the leak fix holds on this tree too. Log: `.235:/var/tmp/valS.log`.
+
+**Still unrun on this kernel: `i4` and `test_slice_rescue`** — the known wedger, and `.235` has no
+remote power control.
