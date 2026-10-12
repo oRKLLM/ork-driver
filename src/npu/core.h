@@ -169,7 +169,8 @@ extern uint64_t orki_sram_total;
 extern volatile sig_atomic_t orki_sig_busy;
 int orki_imp_trace(void);
 int ork_dom(int dom);
-uint64_t orki_opkey(int dt, int mech, int K, int N, int M);   /* op-timing EWMA (predictive drain) */
+uint64_t orki_opkey(int dt, int mech, int K, int N, int M, int geom);   /* op-timing EWMA (predictive drain); geom = tile geometry, 0 if the op has none */
+static inline int orki_geomkey(int H, int Wb){ return (H & 0xffff) | ((Wb & 0xffff) << 16); }   /* int4 BCHAIN tile geometry, as one orki_opkey component */
 double   orki_op_predict_us(ork_npu *c, uint64_t key);        /* 0 = unknown */
 void     orki_op_observe(ork_npu *c, uint64_t key, double us);
 void     orki_op_overslept(ork_npu *c, uint64_t key);

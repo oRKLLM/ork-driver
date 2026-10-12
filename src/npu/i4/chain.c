@@ -617,7 +617,7 @@ static void *bch_mw_worker(void *vp){
      * visible and where steering the in-flight chain is still possible. Placed in BOTH drains because
      * whether ork_dyn_end or the per-core worker does the polling depends on prepolled, which varies by
      * path. ORK_I4_PREDICT=1 enables (default off). */
-    const uint64_t pkey = orki_opkey(4 /*DT_I4*/, 1 /*BCHAIN worker*/, K, N, a->ex[a->e1-1].M);
+    const uint64_t pkey = orki_opkey(4 /*DT_I4*/, 1 /*BCHAIN worker*/, K, N, a->ex[a->e1-1].M, orki_geomkey(H, Wb));
     const double pred = orki_i4_nopredict() ? 0.0 : orki_op_predict_us(c, pkey);
     double t0=ork_now_us();
     int slept_pred = 0, first_check = 1;

@@ -71,6 +71,18 @@ int orki_dyn_collision_landed(ork_dyn_chain *h, int i){
     static int off = -1; if (off < 0) off = getenv("ORK_I4_NOCOLLIDE") ? 1 : 0;
     if (off) return 0;
     const int no = h->nout[i] ? h->nout[i] : h->N;
+    /* BCHAIN's surface is 3/4 PADDING the hardware never writes, so a flat scan of it cannot adjudicate
+     * anything — it is the written cell set that carries the signal. bch_db_cells mode 4 is exactly this
+     * test, per program: a round that never ran leaves EVERY cell of some program at the seed, while a
+     * value collision leaves scattered live cells beside it. */
+    if (h->i4batch) { ork_npu *c = h->c;
+        orki_bsync_live(c->fd, &c->mcc[i], (size_t)no * 2, RKNPU_MEM_SYNC_FROM_DEVICE);
+        if (!orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 4, -1))
+            return 0;
+        fprintf(stderr, "[ork] int4 BCHAIN doorbell: every program wrote output after a DMA sync, so the "
+                        "remaining 0x7fff cells are a saturating W4A4 accumulator reaching the int16 seed, "
+                        "not a dropped round. Accepting core %d as landed (ORK_I4_NOCOLLIDE=1 to refuse).\n", i);
+        return 1; }
     if (no < 1024) return 0;                      /* too small to tell a collision from a stall */
     if (h->outbuf[i]) orki_bsync(h->c->fd, h->outbuf[i], RKNPU_MEM_SYNC_FROM_DEVICE);
     const int16_t *o = (const int16_t*)h->outptr[i];

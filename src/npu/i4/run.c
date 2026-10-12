@@ -68,7 +68,7 @@ static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  * Bit-exact by construction: the cached image IS a full synth, the three address registers are rewritten
  * at every slot they occupy, and nothing else in the synth depends on an address. Wiki: NPU-Quirks. */
 #define I4T_SLOTS 4                       /* max duplicate slots one register may occupy in the template */
-struct orki_i4_tmpl { int valid, mc, K, N; uint32_t ov[3];
+struct orki_i4_tmpl { int valid, mc, K, N; uint32_t ov[4];
                       uint32_t rc[REGCMD_I4_N]; int ns[3], sl[3][I4T_SLOTS]; };
 /* Thread-local (the BCHAIN workers synth concurrently) and 2-way: a tile loop emits one shape for every
  * program but the last M-group and the last N-tile, which alternates two shapes when M%H or N%Wb is
@@ -95,14 +95,15 @@ static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32
 void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     /* The three RE overrides are re-read per call BY DESIGN (one process sweeps them with setenv), so
      * they are part of the cache key rather than baked in. Only the mc>1 arm consults them. */
-    uint32_t ov[3] = {0,0,0};
+    uint32_t ov[4] = {0,0,0,0};
     if(mc > 1){ const char *e;
         if((e = getenv("ORK_I4_DBNK"))) ov[0] = 0x80000000u | (uint32_t)atoi(e);
         if((e = getenv("ORK_I4_1040"))) ov[1] = 0x80000000u | (uint32_t)strtoul(e,0,0);
-        if((e = getenv("ORK_I4_1010"))) ov[2] = 0x80000000u | (uint32_t)strtoul(e,0,0); }
+        if((e = getenv("ORK_I4_1010"))) ov[2] = 0x80000000u | (uint32_t)strtoul(e,0,0);
+        if((e = getenv("ORK_I4_BURST"))) ov[3] = 0x80000000u | (uint32_t)strtoul(e,0,0); }
     if(!orki_i4_fovr_n) for(int w = 0; w < 2; w++){ struct orki_i4_tmpl *t = &orki_i4_tc[w];
         if(t->valid && t->mc == mc && t->K == K && t->N == N
-           && t->ov[0] == ov[0] && t->ov[1] == ov[1] && t->ov[2] == ov[2]){
+           && t->ov[0] == ov[0] && t->ov[1] == ov[1] && t->ov[2] == ov[2] && t->ov[3] == ov[3]){
             memcpy(rc, t->rc, REGCMD_I4_N*4);
             const uint32_t av[3] = { aA, aB, aC };
             for(int i = 0; i < 3; i++) i4t_put(rc, ORKI_I4_ADDR[i], t->sl[i], t->ns[i], av[i]);
@@ -116,7 +117,7 @@ void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
         if(t->ns[i] < 1 || t->ns[i] > I4T_SLOTS) return;   /* unpatchable layout: stay on the full path */
     }
     memcpy(t->rc, rc, REGCMD_I4_N*4);
-    t->mc = mc; t->K = K; t->N = N; t->ov[0] = ov[0]; t->ov[1] = ov[1]; t->ov[2] = ov[2]; t->valid = 1;
+    t->mc = mc; t->K = K; t->N = N; t->ov[0] = ov[0]; t->ov[1] = ov[1]; t->ov[2] = ov[2]; t->ov[3] = ov[3]; t->valid = 1;
 }
 
 static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
@@ -181,6 +182,13 @@ static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32
         /* ORK_I4_1010: override CNA row/activation-cube reg (RE: multi-M computes rows_computed*K=256 elems —
          * a fixed activation-cube budget; find the reg that enlarges it so K=2048 gets >1 row). */
         { const char*e=getenv("ORK_I4_1010"); if(e) orki_setrn(rc,REGCMD_I4_N,RK_CNA_CONV_CON2,(uint32_t)strtoul(e,0,0)); }
+        /* ORK_I4_BURST: CNA_DMA_CON0 (0x1078) = OV4K_BYPASS[31]/WEIGHT_BURST_LEN[19:16]/DATA_BURST_LEN[3:0].
+         * REGCMD_I4 ships 0x000f000f — both bursts at MAXIMUM, the same value int8 copied from an rkllm
+         * capture. RE knob for "is an over-ceiling BCHAIN geometry the CDMA out-running the sequencer?",
+         * which a shorter burst would relieve locally where a lower DRAM clock relieves it globally.
+         * MEASURED ON .235 AND REFUTED, with the opposite sign: shortening the burst breaks a geometry
+         * that WORKS. Do not lower it. Wiki/OPS_REGISTRY carry the sweep. */
+        { const char*e=getenv("ORK_I4_BURST"); if(e) orki_setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON0,(uint32_t)strtoul(e,0,0)); }
     }
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_FEATURE_DATA_ADDR,aA);orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_DATA_ADDR,aB);orki_setrn(rc,REGCMD_I4_N,RK_DPU_DST_BASE_ADDR,aC);
     for(int i=0;i<orki_i4_fovr_n;i++) orki_setr(rc,REGCMD_I4_N,orki_i4_fovr[i].blk,orki_i4_fovr[i].reg,orki_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */

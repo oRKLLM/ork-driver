@@ -413,10 +413,14 @@ int orki_mc_ensure(ork_npu *c,int nc){
  * waking, we overslept and cannot know by how much, so nudge the estimate DOWN instead of recording an
  * inflated sample. That is what stops a too-high estimate from feeding itself (sleep longer -> observe
  * longer -> sleep longer). Real transitions we actually witness are recorded with a normal EWMA. */
-uint64_t orki_opkey(int dt, int mech, int K, int N, int M){
+/* `geom` is the TILE GEOMETRY the op will run at (int4 BCHAIN: H and Wb, via orki_geomkey). It has to be
+ * part of the key because the duration is not a function of the shape alone: the same (K,N,M) run at a
+ * geometry the part takes lands in milliseconds and at one it will not takes seconds of recover. Sharing a
+ * slot between them teaches the EWMA an average of the two, which then mis-sizes the miss window for both. */
+uint64_t orki_opkey(int dt, int mech, int K, int N, int M, int geom){
     uint64_t h = 1469598103934665603ULL;
-    const uint64_t v[5] = { (uint64_t)dt, (uint64_t)mech, (uint64_t)K, (uint64_t)N, (uint64_t)M };
-    for(int i=0;i<5;i++){ h ^= v[i]; h *= 1099511628211ULL; }
+    const uint64_t v[6] = { (uint64_t)dt, (uint64_t)mech, (uint64_t)K, (uint64_t)N, (uint64_t)M, (uint64_t)geom };
+    for(int i=0;i<6;i++){ h ^= v[i]; h *= 1099511628211ULL; }
     return h ? h : 1;
 }
 static inline int orki_opslot(uint64_t key){ return (int)(key & 255u); }

@@ -241,7 +241,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * are the entire source of prefill run-to-run variance. ORK_MISS_TO_US overrides for A/B. */
         /* Shape key + learned duration first: BOTH the miss window and the (opt-in) predictive sleep
          * derive from it, so it has to be computed before either. */
-        const uint64_t pkey = orki_opkey(h->esz == 2 ? 4 : 1, 2 /*dyn_end*/, h->N, h->b_M ? h->b_M : 1, h->S);
+        /* The GEOMETRY is part of the key. An int4 BCHAIN round at a tile geometry this part takes lands in
+         * milliseconds; the same (N,M,S) at one it will not takes seconds of recover. Keyed on shape alone the
+         * two share a slot, the EWMA learns their average, and the miss window below is then wrong for both. */
+        const uint64_t pkey = orki_opkey(h->esz == 2 ? 4 : 1, 2 /*dyn_end*/, h->N, h->b_M ? h->b_M : 1, h->S,
+                                         h->i4batch ? orki_geomkey(h->b_H, h->b_Wb) : 0);
         const double est = orki_op_predict_us(h->c, pkey);        /* 0 = shape not learned yet */
 
         /* LEARNED MISS WINDOW: START GENEROUS, TRIM ONCE KNOWN.
@@ -254,14 +258,20 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * MEASURED cost of getting this wrong: ~3.6 s per miss (time = 23.0s + 3.6s x misses, R^2 0.967
          * over 12 runs) -- the entire source of prefill run-to-run variance.
          * Applies whether or not the predictive SLEEP is on: this is about detecting correctly. */
-        double miss_to;
+        /* THE FLOOR IS MEASURED, NOT A CONSTANT. Its only job is "never declare a miss before the poll has had
+         * a few complete looks", and how long one look takes is a property of the SURFACE, not of the clock: a
+         * flat 50 ms was ~15x a correct 3.5 ms int4 BCHAIN round on one shape and under one pass on another,
+         * so detection could not resolve a drop finer than the floor. Time the first pass instead and floor at
+         * MISS_PASS x that, which scales with the surface by construction. ORK_MISS_FLOOR_US pins it for A/B. */
+        double miss_to; double floor_us = 2000.0;
+        static double mfk = -1; if (mfk < 0) { const char *e = getenv("ORK_MISS_PASS"); mfk = e ? atof(e) : 3.0; }
+        static double mfp = -1; if (mfp < 0) { const char *e = getenv("ORK_MISS_FLOOR_US"); mfp = e ? atof(e) : 0; }
         {   static double mt = -1, k = -1;
             if (mt < 0) { const char *e = getenv("ORK_MISS_TO_US"); mt = e ? atof(e) : 0; }
             if (k  < 0) { const char *e = getenv("ORK_MISS_K");     k  = e ? atof(e) : 6.0; }
             const double CATCHALL = 2000000.0;   /* 2 s: a legit round is never mistaken for a miss */
-            const double FLOOR    =   50000.0;   /* 50 ms: never hair-trigger on a tiny estimate */
             double w = CATCHALL;
-            if (est > 0.0) { w = k * est; if (w < FLOOR) w = FLOOR; if (w > CATCHALL) w = CATCHALL; }
+            if (est > 0.0) { w = k * est; if (w > CATCHALL) w = CATCHALL; }
             if (mt > 0) w = mt;                                   /* explicit override for A/B */
             miss_to = (recov < recov_max) ? w : 3e6;              /* last attempt: full completion wait */
         }
@@ -272,7 +282,13 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         int slept_pred = 0, first_check = 1;
         if (pred > 300.0) { long ns=(long)(pred*750.0); struct timespec ts={ns/1000000000L, ns%1000000000L};
             nanosleep(&ts,NULL); slept_pred=1; }
-        for (;;) { int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
+        int pass0 = 1;
+        for (;;) { double ps = ork_now_us();
+            int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
+            if (pass0) { pass0 = 0;                              /* one complete look over every surface: the floor's unit */
+                floor_us = mfp > 0 ? mfp : mfk * (ork_now_us() - ps);
+                if (floor_us < 2000.0) floor_us = 2000.0;
+                if (miss_to < floor_us) miss_to = floor_us; }
             if (n >= h->S) {                                    /* all tasks, all rows */
                 if (slept_pred && first_check) orki_op_overslept(h->c, pkey);
                 else                           orki_op_observe(h->c, pkey, ork_now_us() - t0);
@@ -295,9 +311,14 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * COLLISION apart from a real miss — the int16 seed 0x7fff is a reachable saturating W4A4
          * accumulator, so one legitimate output can mask completion forever and send us into a
          * resubmit of a round that already ran. See orki_dyn_collision_landed. */
+        /* ONE adjudication pass, then OFF again. collide_ok used to latch for the rest of the chain's life, so
+         * from recover round 1 on, EVERY poll iteration ran the full-surface adjudication its own comment says
+         * "never slows the hot path" — which is where a round's `waited` overshot its window by ~50 ms. Clear
+         * it after the pass: each round still gets exactly one look, inside a spin that stays cheap. */
         if (!h->collide_ok && h->esz == 2) {
             h->collide_ok = 1;
             for (int i = 0; i < h->S; i++) if (!edone[i]) edone[i] = ork_dyn_done_i(h, i);
+            h->collide_ok = 0;
         }
         if (orki_ork_prof) orki_db_poll_us += ork_now_us() - t0;   /* the WAIT half of ork_dyn_end */
         last = ork_dyn_progress(h);
@@ -562,7 +583,15 @@ void orki_mc_recover_resubmit(ork_dyn_chain *h){
     for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
         for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
         if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
-    if (h->esz == 2) {   /* int4: int16 output, full-surface SENT16 (write-order not last-col-last) */
+    if (h->i4batch) {   /* BCHAIN: re-seed ONLY the cells a program writes. The slot is 4x the written cell set
+        * (base = (4*j + 4*Hg*b)*64 inside 4*H*Wmax*64), so the full-surface walk below left ~75% of the surface
+        * permanently at 0x7fff after any recover — which the adjudicator then counted as survivors against a
+        * 0.1% cap and could never pass. Seed what the hardware writes, and nothing else. */
+        for (int x = 0; x < h->S; x++) {
+            orki_bch_db_cells(c, x, h->b_c0[x], h->b_c1[x], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 0, -1);
+            if (h->outbuf[x]) orki_bsync_live(fd, h->outbuf[x], (size_t)(h->nout[x] ? h->nout[x] : h->N) * 2, RKNPU_MEM_SYNC_TO_DEVICE);
+        }
+    } else if (h->esz == 2) {   /* int4: int16 output, full-surface SENT16 (write-order not last-col-last) */
         for (int x = 0; x < h->S; x++) { int no = h->nout[x]; volatile int16_t *o = (volatile int16_t*)h->outptr[x];
             for (int e = 0; e < no; e++){ o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
     } else for (int x = 0; x < h->S; x++) { int Mx = h->oM[x]?h->oM[x]:1, Nx = h->nout[x]?h->nout[x]/Mx:h->N;   /* re-seed sentinels */
