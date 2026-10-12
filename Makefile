@@ -198,6 +198,11 @@ i4_bank_sweep: tools/re/i4_bank_sweep.c $(COBJ)
 i4_role_probe: tools/re/i4_role_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: int4 BCHAIN per-call cost attribution on a MULTI-SHAPE run (what the grow-only scratch
+# buffers' whole-buffer cache maintenance actually costs). Pairs with ORK_BCH_PROF / ORK_BCH_LIVE.
+i4_sync_prof: tools/re/i4_sync_prof.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: OFFLINE CDMA byte-address model + calibration vs ork's known-good standard layout (no NPU/DRM/board).
 # Anchors the M-fold A-layout search in software so on-board work drops to wedge-safe confirmations.
 # Use: make cdma_calib && ./cdma_calib (exit 0 iff the standard model reproduces ork's layouts bit-exact)
