@@ -528,3 +528,87 @@ int orki_i4_run_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, 
     int d = ork_dyn_end(h);
     return (d == M-1) ? 0 : -1;
 }
+
+/* Run the BCHAIN batch, de-escalating the tile geometry if THIS PART will not take it.
+ *
+ * Wb and the orki_i4_hcap() table are constants measured on ONE die. A second RK3588 accepts the
+ * submit and never starts the task at geometries the first one runs, so a doorbell miss here is not
+ * necessarily a dead shape -- it can be a geometry this part will not take. Retry once with the
+ * narrowest N-tile, then once with a shorter M-batch as well. Both steps are bit-exact: same tiles,
+ * same kernel, only the grouping changes, and the goldens are unchanged across them.
+ *
+ * H is only ever LOWERED. Raising it past orki_i4_hcap() does not fail, it MISCOMPUTES SILENTLY, which
+ * is why ORK_I4_H must never be used as a blanket override. A step that would not change the geometry
+ * is skipped, so a part where the measured values hold pays nothing. ORK_I4_NOLADDER=1 for an A/B.
+ *
+ * THE RUNG IS REMEMBERED, and that is the point of this function. The ladder recovered correctly but
+ * re-paid the refused attempt on EVERY call, because nothing recorded that this part had already
+ * refused that geometry -- which on board 10.3.0.235 is 15.86 s per call where the rung it lands on
+ * runs in 3.59 ms. The memo keys on (K,N), the geometry a refusal is a property of, and only ever
+ * TIGHTENS: a lower rung is bit-exact, and the de-escalation path moves to Wb=64 first, the one
+ * N-tile width every measured K accepts. A part that refuses nothing never writes an entry and pays
+ * nothing. A transient miss can pin a shape one rung lower for the life of the process; that costs a
+ * few percent, against three orders of magnitude for getting it wrong the other way.
+ *
+ * Probing is cheap too (ladder_probe): an attempt the ladder can fall back from skips the six recover
+ * rounds and caps its completion wait, so LEARNING a shape costs ~1 s rather than 15.9 s.
+ * Wiki: Exp-2026-10-09-The-Domain-Reference-Leak, Exp-2026-10-12-INT4-BCHAIN-Dispatch-Envelope. */
+#define ORKI_I4_GEOMEMO 64
+static struct { int K, N, rung; } orki_i4_geomemo[ORKI_I4_GEOMEMO];
+static int orki_i4_geomemo_n;
+static pthread_mutex_t orki_i4_geomemo_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static int orki_i4_geomemo_get(int K, int N){
+    int r = 0; pthread_mutex_lock(&orki_i4_geomemo_mu);
+    for(int i = 0; i < orki_i4_geomemo_n; i++)
+        if(orki_i4_geomemo[i].K == K && orki_i4_geomemo[i].N == N){ r = orki_i4_geomemo[i].rung; break; }
+    pthread_mutex_unlock(&orki_i4_geomemo_mu); return r;
+}
+static void orki_i4_geomemo_set(int K, int N, int rung){
+    pthread_mutex_lock(&orki_i4_geomemo_mu);
+    for(int i = 0; i < orki_i4_geomemo_n; i++)
+        if(orki_i4_geomemo[i].K == K && orki_i4_geomemo[i].N == N){
+            if(rung > orki_i4_geomemo[i].rung) orki_i4_geomemo[i].rung = rung;   /* tighten only */
+            pthread_mutex_unlock(&orki_i4_geomemo_mu); return; }
+    if(orki_i4_geomemo_n < ORKI_I4_GEOMEMO){ int i = orki_i4_geomemo_n++;
+        orki_i4_geomemo[i].K = K; orki_i4_geomemo[i].N = N; orki_i4_geomemo[i].rung = rung; }
+    pthread_mutex_unlock(&orki_i4_geomemo_mu);
+}
+
+int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
+    static int noladder = -1; if(noladder < 0) noladder = getenv("ORK_I4_NOLADDER") ? 1 : 0;
+    if(noladder) return orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0, 0);
+    const int K = w->K, N = w->N;
+    int H = orki_i4_hcap(K), Wb = (131072 / K) & ~63;
+    if(Wb > N) Wb = N;
+    /* A rung only exists where it is a DIFFERENT geometry from the one above it. Where it is not
+     * (Wb already 64, or H already <= 4) the memo has to step straight past it, or a shape would
+     * record a rung it can never reach and every later call would skip the attempt that works. */
+    const int r1 = (Wb > 64), r2 = (H > 4);
+    int rung = orki_i4_geomemo_get(K, N), r = -1, missed = 0;
+    if(rung == 0){
+        r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0, (r1 || r2));   /* probe cheaply iff a fallback exists */
+        if(r != -1) return r;
+        missed = 1; rung = 1;
+    }
+    /* RESET before every retry. A geometry the part will not take leaves CBUF residue, and the next
+     * attempt then computes against it -- not a miss but a WRONG ANSWER (test_slice_rescue i4-refuse,
+     * 308202 mismatches, 2026-10-10). This is the same stale-CBUF-residue mode orki_i4_hcap's K=2560
+     * entry documents. ork_npu_mode_reset is the heavyweight ACT_RESET + mode-invalidate, which is what
+     * a retry after a failed submit needs. It is conditioned on `missed`, NOT on "we are past rung 0":
+     * a memoized start attempted nothing, so there is no residue to clear, and resetting anyway costs a
+     * full ACT_RESET + cold re-warm on EVERY call -- measured 216 ms against the 3.6 ms run it precedes,
+     * which ate 98% of what the memo had just won. */
+    if(rung == 1 && r1){
+        if(missed) ork_npu_mode_reset(c);
+        r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64, r2);
+        if(r != -1){ orki_i4_geomemo_set(K, N, 1); return r; }
+        missed = 1; rung = 2;
+    } else if(rung == 1) rung = 2;
+    if(rung >= 2 && r2){
+        if(missed) ork_npu_mode_reset(c);
+        r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64, 0);
+        if(r != -1) orki_i4_geomemo_set(K, N, 2);
+    }
+    return r;
+}

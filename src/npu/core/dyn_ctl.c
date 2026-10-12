@@ -225,6 +225,10 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     int edone[1024];
     int last = -1;
     int recov_max = (h->mc_nc > 0 && (h->mc_dt == DT_I8 || h->mc_dt == DT_I4)) ? 6 : 0;   /* mc int8/int4 rounds carry stashed context to resubmit; a few retries clear a sticky/correlated drop */
+    /* A ladder PROBE has a bit-exact fallback waiting, so recovery here is pure waste: resetting and
+     * resubmitting the same refused geometry six times cannot make this part accept it, and the final
+     * attempt's 3 s completion wait is charged for nothing. Fail it fast and let the caller step down. */
+    if (h->ladder_probe) recov_max = 0;
     double t0 = ork_now_us();
     if (h->prepolled) { last = h->S - 1; for (int i = 0; i < h->S; i++) edone[i] = 1; }   /* parallel colsplit: workers already drained all cores — skip the redundant poll (its miss-timeout was the ~500ms stall) */
     else for (int recov = 0; ; recov++) {
@@ -274,6 +278,10 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             if (est > 0.0) { w = k * est; if (w > CATCHALL) w = CATCHALL; }
             if (mt > 0) w = mt;                                   /* explicit override for A/B */
             miss_to = (recov < recov_max) ? w : 3e6;              /* last attempt: full completion wait */
+            /* ...except a ladder probe, which must not pay that wait: a correct BCHAIN round at any shipped
+             * geometry lands in single-digit ms (the ~107 ms outlier is the process's first, cold call), so
+             * 1 s is far outside the correct envelope while being 16x cheaper than the full miss. */
+            if (h->ladder_probe && miss_to > 1e6) miss_to = 1e6;
         }
 
         /* PREDICTIVE DRAIN (opt-in). Sleep through the predictable part, spin the tail -- the tail is where

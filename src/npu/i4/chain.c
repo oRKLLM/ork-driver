@@ -91,7 +91,7 @@ int orki_i4_validate=-1;   /* ORK_I4_VALIDATE: per-program regcmd validation (DE
  *
  * Above K=8192 there is NO H regime: pack.c K-slices at 8192, so every such shape arrives as <=8192
  * sub-tiles and this table answers it (K=18944 -> {8192,8192,2560}). */
-static int orki_i4_hcap(int K){
+int orki_i4_hcap(int K){
     static const short KT[] = { 32, 64, 96,128,160,192,224,256,512,768,1024,1280,1536,1792,
                                2048,2304,2560,2816,3072,3584,4096,4608,5120,6144,8192};
     static const short HT[] = {128,128,128,128, 64, 64, 64, 64, 32, 22,  16,  13,  11,   9,
@@ -436,8 +436,8 @@ static void *bch_db_worker(void *vp){
     a->rc=-2; return NULL;
 }
 
-static int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc,
-                              int Hlim, int Wblim){
+int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc,
+                       int Hlim, int Wblim, int probe){
     if(w->dtype!=DT_I4 || w->Sk!=1 || w->Sn!=1 || (w->N%64) || M<2) return -4;
     int fd=c->fd, K=w->K, N=w->N;
     /* accurate wedge telemetry: the BCHAIN worker skips validate_regcmd by default, so orki_last_op would
@@ -526,6 +526,7 @@ static int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int3
     h->c=c; h->S=nc; h->P=nc; h->N=N; h->mc=1; h->esz=2; h->dom=dom; h->mc_nc=nc; h->mc_dt=DT_I4; h->mc_dom=dom;
     h->prepolled = getenv("ORK_I4_BLOCKING")?1:0;   /* #54 BLOCKVERIFY(default)+NONBLOCK: prepolled=0 => ork_dyn_end drain-verifies (BLOCKVERIFY's verify is short, post-completion). Pure ORK_I4_BLOCKING: prepolled=1, no verify (miscomputes; A/B only). */
     h->i4batch=1; h->b_H=H; h->b_Wb=Wb; h->b_Wmax=Wmax; h->b_NG=NG; h->b_M=M; h->b_N=N; h->b_C=C;
+    h->ladder_probe=probe;   /* a geometry the caller can fall back from: miss cheaply, don't recover */
     for(int i=0;i<nc && i<ORK_MAXCORE;i++){
         h->outbuf[i]=&c->mcc[i]; h->outptr[i]=(int32_t*)c->mcc[i].cpu;
         h->nout[i]=(int)((size_t)args[i].NT*(size_t)(4*H*Wmax)*64); h->oM[i]=1;
@@ -535,34 +536,6 @@ static int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int3
     if(missed){ free(h); return -1; }   /* a core's blocking submit never completed — don't de-tile garbage; caller falls back */
     int last=ork_dyn_end(h);   /* prepolled: skips poll, de-tiles (i4batch) into C, frees h */
     return (last==nc-1) ? 0 : -1;
-}
-
-/* Run the BCHAIN batch, de-escalating the tile geometry if the hardware will not take it.
- *
- * Wb and the orki_i4_hcap() table are constants measured on ONE die. A second RK3588 accepts the
- * submit and never starts the task at geometries the first one runs, so a doorbell miss here is not
- * necessarily a dead shape -- it can be a geometry this part will not take. Retry once with the
- * narrowest N-tile, then once with a shorter M-batch as well. Both steps are bit-exact: same tiles,
- * same kernel, only the grouping changes, and the goldens are unchanged across them.
- *
- * H is only ever LOWERED. Raising it past orki_i4_hcap() does not fail, it MISCOMPUTES SILENTLY, which
- * is why ORK_I4_H must never be used as a blanket override. A step that would not change the geometry
- * is skipped, so a part where the measured values hold pays nothing. ORK_I4_NOLADDER=1 for an A/B.
- * Wiki: Exp-2026-10-09-The-Domain-Reference-Leak. */
-int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
-    int r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0);
-    if(r != -1 || getenv("ORK_I4_NOLADDER")) return r;
-    int H = orki_i4_hcap(w->K), Wb = (131072/w->K) & ~63;
-    if(Wb > w->N) Wb = w->N;
-    /* RESET before every retry. A geometry the part will not take leaves CBUF residue, and the next
-     * attempt then computes against it -- not a miss but a WRONG ANSWER (test_slice_rescue i4-refuse,
-     * 308202 mismatches, 2026-10-10). This is the same stale-CBUF-residue mode orki_i4_hcap's K=2560
-     * entry documents. ork_npu_mode_reset is the heavyweight ACT_RESET + mode-invalidate, which is what
-     * a retry after a failed submit needs; it costs nothing on the path that never retries. */
-    if(Wb > 64){ ork_npu_mode_reset(c); r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64);
-                 if(r != -1) return r; }
-    if(H > 4){   ork_npu_mode_reset(c); r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64); }
-    return r;
 }
 
 static void *bch_mw_worker(void *vp){

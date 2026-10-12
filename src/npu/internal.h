@@ -259,6 +259,9 @@ struct ork_dyn_chain {
     int        b_H, b_Wb, b_Wmax, b_NG, b_M, b_N;   /* BCHAIN geometry (shared across cores) */
     int        b_c0[ORK_MAXCORE], b_c1[ORK_MAXCORE], b_NT[ORK_MAXCORE];   /* per-core N-chunk range + program count */
     int32_t   *b_C;                    /* caller's int32 C (de-tile destination) */
+    int        ladder_probe;           /* 1 = this round is the BCHAIN geometry ladder PROBING a geometry it has a
+                                        * bit-exact fallback for, so a miss must be declared CHEAPLY: no recover
+                                        * rounds and a short completion wait (orki_i4_run_bchain_db). */
     int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
                              * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
     int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core

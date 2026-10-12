@@ -30,6 +30,9 @@ int ork_i4_npu_probe_mm(ork_npu *c,int M,int K,int N,const int8_t *A,const int8_
 int orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);
 int orki_i4_submit_tmo_ms(void);
 int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);
+int orki_i4_hcap(int K);   /* measured rows-per-weight-stream ceiling (chain.c); the ladder in run.c reads it */
+int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc,
+                       int Hlim, int Wblim, int probe);   /* one rung of that ladder; probe = fail fast, caller falls back */
 int orki_i4_run_experts_bchain_db(ork_npu *c, const ork_mm_task_i4 *ex, int ntask, int nc);
 int orki_i4_slice_run(ork_npu *c, ork_w_sliced *w, int M, const int8_t *A, int32_t *C, int nc);
 ork_w *ork_i4_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n);
