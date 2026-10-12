@@ -129,8 +129,12 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
 ```
 
 - The validated board is RK3588 (SBC IP: `10.3.0.236`). **There is now a SECOND RK3588 board,
-  `10.3.0.235`** (ROCK 5B+, LPDDR5 @ 2400 MHz, A76 @ 2400 MHz, stock Armbian vendor kernel). It has
-  NO NPU kernel patches yet — no rknpu IOMMU refcount fix and no NPU SRAM — so it is **not** a
+  `10.3.0.235`** (ROCK 5B+, LPDDR5 @ 2400 MHz, A76 @ 2400 MHz). **It is NOT a stock-kernel control —
+  that claim was stale from 2026-10-09 and it cost a later investigation its premise.** Since
+  2026-10-09 `.235` runs the same board tree as `.236` (`board-snapshot-2026-10-09`) with NPU SRAM
+  enabled, and since 2026-10-12 it additionally carries the rknpu `list_del` fixes (wiki
+  *Kernel-Modifications* `#patch74`). `uname -r` is the only trustworthy answer to "what is this
+  board running" — **read it, do not infer it from this file.** `.235` is still **not** a
   substitute for `.236` on anything NPU-related, and the two boards' numbers are **not comparable**
   (different DDR type and clock, different kernel, different bootloader). Bring-up record, including
   the two defects that had to be fixed to reach the benchmark standard, is on the wiki:
@@ -172,6 +176,14 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
     device, not the process name.
   - The guard is read-only (it reads `/proc`, sysfs and `dmesg`), so it is always safe to run, including
     while someone else's job is in flight.
+- **NEVER edit a shell script while it is running.** `bash` reads a script **incrementally**, not all at
+  once, so rewriting the file under a running shell makes it resume at a byte offset into the *new* text
+  — it executes spliced garbage or dies with a syntax error partway. Cost a 21-minute board arm on
+  2026-10-12 (a validation script re-staged mid-run errored out after its rounds). Stage the next version
+  under a **new filename** and launch that; never `scp`/`Write` over a script a board run is executing.
+- **`/tmp` on the board does not survive a reboot.** Any helper script staged there (validators, bench
+  wrappers) is gone after a kernel flip — re-copy before the first post-reboot run, or the run fails with
+  `No such file or directory` and looks like a board problem. Durable board-side scratch is `~/work/`.
 - The NPU is **single-stream**: `make test` runs the examples serially; a wedged submit can stall the next — keep that in mind when adding tests.
   - **SBC Hard Wedge**: If the board becomes completely/hard wedged (unresponsive over SSH), use the Home Assistant MCP tools to power cycle the **"Rock 5B Plug"** smart plug. Specifically, call the `mcp_context-forge_home-assistant-hassturnoff(name="Rock 5B Plug")` tool to turn off the smart plug, followed by `mcp_context-forge_home-assistant-hassturnon(name="Rock 5B Plug")` to turn it back on.
     - **If a plug power-cycle does NOT bring it back** (plug reports `on`, but no ping/SSH after several minutes): the SPI bootloader has likely been corrupted (a hard power-cut mid-NPU-submit, or the abrupt loss, can corrupt SPI — the board then won't boot even with power restored). Recovery requires PHYSICAL access: **reflash the SPI image, then reboot from the Belkin power supply.** This was sufficient on `10.3.0.236` — **the SSD did NOT need reseating** (rootfs was intact; only the SPI bootloader was gone). A remote plug cycle cannot fix this — hand off to a physically-present operator.
