@@ -199,6 +199,12 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
     __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
     return 0; }
 
+/* One core's share of the int4 BCHAIN de-tile, shaped for the persistent pool (see ork_dyn_end). */
+struct ork_bchdt { ork_dyn_chain *h; int i; };
+static void *orki_bch_detile_worker(void *vp){ struct ork_bchdt *a = vp; ork_dyn_chain *h = a->h; int i = a->i;
+    orki_bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
+    return NULL; }
+
 int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     double csp_end_t0 = ork_now_us();
     int drain_fail = 0;   /* a full-surface verify timed out => partials were never written */
@@ -400,8 +406,25 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
     if (orki_csp_on > 0) { orki_csp_t[CSP_ENDSYNC] += ork_now_us() - _e0; orki_csp_n[CSP_ENDSYNC]++; }
     double _e1 = ork_now_us();
     if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
-        for (int i = 0; i < h->S; i++)
-            orki_bch_db_cells(h->c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, h->b_C, 2, -1);
+        /* FANNED OUT over the existing persistent pool. The widen is already a tight NEON loop
+         * (ldr q / sxtl / sxtl2 / stp q), so the remaining lever is that it ran on ONE thread for
+         * ALL cores' outputs. Core i owns N-tiles [c0,c1), so the cores write DISJOINT column
+         * ranges of C in 64-element (256 B) blocks at 256 B-aligned offsets: no overlap and no
+         * false sharing. */
+        ork_npu *pc = h->c; int S = h->S;
+        orki_npu_pool_ensure(pc);
+        int P = S; if (P > pc->pool_n) P = pc->pool_n; if (P > ORK_MAXCORE) P = ORK_MAXCORE;
+        struct ork_bchdt a[ORK_MAXCORE];
+        for (int i = 0; i < P; i++) a[i] = (struct ork_bchdt){ h, i };
+        if (P > 1) {
+            pthread_mutex_lock(&pc->pmu); pc->pjob = a; pc->pjob_nc = P; pc->pjob_fn = orki_bch_detile_worker;
+            pc->pjob_stride = sizeof(struct ork_bchdt); pc->pdone = 0; pc->pgen++;
+            pthread_cond_broadcast(&pc->pgo); pthread_mutex_unlock(&pc->pmu);
+            orki_bch_detile_worker(&a[0]);                               /* core 0 on the calling thread */
+            pthread_mutex_lock(&pc->pmu); while (pc->pdone < P-1) pthread_cond_wait(&pc->pdn, &pc->pmu); pthread_mutex_unlock(&pc->pmu);
+        } else if (P == 1) orki_bch_detile_worker(&a[0]);
+        for (int i = P; i < S; i++) {                                    /* more outputs than pool threads: finish serially rather than wait forever */
+            struct ork_bchdt t = { h, i }; orki_bch_detile_worker(&t); }
     }
     /* mc: outputs were written to the in-domain per-core scratch (outptr) — copy each back to the caller's C.
      * int4 (esz==2): the NPU wrote an int16 accumulator; widen int16->int32 into the caller's int32 C. */
