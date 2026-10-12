@@ -88,7 +88,10 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         ork_npu *c = h->c;
         int ok = orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 1, h->b_NT[i]-1);
         if (ok) {
-            orki_bsync(c->fd, &c->mcc[i], RKNPU_MEM_SYNC_FROM_DEVICE);
+            /* Only the live tile extent: mcc is grow-only scratch with a 2 MiB/core pre-allocation floor,
+             * so a whole-buffer sync charges cache maintenance over the widest shape the process ever ran. */
+            orki_bsync_live(c->fd, &c->mcc[i], h->nout[i] ? (size_t)h->nout[i]*2 : c->mcc[i].size,
+                            RKNPU_MEM_SYNC_FROM_DEVICE);
             ok = orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);
         }
         /* This branch polls an int16 surface too, so it is subject to the same seed collision as the

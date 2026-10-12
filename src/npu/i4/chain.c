@@ -368,7 +368,7 @@ static void *bch_db_worker(void *vp){
     uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
     for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
         for(int j=0;j<Hg;j++) orki_i4_tile_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
-    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync_live(fd,&c->maf[i],(size_t)NG*(size_t)(2*H)*(K/2),RKNPU_MEM_SYNC_TO_DEVICE);   /* LIVE extent: the per-core scratch is grow-only with a fixed allocation floor, so a whole-buffer sync charges cache maintenance over the widest shape the process ever ran */
     int tk=0;
     for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
         uint32_t wdma=(uint32_t)(a->w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
@@ -392,11 +392,11 @@ static void *bch_db_worker(void *vp){
                 rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
             else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
             memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync_live(fd,&c->mrc[i],(size_t)NT*REGCMD_I4_N*4,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
     for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
         t[q].regcfg_amount=116; t[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync_live(fd,&c->mtk[i],(size_t)NT*sizeof(struct rknpu_task),RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     memset(&a->sub,0,sizeof a->sub);
     a->sub.task_number=(uint32_t)NT; a->sub.task_obj_addr=c->mtk[i].obj;
     a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
@@ -418,7 +418,7 @@ static void *bch_db_worker(void *vp){
      * "555 blocking" is unattainable-while-correct; NONBLOCK is the best CORRECT option. Default = NONBLOCK(1). */
     static int i4mode=-1; if(i4mode<0) i4mode = getenv("ORK_I4_BLOCKVERIFY")?0 : (getenv("ORK_I4_BLOCKING")?2 : 1);
     if(i4mode!=2){   /* BLOCKVERIFY(0) + NONBLOCK(1): seed the SENT16 landing sentinel so ork_dyn_end can drain-verify */
-        orki_bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+        orki_bch_db_cells(c,i,a->c0,a->c1,Wb,N,NG,M,H,Wmax,NULL,0,-1); orki_bsync_live(fd,&c->mcc[i],(size_t)NT*(size_t)(4*H*Wmax)*64*2,RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
         if(i4mode==1){   /* NONBLOCK doorbell: submit + return; ork_dyn_end (prepolled=0) polls from t=0 */
             a->sub.flags=ork_ppflags()|0x2u; a->sub.timeout=orki_i4_submit_tmo_ms();
             orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1; a->rc=0; return NULL; }
@@ -578,7 +578,7 @@ static void *bch_mw_worker(void *vp){
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
             for(int j=0;j<Hg;j++) orki_i4_tile_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
         aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    orki_bsync(fd,&c->maf[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync_live(fd,&c->maf[i],AFtot,RKNPU_MEM_SYNC_TO_DEVICE);   /* live extent = the bytes just staged */
     /* build the chained regcmd across all experts (tk = cumulative program index) */
     aoff=0; int tk=0;
     for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; ork_w *w=t->w; int M=t->M, NG=(M+H-1)/H;
@@ -598,18 +598,18 @@ static void *bch_mw_worker(void *vp){
                 else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
                 memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
         aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
-    orki_bsync(fd,&c->mrc[i],RKNPU_MEM_SYNC_TO_DEVICE);
+    orki_bsync_live(fd,&c->mrc[i],(size_t)NTtot*REGCMD_I4_N*4,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tt=c->mtk[i].cpu; memset(tt,0,(size_t)NTtot*sizeof*tt);
     for(int q=0;q<NTtot;q++){ tt[q].enable_mask=0xd; tt[q].int_mask=0x300; tt[q].int_clear=0x1ffff;
         tt[q].regcfg_amount=116; tt[q].regcmd_addr=c->mrc[i].dma+(uint64_t)q*REGCMD_I4_N*4; }
-    orki_bsync(fd,&c->mtk[i],RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
+    orki_bsync_live(fd,&c->mtk[i],(size_t)NTtot*sizeof(struct rknpu_task),RKNPU_MEM_SYNC_TO_DEVICE|RKNPU_MEM_SYNC_FROM_DEVICE);
     memset(&a->sub,0,sizeof a->sub);
     a->sub.flags=ork_ppflags()|0x2u; a->sub.task_number=(uint32_t)NTtot; a->sub.task_obj_addr=c->mtk[i].obj;
     a->sub.core_mask=1u<<i; a->sub.fence_fd=-1;
     a->sub.subcore_task[0]=a->sub.subcore_task[1]=a->sub.subcore_task[2]=(struct rknpu_subcore_task){0,(uint32_t)NTtot};
     { int tb=0; for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H;   /* seed SENT16 for every expert's cells */
         bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,0,-1,tb); tb+=NC*NG; } }
-    orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
+    const size_t mcc_live=(size_t)NTtot*(size_t)(4*H*Wmax)*64*2;   /* LIVE extent: every expert's cells, one program stride each */ orki_bsync_live(fd,&c->mcc[i],mcc_live,RKNPU_MEM_SYNC_TO_DEVICE); __asm__ volatile("dsb ish":::"memory");
     a->sub.timeout=orki_i4_submit_tmo_ms(); orki_rknpu_submit_ioctl(fd,&a->sub,dom); c->mwarm[i]=1;   /* #54 bounded timeout: a dropped coalesced job is then reapable by the per-expert fallback's timeout_clean */
     int NGl=(a->ex[a->e1-1].M+H-1)/H, NTl=NC*NGl, tbl=NTtot-NTl;   /* last program of the whole chain lands last */
     /* PREDICTIVE DRAIN. Having polled this shape once we know roughly how long it runs, so sleep through
@@ -625,7 +625,7 @@ static void *bch_mw_worker(void *vp){
         nanosleep(&ts,NULL); slept_pred=1; }
     for(;;){
         if(bch_db_cells_off(c,i,0,NC,Wb,N,NGl,a->ex[a->e1-1].M,H,Wmax,NULL,1,NTl-1,tbl)){   /* last-program civac gate */
-            orki_bsync(fd,&c->mcc[i],RKNPU_MEM_SYNC_FROM_DEVICE);
+            orki_bsync_live(fd,&c->mcc[i],mcc_live,RKNPU_MEM_SYNC_FROM_DEVICE);
             int ok=1, vb=0;
             for(int e=a->e0;e<a->e1 && ok;e++){ int NG=(a->ex[e].M+H-1)/H;
                 if(!bch_db_cells_off(c,i,0,NC,Wb,N,NG,a->ex[e].M,H,Wmax,NULL,3,-1,vb)) ok=0; vb+=NC*NG; }
@@ -846,7 +846,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
     int NMAX = c->soc->nmax, KS = ORK_I4_KS;
-    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc); size_t AFl[ORK_MAXCORE] = {0};   /* AFl = per-core staged A bytes, the maf live extent */
     for (int i = 0; i < nc; i++) {
         int lo = (int)((long)i * S / nc), hi = (int)((long)(i+1) * S / nc), P = hi - lo;
         if (P < 1) { Pc[i] = 0; continue; }
@@ -898,7 +898,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
             h->nout[gi] = Sk * N; h->oM[gi] = 1; h->oSk[gi] = Sk; h->oK[gi] = K;   /* Sk int16 partial blocks of [N]; end() sums -> int32 C */
             coff += (size_t)Sk * N * 2;
         }
-        memset(&subs[i], 0, sizeof subs[i]);
+        AFl[i] = astage; memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj;
         subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
         subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
@@ -908,8 +908,8 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
         for (int col = 0; col < N; col++){ o[col] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[col]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
-        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync_live(fd, &c->maf[i], AFl[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync_live(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4, RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
+        orki_bsync_live(fd, &c->mtk[i], (size_t)Pc[i]*sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     /* TASK #4: stash context so ork_dyn_end recovers a dropped int4 round (same ~1/2000 doorbell-drop; the
@@ -941,7 +941,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
         if (c->mccsz[i] < osz) { orki_bdestroy(fd, &c->mcc[i]); c->mcc[i] = orki_bcreate(fd, osz, 0x403, c->dom_active);
             if (!c->mcc[i].cpu) { free(h); return NULL; } c->mccsz[i] = osz; c->mwarm[i] = 0; } }
     uint32_t rc[REGCMD_I4_N];
-    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
+    struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc); size_t AFl[ORK_MAXCORE] = {0};   /* AFl = per-core staged A bytes, the maf live extent */
     for (int i = 0; i < nc; i++) { int lo=(int)((long)i*M/nc), hi=(int)((long)(i+1)*M/nc), P=hi-lo; if (P<1) { Pc[i]=0; continue; }
         int Pcore = P * Sn * Sk; Pc[i] = Pcore;
         if ((size_t)Pcore * REGCMD_I4_N * 4 > c->mrc[i].size || (size_t)Pcore * sizeof(struct rknpu_task) > c->mtk[i].size) { free(h); return NULL; }
@@ -972,7 +972,7 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
             h->nout[gi] = Sk * N; h->oM[gi] = 1;                     /* Sk int16 partial blocks; grouped_end float-accumulates */
             coff += (size_t)Sk * N * 2;
         }
-        memset(&subs[i], 0, sizeof subs[i]);
+        AFl[i] = astage; memset(&subs[i], 0, sizeof subs[i]);
         subs[i].flags = ork_ppflags() | 0x2u; subs[i].task_number = pp; subs[i].task_obj_addr = c->mtk[i].obj; subs[i].core_mask = 1u << i; subs[i].fence_fd = -1;
         subs[i].subcore_task[0] = subs[i].subcore_task[1] = subs[i].subcore_task[2] = (struct rknpu_subcore_task){0, (uint32_t)pp};
     }
@@ -980,8 +980,8 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
         for (int e = 0; e < no; e++) { o[e] = ORK_DYN_SENT16; __asm__ volatile("dc cvac,%0"::"r"(&o[e]):"memory"); } }
     __asm__ volatile("dsb ish":::"memory");
     for (int i = 0; i < nc; i++) if (Pc[i]) {
-        orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync(fd, &c->mrc[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
-        orki_bsync(fd, &c->mtk[i], RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
+        orki_bsync_live(fd, &c->maf[i], AFl[i], RKNPU_MEM_SYNC_TO_DEVICE); orki_bsync_live(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4, RKNPU_MEM_SYNC_TO_DEVICE); orki_rc_verify(fd, &c->mrc[i], (size_t)Pc[i]*REGCMD_I4_N*4);
+        orki_bsync_live(fd, &c->mtk[i], (size_t)Pc[i]*sizeof(struct rknpu_task), RKNPU_MEM_SYNC_TO_DEVICE | RKNPU_MEM_SYNC_FROM_DEVICE);
         subs[i].timeout = orki_i4_ktmo_ms(); orki_i4_submit_maybe_nochain(fd, &subs[i], dom); }   /* #54 bounded (int4 doorbell): a dropped submit must be PAST its timeout by the poll window so ork_dyn_end's recover resubmit reaps it via rknpu_job_timeout_clean. With the 8s mm_timeout_ms a dom-0 drop's stuck job stayed unreaped -> iommu_domain_refcount>0 -> the switch to dom 1 TIMED OUT at scale (the 35B wedge; the small probe never dropped). */
     for (int i = 0; i < nc; i++) c->mwarm[i] = 1;
     ork_install_term();

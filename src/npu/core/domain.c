@@ -203,6 +203,7 @@ static void orki_dom_drain_kn(ork_npu *c, int K, int N, unsigned cmask){
 void orki_dom_activate(ork_npu *c,int dom){
     if(dom<0) dom=0;
     if(dom==c->dom_active) return;
+    double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: the WHOLE switch, barrier included */
     /* #54 RETIREMENT BARRIER: a nonblock doorbell op is "done" when its output cell lands, which can be BEFORE
      * the kernel retires the job (completion IRQ). Switching the IOMMU domain while the PRIOR domain's job is
      * still in-flight races it -> the first submit in the new domain dispatches nothing (task counter 0x0) ->
@@ -213,8 +214,9 @@ void orki_dom_activate(ork_npu *c,int dom){
       if(drain){ orki_dom_drain(c); }                            /* real barrier: replaces the sleep below */
       else { static long su=-1; if(su<0){ const char*e=getenv("ORK_DOM_SETTLE_US"); su=e?atol(e):1000; }
              if(su>0){ struct timespec ts={su/1000000,(su%1000000)*1000}; nanosleep(&ts,NULL); } } }
+    double _sw_t1 = ork_now_us();                 /* end of the retirement barrier */
     ork_dom_flush_if_dirty(c);   /* #54 THE multi-domain fix: if an int4 doorbell drop left a stuck job in the OUTGOING domain, REAP it now (same-domain timeout_clean, still attached to dom_active) so the switch below finds the domain idle instead of timing out -> cascade. See ork_dom_flush_if_dirty. */
-    double _sw_t0 = ork_now_us();                 /* ORK_DOM_PROFILE: real-switch swap cost */
+    double _sw_t2 = ork_now_us();                 /* end of the stuck-job reap; the park/restore starts here */
     if(orki_dom_reserve(c, (dom>c->dom_active?dom:c->dom_active)+1)) return;   /* grow arrays to cover both old + new domain (also allocates dom_save on first multi-domain use); OOM -> skip */
     struct ork_dom_scratch *old=&c->dom_save[c->dom_active], *neo=&c->dom_save[dom];
     /* park active -> old */
@@ -263,7 +265,8 @@ void orki_dom_activate(ork_npu *c,int dom){
       static int ramp=-2; if(ramp==-2){ const char*e=getenv("ORK_DOM_RAMP"); ramp=e?atoi(e):0; }
       int nr = ramp; if(nr > (int)(sizeof RAMP/sizeof RAMP[0])) nr = (int)(sizeof RAMP/sizeof RAMP[0]);
       for(int _r=0; _r<nr; _r++) orki_dom_drain_kn(c, RAMP[_r].K, RAMP[_r].N, ~0u); }
-    { double _dt = ork_now_us() - _sw_t0;         /* ORK_DOM_PROFILE accounting: total, max, and first-touch split */
+    { double _end = ork_now_us(), _dt = _end - _sw_t0;   /* ORK_DOM_PROFILE: total, max, first-touch, and the three components */
       c->dom_sw_n++; c->dom_sw_us += _dt; if(_dt > c->dom_sw_max_us) c->dom_sw_max_us = _dt;
+      c->dom_sw_drain_us += _sw_t1 - _sw_t0; c->dom_sw_flush_us += _sw_t2 - _sw_t1; c->dom_sw_swap_us += _end - _sw_t2;
       if(_first){ c->dom_sw_first_n++; c->dom_sw_first_us += _dt; } }
 }

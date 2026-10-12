@@ -242,10 +242,14 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
     ork_load_prof_dump(); ork_ssm_prof_dump(); ork_npu_xprof_dump();
     if(getenv("ORK_DOM_PROFILE") && c->dom_sw_n){   /* domain-swap window telemetry */
         uint64_t steady_n = c->dom_sw_n - c->dom_sw_first_n; double steady_us = c->dom_sw_us - c->dom_sw_first_us;
-        fprintf(stderr, "[ork DOM-SWAP] %llu real switches (%.1f us total, %.2f us max) | first-touch %llu (%.0f us, one-time bcreate) | steady swaps %llu = %.3f us total, %.4f us/swap avg\n",
-            (unsigned long long)c->dom_sw_n, c->dom_sw_us, c->dom_sw_max_us,
+        fprintf(stderr, "[ork DOM-SWAP] %llu real switches (%.1f us total, %.2f us max, %.2f us/switch avg) | first-touch %llu (%.0f us, one-time bcreate) | steady %llu = %.1f us total, %.2f us/swap avg\n"
+                        "[ork DOM-SWAP]   components: retirement barrier %.1f us (%.2f us/switch) | stuck-job reap %.1f us (%.2f us/switch) | scratch park/restore %.1f us (%.3f us/switch)\n",
+            (unsigned long long)c->dom_sw_n, c->dom_sw_us, c->dom_sw_max_us, c->dom_sw_us/(double)c->dom_sw_n,
             (unsigned long long)c->dom_sw_first_n, c->dom_sw_first_us,
-            (unsigned long long)steady_n, steady_us, steady_n ? steady_us/(double)steady_n : 0.0);
+            (unsigned long long)steady_n, steady_us, steady_n ? steady_us/(double)steady_n : 0.0,
+            c->dom_sw_drain_us, c->dom_sw_drain_us/(double)c->dom_sw_n,
+            c->dom_sw_flush_us, c->dom_sw_flush_us/(double)c->dom_sw_n,
+            c->dom_sw_swap_us,  c->dom_sw_swap_us /(double)c->dom_sw_n);
     }
     if(c->seq_witness){ ork_mm_free(c, c->seq_witness); c->seq_witness=NULL; }   /* B2 terminal-SDP witness weight */
     ork_ssm_helper_stop(c);   /* join the persistent little-core helper (no-op if never spawned) */
