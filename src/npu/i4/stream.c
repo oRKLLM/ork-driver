@@ -44,7 +44,6 @@ static void *stream_worker_i4(void *vp) {
                 for (int j = 0; j < H; j++)                   /* real row j at A-slot 2j (stride-2 input) */
                     orki_i4_tile_Aslice(abase + (size_t)(2 * j) * (K / 2), t->A + (size_t)(m0 + j) * K, 0, K);
                 orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
-                memset(rc, 0, sizeof rc);
                 orki_i4_synth(rc, 2 * H, K, N, (uint32_t)c->maf[i].dma, bdma, (uint32_t)c->mcc[i].dma);
                 rc[216] = 0; rc[217] = 0; rc[218] = 0x00000014; rc[219] = 0x01010000;   /* single task */
                 memcpy(c->mrc[i].cpu, rc, REGCMD_I4_N * 4);
@@ -73,7 +72,6 @@ static void *stream_worker_i4(void *vp) {
         for (int m = 0; m < M; m++) orki_i4_tile_Aslice(abase + (size_t)m * K, t->A + (size_t)m * K, 0, K);
         orki_bsync(fd, &c->maf[i], RKNPU_MEM_SYNC_TO_DEVICE);
         for (int m = 0; m < M; m++) {                         /* one single-row regcmd per row, PC-chained */
-            memset(rc, 0, sizeof rc);
             orki_i4_synth(rc, 1, K, N, (uint32_t)(c->maf[i].dma + (size_t)m * K), bdma,
                      (uint32_t)(c->mcc[i].dma + (size_t)m * N * 2));
             if (m < M - 1) {

@@ -59,7 +59,67 @@ int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSC
 
 static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=(e&&atoi(e))?1:0;} return v; }  /* default OFF: under pinned-DDR benchmarking N-subslice is ~neutral (submit overhead cancels the weight-DMA saving); the "1.1-1.2x" seen earlier was an unpinned-governor artifact. Kept opt-in. */
 
+/* Per-shape regcmd template cache for orki_i4_synth.
+ *
+ * A full synth is ~23 orki_setr passes, each a linear scan of the whole 232-word buffer that does not
+ * stop at a match — 2.31 us/program, which is 11.4% of a shipped-geometry BCHAIN call. But consecutive
+ * programs of one matmul differ ONLY in their three address registers: everything else is a function of
+ * (mc, K, N) and the three RE override envs. So synthesize once per shape and patch the addresses.
+ * Bit-exact by construction: the cached image IS a full synth, the three address registers are rewritten
+ * at every slot they occupy, and nothing else in the synth depends on an address. Wiki: NPU-Quirks. */
+#define I4T_SLOTS 4                       /* max duplicate slots one register may occupy in the template */
+struct orki_i4_tmpl { int valid, mc, K, N; uint32_t ov[3];
+                      uint32_t rc[REGCMD_I4_N]; int ns[3], sl[3][I4T_SLOTS]; };
+/* Thread-local (the BCHAIN workers synth concurrently) and 2-way: a tile loop emits one shape for every
+ * program but the last M-group and the last N-tile, which alternates two shapes when M%H or N%Wb is
+ * nonzero — a 1-entry cache would miss twice per tile on exactly those runs. */
+static __thread struct orki_i4_tmpl orki_i4_tc[2];
+static __thread int orki_i4_tcw;                  /* next slot to overwrite */
+static const enum ork_reg_id ORKI_I4_ADDR[3] = { RK_CNA_FEATURE_DATA_ADDR, RK_CNA_WEIGHT_DATA_ADDR, RK_DPU_DST_BASE_ADDR };
+
+/* every word index whose (blk,off) matches — orki_setr writes ALL of them, so the patch must too */
+static int i4t_find(const uint32_t *rc, uint32_t b, uint32_t o, int *out){
+    int n = 0;
+    for(int k = 0; k + 1 < REGCMD_I4_N; k += 2)
+        if((rc[k] & 0xffff) == o && (rc[k+1] >> 16) == b){ if(n < I4T_SLOTS) out[n] = k; n++; }
+    return n;
+}
+/* the slot half of orki_setrn: same mask warning, same encoding, no scan */
+static inline void i4t_put(uint32_t *rc, enum ork_reg_id id, const int *sl, int n, uint32_t v){
+    const ork_reg_desc *d = &ORK_REGS[id];
+    if(v & ~d->mask) fprintf(stderr,"[ork] WARN reg %s (%04x:%04x): value %#x has bits outside field mask %#x\n",d->name,d->blk,d->off,v,d->mask);
+    for(int i = 0; i < n; i++){ int k = sl[i]; rc[k] = d->off | ((v & 0xffff) << 16); rc[k+1] = (d->blk << 16) | ((v >> 16) & 0xffff); }
+}
+static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC);
+
 void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
+    /* The three RE overrides are re-read per call BY DESIGN (one process sweeps them with setenv), so
+     * they are part of the cache key rather than baked in. Only the mc>1 arm consults them. */
+    uint32_t ov[3] = {0,0,0};
+    if(mc > 1){ const char *e;
+        if((e = getenv("ORK_I4_DBNK"))) ov[0] = 0x80000000u | (uint32_t)atoi(e);
+        if((e = getenv("ORK_I4_1040"))) ov[1] = 0x80000000u | (uint32_t)strtoul(e,0,0);
+        if((e = getenv("ORK_I4_1010"))) ov[2] = 0x80000000u | (uint32_t)strtoul(e,0,0); }
+    if(!orki_i4_fovr_n) for(int w = 0; w < 2; w++){ struct orki_i4_tmpl *t = &orki_i4_tc[w];
+        if(t->valid && t->mc == mc && t->K == K && t->N == N
+           && t->ov[0] == ov[0] && t->ov[1] == ov[1] && t->ov[2] == ov[2]){
+            memcpy(rc, t->rc, REGCMD_I4_N*4);
+            const uint32_t av[3] = { aA, aB, aC };
+            for(int i = 0; i < 3; i++) i4t_put(rc, ORKI_I4_ADDR[i], t->sl[i], t->ns[i], av[i]);
+            return; } }
+    orki_i4_synth_full(rc, mc, K, N, aA, aB, aC);
+    if(orki_i4_fovr_n) return;            /* RE fuzzer overrides win over everything: never cache */
+    struct orki_i4_tmpl *t = &orki_i4_tc[orki_i4_tcw]; orki_i4_tcw ^= 1; t->valid = 0;
+    for(int i = 0; i < 3; i++){
+        const ork_reg_desc *d = &ORK_REGS[ORKI_I4_ADDR[i]];
+        t->ns[i] = i4t_find(rc, d->blk, d->off, t->sl[i]);
+        if(t->ns[i] < 1 || t->ns[i] > I4T_SLOTS) return;   /* unpatchable layout: stay on the full path */
+    }
+    memcpy(t->rc, rc, REGCMD_I4_N*4);
+    t->mc = mc; t->K = K; t->N = N; t->ov[0] = ov[0]; t->ov[1] = ov[1]; t->ov[2] = ov[2]; t->valid = 1;
+}
+
+static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     memcpy(rc,REGCMD_I4,REGCMD_I4_N*4);
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE1,((K-1)<<16)|K);       /* K range (element count) */
     orki_setrn(rc,REGCMD_I4_N,RK_CNA_WEIGHT_SIZE0,(K*N)/2);             /* weight bytes: int4 = 0.5 B/elem */

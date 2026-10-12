@@ -375,7 +375,7 @@ static void *bch_db_worker(void *vp){
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
             uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-            memset(rc,0,sizeof rc); orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
+            orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
             /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
              * weight-stationary (N-tile outer, M-group g inner sharing wdma), so g==0 loads the N-tile weight and
              * g>0 can REUSE the CBUF-resident weight + skip the re-DMA by setting CNA_CBUF_CON0[13]=WEIGHT_REUSE
@@ -587,7 +587,7 @@ static void *bch_mw_worker(void *vp){
             for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
                 uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
                 uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
-                memset(rc,0,sizeof rc); orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
+                orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
                 if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
                     if(wr){ unsigned bits=((wr&1)?0x2000u:0)|((wr&2)?0x1000u:0); uint32_t v1040=0;
                         for(int k=0;k+1<REGCMD_I4_N;k+=2) if((rc[k]&0xffff)==0x1040 && (rc[k+1]>>16)==0x201){ v1040=((rc[k]>>16)&0xffff)|((rc[k+1]&0xffff)<<16); break; }
@@ -881,7 +881,6 @@ ork_dyn_chain *ork_i4_dyn_begin_mc(ork_npu *c, int S, const ork_mm_task_i8 *task
                             (unsigned long long)WT->dma, (unsigned long long)WT->obj, WT->size, WT->cpu);
                         if(bc) for(int z=0;z<8;z++) fprintf(stderr,"%02x ",bc[z]); else fprintf(stderr,"(null)");
                         fprintf(stderr,"| aslice=0x%x cdma=0x%x\n", aslice[ks], cdma); fflush(stderr); }
-                    memset(rc, 0, sizeof rc);
                     orki_i4_synth(rc, 1, Kp, Nc, aslice[ks], bdma, cdma);
                     if (orki_validate_regcmd("ork_dyn_mc_i4", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
@@ -957,7 +956,6 @@ ork_dyn_chain *ork_i4_dyn_begin_mc_grouped(ork_npu *c, int M, ork_w *w, const in
                 for (int g = 0; g < Sk; g++) {
                     uint32_t cdma = (uint32_t)(CC->dma + coff + (size_t)g * N * 2 + (size_t)n0 * 2);   /* block g, cols [n0,n0+Nc) */
                     uint32_t bdma = (uint32_t)w->Bb[(size_t)ns * Sk + g].dma;
-                    memset(rc, 0, sizeof rc);
                     orki_i4_synth(rc, 1, G, Nc, aslice[g], bdma, cdma);
                     if (orki_validate_regcmd("ork_dyn_mc_i4g", c, rc, REGCMD_I4_N, w, NULL, 0)) { free(h); return NULL; }
                     if (pp < Pcore - 1) { uint64_t nx = RC->dma + (size_t)(pp+1) * REGCMD_I4_N * 4;
