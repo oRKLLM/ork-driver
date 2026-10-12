@@ -376,7 +376,11 @@ int main(int argc, char** argv){
     cp.n_seq_max = 1;
     cp.n_batch = P > UB ? P : UB;
     cp.n_ubatch= UB;
-    cp.n_threads = 4; cp.n_threads_batch = 4;
+    // 4, not 8, per AGENTS.md section 6: the four A55s drag the ggml threadpool barrier. ORK_BENCH_THREADS
+    // overrides so that guidance can be RE-MEASURED rather than inherited -- it is the only way to A/B the
+    // CPU-side thread count from this harness, which otherwise pins it.
+    { const char * e = getenv("ORK_BENCH_THREADS"); int t = e ? atoi(e) : 4; if (t < 1) t = 4;
+      cp.n_threads = t; cp.n_threads_batch = t; }
     // ggml-ork is historically a MUL_MAT accelerator (attention decomposed into mul_mats), so FA is OFF by
     // default. ORK_BENCH_FA=1 enables FLASH_ATTN_EXT so the NPU decode-attention path (ORK_ATTN_DEC/_KV/_FUSED)
     // actually sees the op; prefill FA that can't run under orkd falls to the ork CPU-delegate.
