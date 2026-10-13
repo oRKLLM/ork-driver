@@ -24,6 +24,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <functional>
+#include <unordered_map>
 
 // DFlash extension API (exported extern "C" from libllama; see src/llama-ext.h).
 extern "C" {
@@ -34,6 +37,65 @@ extern "C" {
     void            llama_set_dflash_context        (llama_context *, const float * buf, int32_t len, const int32_t * pos);
     const int32_t * llama_model_target_layer_ids    (const llama_model *);
     uint32_t        llama_model_target_layer_ids_n  (const llama_model *);
+}
+
+/* ---- PER-NODE GRAPH PROFILE (ORK_BENCH_NODEPROF=1) -------------------------------------------------
+ *
+ * The backend's own counters can only see what the backend runs. On a model where the scheduler splits
+ * the graph across ork and the CPU, the half that never reaches ork is unattributable from inside it --
+ * which is how the non-matmul remainder of prefill stayed a single anonymous number. ggml's eval
+ * callback is the only hook that sees every node of every split, so this tallies wall time per (op,
+ * buffer) pair and prints the table at the end.
+ *
+ * IT PERTURBS. Returning true from the ask phase makes the scheduler compute each node on its own with a
+ * synchronize after it, which costs ork its chaining and group fusion. So read it for the SHAPE of the
+ * non-ork half and take the totals from an ordinary (callback-free) run: the two together attribute the
+ * remainder without either having to be trusted for what it cannot measure. */
+struct nodeprof_key { int op; std::string buf; bool operator==(const nodeprof_key&o) const { return op==o.op && buf==o.buf; } };
+struct nodeprof_hash { size_t operator()(const nodeprof_key&k) const { return std::hash<std::string>()(k.buf)*131u + (size_t)k.op; } };
+struct nodeprof_row  { double us = 0; long n = 0; };
+static std::unordered_map<nodeprof_key, nodeprof_row, nodeprof_hash> g_np;
+static double g_np_t0 = 0; static const struct ggml_tensor * g_np_cur = nullptr;
+static double np_now(void){ return (double) std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+static bool nodeprof_cb(struct ggml_tensor * t, bool ask, void * /*ud*/) {
+    if (ask) { g_np_cur = t; g_np_t0 = np_now(); return true; }
+    if (g_np_cur == t) {
+        nodeprof_key k; k.op = (int) t->op;
+        k.buf = t->buffer ? ggml_backend_buffer_name(t->buffer) : "(none)";
+        if (t->op == GGML_OP_UNARY) k.op = 1000 + (int) ggml_get_unary_op(t);
+        /* One MUL_MAT row is three different jobs sharing a name. Split them, because the answer to
+         * "what is the CPU doing" is otherwise one 30%-of-wall bar with no handle on it:
+         *   batched  = attention QK^T / A.V (a broadcast dim; dynamic operands, no weight)
+         *   lm_head  = the vocabulary projection, which supports_op blocks from the NPU by policy
+         *   dense    = an ordinary [K,N] weight projection */
+        if (t->op == GGML_OP_MUL_MAT) k.buf += (t->ne[2] > 1 || t->ne[3] > 1) ? " batched"
+                                             : (t->ne[0] > 32768)             ? " lm_head" : " dense";
+        nodeprof_row & r = g_np[k]; r.us += np_now() - g_np_t0; r.n++;
+    }
+    return true;
+}
+
+static void nodeprof_dump(const char * why) {
+    if (g_np.empty()) return;
+    std::vector<std::pair<nodeprof_key, nodeprof_row>> v(g_np.begin(), g_np.end());
+    std::sort(v.begin(), v.end(), [](const auto&a, const auto&b){ return a.second.us > b.second.us; });
+    double tot = 0; for (auto & e : v) tot += e.second.us;
+    fprintf(stderr, "[ork_bench NODEPROF] %s: %.1f ms over %zu (op,buffer) pairs  [PERTURBED: per-node compute+sync]\n",
+            why, tot/1e3, v.size());
+    for (auto & e : v) {
+        if (e.second.us < 0.005*tot && e.second.us < 1000.0) continue;   // drop the long tail of noise
+        const char * nm = e.first.op >= 1000 ? "UNARY" : ggml_op_name((enum ggml_op) e.first.op);
+        fprintf(stderr, "  %-18s %-22s %9.1f ms (%5.1f%%) n=%-7ld %7.1f us/node\n",
+                nm, e.first.buf.c_str(), e.second.us/1e3, 100.0*e.second.us/tot, e.second.n, e.second.us/e.second.n);
+    }
+    /* Roll up by buffer: the one line that says how the wall divides between the backends. */
+    std::unordered_map<std::string,double> by; std::unordered_map<std::string,long> byn;
+    for (auto & e : v) { std::string b = e.first.buf; size_t sp = b.find(" "); if (sp != std::string::npos) b = b.substr(0, sp);
+                         by[b] += e.second.us; byn[b] += e.second.n; }
+    for (auto & e : by) fprintf(stderr, "[ork_bench NODEPROF] buffer %-22s %9.1f ms (%5.1f%%) n=%ld\n",
+                                e.first.c_str(), e.second/1e3, 100.0*e.second/tot, byn[e.first]);
 }
 
 static llama_token argmax(const float* v, int n){ int b=0; float m=v[0]; for(int i=1;i<n;i++) if(v[i]>m){m=v[i];b=i;} return b; }
@@ -385,6 +447,10 @@ int main(int argc, char** argv){
     // default. ORK_BENCH_FA=1 enables FLASH_ATTN_EXT so the NPU decode-attention path (ORK_ATTN_DEC/_KV/_FUSED)
     // actually sees the op; prefill FA that can't run under orkd falls to the ork CPU-delegate.
     cp.flash_attn_type = getenv("ORK_BENCH_FA") ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // ORK_BENCH_NODEPROF: attribute the graph per node, including the splits the ork backend never sees.
+    // Must be set before the context's scheduler runs anything. See nodeprof_cb for why it perturbs.
+    const bool nodeprof = getenv("ORK_BENCH_NODEPROF") != nullptr;
+    if (nodeprof) { cp.cb_eval = nodeprof_cb; cp.cb_eval_user_data = nullptr; }
     llama_context* ctx = llama_init_from_model(model, cp);
     if(!ctx){ fprintf(stderr,"ctx init FAILED\n"); return 1; }
 
@@ -396,6 +462,11 @@ int main(int argc, char** argv){
     // state (no .orkpack load, no re-warm in the measurement). Not timed; KV is cleared after.
     { llama_batch wb=llama_batch_get_one(toks.data(), nt); if(llama_decode(ctx,wb)!=0){ fprintf(stderr,"warmup decode FAILED\n"); return 3; } }
     llama_memory_clear(llama_get_memory(ctx), true);
+    if (nodeprof) g_np.clear();   // the warmup pays every one-time cost; the table is about the timed prefill
+    /* Scope ORK_PROFILE to the same window as the clock below. The warmup above is a FULL-SHAPE pass, so
+     * without this every counter covers two prefills while pf_s covers one -- a factor of two that is
+     * invisible because it scales every term equally and the shares still add up. */
+    ggml_backend_ork_profile_reset();
 
     // PREFILL: decode the P-token prompt as one batch (ubatch UB), time it.
     int64_t t0 = llama_time_us();
@@ -404,6 +475,7 @@ int main(int argc, char** argv){
     int64_t t1 = llama_time_us();
     if(rc!=0){ fprintf(stderr,"prefill decode FAILED rc=%d (P=%d ubatch=%d)\n",rc,P,UB); return 3; }
     double pf_s = (t1-t0)/1e6, pf_tps = nt/pf_s;
+    if (nodeprof) { nodeprof_dump("prefill"); g_np.clear(); }
 
     // DECODE: greedily generate G tokens, one decode each, time. Detokenize + print each piece so the run
     // doubles as a COHERENCY SMOKE TEST — a tiny prompt ("Hi, how are you?") + a few tokens instantly shows
@@ -425,6 +497,7 @@ int main(int argc, char** argv){
     fprintf(stderr,"\n[ORK BENCH] prefill: %d tok in %.1f ms = %.2f tok/s (ubatch=%d) | decode: %d tok in %.1f ms = %.2f tok/s\n",
             nt, pf_s*1e3, pf_tps, UB, gen, dc_s*1e3, dc_tps);
 
+    if (nodeprof) nodeprof_dump("decode");
     llama_free(ctx); llama_model_free(model); llama_backend_free();
     return 0;
 }
