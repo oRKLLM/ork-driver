@@ -553,11 +553,17 @@ int orki_i4_wbdef(int K, int N){
     return Wb < 64 ? 64 : Wb;
 }
 
-/* Run the BCHAIN batch, de-escalating the tile geometry if THIS PART will not take it.
+/* Run the BCHAIN batch, de-escalating the tile geometry if THIS MEMORY CONFIGURATION will not take it.
  *
- * Wb and the orki_i4_hcap() table are constants measured on ONE die. A second RK3588 accepts the
- * submit and never starts the task at geometries the first one runs, so a doorbell miss here is not
- * necessarily a dead shape -- it can be a geometry this part will not take. The rungs, widest first:
+ * Wb and the orki_i4_hcap() table were measured on ONE MEMORY CONFIGURATION (.236, LPDDR4X @ 2112 MHz).
+ * This is NOT a silicon-lottery / per-die effect -- both boards are RK3588 and they agree on the timing
+ * physics at every geometry both can run. The envelope tracks the DRAM CLOCK: lowering DMC grows it
+ * monotonically on BOTH boards, and capping the NPU devfreq 1000->400 MHz changes nothing. A board with
+ * a different DMC frequency accepts the submit and never starts the task at geometries another one runs,
+ * so a doorbell miss here is not necessarily a dead shape -- it is a geometry this DRAM configuration
+ * will not take. (Clock and memory TYPE are not separated: .235 is LPDDR5 @ 2400 and the OPP tables do
+ * not overlap -- 528/1068/1560/2112 vs 534/1320/1968/2400 -- so no matched-clock experiment exists
+ * between them.) The rungs, widest first:
  *
  *     0  Wb = orki_i4_wbdef(K,N)   the measured-widest tile      1.15-1.26x where the part takes it
  *     1  Wb = (131072/K) & ~63     the shipped containment floor  <-- today's default, never skipped
