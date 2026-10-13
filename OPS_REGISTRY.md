@@ -50,6 +50,26 @@ driver fix, not a dead end.
 - The `*_WIP.md` docs are **backstory/detail**. This file is the **index of truth**. When
   a WIP doc and this registry disagree, a probe re-run settles it — see CONTRADICTIONS.
 
+### Probe admissibility — what a probe has to do before its verdict counts
+
+A probe grading a *configuration* (a geometry, a tile, an H, a schedule) is not a weaker probe when it
+reports only timing or only a checksum. It is a probe that can print the **wrong winner** with full
+confidence, and it has done so:
+
+- **The incorrect configurations were the FASTEST rows in the sweep** (2026-10-12 Wb frontier: 1714 us
+  wrong vs 1767 us correct). Ranking by time *selects the broken config* — a config that drops work,
+  mis-tiles M or reads a short extent finishes sooner because it did less.
+- **A checksum on patterned input agreed on geometries that were wrong.** Re-running those same
+  geometries on full-random input took a published table from 0.0% wrong to 100.0% wrong. Structured
+  inputs let distinct tilings coincide; random inputs do not.
+- **`rc == 0` is not a gate either** — the driver self-heals a timed-out submit and returns the right
+  answer ~1000x late, so a config can be bit-exact and still be broken.
+
+So: **bit-identity against an anchor at the same shape, on full-random inputs, AND a time that is not
+inflated — all three, before any ranking is printed.** `tools/re/probe_gate.h` is the one-line way to
+comply (`ork_probe_fill_random` / `ork_probe_ck` / `ork_probe_gate`); it is header-only and has no
+dependencies, so there is no reason for a new probe to roll its own and get this wrong again.
+
 ### Status enum
 
 | status | meaning |

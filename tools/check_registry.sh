@@ -45,8 +45,12 @@ GGML="../llama.cpp/ggml/src/ggml-ork/ggml-ork.cpp"
 # Recursive, and .cpp counts: tools/re/ holds the llama-API harnesses (ork_bench, ork_ppl, the *_diff_probe
 # differential oracles). The old non-recursive .c/.sh-only listing could not see ANY of them, so citations to
 # them silently failed check 1 (or, worse, resolved to a same-basename file elsewhere).
+# tools/*.h counts too: the toolkit has header-only helpers the registry legitimately cites by name
+# (probe_gate.h), and a citation that resolves to a real file must not fail merely over its extension.
 arts=$(find tools examples -type f \( -name '*.c' -o -name '*.cpp' -o -name '*.sh' \) 2>/dev/null \
-       | sed -E 's|.*/||; s/\.(c|cpp|sh)$//' | sort -u)
+       | sed -E 's|.*/||; s/\.(c|cpp|sh)$//' | sort -u
+       find tools -type f -name '*.h' 2>/dev/null | sed -E 's|.*/||; s/\.h$//' | sort -u)
+arts=$(printf '%s\n' "$arts" | sort -u)
 arts_re=$(printf '%s' "$arts" | paste -sd'|' -)
 
 # --- 1) cited probes must resolve to a real artifact -------------------------------------
