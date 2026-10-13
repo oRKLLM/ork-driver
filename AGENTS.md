@@ -351,9 +351,15 @@ touching any M-tile cap the bound is `mg_max*64`; never reintroduce an `R-1`/`po
 12 banks × 32 KB), walked one bank data-ward per 64-row group; the ceiling is where `WEIGHT_BANK` would
 hit 0. So the fp16 envelope is banks × 32 KB / row-bytes: **`sched=0` → 1 bank → `M ≤ 16384/K`;
 `sched=1` → 11 banks → `M ≤ 180224/K`** (measured 704@K256, 352@K512, 176@K1024, and 8@K2048 … 256@K64
-for sched=0 — `ceiling+1` miscomputes at every one). **K=128 is capped at a measured 256**: it needs
-half-bank steps (`slope = (int)7.5 = 7`), which the encoding cannot express, so its envelope is
-*non-monotonic* (256 ok, 320 bad, 384 ok, …) and only the contiguous prefix is usable.
+for sched=0 — `ceiling+1` miscomputes at every one). **K=128 is a HOLE, not a prefix** (corrected
+2026-10-12, `tools/re/f16_stream_envelope_probe.c`): it needs half-bank steps (`slope = (int)7.5 = 7`),
+which the encoding cannot express, so `DATA_BANK + WEIGHT_BANK` stops summing to 12 and the weight
+window WRAPS into the activation banks for some M and not others. The envelope there is non-monotonic
+in M **and** shrinks with N. The rule is a predicate, not a ceiling — `orki_f16_mc_ok(K,N,sched,mc)`:
+`dreq <= DATA_BANK` and `DATA_BANK + min(wreq, WEIGHT_BANK) <= 12`. At every well-formed K it reduces
+to the bank cap above; at K=128 it says mc<=64 is correct only at N<=512, 65..128 at any N, 129..192
+only at N<=256, 193..256 only at N<=1152. **Ask it about the REMAINDER tile too** — a legal tile can
+leave an illegal one (K=128 N=1024: M=256 and M=384 exact, M=288 wrong).
 
 Two traps this cost us, both now fixed: the old fp16 caps used **32768 ELEMENTS** (the int8 byte budget),
 which is **2× too loose** at 2 B/elem and silently miscomputed at non-pow2 K; and `4*R` overshot at K=128

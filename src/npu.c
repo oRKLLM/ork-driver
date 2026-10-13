@@ -1652,7 +1652,13 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
         int Kp=(K-k0<KS)?(K-k0):KS;
         for(int n0=0;n0<N;n0+=NMAX){
             int Nc=(N-n0<NMAX)?(N-n0):NMAX;
-            int rows=orki_run_loop_chunk(dt,Kp,Nc,RB); if(rows>M)rows=M;
+            int chunk=orki_run_loop_chunk(dt,Kp,Nc,RB);
+            int rows=chunk<M?chunk:M;
+            /* fp16 pads a short tile UP to a legal program height (see the emitter), and the NPU
+             * writes every padded row — so Af/Cc must be sized for the PADDED height, not the real
+             * one. Missing this is the r104 failure mode: not a fault, a hang. */
+            if(dt==DT_F16){ int rem=(M%chunk)?(M%chunk):chunk; if(rem>M)rem=M;
+                int p=orki_f16_mcpad(Kp,Nc,orki_f16_sched(Kp),rem,chunk); if(p>rows)rows=p; }
             size_t o=(size_t)rows*Nc*4; if(o>maxout)maxout=o;
             size_t sz=(size_t)rows*Kp*(dt?1:2); if(sz>maxaf)maxaf=sz;
         }
@@ -1768,11 +1774,20 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
  * fp16 attention at head_dim=32/64) and Kp<2048 (high). Validated in test_bmm (K-sweep 32..256). */
         struct buf*Bb=&w->Bb[(size_t)ns*w->Sk+ks];
         for(int m0=0;m0<M;m0+=chunk){int mc=(M-m0<chunk)?(M-m0):chunk; if(mc<=0)continue;
-            { static int dbg=-1; if(dbg<0)dbg=getenv("ORK_RL_DBG")?1:0; if(dbg) fprintf(stderr,"[run_loop] ns=%d ks=%d Kp=%d sched=%d chunk=%d m0=%d mc=%d M=%d Nc=%d Afsz=%zu Ccsz=%zu\n",ns,ks,Kp,sched,chunk,m0,mc,M,Nc,c->Af.size,c->Cc.size); }
+            /* fp16: a program's HEIGHT must be one the bank split computes correctly (orki_f16_mc_ok).
+             * The envelope is not a ceiling — at K=128 a 64-row program miscomputes at any N>512 while
+             * a 128-row one is bit-exact — so a short LAST tile cannot simply be run short. A and C
+             * both pass through c->Af/c->Cc here, sized from `chunk` >= mch, so the short tile is
+             * COMPUTED TALLER and the padding rows are never gathered in or read back. That is what
+             * keeps ork_f16_mm_run runnable at every M instead of refusing M <= 64. */
+            int mch=mc;
+            if(dt==DT_F16){ mch=orki_f16_mcpad(Kp,Nc,sched,mc,chunk);
+                if(mch<1){ fprintf(stderr,"[ork] fp16 M-tile %d has no legal height at Kp=%d Nc=%d\n",mc,Kp,Nc); return -1; } }
+            { static int dbg=-1; if(dbg<0)dbg=getenv("ORK_RL_DBG")?1:0; if(dbg) fprintf(stderr,"[run_loop] ns=%d ks=%d Kp=%d sched=%d chunk=%d m0=%d mc=%d mch=%d M=%d Nc=%d Afsz=%zu Ccsz=%zu\n",ns,ks,Kp,sched,chunk,m0,mc,mch,M,Nc,c->Af.size,c->Cc.size); }
             /* BEFORE the gather: a short Af is a host heap overflow on the line below, a short Cc
-             * an NPU hang with no interrupt (r104). */
-            if(orki_check_extent("run_loop",&c->Af,(size_t)mc*Kp*(dt?1:2),"activation Af")) return -1;
-            if(orki_check_extent("run_loop",&c->Cc,(size_t)mc*Nc*4,"output Cc")) return -1;
+             * an NPU hang with no interrupt (r104). mch, not mc — the NPU writes the padding rows. */
+            if(orki_check_extent("run_loop",&c->Af,(size_t)mch*Kp*(dt?1:2),"activation Af")) return -1;
+            if(orki_check_extent("run_loop",&c->Cc,(size_t)mch*Nc*4,"output Cc")) return -1;
             double _tc0=ork_now_us();
             /* A[m0..m0+mc, k0..k0+Kp) -> contiguous [mc][Kp]. The inner j run IS contiguous in both
              * operands, so one memcpy per row replaces the scalar element loop (same bytes, same order). */
@@ -1781,11 +1796,11 @@ int orki_run(ork_npu *c,ork_w *w,int M,const void *A,void *C){
             orki_bsync(fd,&c->Af,RKNPU_MEM_SYNC_TO_DEVICE);
             double _ts0=ork_now_us(); orki_mc_copy[0]+=_ts0-_tc0;
             uint32_t rc[REGCMD_N];   /* REGCMD_N == REGCMD_I8_N == 224 */
-            if(dt==DT_F16) orki_f16_synth   (rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
+            if(dt==DT_F16) orki_f16_synth   (rc,mch,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF);
             else           orki_i8_synth(rc,mc,Kp,Nc,(uint32_t)c->Af.dma,(uint32_t)Bb->dma,(uint32_t)c->Cc.dma,sched,CBUF,Nc);
             if (orki_validate_regcmd("run_loop", c, rc, REGCMD_N, w, NULL, 0)) return -1;
             memcpy(c->regcmd.cpu,rc,sizeof rc); orki_bsync(fd,&c->regcmd,RKNPU_MEM_SYNC_TO_DEVICE);
-            if(orki_submit1_db(c,(size_t)mc*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell */
+            if(orki_submit1_db(c,(size_t)mch*Nc)) return -1;   /* P3 #7: single-core matmul (int32/fp32 c->Cc) rides the doorbell. mch: the doorbell must poll the LAST row the NPU writes, padding included. */
             double _ta0=ork_now_us(); orki_mc_sub[0]+=_ta0-_ts0;
             /* K-slice accumulate, NEON. Element-wise over DISJOINT outputs, so vectorising changes no
              * summation order and the result is bit-identical; ks==0 STORES (c->cres is memset to 0,

@@ -111,6 +111,18 @@ static void *stream_worker_f16(void *vp){
  * silently miscomputed (Tier 14 A). One helper now owns the check, so they cannot drift again.
  * `hard` clamps to an additional per-program limit (the doorbell rejects fp16 M>64); 0 = none.
  * Writes the min cap across tasks, the max M, and whether every task's M is the same. */
+/* It also owns the TILE, not just a ceiling. The fp16 M envelope is non-monotonic and N-dependent
+ * (orki_f16_mc_ok), so "M <= cap" does not make a shape runnable: the tiler emits floor(M/tile)
+ * full tiles AND one remainder, and at K=128 a legal tile routinely leaves an illegal remainder.
+ * Measured 2026-10-12 (tools/re/f16_stream_envelope_probe.c): at K=128 N=1024 the chain is
+ * bit-exact at M=256 and M=384 and WRONG at M=288, because 288 = 256 + 32 and a 32-row fp16
+ * program at that N miscomputes. So scan DOWN for a tile that is legal for every task and leaves a
+ * legal remainder on every task, and REFUSE (-2) when none exists rather than compute garbage.
+ *
+ * Refusing is the whole point and it costs nothing measurable here. The shapes with no legal
+ * partition at K=128 are exactly M <= 64 against N > 512, where ork_f16_mm_run_stream was wrong at
+ * every M it was ever given (it clamps every program to 64 rows) and ~100x slower than the chain
+ * besides. The 1.3-1.69x the CHAIN is worth lives at M >= 65, and that is untouched. */
 static int f16_stream_check(ork_npu *c,int S,const ork_mm_task_f16 *tasks,int hard,int *cap,int *maxM,int *uniform){
     int c0=1<<30,mx=0,m0=tasks[0].M,uni=1;
     for(int i=0;i<S;i++){ ork_w *w=tasks[i].w;
@@ -126,7 +138,15 @@ static int f16_stream_check(ork_npu *c,int S,const ork_mm_task_f16 *tasks,int ha
         if(cp<c0) c0=cp;
         if(tasks[i].M>mx) mx=tasks[i].M;
         if(tasks[i].M!=m0) uni=0; }
-    *cap=c0; *maxM=mx; *uniform=uni; return 0;
+    /* the largest tile <= c0 that is legal, with a legal remainder, for EVERY task */
+    int tile=0;
+    for(int t=(mx<c0?mx:c0); t>=1 && !tile; t--){ int good=1;
+        for(int i=0;i<S && good;i++){ ork_w *w=tasks[i].w; int sc=orki_f16_sched(w->K);
+            if(!orki_f16_mc_ok(w->K,w->N,sc,t)) good=0;
+            else { int r=tasks[i].M%t; if(r && !orki_f16_mc_ok(w->K,w->N,sc,r)) good=0; } }
+        if(good) tile=t; }
+    if(tile<1) return -2;                       /* no legal partition — decline, never miscompute */
+    *cap=tile; *maxM=mx; *uniform=uni; return 0;
 }
 
 /* M-TILE an over-envelope batch by re-entering `fn` on row-slices of <= cap rows. Each sub-batch

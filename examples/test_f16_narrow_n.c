@@ -1,4 +1,20 @@
-/* test_f16_narrow_n — fp16 matmuls with a NARROW output width, at and past the M-chunk boundary.
+/* test_f16_narrow_n — the fp16 M-ENVELOPE regression test: shapes where the CBUF bank split 0x1040
+ * emits a program the hardware does not compute. Two episodes live here, both envelope bugs.
+ *
+ * r105 (2026-10-12): the envelope is not a CEILING. At K=128 the 0x1040 slope truncates to 7 and
+ * DATA_BANK + WEIGHT_BANK stops summing to 12, so the weight window WRAPS into the activation banks
+ * for some M and not others — the legal M-tiles are non-monotonic in M AND shrink as N grows. Every
+ * fp16 entrypoint was wrong somewhere in that hole and none of them declined: ork_f16_mm_run_stream
+ * (which clamps every program to 64 rows) at EVERY M; ork_f16_mm_run_stream_chain at M<=64 and at
+ * any M whose remainder tile landed in the hole (M=288 = 256+32 wrong, M=256 and M=384 exact); and
+ * ork_f16_mm_run itself once N outgrew what its per-core column split hid. K=128 is attention's
+ * head_dim and N is n_kv, so this was silently wrong on the shape attention actually runs. The
+ * cases below are the measured boundaries (tools/re/f16_stream_envelope_probe.c).
+ *
+ * The bar for the stream entrypoints is "bit-exact OR refused" — declining a shape it cannot
+ * compute is a correct answer; returning numbers for it is not.
+ *
+ * r103 — fp16 matmuls with a NARROW output width, at and past the M-chunk boundary.
  *
  * r103 (2026-10-06): ork_f16_mm_pack + ork_f16_mm_run at K=1024 N=16 was bit-exact at an M-chunk of
  * 128 and HUNG at 144 — job committed, no completion interrupt, core 0 pinned at 100%, the board
@@ -77,6 +93,44 @@ out:
     free(A); free(B); free(C);
 }
 
+/* r105: the two STREAM entrypoints over S independent head-matmuls of the same shape. Each must be
+ * bit-exact against the fp64 reference or must REFUSE — and it must do the same thing on every one
+ * of the S tasks, so a per-core split that only corrupts one core's share is caught too. */
+static void stream_case(ork_npu *c, int S, int M, int K, int N, const char *why)
+{
+    size_t na = (size_t)M*K, nb = (size_t)K*N, nc = (size_t)M*N;
+    ork_f16 *A = malloc(na*sizeof *A), *B = malloc(nb*sizeof *B);
+    float *C = malloc((size_t)S*nc*sizeof *C);
+    ork_w **w = calloc(S, sizeof *w);
+    ork_mm_task_f16 *tk = malloc((size_t)S*sizeof *tk);
+    if (!A || !B || !C || !w || !tk) { printf("  alloc failed\n"); fails++; return; }
+    for (size_t i = 0; i < na; i++) A[i] = (ork_f16)(u01()*2.0-1.0);
+    for (size_t i = 0; i < nb; i++) B[i] = (ork_f16)(u01()*2.0-1.0);
+    for (int s = 0; s < S; s++) { w[s] = ork_f16_mm_pack(c, K, N, B);
+        if (!w[s]) { printf("  S=%d M=%-5d K=%-4d N=%-5d  pack REFUSED  (%s)\n", S,M,K,N,why); fails++; goto out; } }
+
+    for (int arm = 0; arm < 2; arm++) {
+        memset(C, 0, (size_t)S*nc*sizeof *C);
+        for (int s = 0; s < S; s++) tk[s] = (ork_mm_task_f16){ w[s], M, A, C+(size_t)s*nc };
+        int rc = arm ? ork_f16_mm_run_stream_chain(c, S, tk) : ork_f16_mm_run_stream(c, S, tk);
+        const char *nm = arm ? "chain " : "stream";
+        if (rc) { printf("  %s S=%d M=%-5d K=%-4d N=%-5d  refused rc=%d  (%s)\n", nm,S,M,K,N,rc,why); continue; }
+        double worst = 0;
+        for (int s = 0; s < S; s++) { const float *o = C+(size_t)s*nc;
+            for (int t = 0; t < 40; t++) { int m = (t==39)?M-1:(int)((long)t*M/40);
+                int n = (int)((long)t*N/40) % N;
+                double want = refcell(A,B,m,n,K,N), den = fabs(want)>1e-3?fabs(want):1e-3;
+                double rel = fabs(o[(size_t)m*N+n]-want)/den; if (rel > worst) worst = rel; } }
+        int bad = !(worst < 5e-3);
+        printf("  %s S=%d M=%-5d K=%-4d N=%-5d  relerr %.2e  %s   (%s)\n",
+               nm,S,M,K,N,worst, bad?"FAIL":"ok", why);
+        if (bad) fails++;
+    }
+out:
+    for (int s = 0; s < S; s++) if (w[s]) ork_mm_free(c, w[s]);
+    free(A); free(B); free(C); free(w); free(tk);
+}
+
 int main(void)
 {
     ork_npu *c = ork_npu_init();
@@ -98,6 +152,26 @@ int main(void)
     run_case(c, 704,  256,  16, "K=256 narrow N at its own mcap");
     /* wide N must be untouched by the guard — this is the measured-good path */
     run_case(c, 176,  1024, 3584, "wide N: must keep the full envelope");
+
+    /* r105: K=128 (attention's head_dim) — the K whose 0x1040 encoding is broken. These were all
+     * WRONG, not hung, and nothing declined them. N here is wide on purpose: at N<=256 every tile
+     * happens to be legal, which is why the hole went unseen. */
+    printf("\nK=128, the broken-encoding K (r105 — these returned wrong numbers, silently):\n");
+    run_case(c,  32,  128, 2048, "r105: 32 rows, wide N — was wrong");
+    run_case(c,  64,  128, 2048, "r105: 64 rows, wide N — was wrong");
+    run_case(c,  64,  128, 3584, "r105: not an N=2048 accident");
+    run_case(c, 144,  128, 1024, "r105: the mg=3 hole");
+    run_case(c, 288,  128, 1024, "r105: legal tile, ILLEGAL remainder (256+32)");
+    run_case(c, 512,  128, 1024, "r105: two legal tiles — was already right, must stay right");
+    run_case(c, 512,  128, 2048, "r105: narrower legal set at wider N");
+    run_case(c, 256,  128,  256, "r105: N small enough that every tile is legal");
+
+    printf("\nK=128 through the two STREAM entrypoints (bit-exact OR refused — never numbers):\n");
+    stream_case(c, 4,  64, 128, 1024, "r105: stream clamps to 64 rows; chain was wrong here too");
+    stream_case(c, 4, 128, 128, 1024, "r105: the always-legal mg=2 group");
+    stream_case(c, 4, 288, 128, 1024, "r105: illegal remainder, both arms");
+    stream_case(c, 4, 512, 128, 2048, "r105: the 1.3-1.69x attention lever must survive");
+    stream_case(c, 4, 512, 256, 1024, "control: a well-formed K must be untouched");
 
     /* positive control: a deliberately wrong reference must be rejected, or the bar above is empty */
     printf("\npositive control (must FAIL):\n");

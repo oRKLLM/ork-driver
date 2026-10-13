@@ -264,6 +264,10 @@ struct ork_dyn_chain {
                                         * rounds and a short completion wait (orki_i4_run_bchain_db). */
     int        f16_contig;  /* (A) 1 = fp16 colsplit built ONE chained submit/core over the contiguous Bbc weight (no
                              * cross-buffer boundary) — the worker takes the single-submit path, NOT the per-slice SW-chain. */
+    int        f16_ncmax;   /* WIDEST per-core N any core of this fp16 colsplit round was given. The M-tile's
+                             * legality is monotonically DECREASING in N (orki_f16_mc_ok: a wider weight segment
+                             * claims more CBUF banks), so a tile legal here is legal on every core — which is what
+                             * lets the builder and the worker derive the same program count from one number. */
     int        prepolled;   /* 1 = the per-core parallel colsplit workers already submitted AND drained every core
                              * (blocking or per-core poll) — ork_dyn_end skips its (redundant, ~500ms-stalling) poll. */
     /* GROUPED int4 (ork_i4_dyn_begin_mc_grouped, drained by ork_dyn_grouped_end): per-row Sk int16 partial
@@ -434,6 +438,13 @@ int orki_f16_mcap(int K, int sched);
 /* N-AWARE ceiling: orki_f16_mcap is necessary but not sufficient — a narrow N at a starved
  * WEIGHT_BANK hangs the submit (r103). Any path that knows N must use this one. */
 int orki_f16_mcap_n(int K, int sched, int N);
+/* The predicate BOTH of those are derived from: is a single mc-row fp16 program correct at this K
+ * and N? The envelope is non-monotonic in M and depends on N, so a cap alone cannot express it —
+ * anything that picks an M-tile (including a REMAINDER tile) must ask this about the value it picked.
+ * See the measured bank model at its definition in src/npu/f16/regcmd.c. */
+int orki_f16_mc_ok(int K, int N, int sched, int mc);
+/* Smallest legal program height >= mc, for a path whose staging lets it over-compute and discard. */
+int orki_f16_mcpad(int K, int N, int sched, int mc, int cap);
 /* r103: is this fp16 weight wide enough that it STREAMS? A small segment against a starved
  * WEIGHT_BANK hangs the submit, and colsplit derives its program count in two places that must
  * agree — so narrow shapes are kept out of colsplit and fall to the N-aware single-core path. */

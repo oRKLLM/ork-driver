@@ -165,6 +165,11 @@ attn_thrash_probe: tools/re/attn_thrash_probe.c $(COBJ)
 attn_headchain_probe: tools/re/attn_headchain_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -march=armv8.2-a+fp16 -o $@ $< $(COBJ) -lm
 
+# The (K, N, M) validity envelope of the two fp16 stream entrypoints, graded cell by cell against a
+# CPU reference and reported as a pass RATE over several reps. Anchors the fp16 stream guard.
+f16_stream_envelope_probe: tools/re/f16_stream_envelope_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+fp16 -o $@ $< $(COBJ) -lm
+
 # RE tool: per-shape fp16 matmul RATE with an fp64 reference on SAMPLED rows (first 64, last 64, 64
 # strided through the middle, so the first/last/interior M-chunks are all read) and a wrong-column
 # positive control that must FAIL. The full-row reference for a 248,320-wide head shape would take

@@ -165,6 +165,52 @@ int orki_f16_mcap(int K,int sched){
     return cap<1?1:cap;
 }
 
+/* THE BANK SPLIT 0x1040 WOULD CARRY for this K and M-tile — the same arithmetic orki_f16_synth
+ * emits, factored out so the guard and the emitter cannot disagree. sched=0 leaves the template
+ * default 0xb1. Returns DATA_BANK[3:0] and WEIGHT_BANK[7:4]. */
+static void f16_bank_split(int K,int mc,int sched,int *dbnk,int *wbnk){
+    int v=0xb1;
+    if(sched){ double scale=(double)K/256.0;
+        int base=(int)(177.0-15.0*(scale-1.0)), slope=(int)(15.0*scale), mg=(mc+63)/64; if(mg<1)mg=1;
+        v=base-slope*(mg-1); if(v<0x1b)v=0x1b; }
+    *dbnk=v&0xf; *wbnk=(v>>4)&0xf;
+}
+
+/* IS ONE fp16 PROGRAM OF mc ROWS CORRECT at this K and N? The M envelope is not a ceiling — it is
+ * this predicate, and at K=128 it is neither monotonic in M nor independent of N.
+ *
+ * MEASURED 2026-10-12 (tools/re/f16_stream_envelope_probe.c; 126 (K,N,M) cells x 6 reps, each cell
+ * graded against a CPU fp32 reference, board .235 / 6.1.115-vendor-rk35xx-fix). The CBUF is 12
+ * banks x 32 KB. Activations occupy banks [0, dreq). The WEIGHT WINDOW STARTS AT BANK DATA_BANK
+ * and runs min(wreq, WEIGHT_BANK) banks, wrapping into the activations if it runs off bank 11. So:
+ *
+ *      dreq <= DATA_BANK      AND      DATA_BANK + min(wreq, WEIGHT_BANK) <= 12
+ *
+ * For every WELL-FORMED K the encoding keeps DATA_BANK + WEIGHT_BANK == 12 exactly (0xb1 at K=256
+ * and at the sched=0 default, 0xa2 at K=512, 0x84 at K=1024, 0x48 at K=2048, 0x1b at the floor), so
+ * the second clause is free and this reduces to the banks x 32 KB cap that was already here.
+ *
+ * K=128 IS THE EXCEPTION, and the whole bug. Its slope truncates — (int)(15*0.5) = 7 — so base is
+ * 0xb8 = D8/W11, sum 19, and the invariant is gone. Measured, with wreq = ceil(K*N*2/32768):
+ *   mg=1 (mc<= 64) 0xb8 D 8/W11 -> correct only while wreq <= 4  (K=128: N <=  512)
+ *   mg=2 (mc<=128) 0xb1 D 1/W11 -> correct at every N
+ *   mg=3 (mc<=192) 0xaa D10/W10 -> correct only while wreq <= 2  (K=128: N <=  256)
+ *   mg=4 (mc<=256) 0xa3 D 3/W10 -> correct only while wreq <= 9  (K=128: N <= 1152)
+ * Every one of those boundaries was found by an UPWARD scan and confirmed 0/6 on the far side.
+ *
+ * This had been read as "K=128 has a measured contiguous prefix of 256", which is true only at
+ * N <= 256. At attention's own shape (K=128, N = n_kv) the prefix is a hole: mc<=64 miscomputes at
+ * any N > 512, which is why ork_f16_mm_run_stream (which clamps every program to 64 rows) was
+ * wrong at EVERY M, and ork_f16_mm_run was wrong too once N grew past the per-core split's reach. */
+int orki_f16_mc_ok(int K,int N,int sched,int mc){
+    if(mc<1||K<1||N<1) return 0;
+    int D,W; f16_bank_split(K,mc,sched,&D,&W);
+    long dreq=((long)mc*K*2+32767)/32768;
+    long wreq=((long)K*N*2+32767)/32768;
+    long wuse=(wreq<W)?wreq:W;
+    return dreq<=D && D+wuse<=12;
+}
+
 /* NARROW-N CEILING — the mcap above is necessary but NOT sufficient when N is small.
  *
  * r103 (2026-10-06): fp16 K=1024 N=16 is bit-exact at an M-chunk of 128 and HANGS at 144 — job
@@ -193,7 +239,7 @@ int orki_f16_mcap(int K,int sched){
  * The 4-bank trigger is deliberately conservative: N=16 and N=32 are measured bad and N=3584
  * measured good, while N in between is UNMEASURED, so the trigger covers the unknown side. Narrowing
  * it needs board runs, and each costs a power cycle. */
-int orki_f16_mcap_n(int K,int sched,int N){
+static int f16_mcap_narrown(int K,int sched,int N){
     int cap=orki_f16_mcap(K,sched);
     if(!sched||K<1||N<1) return cap;
     if((long)K*N*2 > 4L*32768) return cap;              /* weight streams — the measured-good regime */
@@ -207,14 +253,42 @@ int orki_f16_mcap_n(int K,int sched,int N){
     return ncap<cap?ncap:cap;
 }
 
+/* ...and then the LARGEST TILE THAT IS ACTUALLY LEGAL at or below it (orki_f16_mc_ok). The two
+ * rules are independent: the narrow-N rule above keeps WEIGHT_BANK off its floor so the submit does
+ * not HANG, and mc_ok keeps the weight window from wrapping into the activations so the submit does
+ * not MISCOMPUTE. Both bite, and neither implies the other. */
+int orki_f16_mcap_n(int K,int sched,int N){
+    int cap=f16_mcap_narrown(K,sched,N);
+    while(cap>1 && !orki_f16_mc_ok(K,N,sched,cap)) cap--;
+    return cap;
+}
+
 /* The chunk a run path may use for a [M,K]x[K,N] matmul. There is deliberately NO N-blind twin:
  * one existed (orki_f16_mtile) and was removed with its last caller in the r103 fix, because an
- * N-blind M-cap is unsafe by construction here and leaving it available invites its reuse. */
+ * N-blind M-cap is unsafe by construction here and leaving it available invites its reuse.
+ *
+ * THE REMAINDER IS PART OF THE ANSWER. A uniform tiler emits floor(M/chunk) chunk-row programs and
+ * ONE remainder of M%chunk rows, and because the envelope is non-monotonic the remainder can be
+ * illegal while the chunk is legal — measured at K=128 N=1024, where M=256 and M=384 are bit-exact
+ * and M=288 (=256+32) is not. So pick the largest tile whose remainder is legal too. 0 = no such
+ * partition exists; the caller must decline or pad, never fall back to "1". */
 int orki_f16_mtile_n(int K,int M,int N){
-    int chunk=orki_f16_mcap_n(K,orki_f16_sched(K),N);
-    if(chunk>M) chunk=M;
-    if(chunk<1) chunk=1;
-    return chunk;
+    int sched=orki_f16_sched(K);
+    int cap=orki_f16_mcap_n(K,sched,N);
+    if(M<1||cap<1) return 0;
+    for(int t=(M<cap?M:cap); t>=1; t--){
+        if(!orki_f16_mc_ok(K,N,sched,t)) continue;
+        int r=M%t;
+        if(!r||orki_f16_mc_ok(K,N,sched,r)) return t; }
+    return 0;
+}
+
+/* The smallest LEGAL program height >= mc, for a path that can over-compute rows it then discards
+ * (the activation/output staging buffers are sized from the tile, so the padding rows cost one
+ * submit's worth of extra MACs and nothing else). 0 = none at or below the cap, i.e. truly refuse. */
+int orki_f16_mcpad(int K,int N,int sched,int mc,int cap){
+    for(int t=mc;t<=cap;t++) if(orki_f16_mc_ok(K,N,sched,t)) return t;
+    return 0;
 }
 
 /* RE fuzzer hook for fp16 (batch-mode mapping): overrides applied at the END of orki_f16_synth(). Inert by default. */

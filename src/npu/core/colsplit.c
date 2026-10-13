@@ -95,11 +95,12 @@ static void *ork_csub_worker(void *vp){ struct ork_csub *a = vp; ork_npu *c = a-
             int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
             /* kcap MUST match the tiling below (it derives np_ks, the program count) — both now
              * come from the one measured envelope so they cannot disagree. */
-            /* N-BLIND cap, and that is safe ONLY because ork_f16_wide_enough() keeps narrow N out of
-             * colsplit upstream (npu.c). The two kcap sites here derive the program COUNT and must
-             * agree, so they cannot take a per-core N; if that gate is ever relaxed, these must move
-             * to orki_f16_mcap_n together or narrow N will wedge again (r103). */
-            int kcap = orki_f16_mcap(Kp, orki_f16_sched(Kp));
+            /* The two kcap sites derive the program COUNT and must agree, so they read the ROUND's
+             * widest per-core N (h->f16_ncmax) rather than this core's own — legality is monotone in
+             * N, so that one number is correct for every core. It cannot be N-blind: an N-blind cap
+             * admits a tile whose weight window wraps into the activation banks (measured 2026-10-12,
+             * K=128). The builder already declined the round if no legal partition exists. */
+            int kcap = orki_f16_mtile_n(Kp, M, a->h->f16_ncmax); if (kcap < 1) kcap = 1;
             int np_ks = (M + kcap - 1) / kcap;
             struct rknpu_submit s; memset(&s, 0, sizeof s);
             s.flags = ork_ppflags() | (f16_sentinel ? 0x2u : 0u);   /* SENTINEL: NONBLOCK (0x2) — CPU polls, never blocks in-kernel. Else BLOCKING (ping-pong safe within one buffer). */
@@ -294,12 +295,23 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
      * left ~1.5 GB of maf and ~1 GB of mcc pinned in a 4 GiB domain for a matmul that then ran single-core,
      * and every LATER call's whole-buffer scratch sync was charged against that high-water mark. The program
      * count depends only on M and the K-slicing, so it can be decided here. */
+    /* WIDEST per-core N of this round — the single number the M-tile's legality is read against on
+     * every core (see ork_dyn_chain::f16_ncmax). */
+    int f16_ncmax = 0;
+    for (int i = 0; i < nc; i++) { int a0 = (int)((long)i * NN / nc), a1 = (int)((long)(i+1) * NN / nc);
+        int nco = (a1 - a0) * nt_sz; if (nco > f16_ncmax) f16_ncmax = nco; }
     if (dt == DT_F16) { int KSq = orki_f16_ks(c), npq = 0;
         for (int ks = 0; ks < w->Sk; ks++) { int k0 = ks*KSq, Kp = (K-k0<KSq)?(K-k0):KSq;
-            int kc = orki_f16_mcap(Kp, orki_f16_sched(Kp)); if (kc < 1) kc = 1;
+            /* N-AWARE, and it has to be: the N-blind cap admitted an M-tile whose weight window wraps
+             * into the activation banks, which is what made ork_f16_mm_run silently wrong at K=128
+             * once N grew past this split's reach (measured 2026-10-12). 0 = no legal partition of M
+             * at this Kp/Ncore — decline colsplit; run_multicore falls back to the single-core fp16
+             * reference, which pads a short tile up to a legal height instead. */
+            int kc = orki_f16_mtile_n(Kp, M, f16_ncmax); if (kc < 1) return NULL;
             npq += (M + kc - 1) / kc; if (npq > 512) return NULL; } }
     ork_dyn_chain *h = calloc(1, sizeof *h); if (!h) return NULL;
     h->c = c; h->S = nc; h->P = nc; h->N = N; h->dom = w->domain; h->reserve = nc; h->mc = 1;
+    h->f16_ncmax = f16_ncmax;
     h->mc_dt = dt;   /* set EARLY: ork_csub_worker (runs before the tail below) reads it for the accumulate dtype */
     struct rknpu_submit subs[ORK_MAXCORE]; int Pc[ORK_MAXCORE]; memset(Pc, 0, sizeof Pc);
     /* per-core LIVE scratch extents for this call (see struct ork_csub) */
@@ -384,12 +396,16 @@ ork_dyn_chain *ork_dyn_begin_colsplit(ork_npu *c, const ork_mm_task_i8 *t, int n
             for (int ks = 0; ks < w->Sk; ks++) {
                 int k0 = ks*KS, Kp = (K-k0<KS)?(K-k0):KS;
                 int sched = orki_f16_sched(Kp);
-                /* fp16 M-tile cap = the MEASURED envelope (orki_f16_mcap). The old
-                 * mg_max*64 / (RBf/2)/Kp / 4*R expression was wrong in BOTH directions: too small
-                 * at K=512/1024 (320/128 vs a real 352/176) and far too LARGE at K=128 (4*R=1024
+                /* fp16 M-tile = the MEASURED envelope, N-aware and remainder-aware (orki_f16_mtile_n
+                 * against the round's widest per-core N — see the twin site in ork_csub_worker).
+                 * The old mg_max*64 / (RBf/2)/Kp / 4*R expression was wrong in BOTH directions: too
+                 * small at K=512/1024 (320/128 vs a real 352/176) and far too LARGE at K=128 (4*R=1024
                  * vs a real 256), which is how ork_f16_mm_run silently miscomputed at K=128 for
-                 * any M in [257,1472] — this multicore/colsplit path is the one it takes. */
-                int kcap = orki_f16_mcap(Kp, sched);
+                 * any M in [257,1472] — this multicore/colsplit path is the one it takes. Its N-blind
+                 * successor was wrong again, in a subtler way: at K=128 the legal M-tiles are a
+                 * function of N, so N-blindness miscomputed at M<=64 for any N this split left above
+                 * 512 columns per core (measured 2026-10-12). */
+                int kcap = orki_f16_mtile_n(Kp, M, h->f16_ncmax); if (kcap < 1) { free(h); return NULL; }
                 uint32_t wbase = (uint32_t)((contig ? (w->Bbc.dma + sloff) : w->Bb[ks].dma) + (uint64_t)t0 * Kp * 32);   /* CONTIG: slice base = Bbc + cumulative slice offset (one buffer); else per-slice Bb[ks]. N-tile stride Kp*32 (== mcworker) */
                 for (int m0 = 0; m0 < M; m0 += kcap) { int mc = (M-m0<kcap)?(M-m0):kcap;
                     if ((size_t)(np2+1) * REGCMD_N * 4 > RC->size) { free(h); return NULL; }
