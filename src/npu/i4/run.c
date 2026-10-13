@@ -529,29 +529,56 @@ int orki_i4_run_mc_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, 
     return (d == M-1) ? 0 : -1;
 }
 
+/* The N-tile width the geometry ladder STARTS from, and orki_i4_bchain_try's default.
+ *
+ * 131072 int4 elements is the CBUF weight-bank containment limit (derivation in orki_i4_bchain_try);
+ * `&~63` rounds it down to whole 64-column blocks. That floor is not the widest tile the hardware
+ * takes: at K<=1024 the weight tile is small enough that 320 columns still fit, worth 1.15-1.26x at
+ * a production shape (10.3.0.236, N=2048 M=128, section 17.4 of the wiki entry). hcap>=12 keeps the
+ * batch clear of the erratic low-H race band; K<=1024 is where it was measured, nothing more.
+ *
+ * It is a PER-PART guess, not a law -- 10.3.0.235 refuses 192, 256 and 320 at K=768 outright. The
+ * ladder below is what makes it safe to ship: rung 1 is this function's own `&~63` floor, so a part
+ * that will not take the wide tile lands on today's shipped width and not two rungs under it.
+ * ORK_I4_NOWIDE=1 pins the floor for an A/B. Wiki: Exp-2026-10-12-INT4-BCHAIN-Dispatch-Envelope. */
+int orki_i4_wbdef(int K, int N){
+    static int nowide = -1; if(nowide < 0) nowide = getenv("ORK_I4_NOWIDE") ? 1 : 0;
+    int Wb = (131072 / K) & ~63;
+    if(!nowide && K <= 1024 && orki_i4_hcap(K) >= 12 && Wb < 320) Wb = 320;   /* widen, never narrow */
+    if(Wb > N) Wb = N;
+    return Wb < 64 ? 64 : Wb;
+}
+
 /* Run the BCHAIN batch, de-escalating the tile geometry if THIS PART will not take it.
  *
  * Wb and the orki_i4_hcap() table are constants measured on ONE die. A second RK3588 accepts the
  * submit and never starts the task at geometries the first one runs, so a doorbell miss here is not
- * necessarily a dead shape -- it can be a geometry this part will not take. Retry once with the
- * narrowest N-tile, then once with a shorter M-batch as well. Both steps are bit-exact: same tiles,
- * same kernel, only the grouping changes, and the goldens are unchanged across them.
+ * necessarily a dead shape -- it can be a geometry this part will not take. The rungs, widest first:
+ *
+ *     0  Wb = orki_i4_wbdef(K,N)   the measured-widest tile      1.15-1.26x where the part takes it
+ *     1  Wb = (131072/K) & ~63     the shipped containment floor  <-- today's default, never skipped
+ *     2  Wb = 64                   the width every measured K accepts
+ *     3  Wb = 64, H = 4            and a shorter M-batch
+ *
+ * Rung 1 is not optional padding. Without it a part that refuses the wide tile forfeits the width it
+ * DOES take and lands on 64: measured -25% at K=768 on 10.3.0.235 (1532 -> 1917 us steady state),
+ * where rung 1 holds it at 1532. Every step only re-tiles -- same tiles, same kernel, only the
+ * grouping changes -- so every rung is BIT-EXACT and the goldens are unchanged across them.
  *
  * H is only ever LOWERED. Raising it past orki_i4_hcap() does not fail, it MISCOMPUTES SILENTLY, which
- * is why ORK_I4_H must never be used as a blanket override. A step that would not change the geometry
- * is skipped, so a part where the measured values hold pays nothing. ORK_I4_NOLADDER=1 for an A/B.
+ * is why ORK_I4_H must never be used as a blanket override. A rung that would not change the geometry
+ * is not live, so a part where the measured values hold pays nothing. ORK_I4_NOLADDER=1 for an A/B.
  *
  * THE RUNG IS REMEMBERED, and that is the point of this function. The ladder recovered correctly but
  * re-paid the refused attempt on EVERY call, because nothing recorded that this part had already
  * refused that geometry -- which on board 10.3.0.235 is 15.86 s per call where the rung it lands on
  * runs in 3.59 ms. The memo keys on (K,N), the geometry a refusal is a property of, and only ever
- * TIGHTENS: a lower rung is bit-exact, and the de-escalation path moves to Wb=64 first, the one
- * N-tile width every measured K accepts. A part that refuses nothing never writes an entry and pays
+ * TIGHTENS: a lower rung is bit-exact. A part that refuses nothing never writes an entry and pays
  * nothing. A transient miss can pin a shape one rung lower for the life of the process; that costs a
  * few percent, against three orders of magnitude for getting it wrong the other way.
  *
  * Probing is cheap too (ladder_probe): an attempt the ladder can fall back from skips the six recover
- * rounds and caps its completion wait, so LEARNING a shape costs ~1 s rather than 15.9 s.
+ * rounds and caps its completion wait, so LEARNING a shape costs ~1.3 s rather than 15.9 s.
  * Wiki: Exp-2026-10-09-The-Domain-Reference-Leak, Exp-2026-10-12-INT4-BCHAIN-Dispatch-Envelope. */
 #define ORKI_I4_GEOMEMO 64
 static struct { int K, N, rung; } orki_i4_geomemo[ORKI_I4_GEOMEMO];
@@ -578,37 +605,34 @@ static void orki_i4_geomemo_set(int K, int N, int rung){
 int orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc){
     static int noladder = -1; if(noladder < 0) noladder = getenv("ORK_I4_NOLADDER") ? 1 : 0;
     if(noladder) return orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0, 0);
-    const int K = w->K, N = w->N;
-    int H = orki_i4_hcap(K), Wb = (131072 / K) & ~63;
-    if(Wb > N) Wb = N;
-    /* A rung only exists where it is a DIFFERENT geometry from the one above it. Where it is not
-     * (Wb already 64, or H already <= 4) the memo has to step straight past it, or a shape would
-     * record a rung it can never reach and every later call would skip the attempt that works. */
-    const int r1 = (Wb > 64), r2 = (H > 4);
+    const int K = w->K, N = w->N, H = orki_i4_hcap(K);
+    int wnar = (131072 / K) & ~63; if(wnar > N) wnar = N; if(wnar < 64) wnar = 64;
+    const int wmin = N < 64 ? N : 64;
+    /* A rung only EXISTS where it is a different geometry from the live rung above it. Where it is
+     * not (the wide tile already is the floor, Wb already 64, H already <= 4) the memo has to step
+     * straight past it, or a shape would record a rung it can never reach and every later call would
+     * skip the attempt that works. */
+    const int RW[4] = { orki_i4_wbdef(K, N), wnar, wmin, wmin };
+    const int RH[4] = { H, H, H, H < 4 ? H : 4 };
+    int live[4]; live[0] = 1;
+    for(int i = 1, p = 0; i < 4; i++){ live[i] = (RW[i] != RW[p] || RH[i] != RH[p]); if(live[i]) p = i; }
     int rung = orki_i4_geomemo_get(K, N), r = -1, missed = 0;
-    if(rung == 0){
-        r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 0, (r1 || r2));   /* probe cheaply iff a fallback exists */
-        if(r != -1) return r;
-        missed = 1; rung = 1;
-    }
-    /* RESET before every retry. A geometry the part will not take leaves CBUF residue, and the next
-     * attempt then computes against it -- not a miss but a WRONG ANSWER (test_slice_rescue i4-refuse,
-     * 308202 mismatches, 2026-10-10). This is the same stale-CBUF-residue mode orki_i4_hcap's K=2560
-     * entry documents. ork_npu_mode_reset is the heavyweight ACT_RESET + mode-invalidate, which is what
-     * a retry after a failed submit needs. It is conditioned on `missed`, NOT on "we are past rung 0":
-     * a memoized start attempted nothing, so there is no residue to clear, and resetting anyway costs a
-     * full ACT_RESET + cold re-warm on EVERY call -- measured 216 ms against the 3.6 ms run it precedes,
-     * which ate 98% of what the memo had just won. */
-    if(rung == 1 && r1){
+    for(; rung < 4; rung++){
+        if(!live[rung]) continue;
+        int more = 0; for(int j = rung + 1; j < 4; j++) if(live[j]){ more = 1; break; }
+        /* RESET before every retry. A geometry the part will not take leaves CBUF residue, and the
+         * next attempt then computes against it -- not a miss but a WRONG ANSWER (test_slice_rescue
+         * i4-refuse, 308202 mismatches, 2026-10-10). This is the same stale-CBUF-residue mode
+         * orki_i4_hcap's K=2560 entry documents. ork_npu_mode_reset is the heavyweight ACT_RESET +
+         * mode-invalidate, which is what a retry after a failed submit needs. It is conditioned on
+         * `missed`, NOT on "we are past rung 0": a memoized start attempted nothing, so there is no
+         * residue to clear, and resetting anyway costs a full ACT_RESET + cold re-warm on EVERY call
+         * -- measured 216 ms against the 3.6 ms run it precedes, which ate 98% of what the memo had
+         * just won. */
         if(missed) ork_npu_mode_reset(c);
-        r = orki_i4_bchain_try(c, w, M, A, C, nc, 0, 64, r2);
-        if(r != -1){ orki_i4_geomemo_set(K, N, 1); return r; }
-        missed = 1; rung = 2;
-    } else if(rung == 1) rung = 2;
-    if(rung >= 2 && r2){
-        if(missed) ork_npu_mode_reset(c);
-        r = orki_i4_bchain_try(c, w, M, A, C, nc, 4, 64, 0);
-        if(r != -1) orki_i4_geomemo_set(K, N, 2);
+        r = orki_i4_bchain_try(c, w, M, A, C, nc, rung == 3 ? 4 : 0, rung ? RW[rung] : 0, more);
+        if(r != -1){ if(rung) orki_i4_geomemo_set(K, N, rung); return r; }
+        missed = 1;
     }
     return r;
 }

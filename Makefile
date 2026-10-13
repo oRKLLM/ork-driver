@@ -224,6 +224,12 @@ i4_storm_probe: tools/re/i4_storm_probe.c $(COBJ)
 i4_e2_probe: tools/re/i4_e2_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: grade the int4 BCHAIN geometry LADDER (and each rung it can land on) against an ABSOLUTE
+# CPU reference. Cell-list mode walks named (Wb,H) geometries in a given order in one process;
+# ladder mode prints per-rep times so the one-time learn is separable from the steady state.
+i4_ladder_probe: tools/re/i4_ladder_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: TIMED model test for the int4 BCHAIN bank budgets. Classifies every point as
 # ok / SELFHEAL / WRONG — a checksum alone cannot validate a config, because the driver self-heals a
 # timed-out submit and returns the right answer ~800x slower.

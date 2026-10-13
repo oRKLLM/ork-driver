@@ -455,7 +455,7 @@ int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C,
     { const char*e=getenv("ORK_I4_H"); if(e){int v=atoi(e); if(v>0) H=v;} }   /* re-read: lets one probe process sweep */
     if(Hlim>0 && Hlim<H) H=Hlim;                 /* geometry ladder (below): lower only, never raise */
     if(H<2) return -4;
-    int Wb=(131072/K)&~63;
+    int Wb=orki_i4_wbdef(K,N);
     /* N-tile width = the WEIGHT-BANK WIDTH. 131072 int4 elements = 65536 B = one CBUF weight bank.
      * This is a CONTAINMENT requirement, not a budget: a native multi-M batch is valid only WITHIN
      * one weight bank (there is no D_BANK to hold a second), so a chunk that straddles banks hits the
@@ -470,7 +470,7 @@ int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C,
      * divide 131072 — e.g. K=768 allows 170 columns/bank but rounds to 128. Capturing that needs the
      * de-tile below generalised off its exact Wmax=Wb/64 block count; keep any probe a multiple of 64
      * until then, or a host-arithmetic break reads as a hardware failure.
-     * ORK_I4_WB overrides for RE. */
+     * orki_i4_wbdef() may WIDEN it past that rounding where measured safe; ORK_I4_WB overrides. */
     { const char*e=getenv("ORK_I4_WB"); if(e){int v=atoi(e); if(v>0) Wb=v;} }   /* re-read: lets one probe process sweep */
     if(Wblim>0 && Wblim<Wb) Wb=Wblim;            /* geometry ladder (below): narrow only */
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
