@@ -348,11 +348,11 @@ static int orki_i4_densek(int K){ static int v=-1; if(v<0){ const char *e=getenv
 
 static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk,int tk_base){
     int tk=0;   /* #54 tk_base: this weight's program slot 0 within the shared per-core chain (0 for single-weight; the expert's cumulative program offset for coalesced multi-expert) */
+    long seedn=0, totn=0, blkdead=0;   /* mode 4 census: seed survivors, written cells, and ENTIRELY-seed 64-cell blocks. Verdict at the bottom. */
     for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
             if(only_tk>=0 && tk!=only_tk){ tk++; continue; }   /* poll fast-gate: only the given program (last program lands last — chain runs in order) */
             int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
-            int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
             const int16x8_t vsent=vdupq_n_s16(ORK_DYN_SENT16);   /* seed/verify/de-tile are NEON: bit-exact, pure movement + a compare-reduce */
             if((mode==3||mode==6) && !orki_bch_slowgate()){   /* invalidate EXACTLY the lines this program wrote, ONE dsb, then read.
                 * Replaces a kernel FROM_DEVICE sync over the whole slot, which is 4x the written cells (2 from cube
@@ -371,11 +371,16 @@ static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,i
                     for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
                         if(vmaxvq_u16(vceqq_s16(v,vsent))) return 0;   /* same predicate as mode 3; C is rewritten whole on the retry */
                         vst1q_s32(&crow[cc],vmovl_s16(vget_low_s16(v))); vst1q_s32(&crow[cc+4],vmovl_s16(vget_high_s16(v))); } }
-                else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
+                else if(mode==4){ int liv=0; for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16) liv++; seedn+=64-liv; totn+=64; blkdead+=!liv; }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. Use ONLY at the poll timeout. CENSUS, not a sample: see the verdict. Wiki: Exp-2026-10-13 INT4 BCHAIN Completion Gate. */
                 else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
                         vst1q_s32(&crow[cc],vmovl_s16(vget_low_s16(v))); vst1q_s32(&crow[cc+4],vmovl_s16(vget_high_s16(v))); } } }
-            if(mode==4 && !ran) return 0;   /* this program is ENTIRELY sentinel => it truly never ran => real drop */
             tk++; } }
+    if(mode==4){ const long cap = totn/1000 > 8 ? totn/1000 : 8;   /* TWO TESTS, because a torn surface and a legitimate saturation differ in SHAPE, not size: an unwritten region
+        * leaves whole 64-cell BLOCKS at the seed, a saturating W4A4 accumulator pinned at 0x7fff is scattered and leaves none. Dead blocks are the discriminator; the survivor count
+        * backstops a sub-block tear. "Did the PROGRAM write anything" is NOT sufficient -- a program caught mid-write always has. ORK_MC_DIAG prints the census.
+        * Wiki: Exp-2026-10-13 INT4 BCHAIN Completion Gate. */
+        if(getenv("ORK_MC_DIAG")) fprintf(stderr,"[bch-collide] core %d: %ld/%ld seed cells, %ld dead blocks (cap %ld) => %s\n",i,seedn,totn,blkdead,cap,(!blkdead&&seedn<=cap)?"ACCEPT":"REFUSE");
+        if(blkdead || seedn>cap) return 0; }   /* loud and retried beats silently de-tiling a half-written surface */
     return 1;
 }
 

@@ -4,6 +4,6 @@
 # differs from CORE_SHA last validated an OLDER tree. 'make check-attest-all' requires every board
 # in ATTEST_BOARDS; 'make attest-waive BOARD=.. REASON=..' excuses one, and the waiver expires with
 # the hash it names. See the Makefile's ATTEST_* block.
-# No BOARD= line yet: this hash was attested under the old single-CORE_SHA format, which did not record
-# which board ran the suite. The next green 'make test' on either board fills its own line in.
-CORE_SHA=a7b8d70805a8eb9eaad91455fcf4f8b99586b5758a7d3b61bf654416af86d553
+CORE_SHA=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08
+BOARD=radxa,rock-5b kernel=6.1.115-vendor-rk35xx-fencefix sha=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08 date=2026-10-13
+BOARD=radxa,rock-5b-plus kernel=6.1.115-vendor-rk35xx-fix sha=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08 date=2026-10-13
