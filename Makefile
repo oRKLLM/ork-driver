@@ -1338,3 +1338,13 @@ law_bench: tools/law_bench.c $(COBJ)
 # the fp16 M-cap consequence at training shapes. Self-validating vs an fp64 reference. Not in all/test.
 train_scope_bench: tools/train_scope_bench.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm -lpthread
+
+# E5: is the int4 MAC array actually 2x as wide as the int8 one? Same (M,K,N) in both precisions,
+# int4 built as far from every known non-MAC bound as its geometry allows, GMAC/s per core.
+i4_macrate_probe: tools/re/i4_macrate_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
+# E3: what does DPU_WDMA_SIZE_0.TP_PRECISION (0x4058 bit 27) do? Sets it (and its TP_EN companion)
+# through the int4 fuzzer and tests the halved-write-pitch signature against a CPU reference.
+i4_tp_precision_probe: tools/re/i4_tp_precision_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
