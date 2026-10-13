@@ -199,6 +199,22 @@ int ork_dyn_halt(ork_dyn_chain *h, int at) { if (!h || h->mc || at < 0) return -
     __asm__ volatile("dc cvac,%0"::"r"(&rcp[218]):"memory"); __asm__ volatile("dsb ish":::"memory");
     return 0; }
 
+/* One core's share of the int4 BCHAIN drain-verify, shaped for the persistent pool.
+ *
+ * The mode-1 gate (the LAST program's cells) is cheap and stays on the calling thread; the mode-3
+ * full-surface verify behind it is the expensive half and used to run SERIALLY for every core on
+ * that one thread, while the three pool threads sat idle. Cores own disjoint scratch and disjoint
+ * column ranges of C, so fanning it out is a pure parallelisation: same cells, same predicate.
+ * It runs mode 6, which widens each verified tile into C in the same pass -- the separate de-tile
+ * below then has nothing left to read. A core that fails leaves C partly written; the retry
+ * rewrites it whole, which is why mode 6 never resumes from a prefix. */
+struct ork_bchvw { ork_dyn_chain *h; int i; int res; };
+static void *orki_bch_verify_worker(void *vp){ struct ork_bchvw *a=vp; if(a->res!=-2) return NULL;
+    ork_dyn_chain *h=a->h; int i=a->i; ork_npu *c=h->c;
+    if(orki_bch_slowgate()) orki_bsync_live(c->fd,&c->mcc[i], h->nout[i]?(size_t)h->nout[i]*2:c->mcc[i].size, RKNPU_MEM_SYNC_FROM_DEVICE);
+    a->res = orki_bch_db_cells(c,i,h->b_c0[i],h->b_c1[i],h->b_Wb,h->b_N,h->b_NG,h->b_M,h->b_H,h->b_Wmax,h->b_C,6,-1);
+    return NULL; }
+
 /* One core's share of the int4 BCHAIN de-tile, shaped for the persistent pool (see ork_dyn_end). */
 struct ork_bchdt { ork_dyn_chain *h; int i; };
 static void *orki_bch_detile_worker(void *vp){ struct ork_bchdt *a = vp; ork_dyn_chain *h = a->h; int i = a->i;
@@ -292,7 +308,26 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             nanosleep(&ts,NULL); slept_pred=1; }
         int pass0 = 1;
         for (;;) { double ps = ork_now_us();
-            int n = 0; for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
+            int n = 0;
+            if (h->i4batch && h->S > 1 && !h->collide_ok && !orki_bch_slowgate()) {
+                /* Gate every core on this thread (cheap), then verify the gated ones in ONE fan-out.
+                 * One fan-out per round, not one per core: the pool wake-up is about 30 us and a per-core
+                 * trickle paid it three times for a check that has to wait for the slowest core anyway. */
+                struct ork_bchvw vw[ORK_MAXCORE]; int any=1, ng=0, P=h->S>ORK_MAXCORE?ORK_MAXCORE:h->S;
+                for (int i=0;i<P;i++){ vw[i].h=h; vw[i].i=i; vw[i].res=-1;
+                    if(!edone[i]){ if(orki_bch_db_cells(h->c,i,h->b_c0[i],h->b_c1[i],h->b_Wb,h->b_N,h->b_NG,h->b_M,h->b_H,h->b_Wmax,NULL,1,h->b_NT[i]-1)) { vw[i].res=-2; ng++; }
+                                   else any=0; } }
+                if(any && ng){ ork_npu *pc=h->c;
+                    if(P>1){ pthread_mutex_lock(&pc->pmu); pc->pjob=vw; pc->pjob_nc=P; pc->pjob_fn=orki_bch_verify_worker;
+                        pc->pjob_stride=sizeof(struct ork_bchvw); pc->pdone=0; pc->pgen++;
+                        pthread_cond_broadcast(&pc->pgo); pthread_mutex_unlock(&pc->pmu);
+                        orki_bch_verify_worker(&vw[0]);
+                        pthread_mutex_lock(&pc->pmu); while(pc->pdone<P-1) pthread_cond_wait(&pc->pdn,&pc->pmu); pthread_mutex_unlock(&pc->pmu); }
+                    else orki_bch_verify_worker(&vw[0]);
+                    for (int i=0;i<P;i++) if(!edone[i] && vw[i].res>0){ edone[i]=1; h->i4_detiled++; } }
+                for (int i=0;i<h->S;i++) n += edone[i];
+            } else
+            for (int i = 0; i < h->S; i++) { if (!edone[i]) edone[i] = ork_dyn_done_i(h, i); n += edone[i]; }
             if (pass0) { pass0 = 0;                              /* one complete look over every surface: the floor's unit */
                 floor_us = mfp > 0 ? mfp : mfk * (ork_now_us() - ps);
                 if (floor_us < 2000.0) floor_us = 2000.0;
@@ -430,11 +465,13 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         int j = 0; while (j < nd && done[j] != b) j++;
         if (j == nd) { if (nd >= 1024) continue; done[nd] = b; dext[nd] = ext; nd++; }
         else if (ext > dext[j]) dext[j] = ext; }
+    if (h->i4batch && h->i4_detiled >= h->S) nd = 0;   /* the drain-verify already invalidated and read every written line; this was a duplicate whole-slot sync */
     for (int j = 0; j < nd; j++) { orki_bsync_live(fd, done[j], dext[j], RKNPU_MEM_SYNC_FROM_DEVICE);
         if (orki_csp_on > 0) orki_csp_b[CSP_ENDSYNC] += (double)(dext[j] < done[j]->size ? dext[j] : done[j]->size); }
     if (orki_csp_on > 0) { orki_csp_t[CSP_ENDSYNC] += ork_now_us() - _e0; orki_csp_n[CSP_ENDSYNC]++; }
     double _e1 = ork_now_us();
-    if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
+    if (h->i4batch && h->i4_detiled >= h->S) { /* the fused drain-verify already widened every tile */ }
+    else if (h->i4batch) {   /* #54 BCHAIN de-tile: widen each core's int16 tiles -> caller's int32 C (mcc synced above). dst[i]=NULL so the generic writeback below skips these. */
         /* FANNED OUT over the existing persistent pool. The widen is already a tight NEON loop
          * (ldr q / sxtl / sxtl2 / stp q), so the remaining lever is that it ran on ONE thread for
          * ALL cores' outputs. Core i owns N-tiles [c0,c1), so the cores write DISJOINT column
@@ -591,6 +628,7 @@ void orki_mc_recover_resubmit(ork_dyn_chain *h){
     for (int x = 0; x < h->S; x++) { struct buf *b = h->outbuf[x]; int seen = 0;
         for (int j = 0; j < ncl; j++) if (cl[j] == b) seen = 1;
         if (!seen && b) { orki_bsync(fd, b, RKNPU_MEM_SYNC_TO_DEVICE); if (ncl < 1024) cl[ncl++] = b; } }
+    h->i4_detiled = 0;   /* the re-seed below puts the sentinel back, so nothing is verified or de-tiled any more */
     if (h->i4batch) {   /* BCHAIN: re-seed ONLY the cells a program writes. The slot is 4x the written cell set
         * (base = (4*j + 4*Hg*b)*64 inside 4*H*Wmax*64), so the full-surface walk below left ~75% of the surface
         * permanently at 0x7fff after any recover — which the adjudicator then counted as survivors against a

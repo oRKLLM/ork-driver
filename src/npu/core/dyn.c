@@ -102,6 +102,7 @@ int ork_dyn_done_i(ork_dyn_chain *h, int i){
         if (ok) {
             /* Only the live tile extent: mcc is grow-only scratch with a 2 MiB/core pre-allocation floor,
              * so a whole-buffer sync charges cache maintenance over the widest shape the process ever ran. */
+            if (orki_bch_slowgate())   /* otherwise mode 3 invalidates its own lines (a quarter of this extent) */
             orki_bsync_live(c->fd, &c->mcc[i], h->nout[i] ? (size_t)h->nout[i]*2 : c->mcc[i].size,
                             RKNPU_MEM_SYNC_FROM_DEVICE);
             ok = orki_bch_db_cells(c, i, h->b_c0[i], h->b_c1[i], h->b_Wb, h->b_N, h->b_NG, h->b_M, h->b_H, h->b_Wmax, NULL, 3, -1);

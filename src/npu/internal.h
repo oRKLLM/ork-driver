@@ -255,6 +255,7 @@ struct ork_dyn_chain {
      * (ork_dyn_done_i), the recover re-seed (orki_mc_recover_resubmit), and the de-tile (ork_dyn_end writeback) all
      * delegate to bch_db_cells with this stored geometry — preserving the mode-1 gate, mode-4 collision-tolerance
      * (SENT16=0x7fff reachable), and mode-2 int16->int32 de-tile. */
+    int        i4_detiled;             /* cores whose drain-verify also widened their tiles into C (fused pass) */
     int        i4batch;                 /* 1 = BCHAIN programs drained by ork_dyn_end via bch_db_cells */
     int        b_H, b_Wb, b_Wmax, b_NG, b_M, b_N;   /* BCHAIN geometry (shared across cores) */
     int        b_c0[ORK_MAXCORE], b_c1[ORK_MAXCORE], b_NT[ORK_MAXCORE];   /* per-core N-chunk range + program count */
@@ -311,6 +312,7 @@ extern const char *orki_last_op; extern int orki_last_K, orki_last_N, orki_last_
 extern volatile sig_atomic_t orki_ork_term, orki_in_doorbell;
 
 /* ---- provided BY src/npu/i4/ to the scaffold ---- */
+int  orki_bch_slowgate(void);
 int  orki_bch_db_cells(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk);
 int  orki_i4_submit_tmo_ms(void);
 int  orki_i4_run_bchain_db(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C, int nc);

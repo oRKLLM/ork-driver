@@ -335,6 +335,10 @@ cleanup:
     return ok;
 }
 
+/* ORK_BCH_SLOWGATE=1 restores the pre-2026-10-13 completion gate -- a serial per-core drain-verify
+ * behind a kernel FROM_DEVICE sync, then a separate de-tile pass -- for an A/B or a bisect. */
+int orki_bch_slowgate(void){ static int v=-1; if(v<0) v=getenv("ORK_BCH_SLOWGATE")?1:0; return v; }
+
 static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk,int tk_base){
     int tk=0;   /* #54 tk_base: this weight's program slot 0 within the shared per-core chain (0 for single-weight; the expert's cumulative program offset for coalesced multi-expert) */
     for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
@@ -343,11 +347,23 @@ static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,i
             int16_t *og=(int16_t*)c->mcc[i].cpu + (size_t)(tk_base+tk)*(size_t)(4*H*Wmax)*64;
             int ran=0;   /* mode 4: did THIS program write anything (>=1 non-sentinel cell = it ran)? */
             const int16x8_t vsent=vdupq_n_s16(ORK_DYN_SENT16);   /* seed/verify/de-tile are NEON: bit-exact, pure movement + a compare-reduce */
+            if((mode==3||mode==6) && !orki_bch_slowgate()){   /* invalidate EXACTLY the lines this program wrote, ONE dsb, then read.
+                * Replaces a kernel FROM_DEVICE sync over the whole slot, which is 4x the written cells (2 from cube
+                * height 2H, 2 from int16 data at an int32 row pitch). Fail-safe by construction: a line that is still
+                * stale reads back the SEED, i.e. not-done -- it can delay completion, never declare it early. */
+                for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;
+                    __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory"); }
+                __asm__ volatile("dsb ish":::"memory"); }
             for(int j=0;j<Hg;j++) for(int b=0;b<NBc;b++){ size_t base=(size_t)(4*j+4*Hg*b)*64;   /* a 64-int16 block = 2 x 64B cache lines */
                 if(mode==0){ for(int cc=0;cc<64;cc+=8) vst1q_s16(&og[base+cc], vsent); }
                 else if(mode==1){ __asm__ volatile("dc civac,%0"::"r"(&og[base]):"memory"); __asm__ volatile("dc civac,%0"::"r"(&og[base+32]):"memory");
                     for(int cc=0;cc<64;cc++) if(((volatile int16_t*)og)[base+cc]==ORK_DYN_SENT16) return 0; }
                 else if(mode==3){ for(int cc=0;cc<64;cc+=8) if(vmaxvq_u16(vceqq_s16(vld1q_s16(&og[base+cc]),vsent))) return 0; }
+                else if(mode==6){   /* FUSED drain-verify + de-tile: the two passes read the same cells, so read them once */
+                    int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64;
+                    for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
+                        if(vmaxvq_u16(vceqq_s16(v,vsent))) return 0;   /* same predicate as mode 3; C is rewritten whole on the retry */
+                        vst1q_s32(&crow[cc],vmovl_s16(vget_low_s16(v))); vst1q_s32(&crow[cc+4],vmovl_s16(vget_high_s16(v))); } }
                 else if(mode==4){ for(int cc=0;cc<64;cc++) if(og[base+cc]!=ORK_DYN_SENT16){ ran=1; break; } }   /* #54 COLLISION-TOLERANT landing: SENT16 (0x7fff) IS a reachable W4A4 int16 output, so mode 1/3 (any-cell==sentinel => not-landed) FALSE-MISS on a legit 0x7fff cell -> recover -> ACT_RESET -> multi-domain corruption. A REAL miss = the program NEVER ran = EVERY cell still sentinel; a landed program has >=1 non-sentinel cell (residual 0x7fff cells are real values, de-tiled correctly). Use ONLY at the poll timeout (by then a run program is fully written). */
                 else { int32_t *crow=C+(size_t)(g*H+j)*N+n0+b*64; for(int cc=0;cc<64;cc+=8){ int16x8_t v=vld1q_s16(&og[base+cc]);
                         vst1q_s32(&crow[cc],vmovl_s16(vget_low_s16(v))); vst1q_s32(&crow[cc+4],vmovl_s16(vget_high_s16(v))); } } }
