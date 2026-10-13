@@ -208,6 +208,11 @@ sdp_mcap_probe: tools/re/sdp_mcap_probe.c $(COBJ)
 i4_hcap_probe: tools/re/i4_hcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: map the int4 BCHAIN (Wb, H) dispatch surface on THIS board -- one pack, H walked UPWARD
+# per N-tile width, every cell graded by PASS-RATE against the Wb=64 H=2 anchor AND by wall time.
+i4_wb_sweep: tools/re/i4_wb_sweep.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: grade ONE int4 BCHAIN geometry on THIS board — repeated, timed, per-call checksum, and a
 # census of outputs sitting at the int16 sentinel. Separates self-heal from miscompute from collision.
 i4_storm_probe: tools/re/i4_storm_probe.c $(COBJ)
