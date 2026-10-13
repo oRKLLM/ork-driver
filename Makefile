@@ -218,6 +218,12 @@ i4_wb_sweep: tools/re/i4_wb_sweep.c $(COBJ)
 i4_storm_probe: tools/re/i4_storm_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# RE tool: grade an int4 BCHAIN geometry against an ABSOLUTE CPU reference, repeated and timed.
+# i4_storm_probe grades against ITS OWN iteration 0, so a consistently-wrong geometry agrees with
+# itself; use this one whenever the arm being compared CHANGES the geometry (H, Wb, the pack).
+i4_e2_probe: tools/re/i4_e2_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
+
 # RE tool: TIMED model test for the int4 BCHAIN bank budgets. Classifies every point as
 # ok / SELFHEAL / WRONG — a checksum alone cannot validate a config, because the driver self-heals a
 # timed-out submit and returns the right answer ~800x slower.

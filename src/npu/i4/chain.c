@@ -476,6 +476,19 @@ int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C,
     if(Wb<64)Wb=64; if(Wb>N)Wb=N;
     int NC=(N+Wb-1)/Wb, NG=(M+H-1)/H, Wmax=Wb/64;
     if(nc<1)nc=1; if(nc>NC)nc=NC; if(nc>c->soc->cores)nc=c->soc->cores; if(nc>ORK_MAXCORE)nc=ORK_MAXCORE;
+    /* TAIL-GROUP BALANCE. The completion poll gates on the LAST program of the chain and scans that
+     * program's r*Wmax*64 output cells, where r = M-(NG-1)*H is the FINAL M-group's row count — so a
+     * full tail group (r==H, i.e. H divides M) is the worst case, and H==orki_i4_hcap(K) is a LOCAL
+     * WORST whenever hcap divides M. Measured ~1.25*Wmax us per tail row against ~3 us for the one
+     * extra program per N-tile a smaller H costs; trade them over a 4-wide window. Gated on Wb>=256:
+     * at Wb<=128 the tail scan is too narrow to pay (measured null) and at Wb==64 it is a small loss.
+     * H only re-tiles M, so every candidate is BIT-IDENTICAL (verified, every H at a fixed M).
+     * Wiki: Exp-2026-10-12-INT4-BCHAIN-Dispatch-Envelope. */
+    if(Wb>=256 && H>=12 && M>H && !getenv("ORK_I4_NOTAIL")){
+        int tcrit=(NC+nc-1)/nc, gam=Wmax+Wmax/4, best=H, bc=1<<30;
+        for(int h=H; h>=H-3 && h>=8; h--){ int g=(M+h-1)/h, cost=gam*(M-(g-1)*h)+3*g*tcrit;
+            if(cost<bc){ bc=cost; best=h; } }
+        if(best!=H){ H=best; NG=(M+H-1)/H; } }
     if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
         fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
     unsigned dom=w->domain;
