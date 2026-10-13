@@ -495,15 +495,17 @@ int orki_i4_bchain_try(ork_npu *c, ork_w *w, int M, const int8_t *A, int32_t *C,
     /* TAIL-GROUP BALANCE. The completion poll gates on the LAST program of the chain and scans that
      * program's r*Wmax*64 output cells, where r = M-(NG-1)*H is the FINAL M-group's row count — so a
      * full tail group (r==H, i.e. H divides M) is the worst case, and H==orki_i4_hcap(K) is a LOCAL
-     * WORST whenever hcap divides M. Measured ~1.25*Wmax us per tail row against ~3 us for the one
-     * extra program per N-tile a smaller H costs; trade them over a 4-wide window. Gated on Wb>=256:
-     * at Wb<=128 the tail scan is too narrow to pay (measured null) and at Wb==64 it is a small loss.
+     * WORST whenever hcap divides M. Both terms are HOST-side and now FITTED over 9 (K,Wb) grids:
+     * a tail row is ~1.7*Wmax us against 2-5 us for the extra program per critical core a smaller H
+     * costs, i.e. gam = 2*Wmax in the model's 3-per-program units; the old 1.25*Wmax was 1.8x light
+     * and declined moves measuring 4-8%. Trade over a 4-wide window. The gate is Wb>=128, where BOTH
+     * boards measure a gain; the old Wb>=256 was one null read at a non-moving M. Wb==64 stays out.
      * H only re-tiles M, so every candidate is BIT-IDENTICAL (verified, every H at a fixed M).
      * Wiki: Exp-2026-10-12-INT4-BCHAIN-Dispatch-Envelope. */
-    if(Wb>=256 && H>=12 && M>H && !getenv("ORK_I4_NOTAIL")){
-        int tcrit=(NC+nc-1)/nc, gam=Wmax+Wmax/4, best=H, bc=1<<30;
-        for(int h=H; h>=H-3 && h>=8; h--){ int g=(M+h-1)/h, cost=gam*(M-(g-1)*h)+3*g*tcrit;
-            if(cost<bc){ bc=cost; best=h; } }
+    if(Wb>=128 && H>=12 && M>H && !getenv("ORK_I4_NOTAIL")){
+        int tcrit=(NC+nc-1)/nc, gam=2*Wmax, best=H, bc=1<<30;
+        for(int h=H; h>=H-3 && h>=8; h--){ int g=(M+h-1)/h, r=M-(g-1)*h, cost=gam*r+3*g*tcrit;
+            if(r>=2 && cost<bc){ bc=cost; best=h; } }   /* r==1 is a DISPATCH HOLE (.235 K=768: 0/9 refused, 15.6 s each; r==2 at the same h is 3/3) and is never a measured win */
         if(best!=H){ H=best; NG=(M+H-1)/H; } }
     if(getenv("ORK_BCH_DEBUG")){ int ntmax=0; for(int i=0;i<nc;i++){ int lc0=(int)((long)i*NC/nc),lc1=(int)((long)(i+1)*NC/nc); int nt=(lc1-lc0)*NG; if(nt>ntmax)ntmax=nt; }
         fprintf(stderr,"[bch] K=%d N=%d M=%d H=%d Wb=%d NC=%d NG=%d nc=%d NTmax=%d\n",K,N,M,H,Wb,NC,NG,nc,ntmax); fflush(stderr); }
