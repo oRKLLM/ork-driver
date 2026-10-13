@@ -56,20 +56,20 @@ enum ork_reg_id {
     RK_CNA_CBUF_CON0,       /**< 0x1040 @brief CBUF bank split DATA_BANK[3:0]/WEIGHT_BANK[7:4]/FC_DATA_BANK[10:8]+reuse; also carries the K-reduction schedule. */
     RK_CNA_CBUF_CON1,       /**< 0x1044 @brief CBUF DATA_ENTRIES[13:0] = (K/64)*M feature rows held resident. */
     RK_CNA_FEATURE_DATA_ADDR,/**< 0x1070 @brief Input feature (A / activations) IOVA. */
-    RK_CNA_DMA_CON1,        /**< 0x107c @brief Feature DMA burst length / line stride. */
+    RK_CNA_DMA_CON1,        /**< 0x107c @brief CNA_DMA_CON1: LINE_STRIDE[27:0] — a line stride, full stop. Burst length is 0x1078, NOT here. */
     RK_CNA_DMA_CON2,        /**< 0x1080 @brief Feature surface stride, SIGNED 28-bit two's complement. w1-low is the sign extension (0xfff for negatives, 0x000 for positives — verified 0/4114 violations, NOT a mode field). Planner-chosen per tile (-3*M common at small M). The old "0x0fffffe8 sentinel" was just -24 read as unsigned. */
-    RK_CNA_DATA_SIZE0_MIR,  /**< 0x1084 @brief Mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020. */
+    RK_CNA_DATA_SIZE0_MIR,  /**< 0x1084 @brief CNA_FC_DATA_SIZE0: DMA_WIDTH[29:16]/DMA_HEIGHT[10:0]. A DIFFERENT register from 0x1020, not a mirror. */
     RK_CNA_FC_DATA_SIZE1,   /**< 0x1088 @brief FC/matmul DMA_CHANNEL[15:0] (= K). */
     RK_CNA_WEIGHT_DATA_ADDR,/**< 0x1110 @brief Weight (B) IOVA. */
     /* ── DPU block 0x1001 (output stage) ─────────────────────────────────────────────── */
-    RK_DPU_OUT_PRECISION,   /**< 0x4010 @brief Output-stage datapath precision: 0=int8, 0x80000000=int32 accumulate-out. */
+    RK_DPU_OUT_PRECISION,   /**< 0x4010 @brief DPU_DATA_FORMAT: OUT_PRECISION[31:29]/IN_PRECISION[28:26]/PROC_PRECISION[2:0]. Enum 0=int8 1=int16 2=fp16 4=int32(out) 6=int4. */
     RK_DPU_DST_BASE_ADDR,   /**< 0x4020 @brief Output (C) base IOVA. */
     RK_DPU_DST_SURF_STRIDE, /**< 0x4024 @brief Output DST_SURF_STRIDE[31:4] between NC1HWC2 surfaces. */
     RK_DPU_DATA_CUBE_WIDTH, /**< 0x4030 @brief Output cube WIDTH-1[12:0] (= M-1 in the fold). */
     RK_DPU_DATA_CUBE_HEIGHT,/**< 0x4034 @brief Output cube HEIGHT-1[12:0] / MINMAX_CTL[24:22]. */
     RK_DPU_DATA_CUBE_NOTCH, /**< 0x4038 @brief Output NC1HWC2 notch offsets NOTCH_ADDR_0[12:0]/1[28:16]; 0 = no notch. */
-    RK_DPU_DST_N_DIMS,      /**< 0x403c @brief Output N dims: dst stride and N-1 (((s-1)<<16)|(N-1)). */
-    RK_DPU_DST_N2,          /**< 0x4058 @brief Output N-1 (secondary). */
+    RK_DPU_DST_N_DIMS,      /**< 0x403c @brief DPU_DATA_CUBE_CHANNEL: ORIG_CHANNEL[28:16]/CHANNEL[12:0]. Both halves are CHANNELS; the high half is NOT a stride. */
+    RK_DPU_DST_N2,          /**< 0x4058 @brief DPU_WDMA_SIZE_0: CHANNEL_WDMA[12:0]/SIZE_C_WDMA[26:16]/TP_PRECISION[27]. The TP_PRECISION bit is unprobed. */
     RK_DPU_WDMA_SIZE_1,     /**< 0x405c @brief Write-DMA WIDTH_WDMA[12:0]/HEIGHT_WDMA[28:16] (-1 each). */
     RK_DPU_SURFACE_ADD,     /**< 0x40c0 @brief Output surface/element-size CONFIG (NOT an IOVA): 0x20 int8, 0x80 int32, 0x400 M-fold. */
     /* ── PDP/aux block 0x0801 (output dims mirror) ───────────────────────────────────── */
@@ -139,19 +139,19 @@ static const ork_reg_desc ORK_REGS[RK_REG__COUNT] = {
     [RK_CNA_CBUF_CON0]        = {0x201, 0x1040, 0x00003fff,  "CNA_CBUF_CON0",        "DATA_BANK[3:0] WEIGHT_BANK[7:4] FC_DATA_BANK[10:8] DATA_REUSE[12] WEIGHT_REUSE[13] (rocket_registers.h). rkllm leaves REUSE=0. 2026-09-06 SOLVED (tools/wr_diag.c): reuse is correct IFF K*segw <= WEIGHT_BANK capacity (banks x 32KB); correct_fraction = min(1, capacity/(K*segw)), verified at 1.0x (0.0%% wrong), 2x (49.8%%), 10.9x (89.3%%). The loader streams the whole weight but the banks retain only the LAST capacity bytes, so the reuse tile reads stale bytes beyond that -- deterministic, confined to reuse tiles, correct columns a contiguous run at the end. This is the vendor conv rule and it transfers; #39 observed an out-of-envelope case, not a hardware limit. Confirmed on THREE levers: shape, CORE COUNT (segw=N/nc; ORK_WR_NC nc=3->50.0%% nc=1->83.3%% wrong, law says 49.8/83.3) and input distribution. Mesa's rocket driver derives the SAME rule independently (weights_banks_required+1 < CBUF_BANKS) and requires all tasks on ONE core (CBUF is per-core -- hence the nc term). Recover by N-TILING to segw <= capacity/K, which is Mesa's shipping 'full weights, partial input' strategy; do NOT widen WEIGHT_BANK here (4->11) -- 0x1040 couples the split to the K-reduction schedule (mc*K = DATA_BANK*32KB) so it collapses mcap 128->16 and quadruples the program count, and the measured '2-4%%, under noise' verdict was that cost, not weight reuse's. DATA_REUSE[12] corrupts at EVERY shape tested (~1.05-1.12x faster, real, because the fetch IS skipped): our loop is M-tile-inner with wbase CONSTANT, so consecutive tasks share the weight and DIFFER in the activation -- bit 12 is invalid by construction here and needs the transposed decode-shaped loop. Its published 8-shape 'clean K' table was an artifact of wr_diag's 2-bit LCG (period 262144 == mcap*K at K=2048/4096 made consecutive tiles bit-identical); ORK_WR_FULLRAND=1 takes those 0.0%% -> 100.0%% wrong"},
     [RK_CNA_CBUF_CON1]        = {0x201, 0x1044, 0x00003fff,  "CNA_CBUF_CON1",        "CBUF DATA_ENTRIES[13:0] = (K/64)*M resident feature rows"},
     [RK_CNA_FEATURE_DATA_ADDR]= {0x201, 0x1070, OKR_ANY,     "CNA_FEATURE_DATA_ADDR","input feature (A / activations) IOVA"},
-    [RK_CNA_DMA_CON1]         = {0x201, 0x107c, OKR_ANY,     "CNA_DMA_CON1",         "feature DMA burst length / line stride"},
+    [RK_CNA_DMA_CON1]         = {0x201, 0x107c, OKR_ANY,     "CNA_DMA_CON1",         "LINE_STRIDE[27:0] (rocket_registers.h) -- a line stride only. Burst length lives in 0x1078 CNA_DMA_CON0, not here. This is the activation-side stride lever for int4's mc_phys=2H zero-line padding; 0x405c is NOT (it is DPU_WDMA_SIZE_1 height/width)"},
     [RK_CNA_DMA_CON2]         = {0x201, 0x1080, 0x0fffffff,  "CNA_DMA_CON2",         "feature surface stride, SIGNED 28-bit two's complement (w1-low = sign extension: 0xfff for negatives, NOT a mode field — 0/4114 violations in capture); planner-chosen per tile (-3*M common at small M). The '0x0fffffe8 sentinel' was just -24 (=-3*8) read as unsigned"},
-    [RK_CNA_DATA_SIZE0_MIR]   = {0x201, 0x1084, 0x07ff07ff,  "CNA_DATA_SIZE0_MIR",   "mirror of CNA_DATA_SIZE0 (WIDTH/HEIGHT); must equal 0x1020"},
+    [RK_CNA_DATA_SIZE0_MIR]   = {0x201, 0x1084, 0x07ff07ff,  "CNA_DATA_SIZE0_MIR",   "CNA_FC_DATA_SIZE0: DMA_WIDTH[29:16]/DMA_HEIGHT[10:0] (rocket_registers.h). A DIFFERENT register from 0x1020 CNA_DATA_SIZE0 -- it merely takes the same value in our templates, so do not treat equality as a requirement"},
     [RK_CNA_FC_DATA_SIZE1]    = {0x201, 0x1088, 0x0000ffff,  "CNA_FC_DATA_SIZE1",    "FC/matmul DMA_CHANNEL[15:0] (= K)"},
     [RK_CNA_WEIGHT_DATA_ADDR] = {0x201, 0x1110, OKR_ANY,     "CNA_WEIGHT_DATA_ADDR", "weight (B) IOVA"},
-    [RK_DPU_OUT_PRECISION]    = {0x1001, 0x4010, OKR_ANY,    "DPU_OUT_PRECISION",    "output-stage precision: 0=int8, 0x80000000=int32 accumulate-out"},
+    [RK_DPU_OUT_PRECISION]    = {0x1001, 0x4010, OKR_ANY,    "DPU_OUT_PRECISION",    "DPU_DATA_FORMAT (rocket_registers.h): OUT_PRECISION[31:29]/IN_PRECISION[28:26]/EW_TRUNCATE_NEG[25:16]/BN_MUL_SHIFT_VALUE_NEG[15:10]/BS_MUL_SHIFT_VALUE_NEG[9:4]/MC_SURF_OUT[3]/PROC_PRECISION[2:0]. Precision enum, derived from our own int8/fp16/int4 captures and carried by NO external source (mainline is enum-free, Mesa writes 0): 0=int8 1=int16 2=fp16 4=int32(out only) 6=int4. int4 MM reads OUT=1/IN=6/PROC=6, i.e. a DEDICATED int4 mode, not a widening of int8"},
     [RK_DPU_DST_BASE_ADDR]    = {0x1001, 0x4020, OKR_ANY,    "DPU_DST_BASE_ADDR",    "output (C) base IOVA"},
     [RK_DPU_DST_SURF_STRIDE]  = {0x1001, 0x4024, OKR_ANY,    "DPU_DST_SURF_STRIDE",  "output DST_SURF_STRIDE[31:4] between NC1HWC2 surfaces"},
     [RK_DPU_DATA_CUBE_WIDTH]  = {0x1001, 0x4030, 0x00001fff, "DPU_DATA_CUBE_WIDTH",  "output cube WIDTH-1[12:0] (= M-1 in the fold)"},
     [RK_DPU_DATA_CUBE_HEIGHT] = {0x1001, 0x4034, 0x01ffffff, "DPU_DATA_CUBE_HEIGHT", "output cube HEIGHT-1[12:0] / MINMAX_CTL[24:22]"},
     [RK_DPU_DATA_CUBE_NOTCH]  = {0x1001, 0x4038, 0x1fff1fff, "DPU_DATA_CUBE_NOTCH",  "output NC1HWC2 notch NOTCH_ADDR_0[12:0]/1[28:16]; 0 = no notch"},
-    [RK_DPU_DST_N_DIMS]       = {0x1001, 0x403c, OKR_ANY,    "DPU_DST_N_DIMS",       "output N dims: dst stride and N-1 (((s-1)<<16)|(N-1))"},
-    [RK_DPU_DST_N2]           = {0x1001, 0x4058, OKR_ANY,    "DPU_DST_N2",           "output N-1 (secondary)"},
+    [RK_DPU_DST_N_DIMS]       = {0x1001, 0x403c, OKR_ANY,    "DPU_DST_N_DIMS",       "DPU_DATA_CUBE_CHANNEL (rocket_registers.h): ORIG_CHANNEL[28:16]/CHANNEL[12:0]. Our ((N-1)<<16)|(N-1) is correct AS CHANNELS; the high half is NOT a destination stride, and reading it as one is one reason a stride keeps being re-derived at the wrong register"},
+    [RK_DPU_DST_N2]           = {0x1001, 0x4058, OKR_ANY,    "DPU_DST_N2",           "DPU_WDMA_SIZE_0 (rocket_registers.h): CHANNEL_WDMA[12:0]/SIZE_C_WDMA[26:16]/TP_PRECISION[27]. We write plain N-1 and silently clear TP_PRECISION -- a one-bit precision selector on the WRITE DMA that both vendor captures also leave 0. Unprobed; candidate for halving the int16 output pitch. Companion: DPU_FEATURE_MODE_CFG.TP_EN (0x400c bit 30)"},
     [RK_DPU_WDMA_SIZE_1]      = {0x1001, 0x405c, 0x1fff1fff, "DPU_WDMA_SIZE_1",      "write-DMA WIDTH_WDMA[12:0]/HEIGHT_WDMA[28:16] (-1 each)"},
     [RK_DPU_SURFACE_ADD]      = {0x1001, 0x40c0, OKR_ANY,    "DPU_SURFACE_ADD",      "output surface/element-size CONFIG (NOT an IOVA): 0x20 int8, 0x80 int32, 0x400 M-fold"},
     [RK_PDP_OUT_M]            = {0x801, 0x3014, OKR_ANY,     "PDP_OUT_M",            "PDP/aux output M dim = M-1 (16-bit; verified M-1 not (M-1)<<16 from the M=8 capture)"},
