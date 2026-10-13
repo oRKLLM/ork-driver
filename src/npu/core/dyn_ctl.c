@@ -296,8 +296,15 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
             miss_to = (recov < recov_max) ? w : 3e6;              /* last attempt: full completion wait */
             /* ...except a ladder probe, which must not pay that wait: a correct BCHAIN round at any shipped
              * geometry lands in single-digit ms (the ~107 ms outlier is the process's first, cold call), so
-             * 1 s is far outside the correct envelope while being 16x cheaper than the full miss. */
-            if (h->ladder_probe && miss_to > 1e6) miss_to = 1e6;
+             * 1 s is far outside the correct envelope while being 16x cheaper than the full miss.
+             * AND NOT A CONSTANT EITHER, once the shape is known. recov_max is 0 for a probe, so it takes the
+             * 3e6 arm above and never sees the learned window at all -- leaving the one path whose whole
+             * contract is "fail cheaply" as the last one still gated by a hard-coded number. MEASURED on a
+             * W4A4 prefill: a probe sat the full 1000 ms out while `est` for that exact geometry (the key
+             * carries H and Wb) read 22.6 ms -- 44x the round it was waiting on. Use the same k x est the
+             * production path uses when the geometry is learned, and keep 1 s as the unknown-shape fallback.
+             * A false miss here costs one rung of a bit-exact ladder, never a wrong answer. */
+            if (h->ladder_probe) { miss_to = (est > 0.0) ? k * est : 1e6; if (miss_to > 1e6) miss_to = 1e6; }
         }
 
         /* PREDICTIVE DRAIN (opt-in). Sleep through the predictable part, spin the tail -- the tail is where
@@ -364,6 +371,11 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
          * tolerance off and returned -1. Every W4A4 model decode died that way (recover x6, then -1). */
         if (!h->collide_ok && h->esz == 2) {
             h->collide_ok = 1;
+            if (getenv("ORK_MC_DIAG")) { int _nd = 0; for (int i = 0; i < h->S; i++) _nd += edone[i];
+                if (_nd < h->S) fprintf(stderr, "[bch-adjudicate] recov=%d %d/%d cores done | waited %.0fus vs miss_to %.0fus "
+                                                "(est %.0fus, floor %.0fus) | K=%d N=%d M=%d H=%d Wb=%d NG=%d Wmax=%d i4batch=%d\n",
+                                        recov, _nd, h->S, ork_now_us() - t0, miss_to, est, floor_us,
+                                        h->oK[0], h->b_N, h->b_M, h->b_H, h->b_Wb, h->b_NG, h->b_Wmax, h->i4batch); }
             for (int i = 0; i < h->S; i++) if (!edone[i]) edone[i] = ork_dyn_done_i(h, i);
         }
         if (orki_ork_prof) orki_db_poll_us += ork_now_us() - t0;   /* the WAIT half of ork_dyn_end */

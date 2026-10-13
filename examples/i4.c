@@ -113,6 +113,14 @@ int main(void){
     fail|=test(c,256,512,256);    /* batch doorbell: M=256 — the per-row doorbell refuses this; BCHAIN serves it */
     fail|=test(c,128,512,512);    /* batch doorbell: multi bank-chunk N-tiling (Wb=256, NC=2) */
     fail|=sattest(c,16,2048,256); /* batch doorbell: one output cell is a legitimate 0x7fff (see sattest) */
+    /* TAIL M-GROUP (M % orki_i4_hcap(K) != 0). The written-cell layout is `base = (4j + 4*Hg*b)*64`, so the
+     * LAST M-group -- the only one with Hg < H -- tiles differently from every full group, and the poll, the
+     * re-seed and the de-tile must all agree on that. Every other BCHAIN case here has M an exact multiple
+     * of H, so none of them can tell a tail-group cell-set mismatch from a correct one. A program polling
+     * cells the hardware never writes shows up here as 32767 landing in C (the de-tile reads what the poll
+     * reads), or as a chain that never completes -- both fail this compare. */
+    fail|=test(c,20,2048,256);    /* K=2048 H=8  -> NG=3, tail Hg=4  */
+    fail|=test(c,100,512,512);    /* K=512  H=32 -> NG=4, tail Hg=4, AND 2 N-chunks (Wb=256) */
     /* SINGLE-CORE int4 (budget=1): W4A4 is physically single-row (mc=1, captured regcmd) + PC-chained
      * for M>1 — no sched=1 M-scheduler/mg_max*64 tile (so the fp16/int8 large-tile bugs don't apply),
      * but this guards the 1-core M>1 chain path that the multi-core cases above don't exercise. */
