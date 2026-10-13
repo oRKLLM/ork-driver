@@ -125,7 +125,7 @@ int ork_npu_enter(ork_npu *c, int to, int profile, int chain);
 #define MCPROF_MAX 8
 extern const char *orki_XFROM[8];
 extern const char *orki_XPNAME[XP_NPROFILE];
-extern double orki_fd_hw_us;
+extern double orki_fd_hw_ns;
 extern double orki_fd_ioctl_us;
 extern double orki_lp_alloc, orki_lp_mmap, orki_lp_prime, orki_lp_create, orki_lp_memcpy, orki_lp_bf;
 extern double orki_mc_copy[MCPROF_MAX], orki_mc_sub[MCPROF_MAX], orki_mc_acc[MCPROF_MAX];

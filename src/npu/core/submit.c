@@ -321,7 +321,7 @@ int orki_rknpu_submit_ioctl(int fd, struct rknpu_submit *sub, int domain) {
     int rc = ioctl(fd, DRM_IOCTL_RKNPU_SUBMIT, sub);
     orki_submit_stamp(sub, domain, rc);   /* ORK_KMSG_SUBMIT: interleave with the kernel watchdog in dmesg */
     { double _fd_dt = ork_now_us() - _fd_t0; orki_fd_ioctl_us += _fd_dt; orki_fd_hw_raw_last = (long long)sub->hw_elapse_time;
-      orki_fd_hw_us += (double)sub->hw_elapse_time; orki_fd_n++;
+      orki_fd_hw_ns += (double)sub->hw_elapse_time; orki_fd_n++;
       if(_nb){ int async=(rc==0 && _fd_dt<50.0);  /* returned in <50us => before the HW could run => async */
                fprintf(stderr,"[nonblock] flags=0x%x rc=%d ioctl-return=%.0fus hw_elapse=%lldus%s\n",
                    sub->flags, rc, _fd_dt, (long long)sub->hw_elapse_time,

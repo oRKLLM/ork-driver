@@ -68,9 +68,13 @@ void         ork_fwht_norm(float *v, int n);
  *   ioctl_us    = total wall-clock time spent INSIDE the blocking SUBMIT ioctl (kernel job setup +
  *                 register programming + NPU execution + completion-wait).
  *   hw_us       = SUM of the kernel-reported sub.hw_elapse_time across those ioctls (the hardware's own
- *                 NPU-busy view). Comparing hw_us to ioctl_us splits real-NPU-compute from driver
- *                 dispatch/wait overhead — the core of the poll-granularity hypothesis.
- *   hw_raw_last = the last raw sub.hw_elapse_time value (to infer whether the kernel reports ns or us).
+ *                 NPU-busy view), in MICROSECONDS. The kernel reports NANOSECONDS; the conversion is
+ *                 done here so no caller has to remember it — one that did not printed 13081669 ms of
+ *                 hardware time for a run lasting half a minute. Comparing hw_us to ioctl_us splits
+ *                 real-NPU-compute from driver dispatch/wait overhead, and because both are measured
+ *                 over the SAME submits the two parts sum to ioctl_us — which is why the split belongs
+ *                 inside that wall and not against some run-path's own wall.
+ *   hw_raw_last = the last raw sub.hw_elapse_time value (unconverted, to confirm the kernel's unit).
  *   n           = number of SUBMIT ioctls counted. */
 void         ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n);
 void         ork_npu_floor_reset(void);

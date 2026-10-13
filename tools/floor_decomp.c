@@ -1,9 +1,9 @@
 /* tools/floor_decomp.c — decompose the RK3588 NPU per-submit "167µs floor" into its components, and
  * test the headroom hypotheses (B poll-granularity, D 3-core concurrency, chain amortization).
  *
- * The new lever: the kernel fills rknpu_submit.hw_elapse_time (its OWN NPU-busy view, in NANOSECONDS)
- * but ork never read it. ork_npu_floor_timing() exposes it + the wall time inside the blocking SUBMIT
- * ioctl. Per call we split:
+ * The new lever: the kernel fills rknpu_submit.hw_elapse_time (its OWN NPU-busy view, in nanoseconds;
+ * ork_npu_floor_timing() converts it to us, so nothing here divides by 1000). It exposes that plus
+ * the wall time inside the blocking SUBMIT ioctl. Per call we split:
  *     run_i8 wall  =  host (regcmd synth + bsync + copy)  +  ioctl wall
  *     ioctl wall   =  hw_elapse (real NPU-busy)  +  dispatch/poll-exit  ( = ioctl - hw )
  *
@@ -42,8 +42,8 @@ int main(int argc, char **argv){
         ork_npu_floor_reset();
         double b0=now_us(); for(int it=0;it<iters;it++) ork_i8_mm_run(c,w,M,A,C); double wall=(now_us()-b0)/iters;
         double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
-        double iou=io/n, hwu=(hw/1000.0)/n, host=wall-iou*(n/iters), disp=iou-hwu; /* iou,hwu per-submit */
-        double per_call_io=io/iters, per_call_hw=(hw/1000.0)/iters;
+        double iou=io/n, hwu=hw/n, host=wall-iou*(n/iters), disp=iou-hwu; /* iou,hwu per-submit */
+        double per_call_io=io/iters, per_call_hw=hw/iters;
         char lbl[24]; snprintf(lbl,sizeof lbl,"%d,%d,%d",M,K,N);
         printf("%-14s %8.1f %8.1f %8.1f %8.1f %7.1f %5ld %5.0f%%\n",
                lbl, wall, per_call_io, wall-per_call_io, per_call_hw, per_call_io-per_call_hw, n/iters,
@@ -71,7 +71,7 @@ int main(int argc, char **argv){
         for(int it=0;it<iters;it++){ if(NT==1) ork_i8_mm_run(c,w,M,A,CC[0]); else ork_i8_mm_run_chain(c,NT,mt); }
         double wall=(now_us()-b0)/iters;
         double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
-        double per_call_io=io/iters, per_call_hw=(hw/1000.0)/iters;
+        double per_call_io=io/iters, per_call_hw=hw/iters;
         printf("%-4d %9.1f %9.1f %9.1f %9.1f %10.1f %10.1f\n",
                NT, wall, per_call_io, wall-per_call_io, per_call_hw, per_call_hw/NT, (wall-per_call_io)/NT);
       }
@@ -130,7 +130,7 @@ int main(int argc, char **argv){
           for(int it=0;it<iters;it++){ if(NT==1) ork_i8_mm_run(c,w,M,A,Cd[0]); else ork_i8_mm_run_chain(c,NT,mt); }
           double wall=(now_us()-b0)/iters;
           double io,hw; long long hwl; long n; ork_npu_floor_timing(&io,&hw,&hwl,&n);
-          double pio=io/iters, phw=(hw/1000.0)/iters;
+          double pio=io/iters, phw=hw/iters;
           int ok=1,nz=0,nk=0; for(int j=0;j<NT;j++) for(int e=0;e<M*N;e++){ if(Cd[j][e]!=K)ok=0; if(Cd[j][e]==0)nz++; if(Cd[j][e]==K)nk++; }
           printf("%-4d %9.1f %9.1f %9.1f %9.1f %10.1f %5s (Cd[0][0]=%d exp=%d; zeros=%d/%d correct=%d)\n",
                  NT, wall, pio, wall-pio, phw, phw/NT, ok?"OK":"BAD", Cd[0][0], K, nz, NT*M*N, nk);

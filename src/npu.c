@@ -97,12 +97,12 @@ long   orki_prof_submit_progs = 0;  /* total PC-chained programs across all subm
 long   orki_prof_submit_chained = 0;/* submits that carried >1 program (chained) */
 /* FLOOR-DECOMP instrumentation (always-on, ~40ns/submit): decompose the per-submit floor.
  * orki_fd_ioctl_us = wall time inside the SUBMIT ioctl (kernel job setup + NPU + completion-wait, blocking).
- * orki_fd_hw_us    = SUM of the kernel-reported sub->hw_elapse_time (the HW's own NPU-busy view) — ork never
- * read this field before. Comparing the two splits the ioctl wall into real-NPU vs driver-wait/dispatch.
- * Read via ork_npu_floor_timing(); reset via ork_npu_floor_reset(). Raw units of hw_elapse are captured
- * separately (g_fd_hw_raw) so the probe can infer ns-vs-us. */
+ * orki_fd_hw_ns    = SUM of the kernel-reported sub->hw_elapse_time, in NANOSECONDS — the unit is in the
+ * name because it was not, and a reader divided the raw ns by 1e3 and printed it as ms. Comparing the two
+ * splits the ioctl wall into real-NPU vs driver-wait/dispatch. Read via ork_npu_floor_timing() (which
+ * converts to us); reset via ork_npu_floor_reset(). The last raw value is kept for unit confirmation. */
 double orki_fd_ioctl_us = 0;   /* sum wall-us inside the SUBMIT ioctl */
-double orki_fd_hw_us = 0;      /* sum of sub->hw_elapse_time (as reported) */
+double orki_fd_hw_ns = 0;      /* sum of sub->hw_elapse_time, NANOSECONDS as the kernel reports it */
 long long orki_fd_hw_raw_last = 0; /* last raw hw_elapse_time value (for unit inference) */
 long   orki_fd_n = 0;          /* number of SUBMIT ioctls timed */
 /* #33 reentrancy guard: orki_i8_slice_pack packs each sub-tile via ork_i8_mm_pack -> orki_pack(), which would ITSELF

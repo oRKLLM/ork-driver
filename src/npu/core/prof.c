@@ -35,9 +35,13 @@ double ork_npu_mc_synth(int core){ return (core>=0&&core<MCPROF_MAX)?orki_mc_syn
 void ork_npu_run_timing(double*setup,double*submit,double*copy,long*n){ if(setup)*setup=orki_rt_setup; if(submit)*submit=orki_rt_submit; if(copy)*copy=orki_rt_copy; if(n)*n=orki_rt_n; }
 
 void ork_npu_floor_timing(double*ioctl_us,double*hw_us,long long*hw_raw_last,long*n){
-    if(ioctl_us)*ioctl_us=orki_fd_ioctl_us; if(hw_us)*hw_us=orki_fd_hw_us; if(hw_raw_last)*hw_raw_last=orki_fd_hw_raw_last; if(n)*n=orki_fd_n; }
+    /* hw_us is MICROSECONDS, converted here. The kernel reports hw_elapse_time in nanoseconds, and the
+     * accumulator says so in its name now (orki_fd_hw_ns) — it used to be called _us and every caller had
+     * to remember to divide by 1000, which the [ork FD-SPLIT] line did not: it printed 13081669 ms of
+     * hardware time for a run that lasted half a minute. hw_raw_last still carries the raw value. */
+    if(ioctl_us)*ioctl_us=orki_fd_ioctl_us; if(hw_us)*hw_us=orki_fd_hw_ns/1000.0; if(hw_raw_last)*hw_raw_last=orki_fd_hw_raw_last; if(n)*n=orki_fd_n; }
 
-void ork_npu_floor_reset(void){ orki_fd_ioctl_us=0; orki_fd_hw_us=0; orki_fd_hw_raw_last=0; orki_fd_n=0; }
+void ork_npu_floor_reset(void){ orki_fd_ioctl_us=0; orki_fd_hw_ns=0; orki_fd_hw_raw_last=0; orki_fd_n=0; }
 
 void ork_npu_xprof_dump(void){
     if(orki_xprof<=0) return;

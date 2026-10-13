@@ -262,13 +262,34 @@ void ork_npu_free(ork_npu *c){ if(!c)return; if(c->daemon){ orkd_disconnect(c->d
         if(orki_prof_submits) fprintf(stderr,"[ork PROFILE] submits: %ld ioctls, %ld programs (%.2f prog/ioctl), %ld chained(>1prog). per-i8-call: %.2f ioctls\n",
                                    orki_prof_submits, orki_prof_submit_progs, (double)orki_prof_submit_progs/orki_prof_submits, orki_prof_submit_chained,
                                    orki_prof_i8_calls?(double)orki_prof_submits/orki_prof_i8_calls:0.0);
-        /* HW-vs-poll split (task #19): orki_run() total vs the SUBMIT ioctl wall vs the kernel-reported HW hw_elapse.
-         * poll/idle = orki_run() - submit-ioctl-wall = the completion-wait after the NONBLOCK doorbell submit. */
-        if(orki_fd_n) fprintf(stderr,"[ork FD-SPLIT] orki_run() %.1fms | %ld submit-ioctls: wall %.1fms (%.0f%%), HW hw_elapse %.1fms (%.0f%%) => poll/idle-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
-                                   orki_prof_i8_us/1e3, orki_fd_n, orki_fd_ioctl_us/1e3, 100.0*orki_fd_ioctl_us/(orki_prof_i8_us+1e-9),
-                                   orki_fd_hw_us/1e3, 100.0*orki_fd_hw_us/(orki_prof_i8_us+1e-9),
-                                   (orki_prof_i8_us-orki_fd_ioctl_us)/1e3, 100.0*(orki_prof_i8_us-orki_fd_ioctl_us)/(orki_prof_i8_us+1e-9),
-                                   orki_fd_ioctl_us/orki_fd_n, orki_fd_hw_us/orki_fd_n);
+        /* HW-vs-wait split of the submit floor. Both terms are taken INSIDE the ioctl wall, over the
+         * same submits, so the parts are guaranteed to sum. They did not before: hw_elapse was summed
+         * in nanoseconds and printed as us, and the denominator was the int8 RUN wall while orki_fd_*
+         * counts every submit of every dtype — so a W4A4 run divided by ~zero and printed a negative
+         * wait. The run-wall relationship is a second line that first checks its counters cover these
+         * submits at all (there is none for f16). Wiki: Optimization-Roadmap, submit-floor decomp. */
+        if(orki_fd_n){
+            const double hw_us = orki_fd_hw_ns/1000.0;          /* ns -> us, once, here */
+            const double wait  = orki_fd_ioctl_us - hw_us;      /* kernel dispatch + completion-wait */
+            /* hw_elapse_time comes back 0 on this vendor kernel for ordinary (non-profiling) submits —
+             * see ork_npu_dump_state. Say that, rather than reporting a 0%/100% split as if measured. */
+            if(hw_us <= 0.0)
+                fprintf(stderr,"[ork FD-SPLIT] %ld submit-ioctls: ioctl wall %.1fms (%.0f us/ioctl). The kernel reported hw_elapse_time=0 for them, so the HW-busy / dispatch-wait split is NOT available on this kernel\n",
+                        orki_fd_n, orki_fd_ioctl_us/1e3, orki_fd_ioctl_us/orki_fd_n);
+            else
+                fprintf(stderr,"[ork FD-SPLIT] %ld submit-ioctls: ioctl wall %.1fms = HW busy %.1fms (%.0f%%) + kernel dispatch/completion-wait %.1fms (%.0f%%) | per-ioctl: wall %.0fus HW %.0fus\n",
+                        orki_fd_n, orki_fd_ioctl_us/1e3, hw_us/1e3, 100.0*hw_us/(orki_fd_ioctl_us+1e-9),
+                        wait/1e3, 100.0*wait/(orki_fd_ioctl_us+1e-9),
+                        orki_fd_ioctl_us/orki_fd_n, hw_us/orki_fd_n);
+            const double run_us = orki_prof_i8_us + orki_prof_i4_us;   /* no f16 run-wall counter exists */
+            if(run_us >= orki_fd_ioctl_us)
+                fprintf(stderr,"[ork FD-SPLIT] run wall (i8 %.1fms + i4 %.1fms) %.1fms => host-side synth/bsync/copy %.1fms (%.0f%%)\n",
+                        orki_prof_i8_us/1e3, orki_prof_i4_us/1e3, run_us/1e3,
+                        (run_us-orki_fd_ioctl_us)/1e3, 100.0*(run_us-orki_fd_ioctl_us)/(run_us+1e-9));
+            else
+                fprintf(stderr,"[ork FD-SPLIT] run wall (i8 %.1fms + i4 %.1fms) %.1fms is BELOW the ioctl wall: these submits came from paths with no run-wall counter (f16/chain/probe), so the host-side share is not derivable here\n",
+                        orki_prof_i8_us/1e3, orki_prof_i4_us/1e3, run_us/1e3);
+        }
     }
     if (orki_npu_ctx == c) orki_npu_ctx = NULL;
     if(c->pool_n){ pthread_mutex_lock(&c->pmu); c->pstop=1; pthread_cond_broadcast(&c->pgo); pthread_mutex_unlock(&c->pmu);
