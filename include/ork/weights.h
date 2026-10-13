@@ -77,6 +77,15 @@ int          ork_i8_mm_inflate_to_f16(ork_npu *ctx, ork_w *w, const int8_t *i8, 
  * bcreate/free. fp16 twin of ork_i8_mm_repack: refresh a persistent weight POOL's data per use (kills
  * per-matmul IOMMU alloc/free churn in a dynamic-operand loop like the SSD scan). 0/ok,<0. */
 int          ork_f16_mm_repack(ork_npu *ctx, ork_w *w, int K, int N, const ork_f16 *B);
+/* Same, but the source is STRIDED instead of row-major: element (k,n) at src + (k*sk + n*sn) ELEMENTS,
+ * src_f32 selecting fp16 (0) or fp32 (1). This exists because the callers that repack per use — batched
+ * attention above all — do not hold a row-major B[K,N]. They hold a view whose CONTRACTION dim is
+ * stride-1 (a ggml KV-cache view is exactly that for both QK^T and A.V), and materializing row-major B
+ * from it is a full elementwise transpose of K*N elements that the tiler then undoes block by block.
+ * Writing the tile directly makes it a gather of 32-element contiguous runs. Byte-identical to
+ * ork_f16_mm_repack of that gathered B, so numerics are unchanged. 0/ok, -1 bad weight, -2 shape. */
+int          ork_f16_mm_repack_strided(ork_npu *ctx, ork_w *w, int K, int N,
+                                       const void *src, long sk, long sn, int src_f32);
 /* NEON-fused pack/repack DIRECTLY from f32[N][K] (n-major): per-channel symmetric int8 quant + tile in
  * one cache-friendly pass (no transpose scratch). Writes per-channel bscale[N]. For dequantizing weight
  * sources (e.g. Q4_K MoE experts via to_float) without the slow strided f32->int8 transpose. */

@@ -228,6 +228,47 @@ static int test_fused_act(ork_npu *npu, int M, int K, int N, int which){
     free(A);free(B);free(C);free(ref);free(acc); return fail;
 }
 
+
+/* ork_f16_mm_repack_strided — the attention repack that skips the row-major B[K,N] intermediate.
+ * The contract is that it is INDISTINGUISHABLE from ork_f16_mm_repack of the gathered row-major B,
+ * so the test is bit-identity of the matmul output, not a tolerance. Source layout is the real one:
+ * element (k,n) at src + k*sk + n*sn, contraction dim stride-1 and the other dim strided by a cache
+ * row (the ggml KV-cache view shape for both QK^T and A.V). f32 source covered too. */
+static int test_repack_strided(ork_npu *npu,int M,int K,int N,long rowstride,int src_f32){
+    long sk=1, sn=rowstride;                       /* [N][K] source, K contiguous, rows strided */
+    size_t nsrc=(size_t)(N-1)*sn+K;
+    ork_f16 *src16 = src_f32?NULL:malloc(nsrc*sizeof(ork_f16));
+    float   *src32 = src_f32?malloc(nsrc*sizeof(float)):NULL;
+    ork_f16 *B     = malloc((size_t)K*N*sizeof(ork_f16));
+    ork_f16 *A     = malloc((size_t)M*K*sizeof(ork_f16));
+    float   *C0    = malloc((size_t)M*N*sizeof(float));
+    float   *C1    = malloc((size_t)M*N*sizeof(float));
+    if(!B||!A||!C0||!C1||(src_f32?!src32:!src16)){ fprintf(stderr,"[repack_strided] OOM\n"); return 1; }
+    for(size_t i=0;i<nsrc;i++){ float v=(float)(rand()%2001-1000)/1000.0f;
+        if(src_f32) src32[i]=(float)f2h(v); else src16[i]=f2h(v); }   /* f32 arm holds exactly-representable values */
+    for(size_t i=0;i<(size_t)M*K;i++) A[i]=f2h((float)(rand()%2001-1000)/1000.0f);
+    for(int k=0;k<K;k++) for(int n=0;n<N;n++)                        /* the gather the handler used to do */
+        B[(size_t)k*N+n] = src_f32 ? f2h(src32[(size_t)n*sn+k]) : src16[(size_t)n*sn+k];
+
+    ork_w *w=ork_f16_mm_scratch(npu,K,N);
+    if(!w){ fprintf(stderr,"[repack_strided] scratch K=%d N=%d failed\n",K,N); return 1; }
+    int fail=0;
+    if(ork_f16_mm_repack(npu,w,K,N,B) || ork_f16_mm_run(npu,w,M,A,C0)) { fprintf(stderr,"[repack_strided] ref path failed\n"); fail=1; }
+    int rc = ork_f16_mm_repack_strided(npu,w,K,N, src_f32?(const void*)src32:(const void*)src16, sk,sn,src_f32);
+    if(rc || ork_f16_mm_run(npu,w,M,A,C1)) { fprintf(stderr,"[repack_strided] strided path rc=%d\n",rc); fail=1; }
+    if(!fail && memcmp(C0,C1,(size_t)M*N*sizeof(float))){
+        size_t bad=0; for(size_t i=0;i<(size_t)M*N;i++) if(C0[i]!=C1[i]){ bad=i; break; }
+        fprintf(stderr,"[repack_strided] NOT BIT-IDENTICAL M=%d K=%d N=%d f32=%d at %zu (%g vs %g)\n",
+                M,K,N,src_f32,bad,C0[bad],C1[bad]); fail=1; }
+    else if(!fail) fprintf(stderr,"[repack_strided] OK M=%d K=%d N=%d f32src=%d rowstride=%ld (bit-identical)\n",M,K,N,src_f32,rowstride);
+    /* a bad-arg call must not corrupt the weight */
+    if(ork_f16_mm_repack_strided(npu,w,K+32,N,src16?(const void*)src16:(const void*)src32,sk,sn,src_f32)!=-2){
+        fprintf(stderr,"[repack_strided] shape mismatch not rejected\n"); fail=1; }
+    ork_mm_free(npu,w);
+    free(B);free(A);free(C0);free(C1);free(src16);free(src32);
+    return fail;
+}
+
 int main(void){
     srand(1234);
     ork_npu *npu = ork_npu_init();
@@ -250,6 +291,13 @@ int main(void){
     fail |= test_fused_act(npu, 8, 512, 64, 0);         /* C=exp(A·B) fused in the matmul output stage (softmax) */
     fail |= test_fused_act(npu, 8, 512, 64, 1);         /* C=silu(A·B) fused (SwiGLU) */
     fail |= test_fused_act(npu, 8, 512, 64, 2);         /* C=gelu(A·B) fused */
+    /* strided->tile repack (attention marshalling). Shapes are the real Qwen3 ones scaled down:
+     * QK^T (K=head_dim, N=n_kv, source row = the KV cache's padded head stride) and A.V (K=n_kv,
+     * N=head_dim, source row = n_ctx). The K=2048 case exercises Sk>1 (multi-K-slice tiles). */
+    fail |= test_repack_strided(npu, 64, 128,  512, 1024, 0);   /* QK^T-shaped, fp16 source */
+    fail |= test_repack_strided(npu, 64, 512,  128, 4096, 0);   /* A.V-shaped,  fp16 source */
+    fail |= test_repack_strided(npu, 64, 2048, 128, 4096, 0);   /* A.V wide-K: Sk>1 */
+    fail |= test_repack_strided(npu, 32, 128,  256,  256, 1);   /* fp32 source arm */
     ork_npu_free(npu);
     fprintf(stderr, fail ? "\nTEST_BMM: FAIL\n" : "\nTEST_BMM: PASS\n");
     return fail ? 1 : 0;

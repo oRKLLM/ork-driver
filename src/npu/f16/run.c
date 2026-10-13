@@ -47,6 +47,35 @@ static void f16_tile_range(int lo,int hi,void *a){
         }
     }
 }
+/* STRIDED tile fill — source straight to the NPU tile, no row-major intermediate.
+ *
+ * The caller (attention) does not hold a row-major B[K,N]; it holds a view whose CONTRACTION dim is
+ * stride-1 and whose other dim is strided — a ggml KV-cache view is exactly that for both QK^T (K is
+ * [head_dim, n_kv], head_dim contiguous) and A.V (V^T is [n_kv, head_dim], n_kv contiguous). Building
+ * row-major B first is a full elementwise TRANSPOSE of K*N elements, and then orki_f16_tile transposes
+ * it back inside each 32x16 block. Both passes exist only because the intermediate does.
+ *
+ * Here [nl][kk] for a fixed (nt,kt) is 16 runs of 32 CONSECUTIVE source elements, so with sk==1 and an
+ * fp16 source each 1 KB tile block is 16 x 64-byte copies. Measured on RK3588 against the pair it
+ * replaces (tools/re/attn_marshal_probe, M=512): QK^T K=128 N=2048 2192 us -> 244 us, A.V K=2048 N=128
+ * 1125 us -> 94 us. Byte-identical to orki_f16_tile of the gathered row-major B (the probe asserts it).
+ * Strides are in ELEMENTS, matching ork_bmm_strides. */
+struct f16_tile_s_arg { f16 *bb; const char *src; int KT,k0,n0; long sk,sn; int f32; };
+static void f16_tile_s_range(int lo,int hi,void *a){
+    struct f16_tile_s_arg *t=a; int KT=t->KT,k0=t->k0,n0=t->n0; long sk=t->sk,sn=t->sn;
+    size_t es=t->f32?4:2;
+    for(int nt=lo;nt<hi;nt++) for(int nl=0;nl<16;nl++){
+        const char *row=t->src+(size_t)(n0+nt*16+nl)*(size_t)sn*es+(size_t)k0*(size_t)sk*es;
+        f16 *dn=t->bb+(size_t)nt*KT*16*32+(size_t)nl*32;
+        for(int kt=0;kt<KT;kt++){
+            f16 *d=dn+(size_t)kt*16*32; const char *p=row+(size_t)kt*32*(size_t)sk*es;
+            if(sk==1){ if(!t->f32) memcpy(d,p,64);
+                       else { const float *f=(const float*)p; for(int kk=0;kk<32;kk++) d[kk]=(f16)f[kk]; } }
+            else     { if(!t->f32) for(int kk=0;kk<32;kk++) d[kk]=*(const f16*)(p+(size_t)kk*(size_t)sk*2);
+                       else        for(int kk=0;kk<32;kk++) d[kk]=(f16)*(const float*)(p+(size_t)kk*(size_t)sk*4); }
+        } }
+}
+
 void orki_f16_tile(f16 *bb,const f16 *B,int NN,int KT,int k0,int n0,int N){
     struct f16_tile_arg ta={bb,B,KT,k0,n0,N};
     /* SERIAL for a small tile. ork_parallel_for wakes and joins a worker pool, which is free against
@@ -116,15 +145,11 @@ int ork_i8_mm_inflate_to_f16(ork_npu *c,ork_w *w,const int8_t *i8,const float *b
     return 0;
 }
 
-int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
-    if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
-    if(w->K!=K || w->N!=N) return -2;
-    int KS=orki_f16_ks(c), NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
-    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
-      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
-        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
-        orki_f16_tile(b->cpu,B,NN,KT,k0,n0,N);
-        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+/* The derived CONTIG copies (w->Bbc / w->Bbc_ns) that the fp16 multi-core colsplit reads instead of
+ * Bb. Every path that refreshes Bb in place must refresh these too, or colsplit silently keeps
+ * computing against the first weight ever packed into the slot. Shared by ork_f16_mm_repack and
+ * ork_f16_mm_repack_strided so the two cannot drift. */
+static void f16_derived_refresh(ork_npu *c,ork_w *w,int K,int N,int KS,int NMAX,int Sk,int Sn){
     /* DERIVED-COPY COHERENCE (defect fix). The fp16 MULTI-CORE colsplit does NOT read Bb: it builds a
      * CONTIGUOUS concatenation of the Sk K-slice tiles ONCE and caches it on the weight (w->Bbc for
      * Sn==1, w->Bbc_ns[] for Sn>1) behind a *_valid latch that was never cleared. A repack that
@@ -163,8 +188,47 @@ int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
                    /* one bad slice invalidates the set: the latch is per-weight, not per-slice */
                    for(int q=0;q<Sn;q++) orki_bdestroy(c->fd,&w->Bbc_ns[q]);
                    w->Bbc_ns_valid=0; break; } } }
+}
+
+int ork_f16_mm_repack(ork_npu *c,ork_w *w,int K,int N,const f16 *B){
+    if(!w || w->dtype!=DT_F16 || !w->Bb) return -1;
+    if(w->K!=K || w->N!=N) return -2;
+    int KS=orki_f16_ks(c), NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
+        orki_f16_tile(b->cpu,B,NN,KT,k0,n0,N);
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    f16_derived_refresh(c,w,K,N,KS,NMAX,Sk,Sn);
     return 0;
 }
+
+/* Fill an EXISTING fp16 weight's NPU tiles from a STRIDED source — the row-major B[K,N] intermediate
+ * that ork_f16_mm_repack requires is the thing this removes. src element (k,n) is at
+ * src + (k*sk + n*sn) elements; sk/sn are in ELEMENTS (as in ork_bmm_strides), src_f32 selects the
+ * source type (0 = fp16, 1 = fp32). Same weight contract as ork_f16_mm_repack (K,N must match w) and
+ * byte-identical output, so numerics are unchanged. Returns 0/ok, -1 bad weight, -2 shape mismatch. */
+int ork_f16_mm_repack_strided(ork_npu *c,ork_w *w,int K,int N,const void *src,long sk,long sn,int src_f32){
+    if(!w || w->dtype!=DT_F16 || !w->Bb || !src || !c) return -1;
+    if(w->K!=K || w->N!=N) return -2;
+    int KS=orki_f16_ks(c), NMAX=c->soc->nmax, Sk=w->Sk, Sn=w->Sn;
+    for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX,NN=Nc/16;
+      for(int ks=0;ks<Sk;ks++){int k0=ks*KS,Kp=(K-k0<KS)?(K-k0):KS,KT=Kp/32;
+        struct buf*b=&w->Bb[(size_t)ns*Sk+ks]; if(!b->cpu) return -1;
+        struct f16_tile_s_arg ta={b->cpu,(const char*)src,KT,k0,n0,sk,sn,src_f32};
+        /* SERIAL, unlike orki_f16_tile — measured, not assumed. The dense tiler's work per element is a
+         * strided scalar store, so its pool pays; this one is a 64-byte copy, i.e. memory-bound, and the
+         * pool LOSES at every size probed (attn_marshal_probe, us pooled vs serial): 85/28 at 128 KB,
+         * 108/48 at 256 KB, 177/92 and 245/242 at 512 KB, 415/225 at 1 MB, 1371/1085 at 2 MB. The gap is
+         * far larger than one wake, and it grows with size, so it is the pool's own threads competing for
+         * the same DRAM (and the A55s dragging the join barrier), not dispatch latency. Re-measure with
+         * that probe before reintroducing ork_parallel_for here. */
+        f16_tile_s_range(0,NN,&ta);
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE);}}
+    f16_derived_refresh(c,w,K,N,KS,NMAX,Sk,Sn);
+    return 0;
+}
+
 
 /* set_f16_silu — graft the SiLU LUT output stage onto the fp16 matmul (REGCMD) program, KEEPING its native
  * fp16 output CVT (0x4010=0xa8000002, 0x40c0=0x40, 0x4050=0x36e, 0x4084 gain — all from the REGCMD template)

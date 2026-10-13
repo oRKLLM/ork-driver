@@ -149,6 +149,16 @@ fold_resident_probe: tools/re/fold_resident_probe.c $(COBJ)
 f16_mcap_probe: tools/re/f16_mcap_probe.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm
 
+# Where the attention-on-NPU wall goes: the per-head gather/repack/scatter vs the matmul itself,
+# for QK^T and A.V separately, with the strided->tile repack priced against the pair it replaces.
+attn_marshal_probe: tools/re/attn_marshal_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+fp16 -o $@ $< $(COBJ) -lm
+
+# Does the fp16 attention bmm pay a mode-transition tax when interleaved with int8 dense matmuls
+# the way a real decoder layer interleaves them? Also prints the fp16 dense rate as the ceiling.
+attn_thrash_probe: tools/re/attn_thrash_probe.c $(COBJ)
+	$(CC) $(CFLAGS) -march=armv8.2-a+fp16 -o $@ $< $(COBJ) -lm
+
 # RE tool: per-shape fp16 matmul RATE with an fp64 reference on SAMPLED rows (first 64, last 64, 64
 # strided through the middle, so the first/last/interior M-chunks are all read) and a wrong-column
 # positive control that must FAIL. The full-row reference for a 248,320-wide head shape would take
