@@ -1,3 +1,9 @@
 # Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together.
 # CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file.
+# One BOARD= line per attesting board, keyed on /proc/device-tree/compatible[0]. A board whose sha
+# differs from CORE_SHA last validated an OLDER tree. 'make check-attest-all' requires every board
+# in ATTEST_BOARDS; 'make attest-waive BOARD=.. REASON=..' excuses one, and the waiver expires with
+# the hash it names. See the Makefile's ATTEST_* block.
+# No BOARD= line yet: this hash was attested under the old single-CORE_SHA format, which did not record
+# which board ran the suite. The next green 'make test' on either board fills its own line in.
 CORE_SHA=a7b8d70805a8eb9eaad91455fcf4f8b99586b5758a7d3b61bf654416af86d553

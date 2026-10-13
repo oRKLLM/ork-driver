@@ -9,6 +9,23 @@
 
 static double now_us(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec*1e6+t.tv_nsec/1e3; }
 
+/* The absolute-latency guards are PER BOARD, keyed on the device-tree compatible string (the same file
+ * ork_soc_detect reads; the SoC id is identical on every RK3588, the product id is not). One constant for
+ * both validated boards cannot work: at M=512 K=N=2048 int8 the ROCK 5B runs ~2.8 ms 3-core and the ROCK
+ * 5B+ ~3.3-3.65 ms, so the 5B's 3600 us limit sat INSIDE the 5B+'s jitter band and failed it most runs.
+ * Each row is that board's worst observed value +15%; the regression each still catches is on the wiki.
+ * Wiki: Benchmark-Standards-and-Methodology § test_speed per-board latency guards. */
+static const struct { const char *key; double mc_us, sc_us; } LIMITS[] = {
+    { "radxa,rock-5b",      3600.0, 6500.0 },
+    { "radxa,rock-5b-plus", 4200.0, 6800.0 },
+};
+
+/* compatible is a NUL-separated list, most specific first. Returns the product id, or NULL. */
+static const char *board_key(char *buf, size_t n){
+    FILE *f = fopen("/proc/device-tree/compatible","r"); if(!f) return NULL;
+    size_t r = fread(buf,1,n-1,f); fclose(f); if(!r) return NULL; buf[r]=0; return buf;
+}
+
 static double run(ork_npu*c,ork_w*w,int M,int K,int8_t*A,int32_t*C,int iters){
     ork_i8_mm_run(c,w,M,A,C);                          /* warm */
     double t0=now_us(); for(int i=0;i<iters;i++) ork_i8_mm_run(c,w,M,A,C);
@@ -60,14 +77,25 @@ int main(void){
      * JITTERS ~1.47-1.58x run-to-run (co-tenant/scheduler), so a 1.5x floor false-failed ~50% of the time even
      * with the best-of-3 above. 1.4x sits cleanly between the collapse band (<1.35x) and the healthy jitter band.
      * The absolute-latency guards below are the real perf-regression detectors; this only detects a lost core. */
-    /* Absolute latency guards (RK3588; RK3576 may differ — loosen there if validated). Margin ~25%
-     * over best-observed (1-core ~5.1ms, 3-core ~2.8ms) so normal ~3-7% spread does not trip them. */
-    if (tN > 3600.0) {
-        printf("FAIL: Multi-core latency (%.1f us) exceeds 3600 us limit.\n", tN);
+    /* Absolute latency guards — the real perf-regression detectors, per board (see LIMITS above). An
+     * uncalibrated board takes the widest row and says so, rather than inheriting another board's number. */
+    char cbuf[256]; const char *bk = board_key(cbuf, sizeof cbuf);
+    double mc_lim = 0, sc_lim = 0; const char *lim_for = NULL;
+    for (size_t i = 0; i < sizeof LIMITS/sizeof *LIMITS; i++) {
+        if (bk && !strcmp(bk, LIMITS[i].key)) { mc_lim = LIMITS[i].mc_us; sc_lim = LIMITS[i].sc_us; lim_for = LIMITS[i].key; break; }
+        if (LIMITS[i].mc_us > mc_lim) mc_lim = LIMITS[i].mc_us;
+        if (LIMITS[i].sc_us > sc_lim) sc_lim = LIMITS[i].sc_us;
+    }
+    if (lim_for) printf("board: %s — limits %.0f us multi-core / %.0f us single-core\n", lim_for, mc_lim, sc_lim);
+    else printf("board: %s — NOT CALIBRATED; using the widest limits %.0f/%.0f us (add a LIMITS row once measured)\n",
+                bk ? bk : "unknown", mc_lim, sc_lim);
+
+    if (tN > mc_lim) {
+        printf("FAIL: Multi-core latency (%.1f us) exceeds %.0f us limit.\n", tN, mc_lim);
         fail = 1;
     }
-    if (t1 > 6500.0) {
-        printf("FAIL: Single-core latency (%.1f us) exceeds 6500 us limit (per-core kernel regression).\n", t1);
+    if (t1 > sc_lim) {
+        printf("FAIL: Single-core latency (%.1f us) exceeds %.0f us limit (per-core kernel regression).\n", t1, sc_lim);
         fail = 1;
     }
 

@@ -42,8 +42,20 @@ COBJ := $(CORE:.c=.o) src/orkd_client.o src/orkd_client_ops.o src/ork_gptq.o # o
 # the NPU output + the test goldens; CI `make check-attest` (no NPU) fails if the tree differs — a catch
 # that the commit was board-validated before push. Excludes include/ork_npu.h (the version-bump bot edits
 # only that header, so it must not invalidate the attest).
+# WHICH board attested, not just that one did: each attesting board adds a `BOARD=` line keyed on the
+# device-tree compatible string (product-level and stable, unlike an IP address; the SoC id is identical
+# on every RK3588). The boards are not interchangeable — they differ in DRAM type/clock, kernel and int4
+# dispatch envelope — so "ALL PASS" on one of them is not validation on the other, and the file now says
+# which. `make test` refreshes only its OWN board's line. Wiki: Benchmark-Standards-and-Methodology.
 ATTEST_FILE := tests/sbc_attest.txt
 ATTEST_SRCS := $(CORE) examples/test_matmul.c examples/quant.c examples/test_sn3.c examples/model.c
+# The boards a full-coverage validation is expected from — see check-attest-all (opt-in, NOT in CI).
+ATTEST_BOARDS := radxa,rock-5b radxa,rock-5b-plus
+# This board's key: compatible is a NUL-separated list, most-specific first (the same file ork_soc_detect
+# reads). One definition, used by the writer and by `make board-key`.
+ATTEST_BOARD_KEY = $$({ tr '\000' '\n' < /proc/device-tree/compatible | head -1; } 2>/dev/null)
+# Emit "<board-key> <sha>" for every BOARD= line, so the gates below can be plain shell.
+ATTEST_LIST = awk '/^BOARD=/{k=substr($$1,7); s=""; for(i=2;i<=NF;i++) if($$i~/^sha=/) s=substr($$i,5); print k, s}' $(ATTEST_FILE) 2>/dev/null
 # EXAMPLES ARE THE TEST SUITE: each self-validates against a CPU reference and exits 0/nonzero, and
 # `make test` runs every one. Something that only PRINTS for a human to read is not a test -- it cannot
 # fail, so running it proves nothing -- and it belongs in DIAGNOSTICS below.
@@ -650,10 +662,7 @@ test: $(EXAMPLES) $(TESTS) $(DIAGNOSTICS) chain_xition_probe chainrr_conc_probe 
 	 $(SUDO) pkill -TERM -x orkd || true; for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x orkd >/dev/null 2>&1 || break; sleep 1; done; \
 	 pgrep -x orkd >/dev/null 2>&1 && echo "WARNING: orkd still running after SIGTERM — inspect before the next run" || true; fi; \
 	if [ $$fail -eq 0 ]; then echo "ALL TESTS PASSED"; \
-	 { echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
-	 echo "# CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file."; \
-	 echo "CORE_SHA=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64)"; } > $(ATTEST_FILE); \
-	 echo "wrote $(ATTEST_FILE)"; \
+	 $(MAKE) --no-print-directory attest-record ATTEST_FROM_TEST=1; \
 	 else echo "TESTS FAILED"; exit 1; fi
 
 # CI gate (no NPU): prove the commit was board-validated. `make test` on the SBC writes tests/sbc_attest.txt
@@ -668,11 +677,68 @@ check-attest:
 	 echo " committed CORE_SHA=$$have"; echo " working-tree =$$want"; \
 	 echo " => run 'make test' on the SBC (RK3588) and commit $(ATTEST_FILE)."; exit 1; fi; \
 	echo "check-attest: attest OK ($$have)"; \
+	cur=$$($(ATTEST_LIST) | awk -v w="$$want" '$$2==w{printf " %s", $$1}'); \
+	old=$$($(ATTEST_LIST) | awk -v w="$$want" '$$2!=w{printf " %s", $$1}'); \
+	if [ -n "$$cur" ]; then echo "check-attest: validated on:$$cur"; \
+	 else echo "check-attest: NOTE — no BOARD= line carries this hash (attest predates board keying)"; fi; \
+	if [ -n "$$old" ]; then echo "check-attest: NOT current on:$$old (that board last validated an older tree)"; fi; \
 	ph=0; \
 	if grep -nE '(check|check_i8|one)\(c[^)]*, *0\)' examples/test_matmul.c examples/quant.c examples/test_sn3.c 2>/dev/null; then ph=1; fi; \
 	if grep -nE 'case [0-9]+: *return 0;' examples/model.c 2>/dev/null; then ph=1; fi; \
 	if [ $$ph -ne 0 ]; then echo "check-attest: FAIL — placeholder (0) golden found; regen on the SBC"; exit 1; fi; \
 	echo "check-attest: no placeholder goldens — OK"
+
+# Writes/refreshes THIS board's attest entry. Invoked by `make test` on ALL TESTS PASSED and refusing to
+# run without its token, because an attest that was not earned by a green suite is worse than none. Only
+# this board's BOARD= line is rewritten; every other board's line is carried through untouched, and the
+# lines are sorted so the file diffs cleanly. CORE_SHA stays the single value check-attest compares.
+attest-record:
+	@if [ "$(ATTEST_FROM_TEST)" != "1" ]; then \
+	 echo "attest-record: refusing — this is written by 'make test' on ALL TESTS PASSED, not by hand."; exit 2; fi; \
+	sha=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64); \
+	bk=$(ATTEST_BOARD_KEY); [ -n "$$bk" ] || bk=unknown-board; \
+	keep=$$(grep '^BOARD=' $(ATTEST_FILE) 2>/dev/null | grep -v "^BOARD=$$bk " || true); \
+	waive=$$(grep '^WAIVE=' $(ATTEST_FILE) 2>/dev/null | grep -v "^WAIVE=$$bk " || true); \
+	{ echo "# Auto-written by 'make test' on ALL TESTS PASSED — the hashed sources were board-validated together."; \
+	  echo "# CI 'make check-attest' fails if the tree hash differs: run 'make test' on the SBC + commit this file."; \
+	  echo "# One BOARD= line per attesting board, keyed on /proc/device-tree/compatible[0]. A board whose sha"; \
+	  echo "# differs from CORE_SHA last validated an OLDER tree. 'make check-attest-all' requires every board"; \
+	  echo "# in ATTEST_BOARDS; 'make attest-waive BOARD=.. REASON=..' excuses one, and the waiver expires with"; \
+	  echo "# the hash it names. See the Makefile's ATTEST_* block."; \
+	  echo "CORE_SHA=$$sha"; \
+	  { echo "BOARD=$$bk kernel=$$(uname -r) sha=$$sha date=$$(date -u +%Y-%m-%d)"; \
+	    [ -n "$$keep" ] && echo "$$keep"; [ -n "$$waive" ] && echo "$$waive"; true; } | sort; } > $(ATTEST_FILE); \
+	echo "wrote $(ATTEST_FILE) (board=$$bk)"
+
+# Opt-in full-coverage gate: every board in ATTEST_BOARDS must have attested THIS hash. Deliberately NOT
+# wired into `all` or CI — the suite is cheap but the boards are shared and serialise agents, so a blocking
+# two-board gate buys less than it costs day to day. Run it before a change that could diverge per board
+# (int4 dispatch, chain geometry, anything whose envelope depends on DRAM clock or kernel).
+check-attest-all: check-attest
+	@want=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64); \
+	miss=; for b in $(ATTEST_BOARDS); do \
+	 if ! $(ATTEST_LIST) | awk -v w="$$want" -v b="$$b" '$$1==b&&$$2==w{f=1} END{exit !f}'; then \
+	  if grep -q "^WAIVE=$$b sha=$$want " $(ATTEST_FILE) 2>/dev/null; then \
+	   echo "check-attest-all: WAIVED $$b — $$(grep "^WAIVE=$$b sha=$$want " $(ATTEST_FILE) | sed 's/.*reason=//')"; \
+	  else miss="$$miss $$b"; fi; fi; done; \
+	if [ -z "$$miss" ]; then echo "check-attest-all: every board in ATTEST_BOARDS is accounted for (attested or waived)"; exit 0; fi; \
+	echo "check-attest-all: FAIL — not attested on:$$miss"; \
+	echo "  => run 'make test' there, or 'make attest-waive BOARD=<key> REASON=\"<why>\"' and commit."; exit 1
+
+# Record an expiring excuse for a board that cannot validate right now (down, reflashing, held by another
+# agent). It names the hash it waives, so it dies the moment ATTEST_SRCS changes — a waiver cannot go stale.
+attest-waive:
+	@if [ -z "$(BOARD)" ] || [ -z "$(REASON)" ]; then \
+	 echo 'usage: make attest-waive BOARD=radxa,rock-5b REASON="board reflashing"'; exit 2; fi; \
+	want=$$(cat $(ATTEST_SRCS) | sha256sum | cut -c1-64); \
+	grep -v "^WAIVE=$(BOARD) " $(ATTEST_FILE) > $(ATTEST_FILE).tmp; \
+	echo "WAIVE=$(BOARD) sha=$$want date=$$(date -u +%Y-%m-%d) reason=$(REASON)" >> $(ATTEST_FILE).tmp; \
+	mv $(ATTEST_FILE).tmp $(ATTEST_FILE); \
+	echo "waived $(BOARD) for $$want — commit $(ATTEST_FILE)"
+
+# Print this board's attest key (what goes in ATTEST_BOARDS / a BOARD= line).
+board-key:
+	@bk=$(ATTEST_BOARD_KEY); echo "$${bk:-unknown-board}  kernel=$$(uname -r)"
 
 # Quick subset via the same pass/fail harness — builds and runs only the named examples:
 # make test-only T="test_ewmul_i8 test_ewmul_f16 test_ewmul_i16" (a name may carry args, e.g. T="model 1")
@@ -740,7 +806,7 @@ clean:
 	rm -rf docs/api
 	rm -f $(EXAMPLES) $(TESTS) rknpu_bench vec_fuzz test_ppu_lut libork_npu.a libork_npu.so $(COBJ)
 
-.PHONY: all lib install install-headers test clean check-attest check-registry check-install
+.PHONY: all lib install install-headers test clean check-attest check-attest-all attest-record attest-waive board-key check-registry check-install
 
 attn_cost: tools/attn_cost.c $(COBJ)
 	$(CC) $(CFLAGS) -o $@ $< $(COBJ) -lm

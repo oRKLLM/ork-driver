@@ -223,6 +223,16 @@ make test MODEL=/path/stories15M.bin    # also run the real-model llama2 test
   code **without** a board `make test`. So: after any such change, run `make test` on the SBC and
   **commit the refreshed `tests/sbc_attest.txt`** or CI (and the version bump — `version-bump.yml` runs
   `check-attest` before bumping) will fail. Workflows: `.github/workflows/sbc-attest.yml` + `version-bump.yml`.
+  - **The attest records WHICH board validated the tree**, as a `BOARD=` line per attesting board keyed on
+    `/proc/device-tree/compatible[0]` (`radxa,rock-5b` = `.236`, `radxa,rock-5b-plus` = `.235`; `make board-key`
+    prints this board's). The boards are NOT interchangeable, so "ALL PASS" on one is not validation on the
+    other — `99771bc` passed the whole suite on `.235` and broke every W4A4 inference on `.236` for six
+    commits. `make test` refreshes only its own line. `make check-attest` is unchanged (it compares
+    `CORE_SHA`) and now also prints which boards hold that hash. **`make check-attest-all` requires every
+    board in `ATTEST_BOARDS`** — opt-in, NOT in CI; run it before a change whose behaviour could depend on
+    DRAM clock, kernel or int4 dispatch envelope. A board that is down gets an expiring waiver
+    (`make attest-waive BOARD=<key> REASON="…"`), which names the hash it excuses and so cannot go stale.
+    Wiki: *Benchmark-Standards-and-Methodology* § "Board-validation attest".
 - **Fast rebuilds.** CORE (`npu.c`) is compiled **once** into shared `-fPIC` objects (`$(COBJ)`) that the
   examples/tests link — an `npu.c` edit rebuilds it once, not ~30×. `CC` uses **ccache** when present
   (`NO_CCACHE=1` to disable). Full build ~20 s, incremental npu.c-edit rebuild ~9 s. `make -j` parallelizes.
