@@ -339,6 +339,13 @@ cleanup:
  * behind a kernel FROM_DEVICE sync, then a separate de-tile pass -- for an A/B or a bisect. */
 int orki_bch_slowgate(void){ static int v=-1; if(v<0) v=getenv("ORK_BCH_SLOWGATE")?1:0; return v; }
 
+/* DENSE activation pack — one K/2-byte line per logical row instead of two (rationale in i4.h).
+ * Expressible only where the group stride K/32 is exact, i.e. K%32==0; every K in orki_i4_hcap's
+ * table is. ORK_I4_DENSE=0 restores the stride-2 pack for an A/B. The OUTPUT is untouched: the
+ * hardware still computes 4*Hg rows and the de-tile still reads every 4th. */
+static int orki_i4_densek(int K){ static int v=-1; if(v<0){ const char *e=getenv("ORK_I4_DENSE"); v=e?atoi(e):1; }
+                                  return v && (K%32)==0; }
+
 static int bch_db_cells_off(ork_npu *c,int i,int c0,int c1,int Wb,int N,int NG,int M,int H,int Wmax,int32_t *C,int mode,int only_tk,int tk_base){
     int tk=0;   /* #54 tk_base: this weight's program slot 0 within the shared per-core chain (0 for single-weight; the expert's cumulative program offset for coalesced multi-expert) */
     for(int nc2=c0;nc2<c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb, NBc=Wc/64;
@@ -381,15 +388,17 @@ static void *bch_db_worker(void *vp){
     int K=a->K,N=a->N,NG=a->NG,M=a->M,H=a->H,Wb=a->Wb,Wmax=a->Wmax; unsigned dom=a->dom;
     a->rc=0; if(NT<1) return NULL;
     orki_pin_big_core(i);
-    uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)(2*H)*(K/2));   /* A packed once per M-group (stride-2) */
+    const int PS_=orki_i4_densek(K)?1:2, LN_=PS_*H;   /* physical lines per logical row, and per M-group */
+    orki_i4_act_dense = PS_==1;                       /* picks the matching 0x107c group stride in orki_i4_synth */
+    uint8_t *abase=c->maf[i].cpu; memset(abase,0,(size_t)NG*(size_t)LN_*(K/2));   /* A packed once per M-group */
     for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-        for(int j=0;j<Hg;j++) orki_i4_tile_Aslice(abase+(size_t)(g*2*H+2*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
-    orki_bsync_live(fd,&c->maf[i],(size_t)NG*(size_t)(2*H)*(K/2),RKNPU_MEM_SYNC_TO_DEVICE);   /* LIVE extent: the per-core scratch is grow-only with a fixed allocation floor, so a whole-buffer sync charges cache maintenance over the widest shape the process ever ran */
+        for(int j=0;j<Hg;j++) orki_i4_tile_Aslice(abase+(size_t)(g*LN_+PS_*j)*(K/2), a->A+(size_t)(g*H+j)*K, 0, K); }
+    orki_bsync_live(fd,&c->maf[i],(size_t)NG*(size_t)LN_*(K/2),RKNPU_MEM_SYNC_TO_DEVICE);   /* LIVE extent: the per-core scratch is grow-only with a fixed allocation floor, so a whole-buffer sync charges cache maintenance over the widest shape the process ever ran */
     int tk=0;
     for(int nc2=a->c0;nc2<a->c1;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
         uint32_t wdma=(uint32_t)(a->w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
-            uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*2*H)*(K/2);
+            uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(g*LN_)*(K/2);
             uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
             orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
             /* #54 int4 HW WEIGHT-REUSE (NEVER tried on int4 — only int8 M-fold #39). The BCHAIN loop is already
@@ -408,6 +417,7 @@ static void *bch_db_worker(void *vp){
                 rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
             else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
             memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
+    orki_i4_act_dense = 0;   /* scoped to the synth loop: core 0 runs on the CALLING thread, and every other orki_i4_synth caller packs stride-2 */
     orki_bsync_live(fd,&c->mrc[i],(size_t)NT*REGCMD_I4_N*4,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *t=c->mtk[i].cpu; memset(t,0,(size_t)NT*sizeof*t);
     for(int q=0;q<NT;q++){ t[q].enable_mask=0xd; t[q].int_mask=0x300; t[q].int_clear=0x1ffff;
@@ -573,23 +583,24 @@ static void *bch_mw_worker(void *vp){
     struct bchmw *a=vp; ork_npu *c=a->c; int fd=c->fd, i=a->core;
     int K=a->K,N=a->N,H=a->H,Wb=a->Wb,Wmax=a->Wmax,NC=a->NC; unsigned dom=a->dom;
     a->rc=0; if(a->e0>=a->e1) return NULL; orki_pin_big_core(i);
+    const int PS_=orki_i4_densek(K)?1:2, LN_=PS_*H;   /* DENSE pack, same as bch_db_worker: one K/2-byte line per logical row, paired with 0x107c=K/32 (see i4.h) */
     int NTtot=0; size_t AFtot=0;
-    for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H; NTtot+=NC*NG; AFtot+=(size_t)NG*(size_t)(2*H)*(K/2); }
+    for(int e=a->e0;e<a->e1;e++){ int NG=(a->ex[e].M+H-1)/H; NTtot+=NC*NG; AFtot+=(size_t)NG*(size_t)LN_*(K/2); }
     memset(c->maf[i].cpu,0,AFtot);
-    /* stage every expert's A (per M-group, stride-2), contiguously in maf */
+    /* stage every expert's A (per M-group), contiguously in maf */
     size_t aoff=0;
     for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; int M=t->M, NG=(M+H-1)/H;
         for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H;
-            for(int j=0;j<Hg;j++) orki_i4_tile_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*2*H+2*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
-        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
+            for(int j=0;j<Hg;j++) orki_i4_tile_Aslice((uint8_t*)c->maf[i].cpu+aoff+(size_t)(g*LN_+PS_*j)*(K/2), t->A+(size_t)(g*H+j)*K, 0, K); }
+        aoff+=(size_t)NG*(size_t)LN_*(K/2); }
     orki_bsync_live(fd,&c->maf[i],AFtot,RKNPU_MEM_SYNC_TO_DEVICE);   /* live extent = the bytes just staged */
     /* build the chained regcmd across all experts (tk = cumulative program index) */
-    aoff=0; int tk=0;
+    orki_i4_act_dense = PS_==1; aoff=0; int tk=0;
     for(int e=a->e0;e<a->e1;e++){ const ork_mm_task_i4 *t=&a->ex[e]; ork_w *w=t->w; int M=t->M, NG=(M+H-1)/H;
         for(int nc2=0;nc2<NC;nc2++){ int n0=nc2*Wb, Wc=(N-n0<Wb)?(N-n0):Wb;
             uint32_t wdma=(uint32_t)(w->Bb[0].dma + (uint64_t)(n0/64)*K*32);
             for(int g=0;g<NG;g++){ int Hg=(M-g*H<H)?(M-g*H):H; uint32_t rc[REGCMD_I4_N];
-                uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*2*H)*(K/2));
+                uint32_t aA=(uint32_t)c->maf[i].dma+(uint32_t)(aoff+(size_t)(g*LN_)*(K/2));
                 uint32_t aC=(uint32_t)c->mcc[i].dma+(uint32_t)tk*(4*H*Wmax)*64*2;
                 orki_i4_synth(rc, 2*Hg, K, Wc, aA, wdma, aC);
                 if(g>0){ static int wr=-1; if(wr<0){ const char*e=getenv("ORK_I4_WREUSE"); wr=e?atoi(e):1; }   /* #54 coalesce path weight-reuse (same as bch_db_worker; default ON, ~8-15% gate/up bit-exact) */
@@ -601,7 +612,8 @@ static void *bch_mw_worker(void *vp){
                     rc[218]=0x0014|(0x0037<<16); rc[219]=(0x0101<<16)|0; }
                 else { rc[216]=0; rc[217]=0; rc[218]=0x00000014; rc[219]=0x01010000; }
                 memcpy((char*)c->mrc[i].cpu+(size_t)tk*REGCMD_I4_N*4, rc, REGCMD_I4_N*4); tk++; } }
-        aoff+=(size_t)NG*(size_t)(2*H)*(K/2); }
+        aoff+=(size_t)NG*(size_t)LN_*(K/2); }
+    orki_i4_act_dense = 0;   /* scoped to the synth loop, as in bch_db_worker: every other orki_i4_synth caller packs stride-2 */
     orki_bsync_live(fd,&c->mrc[i],(size_t)NTtot*REGCMD_I4_N*4,RKNPU_MEM_SYNC_TO_DEVICE);
     struct rknpu_task *tt=c->mtk[i].cpu; memset(tt,0,(size_t)NTtot*sizeof*tt);
     for(int q=0;q<NTtot;q++){ tt[q].enable_mask=0xd; tt[q].int_mask=0x300; tt[q].int_clear=0x1ffff;

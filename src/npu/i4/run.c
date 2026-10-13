@@ -57,6 +57,8 @@ int orki_i4_ktmo_ms(void){
  *   Env var kept as ORK_I4_MSCHED for back-compat (0=off, 1=on). */
 int ork_i4_batch(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_MSCHED"); v=e?(atoi(e)?1:0):1;} return v; }
 
+__thread int orki_i4_act_dense = 0;   /* see i4.h — set only around the BCHAIN worker's synth loop */
+
 static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_I4_NSUB"); v=(e&&atoi(e))?1:0;} return v; }  /* default OFF: under pinned-DDR benchmarking N-subslice is ~neutral (submit overhead cancels the weight-DMA saving); the "1.1-1.2x" seen earlier was an unpinned-governor artifact. Kept opt-in. */
 
 /* Per-shape regcmd template cache for orki_i4_synth.
@@ -68,7 +70,7 @@ static int ork_i4_nsub(void){ static int v=-1; if(v<0){const char*e=getenv("ORK_
  * Bit-exact by construction: the cached image IS a full synth, the three address registers are rewritten
  * at every slot they occupy, and nothing else in the synth depends on an address. Wiki: NPU-Quirks. */
 #define I4T_SLOTS 4                       /* max duplicate slots one register may occupy in the template */
-struct orki_i4_tmpl { int valid, mc, K, N; uint32_t ov[4];
+struct orki_i4_tmpl { int valid, mc, K, N; uint32_t ov[5];
                       uint32_t rc[REGCMD_I4_N]; int ns[3], sl[3][I4T_SLOTS]; };
 /* Thread-local (the BCHAIN workers synth concurrently) and 2-way: a tile loop emits one shape for every
  * program but the last M-group and the last N-tile, which alternates two shapes when M%H or N%Wb is
@@ -95,7 +97,7 @@ static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32
 void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
     /* The three RE overrides are re-read per call BY DESIGN (one process sweeps them with setenv), so
      * they are part of the cache key rather than baked in. Only the mc>1 arm consults them. */
-    uint32_t ov[4] = {0,0,0,0};
+    uint32_t ov[5] = {0,0,0,0,(uint32_t)orki_i4_act_dense};   /* [4]: the activation packing — two different 0x107c group strides, so two different templates */
     if(mc > 1){ const char *e;
         if((e = getenv("ORK_I4_DBNK"))) ov[0] = 0x80000000u | (uint32_t)atoi(e);
         if((e = getenv("ORK_I4_1040"))) ov[1] = 0x80000000u | (uint32_t)strtoul(e,0,0);
@@ -103,7 +105,7 @@ void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
         if((e = getenv("ORK_I4_BURST"))) ov[3] = 0x80000000u | (uint32_t)strtoul(e,0,0); }
     if(!orki_i4_fovr_n) for(int w = 0; w < 2; w++){ struct orki_i4_tmpl *t = &orki_i4_tc[w];
         if(t->valid && t->mc == mc && t->K == K && t->N == N
-           && t->ov[0] == ov[0] && t->ov[1] == ov[1] && t->ov[2] == ov[2] && t->ov[3] == ov[3]){
+           && t->ov[0] == ov[0] && t->ov[1] == ov[1] && t->ov[2] == ov[2] && t->ov[3] == ov[3] && t->ov[4] == ov[4]){
             memcpy(rc, t->rc, REGCMD_I4_N*4);
             const uint32_t av[3] = { aA, aB, aC };
             for(int i = 0; i < 3; i++) i4t_put(rc, ORKI_I4_ADDR[i], t->sl[i], t->ns[i], av[i]);
@@ -117,7 +119,7 @@ void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32
         if(t->ns[i] < 1 || t->ns[i] > I4T_SLOTS) return;   /* unpatchable layout: stay on the full path */
     }
     memcpy(t->rc, rc, REGCMD_I4_N*4);
-    t->mc = mc; t->K = K; t->N = N; t->ov[0] = ov[0]; t->ov[1] = ov[1]; t->ov[2] = ov[2]; t->ov[3] = ov[3]; t->valid = 1;
+    t->mc = mc; t->K = K; t->N = N; t->ov[0] = ov[0]; t->ov[1] = ov[1]; t->ov[2] = ov[2]; t->ov[3] = ov[3]; t->ov[4] = ov[4]; t->valid = 1;
 }
 
 static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC){
@@ -157,11 +159,13 @@ static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32
          *   0x08 0x4038(out width/4)            0x10 0x1010(CNA hint)   0x20 0x1040(K-schedule=POISON) */
         static int mregs=-1; if(mregs<0){const char*e=getenv("ORK_I4_MREGS"); mregs=e?(int)strtoul(e,0,0):0x5f;}
         orki_setrn(rc,REGCMD_I4_N,RK_DPU_WDMA_SIZE_1,0);                                   /* the trigger (always) */
-        /* 0x107c = K/16 : the batch activation-cube-size reg (Exp-2026-07-07 fuzz). Captured as 4 (tuned to
-         * the M=4/K=64 capture); setting it to K/16 restores the native 4-ROW batch at ANY K — bit-exact at
-         * K=512/1024/2048 (0x20/0x40/0x80). This lifts multi-M from 1 row to 4 rows/submit at production K
-         * (4x fewer weight streams). Narrow: only K/16 gives 4 (neighbors give 2); 4 is the cap for this reg. */
-        if(mregs&0x40) orki_setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON1,(uint32_t)(K/16));
+        /* 0x107c CNA_DMA_CON1 LINE_STRIDE = the stride between GROUPS OF FOUR declared activation
+         * rows, in 16-byte atoms (MEASURED 2026-10-12, wiki Exp-2026-10-12-INT4-BCHAIN §E2: sweeping
+         * it 16..512 moves the group base by exactly value*16 bytes, while the step WITHIN a group
+         * stays a hardwired one atom). K/16 spans K bytes = TWO int4 rows, which is the stride-2
+         * activation pack; K/32 spans one row, which is the dense pack. The two must move together
+         * — a dense pack at K/16 reads only the even logical rows and is silently wrong. */
+        if(mregs&0x40) orki_setrn(rc,REGCMD_I4_N,RK_CNA_DMA_CON1,(uint32_t)(orki_i4_act_dense ? K/32 : K/16));
         if(mregs&0x01){ orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0,0x10000|mc_phys);orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE0_MIR,0x10000|mc_phys);orki_setrn(rc,REGCMD_I4_N,RK_CNA_DATA_SIZE3,mc_phys); }
         if(mregs&0x02) orki_setrn(rc,REGCMD_I4_N,RK_DPU_DATA_CUBE_HEIGHT,mc_phys-1);
         if(mregs&0x04) orki_setrn(rc,REGCMD_I4_N,RK_PDP_OUT_M,(mc_phys-1)<<16);

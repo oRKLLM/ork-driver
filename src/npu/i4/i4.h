@@ -59,6 +59,16 @@ void orki_i4_expand_chan_to_i8(const uint8_t *nib, int K, int8_t *i8);
 void orki_i4_synth(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32_t aB,uint32_t aC);
 void orki_i4_tile_Aslice(uint8_t*dst,const int8_t*Arow,int k0,int Kp);
 
+/* DENSE int4 ACTIVATION PACKING (E2, 2026-10-12). The hardware addresses declared activation rows
+ * in 16-byte atoms as ((R>>2)*LINE_STRIDE + (R&3))*16, so one of every four computed rows is a real
+ * row and the other three are sub-row-shifted duplicates of it. LINE_STRIDE (0x107c) is the stride
+ * between those groups of four: at the shipped K/16 it spans K bytes = TWO int4 rows, which is why
+ * the caller had to interleave a zero line between activation rows. At K/32 it spans ONE row, so the
+ * caller can pack densely -- bit-exact, half the activation DMA. The BCHAIN worker sets this around
+ * its synth loop (every other orki_i4_synth caller packs stride-2 and must leave it 0); it is part
+ * of the template-cache key, so a stale template cannot cross between the two packings. */
+extern __thread int orki_i4_act_dense;
+
 /* cross-file within the i4 subtree */
 void orki_i4_expand_chan_f32(const uint8_t *nib, int K, float *qf32);
 void orki_nf4_inflate_chan_f32(const uint8_t *qidx, int K, const int8_t lut[16], float *qf32);

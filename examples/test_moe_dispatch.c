@@ -88,7 +88,7 @@ int main(void){
         long e_sep = verify(A[0],B[0],C[0],M,K,N);
         int r1 = ork_i4_mm_run_experts(c,ex,NE,1); if(r1==0) BEST(g1,4,{ ork_i4_mm_run_experts(c,ex,NE,1); });
         int r3 = ork_i4_mm_run_experts(c,ex,NE,3); if(r3==0) BEST(g3,4,{ ork_i4_mm_run_experts(c,ex,NE,3); });
-        long e_grp = verify(A[0],B[0],ex[0].C,M,K,N);
+        long e_grp = 0; for(int e=0;e<NE;e++){ long v=verify(A[e],B[e],ex[e].C,M,K,N); if(v>e_grp)e_grp=v; }   /* EVERY expert: the coalesced path stages each one at its own cumulative activation offset, so a single-expert check cannot see an offset bug */
 
         printf("\n[PREFILL M=16 NE=32 K=%d N=%d]\n",K,N);
         printf("  separate       : %8.1f us  (%.1f us/expert)   %s\n", sep, sep/NE, e_sep==0?"bit-exact":"MISCOMPUTE");
