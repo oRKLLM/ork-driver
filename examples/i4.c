@@ -26,6 +26,37 @@ static int test(ork_npu*c,int M,int K,int N){
            maxe==0?"OK":"FAIL",(K+10751)/10752,(N+8191)/8192);
     free(A);free(B);free(C); return maxe!=0;
 }
+/* BCHAIN with a LEGITIMATE 0x7fff OUTPUT — the doorbell's one ambiguous value, made deterministic.
+ * Completion is inferred from "the output no longer equals the int16 seed", and the seed 0x7fff is a
+ * REACHABLE W4A4 accumulator, so a real output of 32767 masks completion forever; the drain then has to
+ * adjudicate (bch_db_cells mode 4: every program wrote something => it ran) and that verdict has to reach
+ * the frontier. No other case in this file can produce one — they all run K<=512, where 49*K maxes at
+ * 25088 — which is why a drain regression that killed every W4A4 model decode passed the whole suite.
+ * Construction: one row of A all +7 against one column of B summing to 4681, i.e. exactly 7*4681 = 32767,
+ * reached WITHOUT saturating, so the CPU reference still says 32767 and the compare stays bit-exact. */
+static int sattest(ork_npu*c,int M,int K,int N){
+    if(K < 669){ printf("  sat: K=%d too small to reach 32767\n",K); return 1; }   /* 7*7*K must clear the seed */
+    int8_t*A=calloc((size_t)M*K,1),*B=calloc((size_t)K*N,1); int32_t*C=malloc((size_t)M*N*4);
+    unsigned sd=4242u+(unsigned)(M*K*N);
+    for(size_t i=0;i<(size_t)M*K;i++){ sd=sd*1103515245+12345; A[i]=(int8_t)((int)((sd>>17)%15)-7); }
+    for(size_t i=0;i<(size_t)K*N;i++){ sd=sd*1103515245+12345; B[i]=(int8_t)((int)((sd>>17)%15)-7); }
+    const int m0=0, n0=0;                                  /* n0=0 => core 0's column range */
+    for(int k=0;k<K;k++){ A[m0*K+k]=7; B[(size_t)k*N+n0]=0; }
+    for(int k=0;k<668;k++) B[(size_t)k*N+n0]=7;            /* 668*7 = 4676 */
+    B[(size_t)668*N+n0]=5;                                 /*      + 5 = 4681;  7*4681 = 32767 */
+    ork_w*w=ork_i4_mm_pack(c,K,N,B); if(!w){ printf("  sat M=%d K=%d N=%d: pack failed\n",M,K,N); free(A);free(B);free(C); return 1; }
+    int rc=ork_i4_mm_run(c,w,M,A,C); ork_w_free(w);
+    if(rc){ printf("  sat M=%d K=%d N=%d: run rc=%d (the 0x7fff output was read as a dropped round)\n",M,K,N,rc);
+            free(A);free(B);free(C); return 1; }
+    long maxe=0;
+    for(int m=0;m<M;m++)for(int n=0;n<N;n++){ long s=0; for(int k=0;k<K;k++) s+=(long)A[(size_t)m*K+k]*B[(size_t)k*N+n];
+        long e=C[(size_t)m*N+n]-s; if(e<0)e=-e; if(e>maxe)maxe=e; }
+    int seed_ok = C[(size_t)m0*N+n0]==32767;               /* the case is only meaningful if the cell really is 0x7fff */
+    printf("  sat M=%-3d K=%-5d N=%-4d  C[0][0]=%-6d (want 32767) maxerr=%-4ld %s\n",
+           M,K,N,C[(size_t)m0*N+n0],maxe,(maxe==0&&seed_ok)?"OK":"FAIL");
+    free(A);free(B);free(C); return !(maxe==0&&seed_ok);
+}
+
 /* per-group W4A4: fp32 -> int4 (per-group scales along K) -> NPU dequant -> RMS vs fp32 */
 static int gtest(ork_npu*c,int M,int K,int N,int G){
     int Sk=K/G;
@@ -81,6 +112,7 @@ int main(void){
     fail|=test(c,128,512,256);    /* batch doorbell: large-M prefill (single bank chunk) */
     fail|=test(c,256,512,256);    /* batch doorbell: M=256 — the per-row doorbell refuses this; BCHAIN serves it */
     fail|=test(c,128,512,512);    /* batch doorbell: multi bank-chunk N-tiling (Wb=256, NC=2) */
+    fail|=sattest(c,16,2048,256); /* batch doorbell: one output cell is a legitimate 0x7fff (see sattest) */
     /* SINGLE-CORE int4 (budget=1): W4A4 is physically single-row (mc=1, captured regcmd) + PC-chained
      * for M>1 — no sched=1 M-scheduler/mg_max*64 tile (so the fp16/int8 large-tile bugs don't apply),
      * but this guards the 1-core M>1 chain path that the multi-core cases above don't exercise. */

@@ -357,14 +357,18 @@ int ork_dyn_end(ork_dyn_chain *h) { if (!h) return -1; int fd = h->c->fd;
         /* ONE adjudication pass, then OFF again. collide_ok used to latch for the rest of the chain's life, so
          * from recover round 1 on, EVERY poll iteration ran the full-surface adjudication its own comment says
          * "never slows the hot path" — which is where a round's `waited` overshot its window by ~50 ms. Clear
-         * it after the pass: each round still gets exactly one look, inside a spin that stays cheap. */
+         * it after the pass: each round still gets exactly one look, inside a spin that stays cheap.
+         * CLEARED BELOW, NOT HERE. The frontier is not `edone` — it is ork_dyn_progress, which RE-POLLS through
+         * ork_dyn_done_i and so reads collide_ok itself. Clearing before that call threw the verdict away: the
+         * adjudicator accepted the core, printed that it had, and progress then re-ran the same gate with
+         * tolerance off and returned -1. Every W4A4 model decode died that way (recover x6, then -1). */
         if (!h->collide_ok && h->esz == 2) {
             h->collide_ok = 1;
             for (int i = 0; i < h->S; i++) if (!edone[i]) edone[i] = ork_dyn_done_i(h, i);
-            h->collide_ok = 0;
         }
         if (orki_ork_prof) orki_db_poll_us += ork_now_us() - t0;   /* the WAIT half of ork_dyn_end */
         last = ork_dyn_progress(h);
+        h->collide_ok = 0;                                        /* the verdict has been read; next round re-arms */
         if (last >= h->S - 1 || orki_ork_term) break;            /* all done, or interrupted */
         if (recov < recov_max) {                               /* dropped mc int8 round (output never landed): recover + resubmit + re-poll */
             if (getenv("ORK_MC_DIAG")) {
