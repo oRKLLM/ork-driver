@@ -539,7 +539,15 @@ const int8_t *ork_w_codes(const ork_w *w){ return w ? w->cpu_codes : NULL; }
  *
  * So callers must ASK rather than model. want_bf: -1 = follow ORK_NO_BF (the normal case, so a caller
  * cannot disagree with the loader about it), 0/1 = force, which a sizer needs to compare a with-Bf
- * footprint against a RAM budget before deciding whether Bf is affordable at all. */
+ * footprint against a RAM budget before deciding whether Bf is affordable at all.
+ *
+ * IOVA IS THE WHOLE COST -- there is no host-side term a caller has to add. That was not true until
+ * 2026-10-14: the i4a8 loaders also retained the K*N/2 nibble store on the host, so a 27B at this tier
+ * cost ~22.7 GiB of int8 containers PLUS ~11.3 GiB of anon heap while this function reported only the
+ * former, and the planner it is the authority for under-reported by 50% -- the gap between "16.9 GiB" and
+ * an OOM on the first prompt. The retention is gone (ork_i4a8_w_dump rebuilds the blob from the tiles), so
+ * the authority and reality agree again. If a future loader reintroduces a host-side copy, it belongs in
+ * THIS number or in a sibling the planner is made to ask for; do not leave it unaccounted. */
 size_t ork_w_resident_bytes(ork_npu *c, int K, int N, int wbits, int want_bf){
     if(K<=0 || N<=0) return 0;
     const int NMAX = (c && c->soc) ? c->soc->nmax : 8192;

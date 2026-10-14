@@ -198,12 +198,15 @@ static void orki_i4_synth_full(uint32_t*rc,int mc,int K,int N,uint32_t aA,uint32
     for(int i=0;i<orki_i4_fovr_n;i++) orki_setr(rc,REGCMD_I4_N,orki_i4_fovr[i].blk,orki_i4_fovr[i].reg,orki_i4_fovr[i].val);  /* RE fuzzer overrides (win over all) */
 }
 
-void orki_i4_tile_direct_to_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch) {
+/* `nibs` is the nibble source, passed in rather than read off the weight: a LOADED i4a8 weight keeps no
+ * host copy (see ork_i4a8_w_dump), so the loader hands this its blob pointer while the packer hands it
+ * w->Bi4. */
+void orki_i4_tile_direct_to_i8(ork_npu *c, ork_w *w, int K, int N, int kind, const uint8_t *nibs, int8_t *i8scratch) {
     if (kind == ORK_QK_CODEBOOK_NF4) {
         int8_t lut[16]; for (int i = 0; i < 16; i++) lut[i] = (int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
-        for (int n = 0; n < N; n++) orki_nf4_inflate_chan_to_i8(w->Bi4 + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
+        for (int n = 0; n < N; n++) orki_nf4_inflate_chan_to_i8(nibs + (size_t)n*(K/2), K, lut, i8scratch + (size_t)n*K);
     } else {
-        for (int n = 0; n < N; n++) orki_i4_expand_chan_to_i8(w->Bi4 + (size_t)n*(K/2), K, i8scratch + (size_t)n*K);
+        for (int n = 0; n < N; n++) orki_i4_expand_chan_to_i8(nibs + (size_t)n*(K/2), K, i8scratch + (size_t)n*K);
     }
     orki_i8_tile_to_tiles(c, w, K, N, i8scratch);
 }
@@ -229,7 +232,7 @@ void ork_i4a8_slice_inflate(const ork_w *w, float *qf32) { ork_i4a8_slice_inflat
  * to ork_i4a8_slice_inflate_kind + ork_i8_slice_tile, but in one pass with no float round-trip. */
 void ork_i4a8_slice_direct_kind(ork_npu *c, ork_w *w, int8_t *i8scratch, int kind) {
     if (!w || !w->Bi4) return;
-    orki_i4_tile_direct_to_i8(c, w, w->K, w->N, kind, i8scratch);
+    orki_i4_tile_direct_to_i8(c, w, w->K, w->N, kind, w->Bi4, i8scratch);
 }
 
 int ork_i4_mm_run(ork_npu *c,ork_w *w,int M,const int8_t *A,int32_t *C){

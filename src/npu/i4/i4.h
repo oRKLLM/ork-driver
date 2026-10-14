@@ -74,7 +74,7 @@ void orki_i4_expand_chan_f32(const uint8_t *nib, int K, float *qf32);
 void orki_nf4_inflate_chan_f32(const uint8_t *qidx, int K, const int8_t lut[16], float *qf32);
 void orki_i4_quant_chan(const float *fr, int K, float scale, int sr, uint32_t *seed, uint8_t *nib, float *qf32);
 void orki_nf4_quant_chan(const float *fr, int K, float absmax, int sr, uint32_t *seed, uint8_t *nib, uint8_t *qidx);
-void orki_i4_tile_direct_to_i8(ork_npu *c, ork_w *w, int K, int N, int kind, int8_t *i8scratch);
+void orki_i4_tile_direct_to_i8(ork_npu *c, ork_w *w, int K, int N, int kind, const uint8_t *nibs, int8_t *i8scratch);
 void orki_i4_tile_A(uint8_t*dst,const int8_t*A,int M,int K,int nib);
 void orki_i4_tile_B(uint8_t*dst,const int8_t*B,int K,int N,int nib);
 float orki_wq_best_absmax(const float *fr, int K, float rawabsmax, int nf4, const float *im, float *dq);

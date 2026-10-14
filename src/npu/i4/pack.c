@@ -33,7 +33,7 @@ ork_w *ork_i4a8_mm_pack_im(ork_npu *c, int K, int N, const float *f32, const flo
     int nf4 = getenv("ORK_NF4") != NULL;   /* ORK_NF4: non-uniform NF4 codebook instead of the uniform int4 grid */
     int KS = 1024, NMAX = c->soc->nmax, Sk = (K+KS-1)/KS, Sn = (N+NMAX-1)/NMAX;
     ork_w *w = calloc(1, sizeof *w); if (!w) return NULL;
-    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->dtype = DT_I8; w->owns = 1; w->domain=ork_dom(c->pack_domain); w->quant_kind = nf4 ? ORK_QK_CODEBOOK_NF4 : ORK_QK_UNIFORM;
+    w->K = K; w->N = N; w->Sk = Sk; w->Sn = Sn; w->nmax = NMAX; w->dtype = DT_I8; w->owns = 1; w->domain=ork_dom(c->pack_domain); w->quant_kind = nf4 ? ORK_QK_CODEBOOK_NF4 : ORK_QK_UNIFORM;
     w->Bb = calloc((size_t)Sk*Sn, sizeof(struct buf));
     if (!w->Bb) { free(w); return NULL; }
     for (int ns = 0; ns < Sn; ns++) { int n0 = ns*NMAX, Nc = (N-n0<NMAX)?(N-n0):NMAX;
@@ -86,10 +86,35 @@ ork_w *ork_i4a8_mm_pack_im(ork_npu *c, int K, int N, const float *f32, const flo
     return w;
 }
 
-/* int4-stored: fill = inflate nibbles -> int8 + tile (the .orkpack i4a8 blob, ork_i4a8_w_dump). The fill
- * happens ONCE here (the expensive op, cached in RAM). NULL on import-unavailable / malformed blob. */
+/* Rebuild the nibble store from the resident int8 tiles (or the offline codes), so a LOADED weight need
+ * not keep a second host-side copy of itself just to stay dumpable. Inflation is invertible: UNIFORM is
+ * code=(nib^8)-8 -> nib=code&0xf; the NF4 LUT's 16 round(level*127) entries are distinct, so a reverse
+ * table recovers the index. OPS_REGISTRY: "i4a8 LOAD keeps no host nibble copy". */
+static int orki_i4a8_nibbles_from_tiles(const ork_w *w, uint8_t *nib){
+    const int K=w->K, N=w->N, nf4=(w->quant_kind==ORK_QK_CODEBOOK_NF4);
+    uint8_t rev[256]={0}; if(nf4) for(int i=0;i<16;i++) rev[(uint8_t)(int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f)]=(uint8_t)i;
+#define ORKI_PUTNIB(k,n,code) nib[(size_t)(n)*(K/2)+((k)>>1)] |= \
+        (uint8_t)((nf4?rev[(uint8_t)(code)]:(uint8_t)((code)&0xf)) << (((k)&1)?4:0))
+    memset(nib,0,(size_t)N*(K/2));
+    if(w->cpu_codes){                                  /* OFFLINE: codes[k*N+n], never tiled */
+        for(int n=0;n<N;n++) for(int k=0;k<K;k++) ORKI_PUTNIB(k,n,w->cpu_codes[(size_t)k*N+n]);
+        return 0; }
+    if(!w->Bb || w->Sk<=0 || w->Sn<=0 || w->nmax<=0) return -1;
+    const int KS=1024, Sk=w->Sk, Sn=w->Sn, NMAX=w->nmax;   /* the loader's own N-slice width */
+    for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX, NN=Nc/32;
+      for(int ks=0;ks<Sk;ks++){ int k0=ks*KS, Kp=(K-k0<KS)?(K-k0):KS, KT=Kp/32;
+        const int8_t *bb=(const int8_t*)w->Bb[(size_t)ns*Sk+ks].cpu;
+        if(!bb) return -1;
+        for(int nt=0;nt<NN;nt++)for(int kt=0;kt<KT;kt++)for(int nl=0;nl<32;nl++)for(int kk=0;kk<32;kk++)
+            ORKI_PUTNIB(k0+kt*32+kk, n0+nt*32+nl,
+                        bb[(size_t)nt*KT*1024+(size_t)kt*1024+(size_t)nl*32+kk]); } }
+#undef ORKI_PUTNIB
+    return 0;
+}
+
 size_t ork_i4a8_w_dump(const ork_w *w, void *out, size_t cap){
-    if(!w || !w->Bi4 || !w->bscale) return 0;
+    if(!w || !w->bscale) return 0;
+    if(!w->Bi4 && !w->Bb && !w->cpu_codes) return 0;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)w->N*sizeof(float), nib=(size_t)w->K*w->N/2;
     size_t need=hdr+sc+nib;
     if(!out) return need;
@@ -98,21 +123,21 @@ size_t ork_i4a8_w_dump(const ork_w *w, void *out, size_t cap){
     char *p=out;
     memcpy(p,&h,hdr); p+=hdr;
     memcpy(p,w->bscale,sc); p+=sc;
-    memcpy(p,w->Bi4,nib);
+    if(w->Bi4) memcpy(p,w->Bi4,nib);
+    else if(orki_i4a8_nibbles_from_tiles(w,(uint8_t*)p)) return 0;
     return need;
 }
 
-/* Reload the compact int4 form straight into NPU DMA: parse+validate header, read bscale + Bi4, inflate
- * each channel's nibbles -> int8 (UNIFORM sign-extend / NF4 LUT per quant_kind) and orki_i8_tile_f32 into a
- * fresh DMA buffer — the tail of the pack path, from stored nibbles instead of re-quantized f32. Retains
- * a copy of Bi4 + bscale so the loaded weight can be re-dumped byte-identically. NULL on malformed blob. */
-/* Zero-copy IMPORT variant of ork_i4a8_mm_load: resident tiles are dma-bufs the NPU reads in place (PRIME
- * import), and the int4 nibbles inflate -> int8 directly into them (no f32 round-trip). Bit-identical to
- * ork_i4a8_mm_load (same blob, same tiled bytes). Falls through to NULL (caller uses ork_i4a8_mm_load) if
- * import is unavailable. Retains Bi4 + bscale so the loaded weight re-dumps byte-identically. */
-/* tile shape mirrors ork_i4a8_mm_load: KS=1024 K-split, NMAX N-split; Bf full-K when K%512==0 && K<=4096
- * (same envelope as load_i8_import). Returns NULL if dma-heap absent / alloc fails. */
-ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
+/* Reload the compact int4 form straight into NPU DMA: parse+validate header, read bscale, inflate each
+ * channel's nibbles -> int8 (UNIFORM sign-extend / NF4 LUT per quant_kind) and orki_i8_tile_f32 into a
+ * fresh DMA buffer — the tail of the pack path, from stored nibbles instead of re-quantized f32. The
+ * IMPORT twin below is bit-identical (same blob, same tiled bytes) but its tiles are dma-bufs the NPU
+ * reads in place (PRIME import, no f32 round-trip); it returns NULL if import is unavailable, Bf full-K
+ * when K%512==0 && K<=4096. NULL on a malformed blob.
+ * keep_host: retain the nibble store on the ork_w. 0 for an ordinary .orkpack load (dumpable without it,
+ * and the copy is K*N/2 permanent anon bytes per weight); 1 for the streaming staging path, whose
+ * ork_stage_fill reads the nibbles directly. */
+static ork_w *load_i4a8(ork_npu *c, int K, int N, const void *blob, size_t n, int keep_host){
     if(K%32 || N%32) return NULL;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
     if(n != hdr+sc+nib) return NULL;
@@ -138,9 +163,8 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
         ork_w *w=calloc(1,sizeof *w);
         if(!w){ free(codes); return NULL; }
         /* CARRY THE SCALES. The caller reads them back with ork_w_bscale() for the DT_I4 tier -- the
-         * container is the only place they live, unlike DT_I8 whose scales sit in the pack index. Leaving
-         * them NULL is not a NULL-check away from working: the caller's `if (bs)` simply skips the assign,
-         * ow.bscale stays empty, and the dequant indexes off the end of it. Segfault, not a wrong number. */
+         * container is the only place they live, unlike DT_I8 whose scales sit in the pack index. NULL
+         * here is a segfault: `if (bs)` skips the assign, then the dequant walks off an empty vector. */
         w->bscale=malloc(sc);
         if(!w->bscale){ free(codes); free(w); return NULL; }
         memcpy(w->bscale,bsc,sc);
@@ -150,7 +174,7 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
     }
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
-    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->nmax=NMAX; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf));
     if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -161,17 +185,22 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
         for(int ns=0;ns<Sn && ok;ns++){ int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             struct buf *b=&w->Bf[ns]; *b=orki_bcreate(c->fd,(size_t)K*Nc,0x403,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
-    /* retain the compact store + scales so the loaded weight re-dumps byte-identically */
-    w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
-    if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
+    /* scales are always retained (N floats); the nibble store only when the caller needs it in host RAM */
+    w->bscale=malloc(sc);
+    if(!w->bscale){ ork_mm_free(c,w); return NULL; }
     memcpy(w->bscale,p,sc); p+=sc;
-    memcpy(w->Bi4,p,nib);
+    const uint8_t *nibs=(const uint8_t*)p;             /* inflate straight from the blob */
+    if(keep_host){
+        w->Bi4_bytes=nib; w->Bi4=malloc(nib);
+        if(!w->Bi4){ ork_mm_free(c,w); return NULL; }
+        memcpy(w->Bi4,nibs,nib); nibs=w->Bi4;
+    }
     /* ORK_DIRECT_I4: inflate nibbles STRAIGHT to int8-tiled (1 byte/elem scratch, no f32 round-trip,
      * no re-quant) — bit-identical to the f32 path. Default off; preserves the f32 path for review. */
     if(getenv("ORK_DIRECT_I4")){
         int8_t *i8=malloc((size_t)N*K);
         if(!i8){ ork_mm_free(c,w); return NULL; }
-        orki_i4_tile_direct_to_i8(c, w, K, N, w->quant_kind, i8);
+        orki_i4_tile_direct_to_i8(c, w, K, N, w->quant_kind, nibs, i8);
         free(i8);
         return w;
     }
@@ -182,15 +211,17 @@ ork_w *ork_i4a8_mm_load(ork_npu *c, int K, int N, const void *blob, size_t n){
     for(int nn=0;nn<N;nn++){
         if(w->quant_kind==ORK_QK_CODEBOOK_NF4){
             /* NF4 store keeps the 0..15 index in the nibble; inflate via the int8 LUT */
-            const uint8_t *nibp=w->Bi4+(size_t)nn*(K/2); float *qf=qf32+(size_t)nn*K;
+            const uint8_t *nibp=nibs+(size_t)nn*(K/2); float *qf=qf32+(size_t)nn*K;
             for(int k=0;k<K;k++){ uint8_t idx=(k&1)?(nibp[k>>1]>>4):(nibp[k>>1]&0xf); qf[k]=(float)nf4_lut[idx]; }
-        } else orki_i4_expand_chan_f32(w->Bi4+(size_t)nn*(K/2), K, qf32+(size_t)nn*K);
+        } else orki_i4_expand_chan_f32(nibs+(size_t)nn*(K/2), K, qf32+(size_t)nn*K);
         inv[nn]=1.0f;                                  /* qf32 holds exact codes; no rescale */
     }
     orki_i8_tile_f32(c, w, K, N, qf32, inv);                /* REUSE the int8 DMA/tiling path (no dup) */
     free(qf32); free(inv);
     return w;
 }
+
+ork_w *ork_i4a8_mm_load(ork_npu *c,int K,int N,const void *blob,size_t n){ return load_i4a8(c,K,N,blob,n,0); }
 
 /* Un-tile a .orkpack int4 blob back to raw [K][N] codes in [-8,7]. This is the exact inverse of
  * ork_i4_w_dump_cpu / tile_i4_Bslice, and it is FACTORED rather than copied because the tiler and the
@@ -347,7 +378,7 @@ ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t
     return w;
 }
 
-ork_w *ork_i4a8_mm_load_import(ork_npu *c, int K, int N, const void *blob, size_t n){
+static ork_w *load_i4a8_import(ork_npu *c, int K, int N, const void *blob, size_t n, int keep_host){
     if(K%32 || N%32 || orki_dmaheap_open()<0) return NULL;
     size_t hdr=sizeof(struct ork_i4a8_hdr), sc=(size_t)N*sizeof(float), nib=(size_t)K*N/2;
     if(n != hdr+sc+nib) return NULL;
@@ -357,7 +388,7 @@ ork_w *ork_i4a8_mm_load_import(ork_npu *c, int K, int N, const void *blob, size_
     if(h.quant_kind!=ORK_QK_UNIFORM && h.quant_kind!=ORK_QK_CODEBOOK_NF4) return NULL;
     int KS=1024, NMAX=c->soc->nmax, Sk=(K+KS-1)/KS, Sn=(N+NMAX-1)/NMAX;
     ork_w *w=calloc(1,sizeof *w); if(!w) return NULL;
-    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
+    w->K=K; w->N=N; w->Sk=Sk; w->Sn=Sn; w->nmax=NMAX; w->dtype=DT_I8; w->owns=1; w->domain=ork_dom(c->pack_domain); w->quant_kind=(uint8_t)h.quant_kind;
     ork_dom_prime(c, w->domain);   /* establish a non-0 domain with a native anchor BEFORE importing (same quirk as i8) */
     w->Bb=calloc((size_t)Sk*Sn,sizeof(struct buf)); if(!w->Bb){ free(w); return NULL; }
     for(int ns=0;ns<Sn;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
@@ -368,23 +399,29 @@ ork_w *ork_i4a8_mm_load_import(ork_npu *c, int K, int N, const void *blob, size_
         for(int ns=0;ns<Sn && ok;ns++){int n0=ns*NMAX,Nc=(N-n0<NMAX)?(N-n0):NMAX;
             struct buf*b=&w->Bf[ns]; *b=orki_bimport(c->fd,(size_t)K*Nc,w->domain); if(!b->cpu) ok=0; }
         if(!ok){ for(int ns=0;ns<Sn;ns++) orki_bdestroy(c->fd,&w->Bf[ns]); free(w->Bf); w->Bf=NULL; } }
-    w->Bi4_bytes=nib; w->Bi4=malloc(nib); w->bscale=malloc(sc);
-    if(!w->Bi4 || !w->bscale){ ork_mm_free(c,w); return NULL; }
-    memcpy(w->bscale,p,sc); p+=sc; memcpy(w->Bi4,p,nib);
+    w->bscale=malloc(sc);
+    if(!w->bscale){ ork_mm_free(c,w); return NULL; }
+    memcpy(w->bscale,p,sc); p+=sc;
+    const uint8_t *nibs=(const uint8_t*)p;
+    if(keep_host){ w->Bi4_bytes=nib; w->Bi4=malloc(nib);
+        if(!w->Bi4){ ork_mm_free(c,w); return NULL; }
+        memcpy(w->Bi4,nibs,nib); nibs=w->Bi4; }
     int8_t *i8=malloc((size_t)N*K); if(!i8){ ork_mm_free(c,w); return NULL; }
     if(w->quant_kind==ORK_QK_CODEBOOK_NF4){ int8_t lut[16]; for(int i=0;i<16;i++) lut[i]=(int8_t)lrintf(ORKI_NF4_LEVELS[i]*127.0f);
-        for(int nn=0;nn<N;nn++) orki_nf4_inflate_chan_to_i8(w->Bi4+(size_t)nn*(K/2),K,lut,i8+(size_t)nn*K);
-    } else for(int nn=0;nn<N;nn++) orki_i4_expand_chan_to_i8(w->Bi4+(size_t)nn*(K/2),K,i8+(size_t)nn*K);
+        for(int nn=0;nn<N;nn++) orki_nf4_inflate_chan_to_i8(nibs+(size_t)nn*(K/2),K,lut,i8+(size_t)nn*K);
+    } else for(int nn=0;nn<N;nn++) orki_i4_expand_chan_to_i8(nibs+(size_t)nn*(K/2),K,i8+(size_t)nn*K);
     orki_i8_tile_to_import_tiles(c,w,K,N,i8);
     free(i8);
     return w;
 }
 
+ork_w *ork_i4a8_mm_load_import(ork_npu *c,int K,int N,const void *blob,size_t n){ return load_i4a8_import(c,K,N,blob,n,0); }
+
 struct ork_stream_entry *ork_i4a8_stream_pool_add(struct ork_stream_pool *p, int K, int N, const void *blob, size_t n){
     if(!p) return NULL;
     /* validate + materialize an int4 source ork_w from the blob (host-side Bi4+bscale), inflate into the
      * entry's staging dma-buf, then drop the temporary source (we only needed its nibble store to fill). */
-    ork_w *src=ork_i4a8_mm_load(p->c,K,N,blob,n);  /* allocates resident DMA too — temporary; freed below */
+    ork_w *src=load_i4a8(p->c,K,N,blob,n,1);       /* keep_host=1: ork_stage_fill reads the nibbles */
     if(!src) return NULL;
     struct ork_stream_entry *e=orki_pool_new_entry(p,K,N);
     if(!e){ ork_mm_free(p->c,src); return NULL; }

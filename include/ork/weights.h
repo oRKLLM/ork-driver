@@ -252,11 +252,16 @@ size_t       ork_w_resident_bytes(ork_npu *c, int K, int N, int wbits, int want_
  * refuses loudly. aScale[m*Sk+g], bScale[g*N+n]; C is fp32. */
 int          ork_i8_mm_run_grouped(ork_npu *c,ork_w *w,int M,const int8_t *A,const float *aScale,const float *bScale,float *C);
 
+/* Reload a compact i4a8 blob into NPU DMA (inflate nibbles -> int8 containers + tile). The per-channel
+ * scales are retained on the weight (ork_w_bscale); the NIBBLE STORE IS NOT -- it is K*N/2 bytes of
+ * permanent host heap that would duplicate the resident tiles, and ork_i4a8_w_dump rebuilds the blob from
+ * those tiles byte-identically instead. So ork_w_resident_bytes(.., wbits=8, ..) is the WHOLE cost of a
+ * loaded i4a8 weight, with no host-side term a planner has to add. */
 ork_w       *ork_i4a8_mm_load(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* Zero-copy IMPORT variant of ork_i4a8_mm_load: resident tiles are dma-bufs the NPU reads in place (PRIME
  * import); the int4 nibbles inflate -> int8 directly into them. Bit-identical to ork_i4a8_mm_load (same
  * blob, same tiled bytes, same re-dump). Returns NULL if import is unavailable (caller falls back to
- * ork_i4a8_mm_load) or on a malformed blob / shape mismatch. */
+ * ork_i4a8_mm_load) or on a malformed blob / shape mismatch. Keeps no host nibble copy either. */
 ork_w       *ork_i4a8_mm_load_import(ork_npu *ctx, int K, int N, const void *blob, size_t n);
 /* Reload a pre-tiled NATIVE-W4A4 weight (ork_w_dump of a DT_I4 ork_i4_mm_pack weight) straight into NPU DMA —
  * NO dequant/FWHT-rotate/int4-quant/tile (the cold-pack fix for the mul_mat_i4/_hadamard/group_i4 path). blob =
