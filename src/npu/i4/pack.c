@@ -325,12 +325,9 @@ ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t
         w->Bb=calloc((size_t)SG*SN, sizeof(struct buf));
         if(!w->Bb){ free(w->Bb); free(w); free(codes); return NULL; }
         int ok=1;
-        /* NIBBLE -> INT8 CONTAINER DIRECTLY. orki_i8_tile_range is already an int8->int8 PERMUTATION
-         * (bb[...] = Bi[...]), so the codes go straight into the tile: no f32 staging buffer, no
-         * re-quantisation. Going via orki_i8_tile_f32 meant allocating K*N floats, widening every code to
-         * f32 and quantising it back -- pure round-trip, and it dominated load time. Measured on 27B:
-         * t_quant was 306 ms/matmul against W4A4's 13.7 ms, i.e. 57% of wall, while t_run was IDENTICAL
-         * (233.5 vs 237.4 ms). The inflation was the whole cost of the W4A8 tier, not the extra bytes. */
+        /* NIBBLE -> INT8 CONTAINER DIRECTLY: orki_i8_tile_range is already an int8->int8 permutation, so
+         * the codes go straight into the tile -- no f32 staging, no re-quantisation. (Measured on the 27B,
+         * the f32 round-trip was 57% of load wall for zero change in run time.) */
         /* One tile per (N-slice, K-group). Sn>1 is what a 27B needs -- its wide-N weights slice to Sn=2..3
          * -- and it costs nothing here beyond indexing, because tile_i8_arg already carries the n0 offset
          * and the GLOBAL row stride N, so a [G x Nc] sub-tile is the same permutation with different
@@ -374,6 +371,14 @@ ork_w *ork_i4a8_mm_load_tiled(ork_npu *c, int K, int N, const void *blob, size_t
         struct tile_i8_arg ta={ (int8_t*)b->cpu, codes, Kp/32, k0, n0, N };
         ork_parallel_for(Nc/32, orki_i8_tile_range, &ta);
         orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); } }
+    /* FILL Bf TOO. It is allocated above and ork_i8_mm_run PREFERS it, so leaving it at its allocation
+     * zeros multiplies by a zero weight, silently. Every other int8 loader fills both; this one filled
+     * Bb only. OPS_REGISTRY: "DT_I4_ROT_A8 load (Bf left unfilled)". */
+    if(w->Bf) for(int ns=0;ns<Sn;ns++){ int n0=ns*NMAX, Nc=(N-n0<NMAX)?(N-n0):NMAX;
+        struct buf *b=&w->Bf[ns]; if(!b->cpu) continue;
+        struct tile_i8_arg ta={ (int8_t*)b->cpu, codes, K/32, 0, n0, N };
+        ork_parallel_for(Nc/32, orki_i8_tile_range, &ta);
+        orki_bsync(c->fd,b,RKNPU_MEM_SYNC_TO_DEVICE); }
     free(codes);
     return w;
 }
