@@ -4,6 +4,6 @@
 # differs from CORE_SHA last validated an OLDER tree. 'make check-attest-all' requires every board
 # in ATTEST_BOARDS; 'make attest-waive BOARD=.. REASON=..' excuses one, and the waiver expires with
 # the hash it names. See the Makefile's ATTEST_* block.
-CORE_SHA=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08
-BOARD=radxa,rock-5b kernel=6.1.115-vendor-rk35xx-fencefix sha=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08 date=2026-10-13
-BOARD=radxa,rock-5b-plus kernel=6.1.115-vendor-rk35xx-fix sha=6bb3b2d2dfadae8e9809d77f59d698cde08665f1c2b0680e62b4ee0e5934ec08 date=2026-10-13
+CORE_SHA=217750ab6dfc9f2f99ad86005e26f06cbc878669b0de1b19e1e8a5dccb5ab196
+BOARD=radxa,rock-5b kernel=6.1.115-vendor-rk35xx-fencefix sha=217750ab6dfc9f2f99ad86005e26f06cbc878669b0de1b19e1e8a5dccb5ab196 date=2026-10-14
+BOARD=radxa,rock-5b-plus kernel=6.1.115-vendor-rk35xx-fix sha=217750ab6dfc9f2f99ad86005e26f06cbc878669b0de1b19e1e8a5dccb5ab196 date=2026-10-14
